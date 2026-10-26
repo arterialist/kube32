@@ -54,33 +54,37 @@ def main():
     print("=" * 65)
     print("  Kube32 Automated Dual-Board Hardware Flashing Daemon")
     print("=" * 65)
+    print("Waiting for both boards in Download Mode...")
+    print("  1. Cardputer: Switch OFF -> Hold G0 -> Plug in USB / Switch ON")
+    print("  2. Dev Board: Hold BOOT -> Tap RST -> Release BOOT")
+    print("-" * 65)
     
     flashed = set()
-    ports = glob.glob("/dev/cu.usbmodem*")
-    print(f"[SCAN] Found USB serial devices: {ports}")
-    
-    for port in ports:
-        desc = KNOWN_PORTS.get(port, "Unknown ESP32-S3")
-        print(f"\n[TARGET] Probing {port} ({desc})...")
-        ok, out = probe_port(port)
-        if ok:
-            print(f"[PROBE] {port} is in download mode! Initiating firmware flash...")
-            f_ok, f_out = flash_port(port)
-            if f_ok:
-                print(f"[SUCCESS] Flashed {port} cleanly!")
+    while len(flashed) < 2:
+        ports = glob.glob("/dev/cu.usbmodem*")
+        for port in ports:
+            if port in flashed:
+                continue
+            desc = KNOWN_PORTS.get(port, "ESP32-S3 Board")
+            print(f"\n[SCAN] Detected {port} ({desc})")
+            print(f"[PROBE] Attempting flash at 460800 baud...")
+            ok, out = flash_port(port, baud=460800)
+            if not ok:
+                print(f"[RETRY] 460800 baud failed, trying 115200 baud...")
+                ok, out = flash_port(port, baud=115200)
+            if ok:
+                print(f"[SUCCESS] Successfully flashed {port} ({desc})!")
                 flashed.add(port)
             else:
-                print(f"[FAIL] Flash failed on {port}:\n{f_out}")
-        else:
-            print(f"[WAIT] {port} needs manual bootloader trigger (Hold BOOT, click RST).")
-            # Try flashing at 115200 just in case
-            f_ok, f_out = flash_port(port, baud=115200)
-            if f_ok:
-                print(f"[SUCCESS] Flashed {port} at 115200 baud!")
-                flashed.add(port)
-            else:
-                print(f"       Status: {f_out.splitlines()[-1] if f_out else 'No response'}")
+                last_line = out.strip().splitlines()[-1] if out.strip() else "Timeout"
+                print(f"[STATUS] {port}: {last_line}")
+        time.sleep(2)
+        if len(ports) == 0:
+            print("[SCAN] Waiting for boards to be connected...", end="\r", flush=True)
 
+    print("\n" + "=" * 65)
+    print("  ALL PHYSICAL BOARDS FLASHED SUCCESSFULLY!")
+    print("=" * 65)
     return 0
 
 if __name__ == "__main__":

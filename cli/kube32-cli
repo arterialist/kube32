@@ -1,0 +1,272 @@
+#!/usr/bin/env python3
+"""
+==============================================================================
+Kube32 Developer CLI Tooling & Workload Packaging System
+==============================================================================
+Provides developer abstractions to build, package, test, inspect, and deploy
+sandboxed micro-workloads (Wasm3) to physical ESP32-S3 clusters running Kube32.
+"""
+
+import sys
+import os
+import argparse
+import base64
+import json
+import urllib.request
+import urllib.error
+
+VERSION = "1.0.0-m6"
+
+def cmd_version(args):
+    print(f"Kube32 CLI v{VERSION} (Target: ESP32-S3 Xtensa dual-core @ 240MHz)")
+    print("API Compliance: Kubernetes Core v1 / Apps v1")
+
+def cmd_package(args):
+    if not os.path.isfile(args.wasm_file):
+        print(f"Error: Wasm binary '{args.wasm_file}' not found.", file=sys.stderr)
+        sys.exit(1)
+
+    with open(args.wasm_file, "rb") as f:
+        wasm_bytes = f.read()
+
+    b64_wasm = base64.b64encode(wasm_bytes).decode("ascii")
+    pod_name = args.name or os.path.splitext(os.path.basename(args.wasm_file))[0]
+    namespace = args.namespace or "default"
+
+    manifest = {
+        "apiVersion": "v1",
+        "kind": "Pod",
+        "metadata": {
+            "name": pod_name,
+            "namespace": namespace,
+            "labels": {
+                "app": pod_name,
+                "runtime": "wasm3"
+            }
+        },
+        "spec": {
+            "nodeSelector": {
+                "kubernetes.io/arch": "xtensa"
+            },
+            "containers": [
+                {
+                    "name": pod_name,
+                    "image": f"wasm://embedded/{pod_name}:v1",
+                    "resources": {
+                        "limits": {
+                            "memory": args.memory or "64Ki"
+                        },
+                        "requests": {
+                            "memory": args.memory or "32Ki"
+                        }
+                    },
+                    "securityContext": {
+                        "capabilities": {
+                            "add": [cap.strip() for cap in args.capabilities.split(",") if cap.strip()]
+                        }
+                    },
+                    "env": [
+                        {
+                            "name": "KUBE32_WASM_BYTECODE",
+                            "value": b64_wasm
+                        }
+                    ]
+                }
+            ]
+        }
+    }
+
+    if args.ipc_channel:
+        manifest["spec"]["containers"][0]["env"].append({
+            "name": "KUBE32_IPC_CHANNEL",
+            "value": args.ipc_channel
+        })
+
+    out_yaml = json.dumps(manifest, indent=2)
+    if args.output:
+        with open(args.output, "w") as f:
+            f.write(out_yaml + "\n")
+        print(f"Successfully packaged workload to {args.output} ({len(wasm_bytes)} bytes Wasm bytecode)")
+    else:
+        print(out_yaml)
+
+def cmd_manifest(args):
+    pod_name = args.name
+    manifest = f"""apiVersion: v1
+kind: Pod
+metadata:
+  name: {pod_name}
+  namespace: {args.namespace or 'default'}
+  labels:
+    app: {pod_name}
+spec:
+  nodeSelector:
+    kubernetes.io/hostname: {args.node or 'esp32-node-01'}
+  containers:
+    - name: {pod_name}
+      image: wasm://edge/{pod_name}:v1
+      resources:
+        limits:
+          memory: {args.memory or '64Ki'}
+        requests:
+          memory: {args.memory or '32Ki'}
+      securityContext:
+        capabilities:
+          add:
+            - CHANNEL_IPC
+"""
+    if args.gpio:
+        manifest += f"            - GPIO_WRITE\n"
+    if args.adc:
+        manifest += f"            - ADC_READ\n"
+    if args.ipc_channel:
+        manifest += f"""      env:
+        - name: KUBE32_IPC_CHANNEL
+          value: "{args.ipc_channel}"
+"""
+    if args.output:
+        with open(args.output, "w") as f:
+            f.write(manifest)
+        print(f"Manifest written to {args.output}")
+    else:
+        print(manifest)
+
+def cmd_status(args):
+    server = args.server.rstrip("/")
+    print(f"Connecting to Kube32 Cluster at {server}...")
+    try:
+        req = urllib.request.Request(f"{server}/api/v1/nodes", headers={"Accept": "application/json"})
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+            print("\n=== CLUSTER NODES ===")
+            print(f"{'NAME':<16} {'STATUS':<10} {'ROLES':<14} {'INTERNAL-IP':<16} {'ALLOCATABLE-MEM'}")
+            print("-" * 72)
+            for item in data.get("items", []):
+                name = item.get("metadata", {}).get("name", "unknown")
+                labels = item.get("metadata", {}).get("labels", {})
+                roles = "worker"
+                if "node-role.kubernetes.io/control-plane" in labels or "node-role.kubernetes.io/master" in labels:
+                    roles = "control-plane"
+                conds = item.get("status", {}).get("conditions", [])
+                status = "Ready" if any(c.get("type") == "Ready" and c.get("status") == "True" for c in conds) else "NotReady"
+                addrs = item.get("status", {}).get("addresses", [])
+                ip = next((a.get("address") for a in addrs if a.get("type") == "InternalIP"), "N/A")
+                alloc_mem = item.get("status", {}).get("allocatable", {}).get("memory", "N/A")
+                print(f"{name:<16} {status:<10} {roles:<14} {ip:<16} {alloc_mem}")
+    except Exception as e:
+        print(f"Failed to query nodes: {e}", file=sys.stderr)
+
+    try:
+        req = urllib.request.Request(f"{server}/api/v1/pods", headers={"Accept": "application/json"})
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+            print("\n=== CLUSTER PODS ===")
+            print(f"{'NAMESPACE':<12} {'NAME':<24} {'NODE':<16} {'STATUS':<12} {'MEMORY'}")
+            print("-" * 72)
+            for item in data.get("items", []):
+                ns = item.get("metadata", {}).get("namespace", "default")
+                name = item.get("metadata", {}).get("name", "unknown")
+                node = item.get("spec", {}).get("nodeName", "<none>")
+                status = item.get("status", {}).get("phase", "Pending")
+                limits = item.get("spec", {}).get("containers", [{}])[0].get("resources", {}).get("limits", {})
+                mem = limits.get("memory", "N/A")
+                print(f"{ns:<12} {name:<24} {node:<16} {status:<12} {mem}")
+    except Exception as e:
+        print(f"Failed to query pods: {e}", file=sys.stderr)
+
+def cmd_apply(args):
+    server = args.server.rstrip("/")
+    if not os.path.isfile(args.file):
+        print(f"Error: Manifest file '{args.file}' not found.", file=sys.stderr)
+        sys.exit(1)
+
+    with open(args.file, "r") as f:
+        content = f.read().strip()
+
+    # Split multi-document YAML if needed
+    docs = [d.strip() for d in content.split("---") if d.strip()]
+    for doc in docs:
+        try:
+            # Parse document (simple JSON/YAML mapping)
+            import yaml
+            payload = yaml.safe_load(doc)
+        except ImportError:
+            # Fallback to json if yaml not installed
+            try:
+                payload = json.loads(doc)
+            except Exception:
+                # Basic string parser for minimal manifest
+                payload = json.loads(json.dumps({"raw_yaml": doc}))
+
+        name = payload.get("metadata", {}).get("name", "workload")
+        ns = payload.get("metadata", {}).get("namespace", "default")
+        url = f"{server}/api/v1/namespaces/{ns}/pods"
+
+        req_data = json.dumps(payload).encode("utf-8")
+        req = urllib.request.Request(
+            url,
+            data=req_data,
+            headers={"Content-Type": "application/json", "Accept": "application/json"},
+            method="POST"
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                print(f"pod/{name} created successfully (HTTP {resp.status})")
+        except urllib.error.HTTPError as e:
+            body = e.read().decode("utf-8")
+            print(f"Error creating pod/{name}: HTTP {e.code} - {body}", file=sys.stderr)
+        except Exception as e:
+            print(f"Error connecting to cluster at {server}: {e}", file=sys.stderr)
+
+def main():
+    parser = argparse.ArgumentParser(description="Kube32 Micro-Orchestration Developer CLI")
+    parser.add_argument("--server", default="http://192.168.4.1:6443", help="Kube32 API Server URL (default: http://192.168.4.1:6443)")
+    subparsers = parser.add_subparsers(dest="command")
+
+    # version
+    subparsers.add_parser("version", help="Display Kube32 CLI version")
+
+    # package
+    p_pkg = subparsers.add_parser("package", help="Package a WebAssembly binary into a Pod manifest")
+    p_pkg.add_argument("wasm_file", help="Path to .wasm binary file")
+    p_pkg.add_argument("--name", help="Workload name")
+    p_pkg.add_argument("--namespace", default="default", help="Pod namespace")
+    p_pkg.add_argument("--memory", default="64Ki", help="Memory limit (e.g., 48Ki, 64Ki)")
+    p_pkg.add_argument("--capabilities", default="CHANNEL_IPC", help="Hardware capabilities comma-separated (e.g. GPIO_WRITE,ADC_READ,CHANNEL_IPC)")
+    p_pkg.add_argument("--ipc-channel", help="Virtual channel name for inter-pod IPC")
+    p_pkg.add_argument("-o", "--output", help="Output YAML/JSON file path")
+
+    # manifest
+    p_man = subparsers.add_parser("manifest", help="Generate a sample Pod manifest")
+    p_man.add_argument("--name", required=True, help="Pod name")
+    p_man.add_argument("--node", help="Target nodeName")
+    p_man.add_argument("--namespace", default="default", help="Pod namespace")
+    p_man.add_argument("--memory", default="48Ki", help="Memory limits")
+    p_man.add_argument("--gpio", action="store_true", help="Request GPIO capability")
+    p_man.add_argument("--adc", action="store_true", help="Request ADC capability")
+    p_man.add_argument("--ipc-channel", help="Virtual channel IPC identifier")
+    p_man.add_argument("-o", "--output", help="Output file")
+
+    # status
+    p_stat = subparsers.add_parser("status", help="Inspect cluster status (nodes, pods, memory)")
+
+    # apply
+    p_app = subparsers.add_parser("apply", help="Submit a workload manifest to the cluster")
+    p_app.add_argument("-f", "--file", required=True, help="Path to manifest file")
+
+    args = parser.parse_args()
+    if args.command == "version":
+        cmd_version(args)
+    elif args.command == "package":
+        cmd_package(args)
+    elif args.command == "manifest":
+        cmd_manifest(args)
+    elif args.command == "status":
+        cmd_status(args)
+    elif args.command == "apply":
+        cmd_apply(args)
+    else:
+        parser.print_help()
+
+if __name__ == "__main__":
+    main()

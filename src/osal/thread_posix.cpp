@@ -156,7 +156,9 @@ void Thread::sleep_us(uint64_t us) {
 
 void Thread::yield() {
     taskYIELD();
-    esp_task_wdt_reset();
+    if (esp_task_wdt_status(NULL) == ESP_OK) {
+        esp_task_wdt_reset();
+    }
 }
 
 uint64_t Thread::get_time_ms() {

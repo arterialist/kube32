@@ -49,7 +49,9 @@ void System::restart() {
 }
 
 void System::feed_watchdog() {
-    esp_task_wdt_reset();
+    if (esp_task_wdt_status(NULL) == ESP_OK) {
+        esp_task_wdt_reset();
+    }
 }
 
 } // namespace kube32::osal
