@@ -1,0 +1,6 @@
+(def! core_ns '[* + - / < <= = > >= apply assoc atom atom? concat conj
+  cons contains? count deref dissoc empty? false? first fn? get
+  hash-map keys keyword keyword? list list? macro? map map? meta nil?
+  nth number? pr-str println prn read-string readline reset! rest seq
+  sequential? slurp str string? swap! symbol symbol? throw time-ms
+  true? vals vec vector vector? with-meta])

@@ -1,0 +1,665 @@
+# WASM module examples
+
+### Rust WASI app
+
+Create a new project:
+```sh
+$ cargo new --bin hello
+$ cd hello
+$ rustup target add wasm32-wasip1
+```
+
+Build and run:
+```sh
+$ cargo build --release --target wasm32-wasip1
+
+$ wasm3 ./target/wasm32-wasip1/release/hello.wasm
+Hello, world!
+```
+
+### AssemblyScript WASI app
+
+Create `hello.ts`:
+```ts
+import "wasi"
+import {Console} from "as-wasi"
+
+Console.log('Hello World!');
+```
+
+Create `package.json`:
+```json
+{
+  "scripts": {
+    "asbuild:debug":        "asc hello.ts -b hello.wasm --debug",
+    "asbuild:optimized":    "asc hello.ts -b hello.wasm -O3s --noAssert",
+    "asbuild:tiny":         "asc hello.ts -b hello.wasm -O3z --noAssert --runtime stub --use abort=",
+    "build":                "npm run asbuild:optimized"
+  },
+  "devDependencies": {
+    "assemblyscript": "*",
+    "as-wasi": "*"
+  }
+}
+```
+
+Build and run:
+```sh
+$ npm install
+$ npm run build
+
+$ wasm3 hello.wasm
+Hello World!
+```
+
+### TinyGo WASI app
+
+Create `hello.go`:
+```go
+package main
+
+import "fmt"
+
+func main() {
+    fmt.Printf("Hello, %s!\n", "world")
+}
+```
+
+Build and run:
+```sh
+$ tinygo build -o hello.wasm -target wasi -no-debug hello.go
+
+$ wasm3 hello.wasm
+Hello, world!
+```
+
+
+### Go WASI app
+
+Create `hello.go`:
+```go
+package main
+
+import "fmt"
+
+func main() {
+    fmt.Printf("Hello, %s!\n", "world")
+}
+```
+
+Build and run:
+```sh
+$ GOOS=wasip1 GOARCH=wasm go build -o hello.wasm hello.go
+
+$ wasm3 hello.wasm
+Hello, world!
+```
+
+The Go runtime is linked into every module, so even this one lands at about 2.5 MB.
+What that buys is the whole runtime: goroutines, the scheduler,
+the garbage collector, `time` and `os` all work under Wasm3.
+
+[TinyGo](#tinygo-wasi-app) targets the same interface at a fraction of the size.
+
+
+### Zig WASI app
+
+Create `hello.zig`:
+```zig
+const std = @import("std");
+
+pub fn main() !void {
+    const stdout = std.io.getStdOut().writer();
+    try stdout.print("Hello, {s}!\n", .{"world"});
+}
+```
+
+Build and run:
+```sh
+$ zig build-exe -O ReleaseSmall -target wasm32-wasi hello.zig
+
+$ wasm3 hello.wasm
+Hello, world!
+```
+
+### Zig C-code WASI app
+
+Create `hello.c`:
+```c
+#include <stdio.h>
+
+int main() {
+   printf("Hello, %s!\n", "world");
+   return 0;
+}
+```
+
+Build and run:
+```sh
+$ zig build-exe -O ReleaseSmall -target wasm32-wasi hello.c -lc
+
+$ wasm3 hello.wasm
+Hello, world!
+```
+
+## Zig library
+
+Create `add.zig`:
+```zig
+export fn add(a: i32, b: i32) i64 {
+    return a + b;
+}
+```
+
+Build and run:
+```sh
+$ zig build-lib add.zig -O ReleaseSmall -target wasm32-freestanding
+
+$ wasm3 --repl add.wasm
+wasm3> add 1 2
+Result: 3
+```
+
+### C/C++ WASI app
+
+The easiest way to start is to use the [WASI SDK](https://github.com/WebAssembly/wasi-sdk),
+which is a Clang that already knows where the sysroot is:
+
+```sh
+export WASI_SDK_PATH=/opt/wasi-sdk
+```
+
+Create `hello.cpp`:
+```cpp
+#include <iostream>
+
+int main() {
+    std::cout << "Hello, world!" << std::endl;
+    return 0;
+}
+```
+
+Or `hello.c`:
+```c
+#include <stdio.h>
+
+int main() {
+   printf("Hello, %s!\n", "world");
+   return 0;
+}
+```
+
+Build and run:
+```sh
+$ $WASI_SDK_PATH/bin/clang++ -mcpu=lime1 -O3 hello.cpp -o hello.wasm
+$ $WASI_SDK_PATH/bin/clang   -mcpu=lime1 -O3 hello.c   -o hello.wasm
+
+$ wasm3 hello.wasm
+Hello, world!
+```
+
+`-mcpu=lime1` selects the [Lime1](https://github.com/WebAssembly/tool-conventions/blob/main/Lime.md#lime1)
+feature set - bulk-memory-opt, call-indirect-overlong, extended-const, multivalue,
+mutable-globals, nontrapping-fptoint and sign-ext. It is what the modules under
+`test/wasi` are built with: everything in it is cheap for an interpreter to support, and
+Wasm3 implements all of it. Without `-mcpu`, Clang targets the 2017 MVP and gives up
+those instructions; with a richer `-mcpu`, it will emit SIMD, which Wasm3 does not have.
+
+Clang runs `wasm-opt` on the result whenever it can find one on `PATH`, so a Binaryen
+older than the features being compiled will fail the link with validation errors. Either
+install a current one or pass `--no-wasm-opt`.
+
+Useful `clang` options:
+
+- **-nostdlib** Do not use the standard system startup files or libraries when linking
+
+- **-Wl,--no-entry** Do not output any entry point
+
+- **-Wl,--export=\<value\>** Force a symbol to be exported, e.g. **-Wl,--export=foo** to export foo function
+
+- **-Wl,--export-all** Export all symbols (normally combined with --no-gc-sections)
+
+- **-Wl,--initial-memory=\<value\>** Initial size of the linear memory, which must be a multiple of 65536
+
+- **-Wl,--max-memory=\<value\>** Maximum size of the linear memory, which must be a multiple of 65536
+
+- **-z stack-size=\<value\>** The auxiliary stack size, which is an area of linear memory, and must be smaller than initial memory size.
+
+- **-Wl,--strip-all** Strip all symbols
+
+- **-Wl,--shared-memory** Use shared linear memory
+
+- **-Wl,--allow-undefined** Allow undefined symbols in linked binary
+
+- **-Wl,--allow-undefined-file=\<value\>** Allow symbols listed in \<file\> to be undefined in linked binary
+
+- **-pthread** Support POSIX threads in generated code
+
+Limitations:
+- `setjmp/longjmp` and `C++ exceptions` are not available
+- no support for `threads` and `atomics`
+- no support for `dynamic libraries`
+
+### Grain WASI app
+
+Create `hello.gr`:
+```
+print("Hello, world!")
+```
+
+Build and run:
+```sh
+$ grain compile hello.gr -o hello.wasm
+
+$ wasm3 hello.wasm
+Hello, world!
+```
+
+### WAT WASI app
+
+Create `hello.wat`:
+```wat
+(module
+    ;; wasi_snapshot_preview1!fd_write(file_descriptor, *iovs, iovs_len, nwritten) -> status_code
+    (import "wasi_snapshot_preview1" "fd_write" (func $fd_write (param i32 i32 i32 i32) (result i32)))
+
+    (memory 1)
+    (export "memory" (memory 0))
+
+    ;; Put a message to linear memory at offset 32
+    (data (i32.const 32) "Hello, world!\n")
+
+    (func $main (export "_start")
+        ;; Create a new io vector at address 0x4
+        (i32.store (i32.const 4) (i32.const 32))  ;; iov.iov_base - pointer to the start of the message
+        (i32.store (i32.const 8) (i32.const 14))  ;; iov.iov_len  - length of the message
+
+        (call $fd_write
+            (i32.const 1)  ;; file_descriptor - 1 for stdout
+            (i32.const 4)  ;; *iovs           - pointer to the io vector
+            (i32.const 1)  ;; iovs_len        - count of items in io vector
+            (i32.const 20) ;; nwritten        - where to store the number of bytes written
+        )
+        drop ;; discard the WASI status code
+    )
+)
+```
+
+
+Build and run:
+```sh
+$ wat2wasm hello.wat -o hello.wasm
+
+$ wasm3 hello.wasm    
+Hello, world!
+```
+
+### WAT library
+
+Create `swap.wat`:
+```wat
+(module
+  (func (export "swap") (param i32 i32) (result i32 i32)
+    (local.get 1)
+    (local.get 0)
+  )
+)
+```
+
+Build and run:
+```sh
+$ wat2wasm swap.wat -o swap.wasm
+
+$ wasm3 --repl swap.wasm
+wasm3> :invoke swap 123 456
+Result: 456:i32, 123:i32
+```
+
+# Tracing
+
+Drag'n'drop any of the WASI apps to [`WebAssembly.sh`](https://webassembly.sh/) and run:
+```sh
+$ wasm3-strace /tmp/hello.wasm
+```
+
+The execution trace will be produced:
+```js
+_start () {
+  __wasilibc_init_preopen () {
+    malloc (i32: 16) {
+      dlmalloc (i32: 16) {
+        sbrk (i32: 0) {
+        } = 131072
+        sbrk (i32: 65536) {
+```
+<details>
+  <summary>Click to expand!</summary>
+
+```js
+        } = 131072
+      } = 131088
+    } = 131088
+    calloc (i32: 24, i32: 0) {
+      dlmalloc (i32: 96) {
+      } = 131120
+      memset (i32: 131120, i32: 65504, i32: 0) {
+      } = 131120
+    } = 131120
+    po_map_assertvalid (i32: 131088) {
+    }
+    po_map_assertvalid (i32: 131088) {
+    }
+  }
+  wasi_unstable!fd_prestat_get(3, 65528) { <native> } = 0
+  malloc (i32: 2) {
+    dlmalloc (i32: 2) {
+    } = 131232
+  } = 131232
+  wasi_unstable!fd_prestat_dir_name(3, 131232, 1) { <native> } = 0
+  __wasilibc_register_preopened_fd (i32: 3, i32: 131120) {
+    po_map_assertvalid (i32: 131088) {
+    }
+    po_map_assertvalid (i32: 131088) {
+    }
+    strdup (i32: 131232) {
+      strlen (i32: 131232) {
+      } = 1
+      malloc (i32: 2) {
+        dlmalloc (i32: 2) {
+        } = 131248
+      } = 131248
+      memcpy (i32: 131248, i32: 131233, i32: 131232) {
+      } = 131248
+    } = 131248
+    wasi_unstable!fd_fdstat_get(3, 65496) { <native> } = 0
+    po_map_assertvalid (i32: 131088) {
+    }
+    po_map_assertvalid (i32: 131088) {
+    }
+  } = 0
+  free (i32: 131232) {
+    dlfree (i32: 131232) {
+    }
+  }
+  wasi_unstable!fd_prestat_get(4, 65528) { <native> } = 0
+  malloc (i32: 2) {
+    dlmalloc (i32: 2) {
+    } = 131232
+  } = 131232
+  wasi_unstable!fd_prestat_dir_name(4, 131232, 1) { <native> } = 0
+  __wasilibc_register_preopened_fd (i32: 4, i32: 131120) {
+    po_map_assertvalid (i32: 131088) {
+    }
+    po_map_assertvalid (i32: 131088) {
+    }
+    strdup (i32: 131232) {
+      strlen (i32: 131232) {
+      } = 1
+      malloc (i32: 2) {
+        dlmalloc (i32: 2) {
+        } = 131264
+      } = 131264
+      memcpy (i32: 131264, i32: 131233, i32: 131232) {
+      } = 131264
+    } = 131264
+    wasi_unstable!fd_fdstat_get(4, 65496) { <native> } = 0
+    po_map_assertvalid (i32: 131088) {
+    }
+    po_map_assertvalid (i32: 131088) {
+    }
+  } = 0
+  free (i32: 131232) {
+    dlfree (i32: 131232) {
+    }
+  }
+  wasi_unstable!fd_prestat_get(5, 65528) { <native> } = 8
+  __wasm_call_ctors () {
+  }
+  __original_main () {
+    printf (i32: 65536, i32: 0) {
+      vfprintf (i32: 69512, i32: 0, i32: 65536) {
+        printf_core (i32: 0, i32: -1, i32: 65536, i32: -16, i32: 65480) {
+        } = 0
+        __towrite (i32: 69512) {
+        } = 0
+        printf_core (i32: 69512, i32: 8, i32: 65536, i32: -1, i32: 65480) {
+          __fwritex (i32: 65536, i32: 0, i32: 7) {
+            memcpy (i32: 68472, i32: 0, i32: 65536) {
+            } = 68472
+          } = 7
+          __fwritex (i32: 65543, i32: 0, i32: 0) {
+            memcpy (i32: 68479, i32: 0, i32: 65543) {
+            } = 68479
+          } = 0
+          pop_arg (i32: 64456, i32: 0, i32: 9) {
+          }
+          strnlen (i32: 65548, i32: 0) {
+            memchr (i32: 65548, i32: 4, i32: 0) {
+            } = 65553
+          } = 5
+          __fwritex (i32: 67222, i32: 65553, i32: 0) {
+            memcpy (i32: 68479, i32: 0, i32: 67222) {
+            } = 68479
+          } = 0
+          __fwritex (i32: 65548, i32: 65553, i32: 5) {
+            memcpy (i32: 68479, i32: 0, i32: 65548) {
+            } = 68479
+          } = 5
+          __fwritex (i32: 65545, i32: 0, i32: 2) {
+            __stdout_write (i32: 69512, i32: 0, i32: 65545) {
+              __isatty (i32: 1) {
+                wasi_unstable!fd_fdstat_get(1, 64376) { <native> } = 0
+              } = 1
+              __stdio_write (i32: 69512, i32: 64368, i32: 65545) {
+                writev (i32: 1, i32: -16, i32: 64384) {
+Hello, world!
+                  wasi_unstable!fd_write(1, 64384, 2, 64380) { <native> } = 0
+                } = 14
+              } = 2
+            } = 2
+            memcpy (i32: 68472, i32: -1, i32: 65547) {
+            } = 68472
+          } = 2
+        } = 14
+      } = 14
+    } = 14
+  } = 0
+  __prepare_for_exit () {
+    dummy () {
+    }
+    __stdio_exit () {
+      __ofl_lock () {
+      } = 69504
+    }
+  }
+}
+```
+</details>
+
+# Gas Metering
+
+Wasm3's public API counts exact integer gas units, each a ten-thousandth of a
+gas (`M3_GAS_UNITS_PER_GAS = 10000`). The former `m3_SetGasLimit`,
+`m3_GetGasLimit`, and `m3_GetGasUsed` APIs have been removed. Migrate to
+`m3_SetResourceLimit(runtime, c_m3Limit_GasUnits, units)`,
+`m3_GetResourceLimit`, and `m3_GetResourceUsage`; convert whole gas to units
+before setting a budget. Set it before compiling or running functions. Setting
+a gas limit re-arms the budget and resets usage. Limits above `INT64_MAX`
+saturate, and the getter reports that effective limit. Usage can exceed the
+limit by the cost of the last charged segment.
+
+Any `.wasm` module can be run under a fixed gas budget.
+`--gas-meter` reports what a run costs, and `--gas-limit` sets the budget
+it is allowed to spend:
+
+```sh
+$ wasm3 --gas-meter --func fib test/lang/fib32.wasm 24
+Gas used: 8935.3961
+Result: 46368
+
+$ wasm3 --gas-limit 100 --func fib test/lang/fib32.wasm 24
+Gas used: 100.0183
+Error: [trap] out of gas
+```
+
+> [!NOTE]
+> Enabling `Gas Metering` costs about 10% of throughput.
+> Across the `test/wasi` benchmarks a metered run measures 0.91x an unmetered one.
+
+Instruction costs come from the table
+[ewasm's metering design](https://github.com/ewasm/design/blob/master/metering.md)
+is written against, whose unit is a ten-thousandth of a gas - hence the four
+decimal places.
+
+# Suspendable execution and snapshots
+
+See [Snapshots](./Snapshots.md)
+
+# Deterministic execution
+
+`d_m3DeterministicProfile` builds an interpreter on which the same module, fed the
+same input, produces the same run wherever and whenever it is run.
+
+It is a build option rather than a runtime flag because that is what a profile is.
+The [profiles proposal](https://github.com/WebAssembly/profiles) defines one as a
+subset of the language that an ecosystem picks once, for all of its modules - not
+something a module or a call turns on - and names the deterministic profile as the
+marker set `{N,T}`: the constructs whose behaviour is nondeterministic, and threading.
+
+```sh
+cmake -DCMAKE_C_FLAGS=-Dd_m3DeterministicProfile=1 ..
+```
+
+A build that has it says so in its `--version` banner.
+
+## What the profile covers
+
+**N.** The one rule the proposal spells out is that a NaN result is normalized to the
+canonical NaN, which is `d_m3CanonicalNaN` and is turned on by this. Without it, the
+sign and payload of a NaN are the host's to choose and different architectures choose
+differently, so the same module produces different bits on x86, on ARM and on MIPS.
+`abs`, `neg` and `copysign` still carry their operand's payload through, as the spec
+defines them to. The other N-marked constructs are relaxed SIMD, which Wasm3 does not
+implement, so there is nothing to exclude.
+
+**T.** Threads and atomics, which Wasm3 does not implement either.
+
+## What Wasm3 adds
+
+The proposal is about the language and stops at the module's edge. What a module
+reads through its imports is nondeterministic in exactly the way that matters, so
+this option covers it too:
+
+- every WASI clock starts at a fixed instant and moves forward by a fixed tick on
+  each reading, and by exactly what a wait asked for;
+- `random_get` returns a stream from a fixed seed;
+- `poll_oneoff` stops waiting on anything real - a descriptor is ready at once, and a
+  sleep is the clock moving rather than time passing.
+
+Each runtime carries its own clock and its own entropy, both starting where the last
+one did, so a run is replayed by making a fresh runtime.
+
+Two limits belong alongside, and are separate because each is useful on its own:
+`--gas-limit`, so that a runaway module stops after the same amount of work
+everywhere, and `--max-memory` (`c_m3Limit_MemoryBytes`), so that `memory.grow` fails at the same point rather
+than wherever the host allocator gives out. What the guest reads through the rest of
+WASI - files, arguments, the environment - is input, and reproducing a run means
+supplying it again.
+
+# Resource caps
+
+Limits apply to totals across every module in a runtime. Imported memories and
+tables count once. Usage is tracked even without a limit, and zero means unlimited for
+allocation caps.
+
+| CLI option | API key | Unit |
+|---|---|---|
+| `--max-memory 16M` | `c_m3Limit_MemoryBytes` | Allocated linear memory bytes |
+| `--max-table-elements 10000` | `c_m3Limit_TableElements` | Table elements |
+| `--max-continuations 256` | `c_m3Limit_Continuations` | Concurrent active continuation stacks |
+
+Memory sizes accept binary `K`, `M`, and `G` suffixes, case-insensitively. The
+other caps take plain integers. Add table and continuation caps alongside the
+deterministic profile when those resources need reproducible ceilings.
+
+`m3_SetResourceLimit` refuses allocation limits below current usage with
+`m3Err_resourceLimitBelowUsage`. Unsupported resources return
+`m3Err_resourceLimitNotSupported`, including gas or continuations compiled out
+of the build. Both getters return zero for unsupported or unknown keys; setting
+an unknown key returns `m3Err_unknownResourceLimit`.
+
+Over-budget `memory.grow` and `table.grow` return -1 without changing the object.
+Instantiation fails with `m3Err_memoryLimitExceeded` or `m3Err_tableLimitExceeded`;
+allocations made before a failed load remain owned and counted by the runtime.
+In `--spec-repl`, the spectest module uses 64 KiB and 10 table elements.
+
+`cont.new` traps with `m3Err_continuationLimitExceeded` when the active-stack
+cap is reached. Completion or a trap recycles the stack, so sequential
+create/resume loops fit a cap of one. Binding and suspension transfer the
+existing stack without consuming another slot. Consumed reference records stay
+allocated until runtime teardown; this cap bounds stacks, not record storage.
+Continuation limits saturate at `UINT32_MAX`.
+
+The internal MCU `memoryLimit` clamp still limits backing bytes while allowing
+the page count to grow. `c_m3Limit_MemoryBytes` instead refuses allocation or
+growth beyond a runtime total, counting the bytes left by the clamp. Guarded
+memory counts committed bytes, not reserved address space.
+
+# Exceptions from the host
+
+A tag is the identity of an exception: `catch $t` catches what was thrown with `$t`,
+and `catch_all` catches everything. The host reaches tags three ways:
+
+| Call | Gives |
+|---|---|
+| `m3_FindTag(module, "name")` | a tag the module exports |
+| `m3_NewTag(runtime, &tag, "v(iF)")` | a tag of the host's own, payload typed as in `m3_LinkRawFunction` signatures |
+| `m3_LinkTag(module, "env", "name", tag)` | satisfies a tag import with one of the above; the types must match |
+
+`m3_GetTagArgCount` and `m3_GetTagArgType` read a tag's payload types.
+
+A raw host function throws by returning what `m3_ThrowException` returns - or through
+`m3ApiThrow`, which does the same:
+
+```c
+m3ApiRawFunction(parse_int)
+{
+    m3ApiReturnType (int32_t)
+    m3ApiGetArg     (int32_t, value)
+
+    IM3Tag      tag    = (IM3Tag)_ctx->userdata;   // (tag $bad_input (param i32))
+    const void* args[] = { &value };
+
+    if (value < 0) {
+        m3ApiThrow(tag, 1, args);
+    }
+    m3ApiReturn(value);
+}
+```
+
+The exception unwinds through the guest like one thrown by `throw`. When nothing
+catches it, or anything else the guest threw, the call returns
+`m3Err_trapUncaughtException`, and the runtime keeps a copy of the exception until
+the next call or resume ends:
+
+```c
+if (m3_Call(f, 0, NULL) == m3Err_trapUncaughtException &&
+    m3_GetExceptionTag(runtime) == tag) {
+    int32_t     value;
+    const void* outs[] = { &value };
+    m3_GetExceptionArgs(runtime, 1, outs);
+}
+```
+
+A tag made by `m3_NewTag` and linked to no import is one no module can name, so the
+guest catches what is thrown with it through `catch_all` alone, and `throw_ref` hands
+it back out unchanged - which is how a host can carry its own errors through Wasm
+frames and recognise them on the far side. Code refers to a tag as whatever it
+resolved to when it was compiled, so link tags before calling anything that throws or
+catches them. A snapshot refuses a live exception whose tag the module cannot name,
+such as a host tag linked to none of its imports.
+
+# Other resources
+
+- [WebAssembly by examples](https://wasmbyexample.dev/home.en-us.html) by Aaron Turner
+- [Understanding the text format](https://developer.mozilla.org/en-US/docs/WebAssembly/Guides/Understanding_the_text_format) on MDN

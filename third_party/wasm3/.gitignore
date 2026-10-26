@@ -1,0 +1,16 @@
+/build*/
+/source-*/
+/.toolchains
+test/.spec-*
+test/.wast-*
+test/*.log
+test/tailcall/*.S
+test/fuzz/corpus/*
+node_modules/
+__pycache__/
+.project
+.cproject
+.settings
+.vscode
+.DS_Store
+*zig-*/

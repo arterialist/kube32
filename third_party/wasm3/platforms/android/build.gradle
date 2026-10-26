@@ -1,0 +1,6 @@
+// Top-level build file where you can add configuration options common to all sub-projects/modules.
+// Repositories live in settings.gradle; application dependencies in the module build files.
+
+plugins {
+    id 'com.android.application' version '9.4.0' apply false
+}

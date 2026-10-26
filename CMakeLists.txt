@@ -44,6 +44,8 @@ else()
             -Wpedantic
             -Werror=return-type
             -Wno-unused-parameter
+            -Wno-c99-extensions
+            -Wno-nested-anon-types
             -pthread
         )
     endif()
@@ -64,9 +66,33 @@ else()
     # Core Include Directories
     include_directories(
         ${CMAKE_CURRENT_SOURCE_DIR}/include
+        ${CMAKE_CURRENT_SOURCE_DIR}/third_party/wasm3/source
     )
 
-    # Core Library: OSAL, Memory Architecture, Storage Engine, API Server, Scheduler
+    # Wasm3 Embedded WebAssembly Runtime Engine
+    set(WASM3_SRCS
+        third_party/wasm3/source/m3_api_libc.c
+        third_party/wasm3/source/m3_api_tracer.c
+        third_party/wasm3/source/m3_bind.c
+        third_party/wasm3/source/m3_code.c
+        third_party/wasm3/source/m3_compile.c
+        third_party/wasm3/source/m3_core.c
+        third_party/wasm3/source/m3_deterministic.c
+        third_party/wasm3/source/m3_env.c
+        third_party/wasm3/source/m3_exec.c
+        third_party/wasm3/source/m3_function.c
+        third_party/wasm3/source/m3_info.c
+        third_party/wasm3/source/m3_module.c
+        third_party/wasm3/source/m3_parse.c
+        third_party/wasm3/source/m3_snapshot.c
+        third_party/wasm3/source/m3_validate.c
+        third_party/wasm3/source/m3_xxh64.c
+    )
+    add_library(wasm3 STATIC ${WASM3_SRCS})
+    target_include_directories(wasm3 PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/third_party/wasm3/source)
+    target_compile_definitions(wasm3 PUBLIC d_m3CodePageAlignSize=4096)
+
+    # Core Library: OSAL, Memory Architecture, Storage Engine, API Server, Scheduler, HAL, Runtime, Kubelet
     set(KUBE32_CORE_SRCS
         src/osal/thread_posix.cpp
         src/osal/mutex_posix.cpp
@@ -84,13 +110,24 @@ else()
         src/api/route_handler.cpp
         src/api/http_server.cpp
         src/scheduler/scheduler.cpp
+        src/hal/capability_firewall.cpp
+        src/hal/mock_hal.cpp
+        src/runtime/host_functions.cpp
+        src/runtime/container_lifecycle.cpp
+        src/runtime/wasm_runtime.cpp
+        src/kubelet/node_status_reporter.cpp
+        src/kubelet/kube_api_client.cpp
+        src/kubelet/kubelet.cpp
     )
 
     add_library(kube32_core STATIC
         ${KUBE32_CORE_SRCS}
     )
-    target_include_directories(kube32_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
-    target_link_libraries(kube32_core PUBLIC pthread)
+    target_include_directories(kube32_core PUBLIC
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+        ${CMAKE_CURRENT_SOURCE_DIR}/third_party/wasm3/source
+    )
+    target_link_libraries(kube32_core PUBLIC wasm3 pthread)
 
     # Simulation Binary (kube32-sim)
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/src/main_host.cpp")
@@ -161,4 +198,26 @@ else()
     target_link_libraries(test_scheduler_adversarial PRIVATE kube32_core)
     add_test(NAME test_scheduler_adversarial COMMAND test_scheduler_adversarial)
 
+    # 9. Hardware Abstraction Layer & Capability Firewall Tests (Milestone 3)
+    add_executable(test_capability_firewall
+        tests/test_capability_firewall.cpp
+    )
+    target_link_libraries(test_capability_firewall PRIVATE kube32_core)
+    add_test(NAME test_capability_firewall COMMAND test_capability_firewall)
+
+    # 10. Wasm3 Sandboxed Runtime & Trap Containment Tests (Milestone 3)
+    add_executable(test_wasm_runtime
+        tests/test_wasm_runtime.cpp
+    )
+    target_link_libraries(test_wasm_runtime PRIVATE kube32_core)
+    add_test(NAME test_wasm_runtime COMMAND test_wasm_runtime)
+
+    # 11. ESP32 Node Agent Kubelet & Reconciler Tests (Milestone 3)
+    add_executable(test_kubelet
+        tests/test_kubelet.cpp
+    )
+    target_link_libraries(test_kubelet PRIVATE kube32_core)
+    add_test(NAME test_kubelet COMMAND test_kubelet)
+
 endif()
+

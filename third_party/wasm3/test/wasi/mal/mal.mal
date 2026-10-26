@@ -1,0 +1,187 @@
+(load-file "./env.mal")
+(load-file "./core.mal")
+
+;; EVAL extends this stack trace when propagating exceptions.  If the
+;; exception reaches the REPL loop, the full trace is printed.
+(def! trace (atom ""))
+
+;; read
+(def! READ read-string)
+
+
+;; eval
+
+(def! qq-loop (fn* [elt acc]
+  (if (if (list? elt) (= (first elt) 'splice-unquote)) ; 2nd 'if' means 'and'
+    (if (= 2 (count elt))
+      (list 'concat (nth elt 1) acc)
+      (throw "splice-unquote expects 1 argument"))
+    (list 'cons (QUASIQUOTE elt) acc))))
+(def! qq-foldr (fn* [xs]
+  (if (empty? xs)
+    ()
+    (qq-loop (first xs) (qq-foldr (rest xs))))))
+(def! QUASIQUOTE (fn* [ast]
+  (cond
+    (vector? ast)            (list 'vec (qq-foldr ast))
+    (map? ast)               (list 'quote ast)
+    (symbol? ast)            (list 'quote ast)
+    (not (list? ast))        ast
+    (= (first ast) 'unquote) (if (= 2 (count ast))
+                               (nth ast 1)
+                               (throw "unquote expects 1 argument"))
+    "else"                   (qq-foldr ast))))
+
+(def! LET (fn* [env binds form]
+  (if (empty? binds)
+    (EVAL form env)
+    (if (if (< 1 (count binds)) (symbol? (first binds)))
+      (do
+        (env-set env (first binds) (EVAL (nth binds 1) env))
+        (LET env (rest (rest binds)) form))
+      (throw "invalid binds")))))
+
+(def! EVAL (fn* [ast env]
+  (do
+    (if (env-get-or-nil env 'DEBUG-EVAL)
+      (println "EVAL:" (pr-str ast (env-as-map env))))
+    (try*
+      (cond
+        (symbol? ast)
+        (env-get env ast)
+
+        (vector? ast)
+        (vec (map (fn* [exp] (EVAL exp env)) ast))
+
+        (map? ast)
+        (apply hash-map
+          (apply concat (map (fn* [k] [k (EVAL (get ast k) env)]) (keys ast))))
+
+        (list? ast)
+        (if (empty? ast)
+          ()
+          (let* [a0 (first ast)]
+            (cond
+              (= 'def! a0)
+              (if (if (= 3 (count ast)) (symbol? (nth ast 1)))
+               (let* [val (EVAL (nth ast 2) env)]
+                (do
+                  (env-set env (nth ast 1) val)
+                  val))
+               (throw "bad arguments"))
+
+              (= 'let* a0)
+              (if (if (= 3 (count ast)) (sequential? (nth ast 1)))
+                (LET (new-env env) (nth ast 1) (nth ast 2))
+                (throw "bad arguments"))
+
+              (= 'quote a0)
+              (if (= 2 (count ast))
+                (nth ast 1)
+                (throw "bad argument count"))
+
+              (= 'quasiquote a0)
+              (if (= 2 (count ast))
+                (EVAL (QUASIQUOTE (nth ast 1)) env)
+                (throw "bad argument count"))
+
+              (= 'defmacro! a0)
+              (if (if (= 3 (count ast)) (symbol? (nth ast 1)))
+                (let* [f (EVAL (nth ast 2) env)]
+                  (if (fn? f)
+                    (let* [m (defmacro! _ f)]
+                      (do
+                        (env-set env (nth ast 1) m)
+                        m))
+                    (throw "a macro must be constructed from a function")))
+                (throw "bad arguments"))
+
+              (= 'try* a0)
+              (if (= 2 (count ast))
+                (EVAL (nth ast 1) env)
+                (if (= 3 (count ast))
+                  (let* [a2 (nth ast 2)]
+                    (if (if (list? a2)
+                          (if (= 3 (count a2))
+                            (if (= 'catch* (first a2))
+                              (symbol? (nth a2 1)))))
+                      (try*
+                        (EVAL (nth ast 1) env)
+                        (catch* exc
+                          (do
+                            (reset! trace "")
+                            (EVAL (nth a2 2) (new-env env [(nth a2 1)] [exc])))))
+                      (throw "invalid catch* list")))
+                  (throw "bad argument count")))
+
+              (= 'do a0)
+              (if (<= 2 (count ast))
+                (nth (map (fn* [exp] (EVAL exp env)) (rest ast)) (- (count ast) 2))
+                (throw "bad argument count"))
+
+              (= 'if a0)
+              (if (if (<= 3 (count ast)) (<= (count ast) 4))
+                (if (EVAL (nth ast 1) env)
+                  (EVAL (nth ast 2) env)
+                  (if (= 4 (count ast))
+                    (EVAL (nth ast 3) env)))
+                (throw "bad argument count"))
+
+              (= 'fn* a0)
+              (if (if (= 3 (count ast)) (sequential? (nth ast 1)))
+                (fn* [& args] (EVAL (nth ast 2) (new-env env (nth ast 1) args)))
+                (throw "bad arguments"))
+
+              "else"
+              (let* [f    (EVAL a0 env)
+                     args (rest ast)]
+                (if (macro? f)
+                  (EVAL (apply f args) env)
+                  (if (fn? f)
+                    (apply f (map (fn* [exp] (EVAL exp env)) args))
+                    (throw "can only apply functions")))))))
+
+        "else"
+        ast)
+
+    (catch* exc
+      (do
+        (swap! trace str "\n  in mal EVAL: " ast)
+        (throw exc)))))))
+
+;; print
+(def! PRINT pr-str)
+
+;; repl
+(def! repl-env (new-env))
+(def! rep (fn* [strng]
+  (PRINT (EVAL (READ strng) repl-env))))
+
+;; core.mal: defined directly using mal
+(map (fn* [sym] (env-set repl-env sym (eval sym))) core_ns)
+(env-set repl-env 'eval (fn* [ast] (EVAL ast repl-env)))
+(env-set repl-env '*ARGV* (rest *ARGV*))
+
+;; core.mal: defined using the new language itself
+(rep (str "(def! *host-language* \"" *host-language* "-mal\")"))
+(rep "(def! not (fn* [a] (if a false true)))")
+(rep "(def! load-file (fn* (f) (eval (read-string (str \"(do \" (slurp f) \"\nnil)\")))))")
+(rep "(defmacro! cond (fn* (& xs) (if (> (count xs) 0) (list 'if (first xs) (if (> (count xs) 1) (nth xs 1) (throw \"odd number of forms to cond\")) (cons 'cond (rest (rest xs)))))))")
+
+;; repl loop
+(def! repl-loop (fn* [line]
+  (if line
+    (do
+      (if (not (= "" line))
+        (try*
+          (println (rep line))
+          (catch* exc
+            (do
+              (println "Uncaught exception:" exc @trace)
+              (reset! trace "")))))
+      (repl-loop (readline "mal-user> "))))))
+
+;; main
+(if (empty? *ARGV*)
+  (repl-loop "(println (str \"Mal [\" *host-language* \"]\"))")
+  (rep (str "(load-file \"" (first *ARGV*) "\")")))

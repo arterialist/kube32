@@ -3,6 +3,8 @@
 #include "storage/store.hpp"
 #include "scheduler/scheduler.hpp"
 #include "api/http_server.hpp"
+#include "runtime/wasm_runtime.hpp"
+#include "kubelet/kubelet.hpp"
 
 #include <csignal>
 #include <iostream>
@@ -111,6 +113,22 @@ int main(int argc, char* argv[]) {
     }
 
     std::cout << "[READY] Kube32 API Server listening on http://0.0.0.0:6443" << std::endl;
+
+    // Start Wasm Sandboxed Runtime and Node Agent (Kubelet)
+    auto wasm_runtime = kube32::runtime::create_wasm_runtime();
+    kube32::kubelet::KubeletConfig kubelet_cfg;
+    kubelet_cfg.node_name = "esp32-node-01";
+    kubelet_cfg.api_server_host = "127.0.0.1";
+    kubelet_cfg.api_server_port = 6443;
+    kubelet_cfg.node_ip = "127.0.0.1";
+    auto kubelet = std::make_unique<kube32::kubelet::Kubelet>(kubelet_cfg, *wasm_runtime);
+    if (!kubelet->start()) {
+        std::cerr << "[FATAL] Failed to start Kubelet node agent." << std::endl;
+        server.stop();
+        scheduler->stop();
+        return 1;
+    }
+    std::cout << "[INIT] ESP32 Kubelet node agent running for esp32-node-01." << std::endl;
     std::cout << "[READY] Ready for native kubectl and E2E test suite interactions." << std::endl;
 
     while (g_sim_running.load()) {
@@ -118,6 +136,7 @@ int main(int argc, char* argv[]) {
     }
 
     std::cout << "\n[SHUTDOWN] Intercepted termination signal. Stopping services..." << std::endl;
+    kubelet->stop();
     server.stop();
     scheduler->stop();
     kube32::osal::Socket::cleanup_networking();
@@ -125,3 +144,4 @@ int main(int argc, char* argv[]) {
 
     return 0;
 }
+
