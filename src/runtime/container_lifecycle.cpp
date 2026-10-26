@@ -229,8 +229,8 @@ bool ContainerLifecycleController::start() {
     status_.start_time_ms = osal::System::get_uptime_ms();
 
     osal::Thread::Config t_cfg;
-    std::string t_name = "pod_" + config_.pod_id;
-    t_cfg.name = t_name.c_str();
+    thread_name_ = "pod_" + config_.pod_id;
+    t_cfg.name = thread_name_.c_str();
 #if defined(ESP_PLATFORM)
     t_cfg.stack_size = 12288;
 #else

@@ -240,6 +240,20 @@ else()
     target_link_libraries(test_m3_challenger_4 PRIVATE kube32_core)
     add_test(NAME test_m3_challenger_4 COMMAND test_m3_challenger_4)
 
+    # 15. Milestone 3 Iteration 3 Challenger 6 Concurrency & Thread Lifecycle Suite
+    add_executable(test_m3_challenger_6
+        tests/test_m3_challenger_6.cpp
+    )
+    target_link_libraries(test_m3_challenger_6 PRIVATE kube32_core)
+    add_test(NAME test_m3_challenger_6 COMMAND test_m3_challenger_6)
+
+    # 16. Milestone 3 Iteration 3 Challenger 5 HTTP Chunked Stream Stress Suite
+    add_executable(test_chunked_stress
+        tests/test_chunked_stress.cpp
+    )
+    target_link_libraries(test_chunked_stress PRIVATE kube32_core)
+    add_test(NAME test_chunked_stress COMMAND test_chunked_stress)
+
 endif()
 
 

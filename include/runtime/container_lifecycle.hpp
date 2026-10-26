@@ -95,6 +95,7 @@ private:
     void* m3_runtime_{nullptr};
     void* m3_module_{nullptr};
 
+    std::string thread_name_;
     std::unique_ptr<osal::Thread> worker_thread_;
     std::atomic<bool> thread_detached_{false};
 

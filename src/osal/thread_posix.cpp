@@ -195,14 +195,15 @@ struct Thread::Impl {
     EntryFn entry{nullptr};
     void* arg{nullptr};
     Config config;
+    char name_buf[32] = {0};
 
     static void* posix_trampoline(void* user_ptr) {
         auto* impl = static_cast<Impl*>(user_ptr);
-        if (impl && impl->config.name) {
+        if (impl && impl->name_buf[0] != '\0') {
 #if defined(__APPLE__)
-            pthread_setname_np(impl->config.name);
+            pthread_setname_np(impl->name_buf);
 #elif defined(__linux__)
-            pthread_setname_np(pthread_self(), impl->config.name);
+            pthread_setname_np(pthread_self(), impl->name_buf);
 #endif
         }
         if (impl && impl->entry) {
@@ -247,6 +248,11 @@ bool Thread::start(EntryFn entry, void* arg, const Config& config) {
     impl_->entry = entry;
     impl_->arg = arg;
     impl_->config = config;
+    std::memset(impl_->name_buf, 0, sizeof(impl_->name_buf));
+    if (config.name) {
+        std::strncpy(impl_->name_buf, config.name, sizeof(impl_->name_buf) - 1);
+        impl_->name_buf[sizeof(impl_->name_buf) - 1] = '\0';
+    }
 
     pthread_attr_t attr;
     pthread_attr_init(&attr);
