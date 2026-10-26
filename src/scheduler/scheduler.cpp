@@ -534,6 +534,7 @@ public:
         store_.list("/registry/nodes/", node_jsons);
 
         std::set<std::string> ready_nodes;
+        std::set<std::string> existing_nodes;
         for (const auto& n_json : node_jsons) {
             osal::Thread::yield();
             models::JsonValue doc;
@@ -543,6 +544,8 @@ public:
             const models::JsonValue* meta = doc.get("metadata");
             std::string nname = meta ? meta->get_string("name", "") : "";
             if (nname.empty()) continue;
+
+            existing_nodes.insert(nname);
 
             const models::JsonValue* status = doc.get("status");
             const models::JsonValue* conds = status ? status->get("conditions") : nullptr;
@@ -580,13 +583,14 @@ public:
             bool is_daemon = labels && labels->get_string("kube32.io/daemonset", "") == "true";
             if (is_daemon) continue;
 
-            bool node_missing_or_dead = (!assigned_node.empty() && assigned_node != "<none>" && ready_nodes.count(assigned_node) == 0);
+            // Only consider a node "missing" if it was deleted from /registry/nodes/
+            bool node_deleted = (!assigned_node.empty() && assigned_node != "<none>" && existing_nodes.count(assigned_node) == 0);
 
-            if (node_missing_or_dead) {
-                // Node died or was deleted from cluster: evict and re-schedule!
+            if (node_deleted) {
+                // Node was deleted from cluster: evict and re-schedule!
                 schedule_pod(pod_name, pod_ns);
             } else if (phase == "Pending" || assigned_node.empty() || assigned_node == "<none>") {
-                // Re-evaluate pending pod
+                // Re-evaluate pending pod (e.g. evicted by NodeLifecycleController)
                 schedule_pod(pod_name, pod_ns);
             }
         }
@@ -670,9 +674,23 @@ private:
             models::JsonValue* spec = pod_doc.get_mut("spec");
             if (spec) spec->set("nodeName", models::JsonValue{models::JsonType::String, false, 0, "", {}, {}});
 
-            models::JsonValue status_val;
-            status_val.type = models::JsonType::Object;
-            status_val.set("phase", models::JsonValue{models::JsonType::String, false, 0, "Pending", {}, {}});
+            models::JsonValue* status_val = pod_doc.get_mut("status");
+            if (!status_val || !status_val->is_object()) {
+                models::JsonValue new_status;
+                new_status.type = models::JsonType::Object;
+                pod_doc.set("status", std::move(new_status));
+                status_val = pod_doc.get_mut("status");
+            }
+
+            status_val->set("phase", models::JsonValue{models::JsonType::String, false, 0, "Pending", {}, {}});
+
+            models::JsonValue* conds_arr = status_val->get_mut("conditions");
+            if (!conds_arr || !conds_arr->is_array()) {
+                models::JsonValue new_conds;
+                new_conds.type = models::JsonType::Array;
+                status_val->set("conditions", std::move(new_conds));
+                conds_arr = status_val->get_mut("conditions");
+            }
 
             models::JsonValue cond_item;
             cond_item.type = models::JsonType::Object;
@@ -682,12 +700,18 @@ private:
             cond_item.set("message", models::JsonValue{models::JsonType::String, false, 0, 
                 "0/" + std::to_string(node_jsons.size()) + " nodes are available: insufficient heap memory or peripheral resources", {}, {}});
 
-            models::JsonValue conds_arr;
-            conds_arr.type = models::JsonType::Array;
-            conds_arr.arr_val.push_back(std::move(cond_item));
-            status_val.set("conditions", std::move(conds_arr));
+            bool found_sched = false;
+            for (auto& c : conds_arr->arr_val) {
+                if (c.is_object() && c.get_string("type", "") == "PodScheduled") {
+                    c = std::move(cond_item);
+                    found_sched = true;
+                    break;
+                }
+            }
+            if (!found_sched) {
+                conds_arr->arr_val.push_back(std::move(cond_item));
+            }
 
-            pod_doc.set("status", std::move(status_val));
             in_out_pod_json = pod_doc.to_string();
             return {false, "", "0/" + std::to_string(node_jsons.size()) + " nodes available"};
         }

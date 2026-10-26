@@ -212,11 +212,19 @@ void test_node_failure_and_reconciliation() {
                              "\"allocatable\":{\"memory\":\"240Ki\"}}}";
     store->put("/registry/nodes/esp32-node-01", node1_down, true);
 
-    // Reconcile pass 1: evicts to Pending (clears nodeName)
+    // In M4: Pods remain on NotReady nodes until 30s eviction threshold triggers NodeLifecycleController eviction.
+    // Scheduler alone must NOT prematurely evict pods from living NotReady nodes.
     sched->reconcile_cluster();
     std::string check1;
     store->get("/registry/pods/default/pod-failover", check1);
-    assert(check1.find("\"phase\":\"Pending\"") != std::string::npos);
+    assert(check1.find("\"nodeName\":\"esp32-node-01\"") != std::string::npos);
+
+    // When NodeLifecycleController evicts the pod after eviction threshold:
+    // It clears nodeName and sets phase to Pending (with DisruptionTarget condition).
+    std::string evicted_pod = "{\"kind\":\"Pod\",\"metadata\":{\"name\":\"pod-failover\",\"namespace\":\"default\"},"
+                              "\"spec\":{\"nodeName\":\"\",\"containers\":[{\"name\":\"c\",\"resources\":{\"requests\":{\"memory\":\"32Ki\"}}}]},"
+                              "\"status\":{\"phase\":\"Pending\",\"conditions\":[{\"type\":\"DisruptionTarget\",\"status\":\"True\",\"reason\":\"EvictionByNodeLifecycleController\"}]}}";
+    store->put("/registry/pods/default/pod-failover", evicted_pod, true);
 
     // Reconcile pass 2: reschedules Pending pod onto node2
     sched->reconcile_cluster();

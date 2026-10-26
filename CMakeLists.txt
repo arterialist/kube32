@@ -287,6 +287,14 @@ else()
     target_link_libraries(test_mdns_discovery PRIVATE kube32_core)
     add_test(NAME test_mdns_discovery COMMAND test_mdns_discovery)
 
+    # 21. Milestone 4 Adversarial IPC, Concurrency & Wire Packet Corruption Tests
+    add_executable(test_m4_adversarial_ipc
+        tests/test_m4_adversarial_ipc.cpp
+    )
+    target_link_libraries(test_m4_adversarial_ipc PRIVATE kube32_core)
+    add_test(NAME test_m4_adversarial_ipc COMMAND test_m4_adversarial_ipc)
+
 endif()
+
 
 

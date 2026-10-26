@@ -18,13 +18,13 @@ namespace kube32::ipc {
 // =============================================================================
 // Constants & Error Codes
 // =============================================================================
-constexpr uint32_t K32C_MAGIC               = 0x4B333243; // "K32C"
+constexpr uint32_t K32C_MAGIC               = 0x4332334B; // "K32C" in wire byte order ('K', '3', '2', 'C') on little-endian
 constexpr uint8_t  K32C_VERSION             = 0x01;
 constexpr size_t   K32C_MAX_PACKET_LEN      = 250;        // ESP-NOW MTU
 constexpr size_t   K32C_HEADER_LEN          = 24;
 constexpr size_t   K32C_CRC_LEN             = 2;
 constexpr size_t   K32C_MAX_PAYLOAD_CHUNK   = K32C_MAX_PACKET_LEN - K32C_HEADER_LEN - K32C_CRC_LEN; // 224 bytes
-constexpr size_t   K32C_RING_SLOT_SIZE      = 256;
+constexpr size_t   K32C_RING_SLOT_SIZE      = 1024;
 constexpr size_t   K32C_RING_SLOT_COUNT     = 16;         // Must be power of 2
 constexpr uint32_t K32C_REASSEMBLY_TIMEOUT  = 500;        // ms
 
@@ -115,6 +115,7 @@ private:
     alignas(64) std::atomic<uint32_t> head_{0}; // Written by Producer
     alignas(64) std::atomic<uint32_t> tail_{0}; // Written by Consumer
 
+    osal::Mutex producer_mutex_;
     osal::Mutex cv_mutex_;
     osal::ConditionVariable cv_data_ready_;
 };
@@ -198,6 +199,15 @@ public:
     // Frame ingress hook (invoked by UDP or ESP-NOW receiver thread)
     void on_frame_received(const uint8_t* frame, size_t len);
 
+    struct ChannelStats {
+        std::atomic<uint64_t> frames_received{0};
+        std::atomic<uint64_t> frames_delivered{0};
+        std::atomic<uint64_t> crc_errors{0};
+        std::atomic<uint64_t> bad_magic_errors{0};
+        std::atomic<uint64_t> reassembled_msgs{0};
+    };
+    ChannelStats& stats() { return stats_; }
+
 private:
     ChannelManager();
     ~ChannelManager();
@@ -207,6 +217,7 @@ private:
     std::map<int32_t, ChannelHandle> handles_;
     std::unique_ptr<IChannelTransport> transport_;
     std::atomic<uint16_t> seq_generator_{1};
+    ChannelStats stats_;
     bool initialized_{false};
 
     // Multi-fragment reassembly state
@@ -219,7 +230,7 @@ private:
         uint32_t received_mask{0};
         uint32_t total_bytes{0};
         uint64_t last_activity_ms{0};
-        uint8_t  buffer[4096];
+        uint8_t  buffer[K32C_RING_SLOT_SIZE];
     };
     osal::Mutex reassembly_mutex_;
     std::map<uint64_t, ReassemblyEntry> reassembly_table_;

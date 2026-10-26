@@ -52,7 +52,7 @@ struct KubeletConfig {
     uint32_t memory_pressure_threshold_bytes{24576}; // 24 KiB DRAM threshold
 
     // Task & concurrency configuration
-    size_t task_stack_size{8192};
+    size_t task_stack_size{65536};
     uint32_t task_priority{5};
     int core_affinity{1}; // Core 1
 };

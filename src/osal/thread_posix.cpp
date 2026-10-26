@@ -257,10 +257,11 @@ bool Thread::start(EntryFn entry, void* arg, const Config& config) {
     pthread_attr_t attr;
     pthread_attr_init(&attr);
     if (config.stack_size > 0) {
+        // POSIX host simulation requires >= 64 KB (65536) to accommodate host TLS,
+        // C++ dynamic initialization, and AddressSanitizer/UBSan shadow redzones.
+        size_t min_stack = 65536;
 #if defined(PTHREAD_STACK_MIN)
-        size_t min_stack = static_cast<size_t>(PTHREAD_STACK_MIN);
-#else
-        size_t min_stack = 16384;
+        min_stack = std::max(min_stack, static_cast<size_t>(PTHREAD_STACK_MIN));
 #endif
         size_t actual_stack = std::max(config.stack_size, min_stack);
         pthread_attr_setstacksize(&attr, actual_stack);

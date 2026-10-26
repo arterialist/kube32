@@ -60,6 +60,27 @@ class SimulatedNode:
     def is_alive(self) -> bool:
         return self.process is not None and self.process.poll() is None
 
+    def read_stdout(self, timeout: float = 0.5) -> str:
+        if not self.process or not self.process.stdout:
+            return ""
+        import fcntl
+        fd = self.process.stdout.fileno()
+        fl = fcntl.fcntl(fd, fcntl.F_GETFL)
+        fcntl.fcntl(fd, fcntl.F_SETFL, fl | os.O_NONBLOCK)
+        chunks = []
+        end_time = time.time() + timeout
+        while time.time() < end_time:
+            try:
+                data = self.process.stdout.read()
+                if data:
+                    chunks.append(data.decode("utf-8", errors="replace"))
+            except Exception:
+                pass
+            if chunks:
+                break
+            time.sleep(0.05)
+        return "".join(chunks)
+
     def terminate(self):
         if self.process and self.is_alive():
             self.process.terminate()

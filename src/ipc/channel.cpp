@@ -69,6 +69,8 @@ size_t RingBuffer::size() const {
 bool RingBuffer::push(uint32_t sender_hash, const uint8_t* data, size_t len) {
     if (!data || len > K32C_RING_SLOT_SIZE) return false;
 
+    osal::LockGuard guard(producer_mutex_);
+
     uint32_t current_head = head_.load(std::memory_order_relaxed);
     uint32_t current_tail = tail_.load(std::memory_order_acquire);
 
@@ -287,6 +289,10 @@ void ChannelManager::shutdown() {
     }
     handles_.clear();
     VirtualChannelRoutingTable::instance().clear();
+    {
+        osal::LockGuard r_guard(reassembly_mutex_);
+        reassembly_table_.clear();
+    }
     initialized_ = false;
 }
 
@@ -425,17 +431,33 @@ int32_t ChannelManager::close(const std::string& pod_id, int32_t handle) {
 }
 
 void ChannelManager::on_frame_received(const uint8_t* frame, size_t len) {
+    stats_.frames_received.fetch_add(1, std::memory_order_relaxed);
+
     if (len < K32C_HEADER_LEN + K32C_CRC_LEN) return;
 
     const auto* hdr = reinterpret_cast<const K32CHeader*>(frame);
-    if (hdr->magic != K32C_MAGIC || hdr->version != K32C_VERSION) return;
+    if (hdr->magic != K32C_MAGIC || hdr->version != K32C_VERSION) {
+        stats_.bad_magic_errors.fetch_add(1, std::memory_order_relaxed);
+        std::cout << "[IPC-RX] Dropped frame: invalid magic 0x" << std::hex << hdr->magic
+                  << " (expected 0x" << K32C_MAGIC << ")" << std::dec << std::endl << std::flush;
+        return;
+    }
     if (hdr->payload_len > K32C_MAX_PAYLOAD_CHUNK || (K32C_HEADER_LEN + hdr->payload_len + K32C_CRC_LEN) > len) return;
 
     // CRC Verification
     uint16_t expected_crc = crc16_ccitt(frame, K32C_HEADER_LEN + hdr->payload_len);
     uint16_t packet_crc = 0;
     std::memcpy(&packet_crc, frame + K32C_HEADER_LEN + hdr->payload_len, 2);
-    if (expected_crc != packet_crc) return; // Drop corrupted frame
+    if (expected_crc != packet_crc) {
+        stats_.crc_errors.fetch_add(1, std::memory_order_relaxed);
+        std::cout << "[IPC-RX] Dropped frame: CRC mismatch (expected=0x" << std::hex << expected_crc
+                  << " got=0x" << packet_crc << std::dec << ")" << std::endl << std::flush;
+        return; // Drop corrupted frame
+    }
+
+    std::cout << "[IPC-RX] Accepted valid K32C frame: chan=0x" << std::hex << hdr->channel_hash
+              << " sender=0x" << hdr->sender_hash
+              << " len=" << std::dec << hdr->payload_len << std::endl << std::flush;
 
     // Route lookup
     ChannelRoute route;
@@ -444,13 +466,53 @@ void ChannelManager::on_frame_received(const uint8_t* frame, size_t len) {
 
     // Single-frame message fast path
     if (hdr->frag_count <= 1) {
-        route.local_ring->push(hdr->sender_hash, frame + K32C_HEADER_LEN, hdr->payload_len);
+        if (route.local_ring->push(hdr->sender_hash, frame + K32C_HEADER_LEN, hdr->payload_len)) {
+            stats_.frames_delivered.fetch_add(1, std::memory_order_relaxed);
+        }
         return;
     }
 
-    // Multi-fragment reassembly
+    // Multi-fragment reassembly bounds check (Fix Item 4)
+    if (hdr->frag_count == 0 || hdr->frag_count > 32 ||
+        hdr->frag_index >= hdr->frag_count || hdr->frag_index >= 32) {
+        return;
+    }
+
+    size_t offset = static_cast<size_t>(hdr->frag_index) * K32C_MAX_PAYLOAD_CHUNK;
+    if (offset + hdr->payload_len > K32C_RING_SLOT_SIZE) {
+        return;
+    }
+
     uint64_t reassembly_key = (static_cast<uint64_t>(hdr->channel_hash) << 32) | hdr->seq_num;
+    uint64_t now_ms = osal::System::get_uptime_ms();
+
     osal::LockGuard guard(reassembly_mutex_);
+
+    // Prune stale entries (Fix Item 5: 500ms timeout reaper)
+    for (auto it = reassembly_table_.begin(); it != reassembly_table_.end(); ) {
+        if (now_ms >= it->second.last_activity_ms &&
+            (now_ms - it->second.last_activity_ms) > K32C_REASSEMBLY_TIMEOUT) {
+            it = reassembly_table_.erase(it);
+        } else {
+            ++it;
+        }
+    }
+
+    // Capacity cap (Fix Item 5: max 8 entries)
+    constexpr size_t MAX_REASSEMBLY_ENTRIES = 8;
+    if (reassembly_table_.find(reassembly_key) == reassembly_table_.end()) {
+        if (reassembly_table_.size() >= MAX_REASSEMBLY_ENTRIES) {
+            auto oldest_it = reassembly_table_.begin();
+            for (auto it = reassembly_table_.begin(); it != reassembly_table_.end(); ++it) {
+                if (it->second.last_activity_ms < oldest_it->second.last_activity_ms) {
+                    oldest_it = it;
+                }
+            }
+            if (oldest_it != reassembly_table_.end()) {
+                reassembly_table_.erase(oldest_it);
+            }
+        }
+    }
 
     auto& entry = reassembly_table_[reassembly_key];
     if (entry.total_frags == 0) {
@@ -463,11 +525,10 @@ void ChannelManager::on_frame_received(const uint8_t* frame, size_t len) {
         entry.total_bytes = 0;
     }
 
-    entry.last_activity_ms = osal::System::get_uptime_ms();
+    entry.last_activity_ms = now_ms;
     if ((entry.received_mask & (1U << hdr->frag_index)) == 0) {
         entry.received_mask |= (1U << hdr->frag_index);
         entry.received_frags++;
-        size_t offset = hdr->frag_index * K32C_MAX_PAYLOAD_CHUNK;
         if (offset + hdr->payload_len <= sizeof(entry.buffer)) {
             std::memcpy(entry.buffer + offset, frame + K32C_HEADER_LEN, hdr->payload_len);
             entry.total_bytes += hdr->payload_len;
@@ -475,7 +536,10 @@ void ChannelManager::on_frame_received(const uint8_t* frame, size_t len) {
     }
 
     if (entry.received_frags == entry.total_frags) {
-        route.local_ring->push(entry.sender_hash, entry.buffer, entry.total_bytes);
+        if (route.local_ring->push(entry.sender_hash, entry.buffer, entry.total_bytes)) {
+            stats_.frames_delivered.fetch_add(1, std::memory_order_relaxed);
+            stats_.reassembled_msgs.fetch_add(1, std::memory_order_relaxed);
+        }
         reassembly_table_.erase(reassembly_key);
     }
 }
