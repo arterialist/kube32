@@ -165,7 +165,28 @@ bool Kubelet::deploy_and_start_pod(const models::KubePod& pod, const std::string
 
     // Register capabilities with firewall
     std::string firewall_err;
-    hal::CapabilityFirewall::instance().register_pod(pod_key, manifest_json, firewall_err);
+    if (!hal::CapabilityFirewall::instance().register_pod(pod_key, manifest_json, firewall_err)) {
+        rec.execution_phase = PodExecutionPhase::Failed;
+        rec.last_error_message = "Capability Admission Rejected: " + firewall_err;
+        active_pods_[pod_key] = rec;
+
+        std::string status_patch;
+        status_patch.reserve(512);
+        status_patch += "{\"status\":{";
+        status_patch += "\"phase\":\"Failed\",";
+        status_patch += "\"reason\":\"CapabilityAdmissionFailed\",";
+        status_patch += "\"message\":\"Capability Admission Rejected: " + firewall_err + "\",";
+        status_patch += "\"containerStatuses\":[{";
+        status_patch += "\"name\":\"" + pod.name + "\",";
+        status_patch += "\"ready\":false,";
+        status_patch += "\"restartCount\":0,";
+        status_patch += "\"state\":{\"terminated\":{\"exitCode\":1,\"reason\":\"CapabilityAdmissionFailed\"}}";
+        status_patch += "}]";
+        status_patch += "}}";
+
+        api_client_->patch_pod_status(pod.namespace_name, pod.name, status_patch);
+        return false;
+    }
 
     // Deploy and start runtime
     runtime_.deploy_workload(pod_key, s_default_wasm_binary, sizeof(s_default_wasm_binary), rec.memory_limit_bytes);
@@ -202,23 +223,40 @@ bool Kubelet::terminate_pod(const std::string& pod_key) {
     return true;
 }
 
-void Kubelet::handle_pod_failure(LocalPodRecord& rec, const std::string& exit_msg) {
+void Kubelet::handle_pod_failure(LocalPodRecord& rec, const runtime::ContainerStatus& cs) {
     rec.execution_phase = PodExecutionPhase::Failed;
-    rec.last_error_message = exit_msg;
-    rec.restart_count++;
+    rec.last_error_message = !cs.exit_message.empty() ? cs.exit_message : cs.termination_reason;
+    if (cs.restart_count > static_cast<int>(rec.restart_count)) {
+        rec.restart_count = static_cast<uint32_t>(cs.restart_count);
+    } else {
+        rec.restart_count++;
+    }
+
+    int32_t exit_code = (cs.exit_code != 0) ? cs.exit_code : 137;
+    std::string reason = !cs.termination_reason.empty() ? cs.termination_reason : "RuntimeTrap";
 
     std::string status_patch;
+    status_patch.reserve(512);
     status_patch += "{\"status\":{";
     status_patch += "\"phase\":\"Failed\",";
     status_patch += "\"containerStatuses\":[{";
     status_patch += "\"name\":\"" + rec.name + "\",";
     status_patch += "\"ready\":false,";
     status_patch += "\"restartCount\":" + std::to_string(rec.restart_count) + ",";
-    status_patch += "\"state\":{\"terminated\":{\"exitCode\":137,\"reason\":\"OOMKilled\"}}";
+    status_patch += "\"state\":{\"terminated\":{\"exitCode\":" + std::to_string(exit_code) + ",\"reason\":\"" + reason + "\"}}";
     status_patch += "}]";
     status_patch += "}}";
 
     api_client_->patch_pod_status(rec.namespace_name, rec.name, status_patch);
+}
+
+void Kubelet::handle_pod_failure(LocalPodRecord& rec, const std::string& exit_msg, int32_t exit_code, const std::string& reason) {
+    runtime::ContainerStatus cs;
+    cs.phase = runtime::ContainerPhase::Failed;
+    cs.exit_message = exit_msg;
+    cs.exit_code = exit_code;
+    cs.termination_reason = reason;
+    handle_pod_failure(rec, cs);
 }
 
 void Kubelet::monitor_and_report_pod_statuses() {
@@ -231,7 +269,7 @@ void Kubelet::monitor_and_report_pod_statuses() {
 
         runtime::ContainerStatus cs = runtime_.get_status(pod_key);
         if (cs.phase == runtime::ContainerPhase::Failed && rec.execution_phase != PodExecutionPhase::Failed) {
-            handle_pod_failure(rec, cs.exit_message);
+            handle_pod_failure(rec, cs);
         }
     }
 }

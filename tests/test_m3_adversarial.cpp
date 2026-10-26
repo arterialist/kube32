@@ -351,6 +351,54 @@ void challenge_4_crashloop_backoff_resilience() {
               << " repeated failures with incrementing restartCount without crashing host." << std::endl;
 }
 
+// =============================================================================
+// CHALLENGE 5: Uncooperative Guest Wasm Termination Stress Test
+// =============================================================================
+void challenge_5_uncooperative_guest_wasm_termination() {
+    std::cout << "\n=== [CHALLENGE 5] Uncooperative Guest Wasm Termination Stress Test ===" << std::endl;
+
+    // Bytecode: app_main() -> (loop (br 0))
+    static const uint8_t wasm_infinite_loop[] = {
+        0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00,
+        0x01, 0x05, 0x01, 0x60, 0x00, 0x01, 0x7f,
+        0x03, 0x02, 0x01, 0x00,
+        0x07, 0x0c, 0x01, 0x08, 'a','p','p','_','m','a','i','n', 0x00, 0x00,
+        0x0a, 0x0b, 0x01, 0x09, 0x00, 0x03, 0x40, 0x0c, 0x00, 0x0b, 0x41, 0x00, 0x0b
+    };
+
+    ContainerConfig cfg;
+    cfg.pod_id = "runaway-guest-pod";
+    cfg.container_name = "runaway-worker";
+    cfg.memory_limit_bytes = 64 * 1024;
+    cfg.restart_policy = RestartPolicy::Never;
+
+    ContainerLifecycleController controller(cfg);
+    assert(controller.deploy(wasm_infinite_loop, sizeof(wasm_infinite_loop)));
+    assert(controller.start());
+
+    kube32::osal::Thread::sleep_ms(40);
+    assert(controller.is_running());
+
+    auto start_t = std::chrono::steady_clock::now();
+    bool stopped = controller.stop(150); // Grace period: 150ms
+    auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - start_t).count();
+
+    std::cout << "[CHALLENGE 5] stop(150ms) returned stopped=" << stopped
+              << " in " << elapsed_ms << " ms" << std::endl;
+
+    assert(stopped);
+    assert(elapsed_ms < 500); // Must NOT block indefinitely
+
+    ContainerStatus s = controller.get_status();
+    assert(s.phase == ContainerPhase::Failed);
+    assert(s.exit_code == 137);
+    assert(s.termination_reason == "ExecutionTimeout");
+    assert(!controller.is_running());
+
+    std::cout << "[PASS] CHALLENGE 5: Uncooperative guest loop terminated cleanly without blocking host." << std::endl;
+}
+
 int main() {
     std::cout << "================================================================" << std::endl;
     std::cout << " Kube32 Milestone 3 Empirical Adversarial Stress Harness        " << std::endl;
@@ -361,9 +409,10 @@ int main() {
     challenge_2_memory_limits_and_allocation_quotas();
     challenge_3_thread_lifecycle_and_starvation();
     challenge_4_crashloop_backoff_resilience();
+    challenge_5_uncooperative_guest_wasm_termination();
 
     std::cout << "\n================================================================" << std::endl;
-    std::cout << " ALL 4 EMPIRICAL ADVERSARIAL CHALLENGES COMPLETED SUCCESSFULLY! " << std::endl;
+    std::cout << " ALL 5 EMPIRICAL ADVERSARIAL CHALLENGES COMPLETED SUCCESSFULLY! " << std::endl;
     std::cout << "================================================================" << std::endl;
     return 0;
 }

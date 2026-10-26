@@ -27,6 +27,13 @@ ContainerLifecycleController::~ContainerLifecycleController() {
 }
 
 void ContainerLifecycleController::cleanup_runtime() {
+    if (thread_detached_.load()) {
+        // Runaway guest thread was detached; preserve runtime allocation to prevent Use-After-Free
+        m3_runtime_ = nullptr;
+        m3_module_ = nullptr;
+        m3_env_ = nullptr;
+        return;
+    }
     if (m3_runtime_) {
         m3_FreeRuntime(reinterpret_cast<IM3Runtime>(m3_runtime_));
         m3_runtime_ = nullptr;
@@ -70,6 +77,11 @@ bool ContainerLifecycleController::deploy(const uint8_t* wasm_bytes, size_t len)
     if (config_.memory_limit_bytes > 0) {
         m3_SetResourceLimit(reinterpret_cast<IM3Runtime>(m3_runtime_), c_m3Limit_MemoryBytes, static_cast<uint64_t>(config_.memory_limit_bytes));
     }
+
+#if d_m3HasGasMetering
+    // Arm execution budget so loops can be asynchronously aborted via gas trap
+    m3_SetResourceLimit(reinterpret_cast<IM3Runtime>(m3_runtime_), c_m3Limit_GasUnits, 0x7FFFFFFFFFFFFFFFULL);
+#endif
 
     IM3Module module = nullptr;
     M3Result r = m3_ParseModule(reinterpret_cast<IM3Environment>(m3_env_), &module, wasm_bytecode_.data(), wasm_bytecode_.size());
@@ -153,6 +165,9 @@ void ContainerLifecycleController::worker_thread_main() {
             } else if (r == m3Err_trapStackOverflow) {
                 exit_code = 137;
                 reason = "StackOverflow";
+            } else if (r == m3Err_trapOutOfGas) {
+                exit_code = 137;
+                reason = "ExecutionTimeout";
             }
 
             on_trap_caught(r, exit_code, reason);
@@ -196,6 +211,7 @@ bool ContainerLifecycleController::start() {
 
     stop_requested_.store(false);
     pause_requested_.store(false);
+    thread_detached_.store(false);
     status_.phase = ContainerPhase::Running;
     status_.ready = true;
     status_.start_time_ms = osal::System::get_uptime_ms();
@@ -236,13 +252,45 @@ bool ContainerLifecycleController::stop(uint32_t grace_period_ms) {
         while (worker_thread_->is_joinable() && (osal::System::get_uptime_ms() - start_t < grace_period_ms) && status_.phase == ContainerPhase::Running) {
             osal::Thread::sleep_ms(20);
         }
-        worker_thread_->join();
-        worker_thread_.reset();
+
+        if (worker_thread_->is_joinable() && status_.phase == ContainerPhase::Running) {
+            // Grace period expired: uncooperative guest loop detected
+#if d_m3HasGasMetering
+            if (m3_runtime_) {
+                reinterpret_cast<IM3Runtime>(m3_runtime_)->gasRemaining = -1;
+            }
+            uint64_t trap_t = osal::System::get_uptime_ms();
+            while (worker_thread_->is_joinable() && (osal::System::get_uptime_ms() - trap_t < 50) && status_.phase == ContainerPhase::Running) {
+                osal::Thread::sleep_ms(10);
+            }
+#endif
+            if (worker_thread_->is_joinable()) {
+                // Detach uncooperative thread to prevent host freeze
+                worker_thread_->detach();
+                worker_thread_.reset();
+                thread_detached_.store(true);
+
+                osal::LockGuard guard(mutex_);
+                status_.phase = ContainerPhase::Failed;
+                status_.exit_code = 137;
+                status_.termination_reason = "ExecutionTimeout";
+                status_.exit_message = "ExecutionTimeout: Workload did not terminate within grace period";
+                status_.ready = false;
+                return true;
+            }
+        }
+
+        if (worker_thread_ && worker_thread_->is_joinable()) {
+            worker_thread_->join();
+            worker_thread_.reset();
+        }
     }
 
     osal::LockGuard guard(mutex_);
-    status_.phase = ContainerPhase::Terminated;
-    status_.ready = false;
+    if (status_.phase == ContainerPhase::Running) {
+        status_.phase = ContainerPhase::Terminated;
+        status_.ready = false;
+    }
     return true;
 }
 

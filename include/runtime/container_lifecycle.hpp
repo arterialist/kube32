@@ -96,6 +96,7 @@ private:
     void* m3_module_{nullptr};
 
     std::unique_ptr<osal::Thread> worker_thread_;
+    std::atomic<bool> thread_detached_{false};
 
     uint32_t consecutive_liveness_failures_{0};
     uint32_t consecutive_readiness_failures_{0};

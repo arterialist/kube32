@@ -7,14 +7,18 @@
 namespace kube32::kubelet {
 
 struct NodeTelemetry {
+    size_t total_heap_bytes{320 * 1024};
     size_t free_heap_bytes{0};
     size_t min_free_heap_bytes{0};
     size_t free_psram_bytes{0};
     size_t total_psram_bytes{0};
     uint32_t cpu_freq_mhz{240};
     uint64_t uptime_ms{0};
+    uint32_t total_gpio_count{16};
     uint32_t allocatable_gpio_count{14};
+    uint32_t total_i2c_count{2};
     uint32_t allocatable_i2c_count{2};
+    uint32_t total_adc_count{2};
     uint32_t allocatable_adc_count{2};
 };
 

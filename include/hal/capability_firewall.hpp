@@ -63,12 +63,16 @@ private:
     CapabilityFirewall(const CapabilityFirewall&) = delete;
     CapabilityFirewall& operator=(const CapabilityFirewall&) = delete;
 
-    bool allocate_generic_gpios(uint32_t count, DeviceGrant& grant, const std::string& pod_id, std::string& out_error);
-    bool allocate_generic_i2c(uint32_t count, DeviceGrant& grant, const std::string& pod_id, std::string& out_error);
-    bool allocate_generic_adc(uint32_t count, DeviceGrant& grant, const std::string& pod_id, std::string& out_error);
+    bool allocate_generic_gpios(uint32_t count, DeviceGrant& grant, const std::string& pod_id, std::vector<uint32_t>& out_claimed, std::string& out_error);
+    bool allocate_generic_i2c(uint32_t count, DeviceGrant& grant, const std::string& pod_id, std::vector<uint32_t>& out_claimed, std::string& out_error);
+    bool allocate_generic_adc(uint32_t count, DeviceGrant& grant, const std::string& pod_id, std::vector<uint32_t>& out_claimed, std::string& out_error);
 
     mutable osal::Mutex mutex_;
     std::map<std::string, PodSecurityRecord> pod_records_;
+    uint64_t allocated_gpio_mask_{0};
+    uint16_t allocated_adc1_mask_{0};
+    uint8_t  allocated_i2c_mask_{0};
+    uint8_t  allocated_uart_mask_{0};
 
     // Global Hardware Ownership Registry (for collision detection)
     std::array<std::string, 64> gpio_owners_;

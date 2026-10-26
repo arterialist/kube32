@@ -654,6 +654,68 @@ void test_firewall_concurrency_stress() {
     std::cout << "[PASS] Concurrency Stress Test: 8000 concurrent firewall queries completed with 0 errors" << std::endl;
 }
 
+// =============================================================================
+// Challenge 6: Generic Pin Cleanup on Allocation Failure
+// - Request 3 generic GPIOs and 5 generic I2C buses (ESP32-S3 only has 2 buses)
+// - Assert: Registration fails, and exactly 0 GPIO/I2C pins leak in the firewall
+// =============================================================================
+void test_challenge6_generic_pin_cleanup_on_allocation_failure() {
+    std::cout << "[RUN] Challenge 6: Generic Pin Cleanup on Allocation Failure..." << std::endl;
+
+    CapabilityFirewall& fw = CapabilityFirewall::instance();
+    fw.reset();
+
+    assert(fw.get_allocated_gpio_mask() == 0);
+    assert(fw.get_allocated_i2c_mask() == 0);
+
+    // Request 3 generic GPIOs and 5 generic I2C buses (ESP32-S3 only has 2 buses)
+    std::string doomed_manifest = R"({
+        "spec": {
+            "containers": [{
+                "name": "c",
+                "resources": {
+                    "requests": {
+                        "esp.io/gpio": "3",
+                        "esp.io/i2c": "5"
+                    }
+                }
+            }]
+        }
+    })";
+
+    std::string err;
+    bool ok = fw.register_pod("doomed-pod", doomed_manifest, err);
+    assert(!ok);
+    assert(err.find("Insufficient allocatable I2C buses") != std::string::npos);
+
+    // CRITICAL EMPIRICAL ASSERTION: 0 pins leaked!
+    assert(fw.get_allocated_gpio_mask() == 0);
+    assert(fw.get_allocated_i2c_mask() == 0);
+
+    // Verify subsequent pod can successfully register
+    std::string valid_manifest = R"({
+        "spec": {
+            "containers": [{
+                "name": "c",
+                "resources": {
+                    "requests": {
+                        "esp.io/gpio": "3",
+                        "esp.io/i2c": "1"
+                    }
+                }
+            }]
+        }
+    })";
+
+    err.clear();
+    assert(fw.register_pod("valid-pod", valid_manifest, err));
+    assert(fw.get_allocated_gpio_mask() != 0);
+    fw.unregister_pod("valid-pod");
+    assert(fw.get_allocated_gpio_mask() == 0);
+
+    std::cout << "[PASS] Challenge 6: Generic Pin Cleanup on Allocation Failure completely rolled back (0 leaked pins)" << std::endl;
+}
+
 int main() {
     std::cout << "==========================================================" << std::endl;
     std::cout << " Kube32 HAL Capability Firewall & Peripheral Collision    " << std::endl;
@@ -665,10 +727,11 @@ int main() {
     test_challenge3_peripheral_collision_prevention();
     test_challenge4_linear_memory_buffer_overrun_protection();
     test_challenge5_virtual_bmp280_sensor_emulation();
+    test_challenge6_generic_pin_cleanup_on_allocation_failure();
     test_firewall_concurrency_stress();
 
     std::cout << "==========================================================" << std::endl;
-    std::cout << " ALL 5 EMPIRICAL ADVERSARIAL CHALLENGES PASSED (100%)     " << std::endl;
+    std::cout << " ALL 6 EMPIRICAL ADVERSARIAL CHALLENGES PASSED (100%)     " << std::endl;
     std::cout << "==========================================================" << std::endl;
 
     return 0;

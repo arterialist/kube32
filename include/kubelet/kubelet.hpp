@@ -88,7 +88,8 @@ private:
     // Pod lifecycle actions
     bool deploy_and_start_pod(const models::KubePod& pod, const std::string& manifest_json);
     bool terminate_pod(const std::string& pod_key);
-    void handle_pod_failure(LocalPodRecord& rec, const std::string& exit_msg);
+    void handle_pod_failure(LocalPodRecord& rec, const runtime::ContainerStatus& cs);
+    void handle_pod_failure(LocalPodRecord& rec, const std::string& exit_msg, int32_t exit_code = 137, const std::string& reason = "ContainerFailed");
 
     KubeletConfig config_;
     runtime::Runtime& runtime_;

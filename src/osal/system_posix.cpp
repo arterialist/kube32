@@ -73,12 +73,12 @@ size_t System::get_min_free_heap_bytes() {
 }
 
 size_t System::get_free_psram_bytes() {
-    // Simulates 2048KB external SPI PSRAM
-    return 2048 * 1024;
+    // Simulates 3840KB usable external SPI PSRAM (4MB total capacity)
+    return 3840 * 1024;
 }
 
 size_t System::get_total_psram_bytes() {
-    return 2048 * 1024;
+    return 4096 * 1024;
 }
 
 uint32_t System::get_cpu_freq_mhz() {

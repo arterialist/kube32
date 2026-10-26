@@ -20,9 +20,13 @@ void CapabilityFirewall::reset() {
     for (auto& o : adc1_owners_) o.clear();
     for (auto& o : i2c_owners_) o.clear();
     for (auto& o : uart_owners_) o.clear();
+    allocated_gpio_mask_ = 0;
+    allocated_adc1_mask_ = 0;
+    allocated_i2c_mask_ = 0;
+    allocated_uart_mask_ = 0;
 }
 
-bool CapabilityFirewall::allocate_generic_gpios(uint32_t count, DeviceGrant& grant, const std::string& pod_id, std::string& out_error) {
+bool CapabilityFirewall::allocate_generic_gpios(uint32_t count, DeviceGrant& grant, const std::string& pod_id, std::vector<uint32_t>& out_claimed, std::string& out_error) {
     uint32_t allocated = 0;
     std::vector<uint32_t> claimed_pins;
 
@@ -43,11 +47,13 @@ bool CapabilityFirewall::allocate_generic_gpios(uint32_t count, DeviceGrant& gra
         grant.gpio_read_mask |= (1ULL << pin);
         grant.gpio_write_mask |= (1ULL << pin);
         gpio_owners_[pin] = pod_id;
+        allocated_gpio_mask_ |= (1ULL << pin);
+        out_claimed.push_back(pin);
     }
     return true;
 }
 
-bool CapabilityFirewall::allocate_generic_i2c(uint32_t count, DeviceGrant& grant, const std::string& pod_id, std::string& out_error) {
+bool CapabilityFirewall::allocate_generic_i2c(uint32_t count, DeviceGrant& grant, const std::string& pod_id, std::vector<uint32_t>& out_claimed, std::string& out_error) {
     uint32_t allocated = 0;
     std::vector<uint32_t> claimed_buses;
 
@@ -65,11 +71,13 @@ bool CapabilityFirewall::allocate_generic_i2c(uint32_t count, DeviceGrant& grant
     for (uint32_t bus : claimed_buses) {
         grant.i2c_bus_mask |= (1U << bus);
         i2c_owners_[bus] = pod_id;
+        allocated_i2c_mask_ |= (1U << bus);
+        out_claimed.push_back(bus);
     }
     return true;
 }
 
-bool CapabilityFirewall::allocate_generic_adc(uint32_t count, DeviceGrant& grant, const std::string& pod_id, std::string& out_error) {
+bool CapabilityFirewall::allocate_generic_adc(uint32_t count, DeviceGrant& grant, const std::string& pod_id, std::vector<uint32_t>& out_claimed, std::string& out_error) {
     uint32_t allocated = 0;
     std::vector<uint32_t> claimed_channels;
 
@@ -87,6 +95,8 @@ bool CapabilityFirewall::allocate_generic_adc(uint32_t count, DeviceGrant& grant
     for (uint32_t ch : claimed_channels) {
         grant.adc1_channel_mask |= (1U << ch);
         adc1_owners_[ch] = pod_id;
+        allocated_adc1_mask_ |= (1U << ch);
+        out_claimed.push_back(ch);
     }
     return true;
 }
@@ -116,10 +126,22 @@ bool CapabilityFirewall::register_pod(const std::string& pod_id, const std::stri
     std::vector<uint32_t> claimed_uarts;
 
     auto cleanup_claimed = [&]() {
-        for (uint32_t pin : claimed_gpios) gpio_owners_[pin].clear();
-        for (uint32_t ch : claimed_adcs) adc1_owners_[ch].clear();
-        for (uint32_t bus : claimed_i2cs) i2c_owners_[bus].clear();
-        for (uint32_t port : claimed_uarts) uart_owners_[port].clear();
+        for (uint32_t pin : claimed_gpios) {
+            gpio_owners_[pin].clear();
+            allocated_gpio_mask_ &= ~(1ULL << pin);
+        }
+        for (uint32_t ch : claimed_adcs) {
+            adc1_owners_[ch].clear();
+            allocated_adc1_mask_ &= ~(1U << ch);
+        }
+        for (uint32_t bus : claimed_i2cs) {
+            i2c_owners_[bus].clear();
+            allocated_i2c_mask_ &= ~(1U << bus);
+        }
+        for (uint32_t port : claimed_uarts) {
+            uart_owners_[port].clear();
+            allocated_uart_mask_ &= ~(1U << port);
+        }
     };
 
     const models::JsonValue* spec = doc.get("spec");
@@ -162,6 +184,7 @@ bool CapabilityFirewall::register_pod(const std::string& pod_id, const std::stri
                         grant.gpio_read_mask |= (1ULL << pin);
                         grant.gpio_write_mask |= (1ULL << pin);
                         gpio_owners_[pin] = pod_id;
+                        allocated_gpio_mask_ |= (1ULL << pin);
                         claimed_gpios.push_back(pin);
                     }
                     // Generic GPIO Request: "esp.io/gpio": "2" or "esp32.io/gpio": "2"
@@ -193,6 +216,7 @@ bool CapabilityFirewall::register_pod(const std::string& pod_id, const std::stri
                         }
                         grant.adc1_channel_mask |= (1U << ch);
                         adc1_owners_[ch] = pod_id;
+                        allocated_adc1_mask_ |= (1U << ch);
                         claimed_adcs.push_back(ch);
                     }
                     // Generic ADC: "esp.io/adc": "1" or "esp32.io/adc": "1"
@@ -224,6 +248,7 @@ bool CapabilityFirewall::register_pod(const std::string& pod_id, const std::stri
                         }
                         grant.i2c_bus_mask |= (1U << bus);
                         i2c_owners_[bus] = pod_id;
+                        allocated_i2c_mask_ |= (1U << bus);
                         claimed_i2cs.push_back(bus);
                     }
                     // Generic I2C: "esp.io/i2c": "1" or "esp32.io/i2c": "1"
@@ -255,6 +280,7 @@ bool CapabilityFirewall::register_pod(const std::string& pod_id, const std::stri
                         }
                         grant.uart_port_mask |= (1U << port);
                         uart_owners_[port] = pod_id;
+                        allocated_uart_mask_ |= (1U << port);
                         claimed_uarts.push_back(port);
                     }
                 }
@@ -262,15 +288,15 @@ bool CapabilityFirewall::register_pod(const std::string& pod_id, const std::stri
         }
     }
 
-    if (generic_gpio_count > 0 && !allocate_generic_gpios(generic_gpio_count, grant, pod_id, out_error)) {
+    if (generic_gpio_count > 0 && !allocate_generic_gpios(generic_gpio_count, grant, pod_id, claimed_gpios, out_error)) {
         cleanup_claimed();
         return false;
     }
-    if (generic_i2c_count > 0 && !allocate_generic_i2c(generic_i2c_count, grant, pod_id, out_error)) {
+    if (generic_i2c_count > 0 && !allocate_generic_i2c(generic_i2c_count, grant, pod_id, claimed_i2cs, out_error)) {
         cleanup_claimed();
         return false;
     }
-    if (generic_adc_count > 0 && !allocate_generic_adc(generic_adc_count, grant, pod_id, out_error)) {
+    if (generic_adc_count > 0 && !allocate_generic_adc(generic_adc_count, grant, pod_id, claimed_adcs, out_error)) {
         cleanup_claimed();
         return false;
     }
@@ -304,11 +330,15 @@ bool CapabilityFirewall::grant_capabilities(const std::string& pod_id, const Dev
     for (uint32_t pin = 0; pin < 64; ++pin) {
         if ((combined_gpio & (1ULL << pin)) != 0) {
             if (!gpio_owners_[pin].empty() && gpio_owners_[pin] != pod_id) {
-                for (uint32_t p : claimed_gpios) gpio_owners_[p].clear();
+                for (uint32_t p : claimed_gpios) {
+                    gpio_owners_[p].clear();
+                    allocated_gpio_mask_ &= ~(1ULL << p);
+                }
                 out_error = "Hardware Collision: GPIO " + std::to_string(pin) + " already claimed by " + gpio_owners_[pin];
                 return false;
             }
             gpio_owners_[pin] = pod_id;
+            allocated_gpio_mask_ |= (1ULL << pin);
             claimed_gpios.push_back(pin);
         }
     }
@@ -317,12 +347,19 @@ bool CapabilityFirewall::grant_capabilities(const std::string& pod_id, const Dev
     for (uint32_t ch = 0; ch < 16; ++ch) {
         if ((grant.adc1_channel_mask & (1U << ch)) != 0) {
             if (ch >= 10 || (!adc1_owners_[ch].empty() && adc1_owners_[ch] != pod_id)) {
-                for (uint32_t p : claimed_gpios) gpio_owners_[p].clear();
-                for (uint32_t c : claimed_adcs) adc1_owners_[c].clear();
+                for (uint32_t p : claimed_gpios) {
+                    gpio_owners_[p].clear();
+                    allocated_gpio_mask_ &= ~(1ULL << p);
+                }
+                for (uint32_t c : claimed_adcs) {
+                    adc1_owners_[c].clear();
+                    allocated_adc1_mask_ &= ~(1U << c);
+                }
                 out_error = "Hardware Collision: ADC1 channel " + std::to_string(ch);
                 return false;
             }
             adc1_owners_[ch] = pod_id;
+            allocated_adc1_mask_ |= (1U << ch);
             claimed_adcs.push_back(ch);
         }
     }
@@ -331,13 +368,23 @@ bool CapabilityFirewall::grant_capabilities(const std::string& pod_id, const Dev
     for (uint32_t b = 0; b < 8; ++b) {
         if ((grant.i2c_bus_mask & (1U << b)) != 0) {
             if (b >= 2 || (!i2c_owners_[b].empty() && i2c_owners_[b] != pod_id)) {
-                for (uint32_t p : claimed_gpios) gpio_owners_[p].clear();
-                for (uint32_t c : claimed_adcs) adc1_owners_[c].clear();
-                for (uint32_t bus : claimed_i2cs) i2c_owners_[bus].clear();
+                for (uint32_t p : claimed_gpios) {
+                    gpio_owners_[p].clear();
+                    allocated_gpio_mask_ &= ~(1ULL << p);
+                }
+                for (uint32_t c : claimed_adcs) {
+                    adc1_owners_[c].clear();
+                    allocated_adc1_mask_ &= ~(1U << c);
+                }
+                for (uint32_t bus : claimed_i2cs) {
+                    i2c_owners_[bus].clear();
+                    allocated_i2c_mask_ &= ~(1U << bus);
+                }
                 out_error = "Hardware Collision: I2C bus " + std::to_string(b);
                 return false;
             }
             i2c_owners_[b] = pod_id;
+            allocated_i2c_mask_ |= (1U << b);
             claimed_i2cs.push_back(b);
         }
     }
@@ -346,14 +393,27 @@ bool CapabilityFirewall::grant_capabilities(const std::string& pod_id, const Dev
     for (uint32_t u = 0; u < 8; ++u) {
         if ((grant.uart_port_mask & (1U << u)) != 0) {
             if (u == 0 || u > 2 || (!uart_owners_[u].empty() && uart_owners_[u] != pod_id)) {
-                for (uint32_t p : claimed_gpios) gpio_owners_[p].clear();
-                for (uint32_t c : claimed_adcs) adc1_owners_[c].clear();
-                for (uint32_t bus : claimed_i2cs) i2c_owners_[bus].clear();
-                for (uint32_t port : claimed_uarts) uart_owners_[port].clear();
+                for (uint32_t p : claimed_gpios) {
+                    gpio_owners_[p].clear();
+                    allocated_gpio_mask_ &= ~(1ULL << p);
+                }
+                for (uint32_t c : claimed_adcs) {
+                    adc1_owners_[c].clear();
+                    allocated_adc1_mask_ &= ~(1U << c);
+                }
+                for (uint32_t bus : claimed_i2cs) {
+                    i2c_owners_[bus].clear();
+                    allocated_i2c_mask_ &= ~(1U << bus);
+                }
+                for (uint32_t port : claimed_uarts) {
+                    uart_owners_[port].clear();
+                    allocated_uart_mask_ &= ~(1U << port);
+                }
                 out_error = "Hardware Collision: UART port " + std::to_string(u);
                 return false;
             }
             uart_owners_[u] = pod_id;
+            allocated_uart_mask_ |= (1U << u);
             claimed_uarts.push_back(u);
         }
     }
@@ -371,16 +431,28 @@ void CapabilityFirewall::unregister_pod(const std::string& pod_id) {
     osal::LockGuard guard(mutex_);
     pod_records_.erase(pod_id);
     for (size_t i = 0; i < gpio_owners_.size(); ++i) {
-        if (gpio_owners_[i] == pod_id) gpio_owners_[i].clear();
+        if (gpio_owners_[i] == pod_id) {
+            gpio_owners_[i].clear();
+            allocated_gpio_mask_ &= ~(1ULL << i);
+        }
     }
     for (size_t i = 0; i < adc1_owners_.size(); ++i) {
-        if (adc1_owners_[i] == pod_id) adc1_owners_[i].clear();
+        if (adc1_owners_[i] == pod_id) {
+            adc1_owners_[i].clear();
+            allocated_adc1_mask_ &= ~(1U << i);
+        }
     }
     for (size_t i = 0; i < i2c_owners_.size(); ++i) {
-        if (i2c_owners_[i] == pod_id) i2c_owners_[i].clear();
+        if (i2c_owners_[i] == pod_id) {
+            i2c_owners_[i].clear();
+            allocated_i2c_mask_ &= ~(1U << i);
+        }
     }
     for (size_t i = 0; i < uart_owners_.size(); ++i) {
-        if (uart_owners_[i] == pod_id) uart_owners_[i].clear();
+        if (uart_owners_[i] == pod_id) {
+            uart_owners_[i].clear();
+            allocated_uart_mask_ &= ~(1U << i);
+        }
     }
 }
 
@@ -428,46 +500,22 @@ const PodSecurityRecord* CapabilityFirewall::get_pod_security_record(const std::
 
 uint64_t CapabilityFirewall::get_allocated_gpio_mask() const {
     osal::LockGuard guard(mutex_);
-    uint64_t mask = 0;
-    for (uint32_t i = 0; i < 64; ++i) {
-        if (!gpio_owners_[i].empty()) {
-            mask |= (1ULL << i);
-        }
-    }
-    return mask;
+    return allocated_gpio_mask_;
 }
 
 uint16_t CapabilityFirewall::get_allocated_adc1_mask() const {
     osal::LockGuard guard(mutex_);
-    uint16_t mask = 0;
-    for (uint32_t i = 0; i < 16; ++i) {
-        if (!adc1_owners_[i].empty()) {
-            mask |= (1U << i);
-        }
-    }
-    return mask;
+    return allocated_adc1_mask_;
 }
 
 uint8_t CapabilityFirewall::get_allocated_i2c_mask() const {
     osal::LockGuard guard(mutex_);
-    uint8_t mask = 0;
-    for (uint32_t i = 0; i < 8; ++i) {
-        if (!i2c_owners_[i].empty()) {
-            mask |= (1U << i);
-        }
-    }
-    return mask;
+    return allocated_i2c_mask_;
 }
 
 uint8_t CapabilityFirewall::get_allocated_uart_mask() const {
     osal::LockGuard guard(mutex_);
-    uint8_t mask = 0;
-    for (uint32_t i = 0; i < 8; ++i) {
-        if (!uart_owners_[i].empty()) {
-            mask |= (1U << i);
-        }
-    }
-    return mask;
+    return allocated_uart_mask_;
 }
 
 void CapabilityFirewall::log_violation(const std::string& pod_id, PeripheralType type, uint32_t target, AccessMode mode) {
