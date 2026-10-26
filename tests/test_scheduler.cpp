@@ -159,11 +159,62 @@ void test_scheduler_atomic_binding() {
     std::cout << "[PASS] test_scheduler_atomic_binding" << std::endl;
 }
 
+void test_deleted_node_reconciliation() {
+    std::cout << "[RUN] test_deleted_node_reconciliation" << std::endl;
+
+    StoreOptions opts;
+    opts.enable_flash_persistence = false;
+    auto store = create_radix_store(opts);
+
+    // Register 2 nodes
+    std::string node1 = "{\"kind\":\"Node\",\"metadata\":{\"name\":\"esp32-node-01\"},"
+                        "\"spec\":{\"unschedulable\":false},"
+                        "\"status\":{\"conditions\":[{\"type\":\"Ready\",\"status\":\"True\"}],"
+                        "\"allocatable\":{\"memory\":\"240Ki\",\"esp.io/gpio\":\"14\"}}}";
+
+    std::string node2 = "{\"kind\":\"Node\",\"metadata\":{\"name\":\"esp32-node-02\"},"
+                        "\"spec\":{\"unschedulable\":false},"
+                        "\"status\":{\"conditions\":[{\"type\":\"Ready\",\"status\":\"True\"}],"
+                        "\"allocatable\":{\"memory\":\"240Ki\",\"esp.io/gpio\":\"14\"}}}";
+
+    store->put("/registry/nodes/esp32-node-01", node1, true);
+    store->put("/registry/nodes/esp32-node-02", node2, true);
+
+    auto sched = create_scheduler(*store);
+
+    // Register a running pod on esp32-node-01
+    std::string pod = "{\"kind\":\"Pod\",\"metadata\":{\"name\":\"migrating-pod\",\"namespace\":\"default\"},"
+                      "\"spec\":{\"nodeName\":\"esp32-node-01\",\"containers\":[{\"name\":\"c1\",\"resources\":{\"requests\":{\"memory\":\"32Ki\"}}}]},"
+                      "\"status\":{\"phase\":\"Running\"}}";
+    store->put("/registry/pods/default/migrating-pod", pod, true);
+
+    // Delete esp32-node-01 from registry
+    store->remove("/registry/nodes/esp32-node-01");
+
+    // Pass 1: Reconciliation detects assigned_node is absent from ready_nodes, evicts to Pending
+    sched->reconcile_cluster();
+
+    std::string updated_pod;
+    store->get("/registry/pods/default/migrating-pod", updated_pod);
+    assert(updated_pod.find("\"phase\":\"Pending\"") != std::string::npos);
+    assert(updated_pod.find("\"nodeName\":\"\"") != std::string::npos);
+
+    // Pass 2: Reconciliation re-evaluates Pending pod and schedules onto surviving esp32-node-02
+    sched->reconcile_cluster();
+
+    store->get("/registry/pods/default/migrating-pod", updated_pod);
+    assert(updated_pod.find("\"phase\":\"Running\"") != std::string::npos);
+    assert(updated_pod.find("\"nodeName\":\"esp32-node-02\"") != std::string::npos);
+
+    std::cout << "[PASS] test_deleted_node_reconciliation" << std::endl;
+}
+
 int main() {
     std::cout << "=== Running Kube32 Autonomous Scheduler Unit Tests ===" << std::endl;
     test_quantity_parser();
     test_predicates();
     test_scheduler_atomic_binding();
+    test_deleted_node_reconciliation();
     std::cout << "=== All Scheduler Tests Passed Successfully ===" << std::endl;
     return 0;
 }

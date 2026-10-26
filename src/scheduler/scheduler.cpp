@@ -501,19 +501,21 @@ public:
         uint64_t version = 0;
 
         for (int retry = 0; retry < 3; ++retry) {
-            storage::Status s = store_.get_extended(pod_key, pod_json, &version);
-            if (!s.ok()) {
-                return {false, "", "Pod not found in store: " + pod_key};
-            }
-
             ScheduleResult result;
+            storage::Status put_s;
             {
                 osal::LockGuard guard(mutex_);
+                storage::Status s = store_.get_extended(pod_key, pod_json, &version);
+                if (!s.ok()) {
+                    return {false, "", "Pod not found in store: " + pod_key};
+                }
+
                 result = evaluate_and_bind_manifest(pod_json, pod_key);
+
+                uint64_t next_ver = 0;
+                put_s = store_.put_extended(pod_key, pod_json, true, true, version, &next_ver);
             }
 
-            uint64_t next_ver = 0;
-            storage::Status put_s = store_.put_extended(pod_key, pod_json, true, true, version, &next_ver);
             if (put_s.ok()) {
                 return result;
             }
@@ -527,11 +529,11 @@ public:
     }
 
     void reconcile_cluster() override {
-        // 1. Check for NotReady nodes and evict pods
+        // 1. Check for ready nodes in cluster registry
         std::vector<std::string> node_jsons;
         store_.list("/registry/nodes/", node_jsons);
 
-        std::set<std::string> dead_nodes;
+        std::set<std::string> ready_nodes;
         for (const auto& n_json : node_jsons) {
             osal::Thread::yield();
             models::JsonValue doc;
@@ -544,18 +546,13 @@ public:
 
             const models::JsonValue* status = doc.get("status");
             const models::JsonValue* conds = status ? status->get("conditions") : nullptr;
-            bool ready = false;
             if (conds && conds->is_array()) {
                 for (const auto& c : conds->arr_val) {
                     if (c.is_object() && c.get_string("type") == "Ready" && c.get_string("status") == "True") {
-                        ready = true;
+                        ready_nodes.insert(nname);
                         break;
                     }
                 }
-            }
-
-            if (!ready) {
-                dead_nodes.insert(nname);
             }
         }
 
@@ -579,8 +576,10 @@ public:
             std::string pod_name = meta ? meta->get_string("name", "") : "";
             std::string pod_ns = meta ? meta->get_string("namespace", "default") : "default";
 
-            if (dead_nodes.count(assigned_node)) {
-                // Node died - evict and re-schedule!
+            bool node_missing_or_dead = (!assigned_node.empty() && assigned_node != "<none>" && ready_nodes.count(assigned_node) == 0);
+
+            if (node_missing_or_dead) {
+                // Node died or was deleted from cluster: evict and re-schedule!
                 schedule_pod(pod_name, pod_ns);
             } else if (phase == "Pending" || assigned_node.empty() || assigned_node == "<none>") {
                 // Re-evaluate pending pod

@@ -33,6 +33,10 @@ RouteMatch RouteHandler::match_route(std::string_view path) {
         match.category = RouteCategory::DiscoveryApisAppsV1;
         return match;
     }
+    if (path == "/apis/events.k8s.io/v1") {
+        match.category = RouteCategory::DiscoveryApisEventsV1;
+        return match;
+    }
     if (path == "/openapi/v3") {
         match.category = RouteCategory::DiscoveryOpenApiV3;
         return match;
@@ -189,8 +193,38 @@ HttpResponse RouteHandler::make_status(int status_code,
     return resp;
 }
 
-HttpResponse RouteHandler::handle_request(const HttpRequest& req, mem::MonotonicArena& arena) {
-    (void)arena;
+HttpResponse RouteHandler::handle_request(const HttpRequest& req, mem::MonotonicArena& arena, osal::Socket* client_sock) {
+    // Arena Scratchpad Allocation 1: Normalized URI & Path Tokens
+    size_t uri_len = req.raw_uri.empty() ? req.path.size() : req.raw_uri.size();
+    char* uri_scratch = static_cast<char*>(arena.allocate(uri_len + 16, 4));
+    if (uri_scratch) {
+        std::memcpy(uri_scratch, req.path.data(), req.path.size());
+        uri_scratch[req.path.size()] = '\0';
+    }
+
+    // Arena Scratchpad Allocation 2: Query String Parameter Parsing
+    struct QueryParamView {
+        std::string_view key;
+        std::string_view value;
+    };
+    constexpr size_t MAX_PARAMS = 16;
+    auto* params = static_cast<QueryParamView*>(arena.allocate(sizeof(QueryParamView) * MAX_PARAMS, alignof(QueryParamView)));
+    size_t param_count = 0;
+    if (params && !req.query_string.empty()) {
+        std::string_view qs = req.query_string;
+        while (!qs.empty() && param_count < MAX_PARAMS) {
+            size_t ampersand = qs.find('&');
+            std::string_view token = (ampersand == std::string_view::npos) ? qs : qs.substr(0, ampersand);
+            size_t eq = token.find('=');
+            if (eq != std::string_view::npos) {
+                params[param_count++] = {token.substr(0, eq), token.substr(eq + 1)};
+            } else {
+                params[param_count++] = {token, ""};
+            }
+            if (ampersand == std::string_view::npos) break;
+            qs = qs.substr(ampersand + 1);
+        }
+    }
 
     RouteMatch match = match_route(req.path);
 
@@ -200,25 +234,26 @@ HttpResponse RouteHandler::handle_request(const HttpRequest& req, mem::Monotonic
         case RouteCategory::DiscoveryApis:
         case RouteCategory::DiscoveryApiV1:
         case RouteCategory::DiscoveryApisAppsV1:
+        case RouteCategory::DiscoveryApisEventsV1:
         case RouteCategory::DiscoveryOpenApiV3:
             return handle_discovery(req, match.category);
 
         case RouteCategory::NodesCollection:
         case RouteCategory::NodeItem:
         case RouteCategory::NodeStatus:
-            return handle_nodes(req, match);
+            return handle_nodes(req, match, arena, client_sock);
 
         case RouteCategory::PodsClusterCollection:
         case RouteCategory::PodsNsCollection:
         case RouteCategory::PodItem:
         case RouteCategory::PodStatus:
-            return handle_pods(req, match);
+            return handle_pods(req, match, arena, client_sock);
 
         case RouteCategory::DeploymentsNsCollection:
         case RouteCategory::DeploymentItem:
         case RouteCategory::DeploymentStatus:
         case RouteCategory::DeploymentScale:
-            return handle_deployments(req, match);
+            return handle_deployments(req, match, arena, client_sock);
 
         case RouteCategory::NotFound:
         default:
@@ -289,6 +324,10 @@ HttpResponse RouteHandler::handle_discovery(const HttpRequest& req, RouteCategor
                         "]}";
             break;
 
+        case RouteCategory::DiscoveryApisEventsV1:
+            resp.body = "{\"kind\":\"APIResourceList\",\"apiVersion\":\"v1\",\"groupVersion\":\"events.k8s.io/v1\",\"resources\":[]}";
+            break;
+
         case RouteCategory::DiscoveryOpenApiV3:
             resp.body = "{\"paths\":{}}";
             break;
@@ -297,26 +336,51 @@ HttpResponse RouteHandler::handle_discovery(const HttpRequest& req, RouteCategor
             return make_status(404, "NotFound", "Endpoint not found: " + req.path);
     }
 
+    if (req.method == HttpMethod::Head) {
+        resp.body = "";
+    }
+
     return resp;
 }
 
-HttpResponse RouteHandler::handle_nodes(const HttpRequest& req, const RouteMatch& match) {
+HttpResponse RouteHandler::handle_nodes(const HttpRequest& req, const RouteMatch& match, mem::MonotonicArena& arena, osal::Socket* client_sock) {
     std::string name(match.resource_name);
 
     if (match.category == RouteCategory::NodesCollection) {
-        if (req.method == HttpMethod::Get) {
-            std::vector<std::string> node_jsons;
-            store_.list("/registry/nodes/", node_jsons);
+        if (req.method == HttpMethod::Head) {
             HttpResponse resp;
             resp.status_code = 200;
-            if (req.as_table) {
-                resp.content_type = "application/json;as=Table;v=v1;g=meta.k8s.io";
-                resp.body = TableSerializer::build_nodes_table_json(node_jsons);
-            } else {
-                resp.content_type = "application/json";
-                resp.body = TableSerializer::build_nodes_list_json(node_jsons);
-            }
+            resp.content_type = req.as_table ? "application/json;as=Table;v=v1;g=meta.k8s.io" : "application/json";
+            resp.body = "";
+            resp.is_chunked = false;
             return resp;
+        } else if (req.method == HttpMethod::Get) {
+            std::vector<std::string> node_jsons;
+            store_.list("/registry/nodes/", node_jsons);
+            if (client_sock != nullptr) {
+                ChunkedStreamWriter writer(*client_sock);
+                if (req.as_table) {
+                    TableSerializer::serialize_nodes_table_from_json(writer, node_jsons);
+                } else {
+                    TableSerializer::serialize_nodes_list_from_json(writer, node_jsons);
+                }
+                HttpResponse resp;
+                resp.status_code = 200;
+                resp.is_chunked = true;
+                return resp;
+            } else {
+                HttpResponse resp;
+                resp.status_code = 200;
+                if (req.as_table) {
+                    resp.content_type = "application/json;as=Table;v=v1;g=meta.k8s.io";
+                    resp.body = TableSerializer::build_nodes_table_json(node_jsons);
+                } else {
+                    resp.content_type = "application/json";
+                    resp.body = TableSerializer::build_nodes_list_json(node_jsons);
+                }
+                resp.is_chunked = false;
+                return resp;
+            }
         } else if (req.method == HttpMethod::Post) {
             if (req.body.empty()) {
                 return make_status(400, "BadRequest", "Failed to parse request body: empty body");
@@ -332,7 +396,10 @@ HttpResponse RouteHandler::handle_nodes(const HttpRequest& req, const RouteMatch
                 return make_status(400, "BadRequest", "Node is invalid: metadata.name is required");
             }
 
-            std::string key = "/registry/nodes/" + node_name;
+            char* nkey_buf = static_cast<char*>(arena.allocate(128, 4));
+            int nklen = snprintf(nkey_buf, 128, "/registry/nodes/%.*s", static_cast<int>(node_name.size()), node_name.data());
+            std::string key(nkey_buf, nklen > 0 ? static_cast<size_t>(nklen) : 0);
+
             std::string existing;
             if (store_.get(key, existing).ok()) {
                 return make_status(409, "AlreadyExists", "nodes \"" + node_name + "\" already exists", node_name, "nodes");
@@ -356,7 +423,9 @@ HttpResponse RouteHandler::handle_nodes(const HttpRequest& req, const RouteMatch
         return make_status(405, "MethodNotAllowed", "POST not allowed on resource instance " + req.path);
     }
 
-    std::string key = "/registry/nodes/" + name;
+    char* key_buf = static_cast<char*>(arena.allocate(128, 4));
+    int klen = snprintf(key_buf, 128, "/registry/nodes/%.*s", static_cast<int>(match.resource_name.size()), match.resource_name.data());
+    std::string key(key_buf, klen > 0 ? static_cast<size_t>(klen) : 0);
 
     if (req.method == HttpMethod::Put) {
         if (req.body.empty()) {
@@ -411,7 +480,14 @@ HttpResponse RouteHandler::handle_nodes(const HttpRequest& req, const RouteMatch
         return make_status(404, "NotFound", "nodes \"" + name + "\" not found", name, "nodes");
     }
 
-    if (req.method == HttpMethod::Get) {
+    if (req.method == HttpMethod::Head) {
+        HttpResponse resp;
+        resp.status_code = 200;
+        resp.content_type = "application/json";
+        resp.body = "";
+        resp.is_chunked = false;
+        return resp;
+    } else if (req.method == HttpMethod::Get) {
         HttpResponse resp;
         resp.status_code = 200;
         resp.content_type = "application/json";
@@ -425,41 +501,84 @@ HttpResponse RouteHandler::handle_nodes(const HttpRequest& req, const RouteMatch
     return make_status(405, "MethodNotAllowed", std::string(http_method_str(req.method)) + " not allowed on " + req.path);
 }
 
-HttpResponse RouteHandler::handle_pods(const HttpRequest& req, const RouteMatch& match) {
+HttpResponse RouteHandler::handle_pods(const HttpRequest& req, const RouteMatch& match, mem::MonotonicArena& arena, osal::Socket* client_sock) {
     if (match.category == RouteCategory::PodsClusterCollection) {
-        if (req.method != HttpMethod::Get) {
+        if (req.method == HttpMethod::Head) {
+            HttpResponse resp;
+            resp.status_code = 200;
+            resp.content_type = req.as_table ? "application/json;as=Table;v=v1;g=meta.k8s.io" : "application/json";
+            resp.body = "";
+            resp.is_chunked = false;
+            return resp;
+        } else if (req.method == HttpMethod::Get) {
+            std::vector<std::string> pod_jsons;
+            store_.list("/registry/pods/", pod_jsons);
+            if (client_sock != nullptr) {
+                ChunkedStreamWriter writer(*client_sock);
+                if (req.as_table) {
+                    TableSerializer::serialize_pods_table_from_json(writer, pod_jsons);
+                } else {
+                    TableSerializer::serialize_pods_list_from_json(writer, pod_jsons);
+                }
+                HttpResponse resp;
+                resp.status_code = 200;
+                resp.is_chunked = true;
+                return resp;
+            } else {
+                HttpResponse resp;
+                resp.status_code = 200;
+                if (req.as_table) {
+                    resp.content_type = "application/json;as=Table;v=v1;g=meta.k8s.io";
+                    resp.body = TableSerializer::build_pods_table_json(pod_jsons);
+                } else {
+                    resp.content_type = "application/json";
+                    resp.body = TableSerializer::build_pods_list_json(pod_jsons);
+                }
+                resp.is_chunked = false;
+                return resp;
+            }
+        } else {
             return make_status(405, "MethodNotAllowed", std::string(http_method_str(req.method)) + " not allowed on collection endpoint " + req.path);
         }
-        std::vector<std::string> pod_jsons;
-        store_.list("/registry/pods/", pod_jsons);
-        HttpResponse resp;
-        resp.status_code = 200;
-        if (req.as_table) {
-            resp.content_type = "application/json;as=Table;v=v1;g=meta.k8s.io";
-            resp.body = TableSerializer::build_pods_table_json(pod_jsons);
-        } else {
-            resp.content_type = "application/json";
-            resp.body = TableSerializer::build_pods_list_json(pod_jsons);
-        }
-        return resp;
     }
 
     std::string ns = match.namespace_name.empty() ? "default" : std::string(match.namespace_name);
 
     if (match.category == RouteCategory::PodsNsCollection) {
-        if (req.method == HttpMethod::Get) {
-            std::vector<std::string> pod_jsons;
-            store_.list("/registry/pods/" + ns + "/", pod_jsons);
+        if (req.method == HttpMethod::Head) {
             HttpResponse resp;
             resp.status_code = 200;
-            if (req.as_table) {
-                resp.content_type = "application/json;as=Table;v=v1;g=meta.k8s.io";
-                resp.body = TableSerializer::build_pods_table_json(pod_jsons);
-            } else {
-                resp.content_type = "application/json";
-                resp.body = TableSerializer::build_pods_list_json(pod_jsons);
-            }
+            resp.content_type = req.as_table ? "application/json;as=Table;v=v1;g=meta.k8s.io" : "application/json";
+            resp.body = "";
+            resp.is_chunked = false;
             return resp;
+        } else if (req.method == HttpMethod::Get) {
+            std::vector<std::string> pod_jsons;
+            store_.list("/registry/pods/" + ns + "/", pod_jsons);
+            if (client_sock != nullptr) {
+                ChunkedStreamWriter writer(*client_sock);
+                if (req.as_table) {
+                    TableSerializer::serialize_pods_table_from_json(writer, pod_jsons);
+                } else {
+                    TableSerializer::serialize_pods_list_from_json(writer, pod_jsons);
+                }
+                HttpResponse resp;
+                resp.status_code = 200;
+                resp.is_chunked = true;
+                return resp;
+            } else {
+                HttpResponse resp;
+                resp.status_code = 200;
+                if (req.as_table) {
+                    resp.content_type = "application/json;as=Table;v=v1;g=meta.k8s.io";
+                    resp.body = TableSerializer::build_pods_table_json(pod_jsons);
+                } else {
+                    resp.content_type = "application/json";
+                    resp.body = TableSerializer::build_pods_list_json(pod_jsons);
+                }
+                resp.is_chunked = false;
+                return resp;
+            }
         } else if (req.method == HttpMethod::Post) {
             if (req.body.empty()) {
                 return make_status(400, "BadRequest", "Failed to parse request body: empty body");
@@ -485,7 +604,12 @@ HttpResponse RouteHandler::handle_pods(const HttpRequest& req, const RouteMatch&
                 return make_status(400, "BadRequest", "Pod is invalid: spec.containers: Required value");
             }
 
-            std::string key = "/registry/pods/" + ns + "/" + pod_name;
+            char* pkey_buf = static_cast<char*>(arena.allocate(128, 4));
+            int pklen = snprintf(pkey_buf, 128, "/registry/pods/%.*s/%.*s",
+                                 static_cast<int>(ns.size()), ns.data(),
+                                 static_cast<int>(pod_name.size()), pod_name.data());
+            std::string key(pkey_buf, pklen > 0 ? static_cast<size_t>(pklen) : 0);
+
             std::string existing;
             if (store_.get(key, existing).ok()) {
                 return make_status(409, "AlreadyExists", "pods \"" + pod_name + "\" already exists", pod_name, "pods");
@@ -524,7 +648,11 @@ HttpResponse RouteHandler::handle_pods(const HttpRequest& req, const RouteMatch&
     }
 
     std::string name(match.resource_name);
-    std::string key = "/registry/pods/" + ns + "/" + name;
+    char* key_buf = static_cast<char*>(arena.allocate(128, 4));
+    int klen = snprintf(key_buf, 128, "/registry/pods/%.*s/%.*s",
+                        static_cast<int>(ns.size()), ns.data(),
+                        static_cast<int>(name.size()), name.data());
+    std::string key(key_buf, klen > 0 ? static_cast<size_t>(klen) : 0);
 
     if (req.method == HttpMethod::Put) {
         if (req.body.empty()) {
@@ -600,7 +728,14 @@ HttpResponse RouteHandler::handle_pods(const HttpRequest& req, const RouteMatch&
         return make_status(404, "NotFound", "pods \"" + name + "\" not found", name, "pods");
     }
 
-    if (req.method == HttpMethod::Get) {
+    if (req.method == HttpMethod::Head) {
+        HttpResponse resp;
+        resp.status_code = 200;
+        resp.content_type = "application/json";
+        resp.body = "";
+        resp.is_chunked = false;
+        return resp;
+    } else if (req.method == HttpMethod::Get) {
         HttpResponse resp;
         resp.status_code = 200;
         resp.content_type = "application/json";
@@ -614,23 +749,44 @@ HttpResponse RouteHandler::handle_pods(const HttpRequest& req, const RouteMatch&
     return make_status(405, "MethodNotAllowed", std::string(http_method_str(req.method)) + " not allowed on " + req.path);
 }
 
-HttpResponse RouteHandler::handle_deployments(const HttpRequest& req, const RouteMatch& match) {
+HttpResponse RouteHandler::handle_deployments(const HttpRequest& req, const RouteMatch& match, mem::MonotonicArena& arena, osal::Socket* client_sock) {
     std::string ns = match.namespace_name.empty() ? "default" : std::string(match.namespace_name);
 
     if (match.category == RouteCategory::DeploymentsNsCollection) {
-        if (req.method == HttpMethod::Get) {
-            std::vector<std::string> dep_jsons;
-            store_.list("/registry/deployments/" + ns + "/", dep_jsons);
+        if (req.method == HttpMethod::Head) {
             HttpResponse resp;
             resp.status_code = 200;
-            if (req.as_table) {
-                resp.content_type = "application/json;as=Table;v=v1;g=meta.k8s.io";
-                resp.body = TableSerializer::build_deployments_table_json(dep_jsons);
-            } else {
-                resp.content_type = "application/json";
-                resp.body = TableSerializer::build_deployments_list_json(dep_jsons);
-            }
+            resp.content_type = req.as_table ? "application/json;as=Table;v=v1;g=meta.k8s.io" : "application/json";
+            resp.body = "";
+            resp.is_chunked = false;
             return resp;
+        } else if (req.method == HttpMethod::Get) {
+            std::vector<std::string> dep_jsons;
+            store_.list("/registry/deployments/" + ns + "/", dep_jsons);
+            if (client_sock != nullptr) {
+                ChunkedStreamWriter writer(*client_sock);
+                if (req.as_table) {
+                    TableSerializer::serialize_deployments_table_from_json(writer, dep_jsons);
+                } else {
+                    TableSerializer::serialize_deployments_list_from_json(writer, dep_jsons);
+                }
+                HttpResponse resp;
+                resp.status_code = 200;
+                resp.is_chunked = true;
+                return resp;
+            } else {
+                HttpResponse resp;
+                resp.status_code = 200;
+                if (req.as_table) {
+                    resp.content_type = "application/json;as=Table;v=v1;g=meta.k8s.io";
+                    resp.body = TableSerializer::build_deployments_table_json(dep_jsons);
+                } else {
+                    resp.content_type = "application/json";
+                    resp.body = TableSerializer::build_deployments_list_json(dep_jsons);
+                }
+                resp.is_chunked = false;
+                return resp;
+            }
         } else if (req.method == HttpMethod::Post) {
             if (req.body.empty()) {
                 return make_status(400, "BadRequest", "Failed to parse request body: empty body");
@@ -647,7 +803,12 @@ HttpResponse RouteHandler::handle_deployments(const HttpRequest& req, const Rout
                 return make_status(400, "BadRequest", "Deployment is invalid: metadata.name is required");
             }
 
-            std::string key = "/registry/deployments/" + ns + "/" + dep_name;
+            char* dkey_buf = static_cast<char*>(arena.allocate(128, 4));
+            int dklen = snprintf(dkey_buf, 128, "/registry/deployments/%.*s/%.*s",
+                                 static_cast<int>(ns.size()), ns.data(),
+                                 static_cast<int>(dep_name.size()), dep_name.data());
+            std::string key(dkey_buf, dklen > 0 ? static_cast<size_t>(dklen) : 0);
+
             std::string existing;
             if (store_.get(key, existing).ok()) {
                 return make_status(409, "AlreadyExists", "deployments.apps \"" + dep_name + "\" already exists", dep_name, "deployments");
@@ -695,7 +856,11 @@ HttpResponse RouteHandler::handle_deployments(const HttpRequest& req, const Rout
     }
 
     std::string name(match.resource_name);
-    std::string key = "/registry/deployments/" + ns + "/" + name;
+    char* key_buf = static_cast<char*>(arena.allocate(128, 4));
+    int klen = snprintf(key_buf, 128, "/registry/deployments/%.*s/%.*s",
+                        static_cast<int>(ns.size()), ns.data(),
+                        static_cast<int>(name.size()), name.data());
+    std::string key(key_buf, klen > 0 ? static_cast<size_t>(klen) : 0);
 
     if (req.method == HttpMethod::Put) {
         if (req.body.empty()) {
@@ -761,14 +926,25 @@ HttpResponse RouteHandler::handle_deployments(const HttpRequest& req, const Rout
         HttpResponse resp;
         resp.status_code = 200;
         resp.content_type = "application/json";
-        resp.body = "{\"kind\":\"Scale\",\"apiVersion\":\"autoscaling/v1\","
-                    "\"metadata\":{\"name\":\"" + escape_json(name) + "\",\"namespace\":\"" + escape_json(ns) + "\"},"
-                    "\"spec\":{\"replicas\":" + std::to_string(replicas) + "},"
-                    "\"status\":{\"replicas\":" + std::to_string(replicas) + "}}";
+        if (req.method == HttpMethod::Head) {
+            resp.body = "";
+        } else {
+            resp.body = "{\"kind\":\"Scale\",\"apiVersion\":\"autoscaling/v1\","
+                        "\"metadata\":{\"name\":\"" + escape_json(name) + "\",\"namespace\":\"" + escape_json(ns) + "\"},"
+                        "\"spec\":{\"replicas\":" + std::to_string(replicas) + "},"
+                        "\"status\":{\"replicas\":" + std::to_string(replicas) + "}}";
+        }
         return resp;
     }
 
-    if (req.method == HttpMethod::Get) {
+    if (req.method == HttpMethod::Head) {
+        HttpResponse resp;
+        resp.status_code = 200;
+        resp.content_type = "application/json";
+        resp.body = "";
+        resp.is_chunked = false;
+        return resp;
+    } else if (req.method == HttpMethod::Get) {
         HttpResponse resp;
         resp.status_code = 200;
         resp.content_type = "application/json";

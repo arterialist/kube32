@@ -44,7 +44,12 @@ bool Socket::create(SocketType type) {
     close();
     int sock_type = (type == SocketType::Tcp) ? SOCK_STREAM : SOCK_DGRAM;
     fd_ = ::socket(AF_INET, sock_type, 0);
-    return fd_ >= 0;
+    if (fd_ < 0) return false;
+#if defined(__APPLE__) && defined(SO_NOSIGPIPE)
+    int opt = 1;
+    ::setsockopt(fd_, SOL_SOCKET, SO_NOSIGPIPE, &opt, sizeof(opt));
+#endif
+    return true;
 }
 
 bool Socket::bind(const char* ip, uint16_t port) {
@@ -72,6 +77,11 @@ Socket Socket::accept(std::string* client_ip, uint16_t* client_port) {
     socklen_t addr_len = sizeof(client_addr);
     int client_fd = ::accept(fd_, reinterpret_cast<struct sockaddr*>(&client_addr), &addr_len);
     if (client_fd < 0) return Socket(-1);
+
+#if defined(__APPLE__) && defined(SO_NOSIGPIPE)
+    int opt = 1;
+    ::setsockopt(client_fd, SOL_SOCKET, SO_NOSIGPIPE, &opt, sizeof(opt));
+#endif
 
     if (client_ip) {
         char ip_str[INET_ADDRSTRLEN];
@@ -105,6 +115,9 @@ bool Socket::connect(const char* host_or_ip, uint16_t port, uint32_t timeout_ms)
 
 ssize_t Socket::send(const void* buf, size_t len, int flags) {
     if (fd_ < 0 || !buf) return -1;
+#if defined(MSG_NOSIGNAL)
+    flags |= MSG_NOSIGNAL;
+#endif
     return ::send(fd_, static_cast<const char*>(buf), len, flags);
 }
 
@@ -118,7 +131,12 @@ bool Socket::send_all(const void* buf, size_t len) {
     const char* ptr = static_cast<const char*>(buf);
     size_t remaining = len;
     while (remaining > 0) {
-        ssize_t sent = ::send(fd_, ptr, remaining, 0);
+#if defined(MSG_NOSIGNAL)
+        int send_flags = MSG_NOSIGNAL;
+#else
+        int send_flags = 0;
+#endif
+        ssize_t sent = ::send(fd_, ptr, remaining, send_flags);
         if (sent <= 0) return false;
         ptr += sent;
         remaining -= static_cast<size_t>(sent);

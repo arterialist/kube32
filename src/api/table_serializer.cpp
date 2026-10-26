@@ -372,18 +372,6 @@ private:
 };
 
 std::string TableSerializer::build_nodes_table_json(const std::vector<std::string>& node_jsons, uint64_t resource_version) {
-    std::string out;
-    StringSink sink(out);
-    ChunkedStreamWriter writer(sink);
-    // Write table without HTTP chunk headers for raw JSON body
-    if (!write_table_header(writer, ResourceKind::Node, resource_version)) return "{}";
-    for (size_t i = 0; i < node_jsons.size(); ++i) {
-        models::KubeNode node = models::parse_node_manifest(node_jsons[i]);
-        if (!write_node_row(writer, node, i == 0)) break;
-    }
-    writer.write("]}");
-    writer.flush_chunk();
-    // Strip HTTP chunk framing from string sink if needed, but easier to build cleanly:
     std::string clean = "{\"kind\":\"Table\",\"apiVersion\":\"meta.k8s.io/v1\",\"metadata\":{\"resourceVersion\":\"" + 
                         std::to_string(resource_version) + "\"},\"columnDefinitions\":["
                         "{\"name\":\"NAME\",\"type\":\"string\",\"priority\":0},"

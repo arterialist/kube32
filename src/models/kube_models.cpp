@@ -164,7 +164,9 @@ std::string JsonValue::to_string(bool pretty, int indent_level) const {
 
 class StrictJsonParser {
 public:
-    explicit StrictJsonParser(std::string_view input) : input_(input), pos_(0) {}
+    static constexpr size_t MAX_RECURSION_DEPTH = 32;
+
+    explicit StrictJsonParser(std::string_view input) : input_(input), pos_(0), depth_(0) {}
 
     bool parse(JsonValue& out, std::string& err) {
         skip_whitespace();
@@ -186,6 +188,12 @@ public:
     }
 
 private:
+    struct DepthGuard {
+        size_t& d_;
+        explicit DepthGuard(size_t& d) : d_(d) { ++d_; }
+        ~DepthGuard() { --d_; }
+    };
+
     void skip_whitespace() {
         while (pos_ < input_.size()) {
             char c = input_[pos_];
@@ -208,6 +216,12 @@ private:
     }
 
     bool parse_value(JsonValue& val, std::string& err) {
+        if (depth_ >= MAX_RECURSION_DEPTH) {
+            err = "maximum JSON nesting depth exceeded";
+            return false;
+        }
+        DepthGuard guard(depth_);
+
         skip_whitespace();
         if (pos_ >= input_.size()) {
             err = "unexpected end of input";
@@ -467,6 +481,7 @@ private:
 
     std::string_view input_;
     size_t pos_{0};
+    size_t depth_{0};
 };
 
 bool parse_json(std::string_view input, JsonValue& out_value, std::string& out_error) {

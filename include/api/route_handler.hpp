@@ -8,6 +8,10 @@
 #include <string_view>
 #include <memory>
 
+namespace kube32::osal {
+class Socket;
+}
+
 namespace kube32::api {
 
 enum class RouteCategory {
@@ -16,6 +20,7 @@ enum class RouteCategory {
     DiscoveryApis,
     DiscoveryApiV1,
     DiscoveryApisAppsV1,
+    DiscoveryApisEventsV1,
     DiscoveryOpenApiV3,
     NodesCollection,
     NodeItem,
@@ -49,7 +54,7 @@ public:
     static RouteMatch match_route(std::string_view path);
 
     // Primary request handling entry point
-    HttpResponse handle_request(const HttpRequest& req, mem::MonotonicArena& arena);
+    HttpResponse handle_request(const HttpRequest& req, mem::MonotonicArena& arena, osal::Socket* client_sock = nullptr);
 
     // Standard Kubernetes Status object helper
     static HttpResponse make_status(int status_code, 
@@ -64,9 +69,9 @@ private:
 
     // Endpoint dispatchers
     HttpResponse handle_discovery(const HttpRequest& req, RouteCategory category);
-    HttpResponse handle_nodes(const HttpRequest& req, const RouteMatch& match);
-    HttpResponse handle_pods(const HttpRequest& req, const RouteMatch& match);
-    HttpResponse handle_deployments(const HttpRequest& req, const RouteMatch& match);
+    HttpResponse handle_nodes(const HttpRequest& req, const RouteMatch& match, mem::MonotonicArena& arena, osal::Socket* client_sock = nullptr);
+    HttpResponse handle_pods(const HttpRequest& req, const RouteMatch& match, mem::MonotonicArena& arena, osal::Socket* client_sock = nullptr);
+    HttpResponse handle_deployments(const HttpRequest& req, const RouteMatch& match, mem::MonotonicArena& arena, osal::Socket* client_sock = nullptr);
 };
 
 } // namespace kube32::api

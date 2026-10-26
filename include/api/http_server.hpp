@@ -12,11 +12,14 @@
 
 namespace kube32::api {
 
+constexpr size_t MAX_REQUEST_BODY_SIZE = 2 * 1024 * 1024; // 2MB
+
 struct HttpServerOptions {
     std::string host{"0.0.0.0"};
     uint16_t port{6443};
     int backlog{10};
     size_t rx_buffer_size{8192};
+    size_t max_body_size{MAX_REQUEST_BODY_SIZE};
 };
 
 class HttpServer {

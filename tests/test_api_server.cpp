@@ -160,6 +160,42 @@ void test_discovery_and_method_enforcement() {
     assert(resp7.status_code == 200);
     assert(resp7.body == "{\"paths\":{}}");
 
+    // 8. GET /apis/events.k8s.io/v1 -> 200 APIResourceList
+    HttpRequest r8;
+    r8.method = HttpMethod::Get;
+    r8.path = "/apis/events.k8s.io/v1";
+    HttpResponse resp8 = handler.handle_request(r8, arena);
+    assert(resp8.status_code == 200);
+    assert(resp8.body.find("\"groupVersion\":\"events.k8s.io/v1\"") != std::string::npos);
+    assert(resp8.body.find("\"resources\":[]") != std::string::npos);
+
+    // 9. Arena scratchpad offset > 0 verification
+    assert(arena.get_offset() > 0);
+
+    // 10. HEAD /api/v1/nodes -> 200 OK with empty body
+    HttpRequest r9;
+    r9.method = HttpMethod::Head;
+    r9.path = "/api/v1/nodes";
+    HttpResponse resp9 = handler.handle_request(r9, arena);
+    assert(resp9.status_code == 200);
+    assert(resp9.body.empty());
+
+    // 11. HEAD /api/v1/pods -> 200 OK with empty body
+    HttpRequest r10;
+    r10.method = HttpMethod::Head;
+    r10.path = "/api/v1/pods";
+    HttpResponse resp10 = handler.handle_request(r10, arena);
+    assert(resp10.status_code == 200);
+    assert(resp10.body.empty());
+
+    // 12. HEAD /apis/apps/v1/namespaces/default/deployments -> 200 OK with empty body
+    HttpRequest r11;
+    r11.method = HttpMethod::Head;
+    r11.path = "/apis/apps/v1/namespaces/default/deployments";
+    HttpResponse resp11 = handler.handle_request(r11, arena);
+    assert(resp11.status_code == 200);
+    assert(resp11.body.empty());
+
     std::cout << "[PASS] test_discovery_and_method_enforcement" << std::endl;
 }
 
@@ -208,6 +244,31 @@ void test_table_serialization_columns() {
     std::cout << "[PASS] test_table_serialization_columns" << std::endl;
 }
 
+void test_json_recursion_depth_limit() {
+    std::cout << "[RUN] test_json_recursion_depth_limit" << std::endl;
+
+    // Shallow depth (20) should parse fine
+    std::string shallow;
+    for (int i = 0; i < 20; ++i) shallow += "{\"a\":";
+    shallow += "1";
+    for (int i = 0; i < 20; ++i) shallow += "}";
+
+    kube32::models::JsonValue doc;
+    std::string err;
+    assert(kube32::models::parse_json(shallow, doc, err));
+
+    // Deep depth (40) should be cleanly rejected with depth exceeded error
+    std::string deep;
+    for (int i = 0; i < 40; ++i) deep += "{\"a\":";
+    deep += "1";
+    for (int i = 0; i < 40; ++i) deep += "}";
+
+    assert(!kube32::models::parse_json(deep, doc, err));
+    assert(err.find("maximum JSON nesting depth exceeded") != std::string::npos);
+
+    std::cout << "[PASS] test_json_recursion_depth_limit" << std::endl;
+}
+
 int main() {
     std::cout << "=== Running Kube32 API Server & Router Unit Tests ===" << std::endl;
     test_uri_normalization();
@@ -215,6 +276,7 @@ int main() {
     test_discovery_and_method_enforcement();
     test_chunked_stream_writer_framing();
     test_table_serialization_columns();
+    test_json_recursion_depth_limit();
     std::cout << "=== All API Server Tests Passed Successfully ===" << std::endl;
     return 0;
 }

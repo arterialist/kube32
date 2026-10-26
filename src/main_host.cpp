@@ -62,6 +62,9 @@ int main(int argc, char* argv[]) {
 
     std::signal(SIGINT, signal_handler);
     std::signal(SIGTERM, signal_handler);
+#if defined(SIGPIPE)
+    std::signal(SIGPIPE, SIG_IGN);
+#endif
 
     std::cout << "==================================================================" << std::endl;
     std::cout << "  Kube32 Embedded Cluster Host Simulation Daemon (kube32-sim)     " << std::endl;

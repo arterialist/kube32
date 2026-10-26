@@ -50,6 +50,7 @@ struct HttpRequest {
     std::string accept;
     std::string content_type;
     size_t content_length{0};
+    bool invalid_content_length{false};
     std::string body;
     bool as_table{false};
 };

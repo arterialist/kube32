@@ -154,4 +154,11 @@ else()
     target_link_libraries(test_scheduler PRIVATE kube32_core)
     add_test(NAME test_scheduler COMMAND test_scheduler)
 
+    # 8. Autonomous Scheduler Adversarial Stress Tests (Milestone 2)
+    add_executable(test_scheduler_adversarial
+        tests/test_scheduler_adversarial.cpp
+    )
+    target_link_libraries(test_scheduler_adversarial PRIVATE kube32_core)
+    add_test(NAME test_scheduler_adversarial COMMAND test_scheduler_adversarial)
+
 endif()
