@@ -3,18 +3,26 @@
 #if defined(ESP_PLATFORM)
 
 #include <esp_timer.h>
+#include <atomic>
 
 namespace kube32::osal {
 
 struct Timer::Impl {
     Config config;
     esp_timer_handle_t handle{nullptr};
-    bool running{false};
+    std::atomic<bool> running{false};
+    std::atomic<bool> periodic{false};
 
     static void esp_timer_callback(void* arg) {
         auto* impl = static_cast<Impl*>(arg);
-        if (impl && impl->config.callback) {
-            impl->config.callback(impl->config.arg);
+        if (impl) {
+            // For one-shot timers, reset running flag upon callback execution
+            if (!impl->periodic.load(std::memory_order_acquire)) {
+                impl->running.store(false, std::memory_order_release);
+            }
+            if (impl->config.callback) {
+                impl->config.callback(impl->config.arg);
+            }
         }
     }
 };
@@ -77,22 +85,23 @@ bool Timer::start(uint64_t period_ms, bool periodic) {
     esp_err_t err = periodic ? esp_timer_start_periodic(impl_->handle, period_us)
                              : esp_timer_start_once(impl_->handle, period_us);
     if (err == ESP_OK) {
-        impl_->running = true;
+        impl_->periodic.store(periodic, std::memory_order_release);
+        impl_->running.store(true, std::memory_order_release);
         return true;
     }
     return false;
 }
 
 bool Timer::stop() {
-    if (impl_ && impl_->handle && impl_->running) {
+    if (impl_ && impl_->handle && impl_->running.load(std::memory_order_acquire)) {
         esp_timer_stop(impl_->handle);
-        impl_->running = false;
+        impl_->running.store(false, std::memory_order_release);
     }
     return true;
 }
 
 bool Timer::is_running() const {
-    return impl_ && impl_->running;
+    return impl_ && impl_->running.load(std::memory_order_acquire);
 }
 
 uint64_t Timer::get_time_ms() {

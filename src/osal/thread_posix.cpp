@@ -184,6 +184,7 @@ int Thread::get_current_core() {
 #include <thread>
 #include <cstring>
 #include <unistd.h>
+#include <algorithm>
 
 namespace kube32::osal {
 
@@ -250,7 +251,13 @@ bool Thread::start(EntryFn entry, void* arg, const Config& config) {
     pthread_attr_t attr;
     pthread_attr_init(&attr);
     if (config.stack_size > 0) {
-        pthread_attr_setstacksize(&attr, config.stack_size);
+#if defined(PTHREAD_STACK_MIN)
+        size_t min_stack = static_cast<size_t>(PTHREAD_STACK_MIN);
+#else
+        size_t min_stack = 16384;
+#endif
+        size_t actual_stack = std::max(config.stack_size, min_stack);
+        pthread_attr_setstacksize(&attr, actual_stack);
     }
 
     int rc = pthread_create(&impl_->handle, &attr, Impl::posix_trampoline, impl_);

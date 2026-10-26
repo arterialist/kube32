@@ -199,6 +199,93 @@ void test_system_telemetry() {
     std::cout << "[PASS] test_system_telemetry" << std::endl;
 }
 
+void test_condition_variable_lost_wakeup_guard() {
+    std::cout << "[RUN] test_condition_variable_lost_wakeup_guard" << std::endl;
+    Mutex mtx;
+    ConditionVariable cv;
+    std::atomic<int> completed_consumers{0};
+    constexpr int NUM_CONSUMERS = 4;
+    constexpr int PULSES = 20;
+
+    std::vector<Thread> consumers(NUM_CONSUMERS);
+    std::atomic<bool> start_gate{false};
+    int pulse_sequence = 0;
+
+    struct ConsumerCtx {
+        Mutex* mtx;
+        ConditionVariable* cv;
+        int* seq;
+        std::atomic<bool>* gate;
+        std::atomic<int>* completed;
+        int last_seen{0};
+    };
+
+    std::vector<ConsumerCtx> ctxs(NUM_CONSUMERS);
+    for (int i = 0; i < NUM_CONSUMERS; ++i) {
+        ctxs[i] = {&mtx, &cv, &pulse_sequence, &start_gate, &completed_consumers, 0};
+        consumers[i].start([](void* arg) {
+            auto* c = static_cast<ConsumerCtx*>(arg);
+            while (!c->gate->load()) {
+                Thread::yield();
+            }
+            while (c->last_seen < PULSES) {
+                UniqueLock<Mutex> lock(*c->mtx);
+                c->cv->wait(lock, [&]() { return *c->seq > c->last_seen; });
+                c->last_seen = *c->seq;
+            }
+            c->completed->fetch_add(1);
+        }, &ctxs[i]);
+    }
+
+    start_gate.store(true);
+    for (int p = 1; p <= PULSES; ++p) {
+        Thread::sleep_ms(2);
+        {
+            LockGuard<Mutex> lock(mtx);
+            pulse_sequence = p;
+        }
+        cv.notify_all();
+    }
+
+    for (int i = 0; i < NUM_CONSUMERS; ++i) {
+        consumers[i].join();
+    }
+    assert(completed_consumers.load() == NUM_CONSUMERS);
+    std::cout << "[PASS] test_condition_variable_lost_wakeup_guard" << std::endl;
+}
+
+void test_timer_oneshot_state_reset() {
+    std::cout << "[RUN] test_timer_oneshot_state_reset" << std::endl;
+    std::atomic<bool> fired{false};
+
+    Timer timer;
+    Timer::Config cfg;
+    cfg.name = "oneshot_reset_test";
+    cfg.callback = [](void* arg) {
+        auto* f = static_cast<std::atomic<bool>*>(arg);
+        f->store(true);
+    };
+    cfg.arg = &fired;
+
+    assert(timer.init(cfg));
+    assert(timer.start(20, false)); // 20ms one-shot
+    assert(timer.is_running());
+
+    // Wait until callback fires (up to 100ms)
+    uint64_t start = Thread::get_time_ms();
+    while (!fired.load() && (Thread::get_time_ms() - start < 100)) {
+        Thread::sleep_ms(5);
+    }
+    assert(fired.load());
+
+    // Allow worker thread / callback to finish state update
+    Thread::sleep_ms(10);
+
+    // Verify timer is NO LONGER running without calling stop()
+    assert(!timer.is_running());
+    std::cout << "[PASS] test_timer_oneshot_state_reset" << std::endl;
+}
+
 int main() {
     std::cout << "=== Running Kube32 OSAL Tests ===" << std::endl;
     test_thread_lifecycle();
@@ -206,7 +293,9 @@ int main() {
     test_mutex_basic();
     test_recursive_mutex();
     test_condition_variable();
+    test_condition_variable_lost_wakeup_guard();
     test_timer_oneshot_and_periodic();
+    test_timer_oneshot_state_reset();
     test_socket_loopback();
     test_system_telemetry();
     std::cout << "=== All OSAL Tests Passed Successfully ===" << std::endl;

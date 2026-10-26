@@ -25,19 +25,37 @@ public:
     }
 
     Status remove(const std::string& key) override {
-        std::unique_lock<std::shared_mutex> lock(rw_mutex_);
-        std::string deleted_val;
-        uint64_t deleted_ver = 0;
-        if (!tree_.remove(key, &deleted_val, &deleted_ver)) {
-            return Status::NotFound();
+        if (key.empty()) {
+            return Status::InvalidArgument("Storage key cannot be empty");
         }
 
-        if (options_.enable_flash_persistence && !is_key_ephemeral(key)) {
-            journal_.remove_file(key);
+        std::vector<WatchCallback> pending_callbacks;
+        WatchEvent pending_event;
+        bool has_event = false;
+
+        {
+            std::unique_lock<std::shared_mutex> lock(rw_mutex_);
+            std::string deleted_val;
+            uint64_t deleted_ver = 0;
+            if (!tree_.remove(key, &deleted_val, &deleted_ver)) {
+                return Status::NotFound();
+            }
+
+            if (options_.enable_flash_persistence && !is_key_ephemeral(key)) {
+                journal_.remove_file(key);
+            }
+
+            uint64_t new_version = ++current_version_;
+            pending_callbacks = collect_matching_watchers(key);
+            if (!pending_callbacks.empty()) {
+                pending_event = WatchEvent{WatchEventType::Deleted, key, deleted_val, new_version};
+                has_event = true;
+            }
         }
 
-        uint64_t new_version = ++current_version_;
-        notify_watchers(WatchEventType::Deleted, key, deleted_val, new_version);
+        if (has_event) {
+            notify_watchers(pending_callbacks, pending_event);
+        }
         return Status::Ok();
     }
 
@@ -83,6 +101,9 @@ public:
     }
 
     Status get_extended(const std::string& key, std::string& out_json, uint64_t* out_version) override {
+        if (key.empty()) {
+            return Status::InvalidArgument("Storage key cannot be empty");
+        }
         std::shared_lock<std::shared_mutex> lock(rw_mutex_);
         if (tree_.get(key, out_json, out_version)) {
             return Status::Ok();
@@ -93,38 +114,67 @@ public:
     Status put_extended(const std::string& key, const std::string& json, 
                         bool overwrite, bool persist_to_flash, 
                         uint64_t expected_version, uint64_t* out_version) override {
-        std::unique_lock<std::shared_mutex> lock(rw_mutex_);
-
-        // OCC CAS check
-        std::string existing_val;
-        uint64_t existing_ver = 0;
-        bool exists = tree_.get(key, existing_val, &existing_ver);
-
-        if (exists && expected_version > 0 && existing_ver != expected_version) {
-            return Status::VersionConflict("ResourceVersion mismatch: expected " + 
-                                          std::to_string(expected_version) + " but found " + 
-                                          std::to_string(existing_ver));
+        if (key.empty()) {
+            return Status::InvalidArgument("Storage key cannot be empty");
         }
 
-        if (exists && !overwrite) {
-            return Status::AlreadyExists();
-        }
+        std::vector<WatchCallback> pending_callbacks;
+        WatchEvent pending_event;
+        bool has_event = false;
 
-        // Two-phase atomic write to LittleFS
-        if (options_.enable_flash_persistence && persist_to_flash) {
-            if (!journal_.atomic_write(key, json)) {
-                return Status::StorageFull("Failed writing to persistent flash journal");
+        {
+            std::unique_lock<std::shared_mutex> lock(rw_mutex_);
+
+            // OCC CAS check
+            std::string existing_val;
+            uint64_t existing_ver = 0;
+            bool exists = tree_.get(key, existing_val, &existing_ver);
+
+            if (expected_version > 0) {
+                if (!exists) {
+                    return Status::VersionConflict("ResourceVersion mismatch: key does not exist for expected version " + 
+                                                  std::to_string(expected_version));
+                }
+                if (existing_ver != expected_version) {
+                    return Status::VersionConflict("ResourceVersion mismatch: expected " + 
+                                                  std::to_string(expected_version) + " but found " + 
+                                                  std::to_string(existing_ver));
+                }
+            }
+
+            if (exists && !overwrite) {
+                return Status::AlreadyExists();
+            }
+
+            // Two-phase atomic write to LittleFS
+            if (options_.enable_flash_persistence && persist_to_flash) {
+                if (!journal_.atomic_write(key, json)) {
+                    return Status::StorageFull("Failed writing to persistent flash journal");
+                }
+            }
+
+            uint64_t new_ver = current_version_ + 1;
+            bool is_new = false;
+            if (!tree_.put(key, json, new_ver, !persist_to_flash, overwrite, &is_new)) {
+                return Status::InternalError("Failed inserting key into state store index");
+            }
+            current_version_ = new_ver;
+
+            if (out_version) *out_version = new_ver;
+
+            pending_callbacks = collect_matching_watchers(key);
+            if (!pending_callbacks.empty()) {
+                pending_event = WatchEvent{
+                    is_new ? WatchEventType::Added : WatchEventType::Modified, 
+                    key, json, new_ver
+                };
+                has_event = true;
             }
         }
 
-        uint64_t new_ver = ++current_version_;
-        bool is_new = false;
-        tree_.put(key, json, new_ver, !persist_to_flash, overwrite, &is_new);
-
-        if (out_version) *out_version = new_ver;
-
-        notify_watchers(is_new ? WatchEventType::Added : WatchEventType::Modified, 
-                        key, json, new_ver);
+        if (has_event) {
+            notify_watchers(pending_callbacks, pending_event);
+        }
         return Status::Ok();
     }
 
@@ -190,12 +240,21 @@ private:
         return val == 0 ? 1 : val;
     }
 
-    void notify_watchers(WatchEventType type, const std::string& key, 
-                         const std::string& json, uint64_t version) {
-        WatchEvent ev{type, key, json, version};
+    std::vector<WatchCallback> collect_matching_watchers(const std::string& key) const {
+        std::vector<WatchCallback> callbacks;
         for (const auto& w : watchers_) {
             if (key.rfind(w.prefix, 0) == 0) {
-                w.callback(ev);
+                callbacks.push_back(w.callback);
+            }
+        }
+        return callbacks;
+    }
+
+    static void notify_watchers(const std::vector<WatchCallback>& callbacks, 
+                                const WatchEvent& event) {
+        for (const auto& cb : callbacks) {
+            if (cb) {
+                cb(event);
             }
         }
     }

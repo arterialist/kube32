@@ -19,14 +19,32 @@ LittleFSJournal::LittleFSJournal(std::string base_path) : base_path_(std::move(b
 }
 
 std::string LittleFSJournal::key_to_filepath(const std::string& key) const {
-    std::string cleaned_key = key;
-    if (!cleaned_key.empty() && cleaned_key.front() == '/') {
-        cleaned_key = cleaned_key.substr(1);
+    if (key.empty()) {
+        return "";
     }
+
+    // Traversal and malformed path defense: reject directory traversal (..) and backslashes
+    if (key.find("..") != std::string::npos || key.find('\\') != std::string::npos) {
+        return "";
+    }
+
+    // Strip all leading slashes
+    size_t start = 0;
+    while (start < key.size() && key[start] == '/') {
+        ++start;
+    }
+    if (start >= key.size()) {
+        return ""; // Key consisted solely of slashes
+    }
+
+    std::string cleaned_key = key.substr(start);
     return base_path_ + "/" + cleaned_key + ".json";
 }
 
 std::string LittleFSJournal::filepath_to_key(const std::string& filepath) const {
+    if (filepath.find("..") != std::string::npos) {
+        return "";
+    }
     if (filepath.rfind(base_path_, 0) == 0) {
         std::string sub = filepath.substr(base_path_.size());
         if (!sub.empty() && sub.front() != '/') {
@@ -56,6 +74,9 @@ bool LittleFSJournal::ensure_parent_dirs(const std::string& path) {
 
 bool LittleFSJournal::atomic_write(const std::string& key, const std::string& content) {
     std::string target_file = key_to_filepath(key);
+    if (target_file.empty()) {
+        return false;
+    }
     std::string tmp_file = target_file + ".tmp";
 
     if (!ensure_parent_dirs(target_file)) {
@@ -101,6 +122,9 @@ bool LittleFSJournal::atomic_write(const std::string& key, const std::string& co
 
 bool LittleFSJournal::remove_file(const std::string& key) {
     std::string target_file = key_to_filepath(key);
+    if (target_file.empty()) {
+        return false;
+    }
     return unlink(target_file.c_str()) == 0;
 }
 

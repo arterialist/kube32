@@ -100,28 +100,35 @@ else()
     # ==========================================================================
     enable_testing()
 
-    # 1. OSAL Unit Tests
+    # 1. OSAL Unit & Concurrency Tests
     add_executable(test_osal
         tests/test_osal.cpp
     )
     target_link_libraries(test_osal PRIVATE kube32_core)
     add_test(NAME test_osal COMMAND test_osal)
 
-    # 2. Memory Architecture Unit Tests
+    # 2. Memory Architecture Baseline Tests
     add_executable(test_memory
         tests/test_memory.cpp
     )
     target_link_libraries(test_memory PRIVATE kube32_core)
     add_test(NAME test_memory COMMAND test_memory)
 
-    # 3. Storage Engine Unit Tests
+    # 3. Memory Architecture Adversarial Stress & Hardening Tests
+    add_executable(test_memory_adversarial
+        tests/test_memory_adversarial.cpp
+    )
+    target_link_libraries(test_memory_adversarial PRIVATE kube32_core)
+    add_test(NAME test_memory_adversarial COMMAND test_memory_adversarial)
+
+    # 4. Storage Engine Baseline Tests
     add_executable(test_storage
         tests/test_storage.cpp
     )
     target_link_libraries(test_storage PRIVATE kube32_core)
     add_test(NAME test_storage COMMAND test_storage)
 
-    # 4. Storage Engine Adversarial Stress Tests
+    # 5. Storage Engine Adversarial Stress & Hardening Tests
     add_executable(test_storage_adversarial
         tests/test_storage_adversarial.cpp
     )

@@ -62,10 +62,18 @@ void* MonotonicArena::allocate(size_t bytes, size_t alignment) {
     if (bytes == 0 || !buffer_) return nullptr;
 
     if (alignment == 0) alignment = 4;
-    // Align offset
-    size_t aligned_offset = (offset_ + alignment - 1) & ~(alignment - 1);
-    if (aligned_offset + bytes > capacity_) {
-        return nullptr; // Arena capacity exceeded
+
+    // Calculate alignment based on physical base address
+    uintptr_t base_addr = reinterpret_cast<uintptr_t>(buffer_ + offset_);
+    size_t padding = (alignment - (base_addr % alignment)) % alignment;
+
+    if (offset_ > capacity_ || padding > (capacity_ - offset_)) {
+        return nullptr;
+    }
+
+    size_t aligned_offset = offset_ + padding;
+    if (aligned_offset > capacity_ || bytes > (capacity_ - aligned_offset)) {
+        return nullptr; // Arena capacity exceeded or integer overflow
     }
 
     void* ptr = buffer_ + aligned_offset;

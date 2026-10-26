@@ -618,24 +618,20 @@ void test_adversarial_vulnerabilities_and_edge_cases() {
     // ------------------------------------------------------------------------
     std::cout << "  -> Probing ADV-1: CAS on non-existent key with expected_version > 0..." << std::endl;
     Status s_ghost = store->put_extended("/registry/pods/default/phantom-key", "{\"kind\":\"Pod\"}", true, false, 999, nullptr);
-    if (s_ghost.ok()) {
-        std::cout << "     [VULNERABILITY REPRODUCED] OCC CAS allowed write on non-existent key with expected_version=999!" << std::endl;
-    } else {
-        std::cout << "     [OK] CAS correctly rejected: " << s_ghost.message << std::endl;
-    }
+    // REGRESSION ASSERTION: CAS on non-existent key must be rejected with VersionConflict or NotFound
+    assert(!s_ghost.ok());
+    assert(s_ghost.code == StatusCode::VersionConflict || s_ghost.code == StatusCode::NotFound);
+    std::cout << "     [PASS] CAS correctly rejected: " << s_ghost.message << std::endl;
 
     // ------------------------------------------------------------------------
     // ADV-2: Silent False-Positive on Empty Key
     // ------------------------------------------------------------------------
     std::cout << "  -> Probing ADV-2: Empty key insertion in store->put(\"\")..." << std::endl;
     Status s_empty = store->put("", "{\"empty\":true}", true);
-    std::string empty_val;
-    Status s_get = store->get("", empty_val);
-    if (s_empty.ok() && !s_get.ok()) {
-        std::cout << "     [VULNERABILITY REPRODUCED] store->put(\"\") returned Ok, but key does not exist in store!" << std::endl;
-    } else {
-        std::cout << "     [OK] store->put(\"\") rejected as expected: " << s_empty.message << std::endl;
-    }
+    // REGRESSION ASSERTION: Empty key must be rejected with InvalidArgument
+    assert(!s_empty.ok());
+    assert(s_empty.code == StatusCode::InvalidArgument);
+    std::cout << "     [PASS] store->put(\"\") rejected as expected: " << s_empty.message << std::endl;
 
     // ------------------------------------------------------------------------
     // ADV-3: Path Traversal Vulnerability in LittleFS Journal
@@ -644,31 +640,33 @@ void test_adversarial_vulnerabilities_and_edge_cases() {
     LittleFSJournal journal(test_dir);
     std::string traversal_key = "/../../../tmp/kube32_traversal_test_" + std::to_string(Thread::get_time_us());
     std::string generated_path = journal.key_to_filepath(traversal_key);
-    std::cout << "     Key: " << traversal_key << " -> Filepath: " << generated_path << std::endl;
-    if (generated_path.find("/../") != std::string::npos) {
-        std::cout << "     [VULNERABILITY REPRODUCED] LittleFSJournal unescaped relative path allows escaping base_path!" << std::endl;
-    }
+    // REGRESSION ASSERTION: Traversal must be rejected (empty path) or sanitized without escaping base_path
+    assert(generated_path.empty() || generated_path.find("..") == std::string::npos);
+    std::cout << "     [PASS] Path traversal safely rejected/sanitized." << std::endl;
 
     // ------------------------------------------------------------------------
     // ADV-4: Synchronous Re-Entrancy Hazard in Watcher Callbacks
     // ------------------------------------------------------------------------
     std::cout << "  -> Probing ADV-4: Synchronous re-entrant read deadlock in watcher..." << std::endl;
-    // We demonstrate that the callback is invoked while holding unique_lock.
-    // To avoid freezing the entire test process, we launch the put in a worker thread
-    // and verify that an internal get() blocks / deadlocks until timed out.
     std::atomic<bool> inside_watcher{false};
-    std::atomic<bool> read_attempted{false};
+    std::atomic<bool> reentrant_read_success{false};
 
-    uint32_t wid = store->watch("/registry/pods/deadlock-test", [&](const WatchEvent& ev) {
+    uint32_t wid = store->watch("/registry/pods/reentrant-test", [&](const WatchEvent& ev) {
         inside_watcher.store(true);
         // Attempting to read from the store inside watcher callback:
-        read_attempted.store(true);
         std::string out;
-        // This will block indefinitely because rw_mutex_ is held exclusively by the notifying thread!
+        Status s = store->get(ev.key, out);
+        if (s.ok()) {
+            reentrant_read_success.store(true);
+        }
     });
 
-    std::cout << "     [ARCHITECTURAL HAZARD CONFIRMED] Watchers are invoked synchronously while rw_mutex_ unique_lock is held." << std::endl;
+    Status s_reent = store->put("/registry/pods/reentrant-test/pod1", "{\"state\":\"running\"}", false);
+    assert(s_reent.ok());
+    assert(inside_watcher.load());
+    assert(reentrant_read_success.load()); // Confirms watcher executed outside rw_mutex_!
     store->unwatch(wid);
+    std::cout << "     [PASS] Watcher re-entrancy executed without deadlock." << std::endl;
 
     std::cout << "  [COMPLETED] Adversarial Vulnerabilities & Boundary Probing Completed." << std::endl;
 }

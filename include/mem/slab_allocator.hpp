@@ -5,6 +5,7 @@
 #include <new>
 #include <utility>
 #include <type_traits>
+#include <bitset>
 #include "osal/mutex.hpp"
 
 namespace kube32::mem {
@@ -19,7 +20,7 @@ public:
         int16_t next_free;
     };
 
-    SlabAllocator() : free_head_(0), active_count_(0), high_water_mark_(0) {
+    SlabAllocator() : free_head_(0), active_count_(0), high_water_mark_(0), occupied_{0} {
         for (size_t i = 0; i < Capacity - 1; ++i) {
             slots_[i].next_free = static_cast<int16_t>(i + 1);
         }
@@ -41,12 +42,21 @@ public:
         int16_t idx = free_head_;
         free_head_ = slots_[idx].next_free;
         active_count_++;
-        if (active_count_ > high_water_mark_) {
-            high_water_mark_ = active_count_;
-        }
 
         T* obj_ptr = reinterpret_cast<T*>(slots_[idx].storage);
-        return new (obj_ptr) T(std::forward<Args>(args)...);
+        try {
+            T* instance = new (obj_ptr) T(std::forward<Args>(args)...);
+            occupied_.set(static_cast<size_t>(idx));
+            if (active_count_ > high_water_mark_) {
+                high_water_mark_ = active_count_;
+            }
+            return instance;
+        } catch (...) {
+            slots_[idx].next_free = free_head_;
+            free_head_ = idx;
+            active_count_--;
+            throw;
+        }
     }
 
     void deallocate(T* ptr) {
@@ -65,12 +75,16 @@ public:
             return; // Misaligned slot address
         }
 
-        // Call destructor
-        ptr->~T();
-
         int16_t idx = static_cast<int16_t>(offset / sizeof(Slot));
 
         osal::LockGuard<osal::Mutex> lock(mutex_);
+        if (!occupied_.test(static_cast<size_t>(idx))) {
+            return; // Double-free or unallocated slot rejected!
+        }
+
+        occupied_.reset(static_cast<size_t>(idx));
+        ptr->~T();
+
         slots_[idx].next_free = free_head_;
         free_head_ = idx;
         if (active_count_ > 0) {
@@ -80,15 +94,19 @@ public:
 
     size_t capacity() const { return Capacity; }
     size_t active_count() const {
+        osal::LockGuard<osal::Mutex> lock(mutex_);
         return active_count_;
     }
     size_t free_count() const {
+        osal::LockGuard<osal::Mutex> lock(mutex_);
         return Capacity - active_count_;
     }
     size_t high_water_mark() const {
+        osal::LockGuard<osal::Mutex> lock(mutex_);
         return high_water_mark_;
     }
     bool is_full() const {
+        osal::LockGuard<osal::Mutex> lock(mutex_);
         return free_head_ == -1;
     }
 
@@ -97,6 +115,7 @@ private:
     int16_t free_head_;
     size_t active_count_;
     size_t high_water_mark_;
+    std::bitset<Capacity> occupied_{0};
     mutable osal::Mutex mutex_;
 };
 

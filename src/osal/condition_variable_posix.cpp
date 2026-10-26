@@ -30,13 +30,17 @@ ConditionVariable::~ConditionVariable() {
 
 void ConditionVariable::notify_one() {
     if (impl_) {
+        pthread_mutex_lock(&impl_->internal_mtx);
         pthread_cond_signal(&impl_->cond);
+        pthread_mutex_unlock(&impl_->internal_mtx);
     }
 }
 
 void ConditionVariable::notify_all() {
     if (impl_) {
+        pthread_mutex_lock(&impl_->internal_mtx);
         pthread_cond_broadcast(&impl_->cond);
+        pthread_mutex_unlock(&impl_->internal_mtx);
     }
 }
 
