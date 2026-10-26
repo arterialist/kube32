@@ -22,22 +22,27 @@ KNOWN_PORTS = {
 }
 
 def flash_port(port, baud=460800):
-    cmd = [
-        ESPTOOL,
-        "--port", port,
-        "--chip", "esp32s3",
-        "-b", str(baud),
-        "--before", "default_reset",
-        "--after", "hard_reset",
-        "write_flash",
-        "--flash_mode", "dio",
-        "--flash_size", "8MB",
-        "--flash_freq", "80m",
-        "0x0", BOOTLOADER,
-        "0x8000", PARTITIONS,
-        "0x20000", FIRMWARE
-    ]
-    res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    script_path = os.path.join(os.path.dirname(__file__), "flash.sh")
+    if os.path.exists(script_path):
+        cmd = ["bash", script_path, port, str(baud)]
+    else:
+        cmd = [
+            ESPTOOL,
+            "--port", port,
+            "--chip", "esp32s3",
+            "-b", str(baud),
+            "--before", "default-reset",
+            "--after", "hard-reset",
+            "write-flash",
+            "-u",
+            "--flash-mode", "dio",
+            "--flash-size", "8MB",
+            "--flash-freq", "80m",
+            "0x0", BOOTLOADER,
+            "0x8000", PARTITIONS,
+            "0x20000", FIRMWARE
+        ]
+    res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, errors="replace")
     return res.returncode == 0, res.stdout
 
 def probe_port(port):
@@ -46,9 +51,9 @@ def probe_port(port):
         "--port", port,
         "--chip", "esp32s3",
         "-b", "115200",
-        "chip_id"
+        "chip-id"
     ]
-    res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, errors="replace")
     return res.returncode == 0, res.stdout
 
 def main():
@@ -79,6 +84,7 @@ def main():
             else:
                 last_line = out.strip().splitlines()[-1] if out.strip() else "Timeout"
                 print(f"[STATUS] {port}: {last_line}")
+                time.sleep(3) # Throttled backoff on flash failure
         time.sleep(2)
         if len(ports) == 0:
             print("[SCAN] Waiting for boards to be connected...", end="\r", flush=True)
