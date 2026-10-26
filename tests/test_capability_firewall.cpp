@@ -8,7 +8,10 @@ using namespace kube32::hal;
 
 void test_device_grant_bitmask() {
     DeviceGrant grant;
-    assert(sizeof(DeviceGrant) == 20);
+    assert(sizeof(DeviceGrant) == 24);
+    assert(!grant.is_ipc_permitted());
+    grant.capabilities_mask |= KUBE32_CAP_IPC;
+    assert(grant.is_ipc_permitted());
 
     // GPIO read/write bits
     grant.gpio_read_mask |= (1ULL << 4);

@@ -37,6 +37,10 @@ RouteMatch RouteHandler::match_route(std::string_view path) {
         match.category = RouteCategory::DiscoveryApisEventsV1;
         return match;
     }
+    if (path == "/apis/coordination.k8s.io" || path == "/apis/coordination.k8s.io/v1") {
+        match.category = RouteCategory::DiscoveryApisCoordinationV1;
+        return match;
+    }
     if (path == "/openapi/v3") {
         match.category = RouteCategory::DiscoveryOpenApiV3;
         return match;
@@ -139,6 +143,37 @@ RouteMatch RouteHandler::match_route(std::string_view path) {
         }
     }
 
+    // 5. Coordination Leases Endpoints:
+    // /apis/coordination.k8s.io/v1/namespaces/{ns}/leases
+    // /apis/coordination.k8s.io/v1/namespaces/{ns}/leases/{name}
+    // /apis/coordination.k8s.io/v1/leases
+    if (path == "/apis/coordination.k8s.io/v1/leases") {
+        match.category = RouteCategory::LeasesNsCollection;
+        return match;
+    }
+    static constexpr std::string_view kCoordNsPrefix = "/apis/coordination.k8s.io/v1/namespaces/";
+    if (path.rfind(kCoordNsPrefix, 0) == 0) {
+        std::string_view sub = path.substr(kCoordNsPrefix.length());
+        size_t slash1 = sub.find('/');
+        if (slash1 != std::string_view::npos) {
+            match.namespace_name = sub.substr(0, slash1);
+            std::string_view rest = sub.substr(slash1 + 1);
+
+            if (rest == "leases") {
+                match.category = RouteCategory::LeasesNsCollection;
+                return match;
+            } else if (rest.rfind("leases/", 0) == 0) {
+                std::string_view lease_rest = rest.substr(7);
+                size_t slash2 = lease_rest.find('/');
+                if (slash2 == std::string_view::npos) {
+                    match.category = RouteCategory::LeaseItem;
+                    match.resource_name = lease_rest;
+                    return match;
+                }
+            }
+        }
+    }
+
     match.category = RouteCategory::NotFound;
     return match;
 }
@@ -235,6 +270,7 @@ HttpResponse RouteHandler::handle_request(const HttpRequest& req, mem::Monotonic
         case RouteCategory::DiscoveryApiV1:
         case RouteCategory::DiscoveryApisAppsV1:
         case RouteCategory::DiscoveryApisEventsV1:
+        case RouteCategory::DiscoveryApisCoordinationV1:
         case RouteCategory::DiscoveryOpenApiV3:
             return handle_discovery(req, match.category);
 
@@ -254,6 +290,10 @@ HttpResponse RouteHandler::handle_request(const HttpRequest& req, mem::Monotonic
         case RouteCategory::DeploymentStatus:
         case RouteCategory::DeploymentScale:
             return handle_deployments(req, match, arena, client_sock);
+
+        case RouteCategory::LeasesNsCollection:
+        case RouteCategory::LeaseItem:
+            return handle_leases(req, match, arena, client_sock);
 
         case RouteCategory::NotFound:
         default:
@@ -292,7 +332,9 @@ HttpResponse RouteHandler::handle_discovery(const HttpRequest& req, RouteCategor
                         "{\"name\":\"apps\",\"versions\":[{\"groupVersion\":\"apps/v1\",\"version\":\"v1\"}],"
                         "\"preferredVersion\":{\"groupVersion\":\"apps/v1\",\"version\":\"v1\"}},"
                         "{\"name\":\"events.k8s.io\",\"versions\":[{\"groupVersion\":\"events.k8s.io/v1\",\"version\":\"v1\"}],"
-                        "\"preferredVersion\":{\"groupVersion\":\"events.k8s.io/v1\",\"version\":\"v1\"}}"
+                        "\"preferredVersion\":{\"groupVersion\":\"events.k8s.io/v1\",\"version\":\"v1\"}},"
+                        "{\"name\":\"coordination.k8s.io\",\"versions\":[{\"groupVersion\":\"coordination.k8s.io/v1\",\"version\":\"v1\"}],"
+                        "\"preferredVersion\":{\"groupVersion\":\"coordination.k8s.io/v1\",\"version\":\"v1\"}}"
                         "]}";
             break;
 
@@ -326,6 +368,13 @@ HttpResponse RouteHandler::handle_discovery(const HttpRequest& req, RouteCategor
 
         case RouteCategory::DiscoveryApisEventsV1:
             resp.body = "{\"kind\":\"APIResourceList\",\"apiVersion\":\"v1\",\"groupVersion\":\"events.k8s.io/v1\",\"resources\":[]}";
+            break;
+
+        case RouteCategory::DiscoveryApisCoordinationV1:
+            resp.body = "{\"kind\":\"APIResourceList\",\"apiVersion\":\"v1\",\"groupVersion\":\"coordination.k8s.io/v1\",\"resources\":["
+                        "{\"name\":\"leases\",\"singularName\":\"lease\",\"namespaced\":true,\"kind\":\"Lease\","
+                        "\"verbs\":[\"get\",\"list\",\"watch\",\"create\",\"update\",\"patch\",\"delete\"]}"
+                        "]}";
             break;
 
         case RouteCategory::DiscoveryOpenApiV3:
@@ -406,6 +455,9 @@ HttpResponse RouteHandler::handle_nodes(const HttpRequest& req, const RouteMatch
             }
 
             store_.put(key, req.body, false);
+            if (on_lease_renewed_) {
+                on_lease_renewed_(node_name);
+            }
             HttpResponse resp;
             resp.status_code = 201;
             resp.content_type = "application/json";
@@ -441,6 +493,9 @@ HttpResponse RouteHandler::handle_nodes(const HttpRequest& req, const RouteMatch
             return make_status(404, "NotFound", "nodes \"" + name + "\" not found", name, "nodes");
         }
         store_.put(key, req.body, true);
+        if (on_lease_renewed_) {
+            on_lease_renewed_(name);
+        }
         HttpResponse resp;
         resp.status_code = 200;
         resp.content_type = "application/json";
@@ -466,6 +521,9 @@ HttpResponse RouteHandler::handle_nodes(const HttpRequest& req, const RouteMatch
         models::merge_json(target_doc, patch_doc);
         std::string updated_json = target_doc.to_string();
         store_.put(key, updated_json, true);
+        if (on_lease_renewed_) {
+            on_lease_renewed_(name);
+        }
 
         HttpResponse resp;
         resp.status_code = 200;
@@ -623,9 +681,12 @@ HttpResponse RouteHandler::handle_pods(const HttpRequest& req, const RouteMatch&
 
             std::string pod_json = doc.to_string();
 
-            // Run autonomous scheduler
+            // Run autonomous scheduler if pod does not already have an assigned node
             if (scheduler_) {
-                scheduler_->schedule_pod_manifest(pod_json);
+                std::string explicit_node = spec ? spec->get_string("nodeName", "") : "";
+                if (explicit_node.empty() || explicit_node == "<none>") {
+                    scheduler_->schedule_pod_manifest(pod_json);
+                }
             }
 
             store_.put(key, pod_json, false);
@@ -956,6 +1017,132 @@ HttpResponse RouteHandler::handle_deployments(const HttpRequest& req, const Rout
     }
 
     return make_status(405, "MethodNotAllowed", std::string(http_method_str(req.method)) + " not allowed on " + req.path);
+}
+
+HttpResponse RouteHandler::handle_leases(const HttpRequest& req, const RouteMatch& match, mem::MonotonicArena& arena, osal::Socket* client_sock) {
+    (void)arena;
+    (void)client_sock;
+    std::string ns = match.namespace_name.empty() ? "kube-node-lease" : std::string(match.namespace_name);
+    std::string name(match.resource_name);
+
+    if (match.category == RouteCategory::LeasesNsCollection) {
+        if (req.method == HttpMethod::Get || req.method == HttpMethod::Head) {
+            std::vector<std::string> lease_jsons;
+            std::string prefix = "/registry/leases/" + ns + "/";
+            store_.list(prefix, lease_jsons);
+
+            HttpResponse resp;
+            resp.status_code = 200;
+            resp.content_type = "application/json";
+            if (req.method == HttpMethod::Head) {
+                resp.body = "";
+            } else {
+                std::string list_json = "{\"kind\":\"LeaseList\",\"apiVersion\":\"coordination.k8s.io/v1\",\"metadata\":{\"resourceVersion\":\"1\"},\"items\":[";
+                for (size_t i = 0; i < lease_jsons.size(); ++i) {
+                    if (i > 0) list_json += ",";
+                    list_json += lease_jsons[i];
+                }
+                list_json += "]}";
+                resp.body = std::move(list_json);
+            }
+            return resp;
+        } else if (req.method == HttpMethod::Post) {
+            if (req.body.empty()) {
+                return make_status(400, "BadRequest", "Empty body");
+            }
+            models::JsonValue doc;
+            std::string err;
+            if (!models::parse_json(req.body, doc, err) || !doc.is_object()) {
+                return make_status(400, "BadRequest", "Failed to parse JSON: " + err);
+            }
+            const models::JsonValue* meta = doc.get("metadata");
+            std::string lease_name = meta ? meta->get_string("name", "") : "";
+            if (lease_name.empty()) {
+                return make_status(400, "BadRequest", "metadata.name is required");
+            }
+
+            std::string key = "/registry/leases/" + ns + "/" + lease_name;
+            store_.put(key, req.body, true);
+
+            if (on_lease_renewed_) {
+                on_lease_renewed_(lease_name);
+            }
+
+            HttpResponse resp;
+            resp.status_code = 201;
+            resp.content_type = "application/json";
+            resp.body = req.body;
+            return resp;
+        } else {
+            return make_status(405, "MethodNotAllowed", "Method not allowed on leases collection");
+        }
+    } else if (match.category == RouteCategory::LeaseItem) {
+        std::string key = "/registry/leases/" + ns + "/" + name;
+
+        if (req.method == HttpMethod::Get || req.method == HttpMethod::Head) {
+            std::string lease_json;
+            storage::Status s = store_.get(key, lease_json);
+            if (!s.ok()) {
+                return make_status(404, "NotFound", "leases.coordination.k8s.io \"" + name + "\" not found", name, "leases");
+            }
+            HttpResponse resp;
+            resp.status_code = 200;
+            resp.content_type = "application/json";
+            resp.body = (req.method == HttpMethod::Head) ? "" : lease_json;
+            return resp;
+        } else if (req.method == HttpMethod::Put) {
+            if (req.body.empty()) {
+                return make_status(400, "BadRequest", "Empty body");
+            }
+            store_.put(key, req.body, true);
+            if (on_lease_renewed_) {
+                on_lease_renewed_(name);
+            }
+            HttpResponse resp;
+            resp.status_code = 200;
+            resp.content_type = "application/json";
+            resp.body = req.body;
+            return resp;
+        } else if (req.method == HttpMethod::Patch) {
+            if (req.body.empty()) {
+                return make_status(400, "BadRequest", "Empty body");
+            }
+            std::string existing_json;
+            storage::Status s = store_.get(key, existing_json);
+            std::string final_json = req.body;
+            if (s.ok()) {
+                models::JsonValue orig_doc, patch_doc;
+                std::string err;
+                if (models::parse_json(existing_json, orig_doc, err) && orig_doc.is_object() &&
+                    models::parse_json(req.body, patch_doc, err) && patch_doc.is_object()) {
+                    const models::JsonValue* patch_spec = patch_doc.get("spec");
+                    models::JsonValue* orig_spec = orig_doc.get_mut("spec");
+                    if (patch_spec && orig_spec) {
+                        for (const auto& kv : patch_spec->obj_val) {
+                            orig_spec->set(kv.first, kv.second);
+                        }
+                        final_json = orig_doc.to_string();
+                    }
+                }
+            }
+            store_.put(key, final_json, true);
+            if (on_lease_renewed_) {
+                on_lease_renewed_(name);
+            }
+            HttpResponse resp;
+            resp.status_code = 200;
+            resp.content_type = "application/json";
+            resp.body = final_json;
+            return resp;
+        } else if (req.method == HttpMethod::Delete) {
+            store_.remove(key);
+            return make_status(200, "Success", "leases.coordination.k8s.io \"" + name + "\" deleted", name, "leases");
+        } else {
+            return make_status(405, "MethodNotAllowed", "Method not allowed on lease item");
+        }
+    }
+
+    return make_status(404, "NotFound", "Not found");
 }
 
 } // namespace kube32::api

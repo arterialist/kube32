@@ -22,7 +22,8 @@ enum class PeripheralType : uint8_t {
     GPIO = 0,
     ADC1 = 1,
     I2C  = 2,
-    UART = 3
+    UART = 3,
+    IPC  = 4
 };
 
 enum class AccessMode : uint8_t {
@@ -44,7 +45,10 @@ enum class SecurityAction : uint8_t {
     TrapAndTerminate = 1  // Trigger Wasm trap and terminate container
 };
 
-// 20-Byte Ultra-Compact Device Grant Representation
+// Capabilities bitmask definitions
+constexpr uint32_t KUBE32_CAP_IPC = (1U << 0);
+
+// 24-Byte Ultra-Compact Device Grant Representation
 #pragma pack(push, 1)
 struct DeviceGrant {
     uint64_t gpio_read_mask{0};    // Bit i: Pod can read GPIO pin i
@@ -52,6 +56,7 @@ struct DeviceGrant {
     uint16_t adc1_channel_mask{0}; // Bit c: Pod can read ADC1 channel c (0..9)
     uint8_t  i2c_bus_mask{0};      // Bit b: Pod can access I2C bus b (0 or 1)
     uint8_t  uart_port_mask{0};    // Bit p: Pod can access UART port p (1 or 2)
+    uint32_t capabilities_mask{0}; // Bitmask of higher-level capabilities (e.g. KUBE32_CAP_IPC)
 
     inline bool is_gpio_permitted(uint32_t pin, AccessMode mode) const {
         if (pin >= 64) return false;
@@ -76,9 +81,13 @@ struct DeviceGrant {
         if (port >= 8) return false;
         return (uart_port_mask & (1U << port)) != 0;
     }
+
+    inline bool is_ipc_permitted() const {
+        return (capabilities_mask & KUBE32_CAP_IPC) != 0;
+    }
 };
 #pragma pack(pop)
 
-static_assert(sizeof(DeviceGrant) == 20, "DeviceGrant must be exactly 20 bytes");
+static_assert(sizeof(DeviceGrant) == 24, "DeviceGrant must be exactly 24 bytes");
 
 } // namespace kube32::hal

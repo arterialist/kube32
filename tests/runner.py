@@ -50,6 +50,12 @@ TIER_MAPPING = {
         "tests.tier4_application.test_rescheduling",
         "tests.tier4_application.test_reboot",
         "tests.tier4_application.test_federation",
+    ],
+    "m4": [
+        "tests.test_m4_node_lease",
+        "tests.test_m4_self_healing",
+        "tests.test_m4_channel_ipc",
+        "tests.test_m4_reboot_recovery",
     ]
 }
 
@@ -177,9 +183,9 @@ def main():
     )
     parser.add_argument(
         "--tier",
-        choices=["1", "2", "3", "4", "all"],
+        choices=["1", "2", "3", "4", "m4", "all"],
         default="all",
-        help="Test tier to execute ('1', '2', '3', '4', or 'all')"
+        help="Test tier to execute ('1', '2', '3', '4', 'm4', or 'all')"
     )
     parser.add_argument(
         "-v", "--verbose", "--v",
@@ -215,6 +221,9 @@ def main():
         mock_server.start()
         server_url = mock_server.url
         print(f"[INIT] MockKube32 running on {server_url}")
+    elif args.tier == "m4":
+        # M4 tests manage their own multi-node simulated clusters
+        pass
     else:
         # Check if target server is reachable
         print(f"[INIT] Checking connection to Kube32 server at {server_url}...")
@@ -236,7 +245,8 @@ def main():
             TIER_MAPPING["1"] +
             TIER_MAPPING["2"] +
             TIER_MAPPING["3"] +
-            TIER_MAPPING["4"]
+            TIER_MAPPING["4"] +
+            TIER_MAPPING["m4"]
         )
     else:
         modules_to_run = TIER_MAPPING.get(args.tier, [])

@@ -106,6 +106,11 @@ else()
         src/storage/littlefs_journal.cpp
         src/storage/store.cpp
         src/models/kube_models.cpp
+        src/models/kube_lease.cpp
+        src/net/network_manager.cpp
+        src/net/mdns_discovery.cpp
+        src/controller/node_lifecycle_controller.cpp
+        src/ipc/channel.cpp
         src/api/table_serializer.cpp
         src/api/route_handler.cpp
         src/api/http_server.cpp
@@ -260,6 +265,27 @@ else()
     )
     target_link_libraries(test_m3_thread_names PRIVATE kube32_core)
     add_test(NAME test_m3_thread_names COMMAND test_m3_thread_names)
+
+    # 18. Milestone 4 Low-Latency Virtual Channel IPC Tests
+    add_executable(test_channel_ipc
+        tests/test_channel_ipc.cpp
+    )
+    target_link_libraries(test_channel_ipc PRIVATE kube32_core)
+    add_test(NAME test_channel_ipc COMMAND test_channel_ipc)
+
+    # 19. Milestone 4 Node Lease API & NodeLifecycleController Tests
+    add_executable(test_lease_controller
+        tests/test_lease_controller.cpp
+    )
+    target_link_libraries(test_lease_controller PRIVATE kube32_core)
+    add_test(NAME test_lease_controller COMMAND test_lease_controller)
+
+    # 20. Milestone 4 ZeroConf mDNS Service Discovery Tests
+    add_executable(test_mdns_discovery
+        tests/test_mdns_discovery.cpp
+    )
+    target_link_libraries(test_mdns_discovery PRIVATE kube32_core)
+    add_test(NAME test_mdns_discovery COMMAND test_mdns_discovery)
 
 endif()
 

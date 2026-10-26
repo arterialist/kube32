@@ -263,6 +263,25 @@ bool HttpKubeClient::patch_node_status(const std::string& node_name, const std::
     return resp.status_code == 200;
 }
 
+bool HttpKubeClient::renew_node_lease(const std::string& node_name, uint32_t duration_sec, const std::string& renew_time_iso8601) {
+    std::string path = "/apis/coordination.k8s.io/v1/namespaces/kube-node-lease/leases/" + node_name;
+    std::string lease_json = "{\"apiVersion\":\"coordination.k8s.io/v1\",\"kind\":\"Lease\","
+                             "\"metadata\":{\"name\":\"" + node_name + "\",\"namespace\":\"kube-node-lease\"},"
+                             "\"spec\":{\"holderIdentity\":\"" + node_name + "\","
+                             "\"leaseDurationSeconds\":" + std::to_string(duration_sec) + ","
+                             "\"renewTime\":\"" + renew_time_iso8601 + "\"}}";
+
+    HttpResponse resp = send_http_request("PUT", path, lease_json);
+    if (resp.status_code == 200 || resp.status_code == 201) {
+        return true;
+    }
+    if (resp.status_code == 404) {
+        HttpResponse post_resp = send_http_request("POST", "/apis/coordination.k8s.io/v1/namespaces/kube-node-lease/leases", lease_json);
+        return post_resp.status_code == 200 || post_resp.status_code == 201;
+    }
+    return false;
+}
+
 bool HttpKubeClient::list_pods(std::vector<models::KubePod>& out_pods) {
     HttpResponse resp = send_http_request("GET", "/api/v1/pods", "");
     if (resp.status_code != 200) {

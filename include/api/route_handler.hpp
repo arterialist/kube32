@@ -7,6 +7,7 @@
 
 #include <string_view>
 #include <memory>
+#include <functional>
 
 namespace kube32::osal {
 class Socket;
@@ -33,6 +34,9 @@ enum class RouteCategory {
     DeploymentItem,
     DeploymentStatus,
     DeploymentScale,
+    DiscoveryApisCoordinationV1,
+    LeasesNsCollection,
+    LeaseItem,
     NotFound
 };
 
@@ -49,6 +53,7 @@ public:
     ~RouteHandler() = default;
 
     void set_scheduler(scheduler::Scheduler* scheduler) { scheduler_ = scheduler; }
+    void set_lease_callback(std::function<void(const std::string&)> cb) { on_lease_renewed_ = std::move(cb); }
 
     // Fast route pattern matcher
     static RouteMatch match_route(std::string_view path);
@@ -66,12 +71,14 @@ public:
 private:
     storage::Store& store_;
     scheduler::Scheduler* scheduler_{nullptr};
+    std::function<void(const std::string&)> on_lease_renewed_;
 
     // Endpoint dispatchers
     HttpResponse handle_discovery(const HttpRequest& req, RouteCategory category);
     HttpResponse handle_nodes(const HttpRequest& req, const RouteMatch& match, mem::MonotonicArena& arena, osal::Socket* client_sock = nullptr);
     HttpResponse handle_pods(const HttpRequest& req, const RouteMatch& match, mem::MonotonicArena& arena, osal::Socket* client_sock = nullptr);
     HttpResponse handle_deployments(const HttpRequest& req, const RouteMatch& match, mem::MonotonicArena& arena, osal::Socket* client_sock = nullptr);
+    HttpResponse handle_leases(const HttpRequest& req, const RouteMatch& match, mem::MonotonicArena& arena, osal::Socket* client_sock = nullptr);
 };
 
 } // namespace kube32::api

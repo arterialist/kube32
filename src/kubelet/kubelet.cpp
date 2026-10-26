@@ -95,20 +95,27 @@ void Kubelet::reconcile_node_registration() {
     bool ok = api_client_->register_node(reg_json, conflict);
     if (ok) {
         registered_.store(true);
+        report_heartbeat();
         last_heartbeat_ms_ = osal::System::get_uptime_ms();
-        if (conflict) {
-            // Already existed in cluster store, immediately refresh condition to Ready
-            report_heartbeat();
-        }
     }
 }
 
 void Kubelet::report_heartbeat() {
+    uint64_t now_ms = osal::System::get_uptime_ms();
+    char time_buf[64];
+    snprintf(time_buf, sizeof(time_buf), "2026-10-26T%02u:%02u:%02u.%03uZ",
+             static_cast<unsigned>((now_ms / 3600000) % 24),
+             static_cast<unsigned>((now_ms / 60000) % 60),
+             static_cast<unsigned>((now_ms / 1000) % 60),
+             static_cast<unsigned>(now_ms % 1000));
+
+    api_client_->renew_node_lease(config_.node_name, 40, time_buf);
+
     NodeTelemetry t = status_reporter_->collect_telemetry();
     bool memory_pressure = (t.free_heap_bytes < config_.memory_pressure_threshold_bytes);
     std::string patch = status_reporter_->build_heartbeat_patch_json(t, memory_pressure);
     api_client_->patch_node_status(config_.node_name, patch);
-    last_heartbeat_ms_ = osal::System::get_uptime_ms();
+    last_heartbeat_ms_ = now_ms;
 }
 
 void Kubelet::sync_assigned_pods() {

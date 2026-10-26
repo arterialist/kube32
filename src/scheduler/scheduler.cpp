@@ -576,6 +576,10 @@ public:
             std::string pod_name = meta ? meta->get_string("name", "") : "";
             std::string pod_ns = meta ? meta->get_string("namespace", "default") : "default";
 
+            const models::JsonValue* labels = meta ? meta->get("labels") : nullptr;
+            bool is_daemon = labels && labels->get_string("kube32.io/daemonset", "") == "true";
+            if (is_daemon) continue;
+
             bool node_missing_or_dead = (!assigned_node.empty() && assigned_node != "<none>" && ready_nodes.count(assigned_node) == 0);
 
             if (node_missing_or_dead) {

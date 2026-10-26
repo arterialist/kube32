@@ -6,10 +6,12 @@
 
 #include "wasm3.h"
 #include "m3_env.h"
+#include "ipc/channel.hpp"
 
 #include <mutex>
 #include <map>
 #include <iostream>
+#include <cstring>
 
 #if defined(KUBE32_TARGET_ESP32)
 #include "driver/gpio.h"
@@ -286,6 +288,91 @@ static const void* raw_esp32_delay_ms(IM3Runtime runtime, IM3ImportContext _ctx,
     return m3Err_none;
 }
 
+// kube32_channel_open: signature "i(ii)" -> returns int32_t handle, args: (name_offset, flags)
+static const void* raw_kube32_channel_open(IM3Runtime runtime, IM3ImportContext _ctx, uint64_t* _sp, void* _mem) {
+    uint32_t name_offset = static_cast<uint32_t>(_sp[1]);
+    uint32_t flags       = static_cast<uint32_t>(_sp[2]);
+    std::string pod_id   = get_pod_id(runtime, _ctx);
+
+    // 1. Gatekeeper Capability Firewall Check
+    if (!hal::CapabilityFirewall::instance().check_permission(pod_id, hal::PeripheralType::IPC, 0, hal::AccessMode::ReadWrite)) {
+        *reinterpret_cast<int32_t*>(_sp) = hal::HAL_ERR_PERM; // -EPERM
+        return m3Err_none;
+    }
+
+    // 2. Validate linear memory bounds for channel name string
+    size_t mem_size = m3_GetMemorySizeAt(_mem);
+    if (name_offset >= mem_size) {
+        *reinterpret_cast<int32_t*>(_sp) = hal::HAL_ERR_FAULT; // -EFAULT
+        return m3Err_none;
+    }
+
+    const char* str_start = static_cast<const char*>(_mem) + name_offset;
+    size_t max_len = mem_size - name_offset;
+    size_t name_len = strnlen(str_start, max_len);
+    if (name_len == max_len) {
+        *reinterpret_cast<int32_t*>(_sp) = hal::HAL_ERR_FAULT; // Unterminated string
+        return m3Err_none;
+    }
+
+    std::string channel_name(str_start, name_len);
+    int32_t handle = ipc::ChannelManager::instance().open(pod_id, channel_name, flags);
+    *reinterpret_cast<int32_t*>(_sp) = handle;
+    return m3Err_none;
+}
+
+// kube32_channel_send: signature "i(iii)" -> returns int32_t bytes sent, args: (handle, data_offset, len)
+static const void* raw_kube32_channel_send(IM3Runtime runtime, IM3ImportContext _ctx, uint64_t* _sp, void* _mem) {
+    int32_t  handle      = static_cast<int32_t>(_sp[1]);
+    uint32_t data_offset = static_cast<uint32_t>(_sp[2]);
+    uint32_t len         = static_cast<uint32_t>(_sp[3]);
+    std::string pod_id   = get_pod_id(runtime, _ctx);
+
+    size_t mem_size = m3_GetMemorySizeAt(_mem);
+    if (static_cast<uint64_t>(data_offset) + len > mem_size) {
+        *reinterpret_cast<int32_t*>(_sp) = hal::HAL_ERR_FAULT;
+        return m3Err_none;
+    }
+
+    const uint8_t* data = static_cast<const uint8_t*>(_mem) + data_offset;
+    int32_t sent = ipc::ChannelManager::instance().send(pod_id, handle, data, len);
+    *reinterpret_cast<int32_t*>(_sp) = sent;
+    return m3Err_none;
+}
+
+// kube32_channel_recv: signature "i(iiii)" -> returns int32_t bytes received, args: (handle, buf_offset, max_len, timeout_ms)
+static const void* raw_kube32_channel_recv(IM3Runtime runtime, IM3ImportContext _ctx, uint64_t* _sp, void* _mem) {
+    int32_t  handle      = static_cast<int32_t>(_sp[1]);
+    uint32_t buf_offset  = static_cast<uint32_t>(_sp[2]);
+    uint32_t max_len     = static_cast<uint32_t>(_sp[3]);
+    uint32_t timeout_ms  = static_cast<uint32_t>(_sp[4]);
+    std::string pod_id   = get_pod_id(runtime, _ctx);
+
+    size_t mem_size = m3_GetMemorySizeAt(_mem);
+    if (static_cast<uint64_t>(buf_offset) + max_len > mem_size) {
+        *reinterpret_cast<int32_t*>(_sp) = hal::HAL_ERR_FAULT;
+        return m3Err_none;
+    }
+
+    uint8_t* buf = static_cast<uint8_t*>(_mem) + buf_offset;
+    int32_t recvd = ipc::ChannelManager::instance().recv(pod_id, handle, buf, max_len, timeout_ms);
+    *reinterpret_cast<int32_t*>(_sp) = recvd;
+    return m3Err_none;
+}
+
+// kube32_channel_close: signature "i(i)" -> returns int32_t status, args: (handle)
+static const void* raw_kube32_channel_close(IM3Runtime runtime, IM3ImportContext _ctx, uint64_t* _sp, void* _mem) {
+    (void)runtime;
+    (void)_ctx;
+    (void)_mem;
+    int32_t handle     = static_cast<int32_t>(_sp[1]);
+    std::string pod_id = get_pod_id(runtime, _ctx);
+
+    int32_t res = ipc::ChannelManager::instance().close(pod_id, handle);
+    *reinterpret_cast<int32_t*>(_sp) = res;
+    return m3Err_none;
+}
+
 // -----------------------------------------------------------------------------
 // link_host_functions implementation
 // -----------------------------------------------------------------------------
@@ -313,6 +400,12 @@ bool link_host_functions(IM3Module module, const std::string& pod_id) {
     m3_LinkRawFunction(module, "env", "esp32_uart_read",     "i(iii)",  &raw_esp32_uart_read);
     m3_LinkRawFunction(module, "env", "esp32_get_time_us",   "I()",     &raw_esp32_get_time_us);
     m3_LinkRawFunction(module, "env", "esp32_delay_ms",      "v(i)",    &raw_esp32_delay_ms);
+
+    // Link Virtual Channel IPC functions
+    m3_LinkRawFunction(module, "env", "kube32_channel_open",  "i(ii)",   &raw_kube32_channel_open);
+    m3_LinkRawFunction(module, "env", "kube32_channel_send",  "i(iii)",  &raw_kube32_channel_send);
+    m3_LinkRawFunction(module, "env", "kube32_channel_recv",  "i(iiii)", &raw_kube32_channel_recv);
+    m3_LinkRawFunction(module, "env", "kube32_channel_close", "i(i)",    &raw_kube32_channel_close);
 
     return true;
 }
@@ -401,6 +494,22 @@ int64_t esp32_get_time_us() {
 void esp32_delay_ms(uint32_t ms) {
     osal::Thread::sleep_ms(ms);
     osal::System::feed_watchdog();
+}
+
+int32_t kube32_channel_open(const char* channel_name, uint32_t flags) {
+    return ipc::ChannelManager::instance().open("native", channel_name ? channel_name : "", flags);
+}
+
+int32_t kube32_channel_send(int32_t handle, const uint8_t* data, size_t len) {
+    return ipc::ChannelManager::instance().send("native", handle, data, len);
+}
+
+int32_t kube32_channel_recv(int32_t handle, uint8_t* out_buf, size_t max_len, uint32_t timeout_ms) {
+    return ipc::ChannelManager::instance().recv("native", handle, out_buf, max_len, timeout_ms);
+}
+
+int32_t kube32_channel_close(int32_t handle) {
+    return ipc::ChannelManager::instance().close("native", handle);
 }
 
 } // extern "C"

@@ -144,6 +144,17 @@ bool CapabilityFirewall::register_pod(const std::string& pod_id, const std::stri
         }
     };
 
+    const models::JsonValue* meta = doc.get("metadata");
+    if (meta && meta->is_object()) {
+        const models::JsonValue* annotations = meta->get("annotations");
+        if (annotations && annotations->is_object()) {
+            std::string ipc_ann = annotations->get_string("kube32.io/ipc", "");
+            if (ipc_ann == "true" || ipc_ann == "1") {
+                grant.capabilities_mask |= KUBE32_CAP_IPC;
+            }
+        }
+    }
+
     const models::JsonValue* spec = doc.get("spec");
     if (spec && spec->is_object()) {
         const models::JsonValue* containers = spec->get("containers");
@@ -282,6 +293,12 @@ bool CapabilityFirewall::register_pod(const std::string& pod_id, const std::stri
                         uart_owners_[port] = pod_id;
                         allocated_uart_mask_ |= (1U << port);
                         claimed_uarts.push_back(port);
+                    }
+                    // Virtual Channel IPC: "kube32.io/ipc": "1" or "true"
+                    else if (key == "kube32.io/ipc") {
+                        if (val_str == "1" || val_str == "true") {
+                            grant.capabilities_mask |= KUBE32_CAP_IPC;
+                        }
                     }
                 }
             }
@@ -479,6 +496,9 @@ bool CapabilityFirewall::check_permission(const std::string& pod_id, PeripheralT
             break;
         case PeripheralType::UART:
             permitted = grant.is_uart_permitted(pin_or_port);
+            break;
+        case PeripheralType::IPC:
+            permitted = grant.is_ipc_permitted();
             break;
     }
 

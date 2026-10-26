@@ -14,6 +14,7 @@ public:
 
     virtual bool register_node(const std::string& node_json, bool& out_conflict) = 0;
     virtual bool patch_node_status(const std::string& node_name, const std::string& patch_json) = 0;
+    virtual bool renew_node_lease(const std::string& /*node_name*/, uint32_t /*duration_sec*/, const std::string& /*renew_time_iso8601*/) { return true; }
     virtual bool list_pods(std::vector<models::KubePod>& out_pods) = 0;
     virtual bool list_pods_raw(std::vector<std::pair<models::KubePod, std::string>>& out_pods_with_manifest) = 0;
     virtual bool patch_pod_status(const std::string& ns, const std::string& name, const std::string& status_patch_json) = 0;
@@ -27,6 +28,7 @@ public:
 
     bool register_node(const std::string& node_json, bool& out_conflict) override;
     bool patch_node_status(const std::string& node_name, const std::string& patch_json) override;
+    bool renew_node_lease(const std::string& node_name, uint32_t duration_sec, const std::string& renew_time_iso8601) override;
     bool list_pods(std::vector<models::KubePod>& out_pods) override;
     bool list_pods_raw(std::vector<std::pair<models::KubePod, std::string>>& out_pods_with_manifest) override;
     bool patch_pod_status(const std::string& ns, const std::string& name, const std::string& status_patch_json) override;
