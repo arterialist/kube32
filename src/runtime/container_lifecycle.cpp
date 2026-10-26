@@ -434,7 +434,7 @@ bool ContainerLifecycleController::run_liveness_probe() {
                 int n = sock.recv(buf, sizeof(buf) - 1);
                 if (n > 0) {
                     buf[n] = '\0';
-                    healthy = (std::strstr(buf, "200 OK") != nullptr || std::strstr(buf, "HTTP/1.1 2") != nullptr);
+                    healthy = (strstr(buf, "200 OK") != nullptr || strstr(buf, "HTTP/1.1 2") != nullptr);
                 }
             }
         }

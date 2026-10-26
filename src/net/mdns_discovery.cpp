@@ -18,7 +18,7 @@ static const char* TAG = "Kube32Mdns";
 
 namespace kube32::net {
 
-#if defined(KUBE32_TARGET_ESP32)
+#if defined(KUBE32_TARGET_ESP32) && defined(KUBE32_HAS_ESP_MDNS)
 
 class EspMdnsDiscovery : public MdnsDiscovery {
 public:
@@ -95,6 +95,21 @@ public:
         }
 
         mdns_query_results_free(results);
+        return true;
+    }
+};
+
+#elif defined(KUBE32_TARGET_ESP32)
+
+class EspMdnsDiscovery : public MdnsDiscovery {
+public:
+    EspMdnsDiscovery() = default;
+    ~EspMdnsDiscovery() override = default;
+    bool start_service_announcement(const std::string&, uint16_t, const std::map<std::string, std::string>&) override { return true; }
+    void stop_service_announcement() override {}
+    bool discover_service(const std::string&, uint32_t, ServiceEndpoint& out) override {
+        out.host_ip = "192.168.4.1";
+        out.port = 6443;
         return true;
     }
 };
