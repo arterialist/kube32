@@ -219,5 +219,20 @@ else()
     target_link_libraries(test_kubelet PRIVATE kube32_core)
     add_test(NAME test_kubelet COMMAND test_kubelet)
 
+    # 12. Milestone 3 Adversarial Sandboxing & Fault Containment Tests
+    add_executable(test_m3_adversarial
+        tests/test_m3_adversarial.cpp
+    )
+    target_link_libraries(test_m3_adversarial PRIVATE kube32_core)
+    add_test(NAME test_m3_adversarial COMMAND test_m3_adversarial)
+
+    # 13. HAL Capability Firewall & Peripheral Collision Adversarial Tests (Milestone 3)
+    add_executable(test_hal_adversarial
+        tests/test_hal_adversarial.cpp
+    )
+    target_link_libraries(test_hal_adversarial PRIVATE kube32_core)
+    add_test(NAME test_hal_adversarial COMMAND test_hal_adversarial)
+
 endif()
+
 
