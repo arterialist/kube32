@@ -1,0 +1,11 @@
+# ==============================================================================
+# Kube32 ESP32-S3 8MB Flash Partition Table
+# Total Flash: 0x800000 (8388608 bytes)
+# Sector Alignment: 4KB (0x1000). MMU App Alignment: 64KB (0x10000).
+# ==============================================================================
+# Name,      Type, SubType, Offset,   Size,     Flags
+nvs,         data, nvs,     0x9000,   0x8000,
+phy_init,    data, phy,     0x11000,  0x1000,
+factory,     app,  factory, 0x20000,  0x280000,
+storage,     data, spiffs,  0x2A0000, 0x400000,
+reserved,    data, 0xff,    0x6A0000, 0x160000,
