@@ -2,6 +2,7 @@
 
 #include "models/kube_models.hpp"
 #include <string>
+#include <string_view>
 #include <vector>
 #include <memory>
 
@@ -29,6 +30,10 @@ public:
     bool list_pods(std::vector<models::KubePod>& out_pods) override;
     bool list_pods_raw(std::vector<std::pair<models::KubePod, std::string>>& out_pods_with_manifest) override;
     bool patch_pod_status(const std::string& ns, const std::string& name, const std::string& status_patch_json) override;
+
+    // Helper functions for HTTP response chunk decoding
+    static bool is_chunked_transfer_encoding(std::string_view headers);
+    static std::string decode_chunked_body(std::string_view raw_body);
 
 private:
     struct HttpResponse {

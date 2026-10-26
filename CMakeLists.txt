@@ -233,6 +233,13 @@ else()
     target_link_libraries(test_hal_adversarial PRIVATE kube32_core)
     add_test(NAME test_hal_adversarial COMMAND test_hal_adversarial)
 
+    # 14. Milestone 3 Iteration 2 Challenger 4 Adversarial Re-Verification Suite
+    add_executable(test_m3_challenger_4
+        tests/test_m3_challenger_4.cpp
+    )
+    target_link_libraries(test_m3_challenger_4 PRIVATE kube32_core)
+    add_test(NAME test_m3_challenger_4 COMMAND test_m3_challenger_4)
+
 endif()
 
 

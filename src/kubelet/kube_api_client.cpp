@@ -5,11 +5,160 @@
 #include <sstream>
 #include <iostream>
 #include <cstring>
+#include <cctype>
 
 namespace kube32::kubelet {
 
 HttpKubeClient::HttpKubeClient(std::string host, uint16_t port)
     : host_(std::move(host)), port_(port) {}
+
+bool HttpKubeClient::is_chunked_transfer_encoding(std::string_view headers) {
+    size_t cur = 0;
+    while (cur < headers.size()) {
+        size_t next_line = headers.find("\r\n", cur);
+        size_t sep_len = 2;
+        if (next_line == std::string_view::npos) {
+            next_line = headers.find('\n', cur);
+            sep_len = 1;
+        }
+        if (next_line == std::string_view::npos) {
+            next_line = headers.size();
+            sep_len = 0;
+        }
+
+        std::string_view line = headers.substr(cur, next_line - cur);
+        size_t colon = line.find(':');
+        if (colon != std::string_view::npos) {
+            std::string_view key = line.substr(0, colon);
+            std::string_view val = line.substr(colon + 1);
+
+            while (!key.empty() && (key.front() == ' ' || key.front() == '\t')) key.remove_prefix(1);
+            while (!key.empty() && (key.back() == ' ' || key.back() == '\t' || key.back() == '\r')) key.remove_suffix(1);
+
+            constexpr std::string_view te_key = "transfer-encoding";
+            if (key.size() == te_key.size()) {
+                bool key_match = true;
+                for (size_t i = 0; i < key.size(); ++i) {
+                    if (std::tolower(static_cast<unsigned char>(key[i])) != te_key[i]) {
+                        key_match = false;
+                        break;
+                    }
+                }
+                if (key_match) {
+                    constexpr std::string_view chunked_token = "chunked";
+                    if (val.size() >= chunked_token.size()) {
+                        for (size_t i = 0; i <= val.size() - chunked_token.size(); ++i) {
+                            bool token_match = true;
+                            for (size_t j = 0; j < chunked_token.size(); ++j) {
+                                if (std::tolower(static_cast<unsigned char>(val[i + j])) != chunked_token[j]) {
+                                    token_match = false;
+                                    break;
+                                }
+                            }
+                            if (token_match) {
+                                return true;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        if (sep_len == 0) break;
+        cur = next_line + sep_len;
+    }
+    return false;
+}
+
+std::string HttpKubeClient::decode_chunked_body(std::string_view raw_body) {
+    std::string decoded;
+    decoded.reserve(raw_body.size());
+
+    size_t offset = 0;
+    while (offset < raw_body.size()) {
+        // Skip leading CRLF/LF between chunks if present
+        while (offset < raw_body.size() && (raw_body[offset] == '\r' || raw_body[offset] == '\n')) {
+            offset++;
+        }
+        if (offset >= raw_body.size()) break;
+
+        size_t line_end = raw_body.find("\r\n", offset);
+        size_t sep_len = 2;
+        if (line_end == std::string_view::npos) {
+            line_end = raw_body.find('\n', offset);
+            sep_len = 1;
+        }
+        if (line_end == std::string_view::npos) {
+            break;
+        }
+
+        std::string_view header_line = raw_body.substr(offset, line_end - offset);
+
+        // Strip chunk extensions starting with ';'
+        size_t semi = header_line.find(';');
+        std::string_view hex_view = (semi != std::string_view::npos) ? header_line.substr(0, semi) : header_line;
+
+        while (!hex_view.empty() && (hex_view.front() == ' ' || hex_view.front() == '\t')) {
+            hex_view.remove_prefix(1);
+        }
+        while (!hex_view.empty() && (hex_view.back() == ' ' || hex_view.back() == '\t' || hex_view.back() == '\r')) {
+            hex_view.remove_suffix(1);
+        }
+
+        if (hex_view.empty()) {
+            break;
+        }
+
+        // Parse hex chunk size
+        size_t chunk_size = 0;
+        bool valid_hex = true;
+        for (char c : hex_view) {
+            chunk_size <<= 4;
+            if (c >= '0' && c <= '9') {
+                chunk_size |= static_cast<size_t>(c - '0');
+            } else if (c >= 'a' && c <= 'f') {
+                chunk_size |= static_cast<size_t>(c - 'a' + 10);
+            } else if (c >= 'A' && c <= 'F') {
+                chunk_size |= static_cast<size_t>(c - 'A' + 10);
+            } else {
+                valid_hex = false;
+                break;
+            }
+        }
+
+        if (!valid_hex) {
+            break;
+        }
+
+        // Terminal chunk
+        if (chunk_size == 0) {
+            break;
+        }
+
+        size_t data_start = line_end + sep_len;
+        if (data_start >= raw_body.size()) {
+            break;
+        }
+
+        size_t available = raw_body.size() - data_start;
+        size_t to_copy = (chunk_size <= available) ? chunk_size : available;
+        decoded.append(raw_body.data() + data_start, to_copy);
+
+        if (chunk_size > available) {
+            break;
+        }
+
+        offset = data_start + chunk_size;
+
+        // Skip chunk trailer CRLF or LF
+        if (offset + 1 < raw_body.size() && raw_body[offset] == '\r' && raw_body[offset + 1] == '\n') {
+            offset += 2;
+        } else if (offset < raw_body.size() && (raw_body[offset] == '\r' || raw_body[offset] == '\n')) {
+            offset += 1;
+        }
+    }
+
+    return decoded;
+}
 
 HttpKubeClient::HttpResponse HttpKubeClient::send_http_request(const char* method, const std::string& path, const std::string& body) {
     HttpResponse resp;
@@ -73,10 +222,24 @@ HttpKubeClient::HttpResponse HttpKubeClient::send_http_request(const char* metho
         }
     }
 
-    // Extract Body
+    // Extract Headers and Body
     size_t header_end = raw_response.find("\r\n\r\n");
+    size_t header_sep_len = 4;
+    if (header_end == std::string::npos) {
+        header_end = raw_response.find("\n\n");
+        header_sep_len = 2;
+    }
+
     if (header_end != std::string::npos) {
-        resp.body = raw_response.substr(header_end + 4);
+        std::string_view headers_view(raw_response.data(), header_end);
+        std::string_view raw_body(raw_response.data() + header_end + header_sep_len,
+                                  raw_response.size() - (header_end + header_sep_len));
+
+        if (is_chunked_transfer_encoding(headers_view)) {
+            resp.body = decode_chunked_body(raw_body);
+        } else {
+            resp.body = std::string(raw_body);
+        }
     }
 
     return resp;

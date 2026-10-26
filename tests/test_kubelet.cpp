@@ -352,6 +352,54 @@ void test_kubelet_dynamic_trap_status_reporting() {
     std::cout << "[PASS] test_kubelet_dynamic_trap_status_reporting" << std::endl;
 }
 
+void test_http_chunked_response_decoding() {
+    std::cout << "[RUN] test_http_chunked_response_decoding" << std::endl;
+
+    // 1. Header Detection: Various casings, commas, parameters
+    assert(HttpKubeClient::is_chunked_transfer_encoding("Transfer-Encoding: chunked\r\n"));
+    assert(HttpKubeClient::is_chunked_transfer_encoding("transfer-encoding: chunked\r\n"));
+    assert(HttpKubeClient::is_chunked_transfer_encoding("TRANSFER-ENCODING: CHUNKED\r\n"));
+    assert(HttpKubeClient::is_chunked_transfer_encoding("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n"));
+    assert(HttpKubeClient::is_chunked_transfer_encoding("Transfer-Encoding: gzip, chunked\r\n"));
+    assert(HttpKubeClient::is_chunked_transfer_encoding("Transfer-Encoding: chunked; charset=utf-8\r\n"));
+    assert(!HttpKubeClient::is_chunked_transfer_encoding("Content-Length: 42\r\nContent-Type: application/json\r\n"));
+    assert(!HttpKubeClient::is_chunked_transfer_encoding("Transfer-Encoding: gzip\r\n"));
+    assert(!HttpKubeClient::is_chunked_transfer_encoding(""));
+
+    // 2. Single Chunk (exact wire format emitted by TableSerializer)
+    std::string single_chunk = "3D\r\n{\"kind\":\"PodList\",\"apiVersion\":\"v1\",\"metadata\":{},\"items\":[]}\r\n0\r\n\r\n";
+    std::string decoded = HttpKubeClient::decode_chunked_body(single_chunk);
+    assert(decoded == "{\"kind\":\"PodList\",\"apiVersion\":\"v1\",\"metadata\":{},\"items\":[]}");
+
+    // Verify models::parse_json parses cleanly without error
+    kube32::models::JsonValue doc;
+    std::string err;
+    assert(kube32::models::parse_json(decoded, doc, err));
+    assert(doc.is_object());
+    assert(doc.get("kind") && doc.get("kind")->str_val == "PodList");
+
+    // 3. Multi-Chunk Streaming
+    std::string multi_chunk = "12\r\n{\"kind\":\"PodList\",\r\n2B\r\n\"apiVersion\":\"v1\",\"metadata\":{},\"items\":[]}\r\n0\r\n\r\n";
+    std::string multi_decoded = HttpKubeClient::decode_chunked_body(multi_chunk);
+    assert(multi_decoded == "{\"kind\":\"PodList\",\"apiVersion\":\"v1\",\"metadata\":{},\"items\":[]}");
+    assert(kube32::models::parse_json(multi_decoded, doc, err));
+
+    // 4. Chunk Extensions and Whitespace
+    std::string ext_chunk = "  3D ;ext=param;foo=bar\r\n{\"kind\":\"PodList\",\"apiVersion\":\"v1\",\"metadata\":{},\"items\":[]}\r\n0;terminal-ext\r\n\r\n";
+    std::string ext_decoded = HttpKubeClient::decode_chunked_body(ext_chunk);
+    assert(ext_decoded == "{\"kind\":\"PodList\",\"apiVersion\":\"v1\",\"metadata\":{},\"items\":[]}");
+
+    // 5. Trailers Discarded After Terminal 0 Chunk
+    std::string trailer_chunk = "13\r\n{\"status\":\"Active\"}\r\n0\r\nTrailer-Header: checksum\r\n\r\n";
+    std::string trailer_decoded = HttpKubeClient::decode_chunked_body(trailer_chunk);
+    assert(trailer_decoded == "{\"status\":\"Active\"}");
+
+    // 6. Non-Chunked Payload Handling
+    assert(!HttpKubeClient::is_chunked_transfer_encoding("Content-Length: 32\r\n"));
+
+    std::cout << "[PASS] test_http_chunked_response_decoding" << std::endl;
+}
+
 int main() {
     std::cout << "========================================" << std::endl;
     std::cout << " Running ESP32 Kubelet Node Agent Tests " << std::endl;
@@ -363,6 +411,7 @@ int main() {
     test_kubelet_thread_lifecycle();
     test_kubelet_capability_admission_rejection();
     test_kubelet_dynamic_trap_status_reporting();
+    test_http_chunked_response_decoding();
 
     std::cout << "All Kubelet tests passed successfully!" << std::endl;
     return 0;

@@ -124,6 +124,26 @@ void test_reserved_pin_protection() {
     assert(!ok);
     assert(err.find("Security Violation") != std::string::npos);
 
+    // Pin 0 is Boot / Strapping pin
+    std::string manifest_boot = R"({
+        "spec": {
+            "containers": [{
+                "name": "c1",
+                "resources": {
+                    "requests": {
+                        "esp32.io/gpio-0": "1"
+                    }
+                }
+            }]
+        }
+    })";
+
+    err.clear();
+    ok = fw.register_pod("bad-pod-boot", manifest_boot, err);
+    assert(!ok);
+    assert(err.find("Security Violation") != std::string::npos);
+    assert(err.find("Pin GPIO 0 is reserved or unsafe") != std::string::npos);
+
     std::cout << "[PASS] test_reserved_pin_protection" << std::endl;
 }
 

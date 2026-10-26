@@ -223,6 +223,17 @@ void test_challenge2_hardware_safety_mask_reserved_pins() {
         assert(err.find("Security Violation") != std::string::npos);
     }
 
+    // Strapping / Boot Pin: GPIO 0
+    {
+        std::string err;
+        std::string m0 = "{\"spec\":{\"containers\":[{\"name\":\"c\",\"resources\":{\"requests\":{\"esp32.io/gpio-0\":\"1\"}}}]}}";
+        bool ok0 = fw.register_pod("bad-boot-0", m0, err);
+        assert(!ok0);
+        assert(err.find("Security Violation") != std::string::npos);
+        assert(err.find("GPIO 0") != std::string::npos);
+        assert(fw.get_allocated_gpio_mask() == 0);
+    }
+
     // 4. Boundary Pins: Out of package bounds (GPIO >= 49 on ESP32-S3)
     {
         std::string err;

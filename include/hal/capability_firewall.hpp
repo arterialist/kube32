@@ -11,9 +11,9 @@
 namespace kube32::hal {
 
 // ESP32-S3 Hardware Safety Masks
-// Reserved: Pins 26-32 (Octal Flash/PSRAM), Pin 43-44 (UART0 console), Pin 19-20 (USB)
+// Reserved: Pin 0 (strapping/boot pin), Pins 26-32 (Octal Flash/PSRAM), Pin 43-44 (UART0 console), Pin 19-20 (USB)
 constexpr uint64_t KUBE32_RESERVED_GPIO_MASK = 
-    (0x7FULL << 26) | (1ULL << 43) | (1ULL << 44) | (1ULL << 19) | (1ULL << 20);
+    (1ULL << 0) | (0x7FULL << 26) | (1ULL << 43) | (1ULL << 44) | (1ULL << 19) | (1ULL << 20);
 constexpr uint64_t KUBE32_SAFE_GPIO_MASK = (~KUBE32_RESERVED_GPIO_MASK) & 0x0001FFFFFFFFFFFFULL;
 
 struct PodSecurityRecord {

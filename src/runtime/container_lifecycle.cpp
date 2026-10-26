@@ -4,12 +4,15 @@
 #include "osal/socket.hpp"
 
 #include "wasm3.h"
+#include "m3_config.h"
 #include "m3_env.h"
 
 #include <iostream>
 #include <algorithm>
 
 namespace kube32::runtime {
+
+static osal::RecursiveMutex s_wasm3_global_mutex;
 
 ContainerLifecycleController::ContainerLifecycleController(const ContainerConfig& config)
     : config_(config) {
@@ -27,6 +30,7 @@ ContainerLifecycleController::~ContainerLifecycleController() {
 }
 
 void ContainerLifecycleController::cleanup_runtime() {
+    osal::LockGuard<osal::RecursiveMutex> global_guard(s_wasm3_global_mutex);
     if (thread_detached_.load()) {
         // Runaway guest thread was detached; preserve runtime allocation to prevent Use-After-Free
         m3_runtime_ = nullptr;
@@ -47,6 +51,7 @@ void ContainerLifecycleController::cleanup_runtime() {
 
 bool ContainerLifecycleController::deploy(const uint8_t* wasm_bytes, size_t len) {
     osal::LockGuard guard(mutex_);
+    osal::LockGuard<osal::RecursiveMutex> global_guard(s_wasm3_global_mutex);
 
     cleanup_runtime();
 
@@ -170,7 +175,10 @@ void ContainerLifecycleController::worker_thread_main() {
                 reason = "ExecutionTimeout";
             }
 
-            on_trap_caught(r, exit_code, reason);
+            std::string trap_msg = (r == m3Err_trapOutOfGas)
+                ? "ExecutionTimeout: Workload did not terminate within grace period"
+                : std::string(r ? r : "UnknownTrap");
+            on_trap_caught(trap_msg, exit_code, reason);
         }
     } else {
         // Event loop or library workload without main entrypoint
@@ -178,6 +186,10 @@ void ContainerLifecycleController::worker_thread_main() {
             osal::Thread::sleep_ms(100);
             osal::System::feed_watchdog();
         }
+        osal::LockGuard guard(mutex_);
+        status_.phase = ContainerPhase::Terminated;
+        status_.exit_code = 0;
+        status_.ready = false;
     }
 }
 
@@ -219,7 +231,11 @@ bool ContainerLifecycleController::start() {
     osal::Thread::Config t_cfg;
     std::string t_name = "pod_" + config_.pod_id;
     t_cfg.name = t_name.c_str();
+#if defined(ESP_PLATFORM)
     t_cfg.stack_size = 12288;
+#else
+    t_cfg.stack_size = 65536;
+#endif
     t_cfg.priority = 5;
     t_cfg.core_affinity = 1;
 
@@ -247,25 +263,50 @@ bool ContainerLifecycleController::stop(uint32_t grace_period_ms) {
     stop_requested_.store(true);
 
     if (worker_thread_) {
-        // Wait up to grace_period_ms for worker to finish
         uint64_t start_t = osal::System::get_uptime_ms();
-        while (worker_thread_->is_joinable() && (osal::System::get_uptime_ms() - start_t < grace_period_ms) && status_.phase == ContainerPhase::Running) {
-            osal::Thread::sleep_ms(20);
+
+        // Phase 1: Wait up to grace_period_ms for worker to finish cooperatively
+        while (worker_thread_->is_joinable() && (osal::System::get_uptime_ms() - start_t < grace_period_ms)) {
+            {
+                osal::LockGuard guard(mutex_);
+                if (status_.phase != ContainerPhase::Running) {
+                    break;
+                }
+            }
+            osal::Thread::sleep_ms(10);
         }
 
-        if (worker_thread_->is_joinable() && status_.phase == ContainerPhase::Running) {
-            // Grace period expired: uncooperative guest loop detected
+        // Phase 2: If still running, abort guest loop via gas metering trap
+        bool still_running = false;
+        {
+            osal::LockGuard guard(mutex_);
+            still_running = (status_.phase == ContainerPhase::Running);
+        }
+
+        if (worker_thread_->is_joinable() && still_running) {
 #if d_m3HasGasMetering
-            if (m3_runtime_) {
-                reinterpret_cast<IM3Runtime>(m3_runtime_)->gasRemaining = -1;
-            }
             uint64_t trap_t = osal::System::get_uptime_ms();
-            while (worker_thread_->is_joinable() && (osal::System::get_uptime_ms() - trap_t < 50) && status_.phase == ContainerPhase::Running) {
-                osal::Thread::sleep_ms(10);
+            // Continuously enforce gas exhaustion until worker thread traps or timeout
+            while (worker_thread_->is_joinable() && (osal::System::get_uptime_ms() - trap_t < 250)) {
+                if (m3_runtime_) {
+                    __atomic_store_n(&(reinterpret_cast<IM3Runtime>(m3_runtime_)->gasRemaining), -1, __ATOMIC_SEQ_CST);
+                }
+                {
+                    osal::LockGuard guard(mutex_);
+                    if (status_.phase != ContainerPhase::Running) {
+                        break;
+                    }
+                }
+                osal::Thread::sleep_ms(2);
             }
 #endif
-            if (worker_thread_->is_joinable()) {
-                // Detach uncooperative thread to prevent host freeze
+            {
+                osal::LockGuard guard(mutex_);
+                still_running = (status_.phase == ContainerPhase::Running);
+            }
+
+            // Phase 3: Fail-safe detach only if worker truly refused to trap after full timeout
+            if (worker_thread_->is_joinable() && still_running) {
                 worker_thread_->detach();
                 worker_thread_.reset();
                 thread_detached_.store(true);
@@ -280,6 +321,7 @@ bool ContainerLifecycleController::stop(uint32_t grace_period_ms) {
             }
         }
 
+        // Clean completion or gas trap caught: synchronously join worker thread to prevent UAF
         if (worker_thread_ && worker_thread_->is_joinable()) {
             worker_thread_->join();
             worker_thread_.reset();
