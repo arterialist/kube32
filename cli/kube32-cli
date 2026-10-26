@@ -218,16 +218,23 @@ def cmd_apply(args):
         except Exception as e:
             print(f"Error connecting to cluster at {server}: {e}", file=sys.stderr)
 
+DEFAULT_SERVER = "http://192.168.4.1:6443"
+
 def main():
-    parser = argparse.ArgumentParser(description="Kube32 Micro-Orchestration Developer CLI")
-    parser.add_argument("--server", default="http://192.168.4.1:6443", help="Kube32 API Server URL (default: http://192.168.4.1:6443)")
+    server_parser = argparse.ArgumentParser(add_help=False)
+    server_parser.add_argument("--server", default=argparse.SUPPRESS, help=f"Kube32 API Server URL (default: {DEFAULT_SERVER})")
+
+    parser = argparse.ArgumentParser(
+        description="Kube32 Micro-Orchestration Developer CLI",
+        parents=[server_parser]
+    )
     subparsers = parser.add_subparsers(dest="command")
 
     # version
-    subparsers.add_parser("version", help="Display Kube32 CLI version")
+    subparsers.add_parser("version", help="Display Kube32 CLI version", parents=[server_parser])
 
     # package
-    p_pkg = subparsers.add_parser("package", help="Package a WebAssembly binary into a Pod manifest")
+    p_pkg = subparsers.add_parser("package", help="Package a WebAssembly binary into a Pod manifest", parents=[server_parser])
     p_pkg.add_argument("wasm_file", help="Path to .wasm binary file")
     p_pkg.add_argument("--name", help="Workload name")
     p_pkg.add_argument("--namespace", default="default", help="Pod namespace")
@@ -237,7 +244,7 @@ def main():
     p_pkg.add_argument("-o", "--output", help="Output YAML/JSON file path")
 
     # manifest
-    p_man = subparsers.add_parser("manifest", help="Generate a sample Pod manifest")
+    p_man = subparsers.add_parser("manifest", help="Generate a sample Pod manifest", parents=[server_parser])
     p_man.add_argument("--name", required=True, help="Pod name")
     p_man.add_argument("--node", help="Target nodeName")
     p_man.add_argument("--namespace", default="default", help="Pod namespace")
@@ -248,13 +255,15 @@ def main():
     p_man.add_argument("-o", "--output", help="Output file")
 
     # status
-    p_stat = subparsers.add_parser("status", help="Inspect cluster status (nodes, pods, memory)")
+    p_stat = subparsers.add_parser("status", help="Inspect cluster status (nodes, pods, memory)", parents=[server_parser])
 
     # apply
-    p_app = subparsers.add_parser("apply", help="Submit a workload manifest to the cluster")
+    p_app = subparsers.add_parser("apply", help="Submit a workload manifest to the cluster", parents=[server_parser])
     p_app.add_argument("-f", "--file", required=True, help="Path to manifest file")
 
     args = parser.parse_args()
+    if not hasattr(args, "server") or args.server is None:
+        args.server = DEFAULT_SERVER
     if args.command == "version":
         cmd_version(args)
     elif args.command == "package":
