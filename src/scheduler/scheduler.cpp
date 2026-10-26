@@ -455,10 +455,13 @@ public:
         running_.store(true);
 
         reconcile_thread_ = std::make_unique<osal::Thread>();
+        osal::Thread::Config cfg;
+        cfg.name = "k32_sched";
+        cfg.stack_size = 8192;
         bool started = reconcile_thread_->start([](void* p) {
             auto* self = static_cast<SchedulerImpl*>(p);
             self->run_reconcile_loop();
-        }, this);
+        }, this, cfg);
 
         if (!started) {
             running_.store(false);

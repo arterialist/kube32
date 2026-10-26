@@ -41,10 +41,13 @@ bool HttpServer::start() {
 
     running_.store(true);
     server_thread_ = std::make_unique<osal::Thread>();
+    osal::Thread::Config cfg;
+    cfg.name = "k32_http";
+    cfg.stack_size = 12288;
     bool started = server_thread_->start([](void* p) {
         auto* self = static_cast<HttpServer*>(p);
         self->run_worker_loop();
-    }, this);
+    }, this, cfg);
 
     if (!started) {
         running_.store(false);

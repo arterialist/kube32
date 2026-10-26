@@ -16,7 +16,7 @@ public:
         uint32_t priority;   // FreeRTOS priority (1..24) or POSIX priority
         int core_affinity;   // -1: any/no affinity, 0: Core 0, 1: Core 1
 
-        Config() : name("k32_task"), stack_size(4096), priority(5), core_affinity(-1) {}
+        Config() : name("k32_task"), stack_size(8192), priority(5), core_affinity(-1) {}
     };
 
     Thread();
