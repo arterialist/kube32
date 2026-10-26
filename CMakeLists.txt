@@ -55,7 +55,7 @@ else()
     if(CMAKE_BUILD_TYPE STREQUAL "Debug")
         add_compile_options(-g -O0 -DDEBUG)
     else()
-        add_compile_options(-O2 -DNDEBUG)
+        add_compile_options(-O2 -UNDEBUG)
     endif()
 
     # Preprocessor Target Flags
@@ -66,7 +66,7 @@ else()
         ${CMAKE_CURRENT_SOURCE_DIR}/include
     )
 
-    # Core Library: OSAL, Memory Architecture, Storage Engine
+    # Core Library: OSAL, Memory Architecture, Storage Engine, API Server, Scheduler
     set(KUBE32_CORE_SRCS
         src/osal/thread_posix.cpp
         src/osal/mutex_posix.cpp
@@ -79,6 +79,11 @@ else()
         src/storage/radix_tree.cpp
         src/storage/littlefs_journal.cpp
         src/storage/store.cpp
+        src/models/kube_models.cpp
+        src/api/table_serializer.cpp
+        src/api/route_handler.cpp
+        src/api/http_server.cpp
+        src/scheduler/scheduler.cpp
     )
 
     add_library(kube32_core STATIC
@@ -87,7 +92,7 @@ else()
     target_include_directories(kube32_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
     target_link_libraries(kube32_core PUBLIC pthread)
 
-    # Optional Simulation Binary (if main_host.cpp is present)
+    # Simulation Binary (kube32-sim)
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/src/main_host.cpp")
         add_executable(kube32-sim
             src/main_host.cpp
@@ -134,5 +139,19 @@ else()
     )
     target_link_libraries(test_storage_adversarial PRIVATE kube32_core)
     add_test(NAME test_storage_adversarial COMMAND test_storage_adversarial)
+
+    # 6. Kubernetes API Server & Route Handler Tests (Milestone 2)
+    add_executable(test_api_server
+        tests/test_api_server.cpp
+    )
+    target_link_libraries(test_api_server PRIVATE kube32_core)
+    add_test(NAME test_api_server COMMAND test_api_server)
+
+    # 7. Autonomous Scheduler & Predicate Tests (Milestone 2)
+    add_executable(test_scheduler
+        tests/test_scheduler.cpp
+    )
+    target_link_libraries(test_scheduler PRIVATE kube32_core)
+    add_test(NAME test_scheduler COMMAND test_scheduler)
 
 endif()
