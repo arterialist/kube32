@@ -178,6 +178,10 @@ extern "C" void app_main() {
         // Consume and process from ringbuffer
         uint8_t rx_buf[256] = {0};
         int32_t rx_bytes = kube32::ipc::ChannelManager::instance().recv("keyword-classifier", chan_hdl, rx_buf, sizeof(rx_buf), 200);
+        if (rx_bytes == 32 && std::memcmp(rx_buf, "K32_PIPELINE_READY", 18) == 0) {
+            printf("[PIPELINE] Handshake acknowledged: %s\n", (const char*)rx_buf);
+            rx_bytes = kube32::ipc::ChannelManager::instance().recv("keyword-classifier", chan_hdl, rx_buf, sizeof(rx_buf), 200);
+        }
         if (rx_bytes > 0) {
             auto* recv_feats = reinterpret_cast<MfccFeatures*>(rx_buf);
             printf("[PIPELINE] Stage 2 (keyword-classifier) accepted %d bytes from Stage 1 (audio-preprocessor)\n", (int)rx_bytes);
@@ -187,8 +191,12 @@ extern "C" void app_main() {
             printf("[PIPELINE] Distributed Pipeline Silicon Execution: COMPLETE & VERIFIED\n");
         }
 
+        uint32_t iter = 0;
         while (true) {
-            vTaskDelay(pdMS_TO_TICKS(1000));
+            vTaskDelay(pdMS_TO_TICKS(5000));
+            iter++;
+            printf("[WORKER-HEARTBEAT] Node: %s (iter %u) | Free Heap: %u bytes | Pipeline: ACTIVE\n",
+                   node_name.c_str(), iter, (unsigned)esp_get_free_heap_size());
         }
     } else {
         // -------------------------------------------------------------

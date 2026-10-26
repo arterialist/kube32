@@ -8,7 +8,7 @@ PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$PROJECT_DIR"
 
 PORT="${1:-/dev/cu.usbmodem578E0184461}"
-BAUD="${2:-115200}"
+BAUD="${2:-460800}"
 
 echo "================================================================="
 echo "  Kube32 Production ESP32-S3 Silicon Flasher"
@@ -39,18 +39,16 @@ firmware = "$FIRMWARE"
 print(f"[*] Connecting to ESP32-S3 on {port} at {baud} baud...")
 
 # Ensure robust serial transmission across USB-UART bridges (e.g. CH340 / USB-CDC)
+esptool.loader.DEFAULT_TIMEOUT = 30.0
 esptool.loader.ESPLoader.ESP_RAM_BLOCK = 256
 esptool.loader.StubMixin.FLASH_WRITE_SIZE = 256
 esptool.loader.ESPLoader.FLASH_WRITE_SIZE = 256
 esptool.loader.WRITE_BLOCK_ATTEMPTS = 5
-esptool.loader.DEFAULT_TIMEOUT = 20.0
 
 orig_flash_block = esptool.loader.ESPLoader.flash_block
 def paced_flash_block(self, data, seq, timeout=20.0, encrypted=False):
-    if hasattr(self, '_port') and (self._port.timeout is None or self._port.timeout < 20.0):
-        self._port.timeout = 20.0
     res = orig_flash_block(self, data, seq, timeout=20.0, encrypted=encrypted)
-    time.sleep(0.001)
+    time.sleep(0.0015)
     return res
 esptool.loader.ESPLoader.flash_block = paced_flash_block
 

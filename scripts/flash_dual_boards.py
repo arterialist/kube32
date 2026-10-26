@@ -16,6 +16,7 @@ PARTITIONS = ".pio/build/esp32s3/partitions.bin"
 FIRMWARE = ".pio/build/esp32s3/firmware.bin"
 
 KNOWN_PORTS = {
+    "/dev/cu.usbmodem101": "Node 1 (8MB Flash, Master / Control Plane)",
     "/dev/cu.usbmodem2101": "Node 1 (8MB Flash, Master / Control Plane)",
     "/dev/cu.usbmodem578E0184461": "Node 2 (2MB PSRAM, Worker Node 02)"
 }
