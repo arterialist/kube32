@@ -121,4 +121,11 @@ else()
     target_link_libraries(test_storage PRIVATE kube32_core)
     add_test(NAME test_storage COMMAND test_storage)
 
+    # 4. Storage Engine Adversarial Stress Tests
+    add_executable(test_storage_adversarial
+        tests/test_storage_adversarial.cpp
+    )
+    target_link_libraries(test_storage_adversarial PRIVATE kube32_core)
+    add_test(NAME test_storage_adversarial COMMAND test_storage_adversarial)
+
 endif()
