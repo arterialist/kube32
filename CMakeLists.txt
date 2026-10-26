@@ -254,6 +254,13 @@ else()
     target_link_libraries(test_chunked_stress PRIVATE kube32_core)
     add_test(NAME test_chunked_stress COMMAND test_chunked_stress)
 
+    # 17. Milestone 3 Iteration 4 Challenger 7 Thread Name Length & Concurrency Suite
+    add_executable(test_m3_thread_names
+        tests/test_m3_thread_names.cpp
+    )
+    target_link_libraries(test_m3_thread_names PRIVATE kube32_core)
+    add_test(NAME test_m3_thread_names COMMAND test_m3_thread_names)
+
 endif()
 
 
