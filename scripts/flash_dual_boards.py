@@ -22,9 +22,7 @@ PARTITIONS = os.path.join(PROJECT_DIR, ".pio/build/esp32s3/partitions.bin")
 FIRMWARE = os.path.join(PROJECT_DIR, ".pio/build/esp32s3/firmware.bin")
 
 KNOWN_PORTS = {
-    "/dev/cu.usbmodem101": "Node 1 (8MB Flash, Master / Control Plane)",
-    "/dev/cu.usbmodem2101": "Node 1 (8MB Flash, Master / Control Plane)",
-    "/dev/cu.usbmodem578E0184461": "Node 2 (2MB PSRAM, Worker Node 02)"
+    # Dynamically detected or user-specified serial ports
 }
 
 def flash_port(port, baud=460800):
@@ -152,8 +150,8 @@ def main():
     print("=" * 65)
     print(f"Target Board Count: {target_count} | Max Retries: {max_retries} | Retry Backoff: {retry_delay}s")
     print("Waiting for boards in Download Mode...")
-    print("  1. Cardputer: Switch OFF -> Hold G0 -> Plug in USB / Switch ON")
-    print("  2. Dev Board: Hold BOOT -> Tap RST -> Release BOOT")
+    print("  1. Node 1: Hold BOOT (GPIO 0) -> Tap RST / Power ON -> Release BOOT")
+    print("  2. Node 2: Hold BOOT (GPIO 0) -> Tap RST / Power ON -> Release BOOT")
     print("-" * 65)
 
     flashed = set()

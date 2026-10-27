@@ -30,14 +30,8 @@ static const char* TAG = "Kube32Main";
 // Known MAC Addresses for the Connected Physical Hardware
 static const char* NODE2_MAC = "02:00:00:00:00:01"; // 2MB PSRAM (Worker Node 02)
 
-extern "C" void app_main() {
-    // 1. Initialize NVS Flash
-    esp_err_t ret = nvs_flash_init();
-    if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
-        ESP_ERROR_CHECK(nvs_flash_erase());
-        ret = nvs_flash_init();
-    }
-    ESP_ERROR_CHECK(ret);
+static void kube32_cluster_task(void* pvParameters) {
+    (void)pvParameters;
 
     // 2. Read Factory MAC Address
     uint8_t mac[6] = {0};
@@ -364,5 +358,28 @@ extern "C" void app_main() {
             }
         }
     }
+
+    vTaskDelete(nullptr);
+}
+
+extern "C" void app_main() {
+    // 1. Initialize NVS Flash
+    esp_err_t ret = nvs_flash_init();
+    if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+        ESP_ERROR_CHECK(nvs_flash_erase());
+        ret = nvs_flash_init();
+    }
+    ESP_ERROR_CHECK(ret);
+
+    // 2. Spawn dedicated cluster task with 32KB stack pinned to Core 0
+    xTaskCreatePinnedToCore(
+        kube32_cluster_task,
+        "k32_cluster",
+        32768,
+        nullptr,
+        5,
+        nullptr,
+        0
+    );
 }
 #endif

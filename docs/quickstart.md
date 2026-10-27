@@ -19,6 +19,38 @@ A minimal Kube32 cluster uses two ESP32-S3 boards:
 | **Node 1 (Control plane)** | Standard ESP32-S3 | Native USB-CDC or USB-UART | 512 KB SRAM, 8 MB Flash |
 | **Node 2 (Worker)** | ESP32-S3 with PSRAM | Native USB-CDC or USB-UART | 512 KB SRAM, 2 MB - 8 MB PSRAM, 8 MB Flash |
 
+### Physical interconnect topology
+
+```mermaid
+graph TD
+    subgraph Host["Developer workstation"]
+        CLI["kube32-cli / kubectl"]
+    end
+
+    subgraph Cluster["Physical bare-metal cluster"]
+        subgraph Node1["Node 1: Control plane (esp32-node-01)"]
+            direction TB
+            N1_HW["ESP32-S3 (512 KB SRAM, 8 MB Flash)"]
+            N1_ROLES["API server, scheduler, radix store"]
+            N1_HW --- N1_ROLES
+        end
+
+        subgraph Node2["Node 2: Worker node (esp32-node-02)"]
+            direction TB
+            N2_HW["ESP32-S3 (512 KB SRAM, 2 MB - 8 MB PSRAM)"]
+            N2_ROLES["Worker agent, Wasm3 VM, firewall"]
+            N2_HW --- N2_ROLES
+        end
+    end
+
+    CLI -->|"USB serial link 1"| Node1
+    CLI -->|"USB serial link 2"| Node2
+    Node1 <==>|"Wi-Fi SoftAP (192.168.4.0/24)"| Node2
+    Node1 <==>|"ESP-NOW 2.4 GHz radio mesh"| Node2
+```
+
+### Cluster bootstrap and scheduling flow
+
 ```mermaid
 sequenceDiagram
     autonumber

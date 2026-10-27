@@ -101,18 +101,34 @@ Instead of opening heavy TCP sockets across Wi-Fi for sensor data, Kube32 routes
 
 ## Hardware setup
 
-```
-+-------------------------------------------------------------------------------+
-| Node 1: Control plane                         Node 2: Worker node             |
-| Target: ESP32-S3 (Standard)                   Target: ESP32-S3 with PSRAM     |
-| Memory: 512 KB SRAM, 8 MB Flash               Memory: 512 KB SRAM, 2 MB PSRAM |
-| Roles:  Control plane, API server, scheduler  Roles:  Worker agent, Wasm3 VM  |
-| IP:     192.168.4.1 (SoftAP host)             IP:     192.168.4.2 (Station)   |
-|                                                                               |
-|                   \                              /                            |
-|                    \                            /                             |
-|               Wi-Fi SoftAP                 ESP-NOW 2.0                        |
-|              Kube32-Cluster              Virtual channels                     |
-|             (192.168.4.0/24)             Low-latency data                     |
-+-------------------------------------------------------------------------------+
+```mermaid
+graph TD
+    subgraph Host["Developer workstation"]
+        CLI["kube32-cli / kubectl"]
+    end
+
+    subgraph Cluster["Bare-metal ESP32-S3 cluster"]
+        subgraph Node1["Node 1: Control plane (esp32-node-01)"]
+            direction TB
+            N1_HW["ESP32-S3 (512 KB SRAM, 8 MB Flash)"]
+            N1_ROLE["API server, scheduler, radix store"]
+            N1_IP["IP: 192.168.4.1 (SoftAP host)"]
+            N1_HW --- N1_ROLE
+            N1_ROLE --- N1_IP
+        end
+
+        subgraph Node2["Node 2: Worker node (esp32-node-02)"]
+            direction TB
+            N2_HW["ESP32-S3 (512 KB SRAM, 2 MB - 8 MB PSRAM)"]
+            N2_ROLE["Worker agent, Wasm3 VM, firewall"]
+            N2_IP["IP: 192.168.4.2 (Wi-Fi station)"]
+            N2_HW --- N2_ROLE
+            N2_ROLE --- N2_IP
+        end
+    end
+
+    CLI -->|"Serial link (USB-CDC / USB-UART)"| Node1
+    CLI -.->|"Wi-Fi REST on port 6443 (optional)"| Node1
+    Node1 <==>|"Wi-Fi SoftAP (Kube32-Cluster 192.168.4.0/24)"| Node2
+    Node1 <==>|"ESP-NOW 2.4 GHz virtual channel IPC (&le; 3 ms)"| Node2
 ```

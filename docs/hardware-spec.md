@@ -66,23 +66,27 @@ ESP32-S3 microcontrollers contain a factory-burned 48-bit MAC address in their o
 
 The ESP32-S3 memory splits between the FreeRTOS kernel, networking buffers, and Kube32 components:
 
-```
-0x3FC8_0000 +-----------------------------------------------+
-            | FreeRTOS kernel and system DRAM (128 KB)      |
-0x3FCA_7310 +-----------------------------------------------+
-            | Internal heap (265 KB)                        |
-            | - In-memory radix store (Node 1)              |
-            | - Wi-Fi and socket buffers                    |
-0x3FCE_9710 +-----------------------------------------------+
-            | DMA and peripheral reserved SRAM (32 KB)      |
-0x3FCF_0000 +-----------------------------------------------+
-            | IRAM and instruction cache                    |
-0x3C00_0000 +===============================================+
-            | External SPI PSRAM (Node 2: 2048 KB - 8192 KB)|
-            | - Wasm3 container memory                      |
-            | - TinyML tensor buffers                       |
-            | - Shared IPC ring buffers                     |
-0x3C80_0000 +-----------------------------------------------+
+```mermaid
+graph TD
+    subgraph InternalSRAM["Internal SRAM: 512 KB (0x3FC8_0000 - 0x3FCF_0000)"]
+        direction TB
+        M1["FreeRTOS kernel & system DRAM (128 KB)"]
+        M2["Internal heap (265 KB)<br>• In-memory radix store (Node 1)<br>• Wi-Fi TCP/IP & socket buffers"]
+        M3["DMA & peripheral reserved SRAM (32 KB)"]
+        M4["IRAM & instruction cache (87 KB)"]
+        M1 --- M2
+        M2 --- M3
+        M3 --- M4
+    end
+
+    subgraph ExternalPSRAM["External SPI PSRAM: 2 MB - 8 MB (0x3C00_0000)"]
+        direction TB
+        P1["Wasm3 container linear memory sandboxes"]
+        P2["TinyML tensor buffers & inference models"]
+        P3["Shared IPC ring buffers"]
+        P1 --- P2
+        P2 --- P3
+    end
 ```
 
 The firmware automatically detects whether external PSRAM is installed via `CONFIG_SPIRAM_IGNORE_NOTFOUND=y`. If external RAM is absent, the memory allocator restricts container allocations to available internal SRAM.

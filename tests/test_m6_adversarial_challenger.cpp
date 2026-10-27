@@ -29,7 +29,7 @@ void test_distributed_pipeline_memory_boundaries() {
     std::cout << "=================================================================\n";
 
     // 1. Setup Node manifests representing physical silicon
-    // Node 1: M5Stack Cardputer (512KiB SRAM total, 400KiB allocatable, 0 PSRAM)
+    // Node 1: ESP32-S3 Standard Board (512KiB SRAM total, 400KiB allocatable, 0 PSRAM)
     std::string node1_manifest = 
         "{\"kind\":\"Node\",\"apiVersion\":\"v1\","
         "\"metadata\":{\"name\":\"esp32-node-01\",\"labels\":{\"role\":\"control-plane\"}},"
