@@ -214,6 +214,15 @@ h1, h2, h3, h4, h5, h6 {
   background-color: var(--md-sys-color-surface-container-high) !important;
 }
 
+.md-search__input::placeholder {
+  color: var(--md-sys-color-on-surface-variant) !important;
+  opacity: 0.8 !important;
+}
+
+.md-search__icon {
+  color: var(--md-sys-color-on-surface-variant) !important;
+}
+
 /* M3 Navigation Tabs */
 .md-tabs {
   background-color: var(--md-sys-color-surface-container-low) !important;
@@ -266,22 +275,35 @@ h1, h2, h3, h4, h5, h6 {
   font-weight: 600;
 }
 
-/* M3 Metric Grid */
+/* M3 Metric Grid: 4 items neatly balanced */
 .metric-grid {
   display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+  grid-template-columns: repeat(4, 1fr);
   gap: 1rem;
   margin: 1.5rem 0;
+}
+
+@media (max-width: 900px) {
+  .metric-grid {
+    grid-template-columns: repeat(2, 1fr);
+  }
+}
+
+@media (max-width: 480px) {
+  .metric-grid {
+    grid-template-columns: 1fr;
+  }
 }
 
 .metric-card {
   background-color: var(--md-sys-color-surface-container-low);
   border: 1px solid var(--md-sys-color-outline-variant);
   border-radius: var(--md-sys-shape-corner-lg);
-  padding: 1.25rem;
+  padding: 1.25rem 1rem;
   display: flex;
   flex-direction: column;
   justify-content: center;
+  text-align: center;
   transition: transform 0.15s ease, box-shadow 0.15s ease;
 }
 
@@ -301,7 +323,7 @@ h1, h2, h3, h4, h5, h6 {
 }
 
 .metric-card .metric-label {
-  font-size: 0.78rem;
+  font-size: 0.74rem;
   font-weight: 500;
   text-transform: uppercase;
   letter-spacing: 0.05em;
@@ -338,6 +360,13 @@ h1, h2, h3, h4, h5, h6 {
 }
 
 /* ==============================================================================
+   Layout & Container Scale
+   ============================================================================== */
+.md-grid {
+  max-width: 76rem;
+}
+
+/* ==============================================================================
    Material 3 Tables
    ============================================================================== */
 .md-typeset table:not([class]) {
@@ -357,13 +386,23 @@ h1, h2, h3, h4, h5, h6 {
   font-weight: 600;
   color: var(--md-sys-color-on-surface);
   border-bottom: 1px solid var(--md-sys-color-outline-variant);
-  padding: 10px 14px;
+  padding: 8px 14px;
 }
 
 .md-typeset table:not([class]) td {
-  padding: 10px 14px;
+  padding: 8px 14px;
   border-bottom: 1px solid var(--md-sys-color-outline-variant);
   color: var(--md-sys-color-on-surface);
+}
+
+.md-typeset table:not([class]) td:last-child,
+.md-typeset table:not([class]) th:last-child {
+  min-width: 170px;
+}
+
+.md-typeset table:not([class]) code {
+  white-space: normal;
+  word-break: break-word;
 }
 
 .md-typeset table:not([class]) tr:last-child td {
@@ -380,11 +419,25 @@ h1, h2, h3, h4, h5, h6 {
 .md-typeset code {
   font-family: var(--md-code-font);
   font-size: 0.84em;
-  background-color: var(--md-sys-color-surface-container);
+  background-color: var(--md-sys-color-surface-container-high);
   color: var(--md-sys-color-primary);
-  border: 1px solid var(--md-sys-color-outline-variant);
   border-radius: var(--md-sys-shape-corner-xs);
-  padding: 0.15em 0.4em;
+  padding: 1px 5px;
+  white-space: nowrap;
+}
+
+/* Code inside headings inherits heading typography */
+.md-typeset h1 code,
+.md-typeset h2 code,
+.md-typeset h3 code,
+.md-typeset h4 code {
+  font-family: var(--md-code-font);
+  font-size: 0.9em;
+  font-weight: 600;
+  color: inherit;
+  background-color: transparent;
+  border: none;
+  padding: 0;
 }
 
 .md-typeset pre {
@@ -392,6 +445,7 @@ h1, h2, h3, h4, h5, h6 {
   border: 1px solid var(--md-sys-color-outline-variant);
   background-color: var(--md-sys-color-surface-container-lowest) !important;
   box-shadow: none !important;
+  padding: 0.85rem 2.85rem 0.85rem 1rem !important;
 }
 
 [data-md-color-scheme="slate"] .md-typeset pre {
@@ -405,6 +459,7 @@ h1, h2, h3, h4, h5, h6 {
   background-color: transparent !important;
   border: none !important;
   padding: 0;
+  white-space: pre !important;
 }
 
 /* Copy Button M3 Style */
@@ -451,4 +506,12 @@ h1, h2, h3, h4, h5, h6 {
   border-radius: var(--md-sys-shape-corner-lg) !important;
   padding: 1.5rem !important;
   box-shadow: var(--md-sys-elevation-level1);
+  overflow-x: auto !important;
+}
+
+.mermaid svg {
+  max-width: 100% !important;
+  height: auto !important;
+  display: block;
+  margin: 0 auto;
 }

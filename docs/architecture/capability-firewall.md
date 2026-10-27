@@ -63,7 +63,7 @@ graph TD
         FW -->|No| BLOCK["Block call and return -1<br/>Emit security violation event"]
     end
 
-    REG --> Runtime
+    REG -->|"Configures ACL"| FW
 ```
 
 ---

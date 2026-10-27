@@ -39,7 +39,7 @@ The cluster splits into a master control plane node and one or more worker nodes
 graph TD
     CLI["kube32-cli or kubectl"] -->|"HTTP :6443 or USB serial"| API
 
-    subgraph Node1["Node 1: Master control plane"]
+    subgraph Node1["Node 1: Control plane"]
         API["HTTP API server on port 6443"]
         STORE[("In-memory radix store")]
         SCHED["Scheduler with LeastAllocated scoring"]
@@ -72,10 +72,10 @@ graph TD
         WASM2 --> TASK
     end
 
-    Node1 <==>|"192.168.4.0/24 subnet"| WIFI
-    WIFI <==>|"Wi-Fi station"| Node2
-    Node1 <==>|"K32C frames"| ESPNOW
-    ESPNOW <==>|"Named data channel"| Node2
+    API <-->|"192.168.4.0/24 SoftAP"| WIFI
+    WIFI <-->|"Wi-Fi station"| KUBELET2
+    FW1 <-->|"K32C frames"| ESPNOW
+    ESPNOW <-->|"Named data channel"| FW2
 ```
 
 ---

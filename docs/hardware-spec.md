@@ -13,25 +13,26 @@ Kube32 runs on bare metal on physical ESP32-S3 silicon. This page outlines the p
 ## Board configurations
 
 ```mermaid
-graph LR
-    subgraph N1["Node 1: Control plane"]
-        N1_CPU["ESP32-S3 at 240 MHz"]
-        N1_MEM["512 KB SRAM, 8 MB Flash"]
-        N1_IO["USB-CDC or USB-UART"]
-        N1_ROLE["Control plane & API server"]
+graph TD
+    subgraph N1["Node 1: Control plane (esp32-node-01)"]
+        direction TB
+        N1_CPU["Xtensa LX7 dual-core @ 240 MHz"]
+        N1_MEM["512 KB Internal SRAM & 8 MB Flash"]
+        N1_ROLE["API server & scheduler on Core 0"]
+        N1_CPU --- N1_MEM
+        N1_CPU --- N1_ROLE
     end
 
-    subgraph N2["Node 2: Worker node"]
-        N2_CPU["ESP32-S3 at 240 MHz"]
-        N2_MEM["512 KB SRAM, 2 MB - 8 MB PSRAM"]
-        N2_IO["USB-CDC or USB-UART"]
-        N2_ROLE["Worker agent & Wasm3 VM"]
+    subgraph N2["Node 2: Worker node (esp32-node-02)"]
+        direction TB
+        N2_CPU["Xtensa LX7 dual-core @ 240 MHz"]
+        N2_MEM["512 KB SRAM + 2-8 MB Quad/Octal PSRAM"]
+        N2_ROLE["Worker agent & Wasm3 VM on Core 1"]
+        N2_CPU --- N2_MEM
+        N2_CPU --- N2_ROLE
     end
 
-    N1_CPU --- N1_MEM
-    N1_CPU --- N1_IO
-    N2_CPU --- N2_MEM
-    N2_CPU --- N2_IO
+    N1 <==>|"ESP-NOW 2.4 GHz radio link & SoftAP Wi-Fi"| N2
 ```
 
 ### Node 1: Control plane node

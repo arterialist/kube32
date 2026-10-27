@@ -23,8 +23,8 @@ bash scripts/flash.sh /dev/ttyACM0 460800
 bash scripts/flash.sh /dev/ttyACM1 460800
 ```
 
-> [!TIP]
-> If your workstation runs macOS, replace `/dev/ttyACM*` with `/dev/cu.usbmodem*` or `/dev/cu.usbserial*`. On Windows, use the appropriate `COM*` port.
+!!! tip
+    If your workstation runs macOS, replace `/dev/ttyACM*` with `/dev/cu.usbmodem*` or `/dev/cu.usbserial*`. On Windows, use the appropriate `COM*` port.
 
 ### Flashing directly via PlatformIO
 You can also flash directly using PlatformIO:
@@ -39,6 +39,7 @@ pio run -e esp32s3 -t upload --upload-port /dev/ttyACM0
 
 ### Entering download mode manually
 If the flashing tool cannot communicate with the chip:
+
 1. Press and hold the **BOOT** button (connected to GPIO 0).
 2. Press and release the **RESET** (or EN) button.
 3. Release the **BOOT** button.
@@ -48,6 +49,7 @@ If the flashing tool cannot communicate with the chip:
 Certain USB-to-UART bridge controllers experience buffer overruns when flashing large binaries at 460,800 baud or higher.
 
 If flashing stalls or reports `Packet content transfer stopped`:
+
 1. Use 256-byte flash block sizing:
    ```python
    esptool.loader.ESPLoader.ESP_RAM_BLOCK = 256

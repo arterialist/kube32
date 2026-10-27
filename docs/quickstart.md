@@ -26,7 +26,7 @@ sequenceDiagram
     participant N1 as Node 1 (Control plane)
     participant N2 as Node 2 (Worker)
 
-    N1->>N1: Start Wi-Fi SoftAP "Kube32-Cluster"
+    N1->>N1: Start Wi-Fi SoftAP Kube32-Cluster
     N1->>N1: Start HTTP API server on port 6443
     N2->>N1: Associate over Wi-Fi, receive IP 192.168.4.2
     N2->>N1: Register node via POST /api/v1/nodes
@@ -50,6 +50,7 @@ pio run -e esp32s3
 ```
 
 This compiles three target binaries in `.pio/build/esp32s3/`:
+
 - `bootloader.bin` at offset `0x0000`
 - `partitions.bin` at offset `0x8000`
 - `firmware.bin` at offset `0x20000`
@@ -76,8 +77,8 @@ Connect the second board to your workstation:
 bash scripts/flash.sh /dev/ttyACM1 460800
 ```
 
-> [!NOTE]
-> On macOS, serial devices typically appear as `/dev/cu.usbmodem*` or `/dev/cu.usbserial*`. On Linux, they appear as `/dev/ttyACM*` or `/dev/ttyUSB*`. On Windows, they appear as `COM*`.
+!!! note
+    On macOS, serial devices typically appear as `/dev/cu.usbmodem*` or `/dev/cu.usbserial*`. On Linux, they appear as `/dev/ttyACM*` or `/dev/ttyUSB*`. On Windows, they appear as `COM*`.
 
 ---
 

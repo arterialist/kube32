@@ -20,7 +20,7 @@ graph TD
 
     subgraph Filters["Predicate filters"]
         F1["Node selector filter<br/>kubernetes.io/arch<br/>kubernetes.io/hostname"]
-        F2["Memory capacity filter<br/>requested <= allocatable"]
+        F2["Memory capacity filter<br/>requested &le; allocatable"]
         F3["Hardware capability filter<br/>GPIO and ADC pins available"]
     end
 

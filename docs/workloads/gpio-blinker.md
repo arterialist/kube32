@@ -48,7 +48,7 @@ spec:
 graph TD
     YAML["examples/gpio-blinker.yaml"] --> CLI["kube32-cli apply"]
     CLI --> SCHED["Scheduler on Core 0"]
-    SCHED -->|LeastAllocated scoring| BIND["Bind to esp32-node-02"]
+    SCHED -->|"LeastAllocated scoring"| BIND["Bind to esp32-node-02"]
     BIND --> KUBELET["Worker agent on Node 2"]
     
     subgraph Execution["Node 2 physical execution"]
@@ -57,8 +57,8 @@ graph TD
         PIN["Physical GPIO 10 (LED)"]
         
         KUBELET --> FW
-        FW -->|Audit passed: GPIO_WRITE allowed| WASM
-        WASM -->|esp32_gpio_write(10, 1)| PIN
+        FW -->|"Audit passed: GPIO_WRITE allowed"| WASM
+        WASM -->|"esp32_gpio_write(10, 1)"| PIN
     end
 ```
 

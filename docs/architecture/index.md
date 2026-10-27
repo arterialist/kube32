@@ -39,7 +39,8 @@ graph TB
         IPC_RX --> WASM_VM
     end
 
-    Core0 <==>|"FreeRTOS queues and spinlocks"| Core1
+    RADIX <-->|"FreeRTOS queues and spinlocks"| KUBELET
+    WIFI_DRIVER <-->|"ESP-NOW radio frames"| IPC_RX
 ```
 
 ### Core 0 subsystems

@@ -17,26 +17,32 @@ WebAssembly solves this through software fault isolation. A WebAssembly module o
 ```mermaid
 graph TD
     subgraph Host["ESP32-S3 host running FreeRTOS"]
-        KERNEL["FreeRTOS kernel and hardware registers"]
-        HEAP["System SRAM heap"]
-        RADIO["802.11 and ESP-NOW physical radio"]
-        PINS["Physical GPIO and ADC pins"]
-
-        subgraph Sandbox["Wasm3 execution sandbox"]
-            GUEST_MEM["Linear memory pages (bounded 32 KB - 64 KB)"]
-            INTERP["Wasm3 bytecode interpreter"]
-            STACK["Operand execution stack"]
+        subgraph KernelSpace["Protected host memory"]
+            KERNEL["FreeRTOS kernel & memory-mapped registers"]
+            HEAP["System SRAM heap"]
         end
 
-        GATE["Capability firewall (host function audits)"]
+        subgraph Sandbox["Wasm3 execution sandbox"]
+            direction TB
+            INTERP["Wasm3 bytecode interpreter"]
+            STACK["Operand execution stack"]
+            GUEST_MEM["Linear memory pages (32 KB - 64 KB)"]
+            INTERP --- STACK
+            INTERP --- GUEST_MEM
+        end
 
-        Sandbox <==>|"Trapped host calls"| GATE
-        GATE --> PINS
-        GATE --> RADIO
+        GATE["Capability firewall"]
+
+        subgraph Peripherals["Physical hardware"]
+            PINS["GPIO & ADC pins"]
+            RADIO["2.4 GHz radio (ESP-NOW)"]
+        end
     end
 
-    KERNEL -.->|"Inaccessible to guest"| Sandbox
-    HEAP -.->|"Inaccessible to guest"| Sandbox
+    KernelSpace -.->|"Trap on invalid access"| Sandbox
+    INTERP -->|"Host call traps"| GATE
+    GATE -->|"Authorized write"| PINS
+    GATE -->|"Authorized send"| RADIO
 ```
 
 ---
@@ -85,11 +91,13 @@ sequenceDiagram
 
 ### Linear memory bounds
 In WebAssembly, memory indexing runs from `0` to `linear_memory_size - 1`. The interpreter clamps or faults any offset outside this boundary:
+
 - Guest code cannot inspect host pointers or read Wi-Fi network buffers.
 - Guest code cannot corrupt FreeRTOS task control blocks (TCBs).
 
 ### Traps and host stability
 If guest code divides by zero, exhausts its stack, or attempts an illegal memory access:
+
 1. Wasm3 raises an execution trap (`m3Err_trapOutOfBoundsMemory`).
 2. The `k32_kubelet` worker catches the exception.
 3. The pod status changes to `Failed` (`CrashLoopBackOff`).

@@ -98,7 +98,7 @@ The node lifecycle controller running on Node 1 tracks worker heartbeats over Wi
 ```mermaid
 sequenceDiagram
     autonumber
-    participant N1 as Node 1: Master (lifecycle controller)
+    participant N1 as Node 1: Control plane (lifecycle controller)
     participant N2 as Node 2: Worker node
 
     Note over N1,N2: Regular operation (heartbeat every 5000 ms)
