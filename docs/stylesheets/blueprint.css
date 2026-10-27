@@ -153,7 +153,6 @@
   --neural-c: #a5cdde;
   --neural: linear-gradient(100deg, var(--neural-a) 0%, var(--neural-b) 50%, var(--neural-c) 100%);
   --lit: inset 0 1px 0 rgb(255 255 255 / 0.07), 0 10px 28px rgb(0 0 0 / 0.3);
-  --aura: -20px 10px 48px -16px color-mix(in srgb, var(--neural-a) 50%, transparent), 20px 10px 48px -16px color-mix(in srgb, var(--neural-c) 42%, transparent), 0 16px 48px -14px color-mix(in srgb, var(--neural-b) 40%, transparent);
   --wash: radial-gradient(70% 42% at 50% -8%, color-mix(in srgb, var(--neural-b) 11%, transparent), transparent 70%);
 
   /* MkDocs Material Theme Bridge */
@@ -315,7 +314,7 @@
   background: color-mix(in srgb, var(--secondary) 36%, transparent);
 }
 
-:focus-visible:not(.md-search__input):not(.md-search__form) {
+:focus-visible:not(.md-search__input):not(.md-search__form):not([for="__search"]) {
   outline: 2px solid var(--primary);
   outline-offset: 2px;
   transition: outline-color var(--dur-effects-fast) var(--ease-effects);
@@ -387,8 +386,6 @@ body {
   border-radius: var(--r-full) !important;
   width: 40px !important;
   height: 40px !important;
-  display: inline-grid !important;
-  place-items: center !important;
   transition: color var(--dur-effects-fast) var(--ease-effects),
               background-color var(--dur-effects-fast) var(--ease-effects),
               transform var(--dur-spatial-fast) var(--ease-spatial-fast),
@@ -405,47 +402,68 @@ body {
   border-radius: var(--r-sm) !important;
 }
 
+/* Hide duplicate mobile search toggle button on desktop */
+@media screen and (min-width: 60em) {
+  .md-header__button[for="__search"] {
+    display: none !important;
+  }
+}
+
 /* ==============================================================================
-   Material 3 Search Bar (Flawless pill with zero weird outlines)
+   Material 3 Search Bar (Zero Outline - Pure Tonal Surface from library.css)
    ============================================================================== */
 .md-search {
+  padding: 0 !important;
   outline: none !important;
+  border: none !important;
 }
 
 .md-search__inner {
+  position: relative !important;
   background: transparent !important;
   border-radius: var(--r-full) !important;
   box-shadow: none !important;
   outline: none !important;
+  border: none !important;
+  padding: 0 !important;
+  width: 14rem !important;
+  transition: width var(--dur-spatial) var(--ease-spatial) !important;
+}
+
+[data-md-toggle="search"]:checked ~ .md-header .md-search__inner {
+  width: 26rem !important;
 }
 
 .md-search__form {
   height: 40px !important;
   border-radius: var(--r-full) !important;
   background-color: var(--surface-high) !important;
-  border: 1px solid var(--outline-variant) !important;
-  box-shadow: none !important;
+  border: none !important;
   outline: none !important;
+  box-shadow: none !important;
   overflow: hidden !important;
-  transition: background-color var(--dur-effects) var(--ease-effects),
-              border-color var(--dur-effects) var(--ease-effects),
-              box-shadow var(--dur-spatial-fast) var(--ease-spatial-fast) !important;
+  transition: background-color var(--dur-effects) var(--ease-effects) !important;
 }
 
 .md-search__form:hover {
   background-color: var(--surface-highest) !important;
-  border-color: var(--outline) !important;
+  border: none !important;
+  outline: none !important;
+  box-shadow: none !important;
 }
 
+[data-md-toggle="search"]:checked ~ .md-header .md-search__form,
 .md-search__form:focus-within {
   background-color: var(--surface-highest) !important;
-  border-color: var(--primary) !important;
-  box-shadow: 0 0 0 1px var(--primary) !important;
+  border-radius: var(--r-full) !important;
+  border: none !important;
   outline: none !important;
+  box-shadow: none !important;
 }
 
 .md-search__input {
-  height: 100% !important;
+  height: 40px !important;
+  line-height: 40px !important;
   border-radius: var(--r-full) !important;
   background: transparent !important;
   border: none !important;
@@ -453,8 +471,9 @@ body {
   box-shadow: none !important;
   color: var(--on-surface) !important;
   font-family: var(--font-sans) !important;
-  font-size: 13.5px !important;
+  font-size: 14px !important;
   padding-left: 44px !important;
+  padding-right: 36px !important;
 }
 
 .md-search__input::placeholder {
@@ -462,31 +481,77 @@ body {
   opacity: 1 !important;
 }
 
-.md-search__input:focus {
+.md-search__input:focus,
+.md-search__input:focus-visible {
   outline: none !important;
   box-shadow: none !important;
   border: none !important;
 }
 
-.md-search__icon {
-  color: var(--on-surface-variant) !important;
+.md-search__icon[for="__search"] {
   display: flex !important;
   align-items: center !important;
   justify-content: center !important;
-  width: 40px !important;
+  top: 0 !important;
+  left: 12px !important;
   height: 40px !important;
+  width: 24px !important;
+  color: var(--on-surface-variant) !important;
+  pointer-events: none !important;
+  border: none !important;
+  outline: none !important;
 }
 
+.md-search__options {
+  top: 0 !important;
+  right: 10px !important;
+  height: 40px !important;
+  display: flex !important;
+  align-items: center !important;
+  outline: none !important;
+  border: none !important;
+}
+
+/* Search results dropdown as a floating M3 Surface Container */
 .md-search__output {
+  top: 48px !important;
   border-radius: var(--r-lg) !important;
   background-color: var(--surface-container) !important;
   border: 1px solid var(--outline-variant) !important;
   box-shadow: var(--float-shadow) !important;
   overflow: hidden !important;
+  width: 100% !important;
+}
+
+.md-search__scrollwrap {
+  background-color: var(--surface-container) !important;
+  border-radius: var(--r-lg) !important;
+  width: 100% !important;
+}
+
+.md-search-result__meta {
+  background-color: var(--surface-high) !important;
+  color: var(--on-surface-quiet) !important;
+  font-family: var(--font-sans) !important;
+  font-size: 12px !important;
+  font-weight: 500 !important;
+  padding: var(--s-2) var(--s-4) !important;
+}
+
+.md-search-result__link {
+  color: var(--on-surface) !important;
+  padding: var(--s-3) var(--s-4) !important;
+  transition: background-color var(--dur-effects-fast) var(--ease-effects) !important;
+}
+
+.md-search-result__link:hover,
+.md-search-result__link:focus {
+  background-color: var(--surface-highest) !important;
+  color: var(--primary) !important;
 }
 
 /* ==============================================================================
-   Material 3 Pill Tabs (Exactly identical to agentic-video studio .places/.place)
+   Material 3 Pill Tabs (Identical to agentic-video studio .places/.place in shell.css)
    ============================================================================== */
 .md-tabs {
   background-color: var(--surface-container) !important;
@@ -551,6 +616,75 @@ body {
 .md-tabs__item--active .md-tabs__link:hover {
   background-color: color-mix(in srgb, var(--secondary-container) 88%, var(--on-secondary-container)) !important;
   color: var(--on-secondary-container) !important;
+}
+
+/* ==============================================================================
+   Material 3 Content Tabs (Segmented Connected Group from expressive.css)
+   ============================================================================== */
+.md-typeset .tabbed-set {
+  margin: var(--s-5) 0 !important;
+  border-radius: var(--r-lg) !important;
+  background: transparent !important;
+}
+
+.md-typeset .tabbed-labels {
+  display: inline-flex !important;
+  gap: 2px !important;
+  padding: 3px !important;
+  border-radius: var(--r-full) !important;
+  background-color: var(--surface-container) !important;
+  box-shadow: none !important;
+  border: 1px solid var(--outline-variant) !important;
+  margin-bottom: var(--s-3) !important;
+}
+
+.js .md-typeset .tabbed-labels:before {
+  display: none !important; /* Eliminate bottom line indicator */
+}
+
+.md-typeset .tabbed-labels > label {
+  height: 32px !important;
+  padding: 0 var(--s-4) !important;
+  display: inline-flex !important;
+  align-items: center !important;
+  justify-content: center !important;
+  border-radius: var(--r-full) !important;
+  font-family: var(--font-sans) !important;
+  font-size: 13px !important;
+  font-weight: 500 !important;
+  color: var(--on-surface-quiet) !important;
+  border: none !important;
+  cursor: pointer !important;
+  transition: color var(--dur-effects) var(--ease-effects),
+              background-color var(--dur-effects) var(--ease-effects),
+              border-radius var(--dur-spatial-fast) var(--ease-spatial-fast) !important;
+}
+
+.md-typeset .tabbed-labels > label:hover {
+  color: var(--on-surface) !important;
+  background-color: color-mix(in srgb, var(--on-surface) 6%, transparent) !important;
+}
+
+/* Active tab morphs to secondary-container pill */
+.md-typeset .tabbed-set > input:nth-child(1):checked ~ .tabbed-labels > :nth-child(1),
+.md-typeset .tabbed-set > input:nth-child(2):checked ~ .tabbed-labels > :nth-child(2),
+.md-typeset .tabbed-set > input:nth-child(3):checked ~ .tabbed-labels > :nth-child(3),
+.md-typeset .tabbed-set > input:nth-child(4):checked ~ .tabbed-labels > :nth-child(4),
+.md-typeset .tabbed-set > input:nth-child(5):checked ~ .tabbed-labels > :nth-child(5),
+.md-typeset .tabbed-set > input:nth-child(6):checked ~ .tabbed-labels > :nth-child(6) {
+  background-color: var(--secondary-container) !important;
+  color: var(--on-secondary-container) !important;
+  font-weight: 600 !important;
+  border-radius: var(--r-full) !important;
+  border: none !important;
+}
+
+.md-typeset .tabbed-content {
+  border-radius: var(--r-lg) !important;
+}
+
+.md-typeset .tabbed-block {
+  padding: 0 !important;
 }
 
 /* ==============================================================================
