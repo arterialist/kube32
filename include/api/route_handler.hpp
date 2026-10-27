@@ -48,11 +48,6 @@ enum class RouteCategory {
     DaemonSetItem,
     JobsNsCollection,
     JobItem,
-    WebHardwareWorkbench,
-    HardwareApiState,
-    HardwareApiDisplay,
-    HardwareApiSpeaker,
-    HardwareApiKeyboard,
     NotFound
 };
 
@@ -98,11 +93,6 @@ private:
     HttpResponse handle_services(const HttpRequest& req, const RouteMatch& match, mem::MonotonicArena& arena);
     HttpResponse handle_daemonsets(const HttpRequest& req, const RouteMatch& match, mem::MonotonicArena& arena);
     HttpResponse handle_jobs(const HttpRequest& req, const RouteMatch& match, mem::MonotonicArena& arena);
-    HttpResponse handle_web_workbench();
-    HttpResponse handle_hardware_state();
-    HttpResponse handle_hardware_display(const HttpRequest& req);
-    HttpResponse handle_hardware_speaker(const HttpRequest& req);
-    HttpResponse handle_hardware_keyboard(const HttpRequest& req);
 };
 
 } // namespace kube32::api

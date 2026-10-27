@@ -10,12 +10,28 @@ import os
 import sys
 import time
 import math
+import struct
+import zlib
+import urllib.parse
 import threading
 from http.server import HTTPServer, ThreadingHTTPServer, BaseHTTPRequestHandler
 import socket
 import json
 import serial
 import serial.tools.list_ports
+
+try:
+    from tools.kube32_workbench_app import handle_workload_http_request
+except ImportError:
+    from kube32_workbench_app import handle_workload_http_request
+
+# Load SPDY/3.1 dictionary for Kubernetes portforward streaming
+SPDY_DICT = b""
+_spdy_dict_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "spdy_dict.bin")
+if os.path.exists(_spdy_dict_path):
+    with open(_spdy_dict_path, "rb") as _f:
+        SPDY_DICT = _f.read()
+
 
 def find_serial_port():
     env_port = os.environ.get("KUBE32_SERIAL_PORT")
@@ -227,6 +243,104 @@ def background_hardware_sync():
             pass
         time.sleep(0.05)
 
+def handle_spdy_portforward(sock, pod_name, ns):
+    """
+    Multiplexes bidirectional TCP streaming over SPDY/3.1 for kubectl port-forward and k9s.
+    Dispatches HTTP data streams to the deployed pod workload web app.
+    """
+    comp = zlib.compressobj(wbits=zlib.MAX_WBITS, zdict=SPDY_DICT) if SPDY_DICT else zlib.compressobj()
+    buf = b""
+    data_buffers = {}
+
+    def read_exact(n):
+        nonlocal buf
+        while len(buf) < n:
+            chunk = sock.recv(4096)
+            if not chunk:
+                return None
+            buf += chunk
+        res = buf[:n]
+        buf = buf[n:]
+        return res
+
+    while True:
+        try:
+            hdr = read_exact(8)
+            if not hdr:
+                break
+            is_control = (hdr[0] & 0x80) != 0
+            if is_control:
+                frame_type = (hdr[2] << 8) | hdr[3]
+                flags = hdr[4]
+                length = (hdr[5] << 16) | (hdr[6] << 8) | hdr[7]
+                payload = read_exact(length) if length > 0 else b""
+                if frame_type == 1:  # SYN_STREAM
+                    stream_id = struct.unpack(">I", payload[:4])[0] & 0x7FFFFFFF
+                    # Send SYN_REPLY acknowledgment
+                    hdr_block = comp.compress(b"\x00\x00\x00\x00") + comp.flush(zlib.Z_SYNC_FLUSH)
+                    rep_len = 4 + len(hdr_block)
+                    rep = struct.pack(">HHB", 0x8003, 0x0002, 0) + struct.pack(">I", rep_len)[1:] + struct.pack(">I", stream_id & 0x7FFFFFFF) + hdr_block
+                    sock.sendall(rep)
+            else:  # DATA frame
+                stream_id = struct.unpack(">I", hdr[:4])[0] & 0x7FFFFFFF
+                flags = hdr[4]
+                length = (hdr[5] << 16) | (hdr[6] << 8) | hdr[7]
+                data = read_exact(length) if length > 0 else b""
+                if (stream_id % 4) == 3:  # Client data stream
+                    accum = data_buffers.get(stream_id, b"") + data
+                    data_buffers[stream_id] = accum
+
+                    has_full_request = False
+                    body_part = b""
+                    req_method = "GET"
+                    req_path = "/"
+                    req_headers = {}
+
+                    if b"\r\n\r\n" in accum:
+                        header_part, _, body_part = accum.partition(b"\r\n\r\n")
+                        lines = header_part.decode("utf-8", errors="replace").splitlines()
+                        if lines:
+                            parts = lines[0].split()
+                            if len(parts) >= 2:
+                                req_method = parts[0]
+                                req_path = parts[1]
+                        for line in lines[1:]:
+                            if ":" in line:
+                                hk, _, hv = line.partition(":")
+                                req_headers[hk.strip().lower()] = hv.strip()
+                        cl = int(req_headers.get("content-length", 0))
+                        if len(body_part) >= cl:
+                            has_full_request = True
+                    elif flags & 0x01:
+                        has_full_request = True
+
+                    if has_full_request:
+                        status_code, content_type, resp_body = handle_workload_http_request(
+                            req_method, req_path, req_headers, body_part, hardware_telemetry, send_serial_cmd
+                        )
+
+                        status_text = "OK" if status_code == 200 else ("Not Found" if status_code == 404 else "Error")
+                        header_resp = (
+                            f"HTTP/1.1 {status_code} {status_text}\r\n"
+                            f"Content-Type: {content_type}\r\n"
+                            f"Content-Length: {len(resp_body)}\r\n"
+                            f"Access-Control-Allow-Origin: *\r\n"
+                            f"Connection: close\r\n\r\n"
+                        ).encode("utf-8")
+                        full_resp = header_resp + resp_body
+
+                        chunk_size = 4096
+                        for offset in range(0, len(full_resp), chunk_size):
+                            chunk = full_resp[offset:offset+chunk_size]
+                            is_last = (offset + chunk_size >= len(full_resp))
+                            frame_flags = 0x01 if is_last else 0x00
+                            out_hdr = struct.pack(">IB", stream_id, frame_flags) + struct.pack(">I", len(chunk))[1:]
+                            sock.sendall(out_hdr + chunk)
+                        del data_buffers[stream_id]
+        except Exception:
+            break
+
+
 # ---------------------------------------------------------------------------
 # Kubernetes Resource Serializers (JSON & Table)
 # ---------------------------------------------------------------------------
@@ -379,19 +493,38 @@ def ensure_pod_status_conformance(manifest):
     status["containerStatuses"] = cstatuses
     return manifest
 
-def get_pods_json(namespace=None):
+def get_pods_json(namespace=None, label_selector=None):
     items = []
+    filter_k, filter_v = None, None
+    if label_selector:
+        label_selector = urllib.parse.unquote(label_selector)
+        if "==" in label_selector:
+            parts = label_selector.split("==", 1)
+            filter_k = parts[0].strip()
+            filter_v = parts[1].strip()
+        elif "=" in label_selector:
+            parts = label_selector.split("=", 1)
+            filter_k = parts[0].strip()
+            filter_v = parts[1].strip()
+
     with cluster_lock:
         for key, p in PODS.items():
             if namespace and namespace != p.get("ns"):
                 continue
-            cleaned = ensure_pod_status_conformance(p.get("manifest"))
+            manifest = p.get("manifest")
+            if not manifest:
+                continue
+            if filter_k and filter_v:
+                labels = manifest.get("metadata", {}).get("labels", {})
+                if labels.get(filter_k) != filter_v:
+                    continue
+            cleaned = ensure_pod_status_conformance(manifest)
             if cleaned and cleaned.get("metadata", {}).get("name") not in (None, "unnamed"):
                 items.append(cleaned)
     return {"kind": "PodList", "apiVersion": "v1", "metadata": {"resourceVersion": "100"}, "items": items}
 
-def get_pods_table(namespace=None):
-    pods_doc = get_pods_json(namespace)
+def get_pods_table(namespace=None, label_selector=None):
+    pods_doc = get_pods_json(namespace, label_selector=label_selector)
     rows = []
     now = time.time()
     for item in pods_doc["items"]:
@@ -493,12 +626,14 @@ def get_services_json(namespace=None):
                 "metadata": {
                     "name": s["name"],
                     "namespace": s["ns"],
-                    "creationTimestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(s["created"]))
+                    "labels": s.get("labels", {}),
+                    "creationTimestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(s.get("created", CLUSTER_START_TIME)))
                 },
                 "spec": {
-                    "type": s["type"],
-                    "clusterIP": s["cluster_ip"],
-                    "ports": s["ports"]
+                    "type": s.get("type", "ClusterIP"),
+                    "clusterIP": s.get("cluster_ip", "None"),
+                    "ports": s.get("ports", []),
+                    "selector": s.get("selector", {})
                 }
             })
     return {"kind": "ServiceList", "apiVersion": "v1", "metadata": {"resourceVersion": "100"}, "items": items}
@@ -707,6 +842,8 @@ def generate_pod_log(pod_name, ns="default"):
 # ---------------------------------------------------------------------------
 
 class KubeGatewayHandler(BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+
     def do_GET(self):
         self.handle_request("GET")
 
@@ -1354,10 +1491,13 @@ class KubeGatewayHandler(BaseHTTPRequestHandler):
 
         # 8. Pods (Cluster-wide & Namespaced)
         if path_clean == "/api/v1/pods":
+            query_string = self.path.split("?", 1)[1] if "?" in self.path else ""
+            query_params = urllib.parse.parse_qs(query_string)
+            label_selector = query_params.get("labelSelector", [None])[0]
             if "as=Table" in accept:
-                self.send_json(200, get_pods_table())
+                self.send_json(200, get_pods_table(label_selector=label_selector))
             else:
-                self.send_json(200, get_pods_json())
+                self.send_json(200, get_pods_json(label_selector=label_selector))
             return
 
         # Namespaced pod collections or single pods
@@ -1367,6 +1507,20 @@ class KubeGatewayHandler(BaseHTTPRequestHandler):
             ns = "default"
             if len(parts) >= 5 and parts[3] == "namespaces":
                 ns = parts[4]
+
+            # Portforward: /api/v1/namespaces/{ns}/pods/{name}/portforward
+            if path_clean.endswith("/portforward"):
+                pod_name = parts[-2]
+                resp = (
+                    b"HTTP/1.1 101 Switching Protocols\r\n"
+                    b"Connection: Upgrade\r\n"
+                    b"Upgrade: SPDY/3.1\r\n"
+                    b"X-Stream-Protocol-Version: portforward.k8s.io\r\n\r\n"
+                )
+                self.connection.sendall(resp)
+                self.close_connection = True
+                handle_spdy_portforward(self.connection, pod_name, ns)
+                return
 
             # Pod Logs: /api/v1/namespaces/{ns}/pods/{name}/log
             if path_clean.endswith("/log"):
@@ -1456,10 +1610,13 @@ class KubeGatewayHandler(BaseHTTPRequestHandler):
                     return
                 else:
                     # GET
+                    query_string = self.path.split("?", 1)[1] if "?" in self.path else ""
+                    query_params = urllib.parse.parse_qs(query_string)
+                    label_selector = query_params.get("labelSelector", [None])[0]
                     if "as=Table" in accept:
-                        self.send_json(200, get_pods_table(ns))
+                        self.send_json(200, get_pods_table(ns, label_selector=label_selector))
                     else:
-                        self.send_json(200, get_pods_json(ns))
+                        self.send_json(200, get_pods_json(ns, label_selector=label_selector))
                     return
             else:
                 # Single pod: /api/v1/namespaces/{ns}/pods/{pod_name}
@@ -1531,9 +1688,11 @@ class KubeGatewayHandler(BaseHTTPRequestHandler):
                         SERVICES[key] = {
                             "name": name,
                             "ns": ns,
+                            "labels": meta.get("labels", {}),
                             "type": spec.get("type", "ClusterIP"),
                             "cluster_ip": cluster_ip,
                             "ports": spec.get("ports", []),
+                            "selector": spec.get("selector", {}),
                             "created": time.time()
                         }
                     self.send_json(201, svc_obj)
@@ -1557,12 +1716,14 @@ class KubeGatewayHandler(BaseHTTPRequestHandler):
                             "metadata": {
                                 "name": s["name"],
                                 "namespace": s["ns"],
-                                "creationTimestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(s["created"]))
+                                "labels": s.get("labels", {}),
+                                "creationTimestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(s.get("created", CLUSTER_START_TIME)))
                             },
                             "spec": {
-                                "type": s["type"],
-                                "clusterIP": s["cluster_ip"],
-                                "ports": s["ports"]
+                                "type": s.get("type", "ClusterIP"),
+                                "clusterIP": s.get("cluster_ip", "None"),
+                                "ports": s.get("ports", []),
+                                "selector": s.get("selector", {})
                             }
                         })
                         return
@@ -1672,6 +1833,113 @@ def prefill_initial_workloads():
             "ns": "kube32-cluster",
             "name": "audio-pipeline-tx",
             "node": "esp32-node-01"
+        }
+
+        PODS["kube32-cluster/node1-hardware-controller"] = {
+            "manifest": {
+                "apiVersion": "v1",
+                "kind": "Pod",
+                "metadata": {
+                    "name": "node1-hardware-controller",
+                    "namespace": "kube32-cluster",
+                    "creationTimestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(CLUSTER_START_TIME - 250)),
+                    "labels": {
+                        "app": "hardware-workbench",
+                        "tier": "master-controller",
+                        "node": "esp32-node-01"
+                    }
+                },
+                "spec": {
+                    "nodeName": "esp32-node-01",
+                    "containers": [{
+                        "name": "hardware-controller",
+                        "image": "wasm://embedded/hardware-workbench-master:v1",
+                        "ports": [{"containerPort": 80, "name": "http-web"}],
+                        "resources": {
+                            "limits": {"memory": "48Ki"},
+                            "requests": {
+                                "memory": "32Ki",
+                                "hardware.kube32.io/tft-display": "1",
+                                "hardware.kube32.io/keyboard": "1",
+                                "hardware.kube32.io/speaker": "1"
+                            }
+                        }
+                    }]
+                },
+                "status": {
+                    "phase": "Running",
+                    "podIP": "192.168.4.1",
+                    "conditions": [
+                        {"type": "PodScheduled", "status": "True"},
+                        {"type": "Initialized", "status": "True"},
+                        {"type": "ContainersReady", "status": "True"},
+                        {"type": "Ready", "status": "True"}
+                    ]
+                }
+            },
+            "created": CLUSTER_START_TIME - 250,
+            "ns": "kube32-cluster",
+            "name": "node1-hardware-controller",
+            "node": "esp32-node-01"
+        }
+
+        PODS["kube32-cluster/node2-dsp-coprocessor"] = {
+            "manifest": {
+                "apiVersion": "v1",
+                "kind": "Pod",
+                "metadata": {
+                    "name": "node2-dsp-coprocessor",
+                    "namespace": "kube32-cluster",
+                    "creationTimestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(CLUSTER_START_TIME - 200)),
+                    "labels": {
+                        "app": "hardware-workbench",
+                        "tier": "dsp-coprocessor",
+                        "node": "esp32-node-02"
+                    }
+                },
+                "spec": {
+                    "nodeName": "esp32-node-02",
+                    "containers": [{
+                        "name": "dsp-coprocessor",
+                        "image": "wasm://embedded/hardware-workbench-dsp:v1",
+                        "resources": {
+                            "limits": {"memory": "64Ki"},
+                            "requests": {
+                                "memory": "48Ki",
+                                "hardware.kube32.io/psram": "1"
+                            }
+                        }
+                    }]
+                },
+                "status": {
+                    "phase": "Running",
+                    "podIP": "192.168.4.2",
+                    "conditions": [
+                        {"type": "PodScheduled", "status": "True"},
+                        {"type": "Initialized", "status": "True"},
+                        {"type": "ContainersReady", "status": "True"},
+                        {"type": "Ready", "status": "True"}
+                    ]
+                }
+            },
+            "created": CLUSTER_START_TIME - 200,
+            "ns": "kube32-cluster",
+            "name": "node2-dsp-coprocessor",
+            "node": "esp32-node-02"
+        }
+
+        SERVICES["kube32-cluster/hardware-workbench-svc"] = {
+            "name": "hardware-workbench-svc",
+            "ns": "kube32-cluster",
+            "labels": {"app": "hardware-workbench"},
+            "type": "ClusterIP",
+            "cluster_ip": "10.96.0.105",
+            "ports": [
+                {"name": "http-web", "port": 80, "targetPort": 80, "protocol": "TCP"},
+                {"name": "espnow-ipc", "port": 7400, "targetPort": 7400, "protocol": "UDP"}
+            ],
+            "selector": {"app": "hardware-workbench"},
+            "created": CLUSTER_START_TIME - 250
         }
 
 class Kube32Server(ThreadingHTTPServer):

@@ -248,17 +248,16 @@ static void kube32_cluster_task(void* pvParameters) {
         scheduler->start();
         printf("[CONTROL-PLANE] Autonomous Scheduler active (LeastAllocated)\n");
 
-        // Start Silicon Fullstack HTTP & Kubernetes Server on Port 80
+        // Start Kubernetes API Server on port 6443
         kube32::api::HttpServerOptions http_opts;
         http_opts.host = "0.0.0.0";
-        http_opts.port = 80;
+        http_opts.port = 6443;
         http_opts.backlog = 8;
         http_opts.rx_buffer_size = 4096;
         auto server = std::make_unique<kube32::api::HttpServer>(http_opts, *store, scheduler.get());
         server->start();
-        printf("[CONTROL-PLANE] Kube32 Silicon Fullstack Server listening on http://0.0.0.0:80\n");
-        printf("[CONTROL-PLANE] Open directly in browser: http://%s/\n", ip.c_str());
-        printf("[CONTROL-PLANE] Connect via kubectl: kubectl --server=http://%s:80 get nodes -o wide\n", ip.c_str());
+        printf("[CONTROL-PLANE] Kubernetes API Server listening on http://0.0.0.0:6443\n");
+        printf("[CONTROL-PLANE] Connect via: kubectl --server=http://%s:6443 get nodes -o wide\n", ip.c_str());
 
         // Start local Kubelet agent on Node 1
         auto wasm_runtime = kube32::runtime::create_wasm_runtime();
