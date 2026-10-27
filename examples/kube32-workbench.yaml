@@ -1,0 +1,37 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: kube32-workbench
+  namespace: default
+  labels:
+    app: workbench
+    component: web-ui
+    role: frontend
+spec:
+  nodeName: esp32-node-01
+  containers:
+    - name: workbench-server
+      image: wasm://embedded/workbench-ui:v1
+      resources:
+        limits:
+          memory: 64Ki
+          cpu: 100m
+        requests:
+          memory: 32Ki
+          cpu: 50m
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: kube32-workbench-service
+  namespace: default
+  labels:
+    app: workbench
+spec:
+  type: ClusterIP
+  clusterIP: 10.96.0.80
+  ports:
+    - name: http
+      port: 8080
+      targetPort: 8080
+      protocol: TCP

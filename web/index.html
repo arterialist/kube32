@@ -1,0 +1,411 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Kube32 Cluster Console</title>
+  <link rel="stylesheet" href="styles.css">
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>⚡</text></svg>">
+</head>
+<body>
+  <div class="app-container">
+    <!-- MD3 Navigation Rail -->
+    <nav class="nav-rail" aria-label="Main Navigation">
+      <div class="brand-icon-wrapper" title="Kube32 Embedded Control Plane">
+        <span class="material-symbols-outlined">developer_board</span>
+      </div>
+
+      <button class="nav-item active" data-tab="tab-overview" title="Cluster Topology & Telemetry">
+        <div class="nav-indicator">
+          <span class="material-symbols-outlined">dashboard</span>
+        </div>
+        <span class="nav-label">Topology</span>
+      </button>
+
+      <button class="nav-item" data-tab="tab-workloads" title="Pod Inventory & Deployment">
+        <div class="nav-indicator">
+          <span class="material-symbols-outlined">deployed_code</span>
+        </div>
+        <span class="nav-label">Pods</span>
+      </button>
+
+      <button class="nav-item" data-tab="tab-peripherals" title="Hardware GPIO & Actuator Matrix">
+        <div class="nav-indicator">
+          <span class="material-symbols-outlined">tune</span>
+        </div>
+        <span class="nav-label">GPIO</span>
+      </button>
+
+      <button class="nav-item" data-tab="tab-pipeline" title="Distributed Pipeline & Virtual Channels">
+        <div class="nav-indicator">
+          <span class="material-symbols-outlined">hub</span>
+        </div>
+        <span class="nav-label">Pipeline</span>
+      </button>
+
+      <div class="nav-spacer"></div>
+
+      <button class="nav-item" id="theme-toggle-btn" title="Toggle Light/Dark Theme">
+        <div class="nav-indicator">
+          <span class="material-symbols-outlined" id="theme-icon">light_mode</span>
+        </div>
+        <span class="nav-label">Theme</span>
+      </button>
+    </nav>
+
+    <!-- Main Workspace -->
+    <div class="main-wrapper">
+      <!-- MD3 Top App Bar -->
+      <header class="top-app-bar">
+        <div class="bar-title-section">
+          <h1 class="bar-title">Kube32 Cluster Console</h1>
+          <div class="chip-status">
+            <span class="status-dot-pulse"></span>
+            <span id="cluster-status-text">Connected</span>
+          </div>
+        </div>
+
+        <div class="bar-actions">
+          <div class="context-selector" title="Active Kubernetes Context">
+            <span class="material-symbols-outlined" style="font-size: 18px;">lan</span>
+            <select id="k8s-context-select">
+              <option value="kube32" selected>Context: kube32 (Silicon)</option>
+              <option value="orbstack">Context: orbstack (Host)</option>
+            </select>
+          </div>
+
+          <button class="btn btn-filled" id="btn-open-deploy-modal">
+            <span class="material-symbols-outlined">add</span>
+            Deploy Workload
+          </button>
+        </div>
+      </header>
+
+      <!-- Content Area with Tabs -->
+      <main class="content-area">
+
+        <!-- TAB 1: OVERVIEW & TOPOLOGY -->
+        <section id="tab-overview" class="tab-pane active">
+          <!-- Live Telemetry Row -->
+          <div class="grid-4">
+            <div class="gauge-card">
+              <span class="gauge-label">Internal SRAM Pool</span>
+              <span class="gauge-value" id="sram-val">48,400 B</span>
+              <div class="progress-track">
+                <div class="progress-fill" id="sram-bar" style="width: 78%;"></div>
+              </div>
+              <span style="font-size: 11px; color: var(--md-sys-color-outline);">Free heap on Core 0</span>
+            </div>
+
+            <div class="gauge-card">
+              <span class="gauge-label">External PSRAM Pool</span>
+              <span class="gauge-value" id="psram-val">2.00 MB</span>
+              <div class="progress-track">
+                <div class="progress-fill" id="psram-bar" style="width: 95%; background-color: var(--md-sys-color-tertiary);"></div>
+              </div>
+              <span style="font-size: 11px; color: var(--md-sys-color-outline);">Quad-SPI memory bank</span>
+            </div>
+
+            <div class="gauge-card">
+              <span class="gauge-label">OTA Pipeline Packets</span>
+              <span class="gauge-value" id="ota-count">14 tx</span>
+              <div class="progress-track">
+                <div class="progress-fill" style="width: 100%; background-color: var(--md-custom-color-success);"></div>
+              </div>
+              <span style="font-size: 11px; color: var(--md-sys-color-outline);">2.4 GHz ESP-NOW link</span>
+            </div>
+
+            <div class="gauge-card">
+              <span class="gauge-label">Active Workloads</span>
+              <span class="gauge-value" id="workload-count">2 Pods</span>
+              <div class="progress-track">
+                <div class="progress-fill" id="pod-bar" style="width: 25%;"></div>
+              </div>
+              <span style="font-size: 11px; color: var(--md-sys-color-outline);">wasm3 container runtime</span>
+            </div>
+          </div>
+
+          <!-- Physical Nodes Cards -->
+          <div class="grid-2">
+            <!-- Node 1 -->
+            <div class="md-card elevated ambient-wobble">
+              <div class="md-card-header">
+                <div class="card-title-group">
+                  <span class="material-symbols-outlined" style="color: var(--md-sys-color-primary);">dns</span>
+                  <div>
+                    <h2 class="card-title">esp32-node-01</h2>
+                    <span style="font-size: 12px; color: var(--md-sys-color-outline);">Master Control Plane &bull; 192.168.4.1</span>
+                  </div>
+                </div>
+                <span class="pill-phase pill-running">Ready</span>
+              </div>
+              <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 12px; font-size: 13px;">
+                <div><strong>Architecture:</strong> xtensa (Dual-core 240MHz)</div>
+                <div><strong>OS:</strong> ESP-IDF v5.5.3 (FreeRTOS v10.5)</div>
+                <div><strong>Runtime:</strong> wasm3://v0.5.0</div>
+                <div><strong>Heartbeat:</strong> Operational (Lease valid)</div>
+                <div><strong>Internal Heap:</strong> 512 KiB Capacity</div>
+                <div><strong>Assigned Roles:</strong> control-plane, master</div>
+              </div>
+            </div>
+
+            <!-- Node 2 -->
+            <div class="md-card elevated ambient-wobble" style="animation-delay: -3s;">
+              <div class="md-card-header">
+                <div class="card-title-group">
+                  <span class="material-symbols-outlined" style="color: var(--md-sys-color-tertiary);">memory</span>
+                  <div>
+                    <h2 class="card-title">esp32-node-02</h2>
+                    <span style="font-size: 12px; color: var(--md-sys-color-outline);">Worker Node &bull; 192.168.4.2</span>
+                  </div>
+                </div>
+                <span class="pill-phase pill-running">Ready</span>
+              </div>
+              <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 12px; font-size: 13px;">
+                <div><strong>Architecture:</strong> xtensa (Dual-core 240MHz)</div>
+                <div><strong>PSRAM:</strong> 2 MB Quad-SPI Memory</div>
+                <div><strong>Runtime:</strong> wasm3://v0.5.0</div>
+                <div><strong>MAC:</strong> 02:00:00:00:00:01</div>
+                <div><strong>Mesh Role:</strong> Stage 2 Neural Classifier</div>
+                <div><strong>Assigned Roles:</strong> worker, edge-compute</div>
+              </div>
+            </div>
+          </div>
+
+          <!-- Services & Events Summary -->
+          <div class="grid-2">
+            <div class="md-card">
+              <h3 class="card-title">Cluster Services</h3>
+              <div class="table-container">
+                <table class="md-table">
+                  <thead>
+                    <tr><th>Name</th><th>Namespace</th><th>Type</th><th>Cluster IP</th><th>Port</th></tr>
+                  </thead>
+                  <tbody id="services-tbody">
+                    <tr><td>kubernetes</td><td>default</td><td>ClusterIP</td><td>10.96.0.1</td><td>443/TCP</td></tr>
+                    <tr><td>kube-dns</td><td>kube-system</td><td>ClusterIP</td><td>10.96.0.10</td><td>53/UDP</td></tr>
+                  </tbody>
+                </table>
+              </div>
+            </div>
+
+            <div class="md-card">
+              <h3 class="card-title">Cluster Events</h3>
+              <div class="table-container">
+                <table class="md-table">
+                  <thead>
+                    <tr><th>Reason</th><th>Object</th><th>Message</th></tr>
+                  </thead>
+                  <tbody id="events-tbody">
+                    <tr><td>NodeReady</td><td>Node/esp32-node-01</td><td>Node esp32-node-01 status is now: NodeReady</td></tr>
+                    <tr><td>NodeReady</td><td>Node/esp32-node-02</td><td>Node esp32-node-02 status is now: NodeReady (PSRAM active)</td></tr>
+                  </tbody>
+                </table>
+              </div>
+            </div>
+          </div>
+        </section>
+
+        <!-- TAB 2: PODS & WORKLOADS -->
+        <section id="tab-workloads" class="tab-pane">
+          <div class="md-card">
+            <div class="md-card-header">
+              <h2 class="card-title">Pod Inventory</h2>
+              <button class="btn btn-tonal" id="btn-refresh-pods">
+                <span class="material-symbols-outlined">refresh</span>
+                Refresh
+              </button>
+            </div>
+            <div class="table-container">
+              <table class="md-table">
+                <thead>
+                  <tr>
+                    <th>Namespace</th>
+                    <th>Pod Name</th>
+                    <th>Ready</th>
+                    <th>Status</th>
+                    <th>Node</th>
+                    <th>IP</th>
+                    <th>Age</th>
+                    <th>Actions</th>
+                  </tr>
+                </thead>
+                <tbody id="pods-table-body">
+                  <!-- Populated dynamically -->
+                </tbody>
+              </table>
+            </div>
+          </div>
+        </section>
+
+        <!-- TAB 3: HARDWARE PERIPHERALS & GPIO -->
+        <section id="tab-peripherals" class="tab-pane">
+          <div class="md-card">
+            <div class="md-card-header">
+              <div>
+                <h2 class="card-title">Hardware GPIO Actuator Matrix</h2>
+                <span style="font-size: 13px; color: var(--md-sys-color-outline);">
+                  Capability Firewall validated. Click pins to toggle physical output states on ESP32 silicon.
+                </span>
+              </div>
+              <button class="btn btn-tonal" id="btn-reset-gpio">
+                <span class="material-symbols-outlined">restart_alt</span>
+                All Pins Low
+              </button>
+            </div>
+
+            <div class="gpio-grid" id="gpio-grid-container">
+              <!-- Rendered via JS -->
+            </div>
+          </div>
+
+          <!-- Bus & Sensor Inspector -->
+          <div class="grid-2">
+            <div class="md-card">
+              <h3 class="card-title">ADC Analog Channels</h3>
+              <div style="display: flex; flex-direction: column; gap: 12px; margin-top: 8px;">
+                <div>
+                  <div style="display: flex; justify-content: space-between; font-size: 13px; margin-bottom: 4px;">
+                    <span>ADC1 Channel 0 (GPIO 1)</span>
+                    <strong id="adc-val-1">1.84 V (55%)</strong>
+                  </div>
+                  <div class="progress-track"><div class="progress-fill" style="width: 55%;"></div></div>
+                </div>
+                <div>
+                  <div style="display: flex; justify-content: space-between; font-size: 13px; margin-bottom: 4px;">
+                    <span>ADC1 Channel 1 (GPIO 2)</span>
+                    <strong id="adc-val-2">0.92 V (28%)</strong>
+                  </div>
+                  <div class="progress-track"><div class="progress-fill" style="width: 28%; background-color: var(--md-sys-color-secondary);"></div></div>
+                </div>
+              </div>
+            </div>
+
+            <div class="md-card">
+              <h3 class="card-title">I2C & SPI Bus Telemetry</h3>
+              <div style="display: flex; flex-direction: column; gap: 8px; font-size: 13px; margin-top: 8px;">
+                <div><strong>I2C Port 0:</strong> Active (SDA: GPIO 21, SCL: GPIO 22) &bull; 400 kHz Fast-Mode</div>
+                <div><strong>SPI Bus:</strong> Quad-SPI Enabled for 2MB External PSRAM</div>
+                <div><strong>Capability Firewall:</strong> Zero unauthorized hardware faults recorded</div>
+              </div>
+            </div>
+          </div>
+        </section>
+
+        <!-- TAB 4: DISTRIBUTED PIPELINE -->
+        <section id="tab-pipeline" class="tab-pane">
+          <div class="md-card">
+            <div class="md-card-header">
+              <div>
+                <h2 class="card-title">Coarse-Grained Pipeline Partitioning</h2>
+                <span style="font-size: 13px; color: var(--md-sys-color-outline);">
+                  Splits memory and compute workloads across multiple ESP32 chips via 2.4 GHz ESP-NOW virtual channels.
+                </span>
+              </div>
+              <button class="btn btn-filled" id="btn-trigger-pipeline">
+                <span class="material-symbols-outlined">send</span>
+                Transmit Pipeline Vector
+              </button>
+            </div>
+
+            <div class="pipeline-flow">
+              <div class="stage-node">
+                <div class="stage-header">
+                  <span class="material-symbols-outlined" style="color: var(--md-sys-color-primary);">mic</span>
+                  <h4 class="stage-title">Stage 1: Feature Extractor</h4>
+                </div>
+                <div style="font-size: 12px; color: var(--md-sys-color-on-surface-variant);">
+                  <strong>Node:</strong> esp32-node-01<br>
+                  <strong>Workload:</strong> audio-pipeline-tx<br>
+                  <strong>Payload:</strong> 52-byte MFCC feature vector
+                </div>
+              </div>
+
+              <div class="pipeline-arrow">
+                <span style="font-size: 11px; font-weight: 600;">ESP-NOW 2.4 GHz</span>
+                <div class="pulse-beam"></div>
+                <span class="material-symbols-outlined">arrow_forward</span>
+              </div>
+
+              <div class="stage-node">
+                <div class="stage-header">
+                  <span class="material-symbols-outlined" style="color: var(--md-sys-color-tertiary);">psychology</span>
+                  <h4 class="stage-title">Stage 2: Neural Classifier</h4>
+                </div>
+                <div style="font-size: 12px; color: var(--md-sys-color-on-surface-variant);">
+                  <strong>Node:</strong> esp32-node-02 (2MB PSRAM)<br>
+                  <strong>Workload:</strong> keyword-classifier<br>
+                  <strong>Output:</strong> Classification confidence
+                </div>
+              </div>
+            </div>
+
+            <!-- Waveform / Transmission Log Console -->
+            <div style="margin-top: 16px;">
+              <h4 style="font: var(--md-sys-typescale-title-small); margin-bottom: 8px;">Transmission Stream</h4>
+              <div class="log-terminal" id="pipeline-stream-box">
+[2026-10-27 15:18:00] [ESP-NOW] Subscribed to virtual channel 'audio.features' (handle: 0)
+[2026-10-27 15:18:00] [ESP-NOW] Target route bound to Node 2 (02:00:00:00:00:01)
+[2026-10-27 15:18:20] [PIPELINE-OTA-TX] Transmitting Stage 1 MFCC features (52 bytes)...
+[2026-10-27 15:18:20] [PIPELINE-OTA-TX] ESP-NOW transmission result: 52 (0 = OK) - Latency 1.38ms
+              </div>
+            </div>
+          </div>
+        </section>
+
+      </main>
+    </div>
+  </div>
+
+  <!-- DEPLOY WORKLOAD MODAL -->
+  <div class="modal-backdrop" id="deploy-modal">
+    <div class="modal-content">
+      <div style="display: flex; justify-content: space-between; align-items: center;">
+        <h3 class="card-title">Deploy Edge Workload</h3>
+        <button class="icon-btn" id="btn-close-deploy-modal">
+          <span class="material-symbols-outlined">close</span>
+        </button>
+      </div>
+
+      <div style="display: flex; gap: 8px; margin-bottom: 4px;">
+        <button class="btn btn-tonal" id="btn-preset-blinker">Preset: GPIO Blinker</button>
+        <button class="btn btn-tonal" id="btn-preset-pipeline">Preset: Audio Pipeline</button>
+        <button class="btn btn-tonal" id="btn-preset-sensor">Preset: I2C Sensor</button>
+      </div>
+
+      <textarea id="manifest-input" style="width: 100%; height: 260px; font: var(--md-sys-typescale-code); padding: 12px; border-radius: var(--md-sys-shape-corner-s); background: var(--md-sys-color-surface-container-lowest); border: 1px solid var(--md-sys-color-outline-variant); color: inherit;"></textarea>
+
+      <div style="display: flex; justify-content: flex-end; gap: 12px; margin-top: 8px;">
+        <button class="btn btn-outlined" id="btn-cancel-deploy">Cancel</button>
+        <button class="btn btn-filled" id="btn-submit-deploy">
+          <span class="material-symbols-outlined">rocket_launch</span>
+          Deploy to Cluster
+        </button>
+      </div>
+    </div>
+  </div>
+
+  <!-- POD LOG VIEWER MODAL -->
+  <div class="modal-backdrop" id="log-modal">
+    <div class="modal-content">
+      <div style="display: flex; justify-content: space-between; align-items: center;">
+        <h3 class="card-title" id="log-modal-title">Pod Log Stream</h3>
+        <button class="icon-btn" id="btn-close-log-modal">
+          <span class="material-symbols-outlined">close</span>
+        </button>
+      </div>
+
+      <div class="log-terminal" id="log-modal-body">
+        Loading pod logs...
+      </div>
+
+      <div style="display: flex; justify-content: flex-end; gap: 12px;">
+        <button class="btn btn-tonal" id="btn-refresh-log">Refresh Logs</button>
+        <button class="btn btn-filled" id="btn-dismiss-log">Close</button>
+      </div>
+    </div>
+  </div>
+
+  <script src="app.js"></script>
+</body>
+</html>
