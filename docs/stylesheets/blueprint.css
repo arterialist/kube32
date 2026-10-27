@@ -144,7 +144,7 @@
 
   --alert: #f2b8b5;
   --scrim: rgb(0 0 0 / 0.72);
-  --float-shadow: 0 8px 32px rgb(0 0 0 / 0.5), 0 1px 3px rgb(0 0 0 / 0.4);
+  --float-shadow: 0 4px 20px rgb(0 0 0 / 0.35);
   --shimmer: rgb(255 255 255 / 0.045);
 
   /* Neural Expressive ambient layer */
@@ -152,7 +152,7 @@
   --neural-b: #8ed5b0;
   --neural-c: #a5cdde;
   --neural: linear-gradient(100deg, var(--neural-a) 0%, var(--neural-b) 50%, var(--neural-c) 100%);
-  --lit: inset 0 1px 0 rgb(255 255 255 / 0.07), 0 10px 28px rgb(0 0 0 / 0.3);
+  --lit: none;
   --wash: radial-gradient(70% 42% at 50% -8%, color-mix(in srgb, var(--neural-b) 11%, transparent), transparent 70%);
 
   /* MkDocs Material Theme Bridge */
@@ -224,7 +224,7 @@
 
   --alert: #b3261e;
   --scrim: rgb(20 20 20 / 0.5);
-  --float-shadow: 0 8px 28px rgb(0 0 0 / 0.14), 0 1px 3px rgb(0 0 0 / 0.1);
+  --float-shadow: 0 4px 16px rgb(0 0 0 / 0.08);
   --shimmer: rgb(0 0 0 / 0.04);
 
   /* Neural Expressive ambient layer */
@@ -232,7 +232,7 @@
   --neural-b: #226a4c;
   --neural-c: #3b6473;
   --neural: linear-gradient(100deg, var(--neural-a) 0%, var(--neural-b) 50%, var(--neural-c) 100%);
-  --lit: inset 0 1px 0 rgb(255 255 255 / 0.8), 0 10px 28px rgb(0 0 0 / 0.08);
+  --lit: none;
   --wash: radial-gradient(70% 42% at 50% -8%, color-mix(in srgb, var(--neural-b) 8%, transparent), transparent 70%);
 
   /* MkDocs Material Theme Bridge */
@@ -369,10 +369,16 @@ body {
 
 .md-header__inner {
   height: 64px !important;
+  display: flex !important;
   align-items: center !important;
+  gap: var(--s-3) !important;
 }
 
 .md-header__title {
+  flex-grow: 1 !important;
+  display: flex !important;
+  align-items: center !important;
+  margin-right: var(--s-3) !important;
   font-family: var(--font-sans) !important;
   font-weight: 600 !important;
   font-size: 1.05rem !important;
@@ -381,11 +387,27 @@ body {
   font-variation-settings: "ROND" 100 !important;
 }
 
-.md-header__button {
-  color: var(--on-surface-variant) !important;
-  border-radius: var(--r-full) !important;
+/* Hide hidden buttons and inactive palette options strictly */
+.md-header__button[hidden],
+.md-header__option [hidden],
+[hidden] {
+  display: none !important;
+}
+
+.md-header__button:not([hidden]) {
+  display: inline-flex !important;
+  align-items: center !important;
+  justify-content: center !important;
   width: 40px !important;
   height: 40px !important;
+  padding: 0 !important;
+  margin: 0 !important;
+  box-sizing: border-box !important;
+  color: var(--on-surface-variant) !important;
+  border-radius: var(--r-full) !important;
+  border: none !important;
+  box-shadow: none !important;
+  vertical-align: middle !important;
   transition: color var(--dur-effects-fast) var(--ease-effects),
               background-color var(--dur-effects-fast) var(--ease-effects),
               transform var(--dur-spatial-fast) var(--ease-spatial-fast),
@@ -402,10 +424,78 @@ body {
   border-radius: var(--r-sm) !important;
 }
 
-/* Hide duplicate mobile search toggle button on desktop */
+.md-header__button svg,
+.md-header__button.md-icon svg {
+  display: block !important;
+  width: 20px !important;
+  height: 20px !important;
+  margin: auto !important;
+  fill: currentColor !important;
+}
+
+/* Theme toggle form & icon button alignment (single button only) */
+.md-header__option {
+  display: inline-flex !important;
+  align-items: center !important;
+  justify-content: center !important;
+  height: 40px !important;
+  margin: 0 !important;
+  padding: 0 !important;
+}
+
+.md-header__option label.md-header__button:not([hidden]) {
+  display: inline-flex !important;
+  align-items: center !important;
+  justify-content: center !important;
+  width: 40px !important;
+  height: 40px !important;
+  padding: 0 !important;
+  margin: 0 !important;
+  box-sizing: border-box !important;
+}
+
+.md-header__option label.md-header__button[hidden] {
+  display: none !important;
+}
+
+.md-header__option label.md-header__button svg {
+  display: block !important;
+  width: 20px !important;
+  height: 20px !important;
+  margin: auto !important;
+}
+
+.md-header__source {
+  display: flex !important;
+  align-items: center !important;
+  width: auto !important;
+  max-width: 16rem !important;
+}
+
+.md-header__source .md-source {
+  width: auto !important;
+  max-width: 16rem !important;
+}
+
+.md-header__source .md-source__repository {
+  max-width: 13rem !important;
+}
+
+/* Desktop layout order: Title -> Search -> Theme Switch -> GitHub Repo */
 @media screen and (min-width: 60em) {
   .md-header__button[for="__search"] {
     display: none !important;
+  }
+  .md-search {
+    order: 1 !important;
+    margin-left: auto !important;
+  }
+  .md-header__option {
+    order: 2 !important;
+  }
+  .md-header__source {
+    order: 3 !important;
+    margin-left: var(--s-1) !important;
   }
 }
 
@@ -787,7 +877,7 @@ body {
 }
 
 /* ==============================================================================
-   Material 3 Cards & Components
+   Material 3 Cards & Components (Grounded Tonal Surfaces - Zero Heavy Shadows)
    ============================================================================== */
 /* Tonal Blueprint Card */
 .blueprint-card {
@@ -799,16 +889,14 @@ body {
   margin: var(--s-6) 0;
   line-height: 1.65;
   font-size: 14px;
-  box-shadow: var(--lit);
-  transition: box-shadow var(--dur-spatial-fast) var(--ease-spatial-fast),
-              border-color var(--dur-spatial-fast) var(--ease-spatial-fast),
-              transform var(--dur-spatial-fast) var(--ease-spatial-fast);
+  box-shadow: none;
+  transition: border-color var(--dur-spatial-fast) var(--ease-spatial-fast),
+              background-color var(--dur-spatial-fast) var(--ease-spatial-fast);
 }
 
 .blueprint-card:hover {
   border-color: var(--outline);
-  box-shadow: var(--float-shadow);
-  transform: translateY(-2px);
+  background-color: var(--surface-container);
 }
 
 .blueprint-card strong {
@@ -845,21 +933,15 @@ body {
   flex-direction: column;
   justify-content: center;
   text-align: center;
-  box-shadow: var(--lit);
+  box-shadow: none;
   cursor: default;
-  transition: transform var(--dur-spatial-fast) var(--ease-spatial-fast),
-              box-shadow var(--dur-spatial-fast) var(--ease-spatial-fast),
-              border-color var(--dur-spatial-fast) var(--ease-spatial-fast);
+  transition: border-color var(--dur-spatial-fast) var(--ease-spatial-fast),
+              background-color var(--dur-spatial-fast) var(--ease-spatial-fast);
 }
 
 .metric-card:hover {
-  transform: translateY(-3px) scale(1.01);
-  box-shadow: var(--float-shadow);
-  border-color: var(--primary);
-}
-
-.metric-card:active {
-  transform: translateY(-1px) scale(0.99);
+  background-color: var(--surface-container);
+  border-color: var(--outline);
 }
 
 .metric-card .metric-value {
@@ -899,13 +981,13 @@ body {
   color: var(--on-secondary-container);
   border: 1px solid var(--outline-variant);
   margin-right: 6px;
-  transition: transform var(--dur-spatial-fast) var(--ease-spatial-fast),
-              background-color var(--dur-effects-fast) var(--ease-effects);
+  transition: background-color var(--dur-effects-fast) var(--ease-effects),
+              border-color var(--dur-effects-fast) var(--ease-effects);
 }
 
 .tech-badge:hover {
-  transform: translateY(-1px);
   background-color: color-mix(in srgb, var(--secondary-container) 85%, var(--on-secondary-container));
+  border-color: var(--outline);
 }
 
 /* Blueprint Grid Box */
@@ -933,7 +1015,7 @@ body {
   border-spacing: 0 !important;
   margin: var(--s-5) 0 !important;
   width: 100% !important;
-  box-shadow: var(--lit) !important;
+  box-shadow: none !important;
 }
 
 .md-typeset table:not([class]) th {
@@ -996,15 +1078,13 @@ body {
   border-radius: var(--r-lg) !important;
   border: 1px solid var(--outline-variant) !important;
   background-color: var(--surface-low) !important;
-  box-shadow: var(--lit) !important;
+  box-shadow: none !important;
   padding: 0.85rem 2.85rem 0.85rem 1rem !important;
-  transition: border-color var(--dur-spatial-fast) var(--ease-spatial-fast),
-              box-shadow var(--dur-spatial-fast) var(--ease-spatial-fast) !important;
+  transition: border-color var(--dur-spatial-fast) var(--ease-spatial-fast) !important;
 }
 
 .md-typeset pre:hover {
   border-color: var(--outline) !important;
-  box-shadow: var(--float-shadow) !important;
 }
 
 .md-typeset pre > code {
@@ -1044,17 +1124,15 @@ body {
   border-radius: var(--r-md) !important;
   border: 1px solid var(--outline-variant) !important;
   background-color: var(--surface-container-low) !important;
-  box-shadow: var(--lit) !important;
+  box-shadow: none !important;
   font-size: 0.88rem !important;
   margin: var(--s-5) 0 !important;
   overflow: hidden !important;
-  transition: box-shadow var(--dur-spatial-fast) var(--ease-spatial-fast),
-              border-color var(--dur-spatial-fast) var(--ease-spatial-fast) !important;
+  transition: border-color var(--dur-spatial-fast) var(--ease-spatial-fast) !important;
 }
 
 .md-typeset .admonition:hover {
   border-color: var(--outline) !important;
-  box-shadow: var(--float-shadow) !important;
 }
 
 .md-typeset .admonition-title {
@@ -1063,6 +1141,30 @@ body {
   background-color: var(--surface-container) !important;
   border-bottom: 1px solid var(--outline-variant) !important;
   font-variation-settings: "ROND" 100 !important;
+}
+
+/* ==============================================================================
+   Material 3 Grid Cards
+   ============================================================================== */
+.md-typeset .grid.cards > ul > li,
+.md-typeset .grid.cards > ol > li,
+.md-typeset .grid > .card {
+  background-color: var(--surface-container-low) !important;
+  border: 1px solid var(--outline-variant) !important;
+  border-radius: var(--r-lg) !important;
+  box-shadow: none !important;
+  transform: none !important;
+  transition: border-color var(--dur-spatial-fast) var(--ease-spatial-fast),
+              background-color var(--dur-spatial-fast) var(--ease-spatial-fast) !important;
+}
+
+.md-typeset .grid.cards > ul > li:hover,
+.md-typeset .grid.cards > ol > li:hover,
+.md-typeset .grid > .card:hover {
+  background-color: var(--surface-container) !important;
+  border-color: var(--outline) !important;
+  box-shadow: none !important;
+  transform: none !important;
 }
 
 /* ==============================================================================
@@ -1079,17 +1181,15 @@ body {
   border: 1px solid var(--outline-variant) !important;
   border-radius: var(--r-lg) !important;
   padding: var(--s-6) !important;
-  box-shadow: var(--lit) !important;
+  box-shadow: none !important;
   overflow-x: auto !important;
-  transition: box-shadow var(--dur-spatial-fast) var(--ease-spatial-fast),
-              border-color var(--dur-spatial-fast) var(--ease-spatial-fast),
-              transform var(--dur-spatial-fast) var(--ease-spatial-fast) !important;
+  transition: border-color var(--dur-spatial-fast) var(--ease-spatial-fast) !important;
 }
 
 .mermaid:hover {
   border-color: var(--outline) !important;
-  box-shadow: var(--float-shadow) !important;
-  transform: translateY(-1px) !important;
+  box-shadow: none !important;
+  transform: none !important;
 }
 
 .mermaid svg {
