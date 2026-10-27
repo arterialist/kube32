@@ -276,6 +276,7 @@ int main(int argc, char* argv[]) {
     std::cout << "[M4-NET] ZeroConf mDNS announcing service _kube32-api._tcp on port " << opts.port << std::endl;
 
     std::unique_ptr<kube32::kubelet::Kubelet> local_kubelet;
+    std::unique_ptr<kube32::kubelet::Kubelet> local_kubelet2;
     std::unique_ptr<kube32::runtime::Runtime> wasm_runtime;
     if (opts.role == "standalone") {
         wasm_runtime = kube32::runtime::create_wasm_runtime();
@@ -288,6 +289,12 @@ int main(int argc, char* argv[]) {
         local_kubelet = std::make_unique<kube32::kubelet::Kubelet>(kubelet_cfg, *wasm_runtime);
         local_kubelet->start();
         std::cout << "[INIT] ESP32 Kubelet node agent running for esp32-node-01." << std::endl;
+
+        kube32::kubelet::KubeletConfig kubelet_cfg2 = kubelet_cfg;
+        kubelet_cfg2.node_name = "esp32-node-02";
+        local_kubelet2 = std::make_unique<kube32::kubelet::Kubelet>(kubelet_cfg2, *wasm_runtime);
+        local_kubelet2->start();
+        std::cout << "[INIT] ESP32 Kubelet node agent running for esp32-node-02." << std::endl;
     }
 
     std::cout << "[READY] Ready for native kubectl and E2E test suite interactions." << std::endl;
@@ -298,6 +305,7 @@ int main(int argc, char* argv[]) {
 
     std::cout << "\n[SHUTDOWN] Intercepted termination signal. Stopping services..." << std::endl;
     if (local_kubelet) local_kubelet->stop();
+    if (local_kubelet2) local_kubelet2->stop();
     mdns->stop_service_announcement();
     server->stop();
     scheduler->stop();

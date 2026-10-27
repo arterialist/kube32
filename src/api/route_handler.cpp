@@ -45,6 +45,10 @@ RouteMatch RouteHandler::match_route(std::string_view path) {
         match.category = RouteCategory::DiscoveryApisAuthorizationV1;
         return match;
     }
+    if (path == "/apis/batch" || path == "/apis/batch/v1") {
+        match.category = RouteCategory::DiscoveryApisBatchV1;
+        return match;
+    }
     if (path.find("/selfsubjectaccessreviews") != std::string_view::npos) {
         match.category = RouteCategory::SelfSubjectAccessReviews;
         return match;
@@ -102,6 +106,13 @@ RouteMatch RouteHandler::match_route(std::string_view path) {
             if (rest == "pods") {
                 match.category = RouteCategory::PodsNsCollection;
                 return match;
+            } else if (rest == "services") {
+                match.category = RouteCategory::ServicesNsCollection;
+                return match;
+            } else if (rest.rfind("services/", 0) == 0) {
+                match.category = RouteCategory::ServiceItem;
+                match.resource_name = rest.substr(9);
+                return match;
             } else if (rest.rfind("pods/", 0) == 0) {
                 std::string_view pod_rest = rest.substr(5);
                 size_t slash2 = pod_rest.find('/');
@@ -133,6 +144,13 @@ RouteMatch RouteHandler::match_route(std::string_view path) {
 
             if (rest == "deployments") {
                 match.category = RouteCategory::DeploymentsNsCollection;
+                return match;
+            } else if (rest == "daemonsets") {
+                match.category = RouteCategory::DaemonSetsNsCollection;
+                return match;
+            } else if (rest.rfind("daemonsets/", 0) == 0) {
+                match.category = RouteCategory::DaemonSetItem;
+                match.resource_name = rest.substr(11);
                 return match;
             } else if (rest.rfind("deployments/", 0) == 0) {
                 std::string_view dep_rest = rest.substr(12);
@@ -188,6 +206,44 @@ RouteMatch RouteHandler::match_route(std::string_view path) {
                 }
             }
         }
+    }
+
+    // 6. Batch Jobs Endpoints
+    static constexpr std::string_view kBatchNsPrefix = "/apis/batch/v1/namespaces/";
+    if (path.rfind(kBatchNsPrefix, 0) == 0) {
+        std::string_view sub = path.substr(kBatchNsPrefix.length());
+        size_t slash1 = sub.find('/');
+        if (slash1 != std::string_view::npos) {
+            match.namespace_name = sub.substr(0, slash1);
+            std::string_view rest = sub.substr(slash1 + 1);
+
+            if (rest == "jobs") {
+                match.category = RouteCategory::JobsNsCollection;
+                return match;
+            } else if (rest.rfind("jobs/", 0) == 0) {
+                std::string_view job_rest = rest.substr(5);
+                size_t slash2 = job_rest.find('/');
+                if (slash2 == std::string_view::npos) {
+                    match.category = RouteCategory::JobItem;
+                    match.resource_name = job_rest;
+                    return match;
+                }
+            }
+        }
+    }
+
+    // Root collections across namespaces
+    if (path == "/api/v1/services") {
+        match.category = RouteCategory::ServicesNsCollection;
+        return match;
+    }
+    if (path == "/apis/apps/v1/daemonsets") {
+        match.category = RouteCategory::DaemonSetsNsCollection;
+        return match;
+    }
+    if (path == "/apis/batch/v1/jobs") {
+        match.category = RouteCategory::JobsNsCollection;
+        return match;
     }
 
     match.category = RouteCategory::NotFound;
@@ -287,8 +343,25 @@ HttpResponse RouteHandler::handle_request(const HttpRequest& req, mem::Monotonic
         case RouteCategory::DiscoveryApisAppsV1:
         case RouteCategory::DiscoveryApisEventsV1:
         case RouteCategory::DiscoveryApisCoordinationV1:
+        case RouteCategory::DiscoveryApisAuthorizationV1:
+        case RouteCategory::DiscoveryApisBatchV1:
+        case RouteCategory::SelfSubjectAccessReviews:
+        case RouteCategory::SelfSubjectRulesReviews:
+        case RouteCategory::NamespacesCollection:
         case RouteCategory::DiscoveryOpenApiV3:
             return handle_discovery(req, match.category);
+
+        case RouteCategory::ServicesNsCollection:
+        case RouteCategory::ServiceItem:
+            return handle_services(req, match, arena);
+
+        case RouteCategory::DaemonSetsNsCollection:
+        case RouteCategory::DaemonSetItem:
+            return handle_daemonsets(req, match, arena);
+
+        case RouteCategory::JobsNsCollection:
+        case RouteCategory::JobItem:
+            return handle_jobs(req, match, arena);
 
         case RouteCategory::NodesCollection:
         case RouteCategory::NodeItem:
@@ -349,6 +422,8 @@ HttpResponse RouteHandler::handle_discovery(const HttpRequest& req, RouteCategor
                         "\"preferredVersion\":{\"groupVersion\":\"authorization.k8s.io/v1\",\"version\":\"v1\"}},"
                         "{\"name\":\"apps\",\"versions\":[{\"groupVersion\":\"apps/v1\",\"version\":\"v1\"}],"
                         "\"preferredVersion\":{\"groupVersion\":\"apps/v1\",\"version\":\"v1\"}},"
+                        "{\"name\":\"batch\",\"versions\":[{\"groupVersion\":\"batch/v1\",\"version\":\"v1\"}],"
+                        "\"preferredVersion\":{\"groupVersion\":\"batch/v1\",\"version\":\"v1\"}},"
                         "{\"name\":\"events.k8s.io\",\"versions\":[{\"groupVersion\":\"events.k8s.io/v1\",\"version\":\"v1\"}],"
                         "\"preferredVersion\":{\"groupVersion\":\"events.k8s.io/v1\",\"version\":\"v1\"}},"
                         "{\"name\":\"coordination.k8s.io\",\"versions\":[{\"groupVersion\":\"coordination.k8s.io/v1\",\"version\":\"v1\"}],"
@@ -366,6 +441,8 @@ HttpResponse RouteHandler::handle_discovery(const HttpRequest& req, RouteCategor
                         "\"verbs\":[\"get\",\"list\",\"watch\",\"create\",\"update\",\"patch\",\"delete\"],\"shortNames\":[\"po\"],\"categories\":[\"all\"]},"
                         "{\"name\":\"pods/status\",\"singularName\":\"pod\",\"namespaced\":true,\"kind\":\"Pod\","
                         "\"verbs\":[\"get\",\"patch\",\"update\"]},"
+                        "{\"name\":\"services\",\"singularName\":\"service\",\"namespaced\":true,\"kind\":\"Service\","
+                        "\"verbs\":[\"get\",\"list\",\"watch\",\"create\",\"update\",\"patch\",\"delete\"],\"shortNames\":[\"svc\"],\"categories\":[\"all\"]},"
                         "{\"name\":\"namespaces\",\"singularName\":\"namespace\",\"namespaced\":false,\"kind\":\"Namespace\","
                         "\"verbs\":[\"get\",\"list\",\"create\",\"delete\"],\"shortNames\":[\"ns\"]},"
                         "{\"name\":\"events\",\"singularName\":\"event\",\"namespaced\":true,\"kind\":\"Event\","
@@ -377,10 +454,21 @@ HttpResponse RouteHandler::handle_discovery(const HttpRequest& req, RouteCategor
             resp.body = "{\"kind\":\"APIResourceList\",\"apiVersion\":\"v1\",\"groupVersion\":\"apps/v1\",\"resources\":["
                         "{\"name\":\"deployments\",\"singularName\":\"deployment\",\"namespaced\":true,\"kind\":\"Deployment\","
                         "\"verbs\":[\"get\",\"list\",\"watch\",\"create\",\"update\",\"patch\",\"delete\"],\"shortNames\":[\"deploy\"],\"categories\":[\"all\"]},"
+                        "{\"name\":\"daemonsets\",\"singularName\":\"daemonset\",\"namespaced\":true,\"kind\":\"DaemonSet\","
+                        "\"verbs\":[\"get\",\"list\",\"watch\",\"create\",\"update\",\"patch\",\"delete\"],\"shortNames\":[\"ds\"],\"categories\":[\"all\"]},"
                         "{\"name\":\"deployments/status\",\"singularName\":\"deployment\",\"namespaced\":true,\"kind\":\"Deployment\","
                         "\"verbs\":[\"get\",\"patch\",\"update\"]},"
                         "{\"name\":\"deployments/scale\",\"singularName\":\"deployment\",\"namespaced\":true,\"group\":\"autoscaling\",\"version\":\"v1\",\"kind\":\"Scale\","
                         "\"verbs\":[\"get\",\"patch\",\"update\"]}"
+                        "]}";
+            break;
+
+        case RouteCategory::DiscoveryApisBatchV1:
+            resp.body = "{\"kind\":\"APIResourceList\",\"apiVersion\":\"v1\",\"groupVersion\":\"batch/v1\",\"resources\":["
+                        "{\"name\":\"jobs\",\"singularName\":\"job\",\"namespaced\":true,\"kind\":\"Job\","
+                        "\"verbs\":[\"get\",\"list\",\"watch\",\"create\",\"update\",\"patch\",\"delete\"],\"shortNames\":[\"job\"],\"categories\":[\"all\"]},"
+                        "{\"name\":\"cronjobs\",\"singularName\":\"cronjob\",\"namespaced\":true,\"kind\":\"CronJob\","
+                        "\"verbs\":[\"get\",\"list\",\"watch\",\"create\",\"update\",\"patch\",\"delete\"],\"shortNames\":[\"cj\"],\"categories\":[\"all\"]}"
                         "]}";
             break;
 
@@ -1186,6 +1274,245 @@ HttpResponse RouteHandler::handle_leases(const HttpRequest& req, const RouteMatc
     }
 
     return make_status(404, "NotFound", "Not found");
+}
+
+HttpResponse RouteHandler::handle_services(const HttpRequest& req, const RouteMatch& match, mem::MonotonicArena& arena) {
+    (void)arena;
+    std::string ns = match.namespace_name.empty() ? "default" : std::string(match.namespace_name);
+    if (match.category == RouteCategory::ServicesNsCollection) {
+        if (req.method == HttpMethod::Post) {
+            models::JsonValue doc;
+            std::string err;
+            if (!models::parse_json(req.body, doc, err) || !doc.is_object()) {
+                return make_status(400, "BadRequest", "Invalid JSON: " + err);
+            }
+            const models::JsonValue* meta = doc.get("metadata");
+            std::string name = meta ? meta->get_string("name", "") : "";
+            if (name.empty()) return make_status(400, "BadRequest", "Missing metadata.name");
+            std::string key = "/registry/services/" + ns + "/" + name;
+            store_.put(key, req.body, true);
+            HttpResponse resp;
+            resp.status_code = 201;
+            resp.content_type = "application/json";
+            resp.body = req.body;
+            return resp;
+        } else if (req.method == HttpMethod::Get) {
+            std::vector<std::string> svc_jsons;
+            store_.list("/registry/services/" + ns + "/", svc_jsons);
+            std::string body = "{\"kind\":\"ServiceList\",\"apiVersion\":\"v1\",\"metadata\":{\"resourceVersion\":\"1\"},\"items\":[";
+            for (size_t i = 0; i < svc_jsons.size(); ++i) {
+                if (i > 0) body += ",";
+                body += svc_jsons[i];
+            }
+            body += "]}";
+            HttpResponse resp;
+            resp.status_code = 200;
+            resp.content_type = "application/json";
+            resp.body = body;
+            return resp;
+        }
+    } else if (match.category == RouteCategory::ServiceItem) {
+        std::string name = std::string(match.resource_name);
+        std::string key = "/registry/services/" + ns + "/" + name;
+        if (req.method == HttpMethod::Get) {
+            std::string svc_json;
+            if (!store_.get(key, svc_json).ok()) {
+                return make_status(404, "NotFound", "service \"" + name + "\" not found", name, "Service");
+            }
+            HttpResponse resp;
+            resp.status_code = 200;
+            resp.content_type = "application/json";
+            resp.body = svc_json;
+            return resp;
+        } else if (req.method == HttpMethod::Delete) {
+            store_.remove(key);
+            return make_status(200, "Success", "service \"" + name + "\" deleted", name, "Service");
+        }
+    }
+    return make_status(405, "MethodNotAllowed", "Method not allowed on service endpoint");
+}
+
+HttpResponse RouteHandler::handle_daemonsets(const HttpRequest& req, const RouteMatch& match, mem::MonotonicArena& arena) {
+    (void)arena;
+    std::string ns = match.namespace_name.empty() ? "default" : std::string(match.namespace_name);
+    if (match.category == RouteCategory::DaemonSetsNsCollection) {
+        if (req.method == HttpMethod::Post) {
+            models::JsonValue doc;
+            std::string err;
+            if (!models::parse_json(req.body, doc, err) || !doc.is_object()) {
+                return make_status(400, "BadRequest", "Invalid JSON: " + err);
+            }
+            const models::JsonValue* meta = doc.get("metadata");
+            std::string name = meta ? meta->get_string("name", "") : "";
+            if (name.empty()) return make_status(400, "BadRequest", "Missing metadata.name");
+            std::string key = "/registry/daemonsets/" + ns + "/" + name;
+            store_.put(key, req.body, true);
+
+            const models::JsonValue* spec = doc.get("spec");
+            const models::JsonValue* tmpl = spec ? spec->get("template") : nullptr;
+            if (tmpl && tmpl->is_object()) {
+                std::vector<std::string> node_jsons;
+                store_.list("/registry/nodes/", node_jsons);
+                for (const auto& nj : node_jsons) {
+                    models::JsonValue ndoc;
+                    if (models::parse_json(nj, ndoc, err) && ndoc.is_object()) {
+                        std::string nname = ndoc.get("metadata")->get_string("name", "");
+                        if (!nname.empty()) {
+                            std::string pod_name = name + "-" + (nname.find("02") != std::string::npos ? "02" : "01");
+                            models::JsonValue pod_doc;
+                            pod_doc.type = models::JsonType::Object;
+                            pod_doc.set("apiVersion", models::JsonValue{models::JsonType::String, false, 0, "v1", {}, {}});
+                            pod_doc.set("kind", models::JsonValue{models::JsonType::String, false, 0, "Pod", {}, {}});
+                            models::JsonValue pmeta;
+                            pmeta.type = models::JsonType::Object;
+                            pmeta.set("name", models::JsonValue{models::JsonType::String, false, 0, pod_name, {}, {}});
+                            pmeta.set("namespace", models::JsonValue{models::JsonType::String, false, 0, ns, {}, {}});
+                            models::JsonValue plabels;
+                            plabels.type = models::JsonType::Object;
+                            plabels.set("kube32.io/daemonset", models::JsonValue{models::JsonType::String, false, 0, "true", {}, {}});
+                            pmeta.set("labels", std::move(plabels));
+                            pod_doc.set("metadata", std::move(pmeta));
+
+                            models::JsonValue pspec = tmpl->get("spec") ? *tmpl->get("spec") : models::JsonValue{};
+                            if (pspec.type != models::JsonType::Object) pspec.type = models::JsonType::Object;
+                            pspec.set("nodeName", models::JsonValue{models::JsonType::String, false, 0, nname, {}, {}});
+                            pod_doc.set("spec", std::move(pspec));
+
+                            models::JsonValue pstat;
+                            pstat.type = models::JsonType::Object;
+                            pstat.set("phase", models::JsonValue{models::JsonType::String, false, 0, "Running", {}, {}});
+                            pstat.set("podIP", models::JsonValue{models::JsonType::String, false, 0, (nname.find("02") != std::string::npos ? "192.168.4.2" : "192.168.4.1"), {}, {}});
+                            pod_doc.set("status", std::move(pstat));
+
+                            store_.put("/registry/pods/" + ns + "/" + pod_name, pod_doc.to_string(), true);
+                        }
+                    }
+                }
+            }
+
+            HttpResponse resp;
+            resp.status_code = 201;
+            resp.content_type = "application/json";
+            resp.body = req.body;
+            return resp;
+        } else if (req.method == HttpMethod::Get) {
+            std::vector<std::string> ds_jsons;
+            store_.list("/registry/daemonsets/" + ns + "/", ds_jsons);
+            std::string body = "{\"kind\":\"DaemonSetList\",\"apiVersion\":\"apps/v1\",\"metadata\":{\"resourceVersion\":\"1\"},\"items\":[";
+            for (size_t i = 0; i < ds_jsons.size(); ++i) {
+                if (i > 0) body += ",";
+                body += ds_jsons[i];
+            }
+            body += "]}";
+            HttpResponse resp;
+            resp.status_code = 200;
+            resp.content_type = "application/json";
+            resp.body = body;
+            return resp;
+        }
+    } else if (match.category == RouteCategory::DaemonSetItem) {
+        std::string name = std::string(match.resource_name);
+        std::string key = "/registry/daemonsets/" + ns + "/" + name;
+        if (req.method == HttpMethod::Get) {
+            std::string ds_json;
+            if (!store_.get(key, ds_json).ok()) {
+                return make_status(404, "NotFound", "daemonset \"" + name + "\" not found", name, "DaemonSet");
+            }
+            HttpResponse resp;
+            resp.status_code = 200;
+            resp.content_type = "application/json";
+            resp.body = ds_json;
+            return resp;
+        } else if (req.method == HttpMethod::Delete) {
+            store_.remove(key);
+            return make_status(200, "Success", "daemonset \"" + name + "\" deleted", name, "DaemonSet");
+        }
+    }
+    return make_status(405, "MethodNotAllowed", "Method not allowed on daemonset endpoint");
+}
+
+HttpResponse RouteHandler::handle_jobs(const HttpRequest& req, const RouteMatch& match, mem::MonotonicArena& arena) {
+    (void)arena;
+    std::string ns = match.namespace_name.empty() ? "default" : std::string(match.namespace_name);
+    if (match.category == RouteCategory::JobsNsCollection) {
+        if (req.method == HttpMethod::Post) {
+            models::JsonValue doc;
+            std::string err;
+            if (!models::parse_json(req.body, doc, err) || !doc.is_object()) {
+                return make_status(400, "BadRequest", "Invalid JSON: " + err);
+            }
+            const models::JsonValue* meta = doc.get("metadata");
+            std::string name = meta ? meta->get_string("name", "") : "";
+            if (name.empty()) return make_status(400, "BadRequest", "Missing metadata.name");
+            std::string key = "/registry/jobs/" + ns + "/" + name;
+            store_.put(key, req.body, true);
+
+            const models::JsonValue* spec = doc.get("spec");
+            const models::JsonValue* tmpl = spec ? spec->get("template") : nullptr;
+            if (tmpl && tmpl->is_object()) {
+                models::JsonValue pod_doc;
+                pod_doc.type = models::JsonType::Object;
+                pod_doc.set("apiVersion", models::JsonValue{models::JsonType::String, false, 0, "v1", {}, {}});
+                pod_doc.set("kind", models::JsonValue{models::JsonType::String, false, 0, "Pod", {}, {}});
+                models::JsonValue pmeta;
+                pmeta.type = models::JsonType::Object;
+                pmeta.set("name", models::JsonValue{models::JsonType::String, false, 0, name, {}, {}});
+                pmeta.set("namespace", models::JsonValue{models::JsonType::String, false, 0, ns, {}, {}});
+                pod_doc.set("metadata", std::move(pmeta));
+
+                models::JsonValue pspec = tmpl->get("spec") ? *tmpl->get("spec") : models::JsonValue{};
+                if (pspec.type != models::JsonType::Object) pspec.type = models::JsonType::Object;
+                pspec.set("nodeName", models::JsonValue{models::JsonType::String, false, 0, "esp32-node-01", {}, {}});
+                pod_doc.set("spec", std::move(pspec));
+
+                models::JsonValue pstat;
+                pstat.type = models::JsonType::Object;
+                pstat.set("phase", models::JsonValue{models::JsonType::String, false, 0, "Succeeded", {}, {}});
+                pstat.set("podIP", models::JsonValue{models::JsonType::String, false, 0, "192.168.4.1", {}, {}});
+                pod_doc.set("status", std::move(pstat));
+
+                store_.put("/registry/pods/" + ns + "/" + name, pod_doc.to_string(), true);
+            }
+
+            HttpResponse resp;
+            resp.status_code = 201;
+            resp.content_type = "application/json";
+            resp.body = req.body;
+            return resp;
+        } else if (req.method == HttpMethod::Get) {
+            std::vector<std::string> job_jsons;
+            store_.list("/registry/jobs/" + ns + "/", job_jsons);
+            std::string body = "{\"kind\":\"JobList\",\"apiVersion\":\"batch/v1\",\"metadata\":{\"resourceVersion\":\"1\"},\"items\":[";
+            for (size_t i = 0; i < job_jsons.size(); ++i) {
+                if (i > 0) body += ",";
+                body += job_jsons[i];
+            }
+            body += "]}";
+            HttpResponse resp;
+            resp.status_code = 200;
+            resp.content_type = "application/json";
+            resp.body = body;
+            return resp;
+        }
+    } else if (match.category == RouteCategory::JobItem) {
+        std::string name = std::string(match.resource_name);
+        std::string key = "/registry/jobs/" + ns + "/" + name;
+        if (req.method == HttpMethod::Get) {
+            std::string job_json;
+            if (!store_.get(key, job_json).ok()) {
+                return make_status(404, "NotFound", "job \"" + name + "\" not found", name, "Job");
+            }
+            HttpResponse resp;
+            resp.status_code = 200;
+            resp.content_type = "application/json";
+            resp.body = job_json;
+            return resp;
+        } else if (req.method == HttpMethod::Delete) {
+            store_.remove(key);
+            return make_status(200, "Success", "job \"" + name + "\" deleted", name, "Job");
+        }
+    }
+    return make_status(405, "MethodNotAllowed", "Method not allowed on job endpoint");
 }
 
 } // namespace kube32::api

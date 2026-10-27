@@ -36,11 +36,18 @@ enum class RouteCategory {
     DeploymentScale,
     DiscoveryApisCoordinationV1,
     DiscoveryApisAuthorizationV1,
+    DiscoveryApisBatchV1,
     SelfSubjectAccessReviews,
     SelfSubjectRulesReviews,
     NamespacesCollection,
     LeasesNsCollection,
     LeaseItem,
+    ServicesNsCollection,
+    ServiceItem,
+    DaemonSetsNsCollection,
+    DaemonSetItem,
+    JobsNsCollection,
+    JobItem,
     NotFound
 };
 
@@ -83,6 +90,9 @@ private:
     HttpResponse handle_pods(const HttpRequest& req, const RouteMatch& match, mem::MonotonicArena& arena, osal::Socket* client_sock = nullptr);
     HttpResponse handle_deployments(const HttpRequest& req, const RouteMatch& match, mem::MonotonicArena& arena, osal::Socket* client_sock = nullptr);
     HttpResponse handle_leases(const HttpRequest& req, const RouteMatch& match, mem::MonotonicArena& arena, osal::Socket* client_sock = nullptr);
+    HttpResponse handle_services(const HttpRequest& req, const RouteMatch& match, mem::MonotonicArena& arena);
+    HttpResponse handle_daemonsets(const HttpRequest& req, const RouteMatch& match, mem::MonotonicArena& arena);
+    HttpResponse handle_jobs(const HttpRequest& req, const RouteMatch& match, mem::MonotonicArena& arena);
 };
 
 } // namespace kube32::api
