@@ -338,7 +338,10 @@ def handle_spdy_portforward(sock, pod_name, ns):
                             out_hdr = struct.pack(">IB", stream_id, frame_flags) + struct.pack(">I", len(chunk))[1:]
                             sock.sendall(out_hdr + chunk)
                         del data_buffers[stream_id]
-        except Exception:
+        except Exception as e:
+            import traceback
+            print(f"[SPDY-ERR] Exception in SPDY loop: {e}")
+            traceback.print_exc()
             break
 
 
@@ -1458,15 +1461,17 @@ class KubeGatewayHandler(BaseHTTPRequestHandler):
                 body = self.rfile.read(content_length).decode("utf-8") if content_length > 0 else "{}"
                 freq = 1000
                 dur = 100
+                vol = 20
                 try:
                     d = json.loads(body)
                     freq = d.get("frequency_hz", 1000)
                     dur = d.get("duration_ms", 100)
-                    hardware_telemetry["speaker_active"] = True
-                    send_serial_cmd(f"K32_CMD:BEEP:{freq}:{dur}")
+                    vol = d.get("volume_pct", d.get("volume", 20))
+                    hardware_telemetry["speaker_active"] = (freq > 0 and vol > 0)
+                    send_serial_cmd(f"K32_CMD:BEEP:{freq}:{dur}:{vol}")
                 except Exception as e:
                     print(f"[GATEWAY] Error processing speaker command: {e}")
-                self.send_json(200, {"status": "OK", "action": "tone_played", "freq": freq, "dur": dur, "device": "physical_ns4148"})
+                self.send_json(200, {"status": "OK", "action": "tone_played", "freq": freq, "dur": dur, "volume": vol, "device": "physical_ns4148"})
                 return
             elif path_clean == "/api/v1/hardware/ir":
                 content_length = int(self.headers.get("Content-Length", 0))

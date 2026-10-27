@@ -423,8 +423,22 @@ void init_speaker() {
     ESP_LOGI(TAG, "NS4168 I2S speaker online (BCLK: %d, LRCK: %d, DOUT: %d)", PIN_I2S_BCLK, PIN_I2S_LRCK, PIN_I2S_DATA);
 }
 
-void play_tone(uint32_t freq_hz, uint32_t duration_ms) {
-    if (!s_tx_chan || freq_hz == 0 || duration_ms == 0) return;
+void play_tone(uint32_t freq_hz, uint32_t duration_ms, uint8_t volume_pct) {
+    if (!s_tx_chan) return;
+
+    // Silence buffer
+    int16_t silence[256];
+    std::memset(silence, 0, sizeof(silence));
+    size_t bytes_written = 0;
+
+    if (freq_hz == 0 || duration_ms == 0 || volume_pct == 0) {
+        // Flush silence across multiple DMA descriptors to guarantee complete silence
+        for (int k = 0; k < 8; ++k) {
+            i2s_channel_write(s_tx_chan, silence, sizeof(silence), &bytes_written, pdMS_TO_TICKS(50));
+        }
+        return;
+    }
+
     const uint32_t sample_rate = 16000;
     int samples_per_period = sample_rate / freq_hz;
     if (samples_per_period < 2) samples_per_period = 2;
@@ -433,28 +447,34 @@ void play_tone(uint32_t freq_hz, uint32_t duration_ms) {
     int16_t buf[128];
     int buf_len = sizeof(buf) / sizeof(int16_t);
 
+    // Scale amplitude safely from volume_pct (0..100)
+    // At 100% vol: amplitude = 4000 (well-controlled, clear)
+    // At 20% vol:  amplitude = 800 (gentle, quiet click/beep)
+    if (volume_pct > 100) volume_pct = 100;
+    int16_t amplitude = (int16_t)((4000L * volume_pct) / 100L);
+    if (amplitude < 100 && volume_pct > 0) amplitude = 100;
+
     int phase = 0;
     int remaining = total_samples;
+    // Play exactly once for duration_ms
     while (remaining > 0) {
         int chunk = (remaining > buf_len) ? buf_len : remaining;
         for (int i = 0; i < chunk; ++i) {
-            buf[i] = (phase < samples_per_period / 2) ? 14000 : -14000;
+            buf[i] = (phase < samples_per_period / 2) ? amplitude : -amplitude;
             phase = (phase + 1) % samples_per_period;
         }
-        size_t bytes_written = 0;
         i2s_channel_write(s_tx_chan, buf, chunk * sizeof(int16_t), &bytes_written, pdMS_TO_TICKS(100));
         remaining -= chunk;
+    }
+
+    // Immediately flush silence so the DMA buffer does not loop the tone
+    for (int k = 0; k < 6; ++k) {
+        i2s_channel_write(s_tx_chan, silence, sizeof(silence), &bytes_written, pdMS_TO_TICKS(50));
     }
 }
 
 void play_boot_chime() {
-    play_tone(523, 80); // C5
-    vTaskDelay(pdMS_TO_TICKS(20));
-    play_tone(659, 80); // E5
-    vTaskDelay(pdMS_TO_TICKS(20));
-    play_tone(784, 80); // G5
-    vTaskDelay(pdMS_TO_TICKS(20));
-    play_tone(1046, 150); // C6
+    // Silent on boot
 }
 
 // ---------------------------------------------------------------------------
@@ -504,9 +524,6 @@ static void keyboard_task(void* pvParameters) {
         if (detected != '\0' && detected != prev_key) {
             last_key_pressed = detected;
             printf("[KEYBOARD] Key Pressed: '%c'\n", detected);
-
-            // Audio click feedback
-            play_tone(2200, 10);
 
             // Display on bottom line of physical LCD
             char buf[32];

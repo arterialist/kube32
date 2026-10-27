@@ -49,7 +49,7 @@ void display_draw_string(int x, int y, const char* str, uint16_t color = COLOR_W
 
 // Speaker Acoustic Primitives
 void init_speaker();
-void play_tone(uint32_t freq_hz, uint32_t duration_ms);
+void play_tone(uint32_t freq_hz, uint32_t duration_ms, uint8_t volume_pct = 20);
 void play_boot_chime();
 
 // Keyboard Matrix Scanner

@@ -341,17 +341,26 @@ static void kube32_cluster_task(void* pvParameters) {
                             printf("[HARDWARE-DISPLAY] Physical screen updated: '%s'\n", disp_text.c_str());
                         } else if (line_accum.rfind("K32_CMD:BEEP:", 0) == 0) {
                             std::string beep_args = line_accum.substr(13);
-                            size_t colon_pos = beep_args.find(':');
                             uint32_t freq = 1000;
                             uint32_t dur = 100;
-                            if (colon_pos != std::string::npos) {
-                                freq = std::strtoul(beep_args.substr(0, colon_pos).c_str(), nullptr, 10);
-                                dur = std::strtoul(beep_args.substr(colon_pos + 1).c_str(), nullptr, 10);
+                            uint8_t vol = 20;
+
+                            size_t c1 = beep_args.find(':');
+                            if (c1 != std::string::npos) {
+                                freq = std::strtoul(beep_args.substr(0, c1).c_str(), nullptr, 10);
+                                std::string rest = beep_args.substr(c1 + 1);
+                                size_t c2 = rest.find(':');
+                                if (c2 != std::string::npos) {
+                                    dur = std::strtoul(rest.substr(0, c2).c_str(), nullptr, 10);
+                                    vol = (uint8_t)std::strtoul(rest.substr(c2 + 1).c_str(), nullptr, 10);
+                                } else {
+                                    dur = std::strtoul(rest.c_str(), nullptr, 10);
+                                }
                             } else {
                                 freq = std::strtoul(beep_args.c_str(), nullptr, 10);
                             }
-                            kube32::hal::play_tone(freq, dur);
-                            printf("[HARDWARE-SPEAKER] Played tone %u Hz (%u ms) via NS4168 I2S\n", (unsigned)freq, (unsigned)dur);
+                            kube32::hal::play_tone(freq, dur, vol);
+                            printf("[HARDWARE-SPEAKER] Played tone %u Hz (%u ms, vol: %u%%) via NS4168 I2S (single shot)\n", (unsigned)freq, (unsigned)dur, (unsigned)vol);
                         } else if (line_accum == "K32_CMD:PIPELINE_TRANSMIT") {
                             struct MfccFeatures {
                                 float energy;

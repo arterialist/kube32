@@ -415,8 +415,16 @@ WORKBENCH_HTML = """<!DOCTYPE html>
             </div>
 
             <p style="color: var(--text-secondary); font-size: 13px;">
-                Direct hardware acoustic generator. Clicking a tone sends a real-time signal across the Kubernetes cluster bridge to pulse the physical onboard speaker amplifier.
+                Direct hardware acoustic generator. Clicking a tone sends a single-shot pulse to the physical onboard NS4168 Class-D audio amplifier.
             </p>
+
+            <div style="margin: 12px 0; background: var(--bg); border: 1px solid var(--border); border-radius: 6px; padding: 12px;">
+                <div style="display: flex; justify-content: space-between; margin-bottom: 6px; font-size: 12px; font-family: var(--font-mono);">
+                    <span>SPEAKER VOLUME</span>
+                    <span id="volValue" style="color: var(--accent-cyan); font-weight: 600;">20%</span>
+                </div>
+                <input type="range" id="volSlider" min="0" max="100" value="20" style="width: 100%; accent-color: var(--accent-purple); cursor: pointer;" oninput="document.getElementById('volValue').textContent = this.value + '%'">
+            </div>
 
             <div class="tone-grid">
                 <button class="btn-tone" onclick="playTone(440, 150)">440 Hz (A4)</button>
@@ -426,7 +434,7 @@ WORKBENCH_HTML = """<!DOCTYPE html>
                 <button class="btn-tone" onclick="playTone(1000, 100)">1000 Hz (Beep)</button>
                 <button class="btn-tone" onclick="playTone(1500, 120)">1500 Hz (Alert)</button>
                 <button class="btn-tone" onclick="playTone(2000, 80)">2000 Hz (Hi)</button>
-                <button class="btn-tone" onclick="playBootChime()">Boot Chime</button>
+                <button class="btn-tone" style="border-color: rgba(239, 68, 68, 0.4); color: #f87171;" onclick="stopAudio()">Mute / Stop</button>
             </div>
 
             <div style="border-top: 1px solid var(--border); padding-top: 12px; margin-top: 8px;">
@@ -554,25 +562,33 @@ WORKBENCH_HTML = """<!DOCTYPE html>
         }
 
         async function playTone(freq, dur) {
-            log(`[SPEAKER] Triggering tone: ${freq} Hz (${dur} ms) on physical NS4168 speaker`);
+            const vol = parseInt(document.getElementById('volSlider')?.value || 20);
+            log(`[SPEAKER] Triggering single-shot tone: ${freq} Hz (${dur} ms, volume ${vol}%)`);
             try {
                 const res = await fetch('/api/hardware/speaker', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ frequency_hz: freq, duration_ms: dur })
+                    body: JSON.stringify({ frequency_hz: freq, duration_ms: dur, volume_pct: vol })
                 });
                 const data = await res.json();
-                log(`[SPEAKER] Hardware tone played: ${data.freq} Hz on physical hardware`);
+                log(`[SPEAKER] Hardware tone played: ${data.freq} Hz (single shot, vol ${data.volume}%)`);
             } catch (e) {
                 log(`[SPEAKER-ERR] ${e.message}`);
             }
         }
 
-        async function playBootChime() {
-            playTone(523, 80);
-            setTimeout(() => playTone(659, 80), 90);
-            setTimeout(() => playTone(784, 80), 180);
-            setTimeout(() => playTone(1046, 120), 270);
+        async function stopAudio() {
+            log('[SPEAKER] Immediate mute requested');
+            try {
+                await fetch('/api/hardware/speaker', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ frequency_hz: 0, duration_ms: 0, volume_pct: 0 })
+                });
+                log('[SPEAKER] Speaker muted');
+            } catch (e) {
+                log(`[SPEAKER-ERR] ${e.message}`);
+            }
         }
 
         async function triggerPipeline() {
@@ -686,15 +702,17 @@ def handle_workload_http_request(method, path, headers, body, hardware_telemetry
     if path_clean == '/api/hardware/speaker':
         freq = 1000
         dur = 100
+        vol = 20
         try:
             d = json.loads(body.decode('utf-8', errors='replace') if isinstance(body, bytes) else body)
             freq = d.get("frequency_hz", 1000)
             dur = d.get("duration_ms", 100)
-            hardware_telemetry["speaker_active"] = True
-            send_serial_cmd(f"K32_CMD:BEEP:{freq}:{dur}")
+            vol = d.get("volume_pct", d.get("volume", 20))
+            hardware_telemetry["speaker_active"] = (freq > 0 and vol > 0)
+            send_serial_cmd(f"K32_CMD:BEEP:{freq}:{dur}:{vol}")
         except Exception as e:
             print(f"[WORKLOAD-ERR] Speaker tone error: {e}")
-        resp = {"status": "OK", "action": "tone_played", "freq": freq, "dur": dur, "device": "physical_ns4168"}
+        resp = {"status": "OK", "action": "tone_played", "freq": freq, "dur": dur, "volume": vol, "device": "physical_ns4168"}
         return (200, 'application/json', json.dumps(resp).encode('utf-8'))
 
     if path_clean == '/api/pipeline/transmit':
