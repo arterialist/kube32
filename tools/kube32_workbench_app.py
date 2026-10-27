@@ -1983,7 +1983,7 @@ SUITE_HTML = """<!DOCTYPE html>
         }
 
         // Global Periodic Hardware Pollers
-        setInterval(pollHardwareKeyboard, 80);
+        setInterval(pollHardwareKeyboard, 160);
         setInterval(() => {
             if (currentWorkload === 'fleet') fetchFleet();
         }, 1500);

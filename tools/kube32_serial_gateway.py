@@ -349,6 +349,13 @@ def handle_spdy_portforward(sock, pod_name, ns):
                             frame_flags = 0x01 if is_last else 0x00
                             out_hdr = struct.pack(">IB", stream_id, frame_flags) + struct.pack(">I", len(chunk))[1:]
                             sock.sendall(out_hdr + chunk)
+                        # Also cleanly close paired error stream
+                        error_stream_id = stream_id + 1
+                        err_hdr = struct.pack(">IB", error_stream_id, 0x01) + struct.pack(">I", 0)[1:]
+                        try:
+                            sock.sendall(err_hdr)
+                        except Exception:
+                            pass
                         del data_buffers[stream_id]
         except Exception as e:
             import traceback
