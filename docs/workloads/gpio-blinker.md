@@ -69,7 +69,8 @@ graph TD
 Apply the manifest using `kube32-cli` over the USB serial interface:
 
 ```bash
-./cli/kube32-cli --port /dev/cu.usbmodem2101 apply -f examples/gpio-blinker.yaml
+# Apply workload to the physical cluster
+./cli/kube32-cli --port /dev/ttyACM0 apply -f examples/gpio-blinker.yaml
 ```
 
 Output:
@@ -80,7 +81,7 @@ pod/gpio-blinker applied successfully -> scheduled to esp32-node-02 (HTTP 201)
 Check the active pod status:
 
 ```bash
-./cli/kube32-cli --port /dev/cu.usbmodem2101 status
+./cli/kube32-cli --port /dev/ttyACM0 status
 ```
 
 Output:

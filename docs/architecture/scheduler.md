@@ -68,8 +68,8 @@ Suppose a pod requests 32 KB of memory:
 
 | Candidate node | Total allocatable | Currently allocated | Free memory | Score | Result |
 | :--- | :--- | :--- | :--- | :--- | :--- |
-| **Node 1 (Cardputer)** | 400 KB | 64 KB | 336 KB | 84.0 | Discarded |
-| **Node 2 (DevKit with PSRAM)** | 2,048 KB | 48 KB | 2,000 KB | 97.6 | **Selected** |
+| **Node 1 (Control plane)** | 400 KB | 64 KB | 336 KB | 84.0 | Discarded |
+| **Node 2 (Worker with PSRAM)** | 2,048 KB | 48 KB | 2,000 KB | 97.6 | **Selected** |
 
 Node 2 receives the pod because its 2 MB external PSRAM provides wider headroom, saving Node 1's internal SRAM for API server connections and packet routing.
 

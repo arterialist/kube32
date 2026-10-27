@@ -103,11 +103,10 @@ Instead of opening heavy TCP sockets across Wi-Fi for sensor data, Kube32 routes
 
 ```
 +-------------------------------------------------------------------------------+
-| Node 1: Master control plane                  Node 2: Worker agent            |
-| Device: M5Stack Cardputer                     Device: ESP32-S3 DevKit         |
-| Chip:   ESP32-S3FN8                           Chip:   ESP32-S3 QFN56          |
-| Memory: 512 KB SRAM, 0 MB PSRAM               Memory: 512 KB SRAM, 2 MB PSRAM |
-| MAC:    02:00:00:00:00:02                     MAC:    02:00:00:00:00:01       |
+| Node 1: Control plane                         Node 2: Worker node             |
+| Target: ESP32-S3 (Standard)                   Target: ESP32-S3 with PSRAM     |
+| Memory: 512 KB SRAM, 8 MB Flash               Memory: 512 KB SRAM, 2 MB PSRAM |
+| Roles:  Control plane, API server, scheduler  Roles:  Worker agent, Wasm3 VM  |
 | IP:     192.168.4.1 (SoftAP host)             IP:     192.168.4.2 (Station)   |
 |                                                                               |
 |                   \                              /                            |

@@ -37,7 +37,7 @@ spec:
 Apply the oversized workload:
 
 ```bash
-./cli/kube32-cli --port /dev/cu.usbmodem2101 apply -f oversized-workload.yaml
+./cli/kube32-cli --port /dev/ttyACM0 apply -f oversized-workload.yaml
 ```
 
 Output:
@@ -48,7 +48,7 @@ pod/oversized-ml-model applied successfully -> scheduled to <none> (HTTP 201)
 Check the pod status:
 
 ```bash
-./cli/kube32-cli --port /dev/cu.usbmodem2101 status
+./cli/kube32-cli --port /dev/ttyACM0 status
 ```
 
 Output:

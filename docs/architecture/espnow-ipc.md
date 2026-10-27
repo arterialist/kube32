@@ -75,7 +75,7 @@ sequenceDiagram
     S1->>S1: Sample ADC and extract 12 MFCC coefficients (52 bytes)
     S1->>CH1: send(channel="audio.features", data=features)
     CH1->>CH1: Assemble K32C frame and compute CRC16
-    CH1->>RF: esp_now_send(target_mac=02:00:00:00:00:01)
+    CH1->>RF: esp_now_send(target_mac=24:dc:c3:45:67:02)
     RF-->>CH2: Hardware ISR: recv_callback
     CH2->>CH2: Validate CRC16 and FNV-1a channel hash
     CH2->>CH2: Push payload into ring buffer

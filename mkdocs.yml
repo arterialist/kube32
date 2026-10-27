@@ -11,16 +11,16 @@ theme:
   palette:
     - scheme: default
       primary: light blue
-      accent: cyan
+      accent: light blue
       toggle:
         icon: material/weather-night
-        name: Switch to dark blueprint mode
+        name: Switch to dark mode
     - scheme: slate
       primary: light blue
-      accent: cyan
+      accent: light blue
       toggle:
         icon: material/weather-sunny
-        name: Switch to light blueprint mode
+        name: Switch to light mode
   font:
     text: Google Sans Flex
     code: JetBrains Mono

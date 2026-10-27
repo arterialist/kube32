@@ -8,7 +8,7 @@
 
 `kube32-cli` is the command-line utility for managing Kube32 clusters. It supports two connection modes:
 
-1. **Direct silicon serial mode (`--port`)**: Sends requests across USB serial lines directly to the ESP32-S3 control plane (`/dev/cu.usbmodem...`). This mode works without disconnecting your computer from its regular Wi-Fi network.
+1. **Direct silicon serial mode (`--port`)**: Sends requests across USB serial lines directly to the ESP32-S3 control plane (`/dev/ttyACM...` or `/dev/cu.usbmodem...`). This mode works without disconnecting your computer from its regular Wi-Fi network.
 2. **HTTP REST mode (`--server`)**: Sends standard HTTP requests to port 6443 over the `Kube32-Cluster` Wi-Fi network.
 
 ---
@@ -17,7 +17,7 @@
 
 | Option | Short | Default | Purpose |
 | :--- | :--- | :--- | :--- |
-| `--port` | `-p` | None | Serial device path (such as `/dev/cu.usbmodem2101`) |
+| `--port` | `-p` | None | Serial device path (such as `/dev/ttyACM0` or `/dev/cu.usbmodem1`) |
 | `--server` | | `http://192.168.4.1:6443` | API server HTTP address |
 | `--help` | `-h` | | Show help text and exit |
 
@@ -29,12 +29,12 @@
 Queries cluster state, listing registered nodes, health statuses, free memory, and active pods:
 
 ```bash
-./cli/kube32-cli --port /dev/cu.usbmodem2101 status
+./cli/kube32-cli --port /dev/ttyACM0 status
 ```
 
 Output:
 ```
-Connecting to Kube32 cluster at /dev/cu.usbmodem2101...
+Connecting to Kube32 cluster at /dev/ttyACM0...
 
 === CLUSTER NODES ===
 NAME             STATUS     ROLES          INTERNAL-IP      ALLOCATABLE-MEM
@@ -55,7 +55,7 @@ default      keyword-classifier       esp32-node-02    Running      64Ki
 Submits a declarative workload manifest to the cluster:
 
 ```bash
-./cli/kube32-cli --port /dev/cu.usbmodem2101 apply -f examples/distributed-pipeline.yaml
+./cli/kube32-cli --port /dev/ttyACM0 apply -f examples/distributed-pipeline.yaml
 ```
 
 Output:
@@ -70,7 +70,7 @@ pod/keyword-classifier applied successfully -> scheduled to esp32-node-02 (HTTP 
 Removes a pod from the cluster, freeing its memory and releasing hardware pins:
 
 ```bash
-./cli/kube32-cli --port /dev/cu.usbmodem2101 delete gpio-blinker --namespace default
+./cli/kube32-cli --port /dev/ttyACM0 delete gpio-blinker --namespace default
 ```
 
 Output:
@@ -84,13 +84,13 @@ pod "gpio-blinker" deleted
 Triggers an over-the-air ESP-NOW transmission from Stage 1 on Node 1 to Stage 2 on Node 2:
 
 ```bash
-./cli/kube32-cli --port /dev/cu.usbmodem2101 pipeline
+./cli/kube32-cli --port /dev/ttyACM0 pipeline
 ```
 
 Output:
 ```
-Triggering Stage 1 over-the-air ESP-NOW transmission on /dev/cu.usbmodem2101...
-  Node 1: PIPELINE-OTA-TX: Transmitting Stage 1 MFCC features (52 bytes) over ESP-NOW to Node 2 (02:00:00:00:00:01)...
+Triggering Stage 1 over-the-air ESP-NOW transmission on /dev/ttyACM0...
+  Node 1: PIPELINE-OTA-TX: Transmitting Stage 1 MFCC features (52 bytes) over ESP-NOW to Node 2 (24:dc:c3:45:67:02)...
   Node 1: PIPELINE-OTA-TX: ESP-NOW transmission result: 0 (0 = OK)
 ```
 

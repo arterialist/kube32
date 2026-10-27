@@ -1,9 +1,9 @@
 # Quickstart guide
 
 <div class="blueprint-card">
-  <strong>Execution target</strong>: Two connected ESP32-S3 boards.<br>
-  <strong>Tools needed</strong>: Python 3.10+, PlatformIO, and USB-C cables.<br>
-  <strong>Connection options</strong>: USB serial or Wi-Fi on port 6443.
+  <strong>Execution target</strong>: Two connected ESP32-S3 microcontroller boards.<br>
+  <strong>Prerequisites</strong>: Python 3.10+, PlatformIO or esptool, and USB cables.<br>
+  <strong>Cluster access</strong>: USB serial or local Wi-Fi on port 6443.
 </div>
 
 This guide walks through compiling firmware, flashing two ESP32-S3 boards, and deploying your first WebAssembly container.
@@ -12,23 +12,23 @@ This guide walks through compiling firmware, flashing two ESP32-S3 boards, and d
 
 ## 1. Hardware setup
 
-We use two boards for this cluster:
+A minimal Kube32 cluster uses two ESP32-S3 boards:
 
-| Node role | Board | USB interface | Memory |
+| Node role | Recommended hardware | Interface | Memory specification |
 | :--- | :--- | :--- | :--- |
-| **Node 1 (Control plane)** | M5Stack Cardputer | Native USB-JTAG | 512 KB SRAM, 8 MB Flash, 0 MB PSRAM |
-| **Node 2 (Worker)** | ESP32-S3 DevKit | CH343 USB-UART | 512 KB SRAM, 2 MB Quad PSRAM, 8 MB Flash |
+| **Node 1 (Control plane)** | Standard ESP32-S3 | Native USB-CDC or USB-UART | 512 KB SRAM, 8 MB Flash |
+| **Node 2 (Worker)** | ESP32-S3 with PSRAM | Native USB-CDC or USB-UART | 512 KB SRAM, 2 MB - 8 MB PSRAM, 8 MB Flash |
 
 ```mermaid
 sequenceDiagram
     autonumber
     actor Dev as Developer
-    participant N1 as Node 1 (Master)
+    participant N1 as Node 1 (Control plane)
     participant N2 as Node 2 (Worker)
 
     N1->>N1: Start Wi-Fi SoftAP "Kube32-Cluster"
     N1->>N1: Start HTTP API server on port 6443
-    N2->>N1: Associate over Wi-Fi, get IP 192.168.4.2
+    N2->>N1: Associate over Wi-Fi, receive IP 192.168.4.2
     N2->>N1: Register node via POST /api/v1/nodes
 
     Dev->>N1: Apply gpio-blinker.yaml
@@ -43,13 +43,13 @@ sequenceDiagram
 
 ## 2. Compile the firmware
 
-Build the firmware with PlatformIO and ESP-IDF:
+Build the firmware using PlatformIO and the ESP-IDF framework:
 
 ```bash
-~/.platformio/penv/bin/pio run -e esp32s3
+pio run -e esp32s3
 ```
 
-This creates three binaries in `.pio/build/esp32s3/`:
+This compiles three target binaries in `.pio/build/esp32s3/`:
 - `bootloader.bin` at offset `0x0000`
 - `partitions.bin` at offset `0x8000`
 - `firmware.bin` at offset `0x20000`
@@ -58,37 +58,42 @@ This creates three binaries in `.pio/build/esp32s3/`:
 
 ## 3. Flash the boards
 
-Both boards run the exact same firmware binary. Each board determines its role at boot time from its factory MAC address.
+Both boards run the unified firmware image. At boot time, the firmware automatically detects available memory (SRAM vs PSRAM) and starts the control plane or worker agent services.
 
-### Flash Node 1 (M5Stack Cardputer)
-Push the slide switch on the left edge of the Cardputer to the UP position so the USB controller gets power:
-
-```bash
-bash scripts/flash.sh /dev/cu.usbmodem2101 460800
-```
-
-### Flash Node 2 (ESP32-S3 DevKit with 2 MB PSRAM)
-The CH343 USB-UART chip on the dev board needs 256-byte paced transfers to prevent buffer overruns:
+### Flash Node 1 (Control plane)
+Connect the first board to your workstation:
 
 ```bash
-bash scripts/flash.sh /dev/cu.usbmodem578E0184461 460800
+# Replace /dev/ttyACM0 with your board serial port
+bash scripts/flash.sh /dev/ttyACM0 460800
 ```
+
+### Flash Node 2 (Worker node)
+Connect the second board to your workstation:
+
+```bash
+# Replace /dev/ttyACM1 with your board serial port
+bash scripts/flash.sh /dev/ttyACM1 460800
+```
+
+> [!NOTE]
+> On macOS, serial devices typically appear as `/dev/cu.usbmodem*` or `/dev/cu.usbserial*`. On Linux, they appear as `/dev/ttyACM*` or `/dev/ttyUSB*`. On Windows, they appear as `COM*`.
 
 ---
 
 ## 4. Check cluster status
 
-You can query cluster state over the USB serial cable or over Wi-Fi.
+You can query cluster state over the USB serial interface or over local Wi-Fi.
 
-=== "Over USB serial (recommended)"
+=== "Over USB serial"
 
     ```bash
-    ./cli/kube32-cli --port /dev/cu.usbmodem2101 status
+    ./cli/kube32-cli --port /dev/ttyACM0 status
     ```
 
     Output:
     ```
-    Connecting to Kube32 Cluster at /dev/cu.usbmodem2101...
+    Connecting to Kube32 cluster at /dev/ttyACM0...
 
     === CLUSTER NODES ===
     NAME             STATUS     ROLES          INTERNAL-IP      ALLOCATABLE-MEM
@@ -117,7 +122,7 @@ You can query cluster state over the USB serial cable or over Wi-Fi.
 Deploy `examples/gpio-blinker.yaml`. This manifest requests permission to toggle a GPIO pin:
 
 ```bash
-./cli/kube32-cli --port /dev/cu.usbmodem2101 apply -f examples/gpio-blinker.yaml
+./cli/kube32-cli --port /dev/ttyACM0 apply -f examples/gpio-blinker.yaml
 ```
 
 Output:
@@ -125,12 +130,13 @@ Output:
 pod/gpio-blinker applied successfully -> scheduled to esp32-node-02 (HTTP 201)
 ```
 
-Check the status to verify that the pod is running:
+Verify that the pod is running:
 
 ```bash
-./cli/kube32-cli --port /dev/cu.usbmodem2101 status
+./cli/kube32-cli --port /dev/ttyACM0 status
 ```
 
+Output:
 ```
 === CLUSTER PODS ===
 NAMESPACE    NAME                     NODE             STATUS       MEMORY
@@ -142,12 +148,12 @@ default      gpio-blinker             esp32-node-02    Running      32Ki
 
 ## 6. Read live logs
 
-Open a serial monitor on Node 2 to watch the container run:
+Open a serial monitor on Node 2 to watch the container execute:
 
 ```bash
 python3 -c "
 import serial
-with serial.Serial('/dev/cu.usbmodem578E0184461', 115200) as s:
+with serial.Serial('/dev/ttyACM1', 115200) as s:
     while True:
         line = s.readline()
         if line: print(line.decode('utf-8', errors='replace').strip())

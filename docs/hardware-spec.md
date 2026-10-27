@@ -1,8 +1,8 @@
 # Hardware specifications
 
 <div class="blueprint-card">
-  <strong>Processor</strong>: Espressif ESP32-S3 dual-core Xtensa LX7 at 240 MHz.<br>
-  <strong>Memory architecture</strong>: 384 KB ROM, 512 KB internal SRAM, optional external Quad SPI PSRAM.<br>
+  <strong>Processor</strong>: Espressif ESP32-S3 dual-core Xtensa LX7 running at 240 MHz.<br>
+  <strong>Memory architecture</strong>: 384 KB ROM, 512 KB internal SRAM, optional external Quad/Octal SPI PSRAM.<br>
   <strong>Radios</strong>: 2.4 GHz Wi-Fi (802.11 b/g/n) and ESP-NOW 2.0.
 </div>
 
@@ -10,44 +10,54 @@ Kube32 runs on bare metal on physical ESP32-S3 silicon. This page outlines the p
 
 ---
 
-## Board details
+## Board configurations
 
 ```mermaid
 graph LR
-    subgraph CP["Node 1: M5Stack Cardputer"]
-        CP_CPU["ESP32-S3FN8 at 240 MHz"]
-        CP_MEM["512 KB SRAM, 8 MB Flash"]
-        CP_IO["Native USB-JTAG"]
-        CP_MAC["MAC: 02:00:00:00:00:02"]
+    subgraph N1["Node 1: Control plane"]
+        N1_CPU["ESP32-S3 at 240 MHz"]
+        N1_MEM["512 KB SRAM, 8 MB Flash"]
+        N1_IO["USB-CDC or USB-UART"]
+        N1_ROLE["Control plane & API server"]
     end
 
-    subgraph DK["Node 2: ESP32-S3 DevKit"]
-        DK_CPU["ESP32-S3 QFN56 at 240 MHz"]
-        DK_MEM["512 KB SRAM, 2 MB Quad PSRAM, 8 MB Flash"]
-        DK_IO["CH343 USB-UART"]
-        DK_MAC["MAC: 02:00:00:00:00:01"]
+    subgraph N2["Node 2: Worker node"]
+        N2_CPU["ESP32-S3 at 240 MHz"]
+        N2_MEM["512 KB SRAM, 2 MB - 8 MB PSRAM"]
+        N2_IO["USB-CDC or USB-UART"]
+        N2_ROLE["Worker agent & Wasm3 VM"]
     end
 
-    CP_CPU --- CP_MEM
-    CP_CPU --- CP_IO
-    DK_CPU --- DK_MEM
-    DK_CPU --- DK_IO
+    N1_CPU --- N1_MEM
+    N1_CPU --- N1_IO
+    N2_CPU --- N2_MEM
+    N2_CPU --- N2_IO
 ```
 
-### Node 1: M5Stack Cardputer (Master control plane)
-- **Processor**: ESP32-S3FN8 with 8 MB embedded flash.
-- **PSRAM**: None. The control plane runs inside internal SRAM.
-- **MAC address**: `02:00:00:00:00:02`.
-- **Role**: Master control plane (`esp32-node-01`).
-- **Power switch**: Slide switch on the left edge. Keep it in the UP position to power the USB controller.
-- **Serial port**: Native USB-JTAG (`303A:1001`).
+### Node 1: Control plane node
+- **Processor**: ESP32-S3 dual-core Xtensa LX7 at 240 MHz.
+- **Internal SRAM**: 512 KB.
+- **External PSRAM**: Optional. The control plane, radix store, and scheduler run entirely inside internal SRAM.
+- **Flash storage**: 8 MB or 16 MB SPI Flash.
+- **Role**: Cluster control plane (`esp32-node-01`).
+- **Interfaces**: USB-CDC / JTAG or external USB-to-UART bridge.
 
-### Node 2: ESP32-S3 DevKit (Worker node)
-- **Processor**: ESP32-S3 QFN56 revision v0.2.
-- **PSRAM**: 2 MB Quad SPI PSRAM (`APMemory APS1604M-3SQR`).
-- **MAC address**: `02:00:00:00:00:01`.
-- **Role**: Worker node (`esp32-node-02`).
-- **Serial port**: Dedicated CH343 USB-UART bridge (`1A86:55D3`).
+### Node 2: Worker node
+- **Processor**: ESP32-S3 dual-core Xtensa LX7 at 240 MHz.
+- **Internal SRAM**: 512 KB.
+- **External PSRAM**: 2 MB to 8 MB Quad SPI or Octal SPI PSRAM.
+- **Role**: Workload execution node (`esp32-node-02`).
+- **Interfaces**: USB-CDC / JTAG or external USB-to-UART bridge.
+
+---
+
+## Node identity and MAC addressing
+
+ESP32-S3 microcontrollers contain a factory-burned 48-bit MAC address in their one-time-programmable eFuse block:
+
+- Each node derives its unique cluster identity from its eFuse MAC.
+- During boot, Node 1 initializes the Wi-Fi SoftAP interface (`Kube32-Cluster`) on IP `192.168.4.1`.
+- Worker nodes associate with the SoftAP as stations, receive DHCP assignments (`192.168.4.2` and above), and register themselves with the API server.
 
 ---
 
@@ -67,14 +77,14 @@ The ESP32-S3 memory splits between the FreeRTOS kernel, networking buffers, and 
 0x3FCF_0000 +-----------------------------------------------+
             | IRAM and instruction cache                    |
 0x3C00_0000 +===============================================+
-            | External SPI PSRAM (Node 2: 2048 KB)          |
+            | External SPI PSRAM (Node 2: 2048 KB - 8192 KB)|
             | - Wasm3 container memory                      |
             | - TinyML tensor buffers                       |
-            | - Shared IPC ringbuffers                      |
-0x3C20_0000 +-----------------------------------------------+
+            | - Shared IPC ring buffers                     |
+0x3C80_0000 +-----------------------------------------------+
 ```
 
-The firmware automatically detects whether PSRAM is installed via `CONFIG_SPIRAM_IGNORE_NOTFOUND=y`. If external RAM is absent, as on the Cardputer, the memory allocator limits container allocations to internal SRAM.
+The firmware automatically detects whether external PSRAM is installed via `CONFIG_SPIRAM_IGNORE_NOTFOUND=y`. If external RAM is absent, the memory allocator restricts container allocations to available internal SRAM.
 
 ---
 
@@ -82,18 +92,19 @@ The firmware automatically detects whether PSRAM is installed via `CONFIG_SPIRAM
 
 | Physical pin | Hardware function | Matching capability | Description |
 | :--- | :--- | :--- | :--- |
-| **GPIO 10** | Digital output | `GPIO_WRITE` | Status LED on dev board |
-| **GPIO 1** | Analog input | `ADC_READ` | ADC1 channel 0 sensor input |
-| **GPIO 43** | UART0 TX | System console | Dedicated to system logs |
-| **GPIO 44** | UART0 RX | System console | Dedicated to system logs |
-| **GPIO 19** | USB D- | Native JTAG | Cardputer USB data line |
-| **GPIO 20** | USB D+ | Native JTAG | Cardputer USB data line |
+| **GPIO 10** | Digital output | `GPIO_WRITE` | General user output or status LED |
+| **GPIO 1** | Analog input | `ADC_READ` | ADC1 channel 0 analog sensor input |
+| **GPIO 43** | UART0 TX | System console | Dedicated to system console output |
+| **GPIO 44** | UART0 RX | System console | Dedicated to system console input |
+| **GPIO 19** | USB D- | Native JTAG/OTG | Hardware USB differential data minus |
+| **GPIO 20** | USB D+ | Native JTAG/OTG | Hardware USB differential data plus |
 
 ---
 
 ## Watchdogs and brownout protection
 
-Kube32 configures two hardware watchdogs to keep nodes from freezing:
-1. **Task watchdog (TWDT)**: Tasks feed the watchdog on each loop iteration via `osal::System::feed_watchdog()`. If a task blocks longer than 5 seconds, FreeRTOS recovers the task.
-2. **Interrupt watchdog (IWDT)**: If an interrupt handler runs longer than 300 milliseconds, the hardware resets the CPU.
-3. **Brownout detector**: Set to a 2.7V threshold so sudden power dips during Wi-Fi transmission do not corrupt flash.
+Kube32 configures hardware watchdogs to ensure reliable operation in headless environments:
+
+1. **Task watchdog (TWDT)**: Core tasks feed the watchdog on each loop iteration via `osal::System::feed_watchdog()`. If a task blocks longer than 5 seconds, FreeRTOS triggers an alert and resets the task.
+2. **Interrupt watchdog (IWDT)**: If an interrupt handler runs longer than 300 milliseconds, the hardware watchdog resets the core to prevent deadlocks.
+3. **Brownout detector**: Configured at a 2.7V threshold so sudden power dips during Wi-Fi transmission do not corrupt flash storage.

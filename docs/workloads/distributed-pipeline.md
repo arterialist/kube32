@@ -8,7 +8,7 @@
 
 This guide walks through deploying a distributed dataflow pipeline split across two physical ESP32-S3 microcontrollers.
 
-Stage 1 runs on Node 1 (Cardputer). It samples an analog audio input and extracts a 12-coefficient MFCC feature vector. Node 1 broadcasts these features over an ESP-NOW virtual channel. Stage 2 runs on Node 2 (DevKit with 2 MB PSRAM), receiving the feature stream and classifying wake words in external memory.
+Stage 1 runs on Node 1 (Control plane). It samples an analog audio input and extracts a 12-coefficient MFCC feature vector. Node 1 broadcasts these features over an ESP-NOW virtual channel. Stage 2 runs on Node 2 (Worker with external PSRAM), receiving the feature stream and classifying wake words in external memory.
 
 ---
 
@@ -82,7 +82,7 @@ spec:
 
 ```mermaid
 graph LR
-    subgraph N1["Node 1: Cardputer (Master)"]
+    subgraph N1["Node 1: Control plane"]
         S1["Stage 1: audio-preprocessor<br/>ADC1 channel 0 sampling"]
         EXTRACT["MFCC feature extractor<br/>Energy + 12 coefficients"]
         CH1["IPC channel: audio.features"]
@@ -92,10 +92,10 @@ graph LR
     end
 
     subgraph RF["2.4 GHz RF link"]
-        AIR["ESP-NOW 2.0 wire frame<br/>K32C header and CRC16-CCITT<br/>Direct MAC: 02:00:00:00:00:01"]
+        AIR["ESP-NOW 2.0 wire frame<br/>K32C header and CRC16-CCITT<br/>Direct MAC: 24:dc:c3:45:67:02"]
     end
 
-    subgraph N2["Node 2: DevKit (Worker)"]
+    subgraph N2["Node 2: Worker node"]
         CH2["IPC channel: audio.features"]
         PSRAM["2 MB Quad PSRAM<br/>Tensor workspace"]
         TINYML["Stage 2: keyword-classifier<br/>TinyML classifier"]
@@ -115,7 +115,7 @@ graph LR
 Apply the manifest using `kube32-cli`:
 
 ```bash
-./cli/kube32-cli --port /dev/cu.usbmodem2101 apply -f examples/distributed-pipeline.yaml
+./cli/kube32-cli --port /dev/ttyACM0 apply -f examples/distributed-pipeline.yaml
 ```
 
 Output:
@@ -127,7 +127,7 @@ pod/keyword-classifier applied successfully -> scheduled to esp32-node-02 (HTTP 
 Verify that the scheduler assigned each pod to its target board:
 
 ```bash
-./cli/kube32-cli --port /dev/cu.usbmodem2101 status
+./cli/kube32-cli --port /dev/ttyACM0 status
 ```
 
 Output:
@@ -146,13 +146,13 @@ default      keyword-classifier       esp32-node-02    Running      64Ki
 Trigger the Stage 1 feature extraction and radio transmission over serial:
 
 ```bash
-./cli/kube32-cli --port /dev/cu.usbmodem2101 pipeline
+./cli/kube32-cli --port /dev/ttyACM0 pipeline
 ```
 
 ### Node 1 master telemetry
 
 ```
-PIPELINE-OTA-TX: Transmitting Stage 1 MFCC features (52 bytes) over ESP-NOW to Node 2 (02:00:00:00:00:01)...
+PIPELINE-OTA-TX: Transmitting Stage 1 MFCC features (52 bytes) over ESP-NOW to Node 2 (24:dc:c3:45:67:02)...
 PIPELINE-OTA-TX: ESP-NOW transmission result: 0 (0 = OK)
 ```
 

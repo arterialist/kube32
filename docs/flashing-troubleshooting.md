@@ -1,80 +1,81 @@
 # Flashing and troubleshooting
 
 <div class="blueprint-card">
-  <strong>Flashing scripts</strong>: <code>scripts/flash.sh</code> and <code>scripts/flash_dual_boards.py</code>.<br>
-  <strong>Known chip interfaces</strong>: CH343 USB-UART and native ESP32-S3 USB-JTAG.<br>
-  <strong>Baud rates</strong>: 460,800 baud on Cardputer, 115,200 baud on DevKit.
+  <strong>Flashing utilities</strong>: <code>scripts/flash.sh</code> and PlatformIO / esptool.<br>
+  <strong>Supported interfaces</strong>: Native ESP32-S3 USB-CDC/JTAG and external USB-to-UART bridges.<br>
+  <strong>Recommended baud rates</strong>: 460,800 baud (high speed) or 115,200 baud (recovery).
 </div>
 
-This page documents hardware workarounds discovered while testing Kube32 on physical development boards.
+This page documents flashing procedures, serial connection options, and boot recovery for ESP32-S3 boards.
 
 ---
 
-## 1. Flashing scripts
+## 1. Flashing procedures
 
-The flashing daemon scans for connected boards and flashes them in sequence:
+### Flashing via the helper script
+The repository includes a helper script that flashes the bootloader, partition table, and firmware in a single command:
 
 ```bash
-python3 scripts/flash_dual_boards.py
+# Flash Node 1 (Control plane)
+bash scripts/flash.sh /dev/ttyACM0 460800
+
+# Flash Node 2 (Worker node)
+bash scripts/flash.sh /dev/ttyACM1 460800
 ```
 
-### Flashing boards individually
-To flash a specific board:
+> [!TIP]
+> If your workstation runs macOS, replace `/dev/ttyACM*` with `/dev/cu.usbmodem*` or `/dev/cu.usbserial*`. On Windows, use the appropriate `COM*` port.
+
+### Flashing directly via PlatformIO
+You can also flash directly using PlatformIO:
 
 ```bash
-# Flash Node 1 (Cardputer via native USB-JTAG)
-bash scripts/flash.sh /dev/cu.usbmodem2101 460800
-
-# Flash Node 2 (DevKit via CH343 USB-UART)
-bash scripts/flash.sh /dev/cu.usbmodem578E0184461 460800
+pio run -e esp32s3 -t upload --upload-port /dev/ttyACM0
 ```
 
 ---
 
-## 2. Common hardware issues and fixes
+## 2. Common troubleshooting steps
 
-### CH343 and CH340 buffer overruns
-**Problem**: Flashing stalls at 1% or fails with `Packet content transfer stopped`.
+### Entering download mode manually
+If the flashing tool cannot communicate with the chip:
+1. Press and hold the **BOOT** button (connected to GPIO 0).
+2. Press and release the **RESET** (or EN) button.
+3. Release the **BOOT** button.
+4. Run the flash command again.
 
-**Cause**: The CH343 USB-to-UART bridge on many dev boards drops packets when transfer blocks exceed 256 bytes.
+### High-speed USB transfer pacing
+Certain USB-to-UART bridge controllers experience buffer overruns when flashing large binaries at 460,800 baud or higher.
 
-**Fix**:
-1. Limit RAM block transfer size to 256 bytes:
+If flashing stalls or reports `Packet content transfer stopped`:
+1. Use 256-byte flash block sizing:
    ```python
    esptool.loader.ESPLoader.ESP_RAM_BLOCK = 256
    esptool.loader.StubMixin.FLASH_WRITE_SIZE = 256
    ```
-2. Add a 1.5 millisecond sleep between write blocks:
+2. Introduce a 1.5 millisecond pacing delay between write blocks:
    ```python
    def paced_flash_block(self, data, seq, timeout=20.0, encrypted=False):
        res = orig_flash_block(self, data, seq, timeout=20.0, encrypted=encrypted)
        time.sleep(0.0015)
        return res
    ```
+   The included `scripts/flash.sh` script applies this pacing automatically.
 
-### Cardputer power switch and USB enumeration
-**Problem**: The Cardputer screen lights up, but macOS does not show `/dev/cu.usbmodem2101`.
+### Preventing unintended resets on serial open
+When opening a serial monitor on native USB-CDC or USB-JTAG interfaces, operating system drivers often assert DTR or RTS lines, which can reset the chip into download mode:
 
-**Cause**:
-1. The Cardputer has a small battery. When running on battery alone, the native USB controller does not enumerate because it needs VBUS voltage from the cable.
-2. The mechanical switch on the left edge controls the power rail. If it is switched down, the USB controller stays unpowered.
-
-**Fix**:
-Push the slide switch UP and push the USB-C cable firmly into the recessed socket.
-
-### Native USB reset into download mode
-**Problem**: Opening a serial connection resets the board into ROM download mode instead of normal boot:
 ```
 rst:0x15 (USB_UART_CHIP_RESET), boot:0x0 (DOWNLOAD_BOOT)
 ```
 
-**Fix**:
-Set `dtr=False, rts=False` before opening the port in Python:
+To connect without triggering a reset, configure `dtr=False, rts=False` before opening the port:
+
 ```python
 import serial
 
 s = serial.Serial()
-s.port = "/dev/cu.usbmodem2101"
+s.port = "/dev/ttyACM0"
 s.baudrate = 115200
 s.dtr = False
 s.rts = False
@@ -85,16 +86,17 @@ s.open()
 
 ## 3. Boot strap modes
 
-When the ESP32-S3 starts, the ROM prints its boot strap register. Use this table to check the mode:
+During power-on reset, the ESP32-S3 ROM prints its boot strap register status. Use this table to diagnose the chip state:
 
 | Boot value | Mode name | Status |
 | :--- | :--- | :--- |
-| `boot:0x8` | `SPI_FAST_FLASH_BOOT` | Normal SPI boot. Expected on Node 2. |
-| `boot:0x2b` | `SPI_FAST_FLASH_BOOT` | Normal boot with USB-JTAG active. Expected on Node 1. |
-| `boot:0x0` | `DOWNLOAD_BOOT` | ROM download mode. Used during flashing. |
-| `boot:0x3` | `DOWNLOAD_BOOT` | Strap pin pulled low. Used during flashing. |
+| `boot:0x8` | `SPI_FAST_FLASH_BOOT` | Normal SPI flash boot. |
+| `boot:0x2b` | `SPI_FAST_FLASH_BOOT` | Normal boot with native USB-JTAG enabled. |
+| `boot:0x0` | `DOWNLOAD_BOOT` | ROM download mode. Awaiting firmware upload. |
+| `boot:0x3` | `DOWNLOAD_BOOT` | GPIO 0 held low during reset. |
 
-If a board remains stuck in `boot:0x0`, toggle the RTS line to trigger a reboot:
+If a board remains stuck in `boot:0x0` after flashing, toggle the RTS line or press the physical RESET button to initiate normal execution:
+
 ```python
 s.rts = True
 time.sleep(0.1)
