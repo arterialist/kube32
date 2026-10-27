@@ -7,6 +7,7 @@
 #include "ipc/channel.hpp"
 #include "net/network_manager.hpp"
 #include "osal/thread.hpp"
+#include "hal/tft_keyboard_hardware.hpp"
 
 #include <cstdio>
 #include <cstring>
@@ -79,6 +80,11 @@ static void kube32_cluster_task(void* pvParameters) {
         net_mgr->start_station();
     } else {
         printf("[ROLE] Booting as Master Control Plane: %s (Node ID: %u)\n", node_name.c_str(), node_id);
+        printf("[HARDWARE] Initializing ST7789 Color TFT Display & Backlight (GPIO 38)...\n");
+        kube32::hal::init_display_and_backlight();
+        kube32::hal::init_speaker();
+        kube32::hal::play_boot_chime();
+        kube32::hal::init_keyboard_scanner();
         net_mgr->start_softap();
     }
 
@@ -328,6 +334,24 @@ static void kube32_cluster_task(void* pvParameters) {
                                        (resp.status_code == 200 ? "OK" : resp.status_code == 201 ? "Created" : "Error"),
                                        resp.body.c_str());
                             }
+                        } else if (line_accum.rfind("K32_CMD:DISPLAY:", 0) == 0) {
+                            std::string disp_text = line_accum.substr(16);
+                            kube32::hal::display_fill_rect(8, 36, 224, 70, kube32::hal::COLOR_BG_DARK);
+                            kube32::hal::display_draw_string(8, 36, disp_text.c_str(), kube32::hal::COLOR_CYAN, kube32::hal::COLOR_BG_DARK);
+                            printf("[HARDWARE-DISPLAY] Physical screen updated: '%s'\n", disp_text.c_str());
+                        } else if (line_accum.rfind("K32_CMD:BEEP:", 0) == 0) {
+                            std::string beep_args = line_accum.substr(13);
+                            size_t colon_pos = beep_args.find(':');
+                            uint32_t freq = 1000;
+                            uint32_t dur = 100;
+                            if (colon_pos != std::string::npos) {
+                                freq = std::strtoul(beep_args.substr(0, colon_pos).c_str(), nullptr, 10);
+                                dur = std::strtoul(beep_args.substr(colon_pos + 1).c_str(), nullptr, 10);
+                            } else {
+                                freq = std::strtoul(beep_args.c_str(), nullptr, 10);
+                            }
+                            kube32::hal::play_tone(freq, dur);
+                            printf("[HARDWARE-SPEAKER] Played tone %u Hz (%u ms) on GPIO 42\n", (unsigned)freq, (unsigned)dur);
                         } else if (line_accum == "K32_CMD:PIPELINE_TRANSMIT") {
                             struct MfccFeatures {
                                 float energy;

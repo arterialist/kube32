@@ -150,38 +150,65 @@ def get_serial():
         ser = serial.Serial()
         ser.port = port
         ser.baudrate = BAUD_RATE
-        ser.timeout = 2.0
+        ser.timeout = 0.5
         ser.dtr = False
         ser.rts = False
         ser.open()
         time.sleep(0.05)
     return ser
 
+def send_serial_cmd(cmd: str):
+    """Sends a raw command string to the physical ESP32 hardware via USB-serial."""
+    try:
+        with ser_lock:
+            s = get_serial()
+            s.write((cmd + "\n").encode("utf-8"))
+            s.flush()
+            print(f"[SERIAL-OUT] Sent hardware command: {cmd}")
+    except Exception as e:
+        print(f"[SERIAL-ERR] Could not send to hardware: {e}")
+
 def background_hardware_sync():
-    """Polls hardware telemetry in background without blocking HTTP clients."""
+    """Polls hardware telemetry and reads keyboard/display events without blocking HTTP clients."""
+    last_poll = 0
     while True:
         try:
             with ser_lock:
                 s = get_serial()
-                s.write(b"K32_CMD:STATUS\n")
-                s.flush()
-                t_end = time.time() + 1.2
-                out = []
-                while time.time() < t_end:
-                    line = s.readline()
-                    if line:
-                        out.append(line.decode("utf-8", errors="replace").strip())
-                for l in out:
-                    if "Free Internal SRAM:" in l:
+                now = time.time()
+                if now - last_poll > 4.0:
+                    s.write(b"K32_CMD:STATUS\n")
+                    s.flush()
+                    last_poll = now
+                
+                # Drain lines from hardware
+                while s.in_waiting > 0:
+                    line_raw = s.readline()
+                    if not line_raw:
+                        break
+                    l = line_raw.decode("utf-8", errors="replace").strip()
+                    if not l:
+                        continue
+                    if "[KEYBOARD] Key Pressed:" in l:
+                        # [KEYBOARD] Key Pressed: 'x'
+                        if "'" in l:
+                            parts = l.split("'")
+                            if len(parts) >= 2:
+                                hardware_telemetry["last_key"] = parts[1]
+                                print(f"[PHYSICAL-KEY] Captured keystroke from hardware: '{parts[1]}'")
+                    elif "Free Internal SRAM:" in l:
                         parts = l.split(":")
                         if len(parts) >= 2:
                             num_str = parts[1].replace("bytes", "").strip()
-                            hardware_telemetry["free_sram_bytes"] = int(num_str)
+                            try:
+                                hardware_telemetry["free_sram_bytes"] = int(num_str)
+                            except ValueError:
+                                pass
                     elif "Registered Nodes:" in l:
                         hardware_telemetry["last_sync_time"] = time.time()
         except Exception:
             pass
-        time.sleep(3.0)
+        time.sleep(0.05)
 
 # ---------------------------------------------------------------------------
 # Kubernetes Resource Serializers (JSON & Table)
@@ -1261,22 +1288,30 @@ class KubeGatewayHandler(BaseHTTPRequestHandler):
             elif path_clean == "/api/v1/hardware/display":
                 content_length = int(self.headers.get("Content-Length", 0))
                 body = self.rfile.read(content_length).decode("utf-8") if content_length > 0 else "{}"
+                text = ""
                 try:
                     d = json.loads(body)
-                    hardware_telemetry["display_text"] = d.get("text", "")
-                except Exception:
-                    pass
-                self.send_json(200, {"status": "OK", "action": "display_updated"})
+                    text = d.get("text", "")
+                    hardware_telemetry["display_text"] = text
+                    send_serial_cmd(f"K32_CMD:DISPLAY:{text}")
+                except Exception as e:
+                    print(f"[GATEWAY] Error processing display command: {e}")
+                self.send_json(200, {"status": "OK", "action": "display_updated", "text": text, "device": "physical_st7789"})
                 return
             elif path_clean == "/api/v1/hardware/speaker":
                 content_length = int(self.headers.get("Content-Length", 0))
                 body = self.rfile.read(content_length).decode("utf-8") if content_length > 0 else "{}"
+                freq = 1000
+                dur = 100
                 try:
                     d = json.loads(body)
+                    freq = d.get("frequency_hz", 1000)
+                    dur = d.get("duration_ms", 100)
                     hardware_telemetry["speaker_active"] = True
-                except Exception:
-                    pass
-                self.send_json(200, {"status": "OK", "action": "tone_played"})
+                    send_serial_cmd(f"K32_CMD:BEEP:{freq}:{dur}")
+                except Exception as e:
+                    print(f"[GATEWAY] Error processing speaker command: {e}")
+                self.send_json(200, {"status": "OK", "action": "tone_played", "freq": freq, "dur": dur, "device": "physical_ns4148"})
                 return
             elif path_clean == "/api/v1/hardware/ir":
                 content_length = int(self.headers.get("Content-Length", 0))

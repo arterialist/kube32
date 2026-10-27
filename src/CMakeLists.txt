@@ -28,6 +28,7 @@ set(KUBE32_APP_SRCS
     controller/node_lifecycle_controller.cpp
     hal/capability_firewall.cpp
     hal/mock_hal.cpp
+    hal/tft_keyboard_hardware.cpp
     ipc/channel.cpp
     kubelet/kube_api_client.cpp
     kubelet/kubelet.cpp
