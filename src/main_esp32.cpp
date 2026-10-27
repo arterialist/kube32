@@ -296,8 +296,8 @@ static void kube32_cluster_task(void* pvParameters) {
 
         std::string line_accum;
         char usj_buf[256];
-        std::vector<uint8_t> arena_buf(32768);
-        kube32::mem::MonotonicArena arena(arena_buf.data(), arena_buf.size());
+        static uint8_t arena_buf[4096];
+        kube32::mem::MonotonicArena arena(arena_buf, sizeof(arena_buf));
 
         while (true) {
             int n = usb_serial_jtag_read_bytes(usj_buf, sizeof(usj_buf) - 1, pdMS_TO_TICKS(20));
