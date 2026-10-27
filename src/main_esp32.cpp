@@ -351,7 +351,7 @@ static void kube32_cluster_task(void* pvParameters) {
                                 freq = std::strtoul(beep_args.c_str(), nullptr, 10);
                             }
                             kube32::hal::play_tone(freq, dur);
-                            printf("[HARDWARE-SPEAKER] Played tone %u Hz (%u ms) on GPIO 42\n", (unsigned)freq, (unsigned)dur);
+                            printf("[HARDWARE-SPEAKER] Played tone %u Hz (%u ms) via NS4168 I2S\n", (unsigned)freq, (unsigned)dur);
                         } else if (line_accum == "K32_CMD:PIPELINE_TRANSMIT") {
                             struct MfccFeatures {
                                 float energy;

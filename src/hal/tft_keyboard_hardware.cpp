@@ -2,9 +2,11 @@
 
 #include "hal/tft_keyboard_hardware.hpp"
 #include "esp_log.h"
+#include "esp_heap_caps.h"
 #include "driver/spi_master.h"
 #include "driver/gpio.h"
 #include "driver/ledc.h"
+#include "driver/i2s_std.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include <cstring>
@@ -16,6 +18,8 @@ namespace kube32::hal {
 
 static spi_device_handle_t spi_display = nullptr;
 static volatile char last_key_pressed = '\0';
+static uint8_t* s_dma_buf = nullptr;
+static i2s_chan_handle_t s_tx_chan = nullptr;
 
 // ---------------------------------------------------------------------------
 // Basic 5x7 ASCII Bitmap Font
@@ -119,46 +123,84 @@ static const uint8_t FONT_5X7[][5] = {
 };
 
 // ---------------------------------------------------------------------------
-// ST7789 Low-Level SPI Communication
+// ST7789 Low-Level SPI Communication (DMA-Compliant)
 // ---------------------------------------------------------------------------
 static void lcd_cmd(uint8_t cmd) {
     gpio_set_level((gpio_num_t)PIN_LCD_DC, 0); // Command mode
     spi_transaction_t t;
     std::memset(&t, 0, sizeof(t));
     t.length = 8;
-    t.tx_buffer = &cmd;
-    spi_device_polling_transmit(spi_display, &t);
-}
-
-static void lcd_data(const uint8_t* data, int len) {
-    if (len <= 0) return;
-    gpio_set_level((gpio_num_t)PIN_LCD_DC, 1); // Data mode
-    spi_transaction_t t;
-    std::memset(&t, 0, sizeof(t));
-    t.length = len * 8;
-    t.tx_buffer = data;
+    t.flags = SPI_TRANS_USE_TXDATA;
+    t.tx_data[0] = cmd;
     spi_device_polling_transmit(spi_display, &t);
 }
 
 static void lcd_data_byte(uint8_t byte) {
-    lcd_data(&byte, 1);
+    gpio_set_level((gpio_num_t)PIN_LCD_DC, 1); // Data mode
+    spi_transaction_t t;
+    std::memset(&t, 0, sizeof(t));
+    t.length = 8;
+    t.flags = SPI_TRANS_USE_TXDATA;
+    t.tx_data[0] = byte;
+    spi_device_polling_transmit(spi_display, &t);
+}
+
+static void lcd_data_dma(const uint8_t* data, int len) {
+    if (len <= 0) return;
+    gpio_set_level((gpio_num_t)PIN_LCD_DC, 1); // Data mode
+    if (!s_dma_buf) {
+        s_dma_buf = (uint8_t*)heap_caps_malloc(1024, MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL);
+    }
+    int offset = 0;
+    while (offset < len) {
+        int chunk = (len - offset > 1024) ? 1024 : (len - offset);
+        if (s_dma_buf) {
+            std::memcpy(s_dma_buf, data + offset, chunk);
+            spi_transaction_t t;
+            std::memset(&t, 0, sizeof(t));
+            t.length = chunk * 8;
+            t.tx_buffer = s_dma_buf;
+            spi_device_polling_transmit(spi_display, &t);
+        } else {
+            spi_transaction_t t;
+            std::memset(&t, 0, sizeof(t));
+            t.length = chunk * 8;
+            t.tx_buffer = data + offset;
+            spi_device_polling_transmit(spi_display, &t);
+        }
+        offset += chunk;
+    }
 }
 
 static void set_window(int x0, int y0, int x1, int y1) {
-    // ST7789 240x135 in Landscape (MADCTL 0x70) offset:
-    // X offset = 40, Y offset = 53
+    // ST7789 240x135 Landscape offset: X=40, Y=53
     uint16_t sx = x0 + 40;
     uint16_t ex = x1 + 40;
     uint16_t sy = y0 + 53;
     uint16_t ey = y1 + 53;
 
     lcd_cmd(0x2A); // CASET
-    uint8_t data_x[] = { (uint8_t)(sx >> 8), (uint8_t)(sx & 0xFF), (uint8_t)(ex >> 8), (uint8_t)(ex & 0xFF) };
-    lcd_data(data_x, sizeof(data_x));
+    gpio_set_level((gpio_num_t)PIN_LCD_DC, 1);
+    spi_transaction_t t;
+    std::memset(&t, 0, sizeof(t));
+    t.length = 32;
+    t.flags = SPI_TRANS_USE_TXDATA;
+    t.tx_data[0] = (uint8_t)(sx >> 8);
+    t.tx_data[1] = (uint8_t)(sx & 0xFF);
+    t.tx_data[2] = (uint8_t)(ex >> 8);
+    t.tx_data[3] = (uint8_t)(ex & 0xFF);
+    spi_device_polling_transmit(spi_display, &t);
 
     lcd_cmd(0x2B); // RASET
-    uint8_t data_y[] = { (uint8_t)(sy >> 8), (uint8_t)(sy & 0xFF), (uint8_t)(ey >> 8), (uint8_t)(ey & 0xFF) };
-    lcd_data(data_y, sizeof(data_y));
+    gpio_set_level((gpio_num_t)PIN_LCD_DC, 1);
+    std::memset(&t, 0, sizeof(t));
+    t.length = 32;
+    t.flags = SPI_TRANS_USE_TXDATA;
+    t.tx_data[0] = (uint8_t)(sy >> 8);
+    t.tx_data[1] = (uint8_t)(sy & 0xFF);
+    t.tx_data[2] = (uint8_t)(ey >> 8);
+    t.tx_data[3] = (uint8_t)(ey & 0xFF);
+    spi_device_polling_transmit(spi_display, &t);
 }
 
 // ---------------------------------------------------------------------------
@@ -167,10 +209,31 @@ static void set_window(int x0, int y0, int x1, int y1) {
 void init_display_and_backlight() {
     ESP_LOGI(TAG, "Initializing ST7789 LCD & Backlight on GPIO %d...", PIN_LCD_BACKLIGHT);
 
-    // 1. Backlight GPIO 38
+    // 1. Backlight GPIO 38: configure high drive and 12 kHz PWM boost (100% duty)
     gpio_reset_pin((gpio_num_t)PIN_LCD_BACKLIGHT);
     gpio_set_direction((gpio_num_t)PIN_LCD_BACKLIGHT, GPIO_MODE_OUTPUT);
-    gpio_set_level((gpio_num_t)PIN_LCD_BACKLIGHT, 1); // Turn ON backlight!
+    gpio_set_drive_capability((gpio_num_t)PIN_LCD_BACKLIGHT, GPIO_DRIVE_CAP_3);
+    gpio_set_level((gpio_num_t)PIN_LCD_BACKLIGHT, 1);
+
+    ledc_timer_config_t bl_timer = {
+        .speed_mode = LEDC_LOW_SPEED_MODE,
+        .duty_resolution = LEDC_TIMER_8_BIT,
+        .timer_num = LEDC_TIMER_1,
+        .freq_hz = 12000,
+        .clk_cfg = LEDC_AUTO_CLK
+    };
+    ledc_timer_config(&bl_timer);
+
+    ledc_channel_config_t bl_chan = {
+        .gpio_num = PIN_LCD_BACKLIGHT,
+        .speed_mode = LEDC_LOW_SPEED_MODE,
+        .channel = LEDC_CHANNEL_1,
+        .intr_type = LEDC_INTR_DISABLE,
+        .timer_sel = LEDC_TIMER_1,
+        .duty = 255,
+        .hpoint = 0
+    };
+    ledc_channel_config(&bl_chan);
 
     // 2. Control pins: DC, RST, and CS
     gpio_reset_pin((gpio_num_t)PIN_LCD_DC);
@@ -251,7 +314,8 @@ void init_display_and_backlight() {
 }
 
 void set_backlight(bool enabled) {
-    gpio_set_level((gpio_num_t)PIN_LCD_BACKLIGHT, enabled ? 1 : 0);
+    ledc_set_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_1, enabled ? 255 : 0);
+    ledc_update_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_1);
 }
 
 void display_fill_rect(int x, int y, int w, int h, uint16_t color) {
@@ -274,7 +338,7 @@ void display_fill_rect(int x, int y, int w, int h, uint16_t color) {
 
     while (pixels > 0) {
         int chunk = (pixels > 128) ? 128 : pixels;
-        lcd_data((uint8_t*)buffer, chunk * 2);
+        lcd_data_dma((const uint8_t*)buffer, chunk * 2);
         pixels -= chunk;
     }
 
@@ -304,7 +368,7 @@ void display_draw_char(int x, int y, char c, uint16_t color, uint16_t bg) {
     gpio_set_level((gpio_num_t)PIN_LCD_CS, 0);
     set_window(x, y, x + 5, y + 7);
     lcd_cmd(0x2C); // RAMWR
-    lcd_data((uint8_t*)char_buf, sizeof(char_buf));
+    lcd_data_dma((const uint8_t*)char_buf, sizeof(char_buf));
     gpio_set_level((gpio_num_t)PIN_LCD_CS, 1);
 }
 
@@ -324,42 +388,63 @@ void display_draw_string(int x, int y, const char* str, uint16_t color, uint16_t
 }
 
 // ---------------------------------------------------------------------------
-// Acoustic Synthesizer (LEDC PWM on Speaker Pin 42)
+// Acoustic Synthesizer (NS4168 I2S Mono Audio Amplifier)
 // ---------------------------------------------------------------------------
 void init_speaker() {
-    ledc_timer_config_t timer_conf = {
-        .speed_mode = LEDC_LOW_SPEED_MODE,
-        .duty_resolution = LEDC_TIMER_8_BIT,
-        .timer_num = LEDC_TIMER_0,
-        .freq_hz = 1000,
-        .clk_cfg = LEDC_AUTO_CLK
-    };
-    ledc_timer_config(&timer_conf);
+    i2s_chan_config_t chan_cfg = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_0, I2S_ROLE_MASTER);
+    esp_err_t err = i2s_new_channel(&chan_cfg, &s_tx_chan, nullptr);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "i2s_new_channel failed: %s", esp_err_to_name(err));
+        return;
+    }
 
-    ledc_channel_config_t chan_conf = {
-        .gpio_num = PIN_SPEAKER,
-        .speed_mode = LEDC_LOW_SPEED_MODE,
-        .channel = LEDC_CHANNEL_0,
-        .intr_type = LEDC_INTR_DISABLE,
-        .timer_sel = LEDC_TIMER_0,
-        .duty = 0,
-        .hpoint = 0
+    i2s_std_config_t std_cfg = {
+        .clk_cfg = I2S_STD_CLK_DEFAULT_CONFIG(16000),
+        .slot_cfg = I2S_STD_PHILIPS_SLOT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_16BIT, I2S_SLOT_MODE_MONO),
+        .gpio_cfg = {
+            .mclk = I2S_GPIO_UNUSED,
+            .bclk = (gpio_num_t)PIN_I2S_BCLK,
+            .ws   = (gpio_num_t)PIN_I2S_LRCK,
+            .dout = (gpio_num_t)PIN_I2S_DATA,
+            .din  = I2S_GPIO_UNUSED,
+            .invert_flags = {
+                .mclk_inv = false,
+                .bclk_inv = false,
+                .ws_inv   = false,
+            },
+        },
     };
-    ledc_channel_config(&chan_conf);
+    err = i2s_channel_init_std_mode(s_tx_chan, &std_cfg);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "i2s_channel_init_std_mode failed: %s", esp_err_to_name(err));
+        return;
+    }
+    i2s_channel_enable(s_tx_chan);
+    ESP_LOGI(TAG, "NS4168 I2S speaker online (BCLK: %d, LRCK: %d, DOUT: %d)", PIN_I2S_BCLK, PIN_I2S_LRCK, PIN_I2S_DATA);
 }
 
 void play_tone(uint32_t freq_hz, uint32_t duration_ms) {
-    if (freq_hz == 0) {
-        ledc_set_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0, 0);
-        ledc_update_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0);
-        return;
+    if (!s_tx_chan || freq_hz == 0 || duration_ms == 0) return;
+    const uint32_t sample_rate = 16000;
+    int samples_per_period = sample_rate / freq_hz;
+    if (samples_per_period < 2) samples_per_period = 2;
+
+    int total_samples = (sample_rate * duration_ms) / 1000;
+    int16_t buf[128];
+    int buf_len = sizeof(buf) / sizeof(int16_t);
+
+    int phase = 0;
+    int remaining = total_samples;
+    while (remaining > 0) {
+        int chunk = (remaining > buf_len) ? buf_len : remaining;
+        for (int i = 0; i < chunk; ++i) {
+            buf[i] = (phase < samples_per_period / 2) ? 14000 : -14000;
+            phase = (phase + 1) % samples_per_period;
+        }
+        size_t bytes_written = 0;
+        i2s_channel_write(s_tx_chan, buf, chunk * sizeof(int16_t), &bytes_written, pdMS_TO_TICKS(100));
+        remaining -= chunk;
     }
-    ledc_set_freq(LEDC_LOW_SPEED_MODE, LEDC_TIMER_0, freq_hz);
-    ledc_set_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0, 128); // 50% square wave
-    ledc_update_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0);
-    vTaskDelay(pdMS_TO_TICKS(duration_ms));
-    ledc_set_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0, 0);
-    ledc_update_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0);
 }
 
 void play_boot_chime() {

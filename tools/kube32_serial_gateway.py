@@ -222,6 +222,7 @@ def background_hardware_sync():
                     l = line_raw.decode("utf-8", errors="replace").strip()
                     if not l:
                         continue
+                    print(f"[DEVICE-RAW] {l}")
                     if "[KEYBOARD] Key Pressed:" in l:
                         # [KEYBOARD] Key Pressed: 'x'
                         if "'" in l:

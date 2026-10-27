@@ -16,6 +16,9 @@ constexpr int PIN_LCD_DC        = 34;
 constexpr int PIN_LCD_RST       = 33;
 constexpr int PIN_LCD_BACKLIGHT = 38;
 
+constexpr int PIN_I2S_BCLK      = 41;
+constexpr int PIN_I2S_DATA      = 42;
+constexpr int PIN_I2S_LRCK      = 43;
 constexpr int PIN_SPEAKER       = 42;
 
 constexpr int PIN_KB_A0         = 8;
