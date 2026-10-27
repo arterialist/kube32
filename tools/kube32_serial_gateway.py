@@ -145,7 +145,17 @@ def format_age(seconds):
 
 def get_serial():
     global ser
-    if ser is None or not ser.is_open:
+    if ser is not None:
+        try:
+            # Check if port is genuinely alive
+            _ = ser.in_waiting
+        except Exception:
+            try:
+                ser.close()
+            except Exception:
+                pass
+            ser = None
+    if ser is None:
         port = find_serial_port()
         ser = serial.Serial()
         ser.port = port
@@ -159,6 +169,7 @@ def get_serial():
 
 def send_serial_cmd(cmd: str):
     """Sends a raw command string to the physical ESP32 hardware via USB-serial."""
+    global ser
     try:
         with ser_lock:
             s = get_serial()
@@ -167,6 +178,12 @@ def send_serial_cmd(cmd: str):
             print(f"[SERIAL-OUT] Sent hardware command: {cmd}")
     except Exception as e:
         print(f"[SERIAL-ERR] Could not send to hardware: {e}")
+        try:
+            if ser:
+                ser.close()
+        except Exception:
+            pass
+        ser = None
 
 def background_hardware_sync():
     """Polls hardware telemetry and reads keyboard/display events without blocking HTTP clients."""

@@ -159,8 +159,6 @@ static void set_window(int x0, int y0, int x1, int y1) {
     lcd_cmd(0x2B); // RASET
     uint8_t data_y[] = { (uint8_t)(sy >> 8), (uint8_t)(sy & 0xFF), (uint8_t)(ey >> 8), (uint8_t)(ey & 0xFF) };
     lcd_data(data_y, sizeof(data_y));
-
-    lcd_cmd(0x2C); // RAMWR
 }
 
 // ---------------------------------------------------------------------------
@@ -170,31 +168,26 @@ void init_display_and_backlight() {
     ESP_LOGI(TAG, "Initializing ST7789 LCD & Backlight on GPIO %d...", PIN_LCD_BACKLIGHT);
 
     // 1. Backlight GPIO 38
-    gpio_config_t bl_cfg = {
-        .pin_bit_mask = (1ULL << PIN_LCD_BACKLIGHT),
-        .mode = GPIO_MODE_OUTPUT,
-        .pull_up_en = GPIO_PULLUP_DISABLE,
-        .pull_down_en = GPIO_PULLDOWN_DISABLE,
-        .intr_type = GPIO_INTR_DISABLE
-    };
-    gpio_config(&bl_cfg);
+    gpio_reset_pin((gpio_num_t)PIN_LCD_BACKLIGHT);
+    gpio_set_direction((gpio_num_t)PIN_LCD_BACKLIGHT, GPIO_MODE_OUTPUT);
     gpio_set_level((gpio_num_t)PIN_LCD_BACKLIGHT, 1); // Turn ON backlight!
 
-    // 2. Control pins: DC & RST
-    gpio_config_t ctrl_cfg = {
-        .pin_bit_mask = (1ULL << PIN_LCD_DC) | (1ULL << PIN_LCD_RST),
-        .mode = GPIO_MODE_OUTPUT,
-        .pull_up_en = GPIO_PULLUP_DISABLE,
-        .pull_down_en = GPIO_PULLDOWN_DISABLE,
-        .intr_type = GPIO_INTR_DISABLE
-    };
-    gpio_config(&ctrl_cfg);
+    // 2. Control pins: DC, RST, and CS
+    gpio_reset_pin((gpio_num_t)PIN_LCD_DC);
+    gpio_set_direction((gpio_num_t)PIN_LCD_DC, GPIO_MODE_OUTPUT);
+
+    gpio_reset_pin((gpio_num_t)PIN_LCD_RST);
+    gpio_set_direction((gpio_num_t)PIN_LCD_RST, GPIO_MODE_OUTPUT);
+
+    gpio_reset_pin((gpio_num_t)PIN_LCD_CS);
+    gpio_set_direction((gpio_num_t)PIN_LCD_CS, GPIO_MODE_OUTPUT);
+    gpio_set_level((gpio_num_t)PIN_LCD_CS, 1);
 
     // Hardware Reset Pulse
     gpio_set_level((gpio_num_t)PIN_LCD_RST, 0);
-    vTaskDelay(pdMS_TO_TICKS(20));
+    vTaskDelay(pdMS_TO_TICKS(50));
     gpio_set_level((gpio_num_t)PIN_LCD_RST, 1);
-    vTaskDelay(pdMS_TO_TICKS(120));
+    vTaskDelay(pdMS_TO_TICKS(150));
 
     // 3. SPI Bus Configuration
     spi_bus_config_t buscfg = {
@@ -209,13 +202,15 @@ void init_display_and_backlight() {
 
     spi_device_interface_config_t devcfg = {
         .mode = 0,
-        .clock_speed_hz = 40 * 1000 * 1000, // 40 MHz SPI
-        .spics_io_num = PIN_LCD_CS,
+        .clock_speed_hz = 20 * 1000 * 1000, // 20 MHz SPI for reliable ST7789 comms
+        .spics_io_num = -1, // Manual CS control to keep CS low across RAMWR and pixel streaming
         .queue_size = 7
     };
     spi_bus_add_device(SPI2_HOST, &devcfg, &spi_display);
 
-    // 4. ST7789 Initialization Sequence
+    // 4. ST7789 Initialization Sequence (with CS held LOW)
+    gpio_set_level((gpio_num_t)PIN_LCD_CS, 0);
+
     lcd_cmd(0x01); // SWRESET
     vTaskDelay(pdMS_TO_TICKS(150));
 
@@ -230,8 +225,13 @@ void init_display_and_backlight() {
 
     lcd_cmd(0x21); // INVON (Inversion On for IPS screen)
 
+    lcd_cmd(0x13); // NORON
+    vTaskDelay(pdMS_TO_TICKS(10));
+
     lcd_cmd(0x29); // DISPON
-    vTaskDelay(pdMS_TO_TICKS(50));
+    vTaskDelay(pdMS_TO_TICKS(100));
+
+    gpio_set_level((gpio_num_t)PIN_LCD_CS, 1);
 
     // Clear Screen & Draw Boot Screen
     display_clear(COLOR_BG_DARK);
@@ -261,7 +261,10 @@ void display_fill_rect(int x, int y, int w, int h, uint16_t color) {
     if (y + h > LCD_HEIGHT) h = LCD_HEIGHT - y;
     if (w <= 0 || h <= 0) return;
 
+    gpio_set_level((gpio_num_t)PIN_LCD_CS, 0); // Assert CS LOW
+
     set_window(x, y, x + w - 1, y + h - 1);
+    lcd_cmd(0x2C); // RAMWR
 
     // Line buffer in big-endian RGB565
     int pixels = w * h;
@@ -274,6 +277,8 @@ void display_fill_rect(int x, int y, int w, int h, uint16_t color) {
         lcd_data((uint8_t*)buffer, chunk * 2);
         pixels -= chunk;
     }
+
+    gpio_set_level((gpio_num_t)PIN_LCD_CS, 1); // Deassert CS HIGH
 }
 
 void display_clear(uint16_t color) {
@@ -284,15 +289,23 @@ void display_draw_char(int x, int y, char c, uint16_t color, uint16_t bg) {
     if (c < 32 || c > 126) c = 32;
     const uint8_t* col_bytes = FONT_5X7[c - 32];
 
-    for (int col = 0; col < 5; ++col) {
-        uint8_t bits = col_bytes[col];
-        for (int row = 0; row < 7; ++row) {
-            uint16_t pixel_color = (bits & (1 << row)) ? color : bg;
-            display_fill_rect(x + col, y + row, 1, 1, pixel_color);
+    uint16_t char_buf[6 * 8];
+    uint16_t color_be = (color << 8) | (color >> 8);
+    uint16_t bg_be = (bg << 8) | (bg >> 8);
+
+    for (int row = 0; row < 8; ++row) {
+        for (int col = 0; col < 5; ++col) {
+            bool on = (row < 7) && (col_bytes[col] & (1 << row));
+            char_buf[row * 6 + col] = on ? color_be : bg_be;
         }
+        char_buf[row * 6 + 5] = bg_be; // 1-pixel gap
     }
-    // 1-pixel spacing column
-    display_fill_rect(x + 5, y, 1, 7, bg);
+
+    gpio_set_level((gpio_num_t)PIN_LCD_CS, 0);
+    set_window(x, y, x + 5, y + 7);
+    lcd_cmd(0x2C); // RAMWR
+    lcd_data((uint8_t*)char_buf, sizeof(char_buf));
+    gpio_set_level((gpio_num_t)PIN_LCD_CS, 1);
 }
 
 void display_draw_string(int x, int y, const char* str, uint16_t color, uint16_t bg) {

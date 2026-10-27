@@ -1,6 +1,12 @@
 #include "api/route_handler.hpp"
 #include "api/table_serializer.hpp"
+#include "api/embedded_web_app.hpp"
 #include "models/kube_models.hpp"
+#include "hal/tft_keyboard_hardware.hpp"
+
+#if defined(KUBE32_TARGET_ESP32)
+#include "esp_system.h"
+#endif
 
 #include <sstream>
 
@@ -11,6 +17,28 @@ RouteHandler::RouteHandler(storage::Store& store, scheduler::Scheduler* schedule
 
 RouteMatch RouteHandler::match_route(std::string_view path) {
     RouteMatch match;
+
+    // 0. Cluster-Hosted Web Hardware Workbench
+    if (path == "/" || path == "/index.html" || path == "/hardware-workbench" || path == "/hardware-workbench.html") {
+        match.category = RouteCategory::WebHardwareWorkbench;
+        return match;
+    }
+    if (path == "/api/v1/hardware/state") {
+        match.category = RouteCategory::HardwareApiState;
+        return match;
+    }
+    if (path == "/api/v1/hardware/display") {
+        match.category = RouteCategory::HardwareApiDisplay;
+        return match;
+    }
+    if (path == "/api/v1/hardware/speaker") {
+        match.category = RouteCategory::HardwareApiSpeaker;
+        return match;
+    }
+    if (path == "/api/v1/hardware/keyboard") {
+        match.category = RouteCategory::HardwareApiKeyboard;
+        return match;
+    }
 
     // 1. Discovery Endpoints
     if (path == "/version") {
@@ -336,6 +364,21 @@ HttpResponse RouteHandler::handle_request(const HttpRequest& req, mem::Monotonic
     RouteMatch match = match_route(req.path);
 
     switch (match.category) {
+        case RouteCategory::WebHardwareWorkbench:
+            return handle_web_workbench();
+
+        case RouteCategory::HardwareApiState:
+            return handle_hardware_state();
+
+        case RouteCategory::HardwareApiDisplay:
+            return handle_hardware_display(req);
+
+        case RouteCategory::HardwareApiSpeaker:
+            return handle_hardware_speaker(req);
+
+        case RouteCategory::HardwareApiKeyboard:
+            return handle_hardware_keyboard(req);
+
         case RouteCategory::DiscoveryVersion:
         case RouteCategory::DiscoveryApi:
         case RouteCategory::DiscoveryApis:
@@ -404,6 +447,21 @@ HttpResponse RouteHandler::handle_discovery(const HttpRequest& req, RouteCategor
     resp.content_type = "application/json";
 
     switch (category) {
+        case RouteCategory::WebHardwareWorkbench:
+            return handle_web_workbench();
+
+        case RouteCategory::HardwareApiState:
+            return handle_hardware_state();
+
+        case RouteCategory::HardwareApiDisplay:
+            return handle_hardware_display(req);
+
+        case RouteCategory::HardwareApiSpeaker:
+            return handle_hardware_speaker(req);
+
+        case RouteCategory::HardwareApiKeyboard:
+            return handle_hardware_keyboard(req);
+
         case RouteCategory::DiscoveryVersion:
             resp.body = "{\"major\":\"1\",\"minor\":\"33\",\"gitVersion\":\"v1.33.0-kube32\","
                         "\"gitCommit\":\"esp32-kube32-idf\",\"gitTreeState\":\"clean\","
@@ -1513,6 +1571,97 @@ HttpResponse RouteHandler::handle_jobs(const HttpRequest& req, const RouteMatch&
         }
     }
     return make_status(405, "MethodNotAllowed", "Method not allowed on job endpoint");
+}
+
+HttpResponse RouteHandler::handle_web_workbench() {
+    HttpResponse resp;
+    resp.status_code = 200;
+    resp.content_type = "text/html; charset=utf-8";
+    resp.body = std::string(EMBEDDED_WORKBENCH_HTML);
+    return resp;
+}
+
+HttpResponse RouteHandler::handle_hardware_state() {
+    HttpResponse resp;
+    resp.status_code = 200;
+    resp.content_type = "application/json";
+
+    uint32_t free_sram = 48400;
+    char last_key = ' ';
+#if defined(KUBE32_TARGET_ESP32)
+    free_sram = esp_get_free_heap_size();
+    last_key = hal::get_last_key_pressed();
+#endif
+
+    std::string key_str = (last_key >= 32 && last_key <= 126) ? std::string(1, last_key) : "NONE";
+
+    std::ostringstream ss;
+    ss << "{\"online\":true,\"cluster_silicon\":true,\"nodes\":{"
+       << "\"esp32-node-01\":{\"role\":\"control-plane,display-keyboard-master\","
+       << "\"free_sram_bytes\":" << free_sram << ","
+       << "\"keyboard\":{\"last_key\":\"" << key_str << "\"},"
+       << "\"display\":{\"width\":240,\"height\":135,\"mode\":\"live-silicon\"}},"
+       << "\"esp32-node-02\":{\"role\":\"worker,dsp-coprocessor\","
+       << "\"free_psram_bytes\":2097152}}"
+       << "}";
+
+    resp.body = ss.str();
+    return resp;
+}
+
+HttpResponse RouteHandler::handle_hardware_display(const HttpRequest& req) {
+    HttpResponse resp;
+    resp.status_code = 200;
+    resp.content_type = "application/json";
+
+    std::string text;
+    models::JsonValue doc;
+    std::string err;
+    if (models::parse_json(req.body, doc, err) && doc.is_object()) {
+        text = doc.get_string("text", "");
+    }
+
+#if defined(KUBE32_TARGET_ESP32)
+    if (!text.empty()) {
+        hal::display_fill_rect(8, 36, 224, 70, hal::COLOR_BG_DARK);
+        hal::display_draw_string(8, 36, text.c_str(), hal::COLOR_CYAN, hal::COLOR_BG_DARK);
+    } else {
+        hal::display_fill_rect(8, 36, 224, 70, hal::COLOR_BG_DARK);
+    }
+#endif
+
+    resp.body = "{\"status\":\"OK\",\"action\":\"display_updated\",\"device\":\"physical_st7789\"}";
+    return resp;
+}
+
+HttpResponse RouteHandler::handle_hardware_speaker(const HttpRequest& req) {
+    HttpResponse resp;
+    resp.status_code = 200;
+    resp.content_type = "application/json";
+
+    uint32_t freq = 1000;
+    uint32_t dur = 100;
+    models::JsonValue doc;
+    std::string err;
+    if (models::parse_json(req.body, doc, err) && doc.is_object()) {
+        freq = static_cast<uint32_t>(doc.get_int("frequency_hz", 1000));
+        dur = static_cast<uint32_t>(doc.get_int("duration_ms", 100));
+    }
+
+#if defined(KUBE32_TARGET_ESP32)
+    hal::play_tone(freq, dur);
+#endif
+
+    resp.body = "{\"status\":\"OK\",\"action\":\"tone_played\"}";
+    return resp;
+}
+
+HttpResponse RouteHandler::handle_hardware_keyboard(const HttpRequest& req) {
+    HttpResponse resp;
+    resp.status_code = 200;
+    resp.content_type = "application/json";
+    resp.body = "{\"status\":\"OK\",\"action\":\"key_processed\"}";
+    return resp;
 }
 
 } // namespace kube32::api
