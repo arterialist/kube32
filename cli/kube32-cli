@@ -5,10 +5,12 @@ Kube32 Developer CLI Tooling & Workload Packaging System
 ==============================================================================
 Provides developer abstractions to build, package, test, inspect, and deploy
 sandboxed micro-workloads (Wasm3) to physical ESP32-S3 clusters running Kube32.
+Supports dual-mode control: HTTP REST API (:6443) and Direct Silicon Serial (USB).
 """
 
 import sys
 import os
+import time
 import argparse
 import base64
 import json
@@ -16,6 +18,56 @@ import urllib.request
 import urllib.error
 
 VERSION = "1.0.0-m6"
+DEFAULT_SERVER = "http://192.168.4.1:6443"
+
+def execute_request(args, method, path, body="", timeout=6.0):
+    port = getattr(args, "port", None)
+    if port:
+        import serial
+        try:
+            with serial.Serial(port, 115200, timeout=1.0) as s:
+                s.dtr = False
+                s.rts = False
+                time.sleep(0.05)
+                s.reset_input_buffer()
+                cmd = f"K32_REQ:{method}:{path}:{body}\n"
+                s.write(cmd.encode("utf-8"))
+                s.flush()
+                t0 = time.time()
+                lines = []
+                capturing = False
+                status_code = 0
+                while time.time() - t0 < timeout:
+                    line = s.readline().decode("utf-8", errors="replace").strip()
+                    if "[K32-RESP-START]:" in line:
+                        capturing = True
+                        parts = line.split(":")
+                        status_code = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else 200
+                        continue
+                    if "[K32-RESP-END]" in line:
+                        break
+                    if capturing:
+                        lines.append(line)
+                return status_code, "\n".join(lines)
+        except Exception as e:
+            return 0, f"Serial communication error: {e}"
+    else:
+        server = getattr(args, "server", DEFAULT_SERVER).rstrip("/")
+        url = f"{server}{path}"
+        req_data = body.encode("utf-8") if body else None
+        req = urllib.request.Request(
+            url,
+            data=req_data,
+            headers={"Content-Type": "application/json", "Accept": "application/json"},
+            method=method
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                return resp.status, resp.read().decode("utf-8")
+        except urllib.error.HTTPError as e:
+            return e.code, e.read().decode("utf-8")
+        except Exception as e:
+            return 0, str(e)
 
 def cmd_version(args):
     print(f"Kube32 CLI v{VERSION} (Target: ESP32-S3 Xtensa dual-core @ 240MHz)")
@@ -90,54 +142,14 @@ def cmd_package(args):
     else:
         print(out_yaml)
 
-def cmd_manifest(args):
-    pod_name = args.name
-    manifest = f"""apiVersion: v1
-kind: Pod
-metadata:
-  name: {pod_name}
-  namespace: {args.namespace or 'default'}
-  labels:
-    app: {pod_name}
-spec:
-  nodeSelector:
-    kubernetes.io/hostname: {args.node or 'esp32-node-01'}
-  containers:
-    - name: {pod_name}
-      image: wasm://edge/{pod_name}:v1
-      resources:
-        limits:
-          memory: {args.memory or '64Ki'}
-        requests:
-          memory: {args.memory or '32Ki'}
-      securityContext:
-        capabilities:
-          add:
-            - CHANNEL_IPC
-"""
-    if args.gpio:
-        manifest += f"            - GPIO_WRITE\n"
-    if args.adc:
-        manifest += f"            - ADC_READ\n"
-    if args.ipc_channel:
-        manifest += f"""      env:
-        - name: KUBE32_IPC_CHANNEL
-          value: "{args.ipc_channel}"
-"""
-    if args.output:
-        with open(args.output, "w") as f:
-            f.write(manifest)
-        print(f"Manifest written to {args.output}")
-    else:
-        print(manifest)
-
 def cmd_status(args):
-    server = args.server.rstrip("/")
-    print(f"Connecting to Kube32 Cluster at {server}...")
-    try:
-        req = urllib.request.Request(f"{server}/api/v1/nodes", headers={"Accept": "application/json"})
-        with urllib.request.urlopen(req, timeout=5) as resp:
-            data = json.loads(resp.read().decode("utf-8"))
+    target = getattr(args, "port", None) or getattr(args, "server", DEFAULT_SERVER)
+    print(f"Connecting to Kube32 Cluster at {target}...")
+
+    code, resp_text = execute_request(args, "GET", "/api/v1/nodes")
+    if code in (200, 201):
+        try:
+            data = json.loads(resp_text)
             print("\n=== CLUSTER NODES ===")
             print(f"{'NAME':<16} {'STATUS':<10} {'ROLES':<14} {'INTERNAL-IP':<16} {'ALLOCATABLE-MEM'}")
             print("-" * 72)
@@ -153,13 +165,15 @@ def cmd_status(args):
                 ip = next((a.get("address") for a in addrs if a.get("type") == "InternalIP"), "N/A")
                 alloc_mem = item.get("status", {}).get("allocatable", {}).get("memory", "N/A")
                 print(f"{name:<16} {status:<10} {roles:<14} {ip:<16} {alloc_mem}")
-    except Exception as e:
-        print(f"Failed to query nodes: {e}", file=sys.stderr)
+        except Exception as e:
+            print(f"Error parsing nodes response: {e}\nRaw: {resp_text}", file=sys.stderr)
+    else:
+        print(f"Failed to query nodes: HTTP {code} - {resp_text}", file=sys.stderr)
 
-    try:
-        req = urllib.request.Request(f"{server}/api/v1/pods", headers={"Accept": "application/json"})
-        with urllib.request.urlopen(req, timeout=5) as resp:
-            data = json.loads(resp.read().decode("utf-8"))
+    code, resp_text = execute_request(args, "GET", "/api/v1/pods")
+    if code in (200, 201):
+        try:
+            data = json.loads(resp_text)
             print("\n=== CLUSTER PODS ===")
             print(f"{'NAMESPACE':<12} {'NAME':<24} {'NODE':<16} {'STATUS':<12} {'MEMORY'}")
             print("-" * 72)
@@ -171,11 +185,13 @@ def cmd_status(args):
                 limits = item.get("spec", {}).get("containers", [{}])[0].get("resources", {}).get("limits", {})
                 mem = limits.get("memory", "N/A")
                 print(f"{ns:<12} {name:<24} {node:<16} {status:<12} {mem}")
-    except Exception as e:
-        print(f"Failed to query pods: {e}", file=sys.stderr)
+        except Exception as e:
+            print(f"Error parsing pods response: {e}\nRaw: {resp_text}", file=sys.stderr)
+    else:
+        print(f"Failed to query pods: HTTP {code} - {resp_text}", file=sys.stderr)
 
 def cmd_apply(args):
-    server = args.server.rstrip("/")
+    target = getattr(args, "port", None) or getattr(args, "server", DEFAULT_SERVER)
     if not os.path.isfile(args.file):
         print(f"Error: Manifest file '{args.file}' not found.", file=sys.stderr)
         sys.exit(1)
@@ -183,97 +199,116 @@ def cmd_apply(args):
     with open(args.file, "r") as f:
         content = f.read().strip()
 
-    # Split multi-document YAML if needed
     docs = [d.strip() for d in content.split("---") if d.strip()]
     for doc in docs:
         try:
-            # Parse document (simple JSON/YAML mapping)
             import yaml
             payload = yaml.safe_load(doc)
         except ImportError:
-            # Fallback to json if yaml not installed
-            try:
-                payload = json.loads(doc)
-            except Exception:
-                # Basic string parser for minimal manifest
-                payload = json.loads(json.dumps({"raw_yaml": doc}))
+            payload = json.loads(doc)
 
         name = payload.get("metadata", {}).get("name", "workload")
         ns = payload.get("metadata", {}).get("namespace", "default")
-        url = f"{server}/api/v1/namespaces/{ns}/pods"
+        path = f"/api/v1/namespaces/{ns}/pods"
+        body = json.dumps(payload)
 
-        req_data = json.dumps(payload).encode("utf-8")
-        req = urllib.request.Request(
-            url,
-            data=req_data,
-            headers={"Content-Type": "application/json", "Accept": "application/json"},
-            method="POST"
-        )
-        try:
-            with urllib.request.urlopen(req, timeout=10) as resp:
-                print(f"pod/{name} created successfully (HTTP {resp.status})")
-        except urllib.error.HTTPError as e:
-            body = e.read().decode("utf-8")
-            print(f"Error creating pod/{name}: HTTP {e.code} - {body}", file=sys.stderr)
-        except Exception as e:
-            print(f"Error connecting to cluster at {server}: {e}", file=sys.stderr)
+        code, resp_text = execute_request(args, "POST", path, body)
+        if code in (200, 201):
+            try:
+                res_obj = json.loads(resp_text)
+                assigned_node = res_obj.get("spec", {}).get("nodeName", "<pending>")
+                print(f"pod/{name} applied successfully -> scheduled to [{assigned_node}] (HTTP {code})")
+            except Exception:
+                print(f"pod/{name} created successfully (HTTP {code})")
+        else:
+            print(f"Error creating pod/{name}: HTTP {code} - {resp_text}", file=sys.stderr)
 
-DEFAULT_SERVER = "http://192.168.4.1:6443"
+def cmd_delete(args):
+    ns = getattr(args, "namespace", "default") or "default"
+    name = args.name
+    path = f"/api/v1/namespaces/{ns}/pods/{name}"
+    code, resp_text = execute_request(args, "DELETE", path)
+    if code in (200, 201):
+        print(f"pod \"{name}\" deleted")
+    else:
+        print(f"Error deleting pod/{name}: HTTP {code} - {resp_text}", file=sys.stderr)
+
+def cmd_pipeline(args):
+    port = getattr(args, "port", None)
+    if not port:
+        print("Error: --port is required for physical over-the-air pipeline trigger.", file=sys.stderr)
+        sys.exit(1)
+    import serial
+    print(f"Triggering Stage 1 over-the-air ESP-NOW transmission on {port}...")
+    with serial.Serial(port, 115200, timeout=2.0) as s:
+        s.dtr = False
+        s.rts = False
+        time.sleep(0.05)
+        s.write(b"K32_CMD:PIPELINE_TRANSMIT\n")
+        s.flush()
+        t0 = time.time()
+        while time.time() - t0 < 3.0:
+            line = s.readline().decode("utf-8", errors="replace").strip()
+            if line:
+                print(f"  [Node 1] {line}")
+            if "ESP-NOW transmission result" in line:
+                break
 
 def main():
-    server_parser = argparse.ArgumentParser(add_help=False)
-    server_parser.add_argument("--server", default=argparse.SUPPRESS, help=f"Kube32 API Server URL (default: {DEFAULT_SERVER})")
+    common_parser = argparse.ArgumentParser(add_help=False)
+    common_parser.add_argument("--server", default=argparse.SUPPRESS, help=f"Kube32 API Server URL (default: {DEFAULT_SERVER})")
+    common_parser.add_argument("--port", "-p", default=argparse.SUPPRESS, help="Kube32 Serial Port (e.g., /dev/cu.usbmodem2101)")
 
     parser = argparse.ArgumentParser(
         description="Kube32 Micro-Orchestration Developer CLI",
-        parents=[server_parser]
+        parents=[common_parser]
     )
     subparsers = parser.add_subparsers(dest="command")
 
     # version
-    subparsers.add_parser("version", help="Display Kube32 CLI version", parents=[server_parser])
+    subparsers.add_parser("version", help="Display Kube32 CLI version", parents=[common_parser])
 
     # package
-    p_pkg = subparsers.add_parser("package", help="Package a WebAssembly binary into a Pod manifest", parents=[server_parser])
+    p_pkg = subparsers.add_parser("package", help="Package a WebAssembly binary into a Pod manifest", parents=[common_parser])
     p_pkg.add_argument("wasm_file", help="Path to .wasm binary file")
     p_pkg.add_argument("--name", help="Workload name")
     p_pkg.add_argument("--namespace", default="default", help="Pod namespace")
     p_pkg.add_argument("--memory", default="64Ki", help="Memory limit (e.g., 48Ki, 64Ki)")
-    p_pkg.add_argument("--capabilities", default="CHANNEL_IPC", help="Hardware capabilities comma-separated (e.g. GPIO_WRITE,ADC_READ,CHANNEL_IPC)")
+    p_pkg.add_argument("--capabilities", default="CHANNEL_IPC", help="Hardware capabilities comma-separated")
     p_pkg.add_argument("--ipc-channel", help="Virtual channel name for inter-pod IPC")
     p_pkg.add_argument("-o", "--output", help="Output YAML/JSON file path")
 
-    # manifest
-    p_man = subparsers.add_parser("manifest", help="Generate a sample Pod manifest", parents=[server_parser])
-    p_man.add_argument("--name", required=True, help="Pod name")
-    p_man.add_argument("--node", help="Target nodeName")
-    p_man.add_argument("--namespace", default="default", help="Pod namespace")
-    p_man.add_argument("--memory", default="48Ki", help="Memory limits")
-    p_man.add_argument("--gpio", action="store_true", help="Request GPIO capability")
-    p_man.add_argument("--adc", action="store_true", help="Request ADC capability")
-    p_man.add_argument("--ipc-channel", help="Virtual channel IPC identifier")
-    p_man.add_argument("-o", "--output", help="Output file")
-
     # status
-    p_stat = subparsers.add_parser("status", help="Inspect cluster status (nodes, pods, memory)", parents=[server_parser])
+    subparsers.add_parser("status", help="Inspect cluster status (nodes, pods, memory)", parents=[common_parser])
 
     # apply
-    p_app = subparsers.add_parser("apply", help="Submit a workload manifest to the cluster", parents=[server_parser])
+    p_app = subparsers.add_parser("apply", help="Submit a workload manifest to the cluster", parents=[common_parser])
     p_app.add_argument("-f", "--file", required=True, help="Path to manifest file")
 
+    # delete
+    p_del = subparsers.add_parser("delete", help="Delete a pod from the cluster", parents=[common_parser])
+    p_del.add_argument("name", help="Pod name to delete")
+    p_del.add_argument("--namespace", "-n", default="default", help="Pod namespace (default: default)")
+
+    # pipeline
+    subparsers.add_parser("pipeline", help="Trigger inter-node distributed pipeline transmission", parents=[common_parser])
+
     args = parser.parse_args()
-    if not hasattr(args, "server") or args.server is None:
+    if not hasattr(args, "port") and not hasattr(args, "server"):
         args.server = DEFAULT_SERVER
+
     if args.command == "version":
         cmd_version(args)
     elif args.command == "package":
         cmd_package(args)
-    elif args.command == "manifest":
-        cmd_manifest(args)
     elif args.command == "status":
         cmd_status(args)
     elif args.command == "apply":
         cmd_apply(args)
+    elif args.command == "delete":
+        cmd_delete(args)
+    elif args.command == "pipeline":
+        cmd_pipeline(args)
     else:
         parser.print_help()
 

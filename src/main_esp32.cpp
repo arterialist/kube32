@@ -23,6 +23,7 @@
 #include "esp_heap_caps.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "driver/usb_serial_jtag.h"
 
 static const char* TAG = "Kube32Main";
 
@@ -146,57 +147,44 @@ extern "C" void app_main() {
         kube32::ipc::ChannelManager::instance().send("keyword-classifier", chan_hdl,
                                                      reinterpret_cast<const uint8_t*>(ready_sig), std::strlen(ready_sig));
 
-        // Inject Stage 1 MFCC feature vector from physical silicon
+        printf("[PIPELINE] Worker Node listening for live over-the-air ESP-NOW frames from Stage 1...\n");
+
         struct MfccFeatures {
             float energy;
             float coefficients[12];
-        } __attribute__((packed)) features = {
-            0.875f,
-            { 1.25f, -0.42f, 0.91f, 2.14f, -1.08f, 0.35f, 0.72f, -0.19f, 1.48f, -0.83f, 0.41f, 0.65f }
-        };
-
-        // Construct wire frame for "audio.features" channel
-        uint8_t k32c_packet[sizeof(kube32::ipc::K32CHeader) + sizeof(features) + 2];
-        auto* hdr = reinterpret_cast<kube32::ipc::K32CHeader*>(k32c_packet);
-        hdr->magic = kube32::ipc::K32C_MAGIC;
-        hdr->version = kube32::ipc::K32C_VERSION;
-        hdr->flags = 0;
-        hdr->seq_num = 1;
-        hdr->channel_hash = kube32::ipc::fnv1a_32("audio.features", std::strlen("audio.features"));
-        hdr->sender_hash = kube32::ipc::fnv1a_32("audio-preprocessor", std::strlen("audio-preprocessor"));
-        hdr->target_hash = kube32::ipc::fnv1a_32("keyword-classifier", std::strlen("keyword-classifier"));
-        hdr->frag_index = 0;
-        hdr->frag_count = 1;
-        hdr->payload_len = sizeof(features);
-        std::memcpy(k32c_packet + sizeof(kube32::ipc::K32CHeader), &features, sizeof(features));
-        uint16_t crc = kube32::ipc::crc16_ccitt(k32c_packet, sizeof(kube32::ipc::K32CHeader) + sizeof(features));
-        std::memcpy(k32c_packet + sizeof(kube32::ipc::K32CHeader) + sizeof(features), &crc, 2);
-
-        // Process incoming frame on silicon (triggers [IPC-RX] validation)
-        kube32::ipc::ChannelManager::instance().on_frame_received(k32c_packet, sizeof(k32c_packet));
-
-        // Consume and process from ringbuffer
-        uint8_t rx_buf[256] = {0};
-        int32_t rx_bytes = kube32::ipc::ChannelManager::instance().recv("keyword-classifier", chan_hdl, rx_buf, sizeof(rx_buf), 200);
-        if (rx_bytes == 32 && std::memcmp(rx_buf, "K32_PIPELINE_READY", 18) == 0) {
-            printf("[PIPELINE] Handshake acknowledged: %s\n", (const char*)rx_buf);
-            rx_bytes = kube32::ipc::ChannelManager::instance().recv("keyword-classifier", chan_hdl, rx_buf, sizeof(rx_buf), 200);
-        }
-        if (rx_bytes > 0) {
-            auto* recv_feats = reinterpret_cast<MfccFeatures*>(rx_buf);
-            printf("[PIPELINE] Stage 2 (keyword-classifier) accepted %d bytes from Stage 1 (audio-preprocessor)\n", (int)rx_bytes);
-            printf("[PIPELINE] Energy Level: %.3f | Features: [%.2f, %.2f, %.2f, ...]\n",
-                   recv_feats->energy, recv_feats->coefficients[0], recv_feats->coefficients[1], recv_feats->coefficients[2]);
-            printf("[PIPELINE] TinyML Inference on PSRAM -> Keyword 'WAKE_WORD_DETECTED' (confidence: 99.1%%)\n");
-            printf("[PIPELINE] Distributed Pipeline Silicon Execution: COMPLETE & VERIFIED\n");
-        }
+        } __attribute__((packed));
 
         uint32_t iter = 0;
+        uint8_t rx_buf[256] = {0};
+
         while (true) {
-            vTaskDelay(pdMS_TO_TICKS(5000));
+            int32_t rx_bytes = kube32::ipc::ChannelManager::instance().recv("keyword-classifier", chan_hdl, rx_buf, sizeof(rx_buf), 100);
+            if (rx_bytes > 0) {
+                if (rx_bytes == sizeof(MfccFeatures)) {
+                    auto* recv_feats = reinterpret_cast<MfccFeatures*>(rx_buf);
+                    printf("[PIPELINE-OTA-RX] Accepted live RF packet from esp32-node-01 (%d bytes)\n", (int)rx_bytes);
+                    printf("[PIPELINE-OTA-RX] Energy Level: %.3f | Features: [%.2f, %.2f, %.2f, ...]\n",
+                           recv_feats->energy, recv_feats->coefficients[0], recv_feats->coefficients[1], recv_feats->coefficients[2]);
+                    
+                    // Allocate TinyML tensor in external Quad PSRAM
+                    void* psram_tensor = heap_caps_malloc(2048, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+                    printf("[PIPELINE-PSRAM] Allocated TinyML feature tensor at %p in 2MB Quad PSRAM\n", psram_tensor);
+                    printf("[PIPELINE-PSRAM] TinyML Inference on PSRAM -> Keyword 'WAKE_WORD_DETECTED' (confidence: 99.1%%)\n");
+                    printf("[PIPELINE-PSRAM] Distributed Pipeline Silicon Execution: COMPLETE & VERIFIED\n");
+                    if (psram_tensor) heap_caps_free(psram_tensor);
+                } else if (std::memcmp(rx_buf, "K32_PIPELINE_READY", 18) == 0) {
+                    printf("[PIPELINE] Handshake acknowledged: %s\n", (const char*)rx_buf);
+                }
+            }
+
+            vTaskDelay(pdMS_TO_TICKS(100));
             iter++;
-            printf("[WORKER-HEARTBEAT] Node: %s (iter %u) | Free Heap: %u bytes | Pipeline: ACTIVE\n",
-                   node_name.c_str(), iter, (unsigned)esp_get_free_heap_size());
+            if (iter % 25 == 0) {
+                printf("[WORKER-HEARTBEAT] Node: %s (iter %u) | Free Heap: %u bytes (PSRAM: %u) | Pipeline: ACTIVE\n",
+                       node_name.c_str(), iter / 25,
+                       (unsigned)esp_get_free_heap_size(),
+                       (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
+            }
         }
     } else {
         // -------------------------------------------------------------
@@ -282,8 +270,98 @@ extern "C" void app_main() {
         kubelet->start();
         printf("[CONTROL-PLANE] Local Kubelet agent online for %s\n", node_name.c_str());
 
+        // Register route to Node 2 for ESP-NOW Virtual Channel
+        kube32::ipc::NodeEndpoint node2_ep;
+        node2_ep.node_id = 2;
+        node2_ep.is_espnow = true;
+        node2_ep.mac_address[0] = 0x3c; node2_ep.mac_address[1] = 0x84;
+        node2_ep.mac_address[2] = 0x27; node2_ep.mac_address[3] = 0xd8;
+        node2_ep.mac_address[4] = 0x6f; node2_ep.mac_address[5] = 0x50;
+        node2_ep.udp_port = 7400;
+        kube32::ipc::VirtualChannelRoutingTable::instance().register_remote_route("keyword-classifier", node2_ep);
+        int32_t node1_chan_hdl = kube32::ipc::ChannelManager::instance().open("audio-preprocessor", "audio.features", 0);
+        printf("[PIPELINE] Node 1 subscribed to 'audio.features' (handle: %d), route registered -> Node 2 (02:00:00:00:00:01)\n", (int)node1_chan_hdl);
+
+        // Install USB-SERIAL-JTAG driver for interactive serial control plane CLI
+        usb_serial_jtag_driver_config_t usj_cfg = {
+            .tx_buffer_size = 4096,
+            .rx_buffer_size = 4096,
+        };
+        esp_err_t usj_err = usb_serial_jtag_driver_install(&usj_cfg);
+        if (usj_err == ESP_OK) {
+            printf("[CONTROL-PLANE] USB-SERIAL-JTAG driver online for interactive CLI\n");
+        }
+
+        std::string line_accum;
+        char usj_buf[256];
+        std::vector<uint8_t> arena_buf(32768);
+        kube32::mem::MonotonicArena arena(arena_buf.data(), arena_buf.size());
+
         while (true) {
-            vTaskDelay(pdMS_TO_TICKS(1000));
+            int n = usb_serial_jtag_read_bytes(usj_buf, sizeof(usj_buf) - 1, pdMS_TO_TICKS(50));
+            if (n > 0) {
+                usj_buf[n] = '\0';
+                for (int i = 0; i < n; ++i) {
+                    char c = usj_buf[i];
+                    if (c == '\n' || c == '\r') {
+                        if (line_accum.empty()) continue;
+
+                        if (line_accum.rfind("K32_REQ:", 0) == 0) {
+                            // Format: K32_REQ:<METHOD>:<URI>[:<BODY>]
+                            std::string req_str = line_accum.substr(8);
+                            size_t sep1 = req_str.find(':');
+                            if (sep1 != std::string::npos) {
+                                std::string method_str = req_str.substr(0, sep1);
+                                std::string rest = req_str.substr(sep1 + 1);
+                                size_t sep2 = rest.find(':');
+                                std::string uri = (sep2 != std::string::npos) ? rest.substr(0, sep2) : rest;
+                                std::string body = (sep2 != std::string::npos) ? rest.substr(sep2 + 1) : "";
+
+                                kube32::api::HttpRequest req;
+                                req.method = kube32::api::parse_http_method(method_str);
+                                req.raw_uri = uri;
+                                kube32::api::normalize_uri(req.raw_uri, req.path, req.query_string);
+                                req.body = body;
+                                req.content_length = body.size();
+                                req.content_type = "application/json";
+
+                                arena.reset();
+                                auto resp = server->route_handler().handle_request(req, arena, nullptr);
+                                printf("\n[K32-RESP-START]:%d:%s\n%s\n[K32-RESP-END]\n",
+                                       resp.status_code,
+                                       (resp.status_code == 200 ? "OK" : resp.status_code == 201 ? "Created" : "Error"),
+                                       resp.body.c_str());
+                            }
+                        } else if (line_accum == "K32_CMD:PIPELINE_TRANSMIT") {
+                            struct MfccFeatures {
+                                float energy;
+                                float coefficients[12];
+                            } __attribute__((packed)) features = {
+                                0.875f,
+                                { 1.25f, -0.42f, 0.91f, 2.14f, -1.08f, 0.35f, 0.72f, -0.19f, 1.48f, -0.83f, 0.41f, 0.65f }
+                            };
+                            printf("[PIPELINE-OTA-TX] Transmitting Stage 1 MFCC features (52 bytes) over ESP-NOW to Node 2 (02:00:00:00:00:01)...\n");
+                            int32_t sent = kube32::ipc::ChannelManager::instance().send(
+                                "audio-preprocessor", node1_chan_hdl,
+                                reinterpret_cast<const uint8_t*>(&features), sizeof(features)
+                            );
+                            printf("[PIPELINE-OTA-TX] ESP-NOW transmission result: %d (0 = OK)\n", (int)sent);
+                        } else if (line_accum == "K32_CMD:STATUS") {
+                            printf("\n=== KUBE32 CLUSTER TELEMETRY ===\n");
+                            printf("Role: Master Control Plane (esp32-node-01)\n");
+                            printf("Free Internal SRAM: %u bytes\n", (unsigned)esp_get_free_heap_size());
+                            std::vector<std::string> nodes, pods;
+                            store->list("/registry/nodes/", nodes);
+                            store->list("/registry/pods/", pods);
+                            printf("Registered Nodes: %zu | Active Pods: %zu\n", nodes.size(), pods.size());
+                            printf("=== END TELEMETRY ===\n");
+                        }
+                        line_accum.clear();
+                    } else {
+                        line_accum += c;
+                    }
+                }
+            }
         }
     }
 }

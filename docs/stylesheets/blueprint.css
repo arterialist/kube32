@@ -1,0 +1,207 @@
+/* ==============================================================================
+   Kube32 Blueprint & Wireframe Theme
+   Material Design with Google Sans Flex in Blue & Light Blue Tones
+   ============================================================================== */
+
+@import url('https://fonts.googleapis.com/css2?family=Google+Sans+Flex:wght@100..900&family=JetBrains+Mono:wght@400;500;600;700&display=swap');
+
+:root {
+  --md-text-font: "Google Sans Flex", -apple-system, BlinkMacSystemFont, Helvetica, Arial, sans-serif;
+  --md-code-font: "JetBrains Mono", monospace;
+
+  /* Blue & Light Blue Blueprint Color System */
+  --k32-blue-deep: #034f84;
+  --k32-blue-primary: #0284c7;      /* Sky 600 */
+  --k32-blue-light: #38bdf8;        /* Sky 400 */
+  --k32-blue-cyan: #06b6d4;         /* Cyan 500 */
+  --k32-blue-soft: #e0f2fe;         /* Sky 100 */
+  --k32-blueprint-line: rgba(14, 165, 233, 0.16);
+  --k32-wireframe-border: rgba(14, 165, 233, 0.35);
+  --k32-wireframe-border-bold: rgba(2, 132, 199, 0.6);
+  --k32-tech-badge-bg: rgba(14, 165, 233, 0.08);
+}
+
+[data-md-color-scheme="default"] {
+  --md-primary-fg-color: #0284c7;
+  --md-primary-fg-color--light: #38bdf8;
+  --md-primary-fg-color--dark: #0369a1;
+  --md-accent-fg-color: #06b6d4;
+  --k32-grid-bg: rgba(2, 132, 199, 0.035);
+  --k32-grid-line: rgba(2, 132, 199, 0.08);
+  --k32-card-bg: #ffffff;
+}
+
+[data-md-color-scheme="slate"] {
+  --md-primary-fg-color: #0284c7;
+  --md-primary-fg-color--light: #38bdf8;
+  --md-primary-fg-color--dark: #0369a1;
+  --md-accent-fg-color: #38bdf8;
+  --k32-grid-bg: #0b1322;
+  --k32-grid-line: rgba(56, 189, 248, 0.07);
+  --k32-card-bg: #0f1c30;
+}
+
+/* Typography Enhancements */
+body, .md-typeset {
+  font-family: var(--md-text-font);
+  letter-spacing: -0.01em;
+}
+
+h1, h2, h3, h4, h5, h6 {
+  font-family: var(--md-text-font);
+  font-weight: 700;
+  letter-spacing: -0.025em;
+  color: var(--md-primary-fg-color--dark);
+}
+
+[data-md-color-scheme="slate"] h1,
+[data-md-color-scheme="slate"] h2,
+[data-md-color-scheme="slate"] h3 {
+  color: var(--k32-blue-light);
+}
+
+/* Blueprint Wireframe Cards */
+.blueprint-card {
+  position: relative;
+  background-color: var(--k32-card-bg);
+  border: 1px solid var(--k32-wireframe-border);
+  border-radius: 6px;
+  padding: 1.5rem;
+  margin: 1.5rem 0;
+  box-shadow: 0 4px 12px rgba(2, 132, 199, 0.05);
+  background-image: 
+    linear-gradient(var(--k32-grid-line) 1px, transparent 1px),
+    linear-gradient(90deg, var(--k32-grid-line) 1px, transparent 1px);
+  background-size: 24px 24px;
+}
+
+.blueprint-card::before {
+  content: "[ARCHITECTURAL SPECIFICATION]";
+  position: absolute;
+  top: -9px;
+  right: 14px;
+  font-family: var(--md-code-font);
+  font-size: 0.65rem;
+  font-weight: 600;
+  color: var(--k32-blue-primary);
+  background-color: var(--k32-card-bg);
+  padding: 0 6px;
+  border-radius: 3px;
+  border: 1px solid var(--k32-wireframe-border);
+  letter-spacing: 0.05em;
+}
+
+/* Technical Badges */
+.tech-badge {
+  display: inline-block;
+  font-family: var(--md-code-font);
+  font-size: 0.72rem;
+  font-weight: 600;
+  padding: 2px 8px;
+  border-radius: 4px;
+  background: var(--k32-tech-badge-bg);
+  color: var(--k32-blue-primary);
+  border: 1px solid var(--k32-wireframe-border);
+  margin-right: 6px;
+  vertical-align: middle;
+}
+
+[data-md-color-scheme="slate"] .tech-badge {
+  color: var(--k32-blue-light);
+  background: rgba(56, 189, 248, 0.1);
+}
+
+/* Blueprint Grid Box */
+.blueprint-grid {
+  border: 1px dashed var(--k32-wireframe-border-bold);
+  border-radius: 6px;
+  padding: 1.25rem;
+  margin: 1.25rem 0;
+  background-color: var(--k32-grid-bg);
+  background-image: 
+    linear-gradient(var(--k32-grid-line) 1px, transparent 1px),
+    linear-gradient(90deg, var(--k32-grid-line) 1px, transparent 1px);
+  background-size: 18px 18px;
+}
+
+/* Architecture Metric Grid */
+.metric-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+  gap: 1rem;
+  margin: 1.5rem 0;
+}
+
+.metric-card {
+  border: 1px solid var(--k32-wireframe-border);
+  border-radius: 6px;
+  padding: 1rem;
+  background: var(--k32-card-bg);
+  border-left: 4px solid var(--k32-blue-primary);
+}
+
+.metric-card .metric-value {
+  font-family: var(--md-code-font);
+  font-size: 1.6rem;
+  font-weight: 700;
+  color: var(--k32-blue-primary);
+  line-height: 1.2;
+}
+
+[data-md-color-scheme="slate"] .metric-card .metric-value {
+  color: var(--k32-blue-light);
+}
+
+.metric-card .metric-label {
+  font-size: 0.82rem;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--md-default-fg-color--light);
+  margin-top: 0.25rem;
+}
+
+/* Mermaid Diagrams Theming */
+.mermaid {
+  text-align: center;
+  margin: 1.5rem 0 !important;
+  background-color: var(--k32-grid-bg) !important;
+  background-image: 
+    linear-gradient(var(--k32-grid-line) 1px, transparent 1px),
+    linear-gradient(90deg, var(--k32-grid-line) 1px, transparent 1px) !important;
+  background-size: 16px 16px !important;
+  border: 1px dashed var(--k32-wireframe-border) !important;
+  border-radius: 6px !important;
+  padding: 1.5rem !important;
+}
+
+/* Tables in Technical Wireframe Style */
+.md-typeset table:not([class]) {
+  font-size: 0.82rem;
+  border: 1px solid var(--k32-wireframe-border);
+  border-radius: 4px;
+}
+
+.md-typeset table:not([class]) th {
+  background: var(--k32-tech-badge-bg);
+  font-family: var(--md-code-font);
+  font-weight: 600;
+  color: var(--k32-blue-primary);
+  border-bottom: 2px solid var(--k32-wireframe-border);
+}
+
+[data-md-color-scheme="slate"] .md-typeset table:not([class]) th {
+  color: var(--k32-blue-light);
+}
+
+/* Code Blocks & Inline Code */
+.md-typeset code {
+  font-family: var(--md-code-font);
+  border-radius: 3px;
+  padding: 0.15em 0.35em;
+  font-size: 85%;
+}
+
+.md-typeset pre > code {
+  font-size: 82%;
+  line-height: 1.45;
+}

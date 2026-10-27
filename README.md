@@ -1,6 +1,12 @@
 # Kube32
 
+[![Documentation](https://img.shields.io/badge/docs-GitHub%20Pages-0284c7?style=flat-square)](https://arterialist.github.io/kube32/)
+[![CI](https://github.com/arterialist/kube32/actions/workflows/docs.yaml/badge.svg)](https://github.com/arterialist/kube32/actions/workflows/docs.yaml)
+
+Documentation: **[https://arterialist.github.io/kube32/](https://arterialist.github.io/kube32/)**
+
 Kube32 is an embedded Kubernetes-compatible orchestration system engineered specifically for ESP32 microcontrollers. It runs the full control plane (REST API server, scheduler, state storage, and node lifecycle controller) and worker agent (Kubelet with a sandboxed WebAssembly runtime) natively on microcontroller silicon. You interact with it directly using standard `kubectl`.
+
 
 ```
                     ┌──────────────────────────────────────────────┐

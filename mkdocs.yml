@@ -1,0 +1,94 @@
+site_name: Kube32
+site_description: Embedded Kubernetes Control Plane & WebAssembly Runtime for ESP32-S3 Microcontrollers
+site_url: https://arterialist.github.io/kube32/
+repo_name: arterialist/kube32
+repo_url: https://github.com/arterialist/kube32
+edit_uri: edit/main/docs/
+
+theme:
+  name: material
+  language: en
+  palette:
+    - scheme: default
+      primary: light blue
+      accent: cyan
+      toggle:
+        icon: material/weather-night
+        name: Switch to dark blueprint mode
+    - scheme: slate
+      primary: light blue
+      accent: cyan
+      toggle:
+        icon: material/weather-sunny
+        name: Switch to light blueprint mode
+  font:
+    text: Google Sans Flex
+    code: JetBrains Mono
+  features:
+    - navigation.sections
+    - navigation.top
+    - navigation.instant
+    - navigation.tracking
+    - navigation.tabs
+    - navigation.tabs.sticky
+    - search.suggest
+    - search.highlight
+    - search.share
+    - content.code.copy
+    - content.code.annotate
+    - content.action.edit
+    - content.action.view
+
+extra_css:
+  - stylesheets/blueprint.css
+
+extra_javascript:
+  - https://unpkg.com/mermaid@10/dist/mermaid.min.js
+  - javascripts/mermaid.js
+
+nav:
+  - Overview: index.md
+  - Getting Started:
+      - Quickstart Guide: quickstart.md
+      - Hardware Specifications: hardware-spec.md
+      - Flashing & Troubleshooting: flashing-troubleshooting.md
+  - Architecture:
+      - System Architecture: architecture/index.md
+      - Radix State Store: architecture/radix-store.md
+      - Autonomous Scheduler: architecture/scheduler.md
+      - Wasm3 Runtime Sandbox: architecture/wasm-runtime.md
+      - Capability Firewall: architecture/capability-firewall.md
+      - ESP-NOW Virtual Channel IPC: architecture/espnow-ipc.md
+  - Workloads & Tutorials:
+      - GPIO Peripheral Firewall: workloads/gpio-blinker.md
+      - Distributed TinyML Pipeline: workloads/distributed-pipeline.md
+      - Resource Quotas & OOM Handling: workloads/resource-limits.md
+  - Reference:
+      - CLI Reference: cli-reference.md
+      - Kubernetes API Matrix: api-reference.md
+
+markdown_extensions:
+  - admonition
+  - pymdownx.details
+  - pymdownx.highlight:
+      anchor_linenums: true
+      line_spans: __span
+      pygments_lang_class: true
+  - pymdownx.inlinehilite
+  - pymdownx.snippets
+  - pymdownx.superfences:
+      custom_fences:
+        - name: mermaid
+          class: mermaid
+          format: !!python/name:pymdownx.superfences.fence_code_format
+  - pymdownx.tabbed:
+      alternate_style: true
+  - pymdownx.tasklist:
+      custom_checkbox: true
+  - attr_list
+  - md_in_html
+  - tables
+  - toc:
+      permalink: true
+
+strict: true
