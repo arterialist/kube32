@@ -16,6 +16,92 @@ let clusterPods = [];
 
 const WORKLOAD_CATALOG = [
   {
+    id: 'hardware-workbench',
+    podNames: ['node1-hardware-controller', 'node2-dsp-coprocessor'],
+    title: 'Fullstack Cluster Hardware Workbench',
+    domain: 'Real-Time Hardware & Media',
+    filterCategory: 'all',
+    icon: 'developer_board',
+    problem: 'Real-time human-interface hardware (color TFT LCD, 56-key matrix keyboard, I2S digital mic, I2S speaker, IR transmitter, battery ADC) running alongside compute-heavy 16-band audio FFT overloads single-MCU architectures or causes visible display lag and dropped keystrokes.',
+    impossibleWhy: 'Kube32 distributes the pipeline across nodes: Node 1 handles all hardware I/O with capability firewall protection and streams raw 16 kHz audio over zero-AP ESP-NOW to Node 2. Node 2 uses 2 MB PSRAM for real-time 16-band FFT. The fullstack web app delivers bidirectional controls.',
+    targetNode: 'Dual-Node (Node 1 & Node 2)',
+    specs: {
+      memory: '32 KiB SRAM (Node 1) + 48 KiB SRAM / 2 MB PSRAM (Node 2)',
+      peripherals: 'ST7789 TFT, 56-Key Keyboard, SPM1423 Mic, NS4148 Speaker, IR GPIO 44, ADC1',
+      isolation: 'Capability Bitmask + Zero-AP ESP-NOW Virtual Channel Mesh'
+    },
+    yaml: `apiVersion: v1
+kind: Pod
+metadata:
+  name: node1-hardware-controller
+  namespace: kube32-cluster
+  labels:
+    app: hardware-workbench
+    tier: master-controller
+spec:
+  nodeName: esp32-node-01
+  nodeSelector:
+    kubernetes.io/hostname: esp32-node-01
+  restartPolicy: Always
+  containers:
+    - name: hardware-controller
+      image: wasm://embedded/hardware-workbench-master:v1
+      resources:
+        limits:
+          memory: 48Ki
+        requests:
+          memory: 32Ki
+          hardware.kube32.io/tft-display: "1"
+          hardware.kube32.io/keyboard: "1"
+          hardware.kube32.io/microphone: "1"
+          hardware.kube32.io/speaker: "1"
+          hardware.kube32.io/ir-transmitter: "1"
+          hardware.kube32.io/battery-adc: "1"
+          hardware.kube32.io/ipc: "1"
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: node2-dsp-coprocessor
+  namespace: kube32-cluster
+  labels:
+    app: hardware-workbench
+    tier: dsp-coprocessor
+spec:
+  nodeName: esp32-node-02
+  nodeSelector:
+    kubernetes.io/hostname: esp32-node-02
+    hardware.kube32.io/psram: "1"
+  restartPolicy: Always
+  containers:
+    - name: dsp-coprocessor
+      image: wasm://embedded/hardware-workbench-dsp:v1
+      resources:
+        limits:
+          memory: 64Ki
+        requests:
+          memory: 48Ki
+          hardware.kube32.io/psram: "1"
+          hardware.kube32.io/ipc: "1"
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: hardware-workbench-svc
+  namespace: kube32-cluster
+spec:
+  type: ClusterIP
+  ports:
+    - name: http-web
+      port: 80
+      targetPort: 80
+    - name: espnow-ipc
+      port: 7400
+      targetPort: 7400
+  selector:
+    app: hardware-workbench`
+  },
+  {
     id: 'grid-substation',
     podNames: ['grid-substation-firewall-canary'],
     title: 'Grid Substation SCADA & Peripheral Firewall',
@@ -658,7 +744,7 @@ function renderShowcaseCards(filter = 'all') {
         </div>
 
         <div class="showcase-action-row">
-          <div style="display: flex; gap: 8px;">
+          <div style="display: flex; gap: 8px; flex-wrap: wrap;">
             <button class="btn btn-filled btn-sm" onclick="deployShowcaseWorkload('${w.id}')" id="btn-deploy-${w.id}">
               <span class="material-symbols-outlined">rocket_launch</span>
               Deploy (1-Click)
@@ -667,6 +753,12 @@ function renderShowcaseCards(filter = 'all') {
               <span class="material-symbols-outlined">code</span>
               YAML
             </button>
+            ${w.id === 'hardware-workbench' ? `
+              <a href="/hardware-workbench.html" target="_blank" class="btn btn-tonal btn-sm" style="color: var(--md-sys-color-primary); font-weight: 700;">
+                <span class="material-symbols-outlined">open_in_new</span>
+                Launch Web App
+              </a>
+            ` : ''}
           </div>
           <button class="btn btn-outlined btn-sm" onclick="viewWorkloadLogs('${w.id}')" id="btn-logs-${w.id}">
             <span class="material-symbols-outlined">terminal</span>

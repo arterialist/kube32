@@ -9,8 +9,10 @@ bridged to physical ESP32-S3 microcontroller hardware.
 import os
 import sys
 import time
+import math
 import threading
-from http.server import HTTPServer, BaseHTTPRequestHandler
+from http.server import HTTPServer, ThreadingHTTPServer, BaseHTTPRequestHandler
+import socket
 import json
 import serial
 import serial.tools.list_ports
@@ -478,7 +480,26 @@ def generate_pod_log(pod_name, ns="default"):
     now_str = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
     p = pod_name.lower()
 
-    if "grid-substation" in p or "firewall" in p:
+    if "hardware-controller" in p or "node1-hardware" in p:
+        return (
+            f"{now_str} [st7789-lcd] Display engine active at 30.0 FPS | Resolution: 240x135 RGB565 | Mode: live-k8s\n"
+            f"{now_str} [keyboard-matrix] Scanning 56-key matrix (7 rows x 8 cols) at 100 Hz | Hardware debouncing nominal\n"
+            f"{now_str} [i2s-mic] SPM1423 digital PDM mic streaming 16 kHz 16-bit PCM blocks to ESP-NOW ring buffer\n"
+            f"{now_str} [ns4148-audio] Audio synthesizer ready on I2S DAC (Pins 41, 42, 43) | Volume: 85%\n"
+            f"{now_str} [ir-transmitter] 38 kHz optical pulse generator armed on GPIO 44 (Protocol: NEC)\n"
+            f"{now_str} [battery-adc] Power rail sensed: 4,180 mV (LiPo 94% SOC, Health: Nominal)\n"
+            f"{now_str} [esp-now-tx] Pushing 512-byte PCM audio blocks to Node 2 (02:00:00:00:00:01) via virtual channel 'hw-audio-stream'\n"
+        )
+    elif "dsp-coprocessor" in p or "node2-dsp" in p:
+        return (
+            f"{now_str} [esp-now-rx] Receiving 512-byte PCM frames on channel 'hw-audio-stream' (RSSI: -38 dBm, transit: 0.82 ms)\n"
+            f"{now_str} [psram-dma] Ingested 16 kHz audio block into 2 MB Quad-SPI PSRAM circular ring buffer\n"
+            f"{now_str} [dsp-fft] Executing 512-point real-time FFT across 16 frequency bands in 3.42 ms\n"
+            f"{now_str} [dsp-fft] Peak energy band: 700 Hz (-18.2 dB) | Frequency envelope extracted\n"
+            f"{now_str} [telemetry-tx] Dispatched 16-band spectrum vector back to Node 1 and Web Gateway\n"
+            f"{now_str} [capacity] PSRAM free: 1,268 KiB / 2,048 KiB | Core 1 load: 58.7% | Zero buffer overruns\n"
+        )
+    elif "grid-substation" in p or "firewall" in p:
         return (
             f"{now_str} [wasm3-runtime] Spawned container 'telemetry-reporter' (stack: 8192 bytes, isolation: capability-firewall)\n"
             f"{now_str} [capability-fw] Security profile loaded: DROP ALL, GRANT [UART_READ]\n"
@@ -1034,6 +1055,118 @@ class KubeGatewayHandler(BaseHTTPRequestHandler):
             self.send_json(404, {"kind": "Status", "apiVersion": "v1", "status": "Failure", "message": f"nodes \"{nname}\" not found", "code": 404})
             return
 
+        # Hardware Workbench Endpoints: /api/v1/hardware/...
+        if path_clean.startswith("/api/v1/hardware"):
+            if path_clean == "/api/v1/hardware/state":
+                now_t = time.time()
+                fft_bins = [
+                    int(20 + 15 * math.sin(now_t * 2.0 + 0.5)),
+                    int(35 + 25 * math.sin(now_t * 2.5 + 1.0)),
+                    int(60 + 30 * math.sin(now_t * 3.0 + 1.5)),
+                    int(85 + 40 * math.sin(now_t * 3.5 + 2.0)),
+                    int(115 + 35 * math.sin(now_t * 4.0 + 2.5)),
+                    int(145 + 50 * math.sin(now_t * 4.5 + 3.0)),
+                    int(130 + 45 * math.sin(now_t * 4.0 + 3.5)),
+                    int(105 + 35 * math.sin(now_t * 3.5 + 4.0)),
+                    int(85 + 30 * math.sin(now_t * 3.0 + 4.5)),
+                    int(68 + 25 * math.sin(now_t * 2.5 + 5.0)),
+                    int(50 + 20 * math.sin(now_t * 2.0 + 5.5)),
+                    int(38 + 15 * math.sin(now_t * 1.8 + 6.0)),
+                    int(28 + 12 * math.sin(now_t * 1.5 + 6.5)),
+                    int(20 + 10 * math.sin(now_t * 1.2 + 7.0)),
+                    int(14 + 8 * math.sin(now_t * 1.0 + 7.5)),
+                    int(8 + 5 * math.sin(now_t * 0.8 + 8.0))
+                ]
+                hw_state = {
+                    "online": True,
+                    "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                    "nodes": {
+                        "esp32-node-01": {
+                            "role": "control-plane,display-keyboard-master",
+                            "cpu_load_pct": 34.2 + 4.0 * math.sin(now_t),
+                            "free_sram_bytes": hardware_telemetry.get("free_sram_bytes", 48400),
+                            "battery_mv": 4180 - int(now_t % 60) * 2,
+                            "battery_pct": 94,
+                            "display": {
+                                "width": 240,
+                                "height": 135,
+                                "fps": 30.0,
+                                "mode": "live-k8s-telemetry",
+                                "buffer_text": hardware_telemetry.get("display_text", "Kube32 Cluster v1.33")
+                            },
+                            "keyboard": {
+                                "last_key": hardware_telemetry.get("last_key", "ENTER"),
+                                "scan_rate_hz": 100
+                            },
+                            "audio": {
+                                "mic_rms_db": -24.5 + 4.0 * math.sin(now_t * 3.0),
+                                "mic_peak": int(842 + 200 * math.sin(now_t * 4.0)),
+                                "speaker_active": hardware_telemetry.get("speaker_active", False)
+                            },
+                            "ir": {
+                                "last_proto": hardware_telemetry.get("ir_proto", "NEC"),
+                                "last_code": hardware_telemetry.get("ir_code", "0x00FFA25D")
+                            }
+                        },
+                        "esp32-node-02": {
+                            "role": "worker,dsp-coprocessor",
+                            "cpu_load_pct": 58.7 + 6.0 * math.sin(now_t * 1.5),
+                            "free_sram_bytes": 42100,
+                            "free_psram_bytes": 1268000 + int(20000 * math.sin(now_t)),
+                            "dsp": {
+                                "fft_bins": fft_bins,
+                                "fft_sample_rate": 16000,
+                                "fft_latency_ms": 3.42,
+                                "esp_now_packets_rx": int(6400 + (now_t - CLUSTER_START_TIME) * 12),
+                                "esp_now_transit_ms": 0.82
+                            }
+                        }
+                    }
+                }
+                self.send_json(200, hw_state)
+                return
+            elif path_clean == "/api/v1/hardware/display":
+                content_length = int(self.headers.get("Content-Length", 0))
+                body = self.rfile.read(content_length).decode("utf-8") if content_length > 0 else "{}"
+                try:
+                    d = json.loads(body)
+                    hardware_telemetry["display_text"] = d.get("text", "")
+                except Exception:
+                    pass
+                self.send_json(200, {"status": "OK", "action": "display_updated"})
+                return
+            elif path_clean == "/api/v1/hardware/speaker":
+                content_length = int(self.headers.get("Content-Length", 0))
+                body = self.rfile.read(content_length).decode("utf-8") if content_length > 0 else "{}"
+                try:
+                    d = json.loads(body)
+                    hardware_telemetry["speaker_active"] = True
+                except Exception:
+                    pass
+                self.send_json(200, {"status": "OK", "action": "tone_played"})
+                return
+            elif path_clean == "/api/v1/hardware/ir":
+                content_length = int(self.headers.get("Content-Length", 0))
+                body = self.rfile.read(content_length).decode("utf-8") if content_length > 0 else "{}"
+                try:
+                    d = json.loads(body)
+                    hardware_telemetry["ir_proto"] = d.get("protocol", "NEC")
+                    hardware_telemetry["ir_code"] = d.get("hex_code", "0x00FFA25D")
+                except Exception:
+                    pass
+                self.send_json(200, {"status": "OK", "action": "ir_fired"})
+                return
+            elif path_clean == "/api/v1/hardware/keyboard":
+                content_length = int(self.headers.get("Content-Length", 0))
+                body = self.rfile.read(content_length).decode("utf-8") if content_length > 0 else "{}"
+                try:
+                    d = json.loads(body)
+                    hardware_telemetry["last_key"] = d.get("key", "NONE")
+                except Exception:
+                    pass
+                self.send_json(200, {"status": "OK", "action": "key_injected"})
+                return
+
         # 8. Pods (Cluster-wide & Namespaced)
         if path_clean == "/api/v1/pods":
             if "as=Table" in accept:
@@ -1356,6 +1489,14 @@ def prefill_initial_workloads():
             "node": "esp32-node-01"
         }
 
+class Kube32Server(ThreadingHTTPServer):
+    daemon_threads = True
+    allow_reuse_address = True
+
+    def handle_error(self, request, client_address):
+        # Gracefully ignore client-initiated disconnects / TCP resets
+        pass
+
 def main():
     prefill_initial_workloads()
     port = int(sys.argv[1]) if len(sys.argv) > 1 else HTTP_PORT
@@ -1364,7 +1505,7 @@ def main():
     t = threading.Thread(target=background_hardware_sync, daemon=True)
     t.start()
 
-    server = HTTPServer(("127.0.0.1", port), KubeGatewayHandler)
+    server = Kube32Server(("127.0.0.1", port), KubeGatewayHandler)
     active_port = find_serial_port()
     print(f"=================================================================")
     print(f"  Kube32 Kubernetes Core API Server & Hardware Gateway Online")
