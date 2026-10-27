@@ -1,18 +1,20 @@
-# Radix State Store
+# Radix state store
 
 <div class="blueprint-card">
   <strong>Component</strong>: <code>kube32::storage::RadixTreeStore</code><br>
-  <strong>Memory Complexity</strong>: O(k) prefix tree lookup, zero dynamic heap allocations on read path<br>
-  <strong>Storage Modes</strong>: In-Memory DRAM (high performance) with optional LittleFS flash persistence
+  <strong>Lookup complexity</strong>: O(k) prefix tree walk where k is key length.<br>
+  <strong>Memory footprint</strong>: In-memory SRAM storage with arena-allocated query serialization.
 </div>
 
-The Radix State Store serves as the cluster's single source of truth, replacing external distributed databases (`etcd`) with an embedded prefix tree running within internal SRAM.
+Standard Kubernetes clusters store object manifests in etcd. Operating etcd requires disk storage, distributed consensus over Raft, and dozens of megabytes of memory. Microcontrollers have only a few hundred kilobytes of internal SRAM, and writing repeatedly to SPI flash wears out flash blocks quickly.
+
+Kube32 replaces etcd with an embedded radix tree kept in SRAM. Object keys follow standard Kubernetes API paths. Tree lookups take time proportional to key length rather than cluster size, and range queries for namespaces or resource types match naturally along tree branches.
 
 ---
 
-## Prefix Namespace Hierarchy
+## Prefix key hierarchy
 
-All Kubernetes objects are indexed deterministically using standard Kubernetes API key paths:
+Objects are stored under hierarchical prefixes matching the Kubernetes REST resource model:
 
 ```mermaid
 graph TD
@@ -43,7 +45,8 @@ graph TD
     P_DEF --> P2
 ```
 
-### Key Mapping Rules
+### Key mapping format
+
 - **Nodes**: `/registry/nodes/{node_name}`
 - **Pods**: `/registry/pods/{namespace}/{pod_name}`
 - **Leases**: `/registry/leases/{namespace}/{lease_name}`
@@ -51,36 +54,41 @@ graph TD
 
 ---
 
-## Zero-Copy Query Path via MonotonicArena
+## Memory arena for queries
 
-To eliminate memory fragmentation across millions of API read operations, query serialization uses a bump-allocated memory arena:
+When a client queries all pods in a cluster, typical JSON serializers make dozens of small heap allocations. On FreeRTOS, repeatedly allocating and freeing small heap blocks fragments internal SRAM. Over time, memory fragmentation causes allocation failures even when total free memory appears adequate.
+
+To prevent fragmentation on read paths, Kube32 serializes query responses using a bump-allocated memory arena:
 
 ```cpp
-// Fast query path without FreeRTOS heap fragmentation
-kube32::mem::MonotonicArena arena(32768);
+// Preallocated 32 KB scratch buffer on Core 0
+std::vector<uint8_t> arena_buf(32768);
+kube32::mem::MonotonicArena arena(arena_buf.data(), arena_buf.size());
 
 std::vector<std::string> pod_records;
 store.list("/registry/pods/default/", pod_records);
 
-// Serialize Kubernetes Table format in arena memory
+// Build Kubernetes Table format directly within the arena
 TableSerializer::serialize_pods_table(arena, pod_records);
-arena.reset(); // Instant O(1) memory recycling
+
+// Reset pointer to zero in O(1) time
+arena.reset();
 ```
 
-### Memory Allocation Comparison
+### Memory allocation behavior
 
-| Operation | Standard etcd / JSON Parser | Kube32 Radix Store + Arena |
+| Metric | Typical JSON parser | Kube32 Radix store and arena |
 | :--- | :--- | :--- |
-| **Get Pod Manifest** | 12 heap allocations (`malloc`) | 0 heap allocations (bump pointer) |
-| **List 20 Pods** | ~240 heap allocations | 1 scratch buffer slice |
-| **Lookup Time** | O(log N) B-Tree disk seek | O(K) memory traversal (~4 microseconds) |
-| **Heap Fragmentation** | High (frequent reallocations) | **Zero (arena recycled in place)** |
+| Allocations to read one pod | 12 heap allocations (`malloc`) | 0 heap allocations (bump pointer) |
+| Allocations to list 20 pods | ~240 heap allocations | 1 scratch buffer slice |
+| Lookup latency | O(log N) disk seek | O(K) memory traversal (under 5 microseconds) |
+| Heap fragmentation risk | High | Zero (arena resets in place) |
 
 ---
 
-## Concurrency & Thread Safety
+## Concurrency and locking
 
-The Radix State Store provides thread-safe operations across FreeRTOS tasks through a reader-writer spinlock:
+The radix store handles concurrent access across FreeRTOS tasks on both Xtensa cores using a mutex lock:
 
 ```cpp
 class RadixTreeStore : public Store {
@@ -94,3 +102,5 @@ private:
     RadixNode* root_{nullptr};
 };
 ```
+
+Tasks release the lock before streaming responses over sockets or serial ports. This keeps lock hold times short and prevents the HTTP server from stalling the scheduler loop.

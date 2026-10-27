@@ -1,32 +1,32 @@
-# CLI Reference
+# CLI reference
 
 <div class="blueprint-card">
-  <strong>Executable</strong>: <code>cli/kube32-cli</code><br>
-  <strong>Communication Modes</strong>: Direct Silicon Serial (<code>--port</code>) &amp; HTTP REST API (<code>--server</code>)<br>
-  <strong>Compatibility</strong>: Standard Kubernetes YAML / JSON Manifests
+  <strong>Command</strong>: <code>cli/kube32-cli</code><br>
+  <strong>Connection modes</strong>: Direct silicon serial (<code>--port</code>) and HTTP REST (<code>--server</code>).<br>
+  <strong>Manifest format</strong>: Standard Kubernetes YAML and JSON manifests.
 </div>
 
-`kube32-cli` is the developer and operations command-line interface for physical Kube32 clusters. It provides two operational modes:
+`kube32-cli` is the command-line utility for managing Kube32 clusters. It supports two connection modes:
 
-1. **Direct Silicon Serial Mode (`--port`)**: Sends requests over physical USB serial lines directly to the ESP32-S3 control plane (`/dev/cu.usbmodem...`). This mode operates without requiring the host machine to switch Wi-Fi networks off the internet.
-2. **HTTP REST Mode (`--server`)**: Communicates with the embedded Kubernetes API Server at `http://192.168.4.1:6443` over the `Kube32-Cluster` Wi-Fi network.
+1. **Direct silicon serial mode (`--port`)**: Sends requests across USB serial lines directly to the ESP32-S3 control plane (`/dev/cu.usbmodem...`). This mode works without disconnecting your computer from its regular Wi-Fi network.
+2. **HTTP REST mode (`--server`)**: Sends standard HTTP requests to port 6443 over the `Kube32-Cluster` Wi-Fi network.
 
 ---
 
-## Global Options
+## Global options
 
-| Flag | Short | Default | Description |
+| Option | Short | Default | Purpose |
 | :--- | :--- | :--- | :--- |
-| `--port` | `-p` | None | Serial device path (e.g. `/dev/cu.usbmodem2101`) |
-| `--server` | | `http://192.168.4.1:6443` | HTTP API Server endpoint |
-| `--help` | `-h` | | Display command options and exit |
+| `--port` | `-p` | None | Serial device path (such as `/dev/cu.usbmodem2101`) |
+| `--server` | | `http://192.168.4.1:6443` | API server HTTP address |
+| `--help` | `-h` | | Show help text and exit |
 
 ---
 
 ## Commands
 
-### 1. `status`
-Inspects the physical cluster topology, displaying registered nodes, readiness states, allocated memory, and active Pods:
+### `status`
+Queries cluster state, listing registered nodes, health statuses, free memory, and active pods:
 
 ```bash
 ./cli/kube32-cli --port /dev/cu.usbmodem2101 status
@@ -34,7 +34,7 @@ Inspects the physical cluster topology, displaying registered nodes, readiness s
 
 Output:
 ```
-Connecting to Kube32 Cluster at /dev/cu.usbmodem2101...
+Connecting to Kube32 cluster at /dev/cu.usbmodem2101...
 
 === CLUSTER NODES ===
 NAME             STATUS     ROLES          INTERNAL-IP      ALLOCATABLE-MEM
@@ -51,8 +51,8 @@ default      keyword-classifier       esp32-node-02    Running      64Ki
 
 ---
 
-### 2. `apply`
-Applies a declarative workload manifest (single or multi-document YAML/JSON) to the cluster:
+### `apply`
+Submits a declarative workload manifest to the cluster:
 
 ```bash
 ./cli/kube32-cli --port /dev/cu.usbmodem2101 apply -f examples/distributed-pipeline.yaml
@@ -60,14 +60,14 @@ Applies a declarative workload manifest (single or multi-document YAML/JSON) to 
 
 Output:
 ```
-pod/audio-preprocessor applied successfully -> scheduled to [esp32-node-01] (HTTP 201)
-pod/keyword-classifier applied successfully -> scheduled to [esp32-node-02] (HTTP 201)
+pod/audio-preprocessor applied successfully -> scheduled to esp32-node-01 (HTTP 201)
+pod/keyword-classifier applied successfully -> scheduled to esp32-node-02 (HTTP 201)
 ```
 
 ---
 
-### 3. `delete`
-Deletes a Pod from the cluster, reclaiming allocated resources and resetting peripheral claims:
+### `delete`
+Removes a pod from the cluster, freeing its memory and releasing hardware pins:
 
 ```bash
 ./cli/kube32-cli --port /dev/cu.usbmodem2101 delete gpio-blinker --namespace default
@@ -80,8 +80,8 @@ pod "gpio-blinker" deleted
 
 ---
 
-### 4. `pipeline`
-Triggers an over-the-air ESP-NOW dataflow transmission from Stage 1 on Node 1 across physical 2.4GHz RF to Stage 2 on Node 2:
+### `pipeline`
+Triggers an over-the-air ESP-NOW transmission from Stage 1 on Node 1 to Stage 2 on Node 2:
 
 ```bash
 ./cli/kube32-cli --port /dev/cu.usbmodem2101 pipeline
@@ -90,14 +90,14 @@ Triggers an over-the-air ESP-NOW dataflow transmission from Stage 1 on Node 1 ac
 Output:
 ```
 Triggering Stage 1 over-the-air ESP-NOW transmission on /dev/cu.usbmodem2101...
-  [Node 1] [PIPELINE-OTA-TX] Transmitting Stage 1 MFCC features (52 bytes) over ESP-NOW to Node 2 (02:00:00:00:00:01)...
-  [Node 1] [PIPELINE-OTA-TX] ESP-NOW transmission result: 0 (0 = OK)
+  Node 1: PIPELINE-OTA-TX: Transmitting Stage 1 MFCC features (52 bytes) over ESP-NOW to Node 2 (02:00:00:00:00:01)...
+  Node 1: PIPELINE-OTA-TX: ESP-NOW transmission result: 0 (0 = OK)
 ```
 
 ---
 
-### 5. `package`
-Packages a compiled WebAssembly binary (`.wasm`) into a self-contained, base64-embedded Kubernetes Pod manifest:
+### `package`
+Encodes a compiled WebAssembly binary into a base64-embedded Kubernetes Pod manifest:
 
 ```bash
 ./cli/kube32-cli package build/blinker.wasm \
@@ -109,8 +109,8 @@ Packages a compiled WebAssembly binary (`.wasm`) into a self-contained, base64-e
 
 ---
 
-### 6. `version`
-Displays CLI and API compliance versions:
+### `version`
+Displays version information for the CLI and API server:
 
 ```bash
 ./cli/kube32-cli version
@@ -118,6 +118,6 @@ Displays CLI and API compliance versions:
 
 Output:
 ```
-Kube32 CLI v1.0.0-m6 (Target: ESP32-S3 Xtensa dual-core @ 240MHz)
-API Compliance: Kubernetes Core v1 / Apps v1
+Kube32 CLI v1.0.0-m6 (Target: ESP32-S3 Xtensa dual-core at 240 MHz)
+API compliance: Kubernetes Core v1 and Apps v1
 ```

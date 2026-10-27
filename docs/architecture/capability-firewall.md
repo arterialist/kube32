@@ -1,18 +1,20 @@
-# Hardware Capability Firewall
+# Hardware capability firewall
 
 <div class="blueprint-card">
   <strong>Component</strong>: <code>kube32::hal::CapabilityFirewall</code><br>
-  <strong>Enforcement Point</strong>: Wasm Host Call Interception Boundary<br>
-  <strong>Security Model</strong>: Principle of Least Privilege with Declarative Hardware Capabilities
+  <strong>Enforcement boundary</strong>: Host function trap handler.<br>
+  <strong>Security model</strong>: Declarative peripheral capabilities with exclusive pin claims.
 </div>
 
-The Hardware Capability Firewall enforces strict peripheral sandboxing on physical microcontrollers. Containers running on Kube32 cannot manipulate GPIO pins, sample ADC channels, or transmit packets unless explicitly granted in their Pod manifest.
+In cloud Kubernetes, containers request specific OS permissions through Linux capabilities like `CAP_NET_ADMIN` or `CAP_SYS_PTRACE`.
+
+On microcontrollers, the primary risk is unauthorized access to physical peripherals. Toggling the wrong GPIO line can cause an electrical short, corrupt SPI flash communication, or disrupt serial boot strapping. Kube32 introduces hardware-level capabilities declared in standard Kubernetes `securityContext` blocks. The capability firewall verifies these permissions every time a container calls a hardware host function.
 
 ---
 
-## Security Context Specification
+## Declaring hardware capabilities
 
-Capabilities are declared in the `securityContext.capabilities.add` array of the container specification:
+Capabilities are listed in the `securityContext.capabilities.add` array of the container specification:
 
 ```yaml
 apiVersion: v1
@@ -27,38 +29,38 @@ spec:
       securityContext:
         capabilities:
           add:
-            - GPIO_WRITE      # Grants permission to toggle designated pins
-            - CHANNEL_IPC     # Grants permission to send/recv ESP-NOW frames
+            - GPIO_WRITE      # Grants permission to toggle designated output pins
+            - CHANNEL_IPC     # Grants permission to send and receive ESP-NOW frames
 ```
 
 ---
 
-## Supported Hardware Capabilities
+## Supported hardware capabilities
 
-| Capability Flag | Target Hardware | Permitted Operations | Restricted Operations |
+| Capability flag | Target peripheral | Permitted operations | Restricted operations |
 | :--- | :--- | :--- | :--- |
-| `GPIO_WRITE` | General Purpose I/O | `gpio_set_level()` on assigned pins | Pin mode reprogramming, strapping pins |
-| `GPIO_READ` | General Purpose I/O | `gpio_get_level()` on assigned pins | Interrupt manipulation |
-| `ADC_READ` | Analog-to-Digital Converter | `adc1_get_raw()` on assigned channels | Reference voltage alterations |
-| `UART_READ` | UART Serial Controllers | Reading bytes from auxiliary UARTs | Modifying Console UART0 |
-| `CHANNEL_IPC` | Virtual Channel Layer | Subscribing and sending on named channels | Raw 802.11 promiscuous injection |
+| `GPIO_WRITE` | General purpose I/O | `gpio_set_level()` on assigned pins | Pin mode reconfiguration, strapping pins |
+| `GPIO_READ` | General purpose I/O | `gpio_get_level()` on assigned pins | Interrupt mask changes |
+| `ADC_READ` | Analog-to-digital converter | `adc1_get_raw()` on assigned channels | Reference voltage modifications |
+| `UART_READ` | Serial UART controller | Read bytes from secondary UART lines | Console UART0 access |
+| `CHANNEL_IPC` | Virtual channel layer | Send and receive on designated channel names | Raw 802.11 packet injection |
 
 ---
 
-## Peripheral Access Control Architecture
+## Admission checks and runtime enforcement
 
 ```mermaid
 graph TD
-    POD["Pod Manifest Registration"] --> AUDIT["Admission Audit"]
-    AUDIT --> PASS{"Valid Peripheral Requests?"}
-    PASS -->|No| REJ["Admission Rejected<br/>Reason: Forbidden Hardware Access"]
-    PASS -->|Yes| REG["Register ACL Entry in Firewall"]
+    POD["Pod manifest submitted"] --> AUDIT["Admission audit"]
+    AUDIT --> PASS{"Valid peripheral requests?"}
+    PASS -->|No| REJ["Admission rejected<br/>Reason: Forbidden hardware access"]
+    PASS -->|Yes| REG["Register ACL entry in firewall"]
 
-    subgraph Runtime["Live Container Execution"]
-        GUEST["Wasm Container"] --> CALL["Host Function Call<br/>e.g. esp32_gpio_write(pin, val)"]
-        CALL --> FW{"Firewall Lookup:<br/>Has GPIO_WRITE &amp;<br/>Pin In Authorized ACL?"}
-        FW -->|Yes| OK["Execute Hardware Register Write<br/>GPIO Output Toggled"]
-        FW -->|No| BLOCK["Block Syscall &amp; Return -1<br/>Emit Security Violation Event"]
+    subgraph Runtime["Live container execution"]
+        GUEST["Wasm container"] --> CALL["Host function call<br/>esp32_gpio_write(pin, val)"]
+        CALL --> FW{"Firewall check:<br/>Has GPIO_WRITE and<br/>pin in authorized ACL?"}
+        FW -->|Yes| OK["Write to hardware register<br/>Output pin toggles"]
+        FW -->|No| BLOCK["Block call and return -1<br/>Emit security violation event"]
     end
 
     REG --> Runtime
@@ -66,13 +68,13 @@ graph TD
 
 ---
 
-## Pin Conflict Prevention & Exclusive Pin Claims
+## Preventing pin conflicts
 
-The Capability Firewall prevents race conditions and hardware electrical shorts by enforcing exclusive pin ownership:
+The capability firewall enforces three rules to protect physical hardware:
 
-1. **Exclusive Claims**: If `Pod A` is granted `GPIO_WRITE` on Pin 10, no other container can acquire `GPIO_WRITE` on Pin 10 simultaneously.
-2. **System Console Guard**: Pin 43 and Pin 44 (UART0 console lines) and Pin 19/20 (USB-JTAG lines) are hard-locked by the firewall. Any container requesting these pins is immediately rejected with:
+1. **Exclusive pin ownership**: When Pod A acquires `GPIO_WRITE` on Pin 10, no other container can acquire Pin 10 until Pod A terminates.
+2. **System console lockout**: Pins 43 and 44 (UART0 console) and Pins 19 and 20 (USB-JTAG) are locked by the firmware. Any pod attempting to claim these pins is rejected immediately:
    ```
-   Admission Rejected: GPIO pin 43 is reserved for system console.
+   Admission rejected: GPIO pin 43 is reserved for system console.
    ```
-3. **Automatic Cleanup on Termination**: When a Pod is deleted, the Kubelet releases all claimed peripheral ACLs, returning the pins to high-impedance safe states.
+3. **Automatic pin release on pod termination**: When a pod is deleted, the Kubelet releases its peripheral claims and resets the pins to high-impedance input mode (`GPIO_MODE_INPUT`).

@@ -1,26 +1,25 @@
-# Flashing & Hardware Troubleshooting
+# Flashing and troubleshooting
 
 <div class="blueprint-card">
-  <strong>Flashing Engine</strong>: <code>scripts/flash.sh</code> &amp; <code>scripts/flash_dual_boards.py</code><br>
-  <strong>Driver Considerations</strong>: CH343 / CH340 USB-UART FIFO buffering &amp; Native USB-JTAG CDC<br>
-  <strong>Baud Rates</strong>: 460,800 baud (Cardputer) / 115,200 baud with paced block transfers (DevKit)
+  <strong>Flashing scripts</strong>: <code>scripts/flash.sh</code> and <code>scripts/flash_dual_boards.py</code>.<br>
+  <strong>Known chip interfaces</strong>: CH343 USB-UART and native ESP32-S3 USB-JTAG.<br>
+  <strong>Baud rates</strong>: 460,800 baud on Cardputer, 115,200 baud on DevKit.
 </div>
 
-This document records the empirical hardware solutions established during physical silicon testing of Kube32 across diverse ESP32-S3 boards.
+This page documents hardware workarounds discovered while testing Kube32 on physical development boards.
 
 ---
 
-## 1. Automated Dual-Board Flashing
+## 1. Flashing scripts
 
-The unified flashing daemon automatically discovers connected ESP32-S3 boards and flashes them sequentially with appropriate pacing:
+The flashing daemon scans for connected boards and flashes them in sequence:
 
 ```bash
-# Run the automated flashing daemon
 python3 scripts/flash_dual_boards.py
 ```
 
-### Manual Flashing Commands
-To flash a specific board individually:
+### Flashing boards individually
+To flash a specific board:
 
 ```bash
 # Flash Node 1 (Cardputer via native USB-JTAG)
@@ -32,22 +31,20 @@ bash scripts/flash.sh /dev/cu.usbmodem578E0184461 460800
 
 ---
 
-## 2. Hardware Quirks & Solutions
+## 2. Common hardware issues and fixes
 
-### A. CH343 / CH340 FIFO Buffer Overrun
-**Symptom**: During flash block upload, `esptool` encounters packet checksum errors or hangs at 1% to 15%:
-```
-A fatal error occurred: Packet content transfer stopped (received 8 bytes)
-```
-**Root Cause**: The CH343 USB-to-UART bridge on many DevKit boards has a limited hardware FIFO. Large 4KB write blocks overrun the receiver buffer.
+### CH343 and CH340 buffer overruns
+**Problem**: Flashing stalls at 1% or fails with `Packet content transfer stopped`.
 
-**Solution**:
+**Cause**: The CH343 USB-to-UART bridge on many dev boards drops packets when transfer blocks exceed 256 bytes.
+
+**Fix**:
 1. Limit RAM block transfer size to 256 bytes:
    ```python
    esptool.loader.ESPLoader.ESP_RAM_BLOCK = 256
    esptool.loader.StubMixin.FLASH_WRITE_SIZE = 256
    ```
-2. Inject a 1.5ms pacing delay between successive write packets:
+2. Add a 1.5 millisecond sleep between write blocks:
    ```python
    def paced_flash_block(self, data, seq, timeout=20.0, encrypted=False):
        res = orig_flash_block(self, data, seq, timeout=20.0, encrypted=encrypted)
@@ -55,24 +52,24 @@ A fatal error occurred: Packet content transfer stopped (received 8 bytes)
        return res
    ```
 
-### B. M5Stack Cardputer Power Switch & USB Detection
-**Symptom**: The Cardputer screen turns on and operates, but macOS does not show `/dev/cu.usbmodem2101` in `/dev/cu.*` or `ioreg`.
+### Cardputer power switch and USB enumeration
+**Problem**: The Cardputer screen lights up, but macOS does not show `/dev/cu.usbmodem2101`.
 
-**Root Cause**:
-1. The Cardputer has an internal 120mAh LiPo battery. When powered on via battery, the ESP32-S3 boots, but the native USB controller requires VBUS power from the USB-C cable to enumerate.
-2. The mechanical slide switch on the left edge controls the power rail. If the switch is DOWN (OFF), the USB controller is not powered even if the battery is supplying the screen.
+**Cause**:
+1. The Cardputer has a small battery. When running on battery alone, the native USB controller does not enumerate because it needs VBUS voltage from the cable.
+2. The mechanical switch on the left edge controls the power rail. If it is switched down, the USB controller stays unpowered.
 
-**Solution**:
-Push the slide switch **UP (ON)** and ensure the USB-C cable is fully seated into the recessed connector cutout.
+**Fix**:
+Push the slide switch UP and push the USB-C cable firmly into the recessed socket.
 
-### C. Native USB DTR/RTS Assertion Reset
-**Symptom**: Opening the serial port resets the board into ROM download mode instead of normal SPI boot:
+### Native USB reset into download mode
+**Problem**: Opening a serial connection resets the board into ROM download mode instead of normal boot:
 ```
 rst:0x15 (USB_UART_CHIP_RESET), boot:0x0 (DOWNLOAD_BOOT)
 ```
 
-**Solution**:
-Configure `dtr=False, rts=False` before opening the serial port with `pyserial`:
+**Fix**:
+Set `dtr=False, rts=False` before opening the port in Python:
 ```python
 import serial
 
@@ -86,18 +83,18 @@ s.open()
 
 ---
 
-## 3. ESP32-S3 Boot Strapping Modes
+## 3. Boot strap modes
 
-At power-on, the ESP32-S3 ROM prints the boot strap register. Decode values as follows:
+When the ESP32-S3 starts, the ROM prints its boot strap register. Use this table to check the mode:
 
-| Boot Register | Mode | Meaning | Expected State |
-| :--- | :--- | :--- | :--- |
-| `boot:0x8` | `SPI_FAST_FLASH_BOOT` | Normal production boot from SPI Flash | **Expected for Node 2** |
-| `boot:0x2b` | `SPI_FAST_FLASH_BOOT` | Production boot with USB-JTAG enabled | **Expected for Node 1** |
-| `boot:0x0` | `DOWNLOAD_BOOT` | ROM UART/USB flashing mode | Active only during flashing |
-| `boot:0x3` | `DOWNLOAD_BOOT` | Strap pin pulled LOW for flashing | Active only during flashing |
+| Boot value | Mode name | Status |
+| :--- | :--- | :--- |
+| `boot:0x8` | `SPI_FAST_FLASH_BOOT` | Normal SPI boot. Expected on Node 2. |
+| `boot:0x2b` | `SPI_FAST_FLASH_BOOT` | Normal boot with USB-JTAG active. Expected on Node 1. |
+| `boot:0x0` | `DOWNLOAD_BOOT` | ROM download mode. Used during flashing. |
+| `boot:0x3` | `DOWNLOAD_BOOT` | Strap pin pulled low. Used during flashing. |
 
-If the board remains stuck in `boot:0x0`, trigger a hard hardware reset by toggling RTS:
+If a board remains stuck in `boot:0x0`, toggle the RTS line to trigger a reboot:
 ```python
 s.rts = True
 time.sleep(0.1)

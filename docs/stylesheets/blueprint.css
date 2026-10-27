@@ -66,29 +66,9 @@ h1, h2, h3, h4, h5, h6 {
   background-color: var(--k32-card-bg);
   border: 1px solid var(--k32-wireframe-border);
   border-radius: 6px;
-  padding: 1.5rem;
-  margin: 1.5rem 0;
-  box-shadow: 0 4px 12px rgba(2, 132, 199, 0.05);
-  background-image: 
-    linear-gradient(var(--k32-grid-line) 1px, transparent 1px),
-    linear-gradient(90deg, var(--k32-grid-line) 1px, transparent 1px);
-  background-size: 24px 24px;
-}
-
-.blueprint-card::before {
-  content: "[ARCHITECTURAL SPECIFICATION]";
-  position: absolute;
-  top: -9px;
-  right: 14px;
-  font-family: var(--md-code-font);
-  font-size: 0.65rem;
-  font-weight: 600;
-  color: var(--k32-blue-primary);
-  background-color: var(--k32-card-bg);
-  padding: 0 6px;
-  border-radius: 3px;
-  border: 1px solid var(--k32-wireframe-border);
-  letter-spacing: 0.05em;
+  padding: 1.25rem 1.5rem;
+  margin: 1.25rem 0;
+  box-shadow: 0 2px 8px rgba(2, 132, 199, 0.04);
 }
 
 /* Technical Badges */

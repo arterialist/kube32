@@ -48,24 +48,24 @@ extra_javascript:
 
 nav:
   - Overview: index.md
-  - Getting Started:
-      - Quickstart Guide: quickstart.md
-      - Hardware Specifications: hardware-spec.md
-      - Flashing & Troubleshooting: flashing-troubleshooting.md
+  - Getting started:
+      - Quickstart guide: quickstart.md
+      - Hardware specifications: hardware-spec.md
+      - Flashing and troubleshooting: flashing-troubleshooting.md
   - Architecture:
-      - System Architecture: architecture/index.md
-      - Radix State Store: architecture/radix-store.md
-      - Autonomous Scheduler: architecture/scheduler.md
-      - Wasm3 Runtime Sandbox: architecture/wasm-runtime.md
-      - Capability Firewall: architecture/capability-firewall.md
-      - ESP-NOW Virtual Channel IPC: architecture/espnow-ipc.md
-  - Workloads & Tutorials:
-      - GPIO Peripheral Firewall: workloads/gpio-blinker.md
-      - Distributed TinyML Pipeline: workloads/distributed-pipeline.md
-      - Resource Quotas & OOM Handling: workloads/resource-limits.md
+      - System architecture: architecture/index.md
+      - Radix state store: architecture/radix-store.md
+      - Autonomous scheduler: architecture/scheduler.md
+      - Wasm3 runtime sandbox: architecture/wasm-runtime.md
+      - Capability firewall: architecture/capability-firewall.md
+      - Virtual channel IPC: architecture/espnow-ipc.md
+  - Workloads and tutorials:
+      - GPIO peripheral firewall: workloads/gpio-blinker.md
+      - Distributed TinyML pipeline: workloads/distributed-pipeline.md
+      - Resource limits and OOM handling: workloads/resource-limits.md
   - Reference:
-      - CLI Reference: cli-reference.md
-      - Kubernetes API Matrix: api-reference.md
+      - CLI reference: cli-reference.md
+      - Kubernetes API matrix: api-reference.md
 
 markdown_extensions:
   - admonition

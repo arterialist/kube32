@@ -1,41 +1,43 @@
-# Kubernetes API Matrix
+# Kubernetes API matrix
 
 <div class="blueprint-card">
-  <strong>API Target</strong>: Kubernetes Core API <code>v1</code> &amp; Apps API <code>apps/v1</code><br>
-  <strong>HTTP Engine</strong>: Embedded Micro-HTTP Server (Port 6443)<br>
-  <strong>Serialization Formats</strong>: Kubernetes <code>Table</code> (as=Table v1 meta.k8s.io) &amp; Standard JSON
+  <strong>Target APIs</strong>: Kubernetes Core API <code>v1</code> and Apps API <code>apps/v1</code>.<br>
+  <strong>Engine</strong>: Embedded HTTP server listening on port 6443.<br>
+  <strong>Representations</strong>: Kubernetes <code>Table</code> format (<code>as=Table;v=v1;g=meta.k8s.io</code>) and JSON.
 </div>
 
-Kube32 implements an RFC-compliant subset of the Kubernetes REST API, allowing standard clients (`kubectl`, `kube32-cli`, Go client-go) to interact with the physical microcontroller cluster.
+Standard Kubernetes tools (such as `kubectl` and the Go `client-go` library) communicate through REST endpoints including `/version`, `/api/v1/nodes`, `/api/v1/pods`, and `/apis/coordination.k8s.io/v1`. When you run `kubectl get nodes` or `kubectl get pods`, the client requests data formatted as a Kubernetes Table rather than a raw JSON list.
+
+Kube32 implements these endpoints directly on Core 0. You can interact with the physical microcontroller cluster using standard `kubectl` commands over the Wi-Fi network without requiring translation proxies.
 
 ---
 
-## Endpoint Compliance Matrix
+## Endpoint compliance matrix
 
-| Resource Category | HTTP Verb | Endpoint Path | Implementation Status |
+| Resource category | HTTP method | Endpoint path | Support level |
 | :--- | :--- | :--- | :--- |
-| **Discovery** | `GET` | `/version` | Fully Supported |
-| **Discovery** | `GET` | `/api` | Fully Supported |
-| **Discovery** | `GET` | `/apis` | Fully Supported |
-| **Discovery** | `GET` | `/api/v1` | Fully Supported |
-| **Discovery** | `GET` | `/apis/apps/v1` | Fully Supported |
-| **Discovery** | `GET` | `/apis/coordination.k8s.io/v1` | Fully Supported |
-| **Nodes** | `GET` | `/api/v1/nodes` | Fully Supported (Table &amp; JSON List) |
-| **Nodes** | `POST` | `/api/v1/nodes` | Fully Supported (Node Registration) |
-| **Nodes** | `GET` | `/api/v1/nodes/{name}` | Fully Supported |
-| **Nodes** | `PATCH` | `/api/v1/nodes/{name}/status` | Fully Supported (Heartbeat Status) |
-| **Pods** | `GET` | `/api/v1/pods` | Fully Supported (Cluster Collection) |
-| **Pods** | `GET` | `/api/v1/namespaces/{ns}/pods` | Fully Supported (Namespace Collection) |
-| **Pods** | `POST` | `/api/v1/namespaces/{ns}/pods` | Fully Supported (Pod Creation &amp; Scheduling) |
-| **Pods** | `GET` | `/api/v1/namespaces/{ns}/pods/{name}` | Fully Supported |
-| **Pods** | `DELETE` | `/api/v1/namespaces/{ns}/pods/{name}` | Fully Supported (Pod Eviction &amp; Cleanup) |
-| **Leases** | `GET`, `PUT`, `POST` | `/apis/coordination.k8s.io/v1/namespaces/{ns}/leases/{name}` | Fully Supported (Heartbeat Renewals) |
+| **Discovery** | `GET` | `/version` | Fully supported |
+| **Discovery** | `GET` | `/api` | Fully supported |
+| **Discovery** | `GET` | `/apis` | Fully supported |
+| **Discovery** | `GET` | `/api/v1` | Fully supported |
+| **Discovery** | `GET` | `/apis/apps/v1` | Fully supported |
+| **Discovery** | `GET` | `/apis/coordination.k8s.io/v1` | Fully supported |
+| **Nodes** | `GET` | `/api/v1/nodes` | Fully supported (Table and JSON list) |
+| **Nodes** | `POST` | `/api/v1/nodes` | Fully supported (Node registration) |
+| **Nodes** | `GET` | `/api/v1/nodes/{name}` | Fully supported |
+| **Nodes** | `PATCH` | `/api/v1/nodes/{name}/status` | Fully supported (Heartbeat status) |
+| **Pods** | `GET` | `/api/v1/pods` | Fully supported (Cluster-wide collection) |
+| **Pods** | `GET` | `/api/v1/namespaces/{ns}/pods` | Fully supported (Namespace collection) |
+| **Pods** | `POST` | `/api/v1/namespaces/{ns}/pods` | Fully supported (Pod creation and scheduling) |
+| **Pods** | `GET` | `/api/v1/namespaces/{ns}/pods/{name}` | Fully supported |
+| **Pods** | `DELETE` | `/api/v1/namespaces/{ns}/pods/{name}` | Fully supported (Pod termination and cleanup) |
+| **Leases** | `GET`, `PUT`, `POST` | `/apis/coordination.k8s.io/v1/namespaces/{ns}/leases/{name}` | Fully supported (Node lease renewals) |
 
 ---
 
-## Kubernetes `Table` Format Serialization
+## Kubernetes `Table` format serialization
 
-When standard `kubectl` queries endpoints, it requests the Kubernetes `Table` representation using HTTP content negotiation:
+When `kubectl` requests human-readable lists, it sends a content negotiation header:
 
 ```http
 GET /api/v1/nodes HTTP/1.1
@@ -43,7 +45,7 @@ Host: 192.168.4.1:6443
 Accept: application/json;as=Table;v=v1;g=meta.k8s.io
 ```
 
-Kube32 streams the response using a compact Table serializer:
+Kube32 streams the Table representation directly from its bump-allocated memory arena:
 
 ```json
 {
@@ -73,17 +75,17 @@ Kube32 streams the response using a compact Table serializer:
 
 ---
 
-## Interacting via Standard `kubectl`
+## Interacting with standard `kubectl`
 
-When associated with the `Kube32-Cluster` Wi-Fi network, standard `kubectl` commands work out-of-the-box:
+When your machine is connected to the `Kube32-Cluster` Wi-Fi network, `kubectl` commands run against the cluster directly:
 
 ```bash
 # Query nodes using standard kubectl
 kubectl --server=http://192.168.4.1:6443 get nodes -o wide
 
-# Query pods across all namespaces
+# List pods across all namespaces
 kubectl --server=http://192.168.4.1:6443 get pods
 
-# Submit a workload
+# Submit a workload manifest
 kubectl --server=http://192.168.4.1:6443 apply -f examples/gpio-blinker.yaml
 ```

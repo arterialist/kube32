@@ -1,21 +1,21 @@
-# Workload: Distributed TinyML Pipeline
+# Workload: Distributed TinyML pipeline
 
 <div class="blueprint-card">
   <strong>Manifest</strong>: <code>examples/distributed-pipeline.yaml</code><br>
-  <strong>Pattern</strong>: Coarse-Grained Pipeline Partitioning (Dataflow Architecture)<br>
-  <strong>Inter-Node Link</strong>: Virtual Channel <code>audio.features</code> over ESP-NOW 2.0 (CRC16-CCITT)
+  <strong>Pattern</strong>: Coarse-grained pipeline partitioning across two boards.<br>
+  <strong>Inter-node link</strong>: Virtual channel <code>audio.features</code> over ESP-NOW 2.0 with CRC16-CCITT.
 </div>
 
-This tutorial demonstrates a production-grade distributed computing pipeline running across two physical ESP32-S3 boards. 
+This guide walks through deploying a distributed dataflow pipeline split across two physical ESP32-S3 microcontrollers.
 
-Stage 1 captures audio sensor data on Node 1 and streams extracted MFCC feature vectors over ESP-NOW to Stage 2 on Node 2, which runs a TinyML wake-word classification model inside 2MB external Quad PSRAM.
+Stage 1 runs on Node 1 (Cardputer). It samples an analog audio input and extracts a 12-coefficient MFCC feature vector. Node 1 broadcasts these features over an ESP-NOW virtual channel. Stage 2 runs on Node 2 (DevKit with 2 MB PSRAM), receiving the feature stream and classifying wake words in external memory.
 
 ---
 
-## The Distributed Pipeline Manifest
+## Distributed pipeline manifest
 
 ```yaml
-# Stage 1: Audio/Sensor capture and feature extraction pod on Node 1
+# Stage 1: Audio capture and feature extraction pod on Node 1
 apiVersion: v1
 kind: Pod
 metadata:
@@ -45,7 +45,7 @@ spec:
         - name: KUBE32_IPC_CHANNEL
           value: "audio.features"
 ---
-# Stage 2: Classifier and action dispatcher pod on Node 2
+# Stage 2: TinyML classification pod on Node 2
 apiVersion: v1
 kind: Pod
 metadata:
@@ -78,41 +78,41 @@ spec:
 
 ---
 
-## Distributed Topology
+## Pipeline topology
 
 ```mermaid
 graph LR
     subgraph N1["Node 1: Cardputer (Master)"]
-        S1["Stage 1: audio-preprocessor<br/>(ADC1 Channel 0 Sampling)"]
-        EXTRACT["MFCC Feature Extractor<br/>(Energy + 12 Coefficients)"]
-        CH1["IPC Channel: audio.features"]
+        S1["Stage 1: audio-preprocessor<br/>ADC1 channel 0 sampling"]
+        EXTRACT["MFCC feature extractor<br/>Energy + 12 coefficients"]
+        CH1["IPC channel: audio.features"]
 
         S1 --> EXTRACT
         EXTRACT --> CH1
     end
 
-    subgraph RF["Physical 2.4GHz RF Air Interface"]
-        AIR["ESP-NOW 2.0 Wire Frame<br/>K32C Header + CRC16-CCITT<br/>Direct MAC: 02:00:00:00:00:01"]
+    subgraph RF["2.4 GHz RF link"]
+        AIR["ESP-NOW 2.0 wire frame<br/>K32C header and CRC16-CCITT<br/>Direct MAC: 02:00:00:00:00:01"]
     end
 
     subgraph N2["Node 2: DevKit (Worker)"]
-        CH2["IPC Channel: audio.features"]
-        PSRAM["2MB Quad PSRAM<br/>Tensor Workspace"]
-        TINYML["Stage 2: keyword-classifier<br/>TinyML Neural Classifier"]
+        CH2["IPC channel: audio.features"]
+        PSRAM["2 MB Quad PSRAM<br/>Tensor workspace"]
+        TINYML["Stage 2: keyword-classifier<br/>TinyML classifier"]
 
         CH2 --> PSRAM
         PSRAM --> TINYML
     end
 
-    CH1 ==>|"Over-the-Air Transmission"| AIR
-    AIR ==>|"Hardware ISR Ingest"| CH2
+    CH1 ==>|"Over-the-air transmission"| AIR
+    AIR ==>|"Hardware ISR ingest"| CH2
 ```
 
 ---
 
-## Deployment & Verification
+## Deploying the pipeline
 
-Apply the multi-pod pipeline to the cluster:
+Apply the manifest using `kube32-cli`:
 
 ```bash
 ./cli/kube32-cli --port /dev/cu.usbmodem2101 apply -f examples/distributed-pipeline.yaml
@@ -120,15 +120,17 @@ Apply the multi-pod pipeline to the cluster:
 
 Output:
 ```
-pod/audio-preprocessor applied successfully -> scheduled to [esp32-node-01] (HTTP 201)
-pod/keyword-classifier applied successfully -> scheduled to [esp32-node-02] (HTTP 201)
+pod/audio-preprocessor applied successfully -> scheduled to esp32-node-01 (HTTP 201)
+pod/keyword-classifier applied successfully -> scheduled to esp32-node-02 (HTTP 201)
 ```
 
-Query the cluster status to confirm distributed placement:
+Verify that the scheduler assigned each pod to its target board:
+
 ```bash
 ./cli/kube32-cli --port /dev/cu.usbmodem2101 status
 ```
 
+Output:
 ```
 === CLUSTER PODS ===
 NAMESPACE    NAME                     NODE             STATUS       MEMORY
@@ -139,25 +141,27 @@ default      keyword-classifier       esp32-node-02    Running      64Ki
 
 ---
 
-## Triggering Over-the-Air Pipeline Transmission
+## Triggering pipeline dataflow
 
-Trigger Stage 1 over-the-air ESP-NOW transmission directly via `kube32-cli`:
+Trigger the Stage 1 feature extraction and radio transmission over serial:
 
 ```bash
 ./cli/kube32-cli --port /dev/cu.usbmodem2101 pipeline
 ```
 
-### Live Node 1 (Master) Telemetry:
+### Node 1 master telemetry
+
 ```
-[PIPELINE-OTA-TX] Transmitting Stage 1 MFCC features (52 bytes) over ESP-NOW to Node 2 (02:00:00:00:00:01)...
-[PIPELINE-OTA-TX] ESP-NOW transmission result: 0 (0 = OK)
+PIPELINE-OTA-TX: Transmitting Stage 1 MFCC features (52 bytes) over ESP-NOW to Node 2 (02:00:00:00:00:01)...
+PIPELINE-OTA-TX: ESP-NOW transmission result: 0 (0 = OK)
 ```
 
-### Live Node 2 (Worker) Telemetry on Physical Silicon:
+### Node 2 worker telemetry
+
 ```
-[PIPELINE-OTA-RX] Accepted live RF packet from esp32-node-01 (52 bytes)
-[PIPELINE-OTA-RX] Energy Level: 0.875 | Features: [1.25, -0.42, 0.91, 2.14, ...]
-[PIPELINE-PSRAM] Allocated TinyML feature tensor at 0x3c018240 in 2MB Quad PSRAM
-[PIPELINE-PSRAM] TinyML Inference on PSRAM -> Keyword 'WAKE_WORD_DETECTED' (confidence: 99.1%)
-[PIPELINE-PSRAM] Distributed Pipeline Silicon Execution: COMPLETE & VERIFIED
+PIPELINE-OTA-RX: Accepted live RF packet from esp32-node-01 (52 bytes)
+PIPELINE-OTA-RX: Energy Level: 0.875 | Features: 1.25, -0.42, 0.91, 2.14, ...
+PIPELINE-PSRAM: Allocated TinyML feature tensor at 0x3c018240 in 2MB Quad PSRAM
+PIPELINE-PSRAM: TinyML inference on PSRAM -> keyword 'WAKE_WORD_DETECTED' (confidence: 99.1%)
+PIPELINE-PSRAM: Distributed pipeline silicon execution: COMPLETE & VERIFIED
 ```

@@ -1,81 +1,87 @@
-# Autonomous Scheduler
+# Autonomous scheduler
 
 <div class="blueprint-card">
   <strong>Component</strong>: <code>kube32::scheduler::AutonomousScheduler</code><br>
-  <strong>Scoring Strategy</strong>: <code>LeastAllocated</code> (Prioritizes nodes with greatest unused memory headroom)<br>
-  <strong>Filter Predicates</strong>: Node Selector, Architecture Match, Memory Limits, Peripheral Quotas (GPIO/ADC)
+  <strong>Scoring algorithm</strong>: <code>LeastAllocated</code> (prefers nodes with the most free memory).<br>
+  <strong>Filter checks</strong>: Node selector, architecture, memory limits, and hardware pins (GPIO, ADC).
 </div>
 
-The Kube32 Autonomous Scheduler operates on Xtensa Core 0, running a continuous reconciliation loop that binds pending Pods to optimal physical hardware nodes.
+In Kubernetes, `kube-scheduler` watches for pods that lack an assigned node, filters out nodes that do not meet requirements, scores the survivors, and writes an assignment back to the store.
+
+On microcontroller clusters, scheduling decisions must account for physical hardware differences. An ESP32-S3 without external PSRAM has only 320 KB to 512 KB of internal SRAM. A dev board with Quad PSRAM has 2 MB to 8 MB of RAM. Different boards also expose different GPIO pins. Kube32 runs a continuous reconciliation loop on Core 0 that evaluates pending pods every second against these constraints.
 
 ---
 
-## Two-Phase Scheduling Algorithm
+## Two-phase scheduling algorithm
 
 ```mermaid
 graph TD
-    POD["Incoming Pod Manifest<br/>Phase: Pending"] --> PRED["Phase 1: Predicate Filtering"]
+    POD["Pending pod manifest"] --> PRED["Phase 1: Filter predicates"]
 
-    subgraph Filters["Filter Predicates"]
-        F1["NodeSelector Filter<br/>kubernetes.io/hostname<br/>kubernetes.io/arch"]
-        F2["Memory Headroom Filter<br/>Requested <= Allocatable"]
-        F3["Hardware Capability Filter<br/>GPIO / ADC availability"]
+    subgraph Filters["Predicate filters"]
+        F1["Node selector filter<br/>kubernetes.io/arch<br/>kubernetes.io/hostname"]
+        F2["Memory capacity filter<br/>requested <= allocatable"]
+        F3["Hardware capability filter<br/>GPIO and ADC pins available"]
     end
 
     PRED --> F1
     F1 --> F2
     F2 --> F3
 
-    F3 --> CANDIDATES{"Qualified Candidates?"}
-    CANDIDATES -->|No| REJECT["Pod Remains in Pending<br/>Reason: Unschedulable"]
-    CANDIDATES -->|Yes| SCORE["Phase 2: Priority Scoring"]
+    F3 --> CANDIDATES{"Qualified candidates?"}
+    CANDIDATES -->|No| REJECT["Pod stays Pending<br/>Reason: Unschedulable"]
+    CANDIDATES -->|Yes| SCORE["Phase 2: LeastAllocated scoring"]
 
-    subgraph Scoring["LeastAllocated Scoring"]
-        S1["Score = (Free_Memory / Total_Memory) * 100"]
+    subgraph Scoring["Scoring logic"]
+        S1["Score = (Free memory / Total allocatable) * 100"]
     end
 
     SCORE --> S1
-    S1 --> WINNER["Select Highest-Scoring Node"]
-    WINNER --> BIND["Atomic Binding<br/>spec.nodeName = WINNER"]
+    S1 --> WINNER["Select node with highest score"]
+    WINNER --> BIND["Atomic bind<br/>Set spec.nodeName = WINNER"]
 ```
 
 ---
 
-## Phase 1: Predicate Filtering
+## Phase 1: Filter predicates
 
-Each registered node is checked against strict feasibility conditions:
+The scheduler tests candidate nodes against four feasibility checks:
 
-1. **Architecture Predicate**: Ensures the pod's `nodeSelector` matches the Xtensa LX7 processor architecture (`kubernetes.io/arch: xtensa`).
-2. **Hostname Affinity**: If the pod specifies an explicit `kubernetes.io/hostname: esp32-node-02`, other nodes are immediately disqualified.
-3. **Memory Capacity**: Compares `pod.spec.containers[0].resources.requests.memory` against the node's allocatable memory:
-   - Node 1: 400 KiB allocatable SRAM
-   - Node 2: 2048 KiB allocatable PSRAM
-4. **Peripheral Quotas**: Evaluates requested hardware peripherals (e.g. `hardware.kube32.io/gpio: "1"` or `hardware.kube32.io/adc: "1"`).
+1. **Architecture predicate**: Verifies that the pod's `nodeSelector` matches the Xtensa LX7 processor architecture (`kubernetes.io/arch: xtensa`).
+2. **Hostname affinity**: If the pod sets an explicit `kubernetes.io/hostname` such as `esp32-node-02`, all other nodes are disqualified immediately.
+3. **Memory capacity**: Checks whether `pod.spec.containers[0].resources.requests.memory` fits within the node's allocatable memory:
+   - Node 1: 400 KB allocatable SRAM
+   - Node 2: 2,048 KB allocatable PSRAM
+4. **Hardware peripheral quotas**: Checks that requested peripherals (such as `hardware.kube32.io/gpio: "1"` or `hardware.kube32.io/adc: "1"`) are present and not already locked by another running pod.
 
 ---
 
-## Phase 2: LeastAllocated Priority Scoring
+## Phase 2: LeastAllocated scoring
 
-When multiple nodes pass the predicate filter, Kube32 prioritizes the node with the highest unallocated memory percentage:
+If more than one node satisfies all predicate filters, the scheduler prioritizes the node with the highest percentage of unallocated memory:
 
 $$\text{Score}(N) = \left( \frac{\text{AllocatableMemory}(N) - \text{RequestedMemory}(N)}{\text{AllocatableMemory}(N)} \right) \times 100$$
 
-### Example Placement Calculation
+### Placement example
 
-Suppose a pod requests `memory: 32Ki`:
+Suppose a pod requests 32 KB of memory:
 
-| Candidate Node | Total Allocatable | Currently Allocated | Free Memory | Score | Verdict |
+| Candidate node | Total allocatable | Currently allocated | Free memory | Score | Result |
 | :--- | :--- | :--- | :--- | :--- | :--- |
-| **Node 1 (Cardputer)** | 400 KiB | 64 KiB | 336 KiB | **84.0** | |
-| **Node 2 (DevKit + PSRAM)** | 2048 KiB | 48 KiB | 2000 KiB | **97.6** | **WINNER (Selected)** |
+| **Node 1 (Cardputer)** | 400 KB | 64 KB | 336 KB | 84.0 | Discarded |
+| **Node 2 (DevKit with PSRAM)** | 2,048 KB | 48 KB | 2,000 KB | 97.6 | **Selected** |
 
-Node 2 is selected because its 2MB external PSRAM provides higher headroom, preserving internal SRAM on Node 1 for control-plane operations.
+Node 2 receives the pod because its 2 MB external PSRAM provides wider headroom, saving Node 1's internal SRAM for API server connections and packet routing.
 
 ---
 
-## Quota Enforcement & Unschedulable States
+## Unschedulable workloads
 
-If a pod requests resources exceeding all cluster nodes (e.g. `memory: 1024Ki` when targeted to Node 1):
-1. The scheduler leaves `spec.nodeName` empty (`<none>`).
+If a workload requests resources exceeding all cluster nodes (such as requesting 1,024 KB of RAM when pinned to Node 1):
+
+1. The scheduler leaves `spec.nodeName` blank.
 2. The pod status remains `phase: Pending`.
-3. The scheduler emits a warning event: `0/2 nodes are available: 1 Insufficient memory, 1 nodeSelector mismatch`.
+3. The scheduler emits a warning event:
+   ```
+   0/2 nodes are available: 1 insufficient memory, 1 nodeSelector mismatch.
+   ```
