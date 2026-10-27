@@ -483,6 +483,10 @@ body {
 
 /* Desktop layout order: Title -> Search -> Theme Switch -> GitHub Repo */
 @media screen and (min-width: 60em) {
+  /* Hamburger drawer toggle is strictly unnecessary on desktop (tabs are present) */
+  .md-header__button[for="__drawer"] {
+    display: none !important;
+  }
   .md-header__button[for="__search"] {
     display: none !important;
   }
@@ -497,6 +501,283 @@ body {
     order: 3 !important;
     margin-left: var(--s-1) !important;
   }
+  .md-search__inner {
+    position: relative !important;
+    width: 14rem !important;
+    transition: width var(--dur-spatial) var(--ease-spatial) !important;
+  }
+  [data-md-toggle="search"]:checked ~ .md-header .md-search__inner {
+    width: 26rem !important;
+  }
+}
+
+/* ==============================================================================
+   Material 3 Modal Navigation Drawer & Top App Bar (Mobile Viewports)
+   Specification: Google Material 3 Navigation Drawer (m3.material.io)
+   ============================================================================== */
+@media screen and (max-width: 59.9375em) {
+  /* Mobile Top App Bar */
+  .md-header__inner {
+    padding: 0 var(--s-2) !important;
+    gap: var(--s-1) !important;
+  }
+
+  .md-header__button[for="__drawer"] {
+    display: inline-flex !important;
+    order: -1 !important; /* Leftmost */
+  }
+
+  .md-header__button.md-logo {
+    display: none !important; /* Mobile uses clean hamburger + title pattern */
+  }
+
+  .md-header__title {
+    display: flex !important;
+    align-items: center !important;
+    flex-grow: 1 !important;
+    margin: 0 var(--s-2) !important;
+  }
+
+  .md-header__title .md-header__ellipsis {
+    display: flex !important;
+    align-items: center !important;
+    height: 40px !important;
+  }
+
+  .md-header__title .md-header__topic {
+    position: static !important;
+    opacity: 1 !important;
+    transform: none !important;
+    font-family: var(--font-sans) !important;
+    font-weight: 600 !important;
+    font-size: 1.15rem !important;
+    color: var(--on-surface) !important;
+    letter-spacing: -0.01em !important;
+  }
+
+  .md-header__title .md-header__topic + .md-header__topic {
+    display: none !important;
+  }
+
+  .md-header__option {
+    order: 1 !important;
+  }
+
+  .md-header__button[for="__search"] {
+    display: inline-flex !important;
+    order: 2 !important;
+  }
+
+  .md-header__source {
+    display: none !important; /* Concealed from compact topbar, accessible inside drawer */
+  }
+
+  /* Modal Navigation Drawer Container Sheet */
+  .md-sidebar--primary {
+    position: fixed !important;
+    top: 0 !important;
+    left: calc(-1 * min(340px, 86vw)) !important;
+    width: min(340px, 86vw) !important;
+    max-width: 360px !important;
+    height: 100% !important;
+    z-index: 100 !important;
+    background-color: var(--surface-container-low) !important;
+    border-radius: 0 28px 28px 0 !important;
+    border-right: 1px solid var(--outline-variant) !important;
+    box-shadow: 0 8px 36px rgba(0, 0, 0, 0.45) !important;
+    overflow: hidden !important;
+    transition: transform var(--dur-spatial) var(--ease-spatial) !important;
+  }
+
+  [data-md-toggle="drawer"]:checked ~ .md-container .md-sidebar--primary {
+    transform: translateX(min(340px, 86vw)) !important;
+  }
+
+  .md-sidebar--primary .md-sidebar__scrollwrap {
+    background-color: var(--surface-container-low) !important;
+    border-radius: 0 28px 28px 0 !important;
+    height: 100% !important;
+  }
+
+  /* Scrim Backdrop */
+  .md-overlay {
+    background-color: var(--scrim) !important;
+    backdrop-filter: blur(4px) !important;
+    -webkit-backdrop-filter: blur(4px) !important;
+    transition: opacity var(--dur-effects) var(--ease-effects) !important;
+  }
+
+  /* Drawer Header */
+  .md-nav--primary .md-nav__title[for="__drawer"] {
+    position: relative !important;
+    height: 68px !important;
+    padding: 0 var(--s-5) !important;
+    display: flex !important;
+    align-items: center !important;
+    gap: var(--s-3) !important;
+    background-color: var(--surface-container-low) !important;
+    color: var(--on-surface) !important;
+    border-bottom: 1px solid var(--outline-variant) !important;
+    box-shadow: none !important;
+    font-family: var(--font-sans) !important;
+    font-size: 1.15rem !important;
+    font-weight: 600 !important;
+    letter-spacing: -0.01em !important;
+    text-transform: none !important;
+  }
+
+  .md-nav--primary .md-nav__title .md-logo {
+    position: static !important;
+    display: inline-flex !important;
+    align-items: center !important;
+    justify-content: center !important;
+    width: 36px !important;
+    height: 36px !important;
+    margin: 0 !important;
+    padding: 0 !important;
+    border-radius: var(--r-full) !important;
+    background-color: var(--surface-container-high) !important;
+    color: var(--primary) !important;
+  }
+
+  .md-nav--primary .md-nav__title .md-logo svg {
+    width: 20px !important;
+    height: 20px !important;
+    fill: currentColor !important;
+  }
+
+  /* Drawer Repository Link Strip */
+  .md-nav__source {
+    background-color: var(--surface-container) !important;
+    color: var(--on-surface-variant) !important;
+    border-bottom: 1px solid var(--outline-variant) !important;
+    padding: var(--s-3) var(--s-5) !important;
+    display: flex !important;
+    align-items: center !important;
+  }
+
+  .md-nav__source .md-source {
+    color: var(--on-surface-variant) !important;
+    font-family: var(--font-sans) !important;
+    font-size: 13.5px !important;
+    font-weight: 500 !important;
+    display: flex !important;
+    align-items: center !important;
+  }
+
+  .md-nav__source .md-source__repository {
+    max-width: none !important;
+    white-space: nowrap !important;
+    overflow: visible !important;
+  }
+
+  /* Drawer List Container */
+  .md-nav--primary .md-nav__list {
+    padding: var(--s-3) var(--s-2) !important;
+    background-color: var(--surface-container-low) !important;
+    box-shadow: none !important;
+    border: none !important;
+  }
+
+  /* Suppress duplicate link when table of contents toggle is present */
+  .md-nav--primary .md-nav__link[for="__toc"] + .md-nav__link {
+    display: none !important;
+  }
+
+  /* Drawer Individual Items - M3 Floating Pills */
+  .md-nav--primary .md-nav__item {
+    border: none !important;
+    box-shadow: none !important;
+    padding: 0 !important;
+    margin: 4px 0 !important;
+  }
+
+  .md-nav--primary .md-nav__link {
+    display: flex !important;
+    align-items: center !important;
+    min-height: 48px !important;
+    height: 48px !important;
+    padding: 0 var(--s-4) !important;
+    margin: 0 !important;
+    border-radius: var(--r-full) !important;
+    font-family: var(--font-sans) !important;
+    font-size: 14px !important;
+    font-weight: 500 !important;
+    color: var(--on-surface-variant) !important;
+    border: none !important;
+    box-shadow: none !important;
+    transition: background-color var(--dur-effects-fast) var(--ease-effects),
+                color var(--dur-effects-fast) var(--ease-effects) !important;
+  }
+
+  .md-nav--primary .md-nav__link:hover {
+    background-color: color-mix(in srgb, var(--on-surface) 8%, transparent) !important;
+    color: var(--on-surface) !important;
+  }
+
+  /* Active Drawer Item - Authentic M3 Secondary Container Pill */
+  .md-nav--primary .md-nav__item--active > .md-nav__link {
+    background-color: var(--secondary-container) !important;
+    color: var(--on-secondary-container) !important;
+    font-weight: 600 !important;
+    border-radius: var(--r-full) !important;
+    box-shadow: none !important;
+  }
+
+  /* Nested Sub-lists */
+  .md-nav--primary .md-nav__item--nested > .md-nav > .md-nav__list {
+    padding: 4px 0 4px var(--s-3) !important;
+    border-left: 2px solid var(--outline-variant) !important;
+    margin-left: 20px !important;
+  }
+
+  .md-nav--primary .md-nav__item--nested > .md-nav > .md-nav__list .md-nav__link {
+    height: 42px !important;
+    min-height: 42px !important;
+    font-size: 13.5px !important;
+    margin: 2px 0 !important;
+  }
+
+  .md-nav--primary .md-nav__item--nested > .md-nav > .md-nav__list .md-nav__item--active > .md-nav__link {
+    background-color: var(--secondary-container) !important;
+    color: var(--on-secondary-container) !important;
+    font-weight: 600 !important;
+    border-radius: var(--r-full) !important;
+  }
+
+  /* Full Screen M3 Search Overlay on Mobile */
+  [data-md-toggle="search"]:checked ~ .md-header .md-search {
+    position: fixed !important;
+    top: 0 !important;
+    left: 0 !important;
+    width: 100vw !important;
+    height: 100vh !important;
+    z-index: 100 !important;
+    background-color: var(--surface) !important;
+    display: flex !important;
+    flex-direction: column !important;
+    padding: 0 !important;
+  }
+
+  [data-md-toggle="search"]:checked ~ .md-header .md-search__inner {
+    width: 100% !important;
+    padding: var(--s-3) var(--s-4) !important;
+    box-sizing: border-box !important;
+  }
+
+  [data-md-toggle="search"]:checked ~ .md-header .md-search__output {
+    position: relative !important;
+    top: 0 !important;
+    width: 100% !important;
+    flex-grow: 1 !important;
+    border: none !important;
+    box-shadow: none !important;
+  }
+
+  [data-md-toggle="search"]:checked ~ .md-header .md-search__scrollwrap {
+    width: 100% !important;
+    max-height: calc(100vh - 80px) !important;
+  }
 }
 
 /* ==============================================================================
@@ -509,19 +790,12 @@ body {
 }
 
 .md-search__inner {
-  position: relative !important;
   background: transparent !important;
   border-radius: var(--r-full) !important;
   box-shadow: none !important;
   outline: none !important;
   border: none !important;
   padding: 0 !important;
-  width: 14rem !important;
-  transition: width var(--dur-spatial) var(--ease-spatial) !important;
-}
-
-[data-md-toggle="search"]:checked ~ .md-header .md-search__inner {
-  width: 26rem !important;
 }
 
 .md-search__form {
@@ -798,9 +1072,9 @@ body {
 }
 
 .md-nav__item--active > .md-nav__link {
-  color: var(--primary) !important;
+  color: var(--on-secondary-container) !important;
   font-weight: 600 !important;
-  background-color: var(--surface-container-high) !important;
+  background-color: var(--secondary-container) !important;
 }
 
 .md-nav__title {
