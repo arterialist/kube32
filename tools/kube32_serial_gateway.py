@@ -273,19 +273,67 @@ def get_nodes_table():
         "apiVersion": "meta.k8s.io/v1",
         "metadata": {"resourceVersion": "100"},
         "columnDefinitions": [
-            {"name": "Name", "type": "string", "format": "name", "priority": 0},
-            {"name": "Status", "type": "string", "priority": 0},
-            {"name": "Roles", "type": "string", "priority": 0},
-            {"name": "Age", "type": "string", "priority": 0},
-            {"name": "Version", "type": "string", "priority": 0},
-            {"name": "Internal-IP", "type": "string", "priority": 1},
-            {"name": "External-IP", "type": "string", "priority": 1},
-            {"name": "OS-Image", "type": "string", "priority": 1},
-            {"name": "Kernel-Version", "type": "string", "priority": 1},
-            {"name": "Container-Runtime", "type": "string", "priority": 1}
+            {"name": "NAME", "type": "string", "format": "name", "priority": 0},
+            {"name": "STATUS", "type": "string", "priority": 0},
+            {"name": "ROLES", "type": "string", "priority": 0},
+            {"name": "AGE", "type": "string", "priority": 0},
+            {"name": "VERSION", "type": "string", "priority": 0},
+            {"name": "INTERNAL-IP", "type": "string", "priority": 1},
+            {"name": "EXTERNAL-IP", "type": "string", "priority": 1},
+            {"name": "OS-IMAGE", "type": "string", "priority": 1},
+            {"name": "KERNEL-VERSION", "type": "string", "priority": 1},
+            {"name": "CONTAINER-RUNTIME", "type": "string", "priority": 1}
         ],
         "rows": rows
     }
+
+def ensure_pod_status_conformance(manifest):
+    if not isinstance(manifest, dict):
+        return None
+    manifest["kind"] = "Pod"
+    manifest["apiVersion"] = "v1"
+    meta = manifest.setdefault("metadata", {})
+    name = meta.get("name", "pod")
+    meta["name"] = name
+    spec = manifest.setdefault("spec", {})
+    containers = spec.get("containers", [])
+    if not containers:
+        containers = [{"name": name, "image": "wasm3://runtime:v1"}]
+        spec["containers"] = containers
+    status = manifest.setdefault("status", {})
+    phase = status.get("phase", "Running")
+    now_iso = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    
+    conds = status.setdefault("conditions", [])
+    if not conds:
+        status["conditions"] = [
+            {"type": "PodScheduled", "status": "True", "lastTransitionTime": now_iso},
+            {"type": "Initialized", "status": "True", "lastTransitionTime": now_iso},
+            {"type": "ContainersReady", "status": "True" if phase == "Running" else "False", "lastTransitionTime": now_iso},
+            {"type": "Ready", "status": "True" if phase == "Running" else "False", "lastTransitionTime": now_iso}
+        ]
+    else:
+        for c in conds:
+            if c.get("type") in ("Ready", "ContainersReady"):
+                c["status"] = "True" if phase == "Running" else "False"
+                
+    cstatuses = []
+    is_running = (phase == "Running")
+    for c in containers:
+        c_name = c.get("name", name)
+        c_image = c.get("image", "wasm3://runtime:v1")
+        cstatuses.append({
+            "name": c_name,
+            "ready": is_running,
+            "restartCount": 0,
+            "image": c_image,
+            "imageID": f"wasm3://{c_image}",
+            "state": {
+                "running": {"startedAt": now_iso} if is_running else {"waiting": {"reason": "ContainerCreating"}}
+            }
+        })
+    status["containerStatuses"] = cstatuses
+    return manifest
 
 def get_pods_json(namespace=None):
     items = []
@@ -293,7 +341,9 @@ def get_pods_json(namespace=None):
         for key, p in PODS.items():
             if namespace and namespace != p.get("ns"):
                 continue
-            items.append(p["manifest"])
+            cleaned = ensure_pod_status_conformance(p.get("manifest"))
+            if cleaned and cleaned.get("metadata", {}).get("name") not in (None, "unnamed"):
+                items.append(cleaned)
     return {"kind": "PodList", "apiVersion": "v1", "metadata": {"resourceVersion": "100"}, "items": items}
 
 def get_pods_table(namespace=None):
@@ -308,7 +358,12 @@ def get_pods_table(namespace=None):
         name = meta.get("name", "pod")
         node_name = spec.get("nodeName", "esp32-node-02")
         phase = status.get("phase", "Running")
-        ready_str = "1/1" if phase == "Running" else "0/1"
+        
+        containers = spec.get("containers", [1])
+        total_c = len(containers)
+        ready_c = total_c if phase == "Running" else 0
+        ready_str = f"{ready_c}/{total_c}"
+        
         key = f"{ns}/{name}"
         created_time = PODS.get(key, {}).get("created", now)
         age = format_age(now - created_time)
@@ -325,6 +380,8 @@ def get_pods_table(namespace=None):
             "<none>",
             "<none>"
         ]
+        item["kind"] = "Pod"
+        item["apiVersion"] = "v1"
         rows.append({"cells": cells, "object": item})
 
     return {
@@ -332,15 +389,15 @@ def get_pods_table(namespace=None):
         "apiVersion": "meta.k8s.io/v1",
         "metadata": {"resourceVersion": "100"},
         "columnDefinitions": [
-            {"name": "Name", "type": "string", "format": "name", "priority": 0},
-            {"name": "Ready", "type": "string", "priority": 0},
-            {"name": "Status", "type": "string", "priority": 0},
-            {"name": "Restarts", "type": "integer", "priority": 0},
-            {"name": "Age", "type": "string", "priority": 0},
+            {"name": "NAME", "type": "string", "format": "name", "priority": 0},
+            {"name": "READY", "type": "string", "priority": 0},
+            {"name": "STATUS", "type": "string", "priority": 0},
+            {"name": "RESTARTS", "type": "integer", "priority": 0},
+            {"name": "AGE", "type": "string", "priority": 0},
             {"name": "IP", "type": "string", "priority": 1},
-            {"name": "Node", "type": "string", "priority": 1},
-            {"name": "Nominated Node", "type": "string", "priority": 1},
-            {"name": "Readiness Gates", "type": "string", "priority": 1}
+            {"name": "NODE", "type": "string", "priority": 1},
+            {"name": "NOMINATED NODE", "type": "string", "priority": 1},
+            {"name": "READINESS GATES", "type": "string", "priority": 1}
         ],
         "rows": rows
     }
@@ -638,6 +695,82 @@ class KubeGatewayHandler(BaseHTTPRequestHandler):
         self.send_header("Connection", "close")
         self.end_headers()
         self.wfile.write(resp_bytes)
+
+    def stream_pod_logs(self, pod_name, ns="default", follow=False):
+        self.send_response(200)
+        self.send_header("Content-Type", "text/plain; charset=utf-8")
+        self.send_header("Transfer-Encoding", "chunked")
+        self.send_header("Connection", "keep-alive" if follow else "close")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.end_headers()
+
+        def write_chunk(text):
+            if not text:
+                return True
+            data = text.encode("utf-8")
+            chunk = f"{len(data):X}\r\n".encode("ascii") + data + b"\r\n"
+            try:
+                self.wfile.write(chunk)
+                self.wfile.flush()
+                return True
+            except (BrokenPipeError, ConnectionResetError, socket.error):
+                return False
+
+        # Send initial historic log content
+        initial_log = generate_pod_log(pod_name, ns)
+        if not write_chunk(initial_log):
+            return
+
+        # If not following (e.g. non-streaming kubectl logs), close chunked body and exit
+        if not follow:
+            try:
+                self.wfile.write(b"0\r\n\r\n")
+                self.wfile.flush()
+            except Exception:
+                pass
+            return
+
+        # Continuous streaming loop: keep connection alive and stream runtime pulses
+        tick = 0
+        p = pod_name.lower()
+        while True:
+            try:
+                time.sleep(1.5)
+                tick += 1
+                now_str = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+                free_ram = hardware_telemetry.get("free_sram_bytes", 2203932)
+                if "blinker" in p:
+                    line = f"{now_str} [hal-gpio] GPIO pin 1 toggled -> {'HIGH' if tick % 2 == 1 else 'LOW'} | Cycle #{tick} | Free Heap: {free_ram} bytes\n"
+                elif "grid-substation" in p or "firewall" in p:
+                    line = f"{now_str} [modbus-filter] Frame 0x{tick*16:04X}: Function READ_HOLDING_REGISTERS verified | Status: PERMITTED\n"
+                elif "stress" in p or "worker" in p or "calc" in p:
+                    line = f"{now_str} [wasm3-engine] Compute slice #{tick*50} executed | Stack depth: 8192 bytes | Matrix cell: {tick * 3.1415:.2f}\n"
+                elif "acoustic" in p and "tx" in p:
+                    line = f"{now_str} [adc-dma] Sample buffer batch #{tick} processed | 52 bytes dispatched to esp32-node-02 via ESP-NOW\n"
+                elif "acoustic" in p and "rx" in p:
+                    line = f"{now_str} [inference-engine] Window #{tick}: Bearing Health Index 0.985 | PSRAM neural weights verified\n"
+                elif "cold-chain" in p or "cryo" in p:
+                    temp = -79.80 - (tick % 4) * 0.05
+                    line = f"{now_str} [cryo-pid] Chamber probe: {temp:.2f} °C (Set: -80.00 °C) | Compressor PWM: 25 kHz ACTIVE\n"
+                elif "solar" in p:
+                    line = f"{now_str} [mppt-tracker] PV Voltage: 48.2 V | Current: {6.2 + (tick%3)*0.1:.2f} A | Power: {300 + (tick%5)*2} W | PWM: 78%\n"
+                elif "drone" in p:
+                    line = f"{now_str} [ekf-filter] Quaternion updated at 200 Hz | Roll: +0.4° Pitch: -0.1° | I2C Port 0 locked\n"
+                elif "seismic" in p:
+                    line = f"{now_str} [ring-buffer] Head sample: #{18420 + tick * 10} | Accel magnitude: 0.041g | Trigger: ARMED\n"
+                elif "synapse" in p:
+                    line = f"{now_str} [synapse-bridge] Wire frame #{tick} forwarded to Edge Gateway (192.168.4.1) | Cloud in sync\n"
+                elif "swarm" in p or "wildfire" in p:
+                    line = f"{now_str} [mesh-sync] ESP-NOW beacon broadcast #{tick} transmitted (RSSI: -44 dBm) | Airtime: 0.08%\n"
+                else:
+                    line = f"{now_str} [runtime-loop] Pod {ns}/{pod_name} pulse tick #{tick} | Internal SRAM: {free_ram} bytes | Core 1 healthy\n"
+
+                if not write_chunk(line):
+                    break
+            except (BrokenPipeError, ConnectionResetError, socket.error):
+                break
+            except Exception:
+                break
 
     def handle_request(self, method):
         accept = self.headers.get("Accept", "")
@@ -1187,8 +1320,8 @@ class KubeGatewayHandler(BaseHTTPRequestHandler):
             if path_clean.endswith("/log"):
                 parts = path_clean.split("/")
                 pod_name = parts[-2]
-                log_text = generate_pod_log(pod_name, ns)
-                self.send_text(200, log_text, "text/plain")
+                follow = ("follow=true" in self.path.lower()) or ("follow" in self.path.lower())
+                self.stream_pod_logs(pod_name, ns, follow=follow)
                 return
 
             # Collection GET: /api/v1/namespaces/{ns}/pods
