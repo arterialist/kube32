@@ -385,55 +385,149 @@ static const gpio_num_t KB_ROWS[] = {
     (gpio_num_t)5, (gpio_num_t)6, (gpio_num_t)7
 };
 
-// Keymap: 8 columns x 7 rows
-static const char KEYMAP[8][7] = {
-    { '`', '1', '2', '3', '4', '5', '6' },
-    { '7', '8', '9', '0', '-', '=', '\b' },
-    { '\t', 'q', 'w', 'e', 'r', 't', 'y' },
-    { 'u', 'i', 'o', 'p', '[', ']', '\\' },
-    { 'a', 's', 'd', 'f', 'g', 'h', 'j' },
-    { 'k', 'l', ';', '\'', '\n', 'z', 'x' },
-    { 'c', 'v', 'b', 'n', 'm', ',', '.' },
-    { '/', ' ', ' ', ' ', ' ', ' ', ' ' }
+struct KeyMapChart_t {
+    uint8_t x_1;
+    uint8_t x_2;
+};
+
+static const KeyMapChart_t X_MAP_CHART[7] = {
+    {0, 1}, {2, 3}, {4, 5}, {6, 7}, {8, 9}, {10, 11}, {12, 13}
+};
+
+static const char KEYMAP_NORMAL[4][14] = {
+    { '`', '1', '2', '3', '4', '5', '6', '7', '8', '9', '0', '-', '=', '\b' },
+    { '\t', 'q', 'w', 'e', 'r', 't', 'y', 'u', 'i', 'o', 'p', '[', ']', '\\' },
+    { 0,    0,   'a', 's', 'd', 'f', 'g', 'h', 'j', 'k', 'l', ';', '\'', '\n' },
+    { 0,    0,   0,   'z', 'x', 'c', 'v', 'b', 'n', 'm', ',', '.', '/', ' '  }
+};
+
+static const char KEYMAP_SHIFTED[4][14] = {
+    { '~', '!', '@', '#', '$', '%', '^', '&', '*', '(', ')', '_', '+', '\b' },
+    { '\t', 'Q', 'W', 'E', 'R', 'T', 'Y', 'U', 'I', 'O', 'P', '{', '}', '|' },
+    { 0,    0,   'A', 'S', 'D', 'F', 'G', 'H', 'J', 'K', 'L', ':', '"', '\n' },
+    { 0,    0,   0,   'Z', 'X', 'C', 'V', 'B', 'N', 'M', '<', '>', '?', ' '  }
+};
+
+struct KeyCoord {
+    int x;
+    int y;
 };
 
 static void keyboard_task(void* pvParameters) {
     (void)pvParameters;
-    char prev_key = '\0';
+    static char prev_keys[16] = {0};
+    static int prev_key_count = 0;
 
     while (true) {
-        char detected = '\0';
+        KeyCoord active_coords[16];
+        int active_count = 0;
 
-        // Scan 8 columns using 74HC138 demux (A0=8, A1=9, A2=11)
-        for (int col = 0; col < 8; ++col) {
-            gpio_set_level((gpio_num_t)PIN_KB_A0, (col & 1));
-            gpio_set_level((gpio_num_t)PIN_KB_A1, (col & 2) >> 1);
-            gpio_set_level((gpio_num_t)PIN_KB_A2, (col & 4) >> 2);
-            esp_rom_delay_us(5); // Stabilization delay
+        // 1. Scan 8 demultiplexer lines via 74HC138 (A0=8, A1=9, A2=11)
+        for (int i = 0; i < 8; ++i) {
+            gpio_set_level((gpio_num_t)PIN_KB_A0, (i & 1));
+            gpio_set_level((gpio_num_t)PIN_KB_A1, (i & 2) >> 1);
+            gpio_set_level((gpio_num_t)PIN_KB_A2, (i & 4) >> 2);
+            esp_rom_delay_us(10); // Settle propagation delay
 
-            // Read rows (Active LOW)
-            for (int r = 0; r < 7; ++r) {
-                if (gpio_get_level(KB_ROWS[r]) == 0) {
-                    detected = KEYMAP[col][r];
+            // Read 7 active-low column pins
+            for (int j = 0; j < 7; ++j) {
+                if (gpio_get_level(KB_ROWS[j]) == 0) {
+                    if (active_count < 16) {
+                        int kx = (i > 3) ? X_MAP_CHART[j].x_1 : X_MAP_CHART[j].x_2;
+                        int ky = (i > 3) ? (i - 4) : i;
+                        ky = 3 - ky; // Invert to align with layout rows 0..3
+                        active_coords[active_count++] = { kx, ky };
+                    }
+                }
+            }
+        }
+
+        // 2. Identify active modifier keys
+        bool shift_active = false;
+        bool fn_active = false;
+        bool ctrl_active = false;
+
+        for (int k = 0; k < active_count; ++k) {
+            int x = active_coords[k].x;
+            int y = active_coords[k].y;
+            if (y == 2 && x == 0) fn_active = true;
+            if (y == 2 && x == 1) shift_active = true;
+            if (y == 3 && x == 0) ctrl_active = true;
+        }
+
+        // 3. Process pressed non-modifier keys
+        char current_pressed[16] = {0};
+        int current_count = 0;
+
+        for (int k = 0; k < active_count; ++k) {
+            int x = active_coords[k].x;
+            int y = active_coords[k].y;
+
+            // Skip pure modifiers
+            if (y == 2 && (x == 0 || x == 1)) continue;
+            if (y == 3 && (x >= 0 && x <= 2)) continue;
+            if (x < 0 || x >= 14 || y < 0 || y >= 4) continue;
+
+            char ch = '\0';
+            if (fn_active) {
+                if (y == 0 && x == 0) ch = 27; // Esc
+                else if (y == 2 && x == 11) ch = 'U'; // Up
+                else if (y == 3 && x == 10) ch = 'L'; // Left
+                else if (y == 3 && x == 11) ch = 'D'; // Down
+                else if (y == 3 && x == 12) ch = 'R'; // Right
+                else ch = KEYMAP_NORMAL[y][x];
+            } else if (shift_active) {
+                ch = KEYMAP_SHIFTED[y][x];
+            } else {
+                ch = KEYMAP_NORMAL[y][x];
+            }
+
+            if (ch != '\0' && current_count < 16) {
+                current_pressed[current_count++] = ch;
+            }
+        }
+
+        // 4. Edge-detect newly pressed keys (transition from unpressed -> pressed)
+        for (int i = 0; i < current_count; ++i) {
+            char ch = current_pressed[i];
+            bool was_pressed = false;
+            for (int p = 0; p < prev_key_count; ++p) {
+                if (prev_keys[p] == ch) {
+                    was_pressed = true;
                     break;
                 }
             }
-            if (detected != '\0') break;
+
+            if (!was_pressed) {
+                last_key_pressed = ch;
+                printf("[KEYBOARD] Key Pressed: '%c'\n", ch);
+                fflush(stdout);
+
+                // Update physical LCD display
+                char buf[32];
+                if (ch == '\b') {
+                    std::snprintf(buf, sizeof(buf), "KEY: [BACKSPACE]");
+                } else if (ch == '\n') {
+                    std::snprintf(buf, sizeof(buf), "KEY: [ENTER]");
+                } else if (ch == '\t') {
+                    std::snprintf(buf, sizeof(buf), "KEY: [TAB]");
+                } else if (ch == ' ') {
+                    std::snprintf(buf, sizeof(buf), "KEY: [SPACE]");
+                } else {
+                    std::snprintf(buf, sizeof(buf), "KEY: '%c' (0x%02X)", ch, (uint8_t)ch);
+                }
+                display_fill_rect(8, 120, 220, 12, COLOR_BG_DARK);
+                display_draw_string(8, 120, buf, COLOR_CYAN, COLOR_BG_DARK);
+            }
         }
 
-        if (detected != '\0' && detected != prev_key) {
-            last_key_pressed = detected;
-            printf("[KEYBOARD] Key Pressed: '%c'\n", detected);
-
-            // Display on bottom line of physical LCD
-            char buf[32];
-            std::snprintf(buf, sizeof(buf), "KEY: '%c' (0x%02X)", detected, (uint8_t)detected);
-            display_fill_rect(8, 120, 200, 10, COLOR_BG_DARK);
-            display_draw_string(8, 120, buf, COLOR_CYAN, COLOR_BG_DARK);
+        // Save state for next cycle
+        for (int i = 0; i < current_count; ++i) {
+            prev_keys[i] = current_pressed[i];
         }
-        prev_key = detected;
+        prev_key_count = current_count;
 
-        vTaskDelay(pdMS_TO_TICKS(25)); // 40 Hz scan rate
+        vTaskDelay(pdMS_TO_TICKS(20)); // 50 Hz debounce scan rate
     }
 }
 
