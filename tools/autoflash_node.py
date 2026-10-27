@@ -52,23 +52,33 @@ def main():
     # Allow USB connection and bus settling
     time.sleep(0.5)
 
-    flash_cmd = [
-        PYTHON_BIN, "-m", "esptool",
-        "--chip", "esp32s3",
-        "--port", target_port,
-        "--baud", "921600",
-        "write_flash", "0x20000", FIRMWARE_BIN
-    ]
-
     print(f"[AUTOFLASH] Flashing firmware to {target_port}...")
-    res = subprocess.run(flash_cmd)
-    if res.returncode != 0:
-        print("[AUTOFLASH-ERR] Flash failed. Retrying at 460800 baud...")
-        time.sleep(1.0)
-        flash_cmd[6] = "460800"
-        res = subprocess.run(flash_cmd)
+    def flash_attempt(before_mode, baud="921600"):
+        cmd = [
+            PYTHON_BIN, "-m", "esptool",
+            "--chip", "esp32s3",
+            "--port", target_port,
+            "--baud", baud,
+            "--before", before_mode,
+            "write-flash", "0x20000", FIRMWARE_BIN
+        ]
+        return subprocess.run(cmd).returncode == 0
 
-    if res.returncode == 0:
+    success = flash_attempt("default-reset")
+    if not success:
+        print("[AUTOFLASH] Retrying with usb-reset...")
+        time.sleep(0.5)
+        success = flash_attempt("usb-reset")
+    if not success:
+        print("[AUTOFLASH] Retrying with no-reset...")
+        time.sleep(0.5)
+        success = flash_attempt("no-reset")
+    if not success:
+        print("[AUTOFLASH] Retrying at 460800 baud...")
+        time.sleep(0.5)
+        success = flash_attempt("default-reset", "460800")
+
+    if success:
         print("[AUTOFLASH] Flash successful!")
         time.sleep(0.5)
         # Reset device to boot into the new firmware
@@ -79,18 +89,21 @@ def main():
         # Give the device a moment to re-enumerate CDC before starting services
         time.sleep(2.0)
 
-        # Launch gateway in background if requested
-        print("[AUTOFLASH] Starting Kube32 API Server Gateway...")
-        gateway_script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "kube32_serial_gateway.py")
-        subprocess.Popen([sys.executable, gateway_script, "6443"], env=dict(os.environ, KUBE32_SERIAL_PORT=target_port))
+        if "--flash-only" not in sys.argv:
+            # Launch gateway in background if requested
+            print("[AUTOFLASH] Starting Kube32 API Server Gateway...")
+            gateway_script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "kube32_serial_gateway.py")
+            subprocess.Popen([sys.executable, gateway_script, "6443"], env=dict(os.environ, KUBE32_SERIAL_PORT=target_port))
 
-        time.sleep(1.5)
-        print("[AUTOFLASH] Starting kubectl port-forward for hardware workbench...")
-        subprocess.Popen([
-            "kubectl", "--context", "kube32", "port-forward",
-            "-n", "kube32-cluster", "svc/hardware-workbench-svc", "8080:80"
-        ])
-        print("[AUTOFLASH] Cluster services online at http://localhost:8080")
+            time.sleep(1.5)
+            print("[AUTOFLASH] Starting kubectl port-forward for hardware workbench...")
+            subprocess.Popen([
+                "kubectl", "--context", "kube32", "port-forward",
+                "-n", "kube32-cluster", "svc/hardware-workbench-svc", "8080:80"
+            ])
+            print("[AUTOFLASH] Cluster services online at http://localhost:8080")
+        else:
+            print("[AUTOFLASH] Flash only completed.")
     else:
         print("[AUTOFLASH-ERR] Failed to flash target device.")
 

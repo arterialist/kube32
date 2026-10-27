@@ -6,6 +6,7 @@
 #include "driver/spi_master.h"
 #include "driver/gpio.h"
 #include "driver/i2s_std.h"
+#include "driver/usb_serial_jtag.h"
 #include "esp_lcd_panel_io.h"
 #include "esp_lcd_panel_vendor.h"
 #include "esp_lcd_panel_ops.h"
@@ -348,11 +349,11 @@ void play_tone(uint32_t freq_hz, uint32_t duration_ms, uint8_t volume_pct) {
     int buf_len = sizeof(buf) / sizeof(int16_t);
 
     // Scale amplitude safely from volume_pct (0..100)
-    // At 100% vol: amplitude = 4000 (well-controlled, clear)
-    // At 20% vol:  amplitude = 800 (gentle, quiet click/beep)
+    // At 100% vol: amplitude = 20000 (loud and clear)
+    // At 20% vol:  amplitude = 4000 (clean, audible tone)
     if (volume_pct > 100) volume_pct = 100;
-    int16_t amplitude = (int16_t)((4000L * volume_pct) / 100L);
-    if (amplitude < 100 && volume_pct > 0) amplitude = 100;
+    int16_t amplitude = (int16_t)((20000L * volume_pct) / 100L);
+    if (amplitude < 500 && volume_pct > 0) amplitude = 500;
 
     int phase = 0;
     int remaining = total_samples;
@@ -500,6 +501,9 @@ static void keyboard_task(void* pvParameters) {
 
             if (!was_pressed) {
                 last_key_pressed = ch;
+                char msg[64];
+                int msg_len = std::snprintf(msg, sizeof(msg), "[KEYBOARD] Key Pressed: '%c'\n", ch);
+                usb_serial_jtag_write_bytes(msg, msg_len, pdMS_TO_TICKS(50));
                 printf("[KEYBOARD] Key Pressed: '%c'\n", ch);
                 fflush(stdout);
 

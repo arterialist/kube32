@@ -1212,6 +1212,104 @@ SUITE_HTML = """<!DOCTYPE html>
             if (!audioCtx) {
                 audioCtx = new (window.AudioContext || window.webkitAudioContext)();
             }
+            if (audioCtx && audioCtx.state === 'suspended') {
+                audioCtx.resume();
+            }
+        }
+
+        // Global unlock listeners for browser autoplay policies
+        window.addEventListener('pointerdown', () => initAudio(), { passive: true });
+        window.addEventListener('keydown', () => initAudio(), { passive: true });
+
+        // Synthesizer note frequency table
+        const DAW_NOTE_FREQS = {
+            0: 261.63, 1: 277.18, 2: 293.66, 3: 311.13, 4: 329.63,
+            5: 349.23, 6: 369.99, 7: 392.00, 8: 415.30, 9: 440.00,
+            10: 466.16, 11: 493.88, 12: 523.25, 13: 554.37, 14: 587.33,
+            15: 622.25, 16: 659.25
+        };
+
+        function playKick() {
+            initAudio();
+            if (!audioCtx) return;
+            try {
+                const now = audioCtx.currentTime;
+                const osc = audioCtx.createOscillator();
+                const gain = audioCtx.createGain();
+                osc.type = 'sine';
+                osc.frequency.setValueAtTime(140, now);
+                osc.frequency.exponentialRampToValueAtTime(0.01, now + 0.15);
+                gain.gain.setValueAtTime(0.85, now);
+                gain.gain.exponentialRampToValueAtTime(0.001, now + 0.15);
+                osc.connect(gain);
+                gain.connect(audioCtx.destination);
+                osc.start(now);
+                osc.stop(now + 0.16);
+            } catch (e) {}
+        }
+
+        function playSnare() {
+            initAudio();
+            if (!audioCtx) return;
+            try {
+                const now = audioCtx.currentTime;
+                const bufferSize = Math.floor(audioCtx.sampleRate * 0.12);
+                const buffer = audioCtx.createBuffer(1, bufferSize, audioCtx.sampleRate);
+                const data = buffer.getChannelData(0);
+                for (let i = 0; i < bufferSize; i++) {
+                    data[i] = Math.random() * 2 - 1;
+                }
+                const noise = audioCtx.createBufferSource();
+                noise.buffer = buffer;
+                const filter = audioCtx.createBiquadFilter();
+                filter.type = 'highpass';
+                filter.frequency.setValueAtTime(900, now);
+                const noiseGain = audioCtx.createGain();
+                noiseGain.gain.setValueAtTime(0.45, now);
+                noiseGain.gain.exponentialRampToValueAtTime(0.01, now + 0.12);
+                noise.connect(filter);
+                filter.connect(noiseGain);
+                noiseGain.connect(audioCtx.destination);
+
+                const osc = audioCtx.createOscillator();
+                const oscGain = audioCtx.createGain();
+                osc.type = 'triangle';
+                osc.frequency.setValueAtTime(180, now);
+                oscGain.gain.setValueAtTime(0.35, now);
+                oscGain.gain.exponentialRampToValueAtTime(0.01, now + 0.08);
+                osc.connect(oscGain);
+                oscGain.connect(audioCtx.destination);
+
+                noise.start(now);
+                osc.start(now);
+                osc.stop(now + 0.12);
+            } catch (e) {}
+        }
+
+        function playHiHat() {
+            initAudio();
+            if (!audioCtx) return;
+            try {
+                const now = audioCtx.currentTime;
+                const bufferSize = Math.floor(audioCtx.sampleRate * 0.05);
+                const buffer = audioCtx.createBuffer(1, bufferSize, audioCtx.sampleRate);
+                const data = buffer.getChannelData(0);
+                for (let i = 0; i < bufferSize; i++) {
+                    data[i] = Math.random() * 2 - 1;
+                }
+                const noise = audioCtx.createBufferSource();
+                noise.buffer = buffer;
+                const filter = audioCtx.createBiquadFilter();
+                filter.type = 'highpass';
+                filter.frequency.setValueAtTime(7500, now);
+                const gain = audioCtx.createGain();
+                gain.gain.setValueAtTime(0.35, now);
+                gain.gain.exponentialRampToValueAtTime(0.01, now + 0.05);
+                noise.connect(filter);
+                filter.connect(gain);
+                gain.connect(audioCtx.destination);
+                noise.start(now);
+            } catch (e) {}
         }
 
         // Switch Workloads
@@ -1242,19 +1340,25 @@ SUITE_HTML = """<!DOCTYPE html>
                         const newEvents = (data.events || []).filter(e => e.seq > lastSeenKeySeq);
                         lastSeenKeySeq = data.seq;
                         newEvents.forEach(ev => {
-                            handleHardwareKeystroke(ev.key);
+                            handleHardwareKeystroke(ev.key, ev.code);
                         });
                     }
                 })
                 .catch(() => {});
         }
 
-        function handleHardwareKeystroke(key) {
+        function handleHardwareKeystroke(key, code) {
             // Flash Header Pill
             const pill = document.getElementById('hwKeyPill');
             const val = document.getElementById('hwKeyVal');
             if (val && pill) {
-                val.textContent = (key === ' ') ? '[SPACE]' : (key === '\\b') ? '[DEL]' : (key === '\\n') ? '[ENTER]' : `'${key}'`;
+                const label = (code === 8 || key === '\b') ? '[DEL]'
+                            : (code === 10 || code === 13 || key === '\n' || key === '\r') ? '[ENTER]'
+                            : (code === 9 || key === '\t') ? '[TAB]'
+                            : (code === 32 || key === ' ') ? '[SPACE]'
+                            : (key && key.length === 1) ? `'${key}'`
+                            : `0x${(code || 0).toString(16).toUpperCase()}`;
+                val.textContent = label;
                 pill.style.borderColor = 'var(--accent-green)';
                 pill.style.background = 'rgba(16, 185, 129, 0.2)';
                 setTimeout(() => {
@@ -1263,12 +1367,15 @@ SUITE_HTML = """<!DOCTYPE html>
                 }, 350);
             }
 
-            if (currentWorkload === 'daw') {
-                handleDawHardwareKey(key);
-            } else if (currentWorkload === 'workspace') {
-                handleWorkspaceHardwareKey(key);
+            const ta = document.getElementById('docTextarea');
+            const isDocFocused = (document.activeElement === ta);
+
+            if (isDocFocused || currentWorkload === 'workspace') {
+                handleWorkspaceHardwareKey(key, code);
+            } else if (currentWorkload === 'daw') {
+                handleDawHardwareKey(key, code);
             } else if (currentWorkload === 'fleet') {
-                handleFleetHardwareKey(key);
+                handleFleetHardwareKey(key, code);
             }
         }
 
@@ -1528,7 +1635,8 @@ SUITE_HTML = """<!DOCTYPE html>
             draw();
         }
 
-        // Periodic DAW poll
+        // Periodic DAW poll & Web Audio Sequencer Trigger
+        let lastPlayedDawStep = -1;
         setInterval(() => {
             if (currentWorkload !== 'daw') return;
             fetch('/api/v1/synth/state')
@@ -1541,37 +1649,74 @@ SUITE_HTML = """<!DOCTYPE html>
                         const stepEl = document.getElementById(`step-${trk}-${curStep}`);
                         if (stepEl) stepEl.classList.add('cursor');
                     });
-                });
-        }, 120);
+
+                    // Synthesizer Web Audio Playback
+                    if (st.playing && curStep !== lastPlayedDawStep) {
+                        lastPlayedDawStep = curStep;
+                        if (st.tracks.kick && st.tracks.kick[curStep] > 0) playKick();
+                        if (st.tracks.snare && st.tracks.snare[curStep] > 0) playSnare();
+                        if (st.tracks.hihat && st.tracks.hihat[curStep] > 0) playHiHat();
+                        if (st.tracks.synth && st.tracks.synth[curStep] > 0) {
+                            const noteIdx = st.tracks.synth[curStep];
+                            const freq = DAW_NOTE_FREQS[noteIdx] || 440;
+                            playWebTone(freq, 0.16);
+                        }
+                    } else if (!st.playing) {
+                        lastPlayedDawStep = -1;
+                    }
+                })
+                .catch(() => {});
+        }, 60);
 
         // ===================================================================
         // WORKLOAD 2: AETHER WORKSPACE LOGIC
         // ===================================================================
-        function handleWorkspaceHardwareKey(key) {
+        function handleWorkspaceHardwareKey(key, code) {
             const ta = document.getElementById('docTextarea');
             if (!ta) return;
             
-            const start = ta.selectionStart;
-            const end = ta.selectionEnd;
+            let start = ta.selectionStart;
+            let end = ta.selectionEnd;
             let val = ta.value;
 
-            if (key === '\\b') {
-                if (start > 0) {
+            // Default cursor to end of text if user hasn't explicitly clicked in the box
+            if (document.activeElement !== ta && start === 0 && end === 0 && val.length > 0) {
+                start = end = val.length;
+            }
+
+            const isBackspace = (code === 8 || code === 127 || key === '\b' || key === '\\b' || key === 'Backspace' || (key && key.charCodeAt(0) === 8));
+            const isEnter = (code === 10 || code === 13 || key === '\n' || key === '\r' || key === '\\n' || key === 'Enter' || (key && (key.charCodeAt(0) === 10 || key.charCodeAt(0) === 13)));
+            const isTab = (code === 9 || key === '\t' || key === '\\t' || key === 'Tab' || (key && key.charCodeAt(0) === 9));
+
+            if (isBackspace) {
+                if (start !== end) {
+                    ta.value = val.substring(0, start) + val.substring(end);
+                    ta.selectionStart = ta.selectionEnd = start;
+                } else if (start > 0) {
                     ta.value = val.substring(0, start - 1) + val.substring(end);
                     ta.selectionStart = ta.selectionEnd = start - 1;
                 }
-            } else if (key === '\\n') {
-                ta.value = val.substring(0, start) + '\\n' + val.substring(end);
+            } else if (isEnter) {
+                ta.value = val.substring(0, start) + '\n' + val.substring(end);
                 ta.selectionStart = ta.selectionEnd = start + 1;
-            } else if (key === '\\t') {
+            } else if (isTab) {
                 ta.value = val.substring(0, start) + '  ' + val.substring(end);
                 ta.selectionStart = ta.selectionEnd = start + 2;
-            } else if (key.length === 1) {
+            } else if (key && key.length === 1 && (!code || (code >= 32 && code <= 126))) {
                 ta.value = val.substring(0, start) + key + val.substring(end);
                 ta.selectionStart = ta.selectionEnd = start + 1;
             }
 
+            // Sync markdown live preview and persist
             handleDocInput();
+
+            // Visual feedback on textarea border
+            ta.style.borderColor = 'var(--accent-cyan)';
+            ta.style.boxShadow = '0 0 12px rgba(6, 182, 212, 0.4)';
+            setTimeout(() => {
+                ta.style.borderColor = 'var(--border-dim)';
+                ta.style.boxShadow = 'none';
+            }, 250);
         }
 
         function insertSyntax(prefix, suffix = '') {

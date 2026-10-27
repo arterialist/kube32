@@ -376,14 +376,15 @@ static void kube32_cluster_task(void* pvParameters) {
                             );
                             printf("[PIPELINE-OTA-TX] ESP-NOW transmission result: %d (0 = OK)\n", (int)sent);
                         } else if (line_accum == "K32_CMD:STATUS") {
-                            printf("\n=== KUBE32 CLUSTER TELEMETRY ===\n");
-                            printf("Role: Master Control Plane (esp32-node-01)\n");
-                            printf("Free Internal SRAM: %u bytes\n", (unsigned)esp_get_free_heap_size());
+                            char stat_buf[256];
                             std::vector<std::string> nodes, pods;
                             store->list("/registry/nodes/", nodes);
                             store->list("/registry/pods/", pods);
-                            printf("Registered Nodes: %zu | Active Pods: %zu\n", nodes.size(), pods.size());
-                            printf("=== END TELEMETRY ===\n");
+                            int slen = std::snprintf(stat_buf, sizeof(stat_buf),
+                                "\n=== KUBE32 CLUSTER TELEMETRY ===\nRole: Master Control Plane (esp32-node-01)\nFree Internal SRAM: %u bytes\nRegistered Nodes: %zu | Active Pods: %zu\n=== END TELEMETRY ===\n",
+                                (unsigned)esp_get_free_heap_size(), nodes.size(), pods.size());
+                            usb_serial_jtag_write_bytes(stat_buf, slen, pdMS_TO_TICKS(50));
+                            printf("%s", stat_buf);
                         }
                         line_accum.clear();
                     } else {

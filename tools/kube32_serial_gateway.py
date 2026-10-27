@@ -87,8 +87,8 @@ NODES = {
         "created": CLUSTER_START_TIME,
         "arch": "xtensa",
         "cpu": "2",
-        "memory_cap": "512Mi",
-        "memory_alloc": "480Mi",
+        "memory_cap": "512Ki",
+        "memory_alloc": "400Ki",
         "os": "ESP-IDF v5.5.3",
         "kernel": "FreeRTOS-v10.5 (xtensa)",
         "runtime": "wasm3://v0.5.0",
@@ -101,8 +101,8 @@ NODES = {
         "created": CLUSTER_START_TIME,
         "arch": "xtensa",
         "cpu": "2",
-        "memory_cap": "2048Mi",
-        "memory_alloc": "1920Mi",
+        "memory_cap": "2048Ki",
+        "memory_alloc": "1920Ki",
         "os": "ESP-IDF v5.5.3",
         "kernel": "FreeRTOS-v10.5 (xtensa)",
         "runtime": "wasm3://v0.5.0",
@@ -182,7 +182,7 @@ def get_serial():
         ser.port = port
         ser.baudrate = BAUD_RATE
         ser.timeout = 0.5
-        ser.dtr = False
+        ser.dtr = True
         ser.rts = False
         ser.open()
         time.sleep(0.05)
@@ -209,6 +209,8 @@ def send_serial_cmd(cmd: str):
 def background_hardware_sync():
     """Polls hardware telemetry and reads keyboard/display events without blocking HTTP clients."""
     last_poll = 0
+    accum_serial = b""
+
     while True:
         try:
             with ser_lock:
@@ -219,42 +221,75 @@ def background_hardware_sync():
                     s.flush()
                     last_poll = now
                 
-                # Drain lines from hardware
-                while s.in_waiting > 0:
-                    line_raw = s.readline()
-                    if not line_raw:
-                        break
-                    l = line_raw.decode("utf-8", errors="replace").strip()
-                    if not l:
-                        continue
-                    print(f"[DEVICE-RAW] {l}")
-                    if "[KEYBOARD] Key Pressed:" in l:
-                        # [KEYBOARD] Key Pressed: 'x'
-                        if "'" in l:
-                            parts = l.split("'")
-                            if len(parts) >= 2:
-                                k_char = parts[1]
-                                hardware_telemetry["key_seq"] += 1
-                                hardware_telemetry["last_key"] = k_char
-                                hardware_telemetry["key_events"].append({
-                                    "key": k_char,
-                                    "seq": hardware_telemetry["key_seq"],
-                                    "ts": time.time()
-                                })
-                                print(f"[PHYSICAL-KEY] Captured keystroke from hardware: '{k_char}' (seq={hardware_telemetry['key_seq']})")
-                    elif "Free Internal SRAM:" in l:
-                        parts = l.split(":")
-                        if len(parts) >= 2:
-                            num_str = parts[1].replace("bytes", "").strip()
-                            try:
-                                hardware_telemetry["free_sram_bytes"] = int(num_str)
-                            except ValueError:
-                                pass
-                    elif "Registered Nodes:" in l:
-                        hardware_telemetry["last_sync_time"] = time.time()
+                # Ingest available bytes from USB hardware FIFO
+                waiting = s.in_waiting
+                if waiting > 0:
+                    chunk = s.read(waiting)
+                    if chunk:
+                        accum_serial += chunk
+
+            # Process complete lines outside serial lock
+            while b"\n" in accum_serial:
+                line_bytes, _, accum_serial = accum_serial.partition(b"\n")
+                l = line_bytes.decode("utf-8", errors="replace").strip()
+                if not l:
+                    continue
+                print(f"[DEVICE-RAW] {l}")
+                if "[KEYBOARD] Key" in l or "KEY: [" in l:
+                    code = None
+                    k_char = None
+                    # Format 1: [KEYBOARD] Key: 0x.. (code)
+                    if "(" in l and ")" in l:
+                        try:
+                            code_str = l.split("(")[1].split(")")[0]
+                            code = int(code_str)
+                            k_char = chr(code)
+                        except Exception:
+                            pass
+                    # Format 2: [KEYBOARD] Key Pressed: 'c'
+                    if k_char is None and "'" in l:
+                        parts = l.split("'")
+                        if len(parts) >= 2 and len(parts[1]) > 0:
+                            k_char = parts[1]
+                            code = ord(k_char[0])
+                    # Format 3: Explicit key names
+                    if k_char is None:
+                        if "BACKSPACE" in l or "DEL" in l:
+                            k_char = "\b"
+                            code = 8
+                        elif "ENTER" in l:
+                            k_char = "\n"
+                            code = 10
+                        elif "SPACE" in l:
+                            k_char = " "
+                            code = 32
+                        elif "TAB" in l:
+                            k_char = "\t"
+                            code = 9
+
+                    if k_char is not None:
+                        hardware_telemetry["key_seq"] += 1
+                        hardware_telemetry["last_key"] = k_char
+                        hardware_telemetry["key_events"].append({
+                            "key": k_char,
+                            "code": code if code is not None else ord(k_char[0]),
+                            "seq": hardware_telemetry["key_seq"],
+                            "ts": time.time()
+                        })
+                        print(f"[PHYSICAL-KEY] Captured keystroke from hardware: code={code} char={repr(k_char)} (seq={hardware_telemetry['key_seq']})")
+                elif "Free Internal SRAM:" in l:
+                    parts = l.split(":")
+                    if len(parts) >= 2:
+                        num_str = parts[1].replace("bytes", "").strip()
+                        try:
+                            hardware_telemetry["free_sram_bytes"] = int(num_str)
+                        except ValueError:
+                            pass
+                elif "Registered Nodes:" in l:
+                    hardware_telemetry["last_sync_time"] = time.time()
         except Exception:
             pass
-        time.sleep(0.05)
+        time.sleep(0.04)
 
 def handle_spdy_portforward(sock, pod_name, ns):
     """
@@ -1284,9 +1319,9 @@ class KubeGatewayHandler(BaseHTTPRequestHandler):
             now_iso = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
             # Real hardware memory telemetry from device
             free_sram = hardware_telemetry.get("free_sram_bytes", 48400)
-            ratio = max(0.4, min(0.92, (524288 - free_sram) / 524288.0))
-            node1_mem_mi = int(480 * ratio)
-            node2_mem_mi = int(1920 * 0.28)
+            used_bytes = max(524288 - free_sram, 200000)
+            node1_mem_ki = min(340, used_bytes // 1024)
+            node2_mem_ki = 468
             node1_cpu_m = 145 + int(15 * math.sin(time.time() / 5.0))
             node2_cpu_m = 90 + int(10 * math.cos(time.time() / 7.0))
 
@@ -1301,7 +1336,7 @@ class KubeGatewayHandler(BaseHTTPRequestHandler):
                     "window": "15s",
                     "usage": {
                         "cpu": f"{node1_cpu_m}m",
-                        "memory": f"{node1_mem_mi}Mi"
+                        "memory": f"{node1_mem_ki}Ki"
                     }
                 },
                 {
@@ -1314,7 +1349,7 @@ class KubeGatewayHandler(BaseHTTPRequestHandler):
                     "window": "15s",
                     "usage": {
                         "cpu": f"{node2_cpu_m}m",
-                        "memory": f"{node2_mem_mi}Mi"
+                        "memory": f"{node2_mem_ki}Ki"
                     }
                 }
             ]
@@ -1371,19 +1406,25 @@ class KubeGatewayHandler(BaseHTTPRequestHandler):
 
                     if "vortex" in p_name:
                         c_cpu = 48 + int(8 * math.sin(time.time() / 3.0))
-                        c_mem = 86
+                        c_mem = 28
                     elif "aegis" in p_name:
                         c_cpu = 54 + int(10 * math.cos(time.time() / 4.0))
-                        c_mem = 92
+                        c_mem = 36
                     elif "aether" in p_name:
                         c_cpu = 32 + int(6 * math.sin(time.time() / 6.0))
-                        c_mem = 74
+                        c_mem = 24
                     elif "hardware" in p_name:
                         c_cpu = 40 + int(6 * math.sin(time.time() / 2.0))
-                        c_mem = 68
+                        c_mem = 26
+                    elif "audio" in p_name:
+                        c_cpu = 22 + int(4 * math.sin(time.time() / 5.0))
+                        c_mem = 20
+                    elif "dsp" in p_name:
+                        c_cpu = 26 + int(5 * math.cos(time.time() / 3.0))
+                        c_mem = 38
                     else:
-                        c_cpu = 20 + (hash(p_name) % 25)
-                        c_mem = 42 + (hash(p_name) % 30)
+                        c_cpu = 18
+                        c_mem = 12
 
                     c_name = p_name.replace("-workload", "").replace("-svc", "")
 
@@ -1401,7 +1442,7 @@ class KubeGatewayHandler(BaseHTTPRequestHandler):
                                 "name": c_name,
                                 "usage": {
                                     "cpu": f"{c_cpu}m",
-                                    "memory": f"{c_mem}Mi"
+                                    "memory": f"{c_mem}Ki"
                                 }
                             }
                         ]
