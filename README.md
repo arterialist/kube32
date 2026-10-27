@@ -8,47 +8,45 @@
 
 Kube32 is a Kubernetes-compatible orchestration system for ESP32 microcontrollers. It runs the complete control plane and worker agent on device. The control plane includes an HTTP API server, scheduler, state store, and node lifecycle controller. The worker runs a Kubelet with a sandboxed WebAssembly runtime. Manage the cluster with standard `kubectl`.
 
-```
-                    ┌──────────────────────────────────────────────┐
-                    │               kubectl / Client               │
-                    └──────────────────────┬───────────────────────┘
-                                           │ HTTP/1.1 REST
-                                           ▼
-┌──────────────────────────────────────────────────────────────────────────────────────────┐
-│                                ESP32 Control Plane Node                                  │
-│                                                                                          │
-│   ┌────────────────────┐     ┌─────────────────────┐     ┌───────────────────────────┐   │
-│   │  HTTP API Server   │◄───►│ Radix State Store   │◄───►│ LittleFS Journal (Flash)  │   │
-│   │  (Chunked Stream)  │     │ (Zero-Alloc Slabs)  │     │ (Atomic WAL + Recovery)   │   │
-│   └─────────┬──────────┘     └──────────▲──────────┘     └───────────────────────────┘   │
-│             │                           │                                                │
-│             ▼                           ▼                                                │
-│   ┌────────────────────┐     ┌─────────────────────┐     ┌───────────────────────────┐   │
-│   │    Scheduler       │     │ Node Lifecycle Ctrl │     │ mDNS Discovery Provider   │   │
-│   │ (Resource Scorer)  │     │ (Leases & Eviction) │     │ (_kube32-api._tcp.local)  │   │
-│   └────────────────────┘     └─────────────────────┘     └───────────────────────────┘   │
-└──────────────────────────────────────────┬───────────────────────────────────────────────┘
-                                           │
-                    ┌──────────────────────┴───────────────────────┐
-                    │  Virtual Channel IPC (ESP-NOW / Peer UDP)    │
-                    │  Sub-millisecond latency, zero AP overhead   │
-                    └──────────────────────┬───────────────────────┘
-                                           │
-                                           ▼
-┌──────────────────────────────────────────────────────────────────────────────────────────┐
-│                                 ESP32 Worker Node                                        │
-│                                                                                          │
-│   ┌────────────────────┐     ┌─────────────────────┐     ┌───────────────────────────┐   │
-│   │      Kubelet       │◄───►│ Capability Firewall │◄───►│ Hardware HAL              │   │
-│   │ (Pod & Lease Sync) │     │ (O(1) Pin/Bus Grants)│    │ (GPIO, I2C, SPI, ADC)     │   │
-│   └─────────┬──────────┘     └─────────────────────┘     └───────────────────────────┘   │
-│             │                                                                            │
-│             ▼                                                                            │
-│   ┌──────────────────────────────────────────────────────────────────────────────────┐   │
-│   │                       Wasm3 Sandboxed Execution Runtime                          │   │
-│   │      32 KB Stack | 64 KB Linear Memory | CPU Gas Quota | Syscall Intercept       │   │
-│   └──────────────────────────────────────────────────────────────────────────────────┘   │
-└──────────────────────────────────────────────────────────────────────────────────────────┘
+```mermaid
+flowchart TD
+    Client["kubectl / Client"]
+
+    subgraph ControlPlane["ESP32 Control Plane Node"]
+        direction TB
+        APIServer["HTTP API Server<br/>Chunked streaming, Table serialization"]
+        RadixStore["Radix State Store<br/>Zero-alloc slab pools"]
+        Journal["LittleFS Journal<br/>Flash WAL and recovery"]
+        Scheduler["Scheduler<br/>Resource scoring and pin checking"]
+        NodeCtrl["Node Lifecycle Controller<br/>Lease tracking and failover"]
+        mDNS["mDNS Discovery Provider<br/>_kube32-api._tcp.local"]
+
+        APIServer <--> RadixStore
+        RadixStore <--> Journal
+        APIServer --> Scheduler
+        RadixStore <--> NodeCtrl
+        APIServer --- mDNS
+    end
+
+    subgraph IPC["Virtual Channel IPC"]
+        ESP_NOW["ESP-NOW 802.11 Action Frames on hardware / Peer UDP in simulation<br/>Sub-millisecond latency, zero AP overhead"]
+    end
+
+    subgraph Worker["ESP32 Worker Node"]
+        direction TB
+        Kubelet["Kubelet Agent<br/>Pod and lease synchronization"]
+        Firewall["Capability Firewall<br/>O(1) pin and bus permission checks"]
+        HAL["Hardware HAL<br/>GPIO, I2C, SPI, ADC"]
+        WasmRuntime["Wasm3 Sandboxed Runtime<br/>32 KB stack, 64 KB memory, gas quota"]
+
+        Kubelet <--> Firewall
+        Firewall <--> HAL
+        Kubelet --> WasmRuntime
+    end
+
+    Client -->|"HTTP/1.1 REST"| APIServer
+    ControlPlane --> IPC
+    IPC --> Worker
 ```
 
 ## Table of contents
@@ -133,21 +131,13 @@ Pipelined workloads, such as feature extraction on node 1 and classification on 
 - C++17 compiler, such as Clang or GCC
 - Python 3.9 or newer
 - PlatformIO Core for flashing ESP32 hardware
-- GitHub CLI (`gh`) for repository management and automated workflows
-
-> [!TIP]
-> Authenticate with the GitHub CLI using `gh auth login` to clone repositories over HTTPS or SSH without configuring manual keys.
 
 ### Host simulator
 
 Build and run a multi-node cluster on your workstation using the POSIX host simulator.
 
 ```bash
-# Clone the repository with the GitHub CLI
-gh repo clone arterialist/kube32
-cd kube32
-
-# Or clone with Git
+# Clone the repository
 git clone https://github.com/arterialist/kube32.git
 cd kube32
 
@@ -370,11 +360,6 @@ The test runner verifies:
 - [x] Table formatting and wide output negotiation
 - [x] Node failure detection, eviction, and pod rescheduling
 - [x] Inter-node channel IPC transmission and fragment reassembly
-
-```bash
-# Inspect CI test results using the GitHub CLI
-gh run list --workflow=docs.yaml
-```
 
 ## Repository structure
 
