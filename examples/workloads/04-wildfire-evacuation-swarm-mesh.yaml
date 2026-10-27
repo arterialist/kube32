@@ -1,0 +1,33 @@
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: wildfire-evacuation-swarm
+  namespace: kube32-cluster
+  labels:
+    app: wildfire-beacon
+    mission: emergency-blackout-mesh
+spec:
+  selector:
+    matchLabels:
+      app: wildfire-beacon
+  template:
+    metadata:
+      labels:
+        app: wildfire-beacon
+    spec:
+      containers:
+        - name: swarm-transceiver
+          image: wasm://emergency/swarm-mesh-beacon:v1
+          resources:
+            limits:
+              memory: 28Ki
+            requests:
+              memory: 16Ki
+              hardware.kube32.io/gpio: "4" # Strobe / acoustic siren pin
+          env:
+            - name: BROADCAST_CHANNEL
+              value: "emergency.wildfire.alert"
+            - name: SYNC_INTERVAL_MS
+              value: "500"
+            - name: ESP_NOW_RAW_FRAME
+              value: "true"

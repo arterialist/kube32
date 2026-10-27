@@ -1,0 +1,37 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: grid-substation-firewall-canary
+  namespace: default
+  labels:
+    app: scada-grid-protection
+    tier: critical-infrastructure
+    security.kube32.io/isolation: capability-firewall
+spec:
+  nodeName: esp32-node-01
+  restartPolicy: Never
+  containers:
+    - name: telemetry-reporter
+      image: wasm://grid/scada-telemetry:v2
+      resources:
+        limits:
+          memory: 32Ki
+        requests:
+          memory: 16Ki
+          # Note: No GPIO capabilities requested.
+          # The capability firewall must trap any unauthorized register access.
+      securityContext:
+        capabilities:
+          drop: ["ALL"]
+          add: ["UART_READ"]
+    - name: high-voltage-trip-canary
+      image: wasm://grid/trip-relay-guard:v1
+      resources:
+        limits:
+          memory: 24Ki
+        requests:
+          memory: 12Ki
+          hardware.kube32.io/gpio: "1" # Only permitted to actuate safety pin 1
+      securityContext:
+        capabilities:
+          add: ["GPIO_WRITE"]

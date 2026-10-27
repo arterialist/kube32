@@ -22,6 +22,13 @@
         <span class="nav-label">Topology</span>
       </button>
 
+      <button class="nav-item" data-tab="tab-showcase" title="10 Extreme Workload Demonstrations">
+        <div class="nav-indicator">
+          <span class="material-symbols-outlined">auto_awesome</span>
+        </div>
+        <span class="nav-label">Showcase</span>
+      </button>
+
       <button class="nav-item" data-tab="tab-workloads" title="Pod Inventory & Deployment">
         <div class="nav-indicator">
           <span class="material-symbols-outlined">deployed_code</span>
@@ -203,6 +210,47 @@
                 </table>
               </div>
             </div>
+          </div>
+        </section>
+
+        <!-- TAB: EXTREME WORKLOAD SHOWCASE -->
+        <section id="tab-showcase" class="tab-pane">
+          <div class="showcase-header">
+            <div>
+              <h2 class="card-title" style="display: flex; align-items: center; gap: 8px;">
+                <span class="material-symbols-outlined" style="color: var(--md-sys-color-primary);">auto_awesome</span>
+                Extreme Workload Showcase
+              </h2>
+              <span style="font-size: 13px; color: var(--md-sys-color-outline);">
+                10 mission-critical industrial workloads solving urgent real-world problems impossible without Kube32.
+              </span>
+            </div>
+
+            <div class="showcase-toolbar">
+              <button class="btn btn-outlined" id="btn-reset-cluster-workloads" title="Reset to baseline workloads">
+                <span class="material-symbols-outlined">restart_alt</span>
+                Reset Baseline
+              </button>
+              <button class="btn btn-filled" id="btn-deploy-all-showcase" title="Sequentially deploy all 10 workloads">
+                <span class="material-symbols-outlined">rocket_launch</span>
+                Deploy All 10 Workloads
+              </button>
+            </div>
+          </div>
+
+          <!-- Domain Filter Chips -->
+          <div class="showcase-filters">
+            <button class="filter-chip active" data-filter="all">All Domains (10)</button>
+            <button class="filter-chip" data-filter="security">Critical Infrastructure (2)</button>
+            <button class="filter-chip" data-filter="ai">Distributed AI (2)</button>
+            <button class="filter-chip" data-filter="safety">Life-Safety & Resilience (2)</button>
+            <button class="filter-chip" data-filter="robotics">Avionics & Space (2)</button>
+            <button class="filter-chip" data-filter="mesh">Energy & Hybrid Mesh (2)</button>
+          </div>
+
+          <!-- 10 Showcase Cards Grid -->
+          <div class="showcase-grid" id="showcase-grid-container">
+            <!-- Populated dynamically via app.js -->
           </div>
         </section>
 
@@ -405,6 +453,9 @@
       </div>
     </div>
   </div>
+
+  <!-- Toast Notifications -->
+  <div class="toast-container" id="toast-container"></div>
 
   <script src="app.js"></script>
 </body>

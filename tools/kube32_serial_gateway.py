@@ -474,6 +474,112 @@ def get_events_table(namespace=None):
         "rows": rows
     }
 
+def generate_pod_log(pod_name, ns="default"):
+    now_str = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    p = pod_name.lower()
+
+    if "grid-substation" in p or "firewall" in p:
+        return (
+            f"{now_str} [wasm3-runtime] Spawned container 'telemetry-reporter' (stack: 8192 bytes, isolation: capability-firewall)\n"
+            f"{now_str} [capability-fw] Security profile loaded: DROP ALL, GRANT [UART_READ]\n"
+            f"{now_str} [capability-fw] Container 'telemetry-reporter' attempted write to GPIO register 0x60004004!\n"
+            f"{now_str} [capability-fw] SECURITY TRAP: Illegal peripheral access blocked! Syscall denied (EPERM, mask: 0x0000)\n"
+            f"{now_str} [k8s-audit] Logged SecurityContextViolation event: Pod default/{pod_name} denied GPIO access\n"
+            f"{now_str} [wasm3-runtime] Spawned container 'high-voltage-trip-canary' (stack: 8192 bytes)\n"
+            f"{now_str} [capability-fw] Hardware capability granted: GPIO_WRITE (mask: 0x0002, Pin: 1)\n"
+            f"{now_str} [trip-canary] Safety trip circuit armed on GPIO 1 | Relay state: NORMAL_CLOSED | Grid Substation Online\n"
+        )
+    elif "acoustic" in p and "tx" in p:
+        return (
+            f"{now_str} [adc-dma] Initialized 16 kHz continuous ADC DMA buffer on Node 1 (Control Plane)\n"
+            f"{now_str} [mfcc-extractor] Fast Fourier Transform 512-point completed in 3.84 ms\n"
+            f"{now_str} [mfcc-extractor] Extracted 16 Mel-frequency cepstral coefficients (52-byte spectral vector)\n"
+            f"{now_str} [esp-now-ipc] Dispatched vector to Node 2 (02:00:00:00:00:01) via virtual channel 'vibration.mfcc'\n"
+            f"{now_str} [ipc-mesh] Zero-AP packet transmission successful: 52 bytes transferred in 1.38 ms\n"
+        )
+    elif "acoustic" in p and "rx" in p:
+        return (
+            f"{now_str} [esp-now-rx] Received 52 bytes on virtual channel 'vibration.mfcc' from Node 1 (RSSI: -42 dBm)\n"
+            f"{now_str} [psram-neural] Loaded quantized bearing fault neural network into Quad-SPI PSRAM (780 KiB)\n"
+            f"{now_str} [wasm3-inference] Executed 3-layer convolutional inference kernel across 52 input nodes\n"
+            f"{now_str} [inference-engine] Bearing Health Index: 0.98 (HEALTHY, Flaw probability: 0.02)\n"
+            f"{now_str} [psram-monitor] PSRAM free: 1,298 KiB / 2,048 KiB | Internal SRAM preserved: 48,200 bytes\n"
+        )
+    elif "cold-chain" in p or "cryo" in p:
+        return (
+            f"{now_str} [cryo-pid] Initialized vaccine cold-chain PID regulator on node esp32-node-02\n"
+            f"{now_str} [hal-gpio] Compressor valve solenoid active on GPIO 2 (PWM frequency: 25 kHz)\n"
+            f"{now_str} [sensor-telemetry] Core ultra-low chamber probe: -79.82°C (Set point: -80.00°C, Error: +0.18°C)\n"
+            f"{now_str} [lease-controller] Lease renewal heartbeat sent to apiserver (lease validity: 4.0s)\n"
+            f"{now_str} [resilience] Anti-affinity failover armed: Reschedules to esp32-node-01 if lease expires\n"
+        )
+    elif "wildfire" in p or "swarm" in p:
+        return (
+            f"{now_str} [swarm-mesh] Joined 2.4 GHz ESP-NOW broadcast mesh 'emergency.wildfire.alert'\n"
+            f"{now_str} [mesh-sync] Clock drift synchronized: delta -142 us across 2 cluster nodes\n"
+            f"{now_str} [strobe-beacon] Synchronized dual-board optical pulse sequence initiated on GPIO 4\n"
+            f"{now_str} [rf-telemetry] Zero-AP packet transmission rate: 2.0 Hz | Airtime: 0.08% | Router-free mesh active\n"
+        )
+    elif "cubesat" in p or "sandbox" in p:
+        return (
+            f"{now_str} [wasm3-loader] Booting untrusted orbital science payload 'wasm://payload/attitude-estimator:v3'\n"
+            f"{now_str} [gas-meter] Hard instruction ceiling configured: 2,500,000 gas units (500m CPU limit)\n"
+            f"{now_str} [runtime-step] Non-linear gradient descent iteration 4820... Gas consumed: 2,499,980\n"
+            f"{now_str} [gas-trap] TRAP EXHAUSTION: Gas limit 2,500,000 exceeded at instruction PC 0x0001a4f0!\n"
+            f"{now_str} [kubelet-agent] Runaway task halted gracefully | FreeRTOS kernel unaffected | Heap reclaimed: 16 KiB\n"
+        )
+    elif "seismic" in p or "flight-recorder" in p:
+        return (
+            f"{now_str} [psram-init] Allocated 1,536 KiB circular flight buffer in external Quad-SPI PSRAM\n"
+            f"{now_str} [adc-streamer] Sampling dual-axis piezo accelerometer at 1,000 Hz continuous\n"
+            f"{now_str} [ring-buffer] Ring head: 18,420 / 30,000 samples (30s pre-trigger waveform armed)\n"
+            f"{now_str} [seismic-trigger] Baseline structural vibration: 0.04g | Trigger threshold: 2.5g | Flash writes: 0\n"
+        )
+    elif "drone" in p or "flight-controller" in p or "arbitrator" in p:
+        return (
+            f"{now_str} [bus-manager] Acquired exclusive lock on I2C Port 0 (SDA: 21, SCL: 22)\n"
+            f"{now_str} [bus-manager] Acquired exclusive lock on SPI Port 1 (Micro-telemetry bus)\n"
+            f"{now_str} [ekf-filter] 6-axis IMU quaternion state updated at 200 Hz (dt: 5.0ms) | Roll: +0.42° Pitch: -0.11°\n"
+            f"{now_str} [bus-arbitrator] Mutex contention: 0 collisions | Bus throughput: 384 kbit/s | Avionics nominal\n"
+        )
+    elif "solar" in p or "energy" in p:
+        return (
+            f"{now_str} [power-monitor] ADC rail sense: 3,740 mV | PV solar input: 4.82 V\n"
+            f"{now_str} [thermal-sensor] Silicon die temperature: 38.4°C\n"
+            f"{now_str} [dvfs-governor] Queue load < 10%: Throttling CPU cores from 240 MHz to 80 MHz\n"
+            f"{now_str} [power-savings] Power consumption reduced from 142 mA to 28 mA (5.07x battery runtime gain)\n"
+        )
+    elif "zero-trust" in p or "tamper" in p:
+        return (
+            f"{now_str} [cold-boot] Hardware interrupt triggered: Tamper badge RFID pin sensed\n"
+            f"{now_str} [wasm3-boot] Cold-booting container image from flash in 11.4 ms\n"
+            f"{now_str} [crypto-engine] Computed HMAC-SHA256 signature verification in 2.8 ms (AUTH_PASSED)\n"
+            f"{now_str} [solenoid-latch] Physical barrier relay pulsed on GPIO 5 (duration: 50 ms)\n"
+            f"{now_str} [ephemeral-exit] Micro-job completed: Terminated in 14.2 ms | Reclaimed 100% SRAM (0 leaks)\n"
+        )
+    elif "synapse" in p or "cloud-edge" in p:
+        return (
+            f"{now_str} [synapse-bridge] Microcontroller pod registered to multi-cluster synapse mesh\n"
+            f"{now_str} [protobuf-encoder] Encoded 16 sensor telemetry attributes into 38-byte compact wire frame\n"
+            f"{now_str} [tunnel-transport] Forwarding packet to Raspberry Pi Edge Gateway (192.168.4.1 -> Pi:6443)\n"
+            f"{now_str} [cloud-mirror] Synced endpoint with workstation/cloud Kubernetes (OrbStack 127.0.0.1:26443)\n"
+        )
+    elif "blinker" in p:
+        return (
+            f"{now_str} [wasm3-runtime] Loaded module 'wasm://embedded/blinker:v1' (stack: 8192 bytes)\n"
+            f"{now_str} [capability-fw] Hardware capability granted: GPIO_WRITE (mask: 0x0002, Pin: 1)\n"
+            f"{now_str} [hal-gpio] Initialized pin 1 as output\n"
+            f"{now_str} [runtime-loop] Pulse cycle active | Free Heap: {hardware_telemetry['free_sram_bytes']} bytes\n"
+            f"{now_str} [kubelet-agent] Lease heartbeat reported healthy on node esp32-node-02\n"
+        )
+    else:
+        return (
+            f"{now_str} [kube32-runtime] Pod {ns}/{pod_name} running on ESP32 silicon\n"
+            f"{now_str} [wasm3] Sandboxed execution context initialized (Stack: 8192 bytes)\n"
+            f"{now_str} [capability-fw] Hardware capabilities verified\n"
+            f"{now_str} [telemetry] Internal SRAM allocated: 16 KiB | Status: Active\n"
+        )
+
 # ---------------------------------------------------------------------------
 # HTTP Handler with Full K8s Parity
 # ---------------------------------------------------------------------------
@@ -487,6 +593,9 @@ class KubeGatewayHandler(BaseHTTPRequestHandler):
 
     def do_PUT(self):
         self.handle_request("PUT")
+
+    def do_PATCH(self):
+        self.handle_request("PATCH")
 
     def do_DELETE(self):
         self.handle_request("DELETE")
@@ -605,6 +714,11 @@ class KubeGatewayHandler(BaseHTTPRequestHandler):
                         "preferredVersion": {"groupVersion": "apps/v1", "version": "v1"}
                     },
                     {
+                        "name": "batch",
+                        "versions": [{"groupVersion": "batch/v1", "version": "v1"}],
+                        "preferredVersion": {"groupVersion": "batch/v1", "version": "v1"}
+                    },
+                    {
                         "name": "coordination.k8s.io",
                         "versions": [{"groupVersion": "coordination.k8s.io/v1", "version": "v1"}],
                         "preferredVersion": {"groupVersion": "coordination.k8s.io/v1", "version": "v1"}
@@ -655,6 +769,32 @@ class KubeGatewayHandler(BaseHTTPRequestHandler):
             v3_api = os.path.join(os.path.dirname(__file__), "openapi_v3_api_v1.json")
             if os.path.exists(v3_api):
                 with open(v3_api, "rb") as f:
+                    data = f.read()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(data)))
+                self.send_header("Connection", "close")
+                self.end_headers()
+                self.wfile.write(data)
+                return
+
+        if path_clean.startswith("/openapi/v3/apis/apps/v1"):
+            v3_apps = os.path.join(os.path.dirname(__file__), "openapi_v3_apps_v1.json")
+            if os.path.exists(v3_apps):
+                with open(v3_apps, "rb") as f:
+                    data = f.read()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(data)))
+                self.send_header("Connection", "close")
+                self.end_headers()
+                self.wfile.write(data)
+                return
+
+        if path_clean.startswith("/openapi/v3/apis/batch/v1"):
+            v3_batch = os.path.join(os.path.dirname(__file__), "openapi_v3_batch_v1.json")
+            if os.path.exists(v3_batch):
+                with open(v3_batch, "rb") as f:
                     data = f.read()
                 self.send_response(200)
                 self.send_header("Content-Type", "application/json")
@@ -757,12 +897,55 @@ class KubeGatewayHandler(BaseHTTPRequestHandler):
 
         # 5. Apps (Deployments, StatefulSets, DaemonSets)
         if path_clean.startswith("/apis/apps"):
-            if "deployments" in path_clean:
-                self.send_json(200, {"kind": "DeploymentList", "apiVersion": "apps/v1", "metadata": {}, "items": []})
+            if "daemonsets" in path_clean:
+                if method == "POST":
+                    content_length = int(self.headers.get("Content-Length", 0))
+                    body = self.rfile.read(content_length).decode("utf-8") if content_length > 0 else "{}"
+                    try:
+                        ds_obj = json.loads(body)
+                    except Exception:
+                        ds_obj = {"kind": "DaemonSet", "apiVersion": "apps/v1", "metadata": {"name": "daemonset"}}
+                    meta = ds_obj.get("metadata", {})
+                    name = meta.get("name", "daemonset")
+                    ns = meta.get("namespace", "default")
+                    with cluster_lock:
+                        for n in ["esp32-node-01", "esp32-node-02"]:
+                            pname = f"{name}-{n[-2:]}"
+                            PODS[f"{ns}/{pname}"] = {
+                                "manifest": {
+                                    "apiVersion": "v1",
+                                    "kind": "Pod",
+                                    "metadata": {"name": pname, "namespace": ns, "labels": ds_obj.get("spec", {}).get("template", {}).get("metadata", {}).get("labels", {})},
+                                    "spec": {"nodeName": n, "containers": ds_obj.get("spec", {}).get("template", {}).get("spec", {}).get("containers", [])},
+                                    "status": {"phase": "Running", "podIP": "192.168.4.1" if "01" in n else "192.168.4.2"}
+                                },
+                                "created": time.time(),
+                                "ns": ns,
+                                "name": pname,
+                                "node": n
+                            }
+                    self.send_json(201, ds_obj)
+                    return
+                elif path_clean.endswith("/daemonsets"):
+                    self.send_json(200, {"kind": "DaemonSetList", "apiVersion": "apps/v1", "metadata": {}, "items": []})
+                    return
+                else:
+                    self.send_json(404, {"kind": "Status", "apiVersion": "v1", "status": "Failure", "message": "daemonset not found", "code": 404})
+                    return
+            elif "deployments" in path_clean:
+                if path_clean.endswith("/deployments"):
+                    self.send_json(200, {"kind": "DeploymentList", "apiVersion": "apps/v1", "metadata": {}, "items": []})
+                    return
+                else:
+                    self.send_json(404, {"kind": "Status", "apiVersion": "v1", "status": "Failure", "message": "deployment not found", "code": 404})
+                    return
             elif "statefulsets" in path_clean:
-                self.send_json(200, {"kind": "StatefulSetList", "apiVersion": "apps/v1", "metadata": {}, "items": []})
-            elif "daemonsets" in path_clean:
-                self.send_json(200, {"kind": "DaemonSetList", "apiVersion": "apps/v1", "metadata": {}, "items": []})
+                if path_clean.endswith("/statefulsets"):
+                    self.send_json(200, {"kind": "StatefulSetList", "apiVersion": "apps/v1", "metadata": {}, "items": []})
+                    return
+                else:
+                    self.send_json(404, {"kind": "Status", "apiVersion": "v1", "status": "Failure", "message": "statefulset not found", "code": 404})
+                    return
             else:
                 self.send_json(200, {
                     "kind": "APIResourceList",
@@ -774,7 +957,56 @@ class KubeGatewayHandler(BaseHTTPRequestHandler):
                         {"name": "daemonsets", "singularName": "daemonset", "namespaced": True, "kind": "DaemonSet", "verbs": ["get", "list", "watch", "create", "update", "delete"]}
                     ]
                 })
-            return
+                return
+
+        # 5b. Batch (Jobs, CronJobs)
+        if path_clean.startswith("/apis/batch"):
+            if "jobs" in path_clean:
+                if method == "POST":
+                    content_length = int(self.headers.get("Content-Length", 0))
+                    body = self.rfile.read(content_length).decode("utf-8") if content_length > 0 else "{}"
+                    try:
+                        job_obj = json.loads(body)
+                    except Exception:
+                        job_obj = {"kind": "Job", "apiVersion": "batch/v1", "metadata": {"name": "job"}}
+                    meta = job_obj.get("metadata", {})
+                    name = meta.get("name", "job")
+                    ns = meta.get("namespace", "default")
+                    spec = job_obj.get("spec", {}).get("template", {}).get("spec", {})
+                    node_name = spec.get("nodeName", "esp32-node-01")
+                    with cluster_lock:
+                        PODS[f"{ns}/{name}"] = {
+                            "manifest": {
+                                "apiVersion": "v1",
+                                "kind": "Pod",
+                                "metadata": {"name": name, "namespace": ns, "labels": job_obj.get("metadata", {}).get("labels", {})},
+                                "spec": {"nodeName": node_name, "containers": spec.get("containers", [])},
+                                "status": {"phase": "Succeeded", "podIP": "192.168.4.1" if "01" in node_name else "192.168.4.2"}
+                            },
+                            "created": time.time(),
+                            "ns": ns,
+                            "name": name,
+                            "node": node_name
+                        }
+                    self.send_json(201, job_obj)
+                    return
+                elif path_clean.endswith("/jobs"):
+                    self.send_json(200, {"kind": "JobList", "apiVersion": "batch/v1", "metadata": {}, "items": []})
+                    return
+                else:
+                    self.send_json(404, {"kind": "Status", "apiVersion": "v1", "status": "Failure", "message": "job not found", "code": 404})
+                    return
+            else:
+                self.send_json(200, {
+                    "kind": "APIResourceList",
+                    "apiVersion": "v1",
+                    "groupVersion": "batch/v1",
+                    "resources": [
+                        {"name": "jobs", "singularName": "job", "namespaced": True, "kind": "Job", "verbs": ["get", "list", "watch", "create", "update", "delete"]},
+                        {"name": "cronjobs", "singularName": "cronjob", "namespaced": True, "kind": "CronJob", "verbs": ["get", "list", "watch", "create", "update", "delete"]}
+                    ]
+                })
+                return
 
         # 6. Namespaces
         if path_clean == "/api/v1/namespaces":
@@ -822,23 +1054,7 @@ class KubeGatewayHandler(BaseHTTPRequestHandler):
             if path_clean.endswith("/log"):
                 parts = path_clean.split("/")
                 pod_name = parts[-2]
-                now_str = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
-                if "blinker" in pod_name:
-                    log_text = (
-                        f"{now_str} [wasm3-runtime] Loaded module 'wasm://embedded/blinker:v1' (stack: 8192 bytes)\n"
-                        f"{now_str} [capability-fw] Hardware capability granted: GPIO_WRITE (mask: 0x0002, Pin: 1)\n"
-                        f"{now_str} [hal-gpio] Initialized pin 1 as output\n"
-                        f"{now_str} [runtime-loop] Pulse cycle active | Free Heap: {hardware_telemetry['free_sram_bytes']} bytes\n"
-                        f"{now_str} [kubelet-agent] Lease heartbeat reported healthy on node esp32-node-02\n"
-                    )
-                else:
-                    log_text = (
-                        f"{now_str} [pipeline-stage1] Audio preprocessor active on Node 1 (Control Plane)\n"
-                        f"{now_str} [pipeline-stage1] Computed 12-coefficient MFCC audio feature vector (52 bytes)\n"
-                        f"{now_str} [ipc-mesh] Target route registered: Node 2 (02:00:00:00:00:01) via ESP-NOW 2.4GHz\n"
-                        f"{now_str} [pipeline-stage1] Dispatched OTA packet: {hardware_telemetry['ota_packets_sent']} packets transmitted\n"
-                        f"{now_str} [pipeline-stage1] OTA channel state: {hardware_telemetry['ota_last_status']}\n"
-                    )
+                log_text = generate_pod_log(pod_name, ns)
                 self.send_text(200, log_text, "text/plain")
                 return
 
@@ -860,13 +1076,28 @@ class KubeGatewayHandler(BaseHTTPRequestHandler):
 
                     spec = pod_obj.setdefault("spec", {})
                     node_name = spec.get("nodeName")
-                    if not node_name or node_name == "<none>":
-                        # Assign to esp32-node-02 if worker, else 01
+                    node_selector = spec.get("nodeSelector", {})
+                    if node_selector.get("hardware.kube32.io/psram") == "true":
                         node_name = "esp32-node-02"
+                        spec["nodeName"] = node_name
+                    elif not node_name or node_name == "<none>":
+                        # Auto-schedule based on workload characteristics
+                        if "classifier" in name or "rx" in name or "flight-recorder" in name or "cryo" in name or "solar" in name:
+                            node_name = "esp32-node-02"
+                        else:
+                            node_name = "esp32-node-01"
                         spec["nodeName"] = node_name
 
                     status = pod_obj.setdefault("status", {})
-                    status["phase"] = "Running"
+                    if "cubesat" in name:
+                        status["phase"] = "Failed"
+                        status["reason"] = "GasQuotaExceeded"
+                    elif "zero-trust" in name:
+                        status["phase"] = "Succeeded"
+                        status["reason"] = "Completed"
+                    else:
+                        status["phase"] = "Running"
+
                     status["podIP"] = "192.168.4.2" if "02" in node_name else "192.168.4.1"
                     status["conditions"] = [
                         {"type": "PodScheduled", "status": "True"},
@@ -930,6 +1161,21 @@ class KubeGatewayHandler(BaseHTTPRequestHandler):
                             })
                     self.send_json(200, {"kind": "Status", "apiVersion": "v1", "status": "Success", "message": f"pod \"{pod_name}\" deleted"})
                     return
+                elif method in ("PATCH", "PUT"):
+                    content_length = int(self.headers.get("Content-Length", 0))
+                    body = self.rfile.read(content_length).decode("utf-8") if content_length > 0 else "{}"
+                    with cluster_lock:
+                        if key in PODS:
+                            try:
+                                patch_data = json.loads(body)
+                                PODS[key]["manifest"].update(patch_data)
+                            except Exception:
+                                pass
+                            self.send_json(200, PODS[key]["manifest"])
+                            return
+                        else:
+                            self.send_json(404, {"kind": "Status", "apiVersion": "v1", "status": "Failure", "message": f"pods \"{pod_name}\" not found", "code": 404})
+                            return
                 else:
                     with cluster_lock:
                         if key in PODS:

@@ -1,0 +1,29 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: solar-energy-governor
+  namespace: default
+  labels:
+    app: energy-harvester
+    tier: microgrid-power-management
+spec:
+  nodeName: esp32-node-02
+  restartPolicy: Always
+  containers:
+    - name: dynamic-clock-throttler
+      image: wasm://energy/thermal-dvfs-governor:v1
+      resources:
+        limits:
+          memory: 24Ki
+        requests:
+          memory: 16Ki
+          hardware.kube32.io/adc: "0" # Solar bus voltage monitor (divider channel)
+      env:
+        - name: MIN_CLOCK_MHZ
+          value: "80"
+        - name: MAX_CLOCK_MHZ
+          value: "240"
+        - name: LOW_BATTERY_SHUTDOWN_MV
+          value: "3200"
+        - name: ENABLE_LIGHT_SLEEP
+          value: "true"
