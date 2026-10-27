@@ -1,18 +1,48 @@
 /* ==============================================================================
-   Kube32 Material 3 (M3) Design System & Micro-Animation Engine
-   Engineered to Google Material 3 Specifications & Expressive Tokens (agentic-video)
-   Tonal Surfaces Ladder, Gemini Spring Motion System, Shape & Spacing Scales
-   Google Blue M3 Tonal Palette & Interactive Blueprint Micro-Physics
+   Kube32 Material Design 3 (M3) Design System & Motion Engine
+   Accurately ported from agentic-video studio (Google Material 3 Expressive)
+   Emerald Tonal-Spot Seed (#10b981), M3 Surface Ladder, Gemini Spring Motion,
+   Local SIL Open Font License Google Sans Flex & Code, M3 Pill Tabs, M3 Search Bar
    ============================================================================== */
 
-@import url('https://fonts.googleapis.com/css2?family=Google+Sans+Flex:wght@100..900&family=JetBrains+Mono:wght@400;500;600;700&display=swap');
+/* Local Fonts (Served directly from repository for zero-latency, full offline support) */
+@font-face {
+  font-family: "Google Sans Flex";
+  font-style: normal;
+  font-weight: 1 1000;
+  font-stretch: 100%;
+  font-display: swap;
+  src: url("../fonts/GoogleSansFlex-latin.woff2") format("woff2");
+  unicode-range: U+0000-00FF, U+0131, U+0152-0153, U+02BB-02BC, U+02C6, U+02DA, U+02DC, U+0304, U+0308, U+0329, U+2000-206F, U+20AC, U+2122, U+2191, U+2193, U+2212, U+2215, U+FEFF, U+FFFD;
+}
+
+@font-face {
+  font-family: "Google Sans Flex";
+  font-style: normal;
+  font-weight: 1 1000;
+  font-stretch: 100%;
+  font-display: swap;
+  src: url("../fonts/GoogleSansFlex-latin-ext.woff2") format("woff2");
+  unicode-range: U+0100-02BA, U+02BD-02C5, U+02C7-02CC, U+02CE-02D7, U+02DD-02FF, U+0304, U+0308, U+0329, U+1D00-1DBF, U+1E00-1E9F, U+1EF2-1EFF, U+2020, U+20A0-20AB, U+20AD-20C4, U+2113, U+2C60-2C7F, U+A720-A7FF;
+}
+
+@font-face {
+  font-family: "Google Sans Code";
+  font-style: normal;
+  font-weight: 300 800;
+  font-display: swap;
+  src: url("../fonts/GoogleSansCode-latin.woff2") format("woff2");
+}
 
 :root {
-  /* Typography */
-  --md-text-font: "Google Sans Flex", system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
-  --md-code-font: "JetBrains Mono", "Roboto Mono", monospace;
+  --font-sans: "Google Sans Flex", "Google Sans", "Roboto Flex", Roboto, system-ui, -apple-system, "Segoe UI", sans-serif;
+  --font-mono: "Google Sans Code", "JetBrains Mono", ui-monospace, "SF Mono", Menlo, monospace;
 
-  /* Material 3 Shape Corner Scale (px) */
+  /* MkDocs Font Bridge */
+  --md-text-font-family: var(--font-sans);
+  --md-code-font-family: var(--font-mono);
+
+  /* Shape: Material 3 corner scale (in px) */
   --r-xs: 4px;
   --r-sm: 8px;
   --r-md: 12px;
@@ -23,7 +53,7 @@
   --r-xxl: 48px;
   --r-full: 999px;
 
-  /* Backwards-compatibility aliases */
+  /* Backwards compatibility shape aliases */
   --md-sys-shape-corner-none: 0px;
   --md-sys-shape-corner-xs: var(--r-xs);
   --md-sys-shape-corner-sm: var(--r-sm);
@@ -32,7 +62,7 @@
   --md-sys-shape-corner-xl: var(--r-xl);
   --md-sys-shape-corner-full: var(--r-full);
 
-  /* Material 3 Spacing: 4px grid */
+  /* Space: Material 3 4px grid */
   --s-1: 4px;
   --s-2: 8px;
   --s-3: 12px;
@@ -45,7 +75,7 @@
   --s-16: 64px;
 
   /*
-   * Gemini App Spring Motion System (from agentic-video)
+   * Gemini App Spring Motion System (from agentic-video studio)
    * Spatial springs (mass 1, damping 0.9) sampled into CSS linear() curves.
    * Effects: cubic-bezier(0.2, 0, 0, 1) standard easing.
    */
@@ -66,151 +96,172 @@
   --ease-exit: linear;
   --dur-exit: 200ms;
   --dur-breath: 2800ms;
-
-  /* Material 3 Standard Elevation Levels */
-  --md-sys-elevation-level1: 0 1px 3px 1px rgba(0, 0, 0, 0.12), 0 1px 2px 0 rgba(0, 0, 0, 0.24);
-  --md-sys-elevation-level2: 0 2px 6px 2px rgba(0, 0, 0, 0.12), 0 1px 2px 0 rgba(0, 0, 0, 0.24);
-  --md-sys-elevation-level3: 0 4px 8px 3px rgba(0, 0, 0, 0.12), 0 1px 3px 0 rgba(0, 0, 0, 0.24);
 }
 
 /* ==============================================================================
-   Material 3 Light Color Scheme (Google Blue Tonal Palette)
+   Material 3 Emerald Theme - Dark Mode (from agentic-video studio)
+   Emerald seed (#10b981) tonal-spot scheme & neural expressive surface layer
    ============================================================================== */
-[data-md-color-scheme="default"] {
-  color-scheme: light;
-
-  /* M3 Primary */
-  --md-sys-color-primary: #0b57d0;
-  --md-sys-color-on-primary: #ffffff;
-  --md-sys-color-primary-container: #d3e3fd;
-  --md-sys-color-on-primary-container: #041e49;
-
-  /* M3 Secondary */
-  --md-sys-color-secondary: #00639b;
-  --md-sys-color-on-secondary: #ffffff;
-  --md-sys-color-secondary-container: #cce5ff;
-  --md-sys-color-on-secondary-container: #001d32;
-
-  /* M3 Tertiary */
-  --md-sys-color-tertiary: #006874;
-  --md-sys-color-on-tertiary: #ffffff;
-  --md-sys-color-tertiary-container: #97f0ff;
-  --md-sys-color-on-tertiary-container: #001f24;
-
-  /* M3 Surfaces & Tonal Ladder */
-  --well: #e8ecf2;
-  --surface: #f8fafd;
-  --surface-low: #f2f5f9;
-  --surface-container: #ecf0f5;
-  --surface-high: #e4e9f0;
-  --surface-highest: #dde3eb;
-
-  --md-sys-color-surface: var(--surface);
-  --md-sys-color-on-surface: #191c20;
-  --md-sys-color-surface-variant: #dfe3eb;
-  --md-sys-color-on-surface-variant: #42474e;
-  --md-sys-color-on-surface-quiet: #72777f;
-
-  --md-sys-color-surface-container-lowest: #ffffff;
-  --md-sys-color-surface-container-low: var(--surface-low);
-  --md-sys-color-surface-container: var(--surface-container);
-  --md-sys-color-surface-container-high: var(--surface-high);
-  --md-sys-color-surface-container-highest: var(--surface-highest);
-
-  /* M3 Outlines */
-  --md-sys-color-outline: #72777f;
-  --md-sys-color-outline-variant: #c2c7cf;
-
-  /* Ambient Lighting & Elevation */
-  --float-shadow: 0 8px 28px rgba(0, 0, 0, 0.12), 0 1px 3px rgba(0, 0, 0, 0.08);
-  --lit: inset 0 1px 0 rgba(255, 255, 255, 0.85);
-
-  /* MkDocs Theme Bridge Variables */
-  --md-primary-fg-color: #0b57d0;
-  --md-primary-fg-color--light: #d3e3fd;
-  --md-primary-fg-color--dark: #041e49;
-  --md-accent-fg-color: #00639b;
-  --md-default-bg-color: #f8fafd;
-  --md-default-fg-color: #191c20;
-  --md-default-fg-color--light: #42474e;
-  --md-default-fg-color--lighter: #72777f;
-
-  /* Blueprint Grid Accents */
-  --k32-grid-line: rgba(11, 87, 208, 0.06);
-  --k32-grid-bg: rgba(211, 227, 253, 0.28);
-  --k32-card-bg: #ffffff;
-}
-
-/* ==============================================================================
-   Material 3 Dark Color Scheme (Google Blue Dark Tonal Palette)
-   ============================================================================== */
-[data-md-color-scheme="slate"] {
+[data-md-color-scheme="slate"],
+:root[data-theme="dark"] {
   color-scheme: dark;
 
-  /* M3 Primary */
-  --md-sys-color-primary: #a8c7fa;
-  --md-sys-color-on-primary: #041e49;
-  --md-sys-color-primary-container: #0842a0;
-  --md-sys-color-on-primary-container: #d3e3fd;
+  /* M3 Surface Tonal Ladder */
+  --well: #0a0f0c;
+  --surface: #0f1511;
+  --surface-low: #171d19;
+  --surface-container: #1b211d;
+  --surface-high: #262b28;
+  --surface-highest: #303632;
+  --on-surface: #dee4de;
+  --on-surface-variant: #c0c9c1;
+  --on-surface-quiet: #8a938c;
+  --outline: #707973;
+  --outline-variant: #353d38;
+  --inverse-surface: #dee4de;
+  --on-inverse: #1b211d;
 
-  /* M3 Secondary */
-  --md-sys-color-secondary: #7fcfff;
-  --md-sys-color-on-secondary: #003353;
-  --md-sys-color-secondary-container: #004a75;
-  --md-sys-color-on-secondary-container: #cce5ff;
+  /* M3 Emerald Roles */
+  --accent: #8ed5b0;
+  --on-accent: #003824;
+  --accent-container: #00311f;
+  --on-accent-container: #aaf2cc;
 
-  /* M3 Tertiary */
-  --md-sys-color-tertiary: #4fd8eb;
-  --md-sys-color-on-tertiary: #00363d;
-  --md-sys-color-tertiary-container: #004f58;
-  --md-sys-color-on-tertiary-container: #97f0ff;
+  --primary: #8ed5b0;
+  --on-primary: #003824;
+  --primary-container: #005236;
+  --on-primary-container: #aaf2cc;
 
-  /* M3 Surfaces & Tonal Ladder */
-  --well: #0b0f12;
-  --surface: #101418;
-  --surface-low: #181c20;
-  --surface-container: #1c2024;
-  --surface-high: #262a2f;
-  --surface-highest: #31353a;
+  --secondary: #b4ccbd;
+  --on-secondary: #20352a;
+  --secondary-container: #364b40;
+  --on-secondary-container: #d0e8d8;
 
-  --md-sys-color-surface: var(--surface);
-  --md-sys-color-on-surface: #e1e2e8;
-  --md-sys-color-surface-variant: #41474d;
-  --md-sys-color-on-surface-variant: #c1c7ce;
-  --md-sys-color-on-surface-quiet: #8b9198;
+  --tertiary: #a5cdde;
+  --on-tertiary: #063543;
+  --tertiary-container: #244c5a;
+  --on-tertiary-container: #c0e9fb;
 
-  --md-sys-color-surface-container-lowest: var(--well);
-  --md-sys-color-surface-container-low: var(--surface-low);
-  --md-sys-color-surface-container: var(--surface-container);
-  --md-sys-color-surface-container-high: var(--surface-high);
-  --md-sys-color-surface-container-highest: var(--surface-highest);
+  --alert: #f2b8b5;
+  --scrim: rgb(0 0 0 / 0.72);
+  --float-shadow: 0 8px 32px rgb(0 0 0 / 0.5), 0 1px 3px rgb(0 0 0 / 0.4);
+  --shimmer: rgb(255 255 255 / 0.045);
 
-  /* M3 Outlines */
-  --md-sys-color-outline: #8b9198;
-  --md-sys-color-outline-variant: #41474d;
+  /* Neural Expressive ambient layer */
+  --neural-a: #b4ccbd;
+  --neural-b: #8ed5b0;
+  --neural-c: #a5cdde;
+  --neural: linear-gradient(100deg, var(--neural-a) 0%, var(--neural-b) 50%, var(--neural-c) 100%);
+  --lit: inset 0 1px 0 rgb(255 255 255 / 0.07), 0 10px 28px rgb(0 0 0 / 0.3);
+  --aura: -20px 10px 48px -16px color-mix(in srgb, var(--neural-a) 50%, transparent), 20px 10px 48px -16px color-mix(in srgb, var(--neural-c) 42%, transparent), 0 16px 48px -14px color-mix(in srgb, var(--neural-b) 40%, transparent);
+  --wash: radial-gradient(70% 42% at 50% -8%, color-mix(in srgb, var(--neural-b) 11%, transparent), transparent 70%);
 
-  /* Ambient Lighting & Elevation */
-  --float-shadow: 0 8px 32px rgba(0, 0, 0, 0.45), 0 1px 3px rgba(0, 0, 0, 0.35);
-  --lit: inset 0 1px 0 rgba(255, 255, 255, 0.07);
+  /* MkDocs Material Theme Bridge */
+  --md-default-bg-color: var(--surface);
+  --md-default-fg-color: var(--on-surface);
+  --md-default-fg-color--light: var(--on-surface-variant);
+  --md-default-fg-color--lighter: var(--on-surface-quiet);
+  --md-default-fg-color--lightest: var(--outline-variant);
 
-  /* MkDocs Theme Bridge Variables */
-  --md-primary-fg-color: #0b57d0;
-  --md-primary-fg-color--light: #a8c7fa;
-  --md-primary-fg-color--dark: #041e49;
-  --md-accent-fg-color: #7fcfff;
-  --md-default-bg-color: #101418;
-  --md-default-fg-color: #e1e2e8;
-  --md-default-fg-color--light: #c1c7ce;
-  --md-default-fg-color--lighter: #8b9198;
+  --md-primary-fg-color: var(--primary);
+  --md-primary-fg-color--light: var(--primary-container);
+  --md-primary-fg-color--dark: var(--on-primary);
+  --md-primary-bg-color: var(--on-primary);
+  --md-accent-fg-color: var(--secondary);
+
+  --md-code-bg-color: var(--surface-low);
+  --md-code-fg-color: var(--on-surface);
+  --md-typeset-color: var(--on-surface);
+  --md-typeset-a-color: var(--primary);
 
   /* Blueprint Grid Accents */
-  --k32-grid-line: rgba(168, 199, 250, 0.08);
-  --k32-grid-bg: #181c20;
-  --k32-card-bg: #1c2024;
+  --k32-grid-line: rgba(142, 213, 176, 0.07);
+  --k32-grid-bg: var(--surface-low);
+  --k32-card-bg: var(--surface-container);
 }
 
 /* ==============================================================================
-   Keyframe Micro-Animations (from agentic-video)
+   Material 3 Emerald Theme - Light Mode (from agentic-video studio)
+   ============================================================================== */
+[data-md-color-scheme="default"],
+:root[data-theme="light"] {
+  color-scheme: light;
+
+  /* M3 Surface Tonal Ladder */
+  --well: #e7ece6;
+  --surface: #f5fbf5;
+  --surface-low: #f0f5ef;
+  --surface-container: #eaefe9;
+  --surface-high: #e4eae4;
+  --surface-highest: #d9ded8;
+  --on-surface: #1b211d;
+  --on-surface-variant: #404943;
+  --on-surface-quiet: #707973;
+  --outline: #8a938c;
+  --outline-variant: #cdd7cf;
+  --inverse-surface: #1b211d;
+  --on-inverse: #edf2ec;
+
+  /* M3 Emerald Roles */
+  --accent: #226a4c;
+  --on-accent: #ffffff;
+  --accent-container: #aaf2cc;
+  --on-accent-container: #002517;
+
+  --primary: #226a4c;
+  --on-primary: #ffffff;
+  --primary-container: #aaf2cc;
+  --on-primary-container: #002517;
+
+  --secondary: #4d6356;
+  --on-secondary: #ffffff;
+  --secondary-container: #cfe7d7;
+  --on-secondary-container: #0b1f16;
+
+  --tertiary: #3b6473;
+  --on-tertiary: #ffffff;
+  --tertiary-container: #bee9fb;
+  --on-tertiary-container: #001f28;
+
+  --alert: #b3261e;
+  --scrim: rgb(20 20 20 / 0.5);
+  --float-shadow: 0 8px 28px rgb(0 0 0 / 0.14), 0 1px 3px rgb(0 0 0 / 0.1);
+  --shimmer: rgb(0 0 0 / 0.04);
+
+  /* Neural Expressive ambient layer */
+  --neural-a: #4d6356;
+  --neural-b: #226a4c;
+  --neural-c: #3b6473;
+  --neural: linear-gradient(100deg, var(--neural-a) 0%, var(--neural-b) 50%, var(--neural-c) 100%);
+  --lit: inset 0 1px 0 rgb(255 255 255 / 0.8), 0 10px 28px rgb(0 0 0 / 0.08);
+  --wash: radial-gradient(70% 42% at 50% -8%, color-mix(in srgb, var(--neural-b) 8%, transparent), transparent 70%);
+
+  /* MkDocs Material Theme Bridge */
+  --md-default-bg-color: var(--surface);
+  --md-default-fg-color: var(--on-surface);
+  --md-default-fg-color--light: var(--on-surface-variant);
+  --md-default-fg-color--lighter: var(--on-surface-quiet);
+  --md-default-fg-color--lightest: var(--outline-variant);
+
+  --md-primary-fg-color: var(--primary);
+  --md-primary-fg-color--light: var(--primary-container);
+  --md-primary-fg-color--dark: var(--on-primary);
+  --md-primary-bg-color: var(--on-primary);
+  --md-accent-fg-color: var(--secondary);
+
+  --md-code-bg-color: var(--surface-low);
+  --md-code-fg-color: var(--on-surface);
+  --md-typeset-color: var(--on-surface);
+  --md-typeset-a-color: var(--primary);
+
+  /* Blueprint Grid Accents */
+  --k32-grid-line: rgba(34, 106, 76, 0.06);
+  --k32-grid-bg: var(--surface-low);
+  --k32-card-bg: var(--surface-container-low);
+}
+
+/* ==============================================================================
+   Keyframe Micro-Animations & View Transitions (from agentic-video studio)
    ============================================================================== */
 @keyframes rise {
   from {
@@ -232,35 +283,6 @@
   }
 }
 
-@keyframes pop {
-  from {
-    transform: scale(0.85);
-    opacity: 0;
-  }
-  to {
-    transform: scale(1);
-    opacity: 1;
-  }
-}
-
-@keyframes breathe {
-  0%, 100% {
-    opacity: 0.55;
-  }
-  50% {
-    opacity: 1;
-  }
-}
-
-@keyframes pulse-ring {
-  0% {
-    box-shadow: 0 0 0 0 color-mix(in srgb, var(--md-sys-color-primary) 55%, transparent);
-  }
-  100% {
-    box-shadow: 0 0 0 8px color-mix(in srgb, var(--md-sys-color-primary) 0%, transparent);
-  }
-}
-
 @keyframes sweep {
   from {
     background-position: 100% 0;
@@ -270,25 +292,40 @@
   }
 }
 
-/* ==============================================================================
-   Global Smooth Selection, Focus & Scrollbars
-   ============================================================================== */
-::selection {
-  background: color-mix(in srgb, var(--md-sys-color-primary) 24%, transparent);
+@keyframes breathe {
+  0%, 100% {
+    opacity: 0.45;
+  }
+  50% {
+    opacity: 1;
+  }
 }
 
-:focus-visible {
-  outline: 2px solid var(--md-sys-color-primary) !important;
-  outline-offset: 2px !important;
+@keyframes pulse-ring {
+  0% {
+    box-shadow: 0 0 0 0 color-mix(in srgb, var(--primary) 55%, transparent);
+  }
+  100% {
+    box-shadow: 0 0 0 8px color-mix(in srgb, var(--primary) 0%, transparent);
+  }
+}
+
+/* Global Selection, Scrollbars & Focus */
+::selection {
+  background: color-mix(in srgb, var(--secondary) 36%, transparent);
+}
+
+:focus-visible:not(.md-search__input):not(.md-search__form) {
+  outline: 2px solid var(--primary);
+  outline-offset: 2px;
   transition: outline-color var(--dur-effects-fast) var(--ease-effects);
 }
 
 * {
   scrollbar-width: thin;
-  scrollbar-color: color-mix(in srgb, var(--md-sys-color-on-surface) 18%, transparent) transparent;
+  scrollbar-color: color-mix(in srgb, var(--on-surface) 18%, transparent) transparent;
 }
 
-/* View Transitions Engine */
 ::view-transition-old(root) {
   animation: fade var(--dur-exit) var(--ease-exit) reverse both;
 }
@@ -298,206 +335,354 @@
 }
 
 /* ==============================================================================
-   Material 3 Typography & Hierarchy (Google Sans Flex with ROND 100)
+   Body & Layout Structure
    ============================================================================== */
-body, .md-typeset {
-  font-family: var(--md-text-font);
-  font-size: 0.95rem;
-  line-height: 1.6;
-  letter-spacing: -0.01em;
-  color: var(--md-sys-color-on-surface);
-  -webkit-font-smoothing: antialiased;
-  text-rendering: optimizeLegibility;
-  font-optical-sizing: auto;
+body {
+  background: var(--wash), var(--surface) !important;
+  background-attachment: fixed !important;
+  color: var(--on-surface) !important;
+  font-family: var(--font-sans) !important;
+  font-size: 14px !important;
+  line-height: 22px !important;
+  font-weight: 400 !important;
+  -webkit-font-smoothing: antialiased !important;
+  text-rendering: optimizeLegibility !important;
 }
 
-/* Page content enters smoothly with Gemini standard easing */
+.md-grid {
+  max-width: 76rem !important;
+}
+
 .md-content__inner {
-  animation: rise var(--dur-effects-slow) var(--ease-effects) both;
-}
-
-h1, h2, h3, h4, h5, h6 {
-  font-family: var(--md-text-font);
-  font-weight: 600;
-  color: var(--md-sys-color-on-surface);
-  letter-spacing: -0.02em;
-  font-variation-settings: "ROND" 100;
-}
-
-.md-typeset h1 {
-  font-size: 2.15rem;
-  font-weight: 700;
-  line-height: 1.25;
-  color: var(--md-sys-color-primary);
-  margin-bottom: var(--s-4);
-  font-variation-settings: "ROND" 100;
-}
-
-.md-typeset h2 {
-  font-size: 1.45rem;
-  font-weight: 600;
-  line-height: 1.35;
-  margin-top: var(--s-8);
-  margin-bottom: var(--s-3);
-  padding-bottom: var(--s-1);
-  border-bottom: 1px solid var(--md-sys-color-outline-variant);
-  font-variation-settings: "ROND" 100;
-}
-
-.md-typeset h3 {
-  font-size: 1.15rem;
-  font-weight: 600;
-  margin-top: var(--s-6);
-  margin-bottom: var(--s-2);
-  font-variation-settings: "ROND" 100;
+  animation: fade var(--dur-effects-slow) var(--ease-effects) both;
 }
 
 /* ==============================================================================
-   Material 3 Top App Bar & Navigation Header
+   Material 3 Top App Bar (Header)
    ============================================================================== */
 .md-header {
-  background-color: var(--md-sys-color-surface-container) !important;
-  color: var(--md-sys-color-on-surface) !important;
-  border-bottom: 1px solid var(--md-sys-color-outline-variant);
+  background-color: var(--surface-container) !important;
+  color: var(--on-surface) !important;
+  border-bottom: 1px solid var(--outline-variant) !important;
   box-shadow: none !important;
   transition: background-color var(--dur-effects) var(--ease-effects) !important;
 }
 
-.md-header__title, .md-header__topic {
-  font-family: var(--md-text-font) !important;
+.md-header__inner {
+  height: 64px !important;
+  align-items: center !important;
+}
+
+.md-header__title {
+  font-family: var(--font-sans) !important;
   font-weight: 600 !important;
+  font-size: 1.05rem !important;
   letter-spacing: -0.01em !important;
-  color: var(--md-sys-color-on-surface) !important;
+  color: var(--on-surface) !important;
   font-variation-settings: "ROND" 100 !important;
 }
 
 .md-header__button {
-  color: var(--md-sys-color-on-surface-variant) !important;
+  color: var(--on-surface-variant) !important;
   border-radius: var(--r-full) !important;
-  transition: color var(--dur-effects-fast) var(--ease-effects), 
+  width: 40px !important;
+  height: 40px !important;
+  display: inline-grid !important;
+  place-items: center !important;
+  transition: color var(--dur-effects-fast) var(--ease-effects),
               background-color var(--dur-effects-fast) var(--ease-effects),
-              transform var(--dur-spatial-fast) var(--ease-spatial-fast) !important;
+              transform var(--dur-spatial-fast) var(--ease-spatial-fast),
+              border-radius var(--dur-spatial-fast) var(--ease-spatial-fast) !important;
 }
 
 .md-header__button:hover {
-  background-color: var(--md-sys-color-surface-container-high) !important;
-  color: var(--md-sys-color-primary) !important;
-  transform: scale(1.06);
+  background-color: color-mix(in srgb, var(--on-surface) 8%, transparent) !important;
+  color: var(--on-surface) !important;
 }
 
 .md-header__button:active {
-  transform: scale(0.94);
+  transform: scale(0.92) !important;
+  border-radius: var(--r-sm) !important;
 }
 
-/* M3 Search Bar */
+/* ==============================================================================
+   Material 3 Search Bar (Flawless pill with zero weird outlines)
+   ============================================================================== */
+.md-search {
+  outline: none !important;
+}
+
 .md-search__inner {
-  border-radius: var(--r-xl) !important;
-  background-color: var(--md-sys-color-surface-container-high) !important;
+  background: transparent !important;
+  border-radius: var(--r-full) !important;
+  box-shadow: none !important;
+  outline: none !important;
+}
+
+.md-search__form {
+  height: 40px !important;
+  border-radius: var(--r-full) !important;
+  background-color: var(--surface-high) !important;
+  border: 1px solid var(--outline-variant) !important;
+  box-shadow: none !important;
+  outline: none !important;
+  overflow: hidden !important;
   transition: background-color var(--dur-effects) var(--ease-effects),
+              border-color var(--dur-effects) var(--ease-effects),
               box-shadow var(--dur-spatial-fast) var(--ease-spatial-fast) !important;
 }
 
-.md-search__input {
-  border-radius: var(--r-xl) !important;
-  font-family: var(--md-text-font) !important;
-  color: var(--md-sys-color-on-surface) !important;
-  background-color: var(--md-sys-color-surface-container-high) !important;
-  transition: background-color var(--dur-effects) var(--ease-effects) !important;
+.md-search__form:hover {
+  background-color: var(--surface-highest) !important;
+  border-color: var(--outline) !important;
 }
 
-.md-search__input:focus {
-  background-color: var(--md-sys-color-surface-container-highest) !important;
+.md-search__form:focus-within {
+  background-color: var(--surface-highest) !important;
+  border-color: var(--primary) !important;
+  box-shadow: 0 0 0 1px var(--primary) !important;
+  outline: none !important;
+}
+
+.md-search__input {
+  height: 100% !important;
+  border-radius: var(--r-full) !important;
+  background: transparent !important;
+  border: none !important;
+  outline: none !important;
+  box-shadow: none !important;
+  color: var(--on-surface) !important;
+  font-family: var(--font-sans) !important;
+  font-size: 13.5px !important;
+  padding-left: 44px !important;
 }
 
 .md-search__input::placeholder {
-  color: var(--md-sys-color-on-surface-variant) !important;
-  opacity: 0.8 !important;
-}
-
-.md-search__icon {
-  color: var(--md-sys-color-on-surface-variant) !important;
-  transition: color var(--dur-effects-fast) var(--ease-effects) !important;
-}
-
-/* M3 Navigation Tabs */
-.md-tabs {
-  background-color: var(--md-sys-color-surface-container-low) !important;
-  border-bottom: 1px solid var(--md-sys-color-outline-variant);
-}
-
-.md-tabs__link {
-  font-family: var(--md-text-font) !important;
-  font-weight: 500 !important;
-  font-size: 0.85rem !important;
-  color: var(--md-sys-color-on-surface-variant) !important;
-  opacity: 0.9 !important;
-  position: relative;
-  transition: color var(--dur-effects) var(--ease-effects), 
-              opacity var(--dur-effects) var(--ease-effects),
-              transform var(--dur-spatial-fast) var(--ease-spatial-fast) !important;
-}
-
-.md-tabs__item--active .md-tabs__link,
-.md-tabs__link:hover {
-  color: var(--md-sys-color-primary) !important;
+  color: var(--on-surface-quiet) !important;
   opacity: 1 !important;
 }
 
-.md-tabs__item--active .md-tabs__link {
-  font-weight: 600 !important;
-  border-bottom: 3px solid var(--md-sys-color-primary) !important;
+.md-search__input:focus {
+  outline: none !important;
+  box-shadow: none !important;
+  border: none !important;
 }
 
-/* Navigation Drawer Items */
+.md-search__icon {
+  color: var(--on-surface-variant) !important;
+  display: flex !important;
+  align-items: center !important;
+  justify-content: center !important;
+  width: 40px !important;
+  height: 40px !important;
+}
+
+.md-search__output {
+  border-radius: var(--r-lg) !important;
+  background-color: var(--surface-container) !important;
+  border: 1px solid var(--outline-variant) !important;
+  box-shadow: var(--float-shadow) !important;
+  overflow: hidden !important;
+}
+
+/* ==============================================================================
+   Material 3 Pill Tabs (Exactly identical to agentic-video studio .places/.place)
+   ============================================================================== */
+.md-tabs {
+  background-color: var(--surface-container) !important;
+  border-bottom: 1px solid var(--outline-variant) !important;
+  padding: 6px 0 !important;
+  box-shadow: none !important;
+}
+
+.md-tabs__list {
+  display: flex !important;
+  gap: var(--s-1) !important;
+  align-items: center !important;
+  margin: 0 !important;
+  padding: 0 !important;
+}
+
+.md-tabs__item {
+  margin: 0 !important;
+  padding: 0 !important;
+  border: none !important;
+  display: inline-flex !important;
+  align-items: center !important;
+}
+
+.md-tabs__link {
+  height: 36px !important;
+  padding: 0 var(--s-4) !important;
+  display: inline-flex !important;
+  align-items: center !important;
+  justify-content: center !important;
+  border-radius: var(--r-full) !important;
+  font-family: var(--font-sans) !important;
+  font-size: 14px !important;
+  font-weight: 500 !important;
+  color: var(--on-surface-quiet) !important;
+  border: none !important;
+  border-bottom: none !important;
+  opacity: 1 !important;
+  margin: 0 !important;
+  background-color: transparent !important;
+  transition: color var(--dur-effects) var(--ease-effects),
+              background-color var(--dur-effects) var(--ease-effects),
+              transform var(--dur-spatial-fast) var(--ease-spatial-fast) !important;
+}
+
+.md-tabs__link:hover {
+  color: var(--on-surface) !important;
+  background-color: color-mix(in srgb, var(--on-surface) 6%, transparent) !important;
+  border: none !important;
+}
+
+/* Active tab morphs to a pill filled with secondary-container (agentic-video studio) */
+.md-tabs__item--active .md-tabs__link {
+  background-color: var(--secondary-container) !important;
+  color: var(--on-secondary-container) !important;
+  font-weight: 600 !important;
+  border: none !important;
+  border-bottom: none !important;
+  box-shadow: none !important;
+}
+
+.md-tabs__item--active .md-tabs__link:hover {
+  background-color: color-mix(in srgb, var(--secondary-container) 88%, var(--on-secondary-container)) !important;
+  color: var(--on-secondary-container) !important;
+}
+
+/* ==============================================================================
+   Material 3 Navigation Drawer & Table of Contents
+   ============================================================================== */
 .md-nav__link {
-  border-radius: var(--r-sm) !important;
-  padding: var(--s-1) var(--s-2) !important;
+  border-radius: var(--r-full) !important;
+  padding: var(--s-1) var(--s-3) !important;
+  font-family: var(--font-sans) !important;
+  font-size: 13.5px !important;
+  font-weight: 400 !important;
+  color: var(--on-surface-variant) !important;
   transition: background-color var(--dur-effects-fast) var(--ease-effects),
               color var(--dur-effects-fast) var(--ease-effects),
               transform var(--dur-spatial-fast) var(--ease-spatial-fast) !important;
 }
 
 .md-nav__link:hover {
-  background-color: var(--md-sys-color-surface-container-high) !important;
-  color: var(--md-sys-color-primary) !important;
+  background-color: color-mix(in srgb, var(--on-surface) 6%, transparent) !important;
+  color: var(--on-surface) !important;
 }
 
 .md-nav__item--active > .md-nav__link {
-  color: var(--md-sys-color-primary) !important;
+  color: var(--primary) !important;
   font-weight: 600 !important;
+  background-color: var(--surface-container-high) !important;
+}
+
+.md-nav__title {
+  font-family: var(--font-sans) !important;
+  font-size: 11.5px !important;
+  text-transform: uppercase !important;
+  letter-spacing: 0.05em !important;
+  font-weight: 600 !important;
+  color: var(--on-surface-quiet) !important;
 }
 
 /* ==============================================================================
-   Material 3 Cards & Blueprint Components
+   Material 3 Typography Scale (from agentic-video studio base.css)
    ============================================================================== */
-/* M3 Tonal Blueprint Card */
+.md-typeset {
+  font-family: var(--font-sans) !important;
+  font-size: 14.5px !important;
+  line-height: 1.65 !important;
+  color: var(--on-surface) !important;
+}
+
+.md-typeset h1 {
+  font-family: var(--font-sans) !important;
+  font-size: 34px !important;
+  line-height: 42px !important;
+  font-weight: 600 !important;
+  letter-spacing: -0.01em !important;
+  font-variation-settings: "ROND" 100 !important;
+  color: var(--primary) !important;
+  margin-bottom: var(--s-4) !important;
+}
+
+.md-typeset h2 {
+  font-family: var(--font-sans) !important;
+  font-size: 24px !important;
+  line-height: 32px !important;
+  font-weight: 600 !important;
+  letter-spacing: -0.005em !important;
+  font-variation-settings: "ROND" 100 !important;
+  color: var(--on-surface) !important;
+  margin-top: var(--s-8) !important;
+  margin-bottom: var(--s-3) !important;
+  padding-bottom: var(--s-1) !important;
+  border-bottom: 1px solid var(--outline-variant) !important;
+}
+
+.md-typeset h3 {
+  font-family: var(--font-sans) !important;
+  font-size: 18px !important;
+  line-height: 26px !important;
+  font-weight: 600 !important;
+  font-variation-settings: "ROND" 100 !important;
+  color: var(--on-surface) !important;
+  margin-top: var(--s-6) !important;
+  margin-bottom: var(--s-2) !important;
+}
+
+.md-typeset p {
+  color: var(--on-surface) !important;
+  line-height: 1.65 !important;
+  margin-bottom: 1em !important;
+}
+
+.md-typeset a {
+  color: var(--primary) !important;
+  font-weight: 500 !important;
+  text-decoration: none !important;
+  transition: color var(--dur-effects-fast) var(--ease-effects) !important;
+}
+
+.md-typeset a:hover {
+  color: var(--secondary) !important;
+  text-decoration: underline !important;
+}
+
+/* ==============================================================================
+   Material 3 Cards & Components
+   ============================================================================== */
+/* Tonal Blueprint Card */
 .blueprint-card {
   position: relative;
-  background-color: var(--md-sys-color-surface-container-low);
-  border: 1px solid var(--md-sys-color-outline-variant);
+  background-color: var(--surface-container-low);
+  border: 1px solid var(--outline-variant);
   border-radius: var(--r-lg);
   padding: var(--s-5) var(--s-6);
   margin: var(--s-6) 0;
   line-height: 1.65;
-  font-size: 0.9rem;
+  font-size: 14px;
   box-shadow: var(--lit);
-  transition: box-shadow var(--dur-spatial-fast) var(--ease-spatial-fast), 
+  transition: box-shadow var(--dur-spatial-fast) var(--ease-spatial-fast),
               border-color var(--dur-spatial-fast) var(--ease-spatial-fast),
               transform var(--dur-spatial-fast) var(--ease-spatial-fast);
 }
 
 .blueprint-card:hover {
-  border-color: var(--md-sys-color-outline);
+  border-color: var(--outline);
   box-shadow: var(--float-shadow);
-  transform: translateY(-1px);
+  transform: translateY(-2px);
 }
 
 .blueprint-card strong {
-  color: var(--md-sys-color-primary);
+  color: var(--primary);
   font-weight: 600;
 }
 
-/* M3 Metric Grid: 4 items neatly balanced */
+/* Metric Grid & Metric Cards */
 .metric-grid {
   display: grid;
   grid-template-columns: repeat(4, 1fr);
@@ -518,8 +703,8 @@ h1, h2, h3, h4, h5, h6 {
 }
 
 .metric-card {
-  background-color: var(--md-sys-color-surface-container-low);
-  border: 1px solid var(--md-sys-color-outline-variant);
+  background-color: var(--surface-container-low);
+  border: 1px solid var(--outline-variant);
   border-radius: var(--r-lg);
   padding: var(--s-5) var(--s-4);
   display: flex;
@@ -528,15 +713,15 @@ h1, h2, h3, h4, h5, h6 {
   text-align: center;
   box-shadow: var(--lit);
   cursor: default;
-  transition: transform var(--dur-spatial-fast) var(--ease-spatial-fast), 
-              box-shadow var(--dur-spatial-fast) var(--ease-spatial-fast), 
+  transition: transform var(--dur-spatial-fast) var(--ease-spatial-fast),
+              box-shadow var(--dur-spatial-fast) var(--ease-spatial-fast),
               border-color var(--dur-spatial-fast) var(--ease-spatial-fast);
 }
 
 .metric-card:hover {
   transform: translateY(-3px) scale(1.01);
   box-shadow: var(--float-shadow);
-  border-color: var(--md-sys-color-primary);
+  border-color: var(--primary);
 }
 
 .metric-card:active {
@@ -544,10 +729,10 @@ h1, h2, h3, h4, h5, h6 {
 }
 
 .metric-card .metric-value {
-  font-family: var(--md-text-font);
+  font-family: var(--font-sans);
   font-size: 1.85rem;
   font-weight: 700;
-  color: var(--md-sys-color-primary);
+  color: var(--primary);
   line-height: 1.15;
   letter-spacing: -0.03em;
   font-variation-settings: "ROND" 100;
@@ -555,7 +740,7 @@ h1, h2, h3, h4, h5, h6 {
 }
 
 .metric-card:hover .metric-value {
-  color: var(--md-sys-color-secondary);
+  color: var(--secondary);
 }
 
 .metric-card .metric-label {
@@ -563,22 +748,22 @@ h1, h2, h3, h4, h5, h6 {
   font-weight: 500;
   text-transform: uppercase;
   letter-spacing: 0.05em;
-  color: var(--md-sys-color-on-surface-variant);
+  color: var(--on-surface-variant);
   margin-top: var(--s-1);
 }
 
-/* M3 Filter Chips & Technical Badges with Micro-Interaction */
+/* Tech Badges / Filter Chips (Material 3 Chip style) */
 .tech-badge {
   display: inline-flex;
   align-items: center;
-  font-family: var(--md-code-font);
+  font-family: var(--font-mono);
   font-size: 0.75rem;
   font-weight: 600;
   padding: 3px 10px;
   border-radius: var(--r-sm);
-  background-color: var(--md-sys-color-primary-container);
-  color: var(--md-sys-color-on-primary-container);
-  border: 1px solid var(--md-sys-color-outline-variant);
+  background-color: var(--secondary-container);
+  color: var(--on-secondary-container);
+  border: 1px solid var(--outline-variant);
   margin-right: 6px;
   transition: transform var(--dur-spatial-fast) var(--ease-spatial-fast),
               background-color var(--dur-effects-fast) var(--ease-effects);
@@ -586,143 +771,122 @@ h1, h2, h3, h4, h5, h6 {
 
 .tech-badge:hover {
   transform: translateY(-1px);
-  background-color: var(--md-sys-color-secondary-container);
+  background-color: color-mix(in srgb, var(--secondary-container) 85%, var(--on-secondary-container));
 }
 
 /* Blueprint Grid Box */
 .blueprint-grid {
-  border: 1px solid var(--md-sys-color-outline-variant);
+  border: 1px solid var(--outline-variant);
   border-radius: var(--r-md);
   padding: var(--s-5);
   margin: var(--s-6) 0;
   background-color: var(--k32-grid-bg);
-  background-image: 
+  background-image:
     linear-gradient(var(--k32-grid-line) 1px, transparent 1px),
     linear-gradient(90deg, var(--k32-grid-line) 1px, transparent 1px);
   background-size: 18px 18px;
 }
 
 /* ==============================================================================
-   Layout & Container Scale
-   ============================================================================== */
-.md-grid {
-  max-width: 76rem;
-}
-
-/* ==============================================================================
    Material 3 Tables
    ============================================================================== */
 .md-typeset table:not([class]) {
-  font-size: 0.85rem;
-  border: 1px solid var(--md-sys-color-outline-variant);
-  border-radius: var(--r-md);
-  overflow: hidden;
-  border-collapse: separate;
-  border-spacing: 0;
-  margin: var(--s-5) 0;
-  width: 100%;
-  box-shadow: var(--lit);
+  font-size: 0.88rem !important;
+  border: 1px solid var(--outline-variant) !important;
+  border-radius: var(--r-md) !important;
+  overflow: hidden !important;
+  border-collapse: separate !important;
+  border-spacing: 0 !important;
+  margin: var(--s-5) 0 !important;
+  width: 100% !important;
+  box-shadow: var(--lit) !important;
 }
 
 .md-typeset table:not([class]) th {
-  background-color: var(--md-sys-color-surface-container);
-  font-family: var(--md-text-font);
-  font-weight: 600;
-  color: var(--md-sys-color-on-surface);
-  border-bottom: 1px solid var(--md-sys-color-outline-variant);
-  padding: var(--s-2) var(--s-4);
-  font-variation-settings: "ROND" 100;
+  background-color: var(--surface-container) !important;
+  font-family: var(--font-sans) !important;
+  font-weight: 600 !important;
+  color: var(--on-surface) !important;
+  border-bottom: 1px solid var(--outline-variant) !important;
+  padding: var(--s-2) var(--s-4) !important;
+  font-variation-settings: "ROND" 100 !important;
 }
 
 .md-typeset table:not([class]) td {
-  padding: var(--s-2) var(--s-4);
-  border-bottom: 1px solid var(--md-sys-color-outline-variant);
-  color: var(--md-sys-color-on-surface);
-  transition: background-color var(--dur-effects-fast) var(--ease-effects);
-}
-
-.md-typeset table:not([class]) td:last-child,
-.md-typeset table:not([class]) th:last-child {
-  min-width: 170px;
-}
-
-.md-typeset table:not([class]) code {
-  white-space: normal;
-  word-break: break-word;
+  padding: var(--s-2) var(--s-4) !important;
+  border-bottom: 1px solid var(--outline-variant) !important;
+  color: var(--on-surface) !important;
+  transition: background-color var(--dur-effects-fast) var(--ease-effects) !important;
 }
 
 .md-typeset table:not([class]) tr:last-child td {
-  border-bottom: none;
+  border-bottom: none !important;
 }
 
 .md-typeset table:not([class]) tr:hover td {
-  background-color: var(--md-sys-color-surface-container-high);
+  background-color: var(--surface-container-high) !important;
 }
 
 /* ==============================================================================
-   Material 3 Code Blocks & Syntax
+   Material 3 Code Blocks & Inline Code (Google Sans Code)
    ============================================================================== */
 .md-typeset code {
-  font-family: var(--md-code-font);
-  font-size: 0.84em;
-  background-color: var(--md-sys-color-surface-container-high);
-  color: var(--md-sys-color-primary);
-  border-radius: var(--r-xs);
-  padding: 1px 5px;
-  white-space: nowrap;
-  transition: background-color var(--dur-effects-fast) var(--ease-effects);
+  font-family: var(--font-mono) !important;
+  font-size: 0.85em !important;
+  background-color: var(--surface-high) !important;
+  color: var(--primary) !important;
+  border-radius: var(--r-xs) !important;
+  padding: 2px 6px !important;
+  white-space: nowrap !important;
+  transition: background-color var(--dur-effects-fast) var(--ease-effects) !important;
 }
 
 .md-typeset code:hover {
-  background-color: var(--md-sys-color-surface-container-highest);
+  background-color: var(--surface-highest) !important;
 }
 
-/* Code inside headings inherits heading typography */
 .md-typeset h1 code,
 .md-typeset h2 code,
 .md-typeset h3 code,
 .md-typeset h4 code {
-  font-family: var(--md-code-font);
-  font-size: 0.9em;
-  font-weight: 600;
-  color: inherit;
-  background-color: transparent;
-  border: none;
-  padding: 0;
+  font-family: var(--font-mono) !important;
+  font-size: 0.9em !important;
+  font-weight: 600 !important;
+  color: inherit !important;
+  background-color: transparent !important;
+  border: none !important;
+  padding: 0 !important;
 }
 
 .md-typeset pre {
-  border-radius: var(--r-md) !important;
-  border: 1px solid var(--md-sys-color-outline-variant);
-  background-color: var(--md-sys-color-surface-container-lowest) !important;
+  border-radius: var(--r-lg) !important;
+  border: 1px solid var(--outline-variant) !important;
+  background-color: var(--surface-low) !important;
   box-shadow: var(--lit) !important;
   padding: 0.85rem 2.85rem 0.85rem 1rem !important;
   transition: border-color var(--dur-spatial-fast) var(--ease-spatial-fast),
-              box-shadow var(--dur-spatial-fast) var(--ease-spatial-fast);
+              box-shadow var(--dur-spatial-fast) var(--ease-spatial-fast) !important;
 }
 
 .md-typeset pre:hover {
-  border-color: var(--md-sys-color-outline);
+  border-color: var(--outline) !important;
   box-shadow: var(--float-shadow) !important;
 }
 
-[data-md-color-scheme="slate"] .md-typeset pre {
-  background-color: var(--md-sys-color-surface-container-low) !important;
-}
-
 .md-typeset pre > code {
-  font-family: var(--md-code-font) !important;
-  font-size: 0.82rem;
-  line-height: 1.5;
+  font-family: var(--font-mono) !important;
+  font-size: 0.84rem !important;
+  line-height: 1.55 !important;
   background-color: transparent !important;
   border: none !important;
-  padding: 0;
+  padding: 0 !important;
   white-space: pre !important;
+  color: var(--on-surface) !important;
 }
 
-/* Copy Button M3 Style & Micro-Interaction */
+/* M3 Icon-Button Clipboard Copy */
 .md-clipboard {
-  color: var(--md-sys-color-on-surface-variant) !important;
+  color: var(--on-surface-variant) !important;
   border-radius: var(--r-full) !important;
   transition: color var(--dur-effects-fast) var(--ease-effects),
               transform var(--dur-spatial-fast) var(--ease-spatial-fast),
@@ -730,66 +894,68 @@ h1, h2, h3, h4, h5, h6 {
 }
 
 .md-clipboard:hover {
-  color: var(--md-sys-color-primary) !important;
-  background-color: var(--md-sys-color-surface-container-high) !important;
-  transform: scale(1.1);
+  color: var(--primary) !important;
+  background-color: var(--surface-high) !important;
+  transform: scale(1.08) !important;
 }
 
 .md-clipboard:active {
-  transform: scale(0.92);
+  transform: scale(0.92) !important;
 }
 
 /* ==============================================================================
    Material 3 Admonitions
    ============================================================================== */
 .md-typeset .admonition {
-  border-radius: var(--r-md);
-  border: 1px solid var(--md-sys-color-outline-variant);
-  background-color: var(--md-sys-color-surface-container-low);
-  box-shadow: var(--lit);
-  font-size: 0.88rem;
-  margin: var(--s-5) 0;
+  border-radius: var(--r-md) !important;
+  border: 1px solid var(--outline-variant) !important;
+  background-color: var(--surface-container-low) !important;
+  box-shadow: var(--lit) !important;
+  font-size: 0.88rem !important;
+  margin: var(--s-5) 0 !important;
+  overflow: hidden !important;
   transition: box-shadow var(--dur-spatial-fast) var(--ease-spatial-fast),
-              border-color var(--dur-spatial-fast) var(--ease-spatial-fast);
+              border-color var(--dur-spatial-fast) var(--ease-spatial-fast) !important;
 }
 
 .md-typeset .admonition:hover {
-  border-color: var(--md-sys-color-outline);
-  box-shadow: var(--float-shadow);
+  border-color: var(--outline) !important;
+  box-shadow: var(--float-shadow) !important;
 }
 
 .md-typeset .admonition-title {
-  font-family: var(--md-text-font);
-  font-weight: 600;
-  border-bottom: 1px solid var(--md-sys-color-outline-variant);
-  font-variation-settings: "ROND" 100;
+  font-family: var(--font-sans) !important;
+  font-weight: 600 !important;
+  background-color: var(--surface-container) !important;
+  border-bottom: 1px solid var(--outline-variant) !important;
+  font-variation-settings: "ROND" 100 !important;
 }
 
 /* ==============================================================================
-   Mermaid Diagrams with M3 Blueprint Surface & Hover Physics
+   Mermaid Diagrams
    ============================================================================== */
 .mermaid {
   text-align: center;
   margin: var(--s-6) 0 !important;
-  background-color: var(--k32-grid-bg) !important;
-  background-image: 
+  background-color: var(--surface-container-low) !important;
+  background-image:
     linear-gradient(var(--k32-grid-line) 1px, transparent 1px),
     linear-gradient(90deg, var(--k32-grid-line) 1px, transparent 1px) !important;
   background-size: 16px 16px !important;
-  border: 1px solid var(--md-sys-color-outline-variant) !important;
+  border: 1px solid var(--outline-variant) !important;
   border-radius: var(--r-lg) !important;
   padding: var(--s-6) !important;
-  box-shadow: var(--lit);
+  box-shadow: var(--lit) !important;
   overflow-x: auto !important;
   transition: box-shadow var(--dur-spatial-fast) var(--ease-spatial-fast),
               border-color var(--dur-spatial-fast) var(--ease-spatial-fast),
-              transform var(--dur-spatial-fast) var(--ease-spatial-fast);
+              transform var(--dur-spatial-fast) var(--ease-spatial-fast) !important;
 }
 
 .mermaid:hover {
-  border-color: var(--md-sys-color-outline) !important;
+  border-color: var(--outline) !important;
   box-shadow: var(--float-shadow) !important;
-  transform: translateY(-1px);
+  transform: translateY(-1px) !important;
 }
 
 .mermaid svg {
@@ -804,12 +970,12 @@ h1, h2, h3, h4, h5, h6 {
   display: inline-flex;
   align-items: center;
   gap: var(--s-2);
-  padding: 2px 10px;
+  padding: 3px 12px;
   border-radius: var(--r-full);
-  background-color: var(--md-sys-color-primary-container);
-  color: var(--md-sys-color-on-primary-container);
-  font-family: var(--md-code-font);
-  font-size: 0.72rem;
+  background-color: var(--secondary-container);
+  color: var(--on-secondary-container);
+  font-family: var(--font-mono);
+  font-size: 0.74rem;
   font-weight: 600;
 }
 
@@ -817,7 +983,7 @@ h1, h2, h3, h4, h5, h6 {
   width: 7px;
   height: 7px;
   border-radius: var(--r-full);
-  background-color: var(--md-sys-color-primary);
+  background-color: var(--primary);
   animation: pulse-ring 2s cubic-bezier(0.2, 0, 0, 1) infinite, breathe var(--dur-breath) ease-in-out infinite;
 }
 

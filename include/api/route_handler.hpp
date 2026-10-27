@@ -35,6 +35,10 @@ enum class RouteCategory {
     DeploymentStatus,
     DeploymentScale,
     DiscoveryApisCoordinationV1,
+    DiscoveryApisAuthorizationV1,
+    SelfSubjectAccessReviews,
+    SelfSubjectRulesReviews,
+    NamespacesCollection,
     LeasesNsCollection,
     LeaseItem,
     NotFound

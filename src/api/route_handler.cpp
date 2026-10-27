@@ -41,6 +41,22 @@ RouteMatch RouteHandler::match_route(std::string_view path) {
         match.category = RouteCategory::DiscoveryApisCoordinationV1;
         return match;
     }
+    if (path == "/apis/authorization.k8s.io" || path == "/apis/authorization.k8s.io/v1") {
+        match.category = RouteCategory::DiscoveryApisAuthorizationV1;
+        return match;
+    }
+    if (path.find("/selfsubjectaccessreviews") != std::string_view::npos) {
+        match.category = RouteCategory::SelfSubjectAccessReviews;
+        return match;
+    }
+    if (path.find("/selfsubjectrulesreviews") != std::string_view::npos) {
+        match.category = RouteCategory::SelfSubjectRulesReviews;
+        return match;
+    }
+    if (path == "/api/v1/namespaces") {
+        match.category = RouteCategory::NamespacesCollection;
+        return match;
+    }
     if (path == "/openapi/v3") {
         match.category = RouteCategory::DiscoveryOpenApiV3;
         return match;
@@ -329,6 +345,8 @@ HttpResponse RouteHandler::handle_discovery(const HttpRequest& req, RouteCategor
 
         case RouteCategory::DiscoveryApis:
             resp.body = "{\"kind\":\"APIGroupList\",\"apiVersion\":\"v1\",\"groups\":["
+                        "{\"name\":\"authorization.k8s.io\",\"versions\":[{\"groupVersion\":\"authorization.k8s.io/v1\",\"version\":\"v1\"}],"
+                        "\"preferredVersion\":{\"groupVersion\":\"authorization.k8s.io/v1\",\"version\":\"v1\"}},"
                         "{\"name\":\"apps\",\"versions\":[{\"groupVersion\":\"apps/v1\",\"version\":\"v1\"}],"
                         "\"preferredVersion\":{\"groupVersion\":\"apps/v1\",\"version\":\"v1\"}},"
                         "{\"name\":\"events.k8s.io\",\"versions\":[{\"groupVersion\":\"events.k8s.io/v1\",\"version\":\"v1\"}],"
@@ -374,6 +392,31 @@ HttpResponse RouteHandler::handle_discovery(const HttpRequest& req, RouteCategor
             resp.body = "{\"kind\":\"APIResourceList\",\"apiVersion\":\"v1\",\"groupVersion\":\"coordination.k8s.io/v1\",\"resources\":["
                         "{\"name\":\"leases\",\"singularName\":\"lease\",\"namespaced\":true,\"kind\":\"Lease\","
                         "\"verbs\":[\"get\",\"list\",\"watch\",\"create\",\"update\",\"patch\",\"delete\"]}"
+                        "]}";
+            break;
+
+        case RouteCategory::DiscoveryApisAuthorizationV1:
+            resp.body = "{\"kind\":\"APIResourceList\",\"apiVersion\":\"v1\",\"groupVersion\":\"authorization.k8s.io/v1\",\"resources\":["
+                        "{\"name\":\"selfsubjectaccessreviews\",\"singularName\":\"selfsubjectaccessreview\",\"namespaced\":false,\"kind\":\"SelfSubjectAccessReview\",\"verbs\":[\"create\"]},"
+                        "{\"name\":\"selfsubjectrulesreviews\",\"singularName\":\"selfsubjectrulesreview\",\"namespaced\":false,\"kind\":\"SelfSubjectRulesReview\",\"verbs\":[\"create\"]}"
+                        "]}";
+            break;
+
+        case RouteCategory::SelfSubjectAccessReviews:
+            resp.status_code = 201;
+            resp.body = "{\"kind\":\"SelfSubjectAccessReview\",\"apiVersion\":\"authorization.k8s.io/v1\",\"status\":{\"allowed\":true,\"reason\":\"Kube32 cluster authorization is open\"}}";
+            break;
+
+        case RouteCategory::SelfSubjectRulesReviews:
+            resp.status_code = 201;
+            resp.body = "{\"kind\":\"SelfSubjectRulesReview\",\"apiVersion\":\"authorization.k8s.io/v1\",\"status\":{\"resourceRules\":[{\"verbs\":[\"*\"],\"apiGroups\":[\"*\"],\"resources\":[\"*\"]}],\"nonResourceRules\":[{\"verbs\":[\"*\"],\"nonResourceURLs\":[\"*\"]}],\"incomplete\":false}}";
+            break;
+
+        case RouteCategory::NamespacesCollection:
+            resp.body = "{\"kind\":\"NamespaceList\",\"apiVersion\":\"v1\",\"metadata\":{\"resourceVersion\":\"1\"},\"items\":["
+                        "{\"apiVersion\":\"v1\",\"kind\":\"Namespace\",\"metadata\":{\"name\":\"default\"},\"status\":{\"phase\":\"Active\"}},"
+                        "{\"apiVersion\":\"v1\",\"kind\":\"Namespace\",\"metadata\":{\"name\":\"kube-system\"},\"status\":{\"phase\":\"Active\"}},"
+                        "{\"apiVersion\":\"v1\",\"kind\":\"Namespace\",\"metadata\":{\"name\":\"kube32-cluster\"},\"status\":{\"phase\":\"Active\"}}"
                         "]}";
             break;
 

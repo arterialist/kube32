@@ -16,16 +16,16 @@ function initMermaidDiagrams() {
     securityLevel: "loose",
     theme: isDark ? "dark" : "default",
     themeVariables: {
-      primaryColor: isDark ? "#0842a0" : "#d3e3fd",
-      primaryTextColor: isDark ? "#d3e3fd" : "#041e49",
-      primaryBorderColor: isDark ? "#a8c7fa" : "#0b57d0",
-      lineColor: isDark ? "#a8c7fa" : "#0b57d0",
-      secondaryColor: isDark ? "#004a75" : "#cce5ff",
-      tertiaryColor: isDark ? "#181c20" : "#f2f5f9",
-      background: isDark ? "#101418" : "#f8fafd",
-      nodeBorder: isDark ? "#a8c7fa" : "#0b57d0",
-      clusterBkg: isDark ? "#181c20" : "#f2f5f9",
-      clusterBorder: isDark ? "#41474d" : "#c2c7cf",
+      primaryColor: isDark ? "#005236" : "#aaf2cc",
+      primaryTextColor: isDark ? "#aaf2cc" : "#002517",
+      primaryBorderColor: isDark ? "#8ed5b0" : "#226a4c",
+      lineColor: isDark ? "#8ed5b0" : "#226a4c",
+      secondaryColor: isDark ? "#364b40" : "#cfe7d7",
+      tertiaryColor: isDark ? "#244c5a" : "#bee9fb",
+      background: isDark ? "#0f1511" : "#f5fbf5",
+      nodeBorder: isDark ? "#8ed5b0" : "#226a4c",
+      clusterBkg: isDark ? "#171d19" : "#f0f5ef",
+      clusterBorder: isDark ? "#353d38" : "#cdd7cf",
       fontFamily: "'Google Sans Flex', system-ui, -apple-system, sans-serif"
     }
   });
