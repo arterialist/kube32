@@ -1948,6 +1948,129 @@ def prefill_initial_workloads():
             "created": CLUSTER_START_TIME - 250
         }
 
+        # Workload 1: Vortex DAW & Modular Synthesizer
+        PODS["kube32-cluster/vortex-synth-workload"] = {
+            "manifest": {
+                "apiVersion": "v1",
+                "kind": "Pod",
+                "metadata": {
+                    "name": "vortex-synth-workload",
+                    "namespace": "kube32-cluster",
+                    "creationTimestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(CLUSTER_START_TIME - 180)),
+                    "labels": {"app": "vortex-synth", "tier": "audio-engine"}
+                },
+                "spec": {
+                    "nodeName": "esp32-node-01",
+                    "containers": [{
+                        "name": "synth-engine",
+                        "image": "wasm://embedded/vortex-daw-engine:v2.4",
+                        "ports": [{"containerPort": 80, "name": "http-synth"}],
+                        "resources": {"limits": {"memory": "48Ki"}, "requests": {"memory": "32Ki"}}
+                    }]
+                },
+                "status": {
+                    "phase": "Running",
+                    "podIP": "192.168.4.1",
+                    "conditions": [{"type": "Ready", "status": "True"}]
+                }
+            },
+            "created": CLUSTER_START_TIME - 180,
+            "ns": "kube32-cluster",
+            "name": "vortex-synth-workload",
+            "node": "esp32-node-01"
+        }
+        SERVICES["kube32-cluster/vortex-synth-svc"] = {
+            "name": "vortex-synth-svc",
+            "ns": "kube32-cluster",
+            "labels": {"app": "vortex-synth"},
+            "type": "ClusterIP",
+            "cluster_ip": "10.96.0.110",
+            "ports": [{"name": "http", "port": 80, "targetPort": 80, "protocol": "TCP"}],
+            "created": CLUSTER_START_TIME - 180
+        }
+
+        # Workload 2: Aether Collaborative Workspace & Document Canvas
+        PODS["kube32-cluster/aether-workspace-workload"] = {
+            "manifest": {
+                "apiVersion": "v1",
+                "kind": "Pod",
+                "metadata": {
+                    "name": "aether-workspace-workload",
+                    "namespace": "kube32-cluster",
+                    "creationTimestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(CLUSTER_START_TIME - 160)),
+                    "labels": {"app": "aether-workspace", "tier": "content-engine"}
+                },
+                "spec": {
+                    "nodeName": "esp32-node-01",
+                    "containers": [{
+                        "name": "workspace-engine",
+                        "image": "wasm://embedded/aether-workspace-canvas:v1.8",
+                        "ports": [{"containerPort": 80, "name": "http-workspace"}],
+                        "resources": {"limits": {"memory": "48Ki"}, "requests": {"memory": "32Ki"}}
+                    }]
+                },
+                "status": {
+                    "phase": "Running",
+                    "podIP": "192.168.4.1",
+                    "conditions": [{"type": "Ready", "status": "True"}]
+                }
+            },
+            "created": CLUSTER_START_TIME - 160,
+            "ns": "kube32-cluster",
+            "name": "aether-workspace-workload",
+            "node": "esp32-node-01"
+        }
+        SERVICES["kube32-cluster/aether-workspace-svc"] = {
+            "name": "aether-workspace-svc",
+            "ns": "kube32-cluster",
+            "labels": {"app": "aether-workspace"},
+            "type": "ClusterIP",
+            "cluster_ip": "10.96.0.115",
+            "ports": [{"name": "http", "port": 80, "targetPort": 80, "protocol": "TCP"}],
+            "created": CLUSTER_START_TIME - 160
+        }
+
+        # Workload 3: Aegis Fleet Autonomous Mission Operations Console
+        PODS["kube32-cluster/aegis-fleet-workload"] = {
+            "manifest": {
+                "apiVersion": "v1",
+                "kind": "Pod",
+                "metadata": {
+                    "name": "aegis-fleet-workload",
+                    "namespace": "kube32-cluster",
+                    "creationTimestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(CLUSTER_START_TIME - 140)),
+                    "labels": {"app": "aegis-fleet", "tier": "telemetry-radar"}
+                },
+                "spec": {
+                    "nodeName": "esp32-node-02",
+                    "containers": [{
+                        "name": "fleet-engine",
+                        "image": "wasm://embedded/aegis-fleet-radar:v3.1",
+                        "ports": [{"containerPort": 80, "name": "http-fleet"}],
+                        "resources": {"limits": {"memory": "64Ki"}, "requests": {"memory": "48Ki"}}
+                    }]
+                },
+                "status": {
+                    "phase": "Running",
+                    "podIP": "192.168.4.2",
+                    "conditions": [{"type": "Ready", "status": "True"}]
+                }
+            },
+            "created": CLUSTER_START_TIME - 140,
+            "ns": "kube32-cluster",
+            "name": "aegis-fleet-workload",
+            "node": "esp32-node-02"
+        }
+        SERVICES["kube32-cluster/aegis-fleet-svc"] = {
+            "name": "aegis-fleet-svc",
+            "ns": "kube32-cluster",
+            "labels": {"app": "aegis-fleet"},
+            "type": "ClusterIP",
+            "cluster_ip": "10.96.0.120",
+            "ports": [{"name": "http", "port": 80, "targetPort": 80, "protocol": "TCP"}],
+            "created": CLUSTER_START_TIME - 140
+        }
+
 class Kube32Server(ThreadingHTTPServer):
     daemon_threads = True
     allow_reuse_address = True
