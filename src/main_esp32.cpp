@@ -12,6 +12,8 @@
 #include <cstring>
 #include <memory>
 #include <iostream>
+#include <unistd.h>
+#include <fcntl.h>
 
 #if defined(KUBE32_TARGET_ESP32)
 #include "esp_system.h"
@@ -276,15 +278,15 @@ static void kube32_cluster_task(void* pvParameters) {
         int32_t node1_chan_hdl = kube32::ipc::ChannelManager::instance().open("audio-preprocessor", "audio.features", 0);
         printf("[PIPELINE] Node 1 subscribed to 'audio.features' (handle: %d), route registered -> Node 2 (02:00:00:00:00:01)\n", (int)node1_chan_hdl);
 
-        // Install USB-SERIAL-JTAG driver for interactive serial control plane CLI
-        usb_serial_jtag_driver_config_t usj_cfg = {
-            .tx_buffer_size = 4096,
-            .rx_buffer_size = 4096,
-        };
-        esp_err_t usj_err = usb_serial_jtag_driver_install(&usj_cfg);
-        if (usj_err == ESP_OK) {
-            printf("[CONTROL-PLANE] USB-SERIAL-JTAG driver online for interactive CLI\n");
+        // Install USB-SERIAL-JTAG driver if not already initialized
+        if (!usb_serial_jtag_is_driver_installed()) {
+            usb_serial_jtag_driver_config_t usj_cfg = {
+                .tx_buffer_size = 4096,
+                .rx_buffer_size = 4096,
+            };
+            usb_serial_jtag_driver_install(&usj_cfg);
         }
+        printf("[CONTROL-PLANE] USB-SERIAL-JTAG driver online for interactive CLI\n");
 
         std::string line_accum;
         char usj_buf[256];
@@ -292,7 +294,7 @@ static void kube32_cluster_task(void* pvParameters) {
         kube32::mem::MonotonicArena arena(arena_buf.data(), arena_buf.size());
 
         while (true) {
-            int n = usb_serial_jtag_read_bytes(usj_buf, sizeof(usj_buf) - 1, pdMS_TO_TICKS(50));
+            int n = usb_serial_jtag_read_bytes(usj_buf, sizeof(usj_buf) - 1, pdMS_TO_TICKS(20));
             if (n > 0) {
                 usj_buf[n] = '\0';
                 for (int i = 0; i < n; ++i) {
@@ -356,6 +358,7 @@ static void kube32_cluster_task(void* pvParameters) {
                     }
                 }
             }
+            vTaskDelay(pdMS_TO_TICKS(50));
         }
     }
 

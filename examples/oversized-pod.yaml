@@ -1,0 +1,14 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: oversized-pod
+  namespace: default
+spec:
+  nodeSelector:
+    kubernetes.io/hostname: esp32-node-01
+  containers:
+    - name: greedy-worker
+      image: wasm://untrusted/greedy:v1
+      resources:
+        requests:
+          memory: 4000Ki

@@ -21,8 +21,14 @@ ser = None
 def get_serial():
     global ser
     if ser is None or not ser.is_open:
-        ser = serial.Serial(SERIAL_PORT, BAUD_RATE, timeout=4.0)
-        time.sleep(0.1)
+        ser = serial.Serial()
+        ser.port = SERIAL_PORT
+        ser.baudrate = BAUD_RATE
+        ser.timeout = 4.0
+        ser.dtr = False
+        ser.rts = False
+        ser.open()
+        time.sleep(0.05)
     return ser
 
 def send_k32_request(method, path, body=""):
@@ -31,9 +37,18 @@ def send_k32_request(method, path, body=""):
         # Flush any stale input
         s.reset_input_buffer()
         
-        req_line = f"K32_REQ:{method}:{path}"
+        # Minify body to a single line so it doesn't break serial line protocol
+        clean_body = ""
         if body:
-            req_line += f":{body}"
+            try:
+                import json
+                clean_body = json.dumps(json.loads(body))
+            except Exception:
+                clean_body = body.replace("\r", " ").replace("\n", " ").strip()
+        
+        req_line = f"K32_REQ:{method}:{path}"
+        if clean_body:
+            req_line += f":{clean_body}"
         req_line += "\n"
         
         s.write(req_line.encode("utf-8"))
@@ -83,6 +98,45 @@ class KubeGatewayHandler(BaseHTTPRequestHandler):
         self.handle_proxy("DELETE")
 
     def handle_proxy(self, method):
+        if self.path == "/status" or self.path == "/telemetry":
+            with ser_lock:
+                s = get_serial()
+                s.reset_input_buffer()
+                s.write(b"K32_CMD:STATUS\n")
+                s.flush()
+                out = []
+                t_end = time.time() + 1.5
+                while time.time() < t_end:
+                    b = s.readline()
+                    if b:
+                        out.append(b.decode("utf-8", errors="replace"))
+                resp_bytes = "".join(out).encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "text/plain")
+                self.send_header("Content-Length", str(len(resp_bytes)))
+                self.end_headers()
+                self.wfile.write(resp_bytes)
+                return
+        elif self.path == "/pipeline/transmit":
+            with ser_lock:
+                s = get_serial()
+                s.reset_input_buffer()
+                s.write(b"K32_CMD:PIPELINE_TRANSMIT\n")
+                s.flush()
+                out = []
+                t_end = time.time() + 2.0
+                while time.time() < t_end:
+                    b = s.readline()
+                    if b:
+                        out.append(b.decode("utf-8", errors="replace"))
+                resp_bytes = "".join(out).encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "text/plain")
+                self.send_header("Content-Length", str(len(resp_bytes)))
+                self.end_headers()
+                self.wfile.write(resp_bytes)
+                return
+
         content_length = int(self.headers.get("Content-Length", 0))
         body = self.rfile.read(content_length).decode("utf-8", errors="replace") if content_length > 0 else ""
         
