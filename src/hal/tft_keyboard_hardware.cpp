@@ -5,8 +5,12 @@
 #include "esp_heap_caps.h"
 #include "driver/spi_master.h"
 #include "driver/gpio.h"
-#include "driver/ledc.h"
 #include "driver/i2s_std.h"
+#include "esp_lcd_panel_io.h"
+#include "esp_lcd_panel_vendor.h"
+#include "esp_lcd_panel_ops.h"
+#include "esp_lcd_panel_st7789.h"
+#include "esp_lcd_io_spi.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include <cstring>
@@ -16,9 +20,10 @@ static const char* TAG = "Kube32Hardware";
 
 namespace kube32::hal {
 
-static spi_device_handle_t spi_display = nullptr;
+static esp_lcd_panel_io_handle_t s_io_handle = nullptr;
+static esp_lcd_panel_handle_t s_panel_handle = nullptr;
+static uint16_t* s_framebuffer = nullptr;
 static volatile char last_key_pressed = '\0';
-static uint8_t* s_dma_buf = nullptr;
 static i2s_chan_handle_t s_tx_chan = nullptr;
 
 // ---------------------------------------------------------------------------
@@ -123,180 +128,77 @@ static const uint8_t FONT_5X7[][5] = {
 };
 
 // ---------------------------------------------------------------------------
-// ST7789 Low-Level SPI Communication (DMA-Compliant)
-// ---------------------------------------------------------------------------
-static void lcd_cmd(uint8_t cmd) {
-    gpio_set_level((gpio_num_t)PIN_LCD_DC, 0); // Command mode
-    spi_transaction_t t;
-    std::memset(&t, 0, sizeof(t));
-    t.length = 8;
-    t.flags = SPI_TRANS_USE_TXDATA;
-    t.tx_data[0] = cmd;
-    spi_device_polling_transmit(spi_display, &t);
-}
-
-static void lcd_data_byte(uint8_t byte) {
-    gpio_set_level((gpio_num_t)PIN_LCD_DC, 1); // Data mode
-    spi_transaction_t t;
-    std::memset(&t, 0, sizeof(t));
-    t.length = 8;
-    t.flags = SPI_TRANS_USE_TXDATA;
-    t.tx_data[0] = byte;
-    spi_device_polling_transmit(spi_display, &t);
-}
-
-static void lcd_data_dma(const uint8_t* data, int len) {
-    if (len <= 0) return;
-    gpio_set_level((gpio_num_t)PIN_LCD_DC, 1); // Data mode
-    if (!s_dma_buf) {
-        s_dma_buf = (uint8_t*)heap_caps_malloc(1024, MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL);
-    }
-    int offset = 0;
-    while (offset < len) {
-        int chunk = (len - offset > 1024) ? 1024 : (len - offset);
-        if (s_dma_buf) {
-            std::memcpy(s_dma_buf, data + offset, chunk);
-            spi_transaction_t t;
-            std::memset(&t, 0, sizeof(t));
-            t.length = chunk * 8;
-            t.tx_buffer = s_dma_buf;
-            spi_device_polling_transmit(spi_display, &t);
-        } else {
-            spi_transaction_t t;
-            std::memset(&t, 0, sizeof(t));
-            t.length = chunk * 8;
-            t.tx_buffer = data + offset;
-            spi_device_polling_transmit(spi_display, &t);
-        }
-        offset += chunk;
-    }
-}
-
-static void set_window(int x0, int y0, int x1, int y1) {
-    // ST7789 240x135 Landscape offset: X=40, Y=53
-    uint16_t sx = x0 + 40;
-    uint16_t ex = x1 + 40;
-    uint16_t sy = y0 + 53;
-    uint16_t ey = y1 + 53;
-
-    lcd_cmd(0x2A); // CASET
-    gpio_set_level((gpio_num_t)PIN_LCD_DC, 1);
-    spi_transaction_t t;
-    std::memset(&t, 0, sizeof(t));
-    t.length = 32;
-    t.flags = SPI_TRANS_USE_TXDATA;
-    t.tx_data[0] = (uint8_t)(sx >> 8);
-    t.tx_data[1] = (uint8_t)(sx & 0xFF);
-    t.tx_data[2] = (uint8_t)(ex >> 8);
-    t.tx_data[3] = (uint8_t)(ex & 0xFF);
-    spi_device_polling_transmit(spi_display, &t);
-
-    lcd_cmd(0x2B); // RASET
-    gpio_set_level((gpio_num_t)PIN_LCD_DC, 1);
-    std::memset(&t, 0, sizeof(t));
-    t.length = 32;
-    t.flags = SPI_TRANS_USE_TXDATA;
-    t.tx_data[0] = (uint8_t)(sy >> 8);
-    t.tx_data[1] = (uint8_t)(sy & 0xFF);
-    t.tx_data[2] = (uint8_t)(ey >> 8);
-    t.tx_data[3] = (uint8_t)(ey & 0xFF);
-    spi_device_polling_transmit(spi_display, &t);
-}
-
-// ---------------------------------------------------------------------------
-// Display Initialization & Primitives
+// Display Initialization & Primitives (ESP-IDF esp_lcd ST7789 Engine)
 // ---------------------------------------------------------------------------
 void init_display_and_backlight() {
-    ESP_LOGI(TAG, "Initializing ST7789 LCD & Backlight on GPIO %d...", PIN_LCD_BACKLIGHT);
+    ESP_LOGI(TAG, "Initializing ST7789 Backlight on GPIO %d...", PIN_LCD_BACKLIGHT);
 
-    // 1. Backlight GPIO 38: configure high drive and 12 kHz PWM boost (100% duty)
+    // 1. Backlight GPIO 38: direct HIGH output (3.3V power switch rail)
     gpio_reset_pin((gpio_num_t)PIN_LCD_BACKLIGHT);
     gpio_set_direction((gpio_num_t)PIN_LCD_BACKLIGHT, GPIO_MODE_OUTPUT);
     gpio_set_drive_capability((gpio_num_t)PIN_LCD_BACKLIGHT, GPIO_DRIVE_CAP_3);
     gpio_set_level((gpio_num_t)PIN_LCD_BACKLIGHT, 1);
 
-    ledc_timer_config_t bl_timer = {
-        .speed_mode = LEDC_LOW_SPEED_MODE,
-        .duty_resolution = LEDC_TIMER_8_BIT,
-        .timer_num = LEDC_TIMER_1,
-        .freq_hz = 12000,
-        .clk_cfg = LEDC_AUTO_CLK
-    };
-    ledc_timer_config(&bl_timer);
+    // 2. Allocate 240x135 RGB565 Framebuffer in DMA-capable internal memory
+    if (!s_framebuffer) {
+        s_framebuffer = (uint16_t*)heap_caps_malloc(LCD_WIDTH * LCD_HEIGHT * sizeof(uint16_t), MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL);
+        if (s_framebuffer) {
+            std::memset(s_framebuffer, 0, LCD_WIDTH * LCD_HEIGHT * sizeof(uint16_t));
+        }
+    }
 
-    ledc_channel_config_t bl_chan = {
-        .gpio_num = PIN_LCD_BACKLIGHT,
-        .speed_mode = LEDC_LOW_SPEED_MODE,
-        .channel = LEDC_CHANNEL_1,
-        .intr_type = LEDC_INTR_DISABLE,
-        .timer_sel = LEDC_TIMER_1,
-        .duty = 255,
-        .hpoint = 0
-    };
-    ledc_channel_config(&bl_chan);
+    // 3. Configure SPI Master Bus on SPI2_HOST
+    ESP_LOGI(TAG, "Configuring SPI master bus (MOSI: %d, SCLK: %d, CS: %d, DC: %d, RST: %d)...",
+             PIN_LCD_MOSI, PIN_LCD_SCLK, PIN_LCD_CS, PIN_LCD_DC, PIN_LCD_RST);
+    spi_bus_config_t buscfg = {};
+    buscfg.mosi_io_num = PIN_LCD_MOSI;
+    buscfg.miso_io_num = -1;
+    buscfg.sclk_io_num = PIN_LCD_SCLK;
+    buscfg.quadwp_io_num = -1;
+    buscfg.quadhd_io_num = -1;
+    buscfg.max_transfer_sz = LCD_WIDTH * LCD_HEIGHT * sizeof(uint16_t);
+    esp_err_t ret = spi_bus_initialize(SPI2_HOST, &buscfg, SPI_DMA_CH_AUTO);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "spi_bus_initialize failed: %s", esp_err_to_name(ret));
+        return;
+    }
 
-    // 2. Control pins: DC, RST, and CS
-    gpio_reset_pin((gpio_num_t)PIN_LCD_DC);
-    gpio_set_direction((gpio_num_t)PIN_LCD_DC, GPIO_MODE_OUTPUT);
+    // 4. Create Panel IO SPI Handle
+    esp_lcd_panel_io_spi_config_t io_config = {};
+    io_config.cs_gpio_num = PIN_LCD_CS;
+    io_config.dc_gpio_num = PIN_LCD_DC;
+    io_config.spi_mode = 0;
+    io_config.pclk_hz = 20 * 1000 * 1000;
+    io_config.trans_queue_depth = 10;
+    io_config.lcd_cmd_bits = 8;
+    io_config.lcd_param_bits = 8;
+    ret = esp_lcd_new_panel_io_spi((esp_lcd_spi_bus_handle_t)SPI2_HOST, &io_config, &s_io_handle);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "esp_lcd_new_panel_io_spi failed: %s", esp_err_to_name(ret));
+        return;
+    }
 
-    gpio_reset_pin((gpio_num_t)PIN_LCD_RST);
-    gpio_set_direction((gpio_num_t)PIN_LCD_RST, GPIO_MODE_OUTPUT);
+    // 5. Create ST7789 Panel Device Handle
+    esp_lcd_panel_dev_config_t panel_config = {};
+    panel_config.reset_gpio_num = PIN_LCD_RST;
+    panel_config.rgb_ele_order = LCD_RGB_ELEMENT_ORDER_BGR;
+    panel_config.bits_per_pixel = 16;
+    ret = esp_lcd_new_panel_st7789(s_io_handle, &panel_config, &s_panel_handle);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "esp_lcd_new_panel_st7789 failed: %s", esp_err_to_name(ret));
+        return;
+    }
 
-    gpio_reset_pin((gpio_num_t)PIN_LCD_CS);
-    gpio_set_direction((gpio_num_t)PIN_LCD_CS, GPIO_MODE_OUTPUT);
-    gpio_set_level((gpio_num_t)PIN_LCD_CS, 1);
+    // 6. Initialize ST7789, Invert IPS Colors, Set 240x135 Landscape Viewport
+    esp_lcd_panel_reset(s_panel_handle);
+    esp_lcd_panel_init(s_panel_handle);
+    esp_lcd_panel_invert_color(s_panel_handle, true);
+    esp_lcd_panel_swap_xy(s_panel_handle, true);
+    esp_lcd_panel_mirror(s_panel_handle, true, false);
+    esp_lcd_panel_set_gap(s_panel_handle, 40, 53);
+    esp_lcd_panel_disp_on_off(s_panel_handle, true);
 
-    // Hardware Reset Pulse
-    gpio_set_level((gpio_num_t)PIN_LCD_RST, 0);
-    vTaskDelay(pdMS_TO_TICKS(50));
-    gpio_set_level((gpio_num_t)PIN_LCD_RST, 1);
-    vTaskDelay(pdMS_TO_TICKS(150));
-
-    // 3. SPI Bus Configuration
-    spi_bus_config_t buscfg = {
-        .mosi_io_num = PIN_LCD_MOSI,
-        .miso_io_num = -1,
-        .sclk_io_num = PIN_LCD_SCLK,
-        .quadwp_io_num = -1,
-        .quadhd_io_num = -1,
-        .max_transfer_sz = LCD_WIDTH * LCD_HEIGHT * 2
-    };
-    spi_bus_initialize(SPI2_HOST, &buscfg, SPI_DMA_CH_AUTO);
-
-    spi_device_interface_config_t devcfg = {
-        .mode = 0,
-        .clock_speed_hz = 20 * 1000 * 1000, // 20 MHz SPI for reliable ST7789 comms
-        .spics_io_num = -1, // Manual CS control to keep CS low across RAMWR and pixel streaming
-        .queue_size = 7
-    };
-    spi_bus_add_device(SPI2_HOST, &devcfg, &spi_display);
-
-    // 4. ST7789 Initialization Sequence (with CS held LOW)
-    gpio_set_level((gpio_num_t)PIN_LCD_CS, 0);
-
-    lcd_cmd(0x01); // SWRESET
-    vTaskDelay(pdMS_TO_TICKS(150));
-
-    lcd_cmd(0x11); // SLPOUT
-    vTaskDelay(pdMS_TO_TICKS(120));
-
-    lcd_cmd(0x3A); // COLMOD
-    lcd_data_byte(0x55); // 16-bit RGB565
-
-    lcd_cmd(0x36); // MADCTL
-    lcd_data_byte(0x70); // Landscape 240x135
-
-    lcd_cmd(0x21); // INVON (Inversion On for IPS screen)
-
-    lcd_cmd(0x13); // NORON
-    vTaskDelay(pdMS_TO_TICKS(10));
-
-    lcd_cmd(0x29); // DISPON
-    vTaskDelay(pdMS_TO_TICKS(100));
-
-    gpio_set_level((gpio_num_t)PIN_LCD_CS, 1);
-
-    // Clear Screen & Draw Boot Screen
+    // Initial Screen Draw
     display_clear(COLOR_BG_DARK);
 
     // Header bar
@@ -310,69 +212,64 @@ void init_display_and_backlight() {
     display_draw_string(8, 102, "PODS:   hardware-controller", COLOR_WHITE, COLOR_BG_DARK);
     display_draw_string(8, 120, "READY:  Listening for k8s...", COLOR_GREEN, COLOR_BG_DARK);
 
-    ESP_LOGI(TAG, "ST7789 Display Initialized Successfully. Backlight ON.");
+    ESP_LOGI(TAG, "ST7789 Display Initialized Successfully via esp_lcd. Backlight ON.");
 }
 
 void set_backlight(bool enabled) {
-    ledc_set_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_1, enabled ? 255 : 0);
-    ledc_update_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_1);
+    gpio_set_level((gpio_num_t)PIN_LCD_BACKLIGHT, enabled ? 1 : 0);
 }
 
 void display_fill_rect(int x, int y, int w, int h, uint16_t color) {
+    if (!s_framebuffer) return;
     if (x < 0) { w += x; x = 0; }
     if (y < 0) { h += y; y = 0; }
     if (x + w > LCD_WIDTH) w = LCD_WIDTH - x;
     if (y + h > LCD_HEIGHT) h = LCD_HEIGHT - y;
     if (w <= 0 || h <= 0) return;
 
-    gpio_set_level((gpio_num_t)PIN_LCD_CS, 0); // Assert CS LOW
-
-    set_window(x, y, x + w - 1, y + h - 1);
-    lcd_cmd(0x2C); // RAMWR
-
-    // Line buffer in big-endian RGB565
-    int pixels = w * h;
-    uint16_t color_be = (color << 8) | (color >> 8);
-    uint16_t buffer[128];
-    for (int i = 0; i < 128; ++i) buffer[i] = color_be;
-
-    while (pixels > 0) {
-        int chunk = (pixels > 128) ? 128 : pixels;
-        lcd_data_dma((const uint8_t*)buffer, chunk * 2);
-        pixels -= chunk;
+    for (int r = y; r < y + h; ++r) {
+        for (int c = x; c < x + w; ++c) {
+            s_framebuffer[r * LCD_WIDTH + c] = color;
+        }
     }
-
-    gpio_set_level((gpio_num_t)PIN_LCD_CS, 1); // Deassert CS HIGH
+    if (s_panel_handle) {
+        esp_lcd_panel_draw_bitmap(s_panel_handle, 0, 0, LCD_WIDTH, LCD_HEIGHT, s_framebuffer);
+    }
 }
 
 void display_clear(uint16_t color) {
-    display_fill_rect(0, 0, LCD_WIDTH, LCD_HEIGHT, color);
+    if (!s_framebuffer) return;
+    for (int i = 0; i < LCD_WIDTH * LCD_HEIGHT; ++i) {
+        s_framebuffer[i] = color;
+    }
+    if (s_panel_handle) {
+        esp_lcd_panel_draw_bitmap(s_panel_handle, 0, 0, LCD_WIDTH, LCD_HEIGHT, s_framebuffer);
+    }
 }
 
 void display_draw_char(int x, int y, char c, uint16_t color, uint16_t bg) {
+    if (!s_framebuffer) return;
     if (c < 32 || c > 126) c = 32;
     const uint8_t* col_bytes = FONT_5X7[c - 32];
 
-    uint16_t char_buf[6 * 8];
-    uint16_t color_be = (color << 8) | (color >> 8);
-    uint16_t bg_be = (bg << 8) | (bg >> 8);
-
     for (int row = 0; row < 8; ++row) {
+        int py = y + row;
+        if (py < 0 || py >= LCD_HEIGHT) continue;
         for (int col = 0; col < 5; ++col) {
+            int px = x + col;
+            if (px < 0 || px >= LCD_WIDTH) continue;
             bool on = (row < 7) && (col_bytes[col] & (1 << row));
-            char_buf[row * 6 + col] = on ? color_be : bg_be;
+            s_framebuffer[py * LCD_WIDTH + px] = on ? color : bg;
         }
-        char_buf[row * 6 + 5] = bg_be; // 1-pixel gap
+        int px = x + 5;
+        if (px >= 0 && px < LCD_WIDTH) {
+            s_framebuffer[py * LCD_WIDTH + px] = bg;
+        }
     }
-
-    gpio_set_level((gpio_num_t)PIN_LCD_CS, 0);
-    set_window(x, y, x + 5, y + 7);
-    lcd_cmd(0x2C); // RAMWR
-    lcd_data_dma((const uint8_t*)char_buf, sizeof(char_buf));
-    gpio_set_level((gpio_num_t)PIN_LCD_CS, 1);
 }
 
 void display_draw_string(int x, int y, const char* str, uint16_t color, uint16_t bg) {
+    if (!s_framebuffer) return;
     int cur_x = x;
     int cur_y = y;
     while (*str) {
@@ -384,6 +281,9 @@ void display_draw_string(int x, int y, const char* str, uint16_t color, uint16_t
             cur_x += 6;
         }
         str++;
+    }
+    if (s_panel_handle) {
+        esp_lcd_panel_draw_bitmap(s_panel_handle, 0, 0, LCD_WIDTH, LCD_HEIGHT, s_framebuffer);
     }
 }
 

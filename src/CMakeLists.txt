@@ -72,4 +72,5 @@ idf_component_register(
         vfs
         driver
         esp_driver_gpio
+        esp_lcd
 )
