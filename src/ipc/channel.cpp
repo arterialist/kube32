@@ -145,8 +145,12 @@ int32_t RingBuffer::pop(uint8_t* out_buf, size_t max_len, uint32_t timeout_ms, u
 // =============================================================================
 class PeerUdpTransport : public IChannelTransport {
 public:
-    PeerUdpTransport(uint32_t node_id, uint16_t base_port)
-        : node_id_(node_id), port_(base_port > 0 ? (base_port + node_id) : (7400 + node_id)) {}
+    // Host simulations share one machine, so each node takes base_port + id;
+    // boards have their own address and all listen on the base port.
+    PeerUdpTransport(uint32_t node_id, uint16_t base_port, bool fixed_port = false, size_t rx_stack = 32768)
+        : node_id_(node_id),
+          port_(fixed_port ? (base_port > 0 ? base_port : 7400) : (base_port > 0 ? (base_port + node_id) : (7400 + node_id))),
+          rx_stack_(rx_stack) {}
 
     ~PeerUdpTransport() override { stop(); }
 
@@ -170,7 +174,7 @@ public:
         running_.store(true);
         osal::Thread::Config cfg;
         cfg.name = "udp_ipc_rx";
-        cfg.stack_size = 32768;
+        cfg.stack_size = rx_stack_;
         rx_thread_ = std::make_unique<osal::Thread>();
         return rx_thread_->start(rx_thread_entry, this, cfg);
     }
@@ -217,6 +221,7 @@ private:
 
     [[maybe_unused]] uint32_t node_id_;
     uint16_t port_;
+    size_t rx_stack_;
     osal::Socket sock_;
     std::atomic<bool> running_{false};
     std::unique_ptr<osal::Thread> rx_thread_;
@@ -303,6 +308,26 @@ private:
 };
 SemaphoreHandle_t EspNowTransport::s_send_sem = nullptr;
 volatile bool EspNowTransport::s_last_send_ok = false;
+
+// ESP-NOW reaches boards on the same radio channel; UDP reaches boards that
+// sit on another access point of the same IP network. A frame goes out on
+// whichever transport the peer was discovered through.
+class DualTransport : public IChannelTransport {
+public:
+    DualTransport(uint32_t node_id, uint16_t udp_port) : udp_(node_id, udp_port, true, 4096) {}
+    bool start() override {
+        bool a = espnow_.start();
+        bool b = udp_.start();
+        return a || b;
+    }
+    void stop() override { espnow_.stop(); udp_.stop(); }
+    int32_t send_frame(const NodeEndpoint& target, const uint8_t* frame, size_t len) override {
+        return target.is_espnow ? espnow_.send_frame(target, frame, len) : udp_.send_frame(target, frame, len);
+    }
+private:
+    EspNowTransport espnow_;
+    PeerUdpTransport udp_;
+};
 #endif
 
 // =============================================================================
@@ -321,7 +346,7 @@ bool ChannelManager::init(uint32_t node_id, uint16_t base_udp_port) {
     if (initialized_) return true;
 
 #if defined(KUBE32_TARGET_ESP32)
-    transport_ = std::make_unique<EspNowTransport>();
+    transport_ = std::make_unique<DualTransport>(node_id, base_udp_port);
 #else
     transport_ = std::make_unique<PeerUdpTransport>(node_id, base_udp_port);
 #endif
@@ -641,12 +666,33 @@ void ChannelManager::send_hello() {
     bcast.is_espnow = true;
     std::memset(bcast.mac_address, 0xff, 6);
     send_frames_to(bcast, hash, sender, 0, payload, 4 + name_len, K32C_FLAG_PING);
-#else
+#endif
     for (const auto& p : peers()) {
         if (p.node_id == local_node_id_) continue;
         send_frames_to(p.endpoint, hash, sender, 0, payload, 4 + name_len, K32C_FLAG_PING);
     }
-#endif
+    std::vector<NodeEndpoint> seeds;
+    {
+        osal::LockGuard guard(peer_mutex_);
+        seeds = seed_peers_;
+    }
+    for (const auto& ep : seeds) {
+        send_frames_to(ep, hash, sender, 0, payload, 4 + name_len, K32C_FLAG_PING);
+    }
+}
+
+void ChannelManager::add_seed_peer(const std::string& ip, uint16_t port) {
+    if (ip.empty()) return;
+    osal::LockGuard guard(peer_mutex_);
+    for (const auto& ep : seed_peers_) {
+        if (ep.ip_address == ip && ep.udp_port == port) return;
+    }
+    NodeEndpoint ep;
+    ep.is_espnow = false;
+    ep.ip_address = ip;
+    ep.udp_port = port ? port : 7400;
+    seed_peers_.push_back(ep);
+    std::cout << "[IPC] seed peer " << ip << ":" << ep.udp_port << std::endl;
 }
 
 void ChannelManager::handle_hello(const K32CHeader* hdr, const uint8_t* payload, size_t len, const NodeEndpoint* source) {

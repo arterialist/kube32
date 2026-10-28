@@ -38,7 +38,9 @@ bool sample_pod_from_runtime(const std::string& pod_key, runtime::Runtime& rt, P
         kube32_pool_available(&pool_external);
         bool external = pool_external != 0;
         uint64_t linear = static_cast<uint64_t>(st.memory_used_bytes);
-        uint64_t runtime_part = st.stack_bytes + st.runtime_bytes;
+        // runtime_bytes is wasm3's own accounting of the same linear memory,
+        // so only the interpreter stack is added on top of it.
+        uint64_t runtime_part = st.stack_bytes;
         out.has_memory = true;
         out.has_psram = external;
         if (external) {

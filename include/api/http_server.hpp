@@ -37,6 +37,7 @@ struct HttpServerOptions {
     uint32_t max_requests_per_connection{200};
     uint32_t accept_queue_depth{8};
     const char* name{"k32_http"};
+    bool access_log{false};                // one console line per request (method, path, status, ms, client)
     // Long-lived streams (watch, log follow) served by one hub thread owned by
     // the server. 0 disables streaming (endpoints answer 501).
     uint32_t watch_streams{8};
@@ -89,6 +90,9 @@ private:
     bool responded_{false};
     bool detached_{false};
     bool chunked_open_{false};
+    int status_{0};
+public:
+    int status() const { return status_; }   // last status written, 0 for raw passthrough
 };
 
 class HttpHandler {
@@ -131,6 +135,7 @@ public:
 
     // Custom handler consulted before the Kubernetes router.
     void set_handler(HttpHandler* handler) { handler_ = handler; }
+    void set_access_log(bool on) { options_.access_log = on; }
 
     RouteHandler& route_handler() { return *route_handler_; }
     bool has_route_handler() const { return static_cast<bool>(route_handler_); }

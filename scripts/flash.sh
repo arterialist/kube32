@@ -72,7 +72,7 @@ sys.argv = [
     '--port', port,
     '--chip', 'esp32s3',
     '-b', str(baud),
-    '--before', 'default-reset',
+    '--before', os.environ.get('KUBE32_FLASH_BEFORE', 'default-reset'),   # no-reset when the board is already in download mode
     '--after', 'hard-reset',
     'write-flash',
     '-u',

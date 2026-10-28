@@ -17,6 +17,7 @@
 #include "controller/deployment_controller.hpp"
 #include "kubelet/metrics_provider.hpp"
 #include "esp_sntp.h"
+#include "soc/rtc_cntl_reg.h"
 #include "esp_timer.h"
 #include "freertos/task.h"
 #include "api/http_server.hpp"
@@ -34,9 +35,11 @@
 #include "hal/tft_keyboard_hardware.hpp"
 #include "runtime/pod_memory_pool.h"
 #include "runtime/pod_log.hpp"
+#include "models/kube_models.hpp"
 
 #include <cstdio>
 #include <cstring>
+#include <cstdlib>
 #include <memory>
 #include <string>
 
@@ -176,6 +179,8 @@ struct Console {
 // network when this node does not host the port (workers forward to the control
 // plane). The request must carry "Connection: close".
 static std::string s_forward_host = "127.0.0.1";
+static kube32::api::HttpServer* s_api_server = nullptr;       // for console toggles
+static kube32::api::HttpServer* s_ingress_server = nullptr;
 std::string loopback_http(uint16_t port, const std::string& request) {
     std::string response;
     kube32::osal::Socket sock;
@@ -298,6 +303,57 @@ void console_task(void* arg) {
                 }
                 con.write("K32_OK profile stored, rebooting\n", 33);
                 vTaskDelay(pdMS_TO_TICKS(200));
+                esp_restart();
+            } else if (line.rfind("K32_CMD:TASKBT:", 0) == 0) {
+                // Saved context of a blocked task: the first words of its stack
+                // frame, so a host can addr2line the return addresses and see
+                // where it waits. K32_CMD:TASKBT:<task name prefix>
+                std::string want = line.substr(15);
+                UBaseType_t n = uxTaskGetNumberOfTasks();
+                auto* st = static_cast<TaskStatus_t*>(heap_caps_malloc((n + 4) * sizeof(TaskStatus_t), MALLOC_CAP_8BIT));
+                bool found = false;
+                if (st) {
+                    UBaseType_t got = uxTaskGetSystemState(st, n + 4, nullptr);
+                    for (UBaseType_t i = 0; i < got && !found; ++i) {
+                        if (std::strncmp(st[i].pcTaskName, want.c_str(), want.size()) != 0) continue;
+                        found = true;
+                        // pxTopOfStack is the first member of the TCB
+                        const uint32_t* sp = *reinterpret_cast<uint32_t* const*>(st[i].xHandle);
+                        char l[160];
+                        int ll = snprintf(l, sizeof(l), "K32_BT %s state=%d sp=%p\n", st[i].pcTaskName, (int)st[i].eCurrentState, (const void*)sp);
+                        con.write(l, static_cast<size_t>(ll));
+                        for (int w = 0; w < 48; w += 8) {
+                            ll = snprintf(l, sizeof(l), "K32_BT %08x %08x %08x %08x %08x %08x %08x %08x\n",
+                                          (unsigned)sp[w], (unsigned)sp[w+1], (unsigned)sp[w+2], (unsigned)sp[w+3],
+                                          (unsigned)sp[w+4], (unsigned)sp[w+5], (unsigned)sp[w+6], (unsigned)sp[w+7]);
+                            con.write(l, static_cast<size_t>(ll));
+                        }
+                    }
+                    heap_caps_free(st);
+                }
+                con.write(found ? "K32_OK bt\n" : "K32_ERR no such task\n", found ? 10 : 21);
+            } else if (line.rfind("K32_CMD:TONE:", 0) == 0) {
+                // Plays N tones back to back from the console task to exercise the
+                // speaker driver without a pod: K32_CMD:TONE:<count>
+                int n = std::atoi(line.c_str() + 13);
+                if (n < 1) n = 1;
+                if (n > 200) n = 200;
+                uint64_t t0 = kube32::osal::System::get_uptime_ms();
+                for (int i = 0; i < n; ++i) kube32::hal::play_tone(880 + (i % 4) * 110, 20, 15);
+                char l[64];
+                int ll = snprintf(l, sizeof(l), "K32_OK %d tone(s) in %u ms\n", n, (unsigned)(kube32::osal::System::get_uptime_ms() - t0));
+                con.write(l, static_cast<size_t>(ll));
+            } else if (line.rfind("K32_CMD:ACCESSLOG:", 0) == 0) {
+                bool on = line.substr(18) == "on";
+                if (s_api_server) s_api_server->set_access_log(on);
+                if (s_ingress_server) s_ingress_server->set_access_log(on);
+                con.write(on ? "K32_OK access log on\n" : "K32_OK access log off\n", on ? 21 : 22);
+            } else if (line == "K32_CMD:BOOTLOADER") {
+                // Reboot into the ROM serial bootloader so a host can flash with
+                // "--before no-reset" when the USB auto-reset does not work.
+                con.write("K32_OK entering download mode\n", 30);
+                vTaskDelay(pdMS_TO_TICKS(100));
+                REG_WRITE(RTC_CNTL_OPTION1_REG, RTC_CNTL_FORCE_DOWNLOAD_BOOT);
                 esp_restart();
             } else if (line == "K32_CMD:KEYPOP") {
                 // Pops one key from the matrix queue on the host side (bypasses pods)
@@ -607,6 +663,7 @@ void cluster_task(void* pv) {
             if (nl) nl->record_node_lease(node);
         });
         if (!api_server->start()) ESP_LOGE(TAG, "API server failed to start");
+        s_api_server = api_server.get();
         printf("[CONTROL-PLANE] API server http://%s:6443, scheduler + node lifecycle active\n", ip.c_str());
 
         kubelet_cfg.api_server_host = "127.0.0.1";
@@ -639,6 +696,8 @@ void cluster_task(void* pv) {
     } else {
         kubelet_cfg.api_server_host = api_host;
         kubelet_cfg.api_server_port = 6443;
+        // The control plane may sit on another access point: reach it over UDP too
+        kube32::ipc::ChannelManager::instance().add_seed_peer(api_host, 7400);
         kubelet = std::make_unique<kube32::kubelet::Kubelet>(kubelet_cfg, *wasm_runtime);
         kubelet->start();
         printf("[WORKER] kubelet -> http://%s:6443\n", api_host.c_str());
@@ -670,6 +729,7 @@ void cluster_task(void* pv) {
     // Console on a small task of its own
     console.init(ident.has_display);   // USB-Serial-JTAG on the display board, UART0 (CH340) on the devkit
     if (!ident.is_control_plane) s_forward_host = api_host;   // workers relay console HTTP to the control plane
+    if (wiring) s_ingress_server = wiring->ingress_server();
     static std::pair<Console*, NodeIdentity*> console_ctx(&console, &ident);
     xTaskCreatePinnedToCore(console_task, "k32_console", 4096, &console_ctx, 4, nullptr, 0);
 
@@ -714,6 +774,25 @@ void cluster_task(void* pv) {
             kube32::ipc::ChannelManager::instance().publish("ingress", "tessera.events", reinterpret_cast<const uint8_t*>(ev), static_cast<size_t>(l));
             if (iter % 2 == 0 && wiring->ingress()->sse().count() > 0) {
                 wiring->ingress()->sse().broadcast("cluster", wiring->ingress()->build_cluster_json());
+            }
+        }
+        if (ident.is_control_plane && store && iter % 10 == 0) {
+            // Workers register their InternalIP; seed them as UDP peers so the
+            // channel fabric works across access points, not only over ESP-NOW.
+            std::vector<std::string> nodes;
+            store->list("/registry/nodes/", nodes);
+            for (const auto& nj : nodes) {
+                kube32::models::JsonValue doc;
+                std::string err;
+                if (!kube32::models::parse_json(nj, doc, err)) continue;
+                const auto* meta = doc.get("metadata");
+                if (meta && meta->get_string("name", "") == ident.name) continue;
+                const auto* status = doc.get("status");
+                const auto* addrs = status ? status->get("addresses") : nullptr;
+                if (!addrs || !addrs->is_array()) continue;
+                for (const auto& a : addrs->arr_val) {
+                    if (a.get_string("type", "") == "InternalIP") kube32::ipc::ChannelManager::instance().add_seed_peer(a.get_string("address", ""), 7400);
+                }
             }
         }
         if (iter % 30 == 0) log_memory("steady state");

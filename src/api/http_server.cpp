@@ -85,6 +85,7 @@ static size_t write_head(char* buf, size_t cap, int status, std::string_view con
 }
 
 bool HttpConnection::send_simple(int status, std::string_view content_type, std::string_view body, std::string_view extra_headers) {
+    status_ = status;
     if (responded_) return false;
     responded_ = true;
     char framing[64];
@@ -98,6 +99,7 @@ bool HttpConnection::send_simple(int status, std::string_view content_type, std:
 }
 
 bool HttpConnection::send_blob(std::string_view content_type, const uint8_t* data, size_t len, bool gzip, std::string_view etag, std::string_view cache_control) {
+    status_ = 200;   // or 304 below
     if (responded_) return false;
     responded_ = true;
     char extra[256];
@@ -132,6 +134,7 @@ bool HttpConnection::send_blob(std::string_view content_type, const uint8_t* dat
 }
 
 bool HttpConnection::begin_chunked(int status, std::string_view content_type, std::string_view extra_headers) {
+    status_ = status;
     if (responded_) return false;
     responded_ = true;
     chunked_open_ = true;
@@ -546,7 +549,11 @@ size_t HttpServer::serve_one(Worker& w, osal::Socket& sock, const std::string& c
         have += static_cast<size_t>(n);
     }
     if (!have_head) {
-        if (have > 0) { send_status_only(sock, have >= cap - 1 ? 431 : 400, have >= cap - 1 ? "Request Header Fields Too Large" : "Bad Request"); metrics_.errors.fetch_add(1); }
+        if (have > 0) {
+            send_status_only(sock, have >= cap - 1 ? 431 : 400, have >= cap - 1 ? "Request Header Fields Too Large" : "Bad Request");
+            metrics_.errors.fetch_add(1);
+            if (options_.access_log) printf("[HTTP] %s unparsable request head (%u bytes) -> %d\n", client_ip.c_str(), (unsigned)have, have >= cap - 1 ? 431 : 400);
+        }
         return static_cast<size_t>(-1);
     }
     if (t_start == 0) t_start = osal::Thread::get_time_us();
@@ -614,7 +621,13 @@ size_t HttpServer::serve_one(Worker& w, osal::Socket& sock, const std::string& c
         conn.send_simple(500, "application/json", "{\"error\":\"handler_no_response\"}");
     }
 
-    metrics_.record(static_cast<uint32_t>(osal::Thread::get_time_us() - t_start));
+    uint32_t took_us = static_cast<uint32_t>(osal::Thread::get_time_us() - t_start);
+    metrics_.record(took_us);
+    if (options_.access_log) {
+        printf("[HTTP] %s %s %.*s -> %d %u ms %s%s\n", client_ip.c_str(), http_method_str(req.method),
+               (int)(req.path.size() > 60 ? 60 : req.path.size()), req.path.data(), conn.status(), (unsigned)(took_us / 1000),
+               conn.keep_alive() ? "keep-alive" : "close", conn.responded() ? "" : " (no response)");
+    }
     keep_alive = conn.keep_alive();
     return keep_alive ? leftover : static_cast<size_t>(-1);
 }

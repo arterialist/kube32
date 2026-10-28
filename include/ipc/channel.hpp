@@ -225,6 +225,10 @@ public:
     // Starts the periodic HELLO announcement and the dispatcher thread.
     bool start_background(uint32_t hello_interval_ms = 3000, size_t dispatcher_stack_bytes = 8192, bool stack_in_psram = false);
     void send_hello();
+    // Peers reachable over IP that cannot be found by ESP-NOW broadcast (nodes
+    // on another access point of the same network): HELLO is sent to them
+    // unicast until they answer and become regular peers.
+    void add_seed_peer(const std::string& ip, uint16_t port);
     // ESP-NOW receive callback entry: copies the frame for the dispatcher thread.
     void enqueue_raw_frame(const uint8_t* src_mac, const uint8_t* frame, size_t len);
 
@@ -280,6 +284,7 @@ private:
     // Peers and identity
     mutable osal::Mutex peer_mutex_;
     std::map<uint32_t, PeerInfo> peers_;
+    std::vector<NodeEndpoint> seed_peers_;   // guarded by peer_mutex_
     uint32_t local_node_id_{0};
     std::string local_node_name_;
 

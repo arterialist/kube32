@@ -14,6 +14,22 @@
 
 namespace kube32::osal {
 
+// Pool of control blocks for tasks that run on caller-provided stacks.
+static constexpr int kStaticTcbSlots = 4;
+static StaticTask_t s_static_tcbs[kStaticTcbSlots];
+static TaskHandle_t s_static_tcb_task[kStaticTcbSlots] = {};
+
+static StaticTask_t* acquire_static_tcb() {
+    for (int i = 0; i < kStaticTcbSlots; ++i) {
+        if (s_static_tcb_task[i] == nullptr || eTaskGetState(s_static_tcb_task[i]) == eDeleted) {
+            // xTaskCreateStatic returns the TCB address as the handle
+            s_static_tcb_task[i] = reinterpret_cast<TaskHandle_t>(&s_static_tcbs[i]);
+            return &s_static_tcbs[i];
+        }
+    }
+    return nullptr;
+}
+
 struct Thread::Impl {
     TaskHandle_t handle{nullptr};
     SemaphoreHandle_t join_sem{nullptr};
@@ -56,13 +72,8 @@ Thread::~Thread() {
         if (impl_->join_sem) {
             vSemaphoreDelete(impl_->join_sem);
         }
-        if (impl_->static_tcb) {
-            // vTaskDelete(NULL) in the trampoline runs after join_sem is given;
-            // give the kernel a tick to finish removing the task before the
-            // control block memory is reused.
-            vTaskDelay(pdMS_TO_TICKS(20));
-            heap_caps_free(impl_->static_tcb);
-        }
+        // static_tcb stays in the pool; acquire_static_tcb() checks the kernel
+        // state before handing it out again.
         delete impl_;
         impl_ = nullptr;
     }
@@ -97,10 +108,11 @@ bool Thread::start(EntryFn entry, void* arg, const Config& config) {
     BaseType_t core = (config.core_affinity < 0) ? tskNO_AFFINITY : config.core_affinity;
     BaseType_t rc = pdFAIL;
     if (config.stack_buffer) {
-        // Caller-owned stack (reserved at boot): a static task. The control
-        // block is kept until this Thread is destroyed, which happens after
-        // join(), so the kernel never sees it go away underneath a live task.
-        if (!impl_->static_tcb) impl_->static_tcb = static_cast<StaticTask_t*>(heap_caps_calloc(1, sizeof(StaticTask_t), MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
+        // Caller-owned stack (reserved at boot): a static task. Control blocks
+        // come from a fixed pool and are never freed: the idle task touches a
+        // deleted task's TCB after the deleting task has moved on, so a slot
+        // is reused only once the kernel reports its previous task deleted.
+        impl_->static_tcb = acquire_static_tcb();
         if (impl_->static_tcb) {
             impl_->handle = xTaskCreateStaticPinnedToCore(
                 Impl::freertos_trampoline,
