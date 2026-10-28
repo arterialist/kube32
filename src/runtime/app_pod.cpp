@@ -317,7 +317,12 @@ static const void* raw_key_read(IM3Runtime rt, IM3ImportContext ictx, uint64_t* 
         *reinterpret_cast<int32_t*>(sp) = hal::HAL_ERR_PERM;
         return m3Err_none;
     }
-    *reinterpret_cast<int32_t*>(sp) = s_hooks.key_read ? s_hooks.key_read() : hal::HAL_ERR_NODEV;
+    int32_t key = s_hooks.key_read ? s_hooks.key_read() : hal::HAL_ERR_NODEV;
+    if (key >= 0) {
+        static int traced = 0;
+        if (traced < 8) { traced++; printf("[TRACE] key_read -> %d ('%c') for %s\n", (int)key, (key >= 32 && key < 127) ? (char)key : '.', pod_id.c_str()); }
+    }
+    *reinterpret_cast<int32_t*>(sp) = key;
     return m3Err_none;
 }
 

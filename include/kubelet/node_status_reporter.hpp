@@ -24,7 +24,7 @@ struct NodeTelemetry {
 
 class NodeStatusReporter {
 public:
-    explicit NodeStatusReporter(const std::string& node_name, const std::string& node_ip);
+    explicit NodeStatusReporter(const std::string& node_name, const std::string& node_ip, bool control_plane = false);
     ~NodeStatusReporter() = default;
 
     // Collect telemetry from OSAL & HAL
@@ -40,6 +40,7 @@ public:
 private:
     std::string node_name_;
     std::string node_ip_;
+    bool control_plane_{false};
 };
 
 } // namespace kube32::kubelet

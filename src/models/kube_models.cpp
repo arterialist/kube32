@@ -1,4 +1,10 @@
 #include "models/kube_models.hpp"
+#include "osal/system.hpp"
+#include <random>
+#include <cstdio>
+#if defined(ESP_PLATFORM)
+#include "esp_random.h"
+#endif
 
 #include <cctype>
 #include <cstdlib>
@@ -8,6 +14,20 @@
 #include <algorithm>
 
 namespace kube32::models {
+
+uint64_t parse_quantity(const std::string& val) {
+    if (val.empty()) return 0;
+    size_t idx = 0;
+    while (idx < val.size() && (std::isdigit(static_cast<unsigned char>(val[idx])) || val[idx] == '.')) idx++;
+    if (idx == 0) return 0;
+    double num = 0.0;
+    try { num = std::stod(val.substr(0, idx)); } catch (...) { return 0; }
+    std::string unit = val.substr(idx);
+    if (unit == "Ki" || unit == "ki" || unit == "K" || unit == "k") return static_cast<uint64_t>(num * 1024.0);
+    if (unit == "Mi" || unit == "mi" || unit == "M" || unit == "m") return static_cast<uint64_t>(num * 1024.0 * 1024.0);
+    if (unit == "Gi" || unit == "gi" || unit == "G" || unit == "g") return static_cast<uint64_t>(num * 1024.0 * 1024.0 * 1024.0);
+    return static_cast<uint64_t>(num);
+}
 
 // =============================================================================
 // JsonValue Methods
@@ -528,6 +548,7 @@ KubeNode parse_node_manifest(const std::string& json_str) {
     const JsonValue* meta = doc.get("metadata");
     if (meta && meta->is_object()) {
         node.name = meta->get_string("name", "");
+        node.age_seconds = age_seconds_since(meta->get_string("creationTimestamp", ""));
         const JsonValue* labels = meta->get("labels");
         if (labels && labels->is_object()) {
             for (const auto& kv : labels->obj_val) {
@@ -595,20 +616,104 @@ KubePod parse_pod_manifest(const std::string& json_str) {
     if (meta && meta->is_object()) {
         pod.name = meta->get_string("name", "");
         pod.namespace_name = meta->get_string("namespace", "default");
+        pod.uid = meta->get_string("uid", "");
+        pod.deletion_timestamp = meta->get_string("deletionTimestamp", "");
+        pod.age_seconds = age_seconds_since(meta->get_string("creationTimestamp", ""));
+    }
+
+    if (meta && meta->is_object()) {
+        const JsonValue* labels = meta->get("labels");
+        if (labels && labels->is_object()) {
+            for (const auto& kv : labels->obj_val) {
+                if (kv.second.is_string()) pod.labels[kv.first] = kv.second.str_val;
+            }
+        }
+        const JsonValue* ann = meta->get("annotations");
+        if (ann && ann->is_object()) {
+            for (const auto& kv : ann->obj_val) {
+                if (kv.second.is_string()) pod.annotations[kv.first] = kv.second.str_val;
+            }
+        }
     }
 
     const JsonValue* spec = doc.get("spec");
     if (spec && spec->is_object()) {
         pod.node_name = spec->get_string("nodeName", "<none>");
+        const JsonValue* sel = spec->get("nodeSelector");
+        if (sel && sel->is_object()) {
+            for (const auto& kv : sel->obj_val) {
+                if (kv.second.is_string()) pod.node_selector[kv.first] = kv.second.str_val;
+            }
+        }
         const JsonValue* containers = spec->get("containers");
         if (containers && containers->is_array()) {
             pod.total_containers = static_cast<uint32_t>(containers->arr_val.size());
+            uint64_t total_req = 0;
+            uint64_t total_lim = 0;
+            for (size_t ci = 0; ci < containers->arr_val.size(); ++ci) {
+                const JsonValue& c = containers->arr_val[ci];
+                if (!c.is_object()) continue;
+                if (ci == 0) {
+                    pod.image = c.get_string("image", "");
+                    pod.container_name = c.get_string("name", "");
+                    const JsonValue* env = c.get("env");
+                    if (env && env->is_array()) {
+                        for (const auto& e : env->arr_val) {
+                            if (!e.is_object()) continue;
+                            std::string name = e.get_string("name", "");
+                            if (name.empty()) continue;
+                            const JsonValue* v = e.get("value");
+                            std::string value;
+                            if (v) {
+                                if (v->is_string()) value = v->str_val;
+                                else if (v->is_number()) value = std::to_string(static_cast<long long>(v->num_val));
+                                else if (v->is_bool()) value = v->bool_val ? "true" : "false";
+                            }
+                            pod.env.emplace_back(name, value);
+                        }
+                    }
+                }
+                const JsonValue* res = c.get("resources");
+                if (!res || !res->is_object()) continue;
+                const JsonValue* req = res->get("requests");
+                const JsonValue* lim = res->get("limits");
+                if (req && req->is_object()) {
+                    total_req += parse_quantity(req->get_string("memory", ""));
+                    pod.psram_request_bytes += parse_quantity(req->get_string("esp32.io/psram", req->get_string("esp.io/psram", "")));
+                    pod.gpio_request += static_cast<uint32_t>(parse_quantity(req->get_string("esp32.io/gpio", req->get_string("esp.io/gpio", ""))));
+                }
+                if (lim && lim->is_object()) {
+                    total_lim += parse_quantity(lim->get_string("memory", ""));
+                }
+            }
+            if (total_req > 0) pod.memory_request_bytes = total_req;
+            pod.memory_limit_bytes = total_lim;
+            if (pod.memory_request_bytes == 16 * 1024 && total_req == 0 && total_lim > 0) {
+                pod.memory_request_bytes = total_lim;
+            }
         }
     }
 
     const JsonValue* status = doc.get("status");
     if (status && status->is_object()) {
         pod.status = status->get_string("phase", "Pending");
+        // kubectl's pod printer: a waiting/terminated container reason wins
+        // over the phase, and a deletionTimestamp shows as Terminating.
+        const JsonValue* cst = status->get("containerStatuses");
+        if (cst && cst->is_array()) {
+            for (const auto& cs : cst->arr_val) {
+                const JsonValue* state = cs.get("state");
+                if (!state) continue;
+                if (const JsonValue* w = state->get("waiting")) {
+                    std::string r = w->get_string("reason", "");
+                    if (!r.empty()) pod.status = r;
+                } else if (const JsonValue* t = state->get("terminated")) {
+                    std::string r = t->get_string("reason", "");
+                    if (!r.empty() && pod.status != "Running") pod.status = r;
+                }
+            }
+        }
+        if (!pod.deletion_timestamp.empty() && pod.status != "Succeeded" && pod.status != "Failed") pod.status = "Terminating";
         pod.ip = status->get_string("podIP", "<none>");
         const JsonValue* cstatuses = status->get("containerStatuses");
         if (cstatuses && cstatuses->is_array()) {
@@ -642,6 +747,7 @@ KubeDeployment parse_deployment_manifest(const std::string& json_str) {
     if (meta && meta->is_object()) {
         deploy.name = meta->get_string("name", "");
         deploy.namespace_name = meta->get_string("namespace", "default");
+        deploy.age_seconds = age_seconds_since(meta->get_string("creationTimestamp", ""));
     }
 
     const JsonValue* spec = doc.get("spec");
@@ -678,6 +784,128 @@ KubeDeployment parse_deployment_manifest(const std::string& json_str) {
     }
 
     return deploy;
+}
+
+
+// =============================================================================
+// Time and identity helpers
+// =============================================================================
+
+static void civil_from_days(int64_t z, int& y, unsigned& m, unsigned& d) {
+    // Howard Hinnant's days-from-civil inverse (proleptic Gregorian, UTC)
+    z += 719468;
+    const int64_t era = (z >= 0 ? z : z - 146096) / 146097;
+    const unsigned doe = static_cast<unsigned>(z - era * 146097);
+    const unsigned yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    const int64_t yy = static_cast<int64_t>(yoe) + era * 400;
+    const unsigned doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    const unsigned mp = (5 * doy + 2) / 153;
+    d = doy - (153 * mp + 2) / 5 + 1;
+    m = mp < 10 ? mp + 3 : mp - 9;
+    y = static_cast<int>(yy + (m <= 2 ? 1 : 0));
+}
+
+static int64_t days_from_civil(int y, unsigned m, unsigned d) {
+    y -= m <= 2 ? 1 : 0;
+    const int64_t era = (y >= 0 ? y : y - 399) / 400;
+    const unsigned yoe = static_cast<unsigned>(y - era * 400);
+    const unsigned doy = (153 * (m > 2 ? m - 3 : m + 9) + 2) / 5 + d - 1;
+    const unsigned doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    return era * 146097 + static_cast<int64_t>(doe) - 719468;
+}
+
+std::string format_rfc3339(uint64_t unix_ms) {
+    int64_t secs = static_cast<int64_t>(unix_ms / 1000ULL);
+    int64_t days = secs / 86400;
+    int64_t rem = secs % 86400;
+    int y; unsigned m, d;
+    civil_from_days(days, y, m, d);
+    char buf[32];
+    snprintf(buf, sizeof(buf), "%04d-%02u-%02uT%02lld:%02lld:%02lldZ", y, m, d,
+             static_cast<long long>(rem / 3600), static_cast<long long>((rem % 3600) / 60),
+             static_cast<long long>(rem % 60));
+    return buf;
+}
+
+std::string now_rfc3339() {
+    uint64_t now = osal::System::get_unix_time_ms();
+    return now == 0 ? std::string() : format_rfc3339(now);
+}
+
+bool parse_rfc3339(std::string_view t, uint64_t& out_unix_ms) {
+    // Minimal strict parser: YYYY-MM-DDTHH:MM:SS(.fraction)?(Z|+00:00|-00:00)
+    if (t.size() < 20) return false;
+    auto num = [&](size_t off, size_t len, int& out) {
+        int v = 0;
+        for (size_t i = off; i < off + len; ++i) {
+            if (i >= t.size() || t[i] < '0' || t[i] > '9') return false;
+            v = v * 10 + (t[i] - '0');
+        }
+        out = v;
+        return true;
+    };
+    int y, mo, d, h, mi, s;
+    if (!num(0, 4, y) || t[4] != '-' || !num(5, 2, mo) || t[7] != '-' || !num(8, 2, d) ||
+        (t[10] != 'T' && t[10] != 't' && t[10] != ' ') || !num(11, 2, h) || t[13] != ':' ||
+        !num(14, 2, mi) || t[16] != ':' || !num(17, 2, s)) return false;
+    size_t pos = 19;
+    uint64_t frac_ms = 0;
+    if (pos < t.size() && t[pos] == '.') {
+        ++pos;
+        unsigned digits = 0;
+        while (pos < t.size() && t[pos] >= '0' && t[pos] <= '9') {
+            if (digits < 3) { frac_ms = frac_ms * 10 + static_cast<uint64_t>(t[pos] - '0'); ++digits; }
+            ++pos;
+        }
+        while (digits < 3) { frac_ms *= 10; ++digits; }
+    }
+    int64_t offset_s = 0;
+    if (pos < t.size() && (t[pos] == 'Z' || t[pos] == 'z')) {
+        ++pos;
+    } else if (pos + 6 <= t.size() && (t[pos] == '+' || t[pos] == '-')) {
+        int oh, om;
+        if (!num(pos + 1, 2, oh) || t[pos + 3] != ':' || !num(pos + 4, 2, om)) return false;
+        offset_s = (oh * 3600 + om * 60) * (t[pos] == '+' ? 1 : -1);
+        pos += 6;
+    } else {
+        return false;
+    }
+    if (mo < 1 || mo > 12 || d < 1 || d > 31 || h > 23 || mi > 59 || s > 60) return false;
+    int64_t days = days_from_civil(y, static_cast<unsigned>(mo), static_cast<unsigned>(d));
+    int64_t secs = days * 86400 + h * 3600 + mi * 60 + s - offset_s;
+    if (secs < 0) return false;
+    out_unix_ms = static_cast<uint64_t>(secs) * 1000ULL + frac_ms;
+    return true;
+}
+
+uint64_t age_seconds_since(std::string_view ts) {
+    uint64_t now = osal::System::get_unix_time_ms();
+    uint64_t created = 0;
+    if (now == 0 || ts.empty() || !parse_rfc3339(ts, created)) return AGE_UNKNOWN;
+    return now >= created ? (now - created) / 1000ULL : 0;
+}
+
+std::string generate_uid() {
+    uint32_t words[4];
+#if defined(ESP_PLATFORM)
+    for (auto& w : words) w = esp_random();
+#else
+    std::random_device rd;
+    for (auto& w : words) w = rd();
+#endif
+    unsigned char b[16];
+    for (int i = 0; i < 4; ++i) {
+        b[i * 4 + 0] = static_cast<unsigned char>(words[i] >> 24);
+        b[i * 4 + 1] = static_cast<unsigned char>(words[i] >> 16);
+        b[i * 4 + 2] = static_cast<unsigned char>(words[i] >> 8);
+        b[i * 4 + 3] = static_cast<unsigned char>(words[i]);
+    }
+    b[6] = static_cast<unsigned char>((b[6] & 0x0f) | 0x40); // version 4
+    b[8] = static_cast<unsigned char>((b[8] & 0x3f) | 0x80); // RFC 4122 variant
+    char out[37];
+    snprintf(out, sizeof(out), "%02x%02x%02x%02x-%02x%02x-%02x%02x-%02x%02x-%02x%02x%02x%02x%02x%02x",
+             b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7], b[8], b[9], b[10], b[11], b[12], b[13], b[14], b[15]);
+    return out;
 }
 
 } // namespace kube32::models

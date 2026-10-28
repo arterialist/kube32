@@ -577,6 +577,7 @@ public:
             const models::JsonValue* labels = meta ? meta->get("labels") : nullptr;
             bool is_daemon = labels && labels->get_string("kube32.io/daemonset", "") == "true";
             if (is_daemon) continue;
+            if (meta && !meta->get_string("deletionTimestamp", "").empty()) continue; // being torn down
 
             // Only consider a node "missing" if it was deleted from /registry/nodes/
             bool node_deleted = (!assigned_node.empty() && assigned_node != "<none>" && existing_nodes.count(assigned_node) == 0);
@@ -584,8 +585,10 @@ public:
             if (node_deleted) {
                 // Node was deleted from cluster: evict and re-schedule!
                 schedule_pod(pod_name, pod_ns);
-            } else if (phase == "Pending" || assigned_node.empty() || assigned_node == "<none>") {
-                // Re-evaluate pending pod (e.g. evicted by NodeLifecycleController)
+            } else if (assigned_node.empty() || assigned_node == "<none>") {
+                // Unbound pod (new, or evicted by NodeLifecycleController). A bound
+                // pod stays Pending until its kubelet starts it; it is not re-evaluated.
+                (void)phase;
                 schedule_pod(pod_name, pod_ns);
             }
         }
@@ -596,7 +599,13 @@ private:
         while (running_.load()) {
             osal::Thread::sleep_ms(config_.reconcile_interval_ms);
             if (!running_.load()) break;
-            reconcile_cluster();
+            // An allocation failure while parsing objects must not take the
+            // node down; the next pass retries once memory is back.
+            try {
+                reconcile_cluster();
+            } catch (const std::exception& e) {
+                std::cout << "[SCHED] reconcile skipped: " << e.what() << std::endl;
+            }
         }
     }
 

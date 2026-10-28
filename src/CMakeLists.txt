@@ -30,6 +30,7 @@ set(KUBE32_APP_SRCS
     api/event_recorder.cpp
     api/metrics_registry.cpp
     controller/node_lifecycle_controller.cpp
+    controller/deployment_controller.cpp
     hal/capability_firewall.cpp
     hal/mock_hal.cpp
     hal/tft_keyboard_hardware.cpp

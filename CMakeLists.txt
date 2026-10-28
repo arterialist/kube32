@@ -110,6 +110,7 @@ else()
         src/net/network_manager.cpp
         src/net/mdns_discovery.cpp
         src/controller/node_lifecycle_controller.cpp
+        src/controller/deployment_controller.cpp
         src/ipc/channel.cpp
         src/api/table_serializer.cpp
         src/api/selectors.cpp
@@ -211,6 +212,13 @@ else()
     )
     target_link_libraries(test_api_server PRIVATE kube32_core)
     add_test(NAME test_api_server COMMAND test_api_server)
+
+    # 6b. Watch streams, pod log rings, events and metrics.k8s.io
+    add_executable(test_api_streams
+        tests/test_api_streams.cpp
+    )
+    target_link_libraries(test_api_streams PRIVATE kube32_core)
+    add_test(NAME test_api_streams COMMAND test_api_streams)
 
     # 7. Autonomous Scheduler & Predicate Tests (Milestone 2)
     add_executable(test_scheduler

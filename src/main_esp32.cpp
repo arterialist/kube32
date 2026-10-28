@@ -14,6 +14,11 @@
 #include "storage/store.hpp"
 #include "scheduler/scheduler.hpp"
 #include "controller/node_lifecycle_controller.hpp"
+#include "controller/deployment_controller.hpp"
+#include "kubelet/metrics_provider.hpp"
+#include "esp_sntp.h"
+#include "esp_timer.h"
+#include "freertos/task.h"
 #include "api/http_server.hpp"
 #include "runtime/wasm_runtime.hpp"
 #include "runtime/app_pod.hpp"
@@ -293,6 +298,23 @@ void console_task(void* arg) {
                 con.write("K32_OK profile stored, rebooting\n", 33);
                 vTaskDelay(pdMS_TO_TICKS(200));
                 esp_restart();
+            } else if (line.rfind("K32_CMD:KEY:", 0) == 0) {
+                // Inject keystrokes into the matrix keyboard queue ("\\n" = Enter,
+                // "\\b" = Backspace) so the input path can be exercised from a host.
+                std::string text = line.substr(12);
+                int n = 0;
+                for (size_t i = 0; i < text.size(); ++i) {
+                    char c = text[i];
+                    if (c == '\\' && i + 1 < text.size()) {
+                        char e = text[++i];
+                        c = (e == 'n') ? '\n' : (e == 'b') ? '\b' : (e == 't') ? '\t' : e;
+                    }
+                    kube32::hal::keyboard_inject(c);
+                    n++;
+                }
+                char l[48];
+                int ll = snprintf(l, sizeof(l), "K32_OK %d key(s) queued\n", n);
+                con.write(l, static_cast<size_t>(ll));
             } else if (line == "K32_CMD:SCAN") {
                 // 2.4 GHz networks as seen by this radio (the only band an ESP32 has)
                 wifi_scan_config_t sc = {};
@@ -441,6 +463,37 @@ void cluster_task(void* pv) {
     std::string ip = net_mgr->get_ip_address();
     printf("[NET] %s ip=%s%s\n", net_mgr->current_mode() == kube32::net::NetworkMode::Station ? "station" : "softap", ip.c_str(), uplink ? " (+uplink)" : "");
     log_memory("after wifi");
+    if (uplink) {
+        // Wall clock for creationTimestamp, event times and log timestamps.
+        // Until the first sync the API omits those fields rather than
+        // inventing them (kubectl shows AGE <unknown>).
+        esp_sntp_setoperatingmode(SNTP_OPMODE_POLL);
+        esp_sntp_setservername(0, "pool.ntp.org");
+        esp_sntp_set_time_sync_notification_cb([](struct timeval* tv) {
+            printf("[CLOCK] synchronized, unix time %lld\n", (long long)(tv ? tv->tv_sec : 0));
+        });
+        esp_sntp_init();
+    }
+
+    // Node CPU utilisation for metrics.k8s.io: cumulative run time of every
+    // non-idle task (both cores, esp_timer microseconds) against wall time.
+    kube32::kubelet::set_platform_cpu_sampler([](uint64_t& busy_us, uint64_t& wall_us) -> bool {
+        UBaseType_t n = uxTaskGetNumberOfTasks();
+        auto* states = static_cast<TaskStatus_t*>(heap_caps_malloc((n + 4) * sizeof(TaskStatus_t), MALLOC_CAP_8BIT));
+        if (!states) return false;
+        configRUN_TIME_COUNTER_TYPE total = 0;
+        UBaseType_t got = uxTaskGetSystemState(states, n + 4, &total);
+        uint64_t busy = 0;
+        for (UBaseType_t i = 0; i < got; ++i) {
+            if (states[i].pcTaskName && std::strncmp(states[i].pcTaskName, "IDLE", 4) == 0) continue;
+            busy += static_cast<uint64_t>(states[i].ulRunTimeCounter);
+        }
+        heap_caps_free(states);
+        if (got == 0) return false;
+        busy_us = busy;
+        wall_us = static_cast<uint64_t>(esp_timer_get_time());
+        return true;
+    });
 
     // Channels and peer discovery
     kube32::ipc::ChannelManager::instance().init(ident.id, 7400);
@@ -463,6 +516,7 @@ void cluster_task(void* pv) {
     std::unique_ptr<kube32::storage::Store> store;
     std::unique_ptr<kube32::controller::NodeLifecycleController> node_lifecycle;
     std::unique_ptr<kube32::scheduler::Scheduler> scheduler;
+    std::unique_ptr<kube32::controller::DeploymentController> deployments;
     std::unique_ptr<kube32::api::HttpServer> api_server;
     std::unique_ptr<kube32::kubelet::Kubelet> kubelet;
     std::unique_ptr<kube32::app::AppWiring> wiring;
@@ -475,7 +529,7 @@ void cluster_task(void* pv) {
     // The kubelet task parses manifests and loads/compiles Wasm modules (deep
     // recursion); workers with PSRAM get a generous stack.
     // Module parse + compile + k32_init (seeding) all run on the kubelet task.
-    kubelet_cfg.task_stack_size = ident.has_psram ? 65536 : 14336;
+    kubelet_cfg.task_stack_size = ident.has_psram ? 49152 : 14336;   // k32_init is short since seeding moved to ticks
     kubelet_cfg.task_stack_in_psram = ident.has_psram;
     kubelet_cfg.control_plane = ident.is_control_plane;
     kubelet_cfg.core_affinity = 1;
@@ -500,6 +554,9 @@ void cluster_task(void* pv) {
         scheduler = kube32::scheduler::create_scheduler(*store, sched_cfg);
         scheduler->start();
 
+        deployments = std::make_unique<kube32::controller::DeploymentController>(*store, scheduler.get());
+        deployments->start();
+
         kube32::api::HttpServerOptions http_opts;
         http_opts.host = "0.0.0.0";
         http_opts.port = 6443;
@@ -510,6 +567,10 @@ void cluster_task(void* pv) {
         http_opts.worker_stack_in_psram = ident.has_psram;
         http_opts.worker_core_affinity = 1;
         http_opts.name = "k32_api";
+        // Watch streams (k9s opens several): one hub thread owns the sockets
+        http_opts.watch_streams = ident.has_psram ? 8 : 4;
+        http_opts.watch_stack_bytes = 16384;
+        http_opts.watch_stack_in_psram = ident.has_psram;
         api_server = std::make_unique<kube32::api::HttpServer>(http_opts, *store, scheduler.get());
         api_server->route_handler().set_lease_callback([nl = node_lifecycle.get()](const std::string& node) {
             if (nl) nl->record_node_lease(node);
@@ -532,7 +593,10 @@ void cluster_task(void* pv) {
         aw.ingress_workers = ident.has_psram ? 2 : 1;
         aw.ingress_worker_stack = ident.has_psram ? 98304 : 8192;   // local pod calls run the interpreter here
         aw.ingress_rx_buffer = ident.has_psram ? 4096 : 2560;
-        aw.run_pod_server = ident.has_psram;        // request-handling pods live on PSRAM nodes
+        // The ingress calls a local request-handling pod directly; the pod
+        // HTTP server only matters on worker nodes that host such pods. Not
+        // starting it here keeps 64 KB of PSRAM for the pod runtime itself.
+        aw.run_pod_server = false;
         aw.pod_workers = 1;
         aw.pod_worker_stack = 65536;
         aw.pod_port = 7000;
@@ -585,7 +649,7 @@ void cluster_task(void* pv) {
     {
         kube32::osal::Thread::Config t_cfg;
         t_cfg.name = "k32_tick";
-        t_cfg.stack_size = ident.has_psram ? 65536 : 8192;
+        t_cfg.stack_size = ident.has_psram ? 49152 : 8192;
         t_cfg.stack_in_psram = ident.has_psram;
         t_cfg.priority = 4;
         t_cfg.core_affinity = 1;

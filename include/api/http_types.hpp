@@ -53,6 +53,18 @@ struct HttpRequest {
     bool invalid_content_length{false};
     std::string body;
     bool as_table{false};
+
+    // Connection and application headers
+    bool http11{true};
+    bool keep_alive{true};
+    bool accepts_gzip{false};
+    bool chunked_body{false};
+    std::string cookie;
+    std::string if_none_match;
+    std::string host;
+    std::string request_id;
+    std::string target_pod;   // X-Kube32-Pod, set by the ingress proxy
+    std::string client_ip;
 };
 
 struct HttpResponse {
@@ -60,6 +72,9 @@ struct HttpResponse {
     std::string content_type{"application/json"};
     std::string body;
     bool is_chunked{false};
+    // The handler moved the client socket to a long-lived owner (watch hub,
+    // log follow); the server must not touch the connection again.
+    bool socket_taken{false};
 };
 
 // URL Normalization helper: strips query string and trailing slashes

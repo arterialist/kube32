@@ -3,6 +3,7 @@
 #include "storage/store.hpp"
 #include "scheduler/scheduler.hpp"
 #include "controller/node_lifecycle_controller.hpp"
+#include "controller/deployment_controller.hpp"
 #include "api/http_server.hpp"
 #include "runtime/wasm_runtime.hpp"
 #include "kubelet/kubelet.hpp"
@@ -324,6 +325,18 @@ int main(int argc, char* argv[]) {
     }
     std::cout << "[INIT] Autonomous scheduler started with LeastAllocated scoring." << std::endl;
 
+    // Deployments: replicas from the template, status from the pods that exist
+    kube32::controller::DeploymentControllerConfig dc_cfg;
+    dc_cfg.reconcile_interval_ms = opts.reconcile_interval_ms;
+    auto deployments = std::make_unique<kube32::controller::DeploymentController>(*store, scheduler.get(), dc_cfg);
+    if (!deployments->start()) {
+        std::cerr << "[FATAL] Failed to start Deployment controller." << std::endl;
+        scheduler->stop();
+        node_lifecycle->stop();
+        return 1;
+    }
+    std::cout << "[INIT] Deployment controller active." << std::endl;
+
     // Start HTTP Server
     kube32::api::HttpServerOptions http_opts;
     http_opts.host = "0.0.0.0";
@@ -422,6 +435,7 @@ int main(int argc, char* argv[]) {
     if (local_kubelet2) local_kubelet2->stop();
     mdns->stop_service_announcement();
     server->stop();
+    deployments->stop();
     scheduler->stop();
     node_lifecycle->stop();
     kube32::ipc::ChannelManager::instance().shutdown();

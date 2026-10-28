@@ -1,5 +1,11 @@
 #include "runtime/container_lifecycle.hpp"
+#include <cstdint>
+#include "runtime/pod_log.hpp"
+#if defined(ESP_PLATFORM)
+#include "esp_memory_utils.h"
+#endif
 #include "runtime/host_functions.hpp"
+#include "runtime/app_pod.hpp"
 #include "osal/system.hpp"
 #include "osal/socket.hpp"
 
@@ -9,6 +15,10 @@
 
 #include <iostream>
 #include <algorithm>
+#if defined(ESP_PLATFORM)
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#endif
 
 namespace kube32::runtime {
 
@@ -61,7 +71,22 @@ bool ContainerLifecycleController::deploy(const uint8_t* wasm_bytes, size_t len)
         return false;
     }
 
-    wasm_bytecode_.assign(wasm_bytes, wasm_bytes + len);
+    // wasm3 keeps pointers into the binary for the lifetime of the module, so
+    // the bytes must stay valid. Images embedded in flash are memory mapped and
+    // are used in place; anything else (manifest-inline images) is copied.
+#if defined(ESP_PLATFORM)
+    if (esp_ptr_in_drom(wasm_bytes)) {
+        wasm_bytecode_.clear();
+        wasm_bytecode_.shrink_to_fit();
+        wasm_view_ = wasm_bytes;
+        wasm_view_len_ = len;
+    } else
+#endif
+    {
+        if (wasm_bytes != wasm_bytecode_.data()) wasm_bytecode_.assign(wasm_bytes, wasm_bytes + len);   // restart reuses the copy
+        wasm_view_ = wasm_bytecode_.data();
+        wasm_view_len_ = wasm_bytecode_.size();
+    }
 
     m3_env_ = m3_NewEnvironment();
     if (!m3_env_) {
@@ -71,6 +96,11 @@ bool ContainerLifecycleController::deploy(const uint8_t* wasm_bytes, size_t len)
     }
 
     m3_runtime_ = m3_NewRuntime(reinterpret_cast<IM3Environment>(m3_env_), config_.stack_size_bytes, nullptr);
+    // wasm3 compiles functions lazily and only emits gas checks into code
+    // compiled while a gas limit is set. Arm the runtime now so every function
+    // of every pod is metered; that is what lets stop() interrupt a guest loop
+    // (gasRemaining = -1) and what the per-request budget relies on.
+    if (m3_runtime_) m3_SetResourceLimit(reinterpret_cast<IM3Runtime>(m3_runtime_), c_m3Limit_GasUnits, static_cast<uint64_t>(INT64_MAX));
     if (!m3_runtime_) {
         status_.phase = ContainerPhase::Failed;
         status_.exit_message = "Failed to create Wasm3 runtime";
@@ -89,7 +119,7 @@ bool ContainerLifecycleController::deploy(const uint8_t* wasm_bytes, size_t len)
 #endif
 
     IM3Module module = nullptr;
-    M3Result r = m3_ParseModule(reinterpret_cast<IM3Environment>(m3_env_), &module, wasm_bytecode_.data(), wasm_bytecode_.size());
+    M3Result r = m3_ParseModule(reinterpret_cast<IM3Environment>(m3_env_), &module, wasm_view_, wasm_view_len_);
     if (r != m3Err_none) {
         status_.phase = ContainerPhase::Failed;
         status_.exit_message = std::string("Wasm parse error: ") + r;
@@ -107,14 +137,18 @@ bool ContainerLifecycleController::deploy(const uint8_t* wasm_bytes, size_t len)
 
     m3_module_ = module;
 
-    // Link standard Kube32 host functions
+    // Link standard Kube32 host functions and the application ABI imports
     link_host_functions(module, config_.pod_id);
+    link_app_host_functions(module, config_.pod_id);
 
     // Optional pre-compile
     m3_CompileModule(module);
 
     size_t mem_size = m3_GetMemorySize(module, 0);
     status_.memory_used_bytes = static_cast<uint32_t>(mem_size);
+    status_.bytecode_bytes = wasm_bytecode_.size();
+    status_.stack_bytes = config_.stack_size_bytes;
+    status_.runtime_bytes = m3_GetResourceUsage(reinterpret_cast<IM3Runtime>(m3_runtime_), c_m3Limit_MemoryBytes);
     status_.phase = ContainerPhase::Pending;
     status_.ready = false;
     status_.exit_message.clear();
@@ -145,9 +179,13 @@ void ContainerLifecycleController::worker_thread_main() {
     }
 
     if (entry_fn) {
+#if defined(ESP_PLATFORM)
+        printf("[STACK] pod thread before entry: free=%u bytes\n", (unsigned)uxTaskGetStackHighWaterMark(nullptr));
+#endif
         M3Result r = m3_CallV(entry_fn);
 
         if (r == m3Err_none) {
+            PodLogStore::runtime().append(config_.pod_id, "[kube32] entrypoint returned, container completed");
             osal::LockGuard guard(mutex_);
             status_.phase = ContainerPhase::Terminated;
             status_.exit_code = 0;
@@ -205,6 +243,8 @@ void ContainerLifecycleController::on_trap_caught_locked(const std::string& trap
 }
 
 void ContainerLifecycleController::on_trap_caught(const std::string& trap_message, int32_t exit_code, const std::string& reason) {
+    PodLogStore::runtime().append(config_.pod_id, "[kube32] container trapped: " + trap_message + " (" + reason +
+                                                      ", exit code " + std::to_string(exit_code) + ")");
     osal::LockGuard guard(mutex_);
     on_trap_caught_locked(trap_message, exit_code, reason);
 }
@@ -227,17 +267,22 @@ bool ContainerLifecycleController::start() {
     status_.phase = ContainerPhase::Running;
     status_.ready = true;
     status_.start_time_ms = osal::System::get_uptime_ms();
+    PodLogStore::runtime().append(config_.pod_id, "[kube32] container started (linear memory " +
+                                                      std::to_string(status_.memory_used_bytes / 1024) + " KiB, limit " +
+                                                      std::to_string(config_.memory_limit_bytes / 1024) + " KiB)");
 
     osal::Thread::Config t_cfg;
     thread_name_ = "pod_" + config_.pod_id;
     t_cfg.name = thread_name_.c_str();
 #if defined(ESP_PLATFORM)
-    t_cfg.stack_size = 12288;
+    // app_main style pods interpret inside this task and call into drivers
+    t_cfg.stack_size = (osal::System::get_total_psram_bytes() > 0) ? 65536 : 49152;
 #else
     t_cfg.stack_size = 65536;
 #endif
     t_cfg.priority = 5;
     t_cfg.core_affinity = 1;
+    t_cfg.stack_in_psram = true;   // falls back to internal RAM on boards without PSRAM
 
     worker_thread_ = std::make_unique<osal::Thread>();
     return worker_thread_->start(worker_thread_entry, this, t_cfg);
@@ -286,8 +331,11 @@ bool ContainerLifecycleController::stop(uint32_t grace_period_ms) {
         if (worker_thread_->is_joinable() && still_running) {
 #if d_m3HasGasMetering
             uint64_t trap_t = osal::System::get_uptime_ms();
-            // Continuously enforce gas exhaustion until worker thread traps or timeout
-            while (worker_thread_->is_joinable() && (osal::System::get_uptime_ms() - trap_t < 250)) {
+            // Continuously enforce gas exhaustion until worker thread traps or timeout.
+            // A guest parked in a blocking host call (channel recv, sleep) only
+            // sees the trap when it returns, so allow the full grace period.
+            const uint32_t trap_window_ms = grace_period_ms > 250 ? grace_period_ms : 250;
+            while (worker_thread_->is_joinable() && (osal::System::get_uptime_ms() - trap_t < trap_window_ms)) {
                 if (m3_runtime_) {
                     __atomic_store_n(&(reinterpret_cast<IM3Runtime>(m3_runtime_)->gasRemaining), -1, __ATOMIC_SEQ_CST);
                 }
@@ -307,6 +355,8 @@ bool ContainerLifecycleController::stop(uint32_t grace_period_ms) {
 
             // Phase 3: Fail-safe detach only if worker truly refused to trap after full timeout
             if (worker_thread_->is_joinable() && still_running) {
+                std::cout << "[RUNTIME] " << config_.pod_id << ": guest ignored stop, detaching (memory stays reserved)" << std::endl;
+                PodLogStore::runtime().append(config_.pod_id, "[kube32] container ignored stop within grace period, detached (ExecutionTimeout)");
                 worker_thread_->detach();
                 worker_thread_.reset();
                 thread_detached_.store(true);
@@ -325,6 +375,9 @@ bool ContainerLifecycleController::stop(uint32_t grace_period_ms) {
         if (worker_thread_ && worker_thread_->is_joinable()) {
             worker_thread_->join();
             worker_thread_.reset();
+            std::cout << "[RUNTIME] " << config_.pod_id << ": stopped (" << status_.termination_reason << ")" << std::endl;
+            PodLogStore::runtime().append(config_.pod_id, "[kube32] container stopped (" +
+                                                              (status_.termination_reason.empty() ? std::string("stop requested by kubelet") : status_.termination_reason) + ")");
         }
     }
 
@@ -338,8 +391,8 @@ bool ContainerLifecycleController::stop(uint32_t grace_period_ms) {
 
 bool ContainerLifecycleController::restart() {
     stop(1000);
-    if (!wasm_bytecode_.empty()) {
-        if (!deploy(wasm_bytecode_.data(), wasm_bytecode_.size())) {
+    if (wasm_view_ && wasm_view_len_) {
+        if (!deploy(wasm_view_, wasm_view_len_)) {
             return false;
         }
     }
@@ -351,6 +404,9 @@ ContainerStatus ContainerLifecycleController::get_status() {
     if (m3_module_) {
         size_t mem_size = m3_GetMemorySize(reinterpret_cast<IM3Module>(m3_module_), 0);
         status_.memory_used_bytes = static_cast<uint32_t>(mem_size);
+    }
+    if (m3_runtime_) {
+        status_.runtime_bytes = m3_GetResourceUsage(reinterpret_cast<IM3Runtime>(m3_runtime_), c_m3Limit_MemoryBytes);
     }
     return status_;
 }
@@ -394,6 +450,7 @@ int32_t ContainerLifecycleController::call_function(const std::string& fn_name, 
 
     if (call_r != m3Err_none) {
         // Trap occurred during function call
+        std::cout << "[RUNTIME] " << config_.pod_id << ": trap in " << fn_name << ": " << call_r << std::endl;
         int32_t exit_code = 137;
         std::string reason = "RuntimeTrap";
         if (call_r == m3Err_trapOutOfBoundsMemoryAccess || call_r == m3Err_memoryLimitExceeded) {
@@ -414,6 +471,23 @@ int32_t ContainerLifecycleController::call_function(const std::string& fn_name, 
         return ret_val;
     }
     return 0;
+}
+
+bool ContainerLifecycleController::has_export(const char* fn_name) const {
+    osal::LockGuard guard(mutex_);
+    if (!m3_runtime_ || !fn_name) return false;
+    IM3Function fn = nullptr;
+    M3Result r = m3_FindFunction(&fn, reinterpret_cast<IM3Runtime>(m3_runtime_), fn_name);
+    return (r == m3Err_none && fn != nullptr);
+}
+
+uint8_t* ContainerLifecycleController::guest_memory(size_t& out_size) const {
+    out_size = 0;
+    if (!m3_module_) return nullptr;
+    size_t size = 0;
+    uint8_t* mem = m3_GetMemory(reinterpret_cast<IM3Module>(m3_module_), &size, 0);
+    out_size = size;
+    return mem;
 }
 
 bool ContainerLifecycleController::run_liveness_probe() {

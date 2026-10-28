@@ -168,7 +168,7 @@ void test_occ_atomic_binding() {
 
     std::string saved;
     store->get("/registry/pods/default/pod-occ", saved);
-    assert(saved.find("\"phase\":\"Running\"") != std::string::npos);
+    assert(saved.find("\"type\":\"PodScheduled\",\"status\":\"True\"") != std::string::npos);
     assert(saved.find("\"nodeName\":\"esp32-node-01\"") != std::string::npos);
 
     std::cout << "[PASS] test_occ_atomic_binding" << std::endl;
@@ -230,7 +230,7 @@ void test_node_failure_and_reconciliation() {
     sched->reconcile_cluster();
     std::string check2;
     store->get("/registry/pods/default/pod-failover", check2);
-    assert(check2.find("\"phase\":\"Running\"") != std::string::npos);
+    assert(check2.find("\"type\":\"PodScheduled\",\"status\":\"True\"") != std::string::npos);
     assert(check2.find("\"nodeName\":\"esp32-node-02\"") != std::string::npos);
     std::cout << " -> Pod failover to node-02 on Ready=False: SUCCESS" << std::endl;
 
@@ -244,8 +244,7 @@ void test_node_failure_and_reconciliation() {
     std::string check3;
     store->get("/registry/pods/default/pod-failover", check3);
 
-    bool stranded_on_deleted_node = (check3.find("\"nodeName\":\"esp32-node-02\"") != std::string::npos &&
-                                     check3.find("\"phase\":\"Running\"") != std::string::npos);
+    bool stranded_on_deleted_node = (check3.find("\"nodeName\":\"esp32-node-02\"") != std::string::npos);
 
     if (stranded_on_deleted_node) {
         std::cerr << "[CRITICAL DEFECT CONFIRMED] Pod remains Running on deleted node esp32-node-02!" << std::endl;

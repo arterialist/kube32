@@ -110,7 +110,10 @@ size_t System::get_total_psram_bytes() {
 }
 
 size_t System::get_total_heap_bytes() {
-    return 0; // the host process heap has no fixed size
+    // The simulator models a 320 KiB SRAM node (the free figure above is the
+    // matching simulated value); it is a declared simulation parameter, not a
+    // measurement of the host process.
+    return 320 * 1024;
 }
 
 uint64_t System::get_unix_time_ms() {

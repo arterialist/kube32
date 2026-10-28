@@ -134,7 +134,9 @@ void test_scheduler_atomic_binding() {
     ScheduleResult res1 = sched->schedule_pod_manifest(pod1);
     assert(res1.scheduled);
     assert(res1.target_node == "esp32-node-01"); // deterministic tie-break
-    assert(pod1.find("\"phase\":\"Running\"") != std::string::npos);
+    // Binding only assigns the node; the kubelet reports Running once it runs
+    assert(pod1.find("\"phase\":\"Pending\"") != std::string::npos);
+    assert(pod1.find("\"type\":\"PodScheduled\",\"status\":\"True\"") != std::string::npos);
     assert(pod1.find("\"nodeName\":\"esp32-node-01\"") != std::string::npos);
 
     // Commit small pod to store
@@ -146,7 +148,8 @@ void test_scheduler_atomic_binding() {
     ScheduleResult res2 = sched->schedule_pod_manifest(pod2);
     assert(res2.scheduled);
     assert(res2.target_node == "esp32-node-02"); // node2 has 100% free memory!
-    assert(pod2.find("\"phase\":\"Running\"") != std::string::npos);
+    assert(pod2.find("\"phase\":\"Pending\"") != std::string::npos);
+    assert(pod2.find("\"type\":\"PodScheduled\",\"status\":\"True\"") != std::string::npos);
 
     // Schedule excessive pod that exceeds all nodes
     std::string pod_giant = "{\"kind\":\"Pod\",\"metadata\":{\"name\":\"giant-pod\",\"namespace\":\"default\"},"
@@ -203,7 +206,7 @@ void test_deleted_node_reconciliation() {
     sched->reconcile_cluster();
 
     store->get("/registry/pods/default/migrating-pod", updated_pod);
-    assert(updated_pod.find("\"phase\":\"Running\"") != std::string::npos);
+    assert(updated_pod.find("\"type\":\"PodScheduled\",\"status\":\"True\"") != std::string::npos);
     assert(updated_pod.find("\"nodeName\":\"esp32-node-02\"") != std::string::npos);
 
     std::cout << "[PASS] test_deleted_node_reconciliation" << std::endl;

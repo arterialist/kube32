@@ -7,7 +7,27 @@
 namespace kube32::controller {
 
 NodeLifecycleController::NodeLifecycleController(storage::Store& store, NodeLifecycleConfig config)
-    : store_(store), config_(config) {}
+    : store_(store), config_(config), events_(store, 64) {}
+
+void NodeLifecycleController::record_node_event(const std::string& node_name, const char* reason, const std::string& message, bool warning) {
+    api::EventSpec ev;
+    ev.involved.kind = "Node";
+    ev.involved.name = node_name;
+    std::string node_json;
+    if (store_.get("/registry/nodes/" + node_name, node_json).ok()) {
+        models::JsonValue doc;
+        std::string err;
+        if (models::parse_json(node_json, doc, err) && doc.is_object()) {
+            const models::JsonValue* meta = doc.get("metadata");
+            if (meta) ev.involved.uid = meta->get_string("uid", "");
+        }
+    }
+    ev.reason = reason;
+    ev.message = message;
+    ev.warning = warning;
+    ev.component = "node-controller";
+    events_.record(ev);
+}
 
 NodeLifecycleController::~NodeLifecycleController() {
     stop();
@@ -20,7 +40,7 @@ bool NodeLifecycleController::start() {
     thread_ = std::make_unique<osal::Thread>();
     osal::Thread::Config cfg;
     cfg.name = "node_lifecycle";
-    cfg.stack_size = 16384;
+    cfg.stack_size = 8192;
     return thread_->start(task_entry, this, cfg);
 }
 
@@ -39,17 +59,30 @@ void NodeLifecycleController::task_entry(void* arg) {
 
 void NodeLifecycleController::run_loop() {
     while (running_.load()) {
-        reconcile_nodes();
+        try {
+            reconcile_nodes();
+        } catch (const std::exception& e) {
+            std::cout << "[LIFECYCLE] pass skipped: " << e.what() << std::endl;
+        }
         osal::Thread::sleep_ms(config_.check_interval_ms);
     }
 }
 
 void NodeLifecycleController::record_node_lease(const std::string& node_name, uint64_t uptime_ms) {
-    osal::LockGuard guard(lease_mutex_);
-    if (uptime_ms == 0) {
-        uptime_ms = osal::System::get_uptime_ms();
+    bool recovered = false;
+    {
+        osal::LockGuard guard(lease_mutex_);
+        if (uptime_ms == 0) {
+            uptime_ms = osal::System::get_uptime_ms();
+        }
+        last_lease_update_ms_[node_name] = uptime_ms;
+        recovered = not_ready_.erase(node_name) > 0;
     }
-    last_lease_update_ms_[node_name] = uptime_ms;
+    if (recovered) {
+        // The kubelet's next heartbeat patch restores the Ready condition; the
+        // transition itself is what the event records.
+        record_node_event(node_name, "NodeReady", "Node " + node_name + " status is now: NodeReady", false);
+    }
 }
 
 uint64_t NodeLifecycleController::get_last_lease_time(const std::string& node_name) const {
@@ -128,6 +161,14 @@ void NodeLifecycleController::mark_node_not_ready(const std::string& node_name, 
     if (modified) {
         store_.put("/registry/nodes/" + node_name, doc.to_string(), true);
     }
+    bool first = false;
+    {
+        osal::LockGuard guard(lease_mutex_);
+        first = not_ready_.insert(node_name).second;
+    }
+    if (first) {
+        record_node_event(node_name, "NodeNotReady", "Node " + node_name + " status is now: NodeNotReady (lease heartbeat expired)", true);
+    }
 }
 
 void NodeLifecycleController::mark_node_unreachable_and_evict(const std::string& node_name, const std::string& current_node_json) {
@@ -166,6 +207,15 @@ void NodeLifecycleController::mark_node_unreachable_and_evict(const std::string&
 
     store_.put("/registry/nodes/" + node_name, doc.to_string(), true);
 
+    bool first = false;
+    {
+        osal::LockGuard guard(lease_mutex_);
+        first = not_ready_.insert(node_name).second;
+    }
+    if (first) {
+        record_node_event(node_name, "NodeNotReady", "Node " + node_name + " status is now: NodeNotReady (lease heartbeat expired)", true);
+    }
+
     // Evict all non-daemon pods from dead node
     evict_pods_from_node(node_name);
 }
@@ -189,6 +239,11 @@ void NodeLifecycleController::evict_pods_from_node(const std::string& node_name)
         const models::JsonValue* meta = doc.get("metadata");
         const models::JsonValue* labels = meta ? meta->get("labels") : nullptr;
         if (labels && labels->get_string("kube32.io/daemonset", "") == "true") {
+            continue;
+        }
+        // A pod already being deleted has no kubelet left to finalize it
+        if (meta && !meta->get_string("deletionTimestamp", "").empty()) {
+            store_.remove(pod_keys[i]);
             continue;
         }
 
@@ -226,6 +281,17 @@ void NodeLifecycleController::evict_pods_from_node(const std::string& node_name)
         conds->arr_val.push_back(std::move(disrupt));
 
         store_.put(pod_keys[i], doc.to_string(), true);
+
+        api::EventSpec ev;
+        ev.involved.kind = "Pod";
+        ev.involved.name = meta ? meta->get_string("name", "") : "";
+        ev.involved.namespace_name = meta ? meta->get_string("namespace", "default") : "default";
+        ev.involved.uid = meta ? meta->get_string("uid", "") : "";
+        ev.reason = "Evicted";
+        ev.message = "Pod evicted from node " + node_name + ": node lease expired, pending rescheduling";
+        ev.warning = true;
+        ev.component = "node-controller";
+        events_.record(ev);
     }
 }
 

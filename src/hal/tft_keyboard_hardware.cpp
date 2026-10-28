@@ -351,6 +351,8 @@ static volatile uint8_t s_keyq_head = 0, s_keyq_tail = 0;
 static volatile char s_last_key = '\0';
 
 static void keyq_push(char c) {
+    static int traced = 0;
+    if (traced < 8) { traced++; printf("[TRACE] keyboard matrix key 0x%02x\n", (unsigned)(unsigned char)c); }
     uint8_t next = static_cast<uint8_t>((s_keyq_head + 1) % KEYQ_SIZE);
     if (next == s_keyq_tail) return;
     s_keyq[s_keyq_head] = c;
@@ -365,6 +367,8 @@ int keyboard_pop() {
 }
 
 char get_last_key_pressed() { return s_last_key; }
+
+void keyboard_inject(char c) { s_last_key = c; keyq_push(c); }
 
 struct KeyCoord { int x; int y; };
 

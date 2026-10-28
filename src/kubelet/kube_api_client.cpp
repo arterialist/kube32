@@ -265,11 +265,13 @@ bool HttpKubeClient::patch_node_status(const std::string& node_name, const std::
 
 bool HttpKubeClient::renew_node_lease(const std::string& node_name, uint32_t duration_sec, const std::string& renew_time_iso8601) {
     std::string path = "/apis/coordination.k8s.io/v1/namespaces/kube-node-lease/leases/" + node_name;
+    // renewTime is omitted while the node has no wall clock; the control plane
+    // timestamps the renewal on arrival (NodeLifecycleController).
     std::string lease_json = "{\"apiVersion\":\"coordination.k8s.io/v1\",\"kind\":\"Lease\","
                              "\"metadata\":{\"name\":\"" + node_name + "\",\"namespace\":\"kube-node-lease\"},"
                              "\"spec\":{\"holderIdentity\":\"" + node_name + "\","
-                             "\"leaseDurationSeconds\":" + std::to_string(duration_sec) + ","
-                             "\"renewTime\":\"" + renew_time_iso8601 + "\"}}";
+                             "\"leaseDurationSeconds\":" + std::to_string(duration_sec) +
+                             (renew_time_iso8601.empty() ? std::string() : ",\"renewTime\":\"" + renew_time_iso8601 + "\"") + "}}";
 
     HttpResponse resp = send_http_request("PUT", path, lease_json);
     if (resp.status_code == 200 || resp.status_code == 201) {
@@ -304,7 +306,8 @@ bool HttpKubeClient::list_pods(std::vector<models::KubePod>& out_pods) {
 }
 
 bool HttpKubeClient::list_pods_raw(std::vector<std::pair<models::KubePod, std::string>>& out_pods_with_manifest) {
-    HttpResponse resp = send_http_request("GET", "/api/v1/pods", "");
+    std::string path = node_filter_.empty() ? std::string("/api/v1/pods") : ("/api/v1/pods?fieldSelector=spec.nodeName%3D" + node_filter_);
+    HttpResponse resp = send_http_request("GET", path, "");
     if (resp.status_code != 200) {
         return false;
     }
@@ -337,6 +340,27 @@ bool HttpKubeClient::patch_pod_status(const std::string& ns, const std::string& 
         return resp.status_code == 200;
     }
     return false;
+}
+
+
+bool HttpKubeClient::create_event(const std::string& ns, const std::string& event_json) {
+    HttpResponse resp = send_http_request("POST", "/api/v1/namespaces/" + ns + "/events", event_json);
+    return resp.status_code == 201 || resp.status_code == 200;
+}
+
+bool HttpKubeClient::push_pod_logs(const std::string& ns, const std::string& name, const std::string& ndjson) {
+    HttpResponse resp = send_http_request("POST", "/api/v1/namespaces/" + ns + "/pods/" + name + "/log", ndjson);
+    return resp.status_code == 200;
+}
+
+bool HttpKubeClient::delete_pod(const std::string& ns, const std::string& name) {
+    HttpResponse resp = send_http_request("DELETE", "/api/v1/namespaces/" + ns + "/pods/" + name + "?gracePeriodSeconds=0", "");
+    return resp.status_code == 200 || resp.status_code == 404;
+}
+
+bool HttpKubeClient::push_metrics(const std::string& node_name, const std::string& sample_json) {
+    HttpResponse resp = send_http_request("POST", "/apis/metrics.k8s.io/v1beta1/nodes/" + node_name, sample_json);
+    return resp.status_code == 200;
 }
 
 } // namespace kube32::kubelet

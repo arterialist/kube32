@@ -2,12 +2,81 @@
 #include "storage/radix_tree.hpp"
 #include "storage/littlefs_journal.hpp"
 
-#include <shared_mutex>
+#include <mutex>
 #include <mutex>
 #include <algorithm>
 #include <cctype>
 
 namespace kube32::storage {
+
+// Writes the store's version into metadata.resourceVersion so every object a
+// client reads carries the version the store assigned (watch bookmarks and
+// resourceVersion-based watches depend on it). Pure string surgery: scans the
+// metadata object at depth 1, replaces an existing resourceVersion value or
+// inserts one. Values without a metadata object are stored verbatim.
+std::string inject_resource_version(const std::string& json, uint64_t version) {
+    size_t meta = json.find("\"metadata\"");
+    if (meta == std::string::npos) return json;
+    size_t p = meta + 10;
+    while (p < json.size() && (json[p] == ' ' || json[p] == '\t' || json[p] == '\n' || json[p] == '\r')) ++p;
+    if (p >= json.size() || json[p] != ':') return json;
+    ++p;
+    while (p < json.size() && (json[p] == ' ' || json[p] == '\t' || json[p] == '\n' || json[p] == '\r')) ++p;
+    if (p >= json.size() || json[p] != '{') return json;
+    const size_t open = p;
+    std::string ver = "\"" + std::to_string(version) + "\"";
+
+    int depth = 0;
+    bool in_str = false;
+    size_t i = open;
+    for (; i < json.size(); ++i) {
+        char c = json[i];
+        if (in_str) {
+            if (c == '\\') { ++i; continue; }
+            if (c == '"') in_str = false;
+            continue;
+        }
+        if (c == '"') {
+            if (depth == 1 && json.compare(i, 17, "\"resourceVersion\"") == 0) {
+                size_t q = i + 17;
+                while (q < json.size() && (json[q] == ' ' || json[q] == ':')) ++q;
+                size_t vstart = q;
+                size_t vend = q;
+                if (q < json.size() && json[q] == '"') {
+                    vend = q + 1;
+                    while (vend < json.size() && json[vend] != '"') { if (json[vend] == '\\') ++vend; ++vend; }
+                    if (vend < json.size()) ++vend;
+                } else {
+                    while (vend < json.size() && json[vend] != ',' && json[vend] != '}') ++vend;
+                }
+                std::string out;
+                out.reserve(json.size() + 8);
+                out.append(json, 0, vstart);
+                out += ver;
+                out.append(json, vend, std::string::npos);
+                return out;
+            }
+            in_str = true;
+            continue;
+        }
+        if (c == '{' || c == '[') { ++depth; continue; }
+        if (c == '}' || c == ']') {
+            --depth;
+            if (depth == 0) break;
+        }
+    }
+    // No resourceVersion in metadata: insert right after the opening brace
+    size_t after = open + 1;
+    while (after < json.size() && (json[after] == ' ' || json[after] == '\n' || json[after] == '\r' || json[after] == '\t')) ++after;
+    bool empty_obj = (after < json.size() && json[after] == '}');
+    std::string out;
+    out.reserve(json.size() + 32);
+    out.append(json, 0, open + 1);
+    out += "\"resourceVersion\":" + ver;
+    if (!empty_obj) out += ",";
+    out.append(json, open + 1, std::string::npos);
+    return out;
+}
 
 class RadixStore : public Store {
 public:
@@ -34,7 +103,7 @@ public:
         bool has_event = false;
 
         {
-            std::unique_lock<std::shared_mutex> lock(rw_mutex_);
+            std::lock_guard<std::recursive_mutex> lock(rw_mutex_);
             std::string deleted_val;
             uint64_t deleted_ver = 0;
             if (!tree_.remove(key, &deleted_val, &deleted_ver)) {
@@ -60,14 +129,14 @@ public:
     }
 
     Status list(const std::string& prefix, std::vector<std::string>& out_jsons) override {
-        std::shared_lock<std::shared_mutex> lock(rw_mutex_);
+        std::lock_guard<std::recursive_mutex> lock(rw_mutex_);
         tree_.list(prefix, out_jsons, nullptr);
         return Status::Ok();
     }
 
     Status persist() override {
         if (!options_.enable_flash_persistence) return Status::Ok();
-        std::shared_lock<std::shared_mutex> lock(rw_mutex_);
+        std::lock_guard<std::recursive_mutex> lock(rw_mutex_);
         Status result = Status::Ok();
         tree_.iterate_all([this, &result](const std::string& key, const std::string& value, 
                                           uint64_t /*ver*/, bool ephemeral) {
@@ -81,7 +150,7 @@ public:
     }
 
     Status recover() override {
-        std::unique_lock<std::shared_mutex> lock(rw_mutex_);
+        std::lock_guard<std::recursive_mutex> lock(rw_mutex_);
         tree_.clear();
 
         if (!options_.enable_flash_persistence) return Status::Ok();
@@ -104,7 +173,7 @@ public:
         if (key.empty()) {
             return Status::InvalidArgument("Storage key cannot be empty");
         }
-        std::shared_lock<std::shared_mutex> lock(rw_mutex_);
+        std::lock_guard<std::recursive_mutex> lock(rw_mutex_);
         if (tree_.get(key, out_json, out_version)) {
             return Status::Ok();
         }
@@ -123,7 +192,7 @@ public:
         bool has_event = false;
 
         {
-            std::unique_lock<std::shared_mutex> lock(rw_mutex_);
+            std::lock_guard<std::recursive_mutex> lock(rw_mutex_);
 
             // OCC CAS check
             std::string existing_val;
@@ -146,16 +215,18 @@ public:
                 return Status::AlreadyExists();
             }
 
+            uint64_t new_ver = current_version_ + 1;
+            const std::string stored = inject_resource_version(json, new_ver);
+
             // Two-phase atomic write to LittleFS
             if (options_.enable_flash_persistence && persist_to_flash) {
-                if (!journal_.atomic_write(key, json)) {
+                if (!journal_.atomic_write(key, stored)) {
                     return Status::StorageFull("Failed writing to persistent flash journal");
                 }
             }
 
-            uint64_t new_ver = current_version_ + 1;
             bool is_new = false;
-            if (!tree_.put(key, json, new_ver, !persist_to_flash, overwrite, &is_new)) {
+            if (!tree_.put(key, stored, new_ver, !persist_to_flash, overwrite, &is_new)) {
                 return Status::InternalError("Failed inserting key into state store index");
             }
             current_version_ = new_ver;
@@ -166,7 +237,7 @@ public:
             if (!pending_callbacks.empty()) {
                 pending_event = WatchEvent{
                     is_new ? WatchEventType::Added : WatchEventType::Modified, 
-                    key, json, new_ver
+                    key, stored, new_ver
                 };
                 has_event = true;
             }
@@ -180,20 +251,20 @@ public:
 
     Status list_extended(const std::string& prefix, std::vector<std::string>& out_jsons, 
                          std::vector<std::string>* out_keys) override {
-        std::shared_lock<std::shared_mutex> lock(rw_mutex_);
+        std::lock_guard<std::recursive_mutex> lock(rw_mutex_);
         tree_.list(prefix, out_jsons, out_keys);
         return Status::Ok();
     }
 
     uint32_t watch(const std::string& prefix, WatchCallback cb) override {
-        std::unique_lock<std::shared_mutex> lock(rw_mutex_);
+        std::lock_guard<std::recursive_mutex> lock(rw_mutex_);
         uint32_t id = ++next_watch_id_;
         watchers_.emplace_back(Watcher{id, prefix, std::move(cb)});
         return id;
     }
 
     void unwatch(uint32_t watch_id) override {
-        std::unique_lock<std::shared_mutex> lock(rw_mutex_);
+        std::lock_guard<std::recursive_mutex> lock(rw_mutex_);
         watchers_.erase(std::remove_if(watchers_.begin(), watchers_.end(),
             [watch_id](const Watcher& w) { return w.id == watch_id; }), watchers_.end());
     }
@@ -210,7 +281,7 @@ private:
     };
 
     StoreOptions options_;
-    mutable std::shared_mutex rw_mutex_;
+    mutable std::recursive_mutex rw_mutex_;
     RadixTree tree_;
     LittleFSJournal journal_;
     uint64_t current_version_{0};
@@ -219,6 +290,7 @@ private:
 
     static bool is_key_ephemeral(const std::string& key) {
         return key.find("/registry/leases/") != std::string::npos || 
+               key.find("/registry/events/") != std::string::npos ||
                key.find("/heartbeat") != std::string::npos ||
                key.find("/telemetry") != std::string::npos;
     }

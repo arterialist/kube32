@@ -61,7 +61,7 @@ struct KubeNode {
     std::string name;
     bool is_ready{true};
     std::string roles{"worker"};
-    uint64_t age_seconds{3600};
+    uint64_t age_seconds{~0ULL}; // AGE_UNKNOWN until creationTimestamp is known
     std::string version{"v1.33.0-kube32"};
     std::string internal_ip{"127.0.0.1"};
     std::string external_ip{"<none>"};
@@ -81,11 +81,13 @@ struct KubeNode {
 struct KubePod {
     std::string name;
     std::string namespace_name{"default"};
+    std::string uid;                       // metadata.uid as assigned by the API server
+    std::string deletion_timestamp;        // set while the pod is Terminating
     uint32_t ready_containers{1};
     uint32_t total_containers{1};
     std::string status{"Pending"}; // Running, Pending, CrashLoopBackOff
     uint32_t restart_count{0};
-    uint64_t age_seconds{300};
+    uint64_t age_seconds{~0ULL};
     std::string ip{"<none>"};
     std::string node_name{"<none>"};
 
@@ -96,7 +98,18 @@ struct KubePod {
     uint32_t i2c_request{0};
     uint32_t adc_request{0};
     std::map<std::string, std::string> node_selector;
+
+    // Workload image and runtime configuration (first container)
+    std::string container_name;              // first container's name (events, metrics)
+    std::string image;                       // e.g. "wasm://embedded/tessera-core:v1"
+    uint64_t memory_limit_bytes{0};          // resources.limits.memory, 0 when absent
+    std::vector<std::pair<std::string, std::string>> env; // container env name/value pairs
+    std::map<std::string, std::string> labels;
+    std::map<std::string, std::string> annotations;
 };
+
+// Parses a Kubernetes resource quantity ("1536Ki", "2Mi", "64K", "4096") into bytes.
+uint64_t parse_quantity(const std::string& value);
 
 struct KubeDeployment {
     std::string name;
@@ -105,11 +118,28 @@ struct KubeDeployment {
     uint32_t replicas{1};
     uint32_t updated_replicas{1};
     uint32_t available_replicas{1};
-    uint64_t age_seconds{600};
+    uint64_t age_seconds{~0ULL};
     std::string containers{"app"};
     std::string images{"wasm://app"};
     std::string selector{"app=test"};
 };
+
+// =============================================================================
+// Time and identity helpers shared by the API server, controllers and kubelet
+// =============================================================================
+
+// RFC 3339 UTC timestamp ("2026-10-28T09:12:33Z") from Unix milliseconds.
+std::string format_rfc3339(uint64_t unix_ms);
+// Current wall-clock time as RFC 3339, or "" while the platform clock is unset.
+std::string now_rfc3339();
+// Parses "YYYY-MM-DDTHH:MM:SS[.fff]Z" (and +00:00). Returns false on malformed input.
+bool parse_rfc3339(std::string_view text, uint64_t& out_unix_ms);
+// Seconds between a creationTimestamp and now. Returns UINT64_MAX when either
+// side is unknown (no wall clock, missing or malformed timestamp).
+uint64_t age_seconds_since(std::string_view rfc3339_timestamp);
+constexpr uint64_t AGE_UNKNOWN = ~0ULL;
+// RFC 4122 v4 layout from platform entropy; identifiers for metadata.uid.
+std::string generate_uid();
 
 // Converters from JSON AST to typed structs
 KubeNode parse_node_manifest(const std::string& json_str);

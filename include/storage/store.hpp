@@ -96,4 +96,8 @@ public:
 // Factory to create standard store instance
 std::unique_ptr<Store> create_radix_store(StoreOptions options = {});
 
+// Returns `json` with metadata.resourceVersion set to `version` (inserted when
+// absent). Exposed for tests; the radix store applies it on every put.
+std::string inject_resource_version(const std::string& json, uint64_t version);
+
 } // namespace kube32::storage

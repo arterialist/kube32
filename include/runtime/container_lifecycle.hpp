@@ -45,6 +45,7 @@ struct ContainerConfig {
     RestartPolicy restart_policy{RestartPolicy::Always};
     ProbeSpec liveness_probe;
     ProbeSpec readiness_probe;
+    std::vector<std::pair<std::string, std::string>> env; // exposed through k32_env_get
 };
 
 class ContainerLifecycleController {
@@ -75,6 +76,12 @@ public:
     // Synchronous function invocation helper
     int32_t call_function(const std::string& fn_name, const std::vector<int32_t>& args = {});
 
+    // Introspection used by the application ABI host
+    bool has_export(const char* fn_name) const;
+    uint8_t* guest_memory(size_t& out_size) const;
+    void* m3_runtime_handle() const { return m3_runtime_; }
+    const ContainerConfig& config() const { return config_; }
+
 private:
     static void worker_thread_entry(void* arg);
     void worker_thread_main();
@@ -86,7 +93,9 @@ private:
     mutable osal::Mutex mutex_;
     ContainerStatus status_;
     
-    std::vector<uint8_t> wasm_bytecode_;
+    std::vector<uint8_t> wasm_bytecode_;      // owned copy when the image is not memory mapped
+    const uint8_t* wasm_view_{nullptr};       // bytes the module was parsed from
+    size_t wasm_view_len_{0};
     std::atomic<bool> stop_requested_{false};
     std::atomic<bool> pause_requested_{false};
 

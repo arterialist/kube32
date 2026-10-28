@@ -23,7 +23,7 @@ struct ContainerStatus {
     uint32_t memory_used_bytes{0};   // Wasm linear memory currently mapped
     uint64_t bytecode_bytes{0};      // module bytes the controller keeps for restarts
     uint64_t stack_bytes{0};         // interpreter operand stack reserved for the module
-    uint64_t runtime_bytes{0};       // interpreter-side allocations wasm3 reports (0 when unknown)
+    uint64_t runtime_bytes{0};       // backing bytes of the module's memories as wasm3 accounts them (c_m3Limit_MemoryBytes)
     std::string exit_message;
     bool ready{false};
     uint64_t start_time_ms{0};

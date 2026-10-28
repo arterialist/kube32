@@ -55,6 +55,7 @@ void play_tone(uint32_t freq_hz, uint32_t duration_ms, uint8_t volume_pct = 20);
 // Keyboard matrix. Key presses queue up (16 deep); pods drain the queue.
 bool init_keyboard_scanner();
 int  keyboard_pop();          // ASCII code, or -1 when empty
+void keyboard_inject(char c);  // queue a key as if the matrix produced it (console K32_CMD:KEY)
 char get_last_key_pressed();
 
 } // namespace kube32::hal

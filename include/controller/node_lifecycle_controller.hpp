@@ -1,11 +1,13 @@
 #pragma once
 
 #include "storage/store.hpp"
+#include "api/event_recorder.hpp"
 #include "osal/thread.hpp"
 #include "osal/mutex.hpp"
 
 #include <string>
 #include <map>
+#include <set>
 #include <atomic>
 #include <memory>
 #include <cstdint>
@@ -51,6 +53,9 @@ private:
 
     mutable osal::Mutex lease_mutex_;
     std::map<std::string, uint64_t> last_lease_update_ms_;
+    std::set<std::string> not_ready_;      // nodes this controller marked NotReady
+    api::EventRecorder events_;
+    void record_node_event(const std::string& node_name, const char* reason, const std::string& message, bool warning);
 };
 
 } // namespace kube32::controller

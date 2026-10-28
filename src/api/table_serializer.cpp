@@ -3,13 +3,16 @@
 
 #include <cstdio>
 #include <cstring>
+#include <cctype>
 #include <sstream>
 
 namespace kube32::api {
 
 void TableSerializer::format_age(uint64_t duration_sec, char* out_buf, size_t out_buf_len) {
     if (out_buf_len == 0) return;
-    if (duration_sec < 60) {
+    if (duration_sec == models::AGE_UNKNOWN) {
+        snprintf(out_buf, out_buf_len, "<unknown>");
+    } else if (duration_sec < 60) {
         snprintf(out_buf, out_buf_len, "%llus", static_cast<unsigned long long>(duration_sec));
     } else if (duration_sec < 3600) {
         snprintf(out_buf, out_buf_len, "%llum", static_cast<unsigned long long>(duration_sec / 60));
@@ -331,7 +334,9 @@ bool TableSerializer::serialize_pods_list_from_json(ChunkedStreamWriter& writer,
                                                    const std::vector<std::string>& pod_jsons,
                                                    uint64_t resource_version) {
     if (!writer.send_headers("application/json")) return false;
-    if (!writer.write("{\"kind\":\"PodList\",\"apiVersion\":\"v1\",\"metadata\":{},\"items\":[")) return false;
+    if (!writer.write("{\"kind\":\"PodList\",\"apiVersion\":\"v1\",\"metadata\":{\"resourceVersion\":\"")) return false;
+    if (!writer.write_uint(resource_version)) return false;
+    if (!writer.write("\"},\"items\":[")) return false;
 
     for (size_t i = 0; i < pod_jsons.size(); ++i) {
         if (i > 0 && !writer.write(",")) return false;
@@ -347,7 +352,9 @@ bool TableSerializer::serialize_deployments_list_from_json(ChunkedStreamWriter& 
                                                           const std::vector<std::string>& deployment_jsons,
                                                           uint64_t resource_version) {
     if (!writer.send_headers("application/json")) return false;
-    if (!writer.write("{\"kind\":\"DeploymentList\",\"apiVersion\":\"apps/v1\",\"metadata\":{},\"items\":[")) return false;
+    if (!writer.write("{\"kind\":\"DeploymentList\",\"apiVersion\":\"apps/v1\",\"metadata\":{\"resourceVersion\":\"")) return false;
+    if (!writer.write_uint(resource_version)) return false;
+    if (!writer.write("\"},\"items\":[")) return false;
 
     for (size_t i = 0; i < deployment_jsons.size(); ++i) {
         if (i > 0 && !writer.write(",")) return false;
@@ -406,7 +413,8 @@ std::string TableSerializer::build_nodes_table_json(const std::vector<std::strin
 }
 
 std::string TableSerializer::build_pods_table_json(const std::vector<std::string>& pod_jsons, uint64_t resource_version) {
-    std::string clean = "{\"kind\":\"Table\",\"apiVersion\":\"meta.k8s.io/v1\",\"metadata\":{},\"columnDefinitions\":["
+    std::string clean = "{\"kind\":\"Table\",\"apiVersion\":\"meta.k8s.io/v1\",\"metadata\":{\"resourceVersion\":\"" +
+                        std::to_string(resource_version) + "\"},\"columnDefinitions\":["
                         "{\"name\":\"NAME\",\"type\":\"string\",\"priority\":0},"
                         "{\"name\":\"READY\",\"type\":\"string\",\"priority\":0},"
                         "{\"name\":\"STATUS\",\"type\":\"string\",\"priority\":0},"
@@ -436,7 +444,8 @@ std::string TableSerializer::build_pods_table_json(const std::vector<std::string
 }
 
 std::string TableSerializer::build_deployments_table_json(const std::vector<std::string>& deployment_jsons, uint64_t resource_version) {
-    std::string clean = "{\"kind\":\"Table\",\"apiVersion\":\"meta.k8s.io/v1\",\"metadata\":{},\"columnDefinitions\":["
+    std::string clean = "{\"kind\":\"Table\",\"apiVersion\":\"meta.k8s.io/v1\",\"metadata\":{\"resourceVersion\":\"" +
+                        std::to_string(resource_version) + "\"},\"columnDefinitions\":["
                         "{\"name\":\"NAME\",\"type\":\"string\",\"priority\":0},"
                         "{\"name\":\"READY\",\"type\":\"string\",\"priority\":0},"
                         "{\"name\":\"UP-TO-DATE\",\"type\":\"string\",\"priority\":0},"
@@ -477,7 +486,8 @@ std::string TableSerializer::build_nodes_list_json(const std::vector<std::string
 }
 
 std::string TableSerializer::build_pods_list_json(const std::vector<std::string>& pod_jsons, uint64_t resource_version) {
-    std::string out = "{\"kind\":\"PodList\",\"apiVersion\":\"v1\",\"metadata\":{},\"items\":[";
+    std::string out = "{\"kind\":\"PodList\",\"apiVersion\":\"v1\",\"metadata\":{\"resourceVersion\":\"" +
+                      std::to_string(resource_version) + "\"},\"items\":[";
     for (size_t i = 0; i < pod_jsons.size(); ++i) {
         if (i > 0) out += ",";
         out += pod_jsons[i];
@@ -487,10 +497,155 @@ std::string TableSerializer::build_pods_list_json(const std::vector<std::string>
 }
 
 std::string TableSerializer::build_deployments_list_json(const std::vector<std::string>& deployment_jsons, uint64_t resource_version) {
-    std::string out = "{\"kind\":\"DeploymentList\",\"apiVersion\":\"apps/v1\",\"metadata\":{},\"items\":[";
+    std::string out = "{\"kind\":\"DeploymentList\",\"apiVersion\":\"apps/v1\",\"metadata\":{\"resourceVersion\":\"" +
+                      std::to_string(resource_version) + "\"},\"items\":[";
     for (size_t i = 0; i < deployment_jsons.size(); ++i) {
         if (i > 0) out += ",";
         out += deployment_jsons[i];
+    }
+    out += "]}";
+    return out;
+}
+
+
+// =============================================================================
+// Generic Tables (Event, Namespace, Service, ConfigMap, Secret, Lease)
+// =============================================================================
+std::string TableSerializer::format_age(uint64_t duration_sec) {
+    char buf[16];
+    format_age(duration_sec, buf, sizeof(buf));
+    return buf;
+}
+
+static std::string json_cell(const std::string& v) {
+    std::string out = "\"";
+    for (char c : v) {
+        switch (c) {
+            case '"': out += "\\\""; break;
+            case '\\': out += "\\\\"; break;
+            case '\n': out += "\\n"; break;
+            case '\r': out += "\\r"; break;
+            case '\t': out += "\\t"; break;
+            default:
+                if (static_cast<unsigned char>(c) < 0x20) { char b[8]; snprintf(b, sizeof(b), "\\u%04x", static_cast<unsigned char>(c)); out += b; }
+                else out += c;
+        }
+    }
+    out += "\"";
+    return out;
+}
+
+static std::string col(const char* name, int priority) {
+    return std::string("{\"name\":\"") + name + "\",\"type\":\"string\",\"priority\":" + std::to_string(priority) + "}";
+}
+
+bool TableSerializer::has_generic_table(std::string_view kind) {
+    return kind == "Event" || kind == "Namespace" || kind == "Service" || kind == "ConfigMap" || kind == "Secret" || kind == "Lease";
+}
+
+std::string TableSerializer::build_generic_table_json(std::string_view kind, const std::vector<std::string>& jsons, uint64_t resource_version) {
+    std::string out = "{\"kind\":\"Table\",\"apiVersion\":\"meta.k8s.io/v1\",\"metadata\":{\"resourceVersion\":\"" +
+                      std::to_string(resource_version) + "\"},\"columnDefinitions\":[";
+    if (kind == "Event") {
+        out += col("LAST SEEN", 0) + "," + col("TYPE", 0) + "," + col("REASON", 0) + "," + col("OBJECT", 0) + "," +
+               col("SUBOBJECT", 1) + "," + col("SOURCE", 1) + "," + col("MESSAGE", 0) + "," + col("FIRST SEEN", 1) + "," +
+               col("COUNT", 1) + "," + col("NAME", 1);
+    } else if (kind == "Namespace") {
+        out += col("NAME", 0) + "," + col("STATUS", 0) + "," + col("AGE", 0);
+    } else if (kind == "Service") {
+        out += col("NAME", 0) + "," + col("TYPE", 0) + "," + col("CLUSTER-IP", 0) + "," + col("EXTERNAL-IP", 0) + "," +
+               col("PORT(S)", 0) + "," + col("AGE", 0) + "," + col("SELECTOR", 1);
+    } else if (kind == "ConfigMap") {
+        out += col("NAME", 0) + "," + col("DATA", 0) + "," + col("AGE", 0);
+    } else if (kind == "Secret") {
+        out += col("NAME", 0) + "," + col("TYPE", 0) + "," + col("DATA", 0) + "," + col("AGE", 0);
+    } else if (kind == "Lease") {
+        out += col("NAME", 0) + "," + col("HOLDER", 0) + "," + col("AGE", 0);
+    } else {
+        out += col("NAME", 0) + "," + col("AGE", 0);
+    }
+    out += "],\"rows\":[";
+
+    for (size_t i = 0; i < jsons.size(); ++i) {
+        models::JsonValue doc;
+        std::string err;
+        if (!models::parse_json(jsons[i], doc, err) || !doc.is_object()) continue;
+        if (i > 0) out += ",";
+        const models::JsonValue* meta = doc.get("metadata");
+        std::string name = meta ? meta->get_string("name", "") : "";
+        std::string ns = meta ? meta->get_string("namespace", "") : "";
+        std::string age = format_age(models::age_seconds_since(meta ? meta->get_string("creationTimestamp", "") : ""));
+        std::vector<std::string> cells;
+
+        if (kind == "Event") {
+            const models::JsonValue* inv = doc.get("involvedObject");
+            const models::JsonValue* src = doc.get("source");
+            std::string last = doc.get_string("lastTimestamp", doc.get_string("eventTime", ""));
+            std::string first = doc.get_string("firstTimestamp", last);
+            std::string object = inv ? (inv->get_string("kind", "") + "/" + inv->get_string("name", "")) : "";
+            std::string kind_lower = object;
+            for (auto& c : kind_lower) { if (c == '/') break; c = static_cast<char>(std::tolower(static_cast<unsigned char>(c))); }
+            std::string source = doc.get_string("reportingComponent", src ? src->get_string("component", "") : "");
+            std::string host = doc.get_string("reportingInstance", src ? src->get_string("host", "") : "");
+            if (!host.empty()) source += ", " + host;
+            cells = {format_age(models::age_seconds_since(last)), doc.get_string("type", ""), doc.get_string("reason", ""), kind_lower,
+                     inv ? inv->get_string("fieldPath", "") : "", source, doc.get_string("message", ""),
+                     format_age(models::age_seconds_since(first)), std::to_string(doc.get_int("count", 1)), name};
+        } else if (kind == "Namespace") {
+            const models::JsonValue* st = doc.get("status");
+            cells = {name, st ? st->get_string("phase", "") : "", age};
+        } else if (kind == "Service") {
+            const models::JsonValue* spec = doc.get("spec");
+            std::string type = spec ? spec->get_string("type", "ClusterIP") : "ClusterIP";
+            std::string cluster_ip = spec ? spec->get_string("clusterIP", "") : "";
+            if (cluster_ip.empty()) cluster_ip = "<none>";
+            std::string ports;
+            std::string selector;
+            if (spec) {
+                const models::JsonValue* pl = spec->get("ports");
+                if (pl && pl->is_array()) {
+                    for (const auto& p : pl->arr_val) {
+                        if (!ports.empty()) ports += ",";
+                        ports += std::to_string(p.get_int("port", 0));
+                        int64_t np = p.get_int("nodePort", 0);
+                        if (np) ports += ":" + std::to_string(np);
+                        ports += "/" + p.get_string("protocol", "TCP");
+                    }
+                }
+                const models::JsonValue* sel = spec->get("selector");
+                if (sel && sel->is_object()) {
+                    for (const auto& kv : sel->obj_val) {
+                        if (!selector.empty()) selector += ",";
+                        selector += kv.first + "=" + (kv.second.is_string() ? kv.second.str_val : "");
+                    }
+                }
+            }
+            cells = {name, type, cluster_ip, "<none>", ports.empty() ? "<none>" : ports, age, selector.empty() ? "<none>" : selector};
+        } else if (kind == "ConfigMap" || kind == "Secret") {
+            size_t n = 0;
+            const models::JsonValue* data = doc.get("data");
+            if (data && data->is_object()) n += data->obj_val.size();
+            const models::JsonValue* bdata = doc.get("binaryData");
+            if (bdata && bdata->is_object()) n += bdata->obj_val.size();
+            const models::JsonValue* sdata = doc.get("stringData");
+            if (sdata && sdata->is_object()) n += sdata->obj_val.size();
+            if (kind == "Secret") cells = {name, doc.get_string("type", "Opaque"), std::to_string(n), age};
+            else cells = {name, std::to_string(n), age};
+        } else if (kind == "Lease") {
+            const models::JsonValue* spec = doc.get("spec");
+            cells = {name, spec ? spec->get_string("holderIdentity", "") : "", age};
+        } else {
+            cells = {name, age};
+        }
+
+        out += "{\"cells\":[";
+        for (size_t c = 0; c < cells.size(); ++c) {
+            if (c) out += ",";
+            out += json_cell(cells[c]);
+        }
+        out += "],\"object\":{\"kind\":\"PartialObjectMetadata\",\"apiVersion\":\"meta.k8s.io/v1\",\"metadata\":{\"name\":" + json_cell(name);
+        if (!ns.empty()) out += ",\"namespace\":" + json_cell(ns);
+        out += "}}}";
     }
     out += "]}";
     return out;
