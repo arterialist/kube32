@@ -53,6 +53,7 @@ bool MetricsRegistry::ingest(const std::string& json, std::string& err) {
                             cu.name = c.get_string("name", ps.name);
                             if (c.get("cpu_nanocores")) { cu.has_cpu = true; cu.cpu_nanocores = static_cast<uint64_t>(c.get_int("cpu_nanocores", 0)); }
                             if (c.get("memory_bytes")) { cu.has_memory = true; cu.memory_bytes = static_cast<uint64_t>(c.get_int("memory_bytes", 0)); }
+                            if (c.get("psram_bytes")) { cu.has_psram = true; cu.psram_bytes = static_cast<uint64_t>(c.get_int("psram_bytes", 0)); }
                             ps.containers.push_back(std::move(cu));
                         }
                     }
@@ -122,11 +123,15 @@ std::string MetricsRegistry::quantity_memory(uint64_t bytes) {
     return std::to_string(bytes);
 }
 
-static void append_usage(std::string& out, bool has_cpu, uint64_t cpu, bool has_mem, uint64_t mem) {
+static void append_usage(std::string& out, bool has_cpu, uint64_t cpu, bool has_mem, uint64_t mem, bool has_psram = false, uint64_t psram = 0) {
     out += "\"usage\":{";
     bool first = true;
     if (has_cpu) { out += "\"cpu\":\"" + MetricsRegistry::quantity_cpu(cpu) + "\""; first = false; }
-    if (has_mem) { if (!first) out += ","; out += "\"memory\":\"" + MetricsRegistry::quantity_memory(mem) + "\""; }
+    if (has_mem) { if (!first) out += ","; out += "\"memory\":\"" + MetricsRegistry::quantity_memory(mem) + "\""; first = false; }
+    // Extra resource name in the usage map: kubectl top ignores it, k9s and
+    // the ingress telemetry can read it, and "memory" keeps the meaning of the
+    // pod's memory request (internal SRAM).
+    if (has_psram) { if (!first) out += ","; out += "\"esp32.io/psram\":\"" + MetricsRegistry::quantity_memory(psram) + "\""; }
     out += "}";
 }
 
@@ -158,7 +163,8 @@ std::string MetricsRegistry::pod_metrics_json(const PodUsageSample& s) {
     for (size_t i = 0; i < s.containers.size(); ++i) {
         if (i) out += ",";
         out += "{\"name\":\"" + s.containers[i].name + "\",";
-        append_usage(out, s.containers[i].has_cpu, s.containers[i].cpu_nanocores, s.containers[i].has_memory, s.containers[i].memory_bytes);
+        append_usage(out, s.containers[i].has_cpu, s.containers[i].cpu_nanocores, s.containers[i].has_memory, s.containers[i].memory_bytes,
+                     s.containers[i].has_psram, s.containers[i].psram_bytes);
         out += "}";
     }
     out += "]}";

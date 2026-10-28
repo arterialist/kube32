@@ -1,4 +1,5 @@
 #include "kubelet/metrics_provider.hpp"
+#include "runtime/pod_memory_pool.h"
 #include "runtime/app_pod.hpp"
 #include "osal/system.hpp"
 #include "osal/thread.hpp"
@@ -30,8 +31,22 @@ bool sample_pod_from_runtime(const std::string& pod_key, runtime::Runtime& rt, P
     if (st.phase == runtime::ContainerPhase::Terminated && st.exit_message == "Pod not found") return false;
     out = PodResourceSample{};
     if (st.memory_used_bytes > 0) {
+        // Linear memory comes from the pod pool, which is PSRAM on boards that
+        // have it; the interpreter's own allocations follow the same policy
+        // (kube32_rt_calloc). Bytecode is parsed in place from flash.
+        int pool_external = 0;
+        kube32_pool_available(&pool_external);
+        bool external = pool_external != 0;
+        uint64_t linear = static_cast<uint64_t>(st.memory_used_bytes);
+        uint64_t runtime_part = st.stack_bytes + st.runtime_bytes;
         out.has_memory = true;
-        out.memory_bytes = static_cast<uint64_t>(st.memory_used_bytes) + st.bytecode_bytes + st.stack_bytes;
+        out.has_psram = external;
+        if (external) {
+            out.psram_bytes = linear + runtime_part;
+            out.memory_bytes = 0;
+        } else {
+            out.memory_bytes = linear + runtime_part;
+        }
     }
     uint64_t task_us = 0;
     if (s_pod_cpu_sampler && s_pod_cpu_sampler(pod_key, task_us)) {

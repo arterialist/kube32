@@ -318,6 +318,10 @@ static const void* raw_key_read(IM3Runtime rt, IM3ImportContext ictx, uint64_t* 
         return m3Err_none;
     }
     int32_t key = s_hooks.key_read ? s_hooks.key_read() : hal::HAL_ERR_NODEV;
+    {
+        static int raw_traced = 0;   // first few results whatever they are, to see which hook answers
+        if (raw_traced < 3) { raw_traced++; printf("[TRACE] key_read hook=%s result=%d\n", s_hooks.key_read ? "set" : "none", (int)key); }
+    }
     if (key >= 0) {
         static int traced = 0;
         if (traced < 8) { traced++; printf("[TRACE] key_read -> %d ('%c') for %s\n", (int)key, (key >= 32 && key < 127) ? (char)key : '.', pod_id.c_str()); }

@@ -42,19 +42,30 @@ firmware = "$FIRMWARE"
 
 print(f"[*] Connecting to ESP32-S3 on {port} at {baud} baud...")
 
-# Ensure robust serial transmission across USB-UART bridges (e.g. CH340 / USB-CDC)
+# CH340-style USB-UART bridges (VID 0x1a86) drop bytes with esptool's default
+# block size; they get 256-byte paced blocks. Native USB-Serial/JTAG ports
+# flash the 1.9 MB image in well under a minute with the defaults.
 esptool.loader.DEFAULT_TIMEOUT = 30.0
-esptool.loader.ESPLoader.ESP_RAM_BLOCK = 256
-esptool.loader.StubMixin.FLASH_WRITE_SIZE = 256
-esptool.loader.ESPLoader.FLASH_WRITE_SIZE = 256
 esptool.loader.WRITE_BLOCK_ATTEMPTS = 5
-
-orig_flash_block = esptool.loader.ESPLoader.flash_block
-def paced_flash_block(self, data, seq, timeout=20.0, encrypted=False):
-    res = orig_flash_block(self, data, seq, timeout=20.0, encrypted=encrypted)
-    time.sleep(0.0015)
-    return res
-esptool.loader.ESPLoader.flash_block = paced_flash_block
+bridge = False
+try:
+    import serial.tools.list_ports
+    for p in serial.tools.list_ports.comports():
+        if p.device == port and p.vid == 0x1A86:
+            bridge = True
+except Exception:
+    pass
+if bridge:
+    print("[*] USB-UART bridge detected: 256-byte paced blocks")
+    esptool.loader.ESPLoader.ESP_RAM_BLOCK = 256
+    esptool.loader.StubMixin.FLASH_WRITE_SIZE = 256
+    esptool.loader.ESPLoader.FLASH_WRITE_SIZE = 256
+    orig_flash_block = esptool.loader.ESPLoader.flash_block
+    def paced_flash_block(self, data, seq, timeout=20.0, encrypted=False):
+        res = orig_flash_block(self, data, seq, timeout=20.0, encrypted=encrypted)
+        time.sleep(0.0015)
+        return res
+    esptool.loader.ESPLoader.flash_block = paced_flash_block
 
 sys.argv = [
     'esptool.py',

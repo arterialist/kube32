@@ -1982,6 +1982,9 @@ HttpResponse RouteHandler::handle_watch(const HttpRequest& req, const RouteMatch
     if (query_uint(req.query_string, "resourceVersion", v)) spec.since_version = v;
     if (query_uint(req.query_string, "timeoutSeconds", v)) spec.timeout_s = static_cast<uint32_t>(v);
     spec.bookmarks = query_flag(req.query_string, "allowWatchBookmarks");
+    spec.send_initial_events = query_flag(req.query_string, "sendInitialEvents");
+    // resourceVersionMatch=NotOlderThan without a resourceVersion asks for the
+    // current state: same as no resourceVersion at all.
 
     std::string content_type = "application/json";
     if (events_v1 && !req.as_table) {

@@ -577,11 +577,15 @@ uint8_t CapabilityFirewall::get_allocated_uart_mask() const {
 }
 
 void CapabilityFirewall::log_violation(const std::string& pod_id, PeripheralType type, uint32_t target, AccessMode mode) {
-    // In production or host sim, we can log to debug/console
-    (void)pod_id;
-    (void)type;
-    (void)target;
-    (void)mode;
+    // A denied hardware access is a real event worth seeing on the console;
+    // bounded so a misbehaving pod cannot flood it.
+    static int logged = 0;
+    if (logged >= 16) return;
+    logged++;
+    static const char* const names[] = {"gpio", "adc", "i2c", "uart", "ipc", "display", "keyboard", "speaker"};   // PeripheralType order
+    unsigned ti = static_cast<unsigned>(type);
+    std::cout << "[FIREWALL] denied " << pod_id << ": " << (ti < sizeof(names) / sizeof(names[0]) ? names[ti] : "peripheral")
+              << " " << target << " " << (mode == AccessMode::Write ? "write" : "read") << std::endl;
 }
 
 } // namespace kube32::hal

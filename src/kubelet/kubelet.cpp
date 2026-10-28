@@ -584,6 +584,7 @@ void Kubelet::push_metrics_sample() {
             if (ps.has_memory) {
                 if (!cu.empty()) cu += ",";
                 cu += "\"memory_bytes\":" + std::to_string(ps.memory_bytes);
+                if (ps.has_psram) cu += ",\"psram_bytes\":" + std::to_string(ps.psram_bytes);
             }
             if (!first) body += ",";
             first = false;

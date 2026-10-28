@@ -36,8 +36,13 @@ struct NodeResourceSample {
 };
 
 struct PodResourceSample {
+    // memory_bytes counts what the node's "memory" resource governs (internal
+    // SRAM); psram_bytes is the pod's footprint in external RAM, the resource
+    // esp32.io/psram. A pod's 1.3 MB data set on a PSRAM board is psram, not memory.
     bool has_memory{false};
-    uint64_t memory_bytes{0};        // linear memory + bytecode + interpreter stack
+    uint64_t memory_bytes{0};
+    bool has_psram{false};
+    uint64_t psram_bytes{0};
     bool has_cpu{false};
     uint64_t cpu_busy_us{0};         // cumulative interpreter time
 };

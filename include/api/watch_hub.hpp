@@ -45,6 +45,7 @@ struct WatchSpec {
     ListSelector selector;
     uint64_t since_version{0};        // 0: send ADDED for every existing object first
     bool bookmarks{false};
+    bool send_initial_events{false};  // WatchList protocol: end the initial list with an annotated BOOKMARK
     uint32_t timeout_s{0};            // 0: hub default
     // Optional transform applied to every object before framing (Table rows).
     std::function<std::string(const std::string& object_json)> wrap;
@@ -107,6 +108,7 @@ private:
     void run();
     void on_store_event(const storage::WatchEvent& ev);
     bool prime(Stream& s);
+    bool send_initial_events_end(Stream& s);
     bool flush(Stream& s, std::vector<EventPtr>& batch);
     bool send_frame(Stream& s, const std::string& payload);
     bool send_watch_event(Stream& s, const char* type, const std::string& object_json);

@@ -36,6 +36,8 @@ public:
     void end() override;
     int status() const { return status_; }
     size_t bytes() const { return bytes_; }
+    uint32_t socket_us() const { return socket_us_; }   // time spent inside socket writes
+    uint32_t flushes() const { return flushes_; }
 private:
     bool flush_head();
     bool flush_buffer();
@@ -46,6 +48,8 @@ private:
     bool head_sent_{false};
     bool ended_{false};
     size_t bytes_{0};
+    uint32_t socket_us_{0};
+    uint32_t flushes_{0};
     // Four full segments per write: a sub-MSS write per chunk left lwIP's
     // Nagle logic waiting one delayed-ACK round trip per 1400 bytes.
     static constexpr size_t kChunk = 5760;

@@ -185,7 +185,7 @@ bool WatchHub::prime(Stream& s) {
             if (!send_watch_event(s, "ADDED", jsons[i])) return false;
             osal::Thread::yield();
         }
-        return true;
+        return !s.watch.send_initial_events || send_initial_events_end(s);
     }
     std::vector<EventPtr> history;
     bool expired = false;
@@ -210,7 +210,17 @@ bool WatchHub::prime(Stream& s) {
                          : (e->type == storage::WatchEventType::Deleted) ? "DELETED" : "MODIFIED";
         if (!send_watch_event(s, type, e->json)) return false;
     }
-    return true;
+    return !s.watch.send_initial_events || send_initial_events_end(s);
+}
+
+// WatchList (sendInitialEvents=true): client-go treats the stream as its LIST
+// and waits for a BOOKMARK carrying the initial-events-end annotation before
+// it considers the cache synced. k9s uses this for every view.
+bool WatchHub::send_initial_events_end(Stream& s) {
+    std::string obj = "{\"kind\":\"" + s.watch.kind + "\",\"apiVersion\":\"" + s.watch.api_version +
+                      "\",\"metadata\":{\"resourceVersion\":\"" + std::to_string(store_.current_version()) +
+                      "\",\"annotations\":{\"k8s.io/initial-events-end\":\"true\"}}}";
+    return send_frame(s, frame("BOOKMARK", obj));
 }
 
 bool WatchHub::flush(Stream& s, std::vector<EventPtr>& batch) {

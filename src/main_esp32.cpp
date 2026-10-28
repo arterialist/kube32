@@ -299,6 +299,12 @@ void console_task(void* arg) {
                 con.write("K32_OK profile stored, rebooting\n", 33);
                 vTaskDelay(pdMS_TO_TICKS(200));
                 esp_restart();
+            } else if (line == "K32_CMD:KEYPOP") {
+                // Pops one key from the matrix queue on the host side (bypasses pods)
+                int k = kube32::hal::keyboard_pop();
+                char l[48];
+                int ll = snprintf(l, sizeof(l), "K32_OK keypop=%d\n", k);
+                con.write(l, static_cast<size_t>(ll));
             } else if (line == "K32_CMD:TASKS") {
                 // FreeRTOS task table: state, priority, core, stack high-water mark,
                 // cumulative run time (run-time statistics are enabled in sdkconfig).

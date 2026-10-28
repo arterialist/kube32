@@ -34,7 +34,10 @@ bool HttpAppSink::flush_head() {
 
 bool HttpAppSink::flush_buffer() {
     if (buf_len_ == 0) return true;
+    uint64_t t0 = osal::Thread::get_time_us();
     bool ok = conn_.write_chunk(buf_, buf_len_);
+    socket_us_ += static_cast<uint32_t>(osal::Thread::get_time_us() - t0);
+    flushes_++;
     buf_len_ = 0;
     return ok;
 }
@@ -348,7 +351,20 @@ bool Ingress::serve_api(api::HttpConnection& conn) {
         areq.forwarded_for = req.client_ip;
         areq.body = req.body;
         HttpAppSink sink(conn);
+        uint64_t t_call = osal::Thread::get_time_us();
         int32_t rc = runtime::AppPodHost::instance().handle(cfg_.core_namespace + "/" + cfg_.core_pod, areq, sink);
+        {
+            // Where a large response spends its time: inside the guest or in
+            // socket writes made on its behalf. Bounded diagnostic.
+            static int logged = 0;
+            uint32_t total_us = static_cast<uint32_t>(osal::Thread::get_time_us() - t_call);
+            if (sink.bytes() >= 16384 && logged < 20) {
+                logged++;
+                printf("[INGRESS] %.*s: %u bytes in %u ms, %u ms of it in %u socket writes\n",
+                       (int)areq.path_and_query.size(), areq.path_and_query.data(), (unsigned)sink.bytes(),
+                       (unsigned)(total_us / 1000), (unsigned)(sink.socket_us() / 1000), (unsigned)sink.flushes());
+            }
+        }
         if (rc < 0 && !conn.responded()) {
             return conn.send_simple(502, "application/json", "{\"error\":\"pod_failure\"}");
         }

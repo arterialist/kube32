@@ -21,6 +21,8 @@ struct ContainerUsage {
     uint64_t cpu_nanocores{0};
     bool has_memory{false};
     uint64_t memory_bytes{0};
+    bool has_psram{false};           // external RAM footprint, reported as esp32.io/psram
+    uint64_t psram_bytes{0};
 };
 
 struct NodeUsageSample {
