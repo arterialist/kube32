@@ -47,3 +47,7 @@ CONFIG_FATFS_LFN_HEAP=y
 CONFIG_FATFS_MAX_LFN=255
 
 CONFIG_LWIP_MAX_ACTIVE_TCP=32
+
+# FatFs sizes its buffers by max(SD sector, wear-levelling sector); no internal
+# flash FAT is used, so keep both at 512 bytes (saves ~24 KB with an SD card)
+CONFIG_WL_SECTOR_SIZE_512=y

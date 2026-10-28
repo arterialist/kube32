@@ -73,7 +73,7 @@ sys.argv = [
     '--chip', 'esp32s3',
     '-b', str(baud),
     '--before', os.environ.get('KUBE32_FLASH_BEFORE', 'default-reset'),   # no-reset when the board is already in download mode
-    '--after', 'hard-reset',
+    '--after', os.environ.get('KUBE32_FLASH_AFTER', 'hard-reset' if bridge else 'watchdog-reset'),   # USB-JTAG reset can leave the chip in download mode
     'write-flash',
     '-u',
     '--flash-mode', 'dio',

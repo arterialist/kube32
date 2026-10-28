@@ -58,6 +58,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "driver/usb_serial_jtag.h"
+#include "driver/usb_serial_jtag_vfs.h"
 #include "driver/uart.h"
 #include "driver/uart_vfs.h"
 
@@ -146,6 +147,11 @@ struct Console {
             usb_serial_jtag_driver_config_t cfg = { .tx_buffer_size = 4096, .rx_buffer_size = 4096 };
             usb_serial_jtag_driver_install(&cfg);
         }
+        // Once the driver owns the USB-JTAG FIFO, printf/ESP_LOG must go through
+        // it too. Left on the default path they write the FIFO directly, race
+        // the driver's interrupt handler, and the port stops answering until
+        // the board is power cycled.
+        usb_serial_jtag_vfs_use_driver();
         uart_enabled = !usb_only;
         if (uart_enabled) {
             if (!uart_is_driver_installed(UART_NUM_0)) {
@@ -547,7 +553,10 @@ void cluster_task(void* pv) {
     }
     // microSD slot of the display board: its own SPI bus (SPI3), FAT at /sd
     if (ident.has_display) {
-        if (kube32::hal::sd_mount()) {
+        const size_t sd_heap_before = heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+        bool sd_ok = kube32::hal::sd_mount();
+        printf("[SD] mount cost %d bytes of internal RAM\n", (int)((long)sd_heap_before - (long)heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT)));
+        if (sd_ok) {
             kube32::hal::SdInfo si = kube32::hal::sd_info();
             printf("[SD] %s %s mounted at /sd: %llu MB total, %llu MB free, SPI3 %u kHz\n", si.type.c_str(), si.name.c_str(),
                    (unsigned long long)(si.total_bytes / (1024 * 1024)), (unsigned long long)(si.free_bytes / (1024 * 1024)), (unsigned)si.bus_khz);
@@ -731,7 +740,7 @@ void cluster_task(void* pv) {
         aw.run_ingress = true;
         aw.ingress_port = 80;
         aw.ingress_workers = ident.has_psram ? 2 : 1;
-        aw.ingress_worker_stack = ident.has_psram ? 98304 : 8192;   // local pod calls run the interpreter here
+        aw.ingress_worker_stack = ident.has_psram ? 65536 : 8192;   // local pod calls run the interpreter here (same depth as the kubelet's k32_init)
         aw.ingress_rx_buffer = ident.has_psram ? 4096 : 2560;
         // The ingress calls a local request-handling pod directly; the pod
         // HTTP server only matters on worker nodes that host such pods. Not
@@ -760,7 +769,9 @@ void cluster_task(void* pv) {
         aw.local_node_name = ident.name;
         // Pods with a card volume are worth reaching over HTTP (GET /log on
         // sdnote): one 12 KB worker when a card is mounted on a no-PSRAM board.
-        aw.run_pod_server = ident.has_psram || kube32::hal::sd_is_mounted();
+        // Boards without PSRAM cannot spare 16 KB for a pod HTTP server next to
+        // the HUD; request-handling pods belong on PSRAM nodes.
+        aw.run_pod_server = ident.has_psram;
         aw.pod_port = 7000;
         aw.pod_workers = ident.has_psram ? 2 : 1;
         aw.pod_worker_stack = ident.has_psram ? 24576 : 12288;
@@ -828,10 +839,16 @@ void cluster_task(void* pv) {
                              (unsigned)(heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT) / 1024), (unsigned)(now / 1000));
             kube32::ipc::ChannelManager::instance().publish("ingress", "tessera.events", reinterpret_cast<const uint8_t*>(ev), static_cast<size_t>(l));
             if (iter % 2 == 0 && wiring->ingress()->sse().count() > 0) {
-                wiring->ingress()->sse().broadcast("cluster", wiring->ingress()->build_cluster_json());
+                // Telemetry is best effort: an allocation failure skips one update
+                // instead of aborting the node
+                try {
+                    wiring->ingress()->sse().broadcast("cluster", wiring->ingress()->build_cluster_json());
+                } catch (const std::exception& e) {
+                    printf("[INGRESS] telemetry skipped: %s\n", e.what());
+                }
             }
         }
-        if (ident.is_control_plane && store && iter % 10 == 0) {
+        if (ident.is_control_plane && store && iter % 10 == 0) try {
             // Workers register their InternalIP; seed them as UDP peers so the
             // channel fabric works across access points, not only over ESP-NOW.
             std::vector<std::string> nodes;
@@ -849,6 +866,8 @@ void cluster_task(void* pv) {
                     if (a.get_string("type", "") == "InternalIP") kube32::ipc::ChannelManager::instance().add_seed_peer(a.get_string("address", ""), 7400);
                 }
             }
+        } catch (const std::exception& e) {
+            printf("[IPC] peer seeding skipped: %s\n", e.what());
         }
         if (iter % 30 == 0) log_memory("steady state");
         kube32::osal::System::feed_watchdog();

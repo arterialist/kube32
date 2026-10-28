@@ -577,6 +577,14 @@ std::string Ingress::build_cluster_json() {
     if (cfg_.store) {
         std::vector<std::string> nodes;
         cfg_.store->list("/registry/nodes/", nodes);
+        // Pods are listed and parsed once, not once per node
+        std::vector<models::KubePod> all_pods;
+        {
+            std::vector<std::string> pod_jsons;
+            cfg_.store->list("/registry/pods/", pod_jsons);
+            all_pods.reserve(pod_jsons.size());
+            for (const auto& pj : pod_jsons) all_pods.push_back(models::parse_pod_manifest(pj));
+        }
         for (const auto& nj : nodes) {
             models::JsonValue doc;
             std::string err;
@@ -620,11 +628,8 @@ std::string Ingress::build_cluster_json() {
             if (node_telemetry_) out += node_telemetry_(name);
             // Pods on this node
             out += ",\"pods\":[";
-            std::vector<std::string> pods;
-            cfg_.store->list("/registry/pods/", pods);
             bool pf = true;
-            for (const auto& pj : pods) {
-                models::KubePod p = models::parse_pod_manifest(pj);
+            for (const auto& p : all_pods) {
                 if (p.node_name != name) continue;
                 if (!pf) out += ",";
                 pf = false;
