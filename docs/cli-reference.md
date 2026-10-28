@@ -1,123 +1,91 @@
-# CLI reference
+# Tools
 
-<div class="blueprint-card">
-  <strong>Command</strong>: <code>cli/kube32-cli</code><br>
-  <strong>Connection modes</strong>: Direct silicon serial (<code>--port</code>) and HTTP REST (<code>--server</code>).<br>
-  <strong>Manifest format</strong>: Standard Kubernetes YAML and JSON manifests.
-</div>
+The cluster itself is driven with `kubectl` (and k9s). The tools below cover
+the parts kubectl does not: building and shipping Wasm pods, reaching a board
+over USB, and measuring an app.
 
-`kube32-cli` is the command-line utility for managing Kube32 clusters. It supports two connection modes:
+| Tool | Purpose |
+| --- | --- |
+| `tools/kube32-cli` | build, check, deploy, embed and `sd-push` Wasm pods |
+| `tools/kube32_serial_gateway.py` | reach a board's HTTP servers over its USB serial port |
+| `tools/tessera_loadtest.py` | latency percentiles against a running Tessera ingress |
+| `tools/embed_assets.py`, `tools/pio_embed.py` | generate the firmware's embedded image and asset tables (run by the builds) |
+| `scripts/flash.sh` | flash one board ([Flashing](flashing-troubleshooting.md)) |
 
-1. **Direct silicon serial mode (`--port`)**: Sends requests across USB serial lines directly to the ESP32-S3 control plane (`/dev/ttyACM...` or `/dev/cu.usbmodem...`). This mode works without disconnecting your computer from its regular Wi-Fi network.
-2. **HTTP REST mode (`--server`)**: Sends standard HTTP requests to port 6443 over the `Kube32-Cluster` Wi-Fi network.
+## kube32-cli
 
----
+Python 3, standard library only. [Writing app pods](app-development.md) walks
+through every subcommand with real output; this is the summary from
+`tools/kube32-cli --help`:
 
-## Global options
+| Command | What it does |
+| --- | --- |
+| `build <dir>` | compile a C, Rust or AssemblyScript app directory to `.wasm` and check it |
+| `check <file>` | validate a `.wasm` against the app ABI and the opcode set of this wasm3 build (`--memory` adds a size limit) |
+| `deploy <file>` | create a Pod that carries the module in the `kube32.io/wasm-base64` annotation, through `kubectl create`; no reflash |
+| `embed <file>` | copy a checked module into `images/` so the next firmware build embeds it |
+| `sd-push <file> --to <mount point>` | copy a checked module onto a microSD card as `kube32/images/<name>.wasm` |
 
-| Option | Short | Default | Purpose |
-| :--- | :--- | :--- | :--- |
-| `--port` | `-p` | None | Serial device path (such as `/dev/ttyACM0` or `/dev/cu.usbmodem1`) |
-| `--server` | | `http://192.168.4.1:6443` | API server HTTP address |
-| `--help` | `-h` | | Show help text and exit |
+Exit codes:
 
----
+| Code | Meaning |
+| --- | --- |
+| 0 | ok |
+| 1 | input or toolchain problem |
+| 2 | usage |
+| 3 | the ABI check failed |
+| 4 | kubectl failed |
+| 5 | `deploy` found the pod already there; pass `--replace` |
 
-## Commands
+`deploy` uses the current kubectl context unless `--context`, `--kubeconfig`
+or `--server` is given. It still passes `--validate=false` to kubectl. Since
+the server started publishing an OpenAPI index, that flag is no longer
+needed, and it does no harm.
 
-### `status`
-Queries cluster state, listing registered nodes, health statuses, free memory, and active pods:
+The test suite is `python3 -m unittest discover -s tools/tests -v`, 62 tests.
 
-```bash
-./cli/kube32-cli --port /dev/ttyACM0 status
+## kube32_serial_gateway.py
+
+Needs `pyserial`. It listens on local ports and relays each HTTP request to a
+board through the console's `K32_HTTP` framing:
+
+```
+python3 tools/kube32_serial_gateway.py [--port <serial port>] [--map <local>:<device>]...
 ```
 
-Output:
+- **Port.** Without `--port` it uses `KUBE32_SERIAL_PORT`, then the first
+  native USB-Serial/JTAG port, then a CH340 port.
+- **Mappings.** The defaults are `6443:6443` (API) and `8080:80` (ingress).
+- **Through a worker.** A worker forwards relayed requests to the control
+  plane, so any board can be the one on USB.
+
+It relays one request at a time and returns a response only once the board
+has closed the connection. Watches, `kubectl logs -f` and k9s do not work
+through it. The protocol is described under
+[HTTP over the console](flashing-troubleshooting.md#http-over-the-console).
+
+## tessera_loadtest.py
+
+Runs concurrent clients against a Tessera ingress for a fixed time. It then
+prints latency percentiles, throughput and errors per endpoint, all from
+real requests:
+
 ```
-Connecting to Kube32 cluster at /dev/ttyACM0...
-
-=== CLUSTER NODES ===
-NAME             STATUS     ROLES          INTERNAL-IP      ALLOCATABLE-MEM
-------------------------------------------------------------------------
-esp32-node-01    Ready      control-plane  192.168.4.1      400Ki
-esp32-node-02    Ready      worker         192.168.4.2      2048Ki
-
-=== CLUSTER PODS ===
-NAMESPACE    NAME                     NODE             STATUS       MEMORY
-------------------------------------------------------------------------
-default      audio-preprocessor       esp32-node-01    Running      48Ki
-default      keyword-classifier       esp32-node-02    Running      64Ki
-```
-
----
-
-### `apply`
-Submits a declarative workload manifest to the cluster:
-
-```bash
-./cli/kube32-cli --port /dev/ttyACM0 apply -f examples/distributed-pipeline.yaml
+python3 tools/tessera_loadtest.py http://<control-plane-address> --clients 4 --seconds 60 [--no-keepalive]
 ```
 
-Output:
-```
-pod/audio-preprocessor applied successfully -> scheduled to esp32-node-01 (HTTP 201)
-pod/keyword-classifier applied successfully -> scheduled to esp32-node-02 (HTTP 201)
-```
+The request mix is weighted towards lists and the board view. One of its
+endpoints, `GET /api/issues/TES-42`, predates the current seed data: the
+project keys are now `WEB`, `IOS` and `API`, so that request answers 404 and
+is counted as an error. Keep that in mind when reading its error column.
 
----
+## Embedding assets
 
-### `delete`
-Removes a pod from the cluster, freeing its memory and releasing hardware pins:
+`tools/embed_assets.py` turns `images/*.wasm` and `images/web/<app>/*.gz`
+into tables the image registry and the ingress serve:
 
-```bash
-./cli/kube32-cli --port /dev/ttyACM0 delete gpio-blinker --namespace default
-```
-
-Output:
-```
-pod "gpio-blinker" deleted
-```
-
----
-
-### `pipeline`
-Triggers an over-the-air ESP-NOW transmission from Stage 1 on Node 1 to Stage 2 on Node 2:
-
-```bash
-./cli/kube32-cli --port /dev/ttyACM0 pipeline
-```
-
-Output:
-```
-Triggering Stage 1 over-the-air ESP-NOW transmission on /dev/ttyACM0...
-  Node 1: PIPELINE-OTA-TX: Transmitting Stage 1 MFCC features (52 bytes) over ESP-NOW to Node 2 (24:dc:c3:45:67:02)...
-  Node 1: PIPELINE-OTA-TX: ESP-NOW transmission result: 0 (0 = OK)
-```
-
----
-
-### `package`
-Encodes a compiled WebAssembly binary into a base64-embedded Kubernetes Pod manifest:
-
-```bash
-./cli/kube32-cli package build/blinker.wasm \
-  --name gpio-blinker \
-  --memory 32Ki \
-  --capabilities GPIO_WRITE \
-  -o manifests/blinker-pod.yaml
-```
-
----
-
-### `version`
-Displays version information for the CLI and API server:
-
-```bash
-./cli/kube32-cli version
-```
-
-Output:
-```
-Kube32 CLI v1.0.0-m6 (Target: ESP32-S3 Xtensa dual-core at 240 MHz)
-API compliance: Kubernetes Core v1 and Apps v1
-```
+- **Host build.** CMake runs it with `--host-out`, which writes byte arrays
+  into `build/generated/`.
+- **Firmware build.** PlatformIO runs it through `tools/pio_embed.py` with
+  `--esp`, which writes `src/embedded/embedded_blobs_esp.cpp` and the file
+  list the ESP-IDF component embeds.

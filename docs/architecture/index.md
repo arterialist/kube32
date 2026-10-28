@@ -1,106 +1,140 @@
 # Architecture overview
 
-<div class="blueprint-card">
-  <strong>Design pattern</strong>: Distributed micro-kernel orchestrator for dual-core MCUs.<br>
-  <strong>Concurrency</strong>: FreeRTOS SMP with pinned tasks on Xtensa LX7.<br>
-  <strong>Inter-node networking</strong>: 802.11 SoftAP for TCP/IP and ESP-NOW for low-latency messaging.
-</div>
+Kube32 is one C++17 code base built two ways:
 
-Kube32 implements the Kubernetes separation between control plane and worker agent directly on dual-core microcontrollers, without Linux or container daemons.
+- **Firmware.** `pio run -e esp32s3` builds it for the ESP32-S3 on ESP-IDF
+  5.5.3 and FreeRTOS. `src/main_esp32.cpp` is the entry point.
+- **Host simulator.** CMake builds it for macOS or Linux on POSIX threads and
+  sockets. `src/main_host.cpp` is the entry point.
 
----
-
-## Dual-core task partitioning
-
-The ESP32-S3 contains two Xtensa LX7 cores running at 240 MHz. FreeRTOS can schedule tasks across both cores, but Wi-Fi packet processing and serial interrupts require consistent latency. Kube32 pins networking, cluster state storage, and scheduling to Core 0. Core 1 runs the worker agent, guest WebAssembly bytecode, and peripheral access audits.
+Everything else under `src/` is shared. The OS abstraction in `src/osal/`
+wraps threads, mutexes, timers and sockets for both targets.
 
 ```mermaid
-graph TB
-    subgraph Core0["Xtensa LX7 Core 0: Network and control plane"]
-        WIFI_DRIVER["ESP32 Wi-Fi driver task (priority 23)"]
-        HTTP_SRV["k32_http: API server on port 6443 (stack: 12 KB)"]
-        SCHED["k32_sched: Scheduler (stack: 8 KB)"]
-        NLC["k32_nlc: Node lifecycle controller (stack: 4 KB)"]
-        RADIX["Radix state store (internal SRAM)"]
-
-        HTTP_SRV <--> RADIX
-        SCHED <--> RADIX
-        NLC <--> RADIX
+flowchart TB
+    subgraph CP["Control plane (board with PSRAM)"]
+        API["API server :6443<br/>src/api"]
+        STORE["Object store<br/>src/storage"]
+        SCHED["Scheduler<br/>src/scheduler"]
+        NLC["Node lifecycle controller"]
+        DEP["Deployment controller"]
+        KL1["Kubelet"]
+        RT1["wasm3 runtime + app ABI"]
+        ING["Ingress :80<br/>src/app"]
+        API --- STORE
+        SCHED --- STORE
+        NLC --- STORE
+        DEP --- STORE
+        KL1 -->|HTTP 127.0.0.1:6443| API
+        KL1 --> RT1
+        ING --> RT1
     end
-
-    subgraph Core1["Xtensa LX7 Core 1: Worker agent and runtime"]
-        KUBELET["k32_kubelet: Worker agent (stack: 8 KB)"]
-        WASM_VM["Wasm3 interpreter (stack: 16 KB)"]
-        FIREWALL["Capability firewall for GPIO and ADC"]
-        IPC_RX["ESP-NOW frame handler ring buffer"]
-
-        KUBELET --> WASM_VM
-        WASM_VM --> FIREWALL
-        IPC_RX --> WASM_VM
+    subgraph WK["Worker (board without PSRAM)"]
+        KL2["Kubelet"]
+        RT2["wasm3 runtime + app ABI"]
+        FW["Capability firewall"]
+        HW["Display, keypad, speaker, microSD"]
+        KL2 --> RT2
+        RT2 --> FW --> HW
     end
-
-    RADIX <-->|"FreeRTOS queues and spinlocks"| KUBELET
-    WIFI_DRIVER <-->|"ESP-NOW radio frames"| IPC_RX
+    KL2 -->|HTTP :6443 over Wi-Fi| API
+    RT1 <-->|"events: ESP-NOW and UDP :7400"| RT2
 ```
 
-### Core 0 subsystems
+## Boot sequence on a board
 
-- **Wi-Fi driver**: Handles the 802.11 physical layer, generates SoftAP beacons, and routes inbound IP frames.
-- **HTTP API server (`k32_http`)**: Accepts TCP connections on port 6443. Parses Kubernetes REST requests and routes them to the radix store. Uses a 12 KB task stack.
-- **Scheduler (`k32_sched`)**: Evaluates unassigned pods every 1,000 ms. Disqualifies nodes that lack requested memory or hardware pins, then scores candidate nodes by available memory. Uses an 8 KB task stack.
-- **Node lifecycle controller (`k32_nlc`)**: Monitors worker heartbeats. Marks a node as `NotReady` if heartbeats stop for 15 seconds, and begins pod eviction after 30 seconds. Uses a 4 KB task stack.
+`app_main` initialises NVS and starts the `k32_cluster` task, which does the
+following in order (`cluster_task` in `src/main_esp32.cpp`):
 
-### Core 1 subsystems
+1. **Identity.** A board with PSRAM is the control plane (`esp32-node-01`);
+   any other board is a worker (`esp32-node-02`). The NVS key `role`
+   (`K32_CMD:ROLE:`) overrides this. The NVS key `board` = `cardputer`
+   enables the display, keypad, speaker and microSD hooks. The boot banner
+   prints the MAC address, but the MAC plays no part in choosing the role.
+2. **Memory reservations**, made while the heap is still unfragmented:
+   - Without PSRAM: 67 KiB of internal RAM for one 64 KiB pod, a 40 KiB pod
+     thread stack, and 1 KiB log rings.
+   - With PSRAM: a 1,340 KiB PSRAM block for one large pod (the Tessera
+     core's 1,280 KiB linear memory plus headers).
+3. **Peripherals** of the Cardputer profile: the ST7789 display, the I2S
+   speaker, the key-matrix scanner and the microSD card. The boot log prints
+   one `[SD]` line with the card's figures and what the mount cost in RAM.
+4. **Wi-Fi.** With credentials stored by `K32_CMD:WIFI:` the board joins that
+   network as a station. A control plane also runs the `Kube32-Cluster`
+   access point unless `K32_CMD:AP:off` is stored. Without credentials the
+   control plane runs the access point only, and a worker tries to join it.
+   SNTP sets the wall clock when there is an uplink. Until the first sync, API
+   timestamps are left out rather than invented.
+5. **Channels**: ESP-NOW plus UDP port 7400, with HELLO peer discovery every
+   3 s. See [Events between nodes](espnow-ipc.md).
+6. **Image registry.** The Wasm images compiled into the firmware are
+   registered from `images/*.wasm`.
+7. **Role services.**
+   - On the control plane: the object store, the node lifecycle controller,
+     the scheduler, the Deployment controller, the API server on port 6443, a
+     local kubelet that talks to `127.0.0.1:6443`, and the ingress on port 80.
+   - On a worker: the kubelet, pointed at the address stored by
+     `K32_CMD:API:` (default `192.168.4.1`, the access point's address).
+8. **Console, ticks and housekeeping.** The console task starts, then a tick
+   thread that calls `k32_tick` on every pod once a second, or every 10 ms
+   while a pod reports pending work. A housekeeping loop:
+   - publishes a stats event every second;
+   - pushes cluster telemetry to browsers every 2 s;
+   - seeds UDP peers from node addresses every 10 s;
+   - logs memory every 30 s.
 
-- **Worker agent (`k32_kubelet`)**: Checks for newly scheduled pods assigned to this node, initializes sandboxes, and reports execution state back to the control plane. Uses an 8 KB task stack.
-- **Wasm3 interpreter**: Executes guest WebAssembly modules inside a memory sandbox bounded between 32 KB and 64 KB. Uses a 16 KB task stack.
-- **Capability firewall**: Intercepts guest host calls such as `esp32_gpio_write` and `esp32_adc_read`. Checks each call against permissions granted in the pod manifest.
-- **ESP-NOW frame handler**: Inspects incoming radio frames, verifies CRC16 checksums, and pushes payloads into container ring buffers.
+`K32_CMD:TASKS` prints the live task table with stack high-water marks. Use it
+rather than any stack figure written in a document; the sizes are tuned often.
 
----
+## Creating a pod, end to end
 
-## State synchronization flow
+1. `kubectl apply` sends the Pod to the API server. The server stamps `uid`,
+   `creationTimestamp` and `resourceVersion` and stores the object under
+   `/registry/pods/<ns>/<name>`. If `spec.nodeName` is empty, the scheduler
+   binds the pod at once; the scheduler's loop (every 3 s on the boards) picks
+   up anything left unbound.
+2. Every 2 s the kubelet on each node lists the pods bound to it. For a new
+   pod it:
+   - resolves the image (microSD card, then the embedded registry, then the
+     `kube32.io/wasm-base64` annotation);
+   - admits the pod through the capability firewall;
+   - loads and links the module in wasm3, and runs `k32_init`;
+   - either registers the pod as a request handler or starts its entry point
+     on a thread.
+3. The kubelet patches the pod's status (`Running`, `Failed` with a reason, or
+   `Succeeded` when an entry point returns). It records events, ships the
+   pod's log ring and sends metrics with its 5 s heartbeat.
+4. If the pod disappears from the API, the kubelet stops it. Changes to the
+   manifest of a pod that is already running are not applied.
 
-When a client creates a pod, the control plane persists the manifest and schedules it to a qualified node. The worker node pulls the pod definition and starts the WebAssembly container.
+## Serving an app
 
-```mermaid
-sequenceDiagram
-    autonumber
-    participant Dev as Client (kube32-cli or kubectl)
-    participant API as API server on port 6443
-    participant Store as Radix state store
-    participant Sched as Scheduler
-    participant Kube as Worker agent (Node 2)
-    participant Wasm as Wasm3 sandbox
+The ingress on the control plane, port 80 (`src/app/ingress.cpp`), routes
+requests as follows:
 
-    Dev->>API: POST /api/v1/namespaces/default/pods
-    API->>Store: Put /registry/pods/default/app (Phase: Pending)
-    API-->>Dev: HTTP 201 Created
-    
-    loop Every 1000 ms
-        Sched->>Store: List /registry/pods/
-        Sched->>Store: Evaluate nodes by available memory
-        Sched->>Store: Bind pod to esp32-node-02
-    end
+| Path | Handling |
+| --- | --- |
+| `/` and other asset paths | gzip-compressed assets embedded from `images/web/<app>/`; a client that does not accept gzip gets 406 |
+| `/api/*` | forwarded to the app's core pod. A pod on the same node is called directly through `k32_handle`. A pod on another node is proxied to that node's pod HTTP server on port 7000, which boards start only when they have PSRAM |
+| `/events` | server-sent events: everything published on `<app>.events`, plus cluster telemetry |
+| `/api/cluster` | the ingress's own JSON summary of nodes and pods |
+| `/healthz` | `ok` |
 
-    loop Every 2000 ms
-        Kube->>API: GET /api/v1/pods
-        API-->>Kube: Pod assigned to esp32-node-02
-    end
+On the boards the app name is fixed to `tessera`, with core pod
+`tessera-core`, in `src/main_esp32.cpp`. The simulator takes `--app` and
+`--core-pod`.
 
-    Kube->>Wasm: Instantiate module (memory limit: 64 KB)
-    Kube->>Store: Patch pod status (Phase: Running)
-    Wasm->>Wasm: Run container entrypoint
-```
+## Host simulator differences
 
----
-
-## Task memory and stack limits
-
-| Task name | Core affinity | Stack size | Priority | Purpose |
-| :--- | :--- | :--- | :--- | :--- |
-| `k32_http` | Core 0 | 12 KB | 5 | Kubernetes REST API server |
-| `k32_sched` | Core 0 | 8 KB | 4 | Pod scheduling and node scoring |
-| `k32_nlc` | Core 0 | 4 KB | 3 | Node health and lease monitoring |
-| `k32_kubelet` | Core 1 | 8 KB | 4 | Pod synchronization and container supervision |
-| `wifi` | Core 0 | 6.5 KB | 23 | Espressif 802.11 PHY driver |
+- `--role standalone` (the default) runs the API server, the controllers and
+  two kubelets (`esp32-node-01`, `esp32-node-02`) in one process. The two
+  Node objects are seeded with declared capacity and version strings.
+- Pods are ticked once a second, never every 10 ms.
+- Channels use UDP only, on port 7400 plus the node ID.
+- Display, keypad and speaker calls print to the log, and `k32_key_read`
+  finds no keys.
+- `--enable-flash --data-dir <dir>` persists the object store to one JSON file
+  per key and recovers it at start. The boards do not persist the store.
+- Worker processes (`--role worker`) find the API server through `--join
+  <url>`, or through a plain-text UDP discovery exchange on port 5354. That
+  exchange is not mDNS, and the firmware does not use it.

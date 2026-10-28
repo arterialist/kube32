@@ -20,8 +20,9 @@ same behaviour over a directory so the tests exercise the same code.
 | Formatting | never; a card without a FAT filesystem is reported, not formatted |
 
 The card is mounted at boot on boards with the `cardputer` profile
-(`K32_CMD:BOARD:cardputer`), right after the display. The boot log carries
-one line with measured figures:
+(`K32_CMD:BOARD:cardputer`), right after the display. Since commit `f54968a`
+the boot log first prints `[SD] mount cost <n> bytes of internal RAM`, then
+one line with the card's figures:
 
 ```
 [SD] SDHC/SDXC SD32G mounted at /sd: 30436 MB total, 30412 MB free, SPI3 20000 kHz
@@ -96,9 +97,11 @@ Started   Started container sdnote
 ### Manifest shape
 
 A pod gets a directory on the card when it requests the resource and names a
-volume claim. Two volume spellings are accepted; the `persistentVolumeClaim`
-one passes `kubectl` schema validation, the `kube32.io/sd` one is the
-explicit form:
+volume claim. Two volume spellings are accepted, `persistentVolumeClaim` and
+the explicit `kube32.io/sd`. Both go through a plain `kubectl apply`: the API
+server checks only top-level and `metadata` fields, so the non-standard
+volume key is not rejected. Both spellings were applied on the host
+simulator for this page:
 
 ```yaml
 spec:
@@ -174,12 +177,15 @@ make -C apps/sdnote                      # -> images/sd/sdnote.wasm (not embedde
 cp images/sd/sdnote.wasm /Volumes/<card>/kube32/images/sdnote.wasm   # mkdir -p kube32/images first
 kubectl --context kube32 apply -f examples/sdnote.yaml
 kubectl --context kube32 logs sdnote     # sdnote: appended to boot.log, bytes=29
-curl -H 'X-Kube32-Pod: default/sdnote' http://<cardputer ip>:7000/log
 ```
 
-On a board without PSRAM the pod HTTP server (port 7000, one worker with a
-12 KB stack) is started only when a card is mounted, so pods with volumes
-can be reached. `X-Kube32-Pod` selects the pod when several handle requests.
+`GET /log` cannot be reached on the Cardputer. Since commit `f54968a`,
+boards without PSRAM no longer start the pod HTTP server on port 7000: its
+16 KB could not be spared next to the HUD pod. The log line above and
+`K32_CMD:SD`, which lists `boot.log` with its size, show what the pod
+wrote. On the host simulator the pod HTTP server runs; there,
+`X-Kube32-Pod: default/sdnote` selects the pod when several handle
+requests.
 
 ## Host simulator
 
@@ -204,7 +210,6 @@ Steady-state cost with the card mounted, from the allocations involved
 | FATFS volume object (512-byte window) | about 0.6 KB |
 | VFS FAT context with 4 `FIL` slots (512-byte cache each) | about 2.6 KB |
 | SPI3 bus DMA descriptors | about 0.3 KB |
-| pod HTTP server: 1 worker stack + 4 KB receive buffer | about 16 KB |
 | per pod: fd table | 40 bytes |
 | image pull: the module itself, once, for its lifetime | file size |
 | transient per `k32_fs_*` call: LFN buffer on the heap | 0.5 KB |

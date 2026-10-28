@@ -1,106 +1,55 @@
-# Radix state store
+# Object store
 
-<div class="blueprint-card">
-  <strong>Component</strong>: <code>kube32::storage::RadixTreeStore</code><br>
-  <strong>Lookup complexity</strong>: O(k) prefix tree walk where k is key length.<br>
-  <strong>Memory footprint</strong>: In-memory SRAM storage with arena-allocated query serialization.
-</div>
+The control plane keeps every API object in an in-memory radix tree
+(`src/storage/radix_tree.cpp`, behind the `Store` interface in
+`include/storage/store.hpp`). It plays the role etcd plays in Kubernetes, at
+a much smaller scale: one process, no replication, no consensus.
 
-Standard Kubernetes clusters store object manifests in etcd. Operating etcd requires disk storage, distributed consensus over Raft, and dozens of megabytes of memory. Microcontrollers have only a few hundred kilobytes of internal SRAM, and writing repeatedly to SPI flash wears out flash blocks quickly.
+## Keys
 
-Kube32 replaces etcd with an embedded radix tree kept in SRAM. Object keys follow standard Kubernetes API paths. Tree lookups take time proportional to key length rather than cluster size, and range queries for namespaces or resource types match naturally along tree branches.
+Objects are stored as JSON strings under etcd-style keys. The kinds that have
+their own handlers use these keys:
 
----
+| Kind | Key |
+| --- | --- |
+| Node | `/registry/nodes/<name>` |
+| Pod | `/registry/pods/<namespace>/<name>` |
+| Deployment | `/registry/deployments/<namespace>/<name>` |
+| Lease | `/registry/leases/<namespace>/<name>` |
 
-## Prefix key hierarchy
+Namespaces, Services, ConfigMaps, Secrets, DaemonSets, Jobs and Events
+follow the same pattern; `resource_info` in `src/api/route_handler.cpp` lists
+them. A list request is a prefix scan, for example `/registry/pods/default/`.
+Prefix scans walk only the matching branch of the tree.
 
-Objects are stored under hierarchical prefixes matching the Kubernetes REST resource model:
+## Versions
 
-```mermaid
-graph TD
-    ROOT["/registry"]
-    NODES["/nodes"]
-    PODS["/pods"]
-    LEASES["/leases"]
-    DEPLOYS["/deployments"]
+Each write increments a store-wide revision. The object's `resourceVersion`
+carries it, and watches use it to replay recent events. `put` can take an
+expected version and fail on a mismatch. The API server's PUT path does not
+pass one, so concurrent updates through the API are last-writer-wins.
 
-    ROOT --> NODES
-    ROOT --> PODS
-    ROOT --> LEASES
-    ROOT --> DEPLOYS
+## Persistence
 
-    N1["/esp32-node-01"]
-    N2["/esp32-node-02"]
-    NODES --> N1
-    NODES --> N2
+| Target | Behaviour |
+| --- | --- |
+| Boards | Not persisted. `src/main_esp32.cpp` sets `enable_flash_persistence = false`. Nothing mounts the `storage` partition in `partitions.csv`. |
+| Simulator | Persisted with `--enable-flash --data-dir <dir>`: one `<key>.json` file per object, written to a temporary file, fsynced and renamed. `recover()` reloads the directory at start. Leases and events are not written. |
 
-    P_DEF["/default"]
-    P_SYS["/kube-system"]
-    PODS --> P_DEF
-    PODS --> P_SYS
+The class that writes those files is called `LittleFSJournal`, but it uses
+plain POSIX file calls. It is not LittleFS, and there is no checksum,
+snapshot or append-only log.
 
-    P1["/gpio-blinker"]
-    P2["/keyword-classifier"]
-    P_DEF --> P1
-    P_DEF --> P2
-```
+What a control-plane reboot on a board does, as the code stands:
 
-### Key mapping format
+1. Every object is lost, including the Tessera pods.
+2. The workers fail two heartbeats and register again.
+3. On their next sync they see no pods bound to them, and they stop the pods
+   they were running.
+4. Nothing recreates the workloads; apply the manifests again.
 
-- **Nodes**: `/registry/nodes/{node_name}`
-- **Pods**: `/registry/pods/{namespace}/{pod_name}`
-- **Leases**: `/registry/leases/{namespace}/{lease_name}`
-- **Deployments**: `/registry/deployments/{namespace}/{deploy_name}`
+## Concurrency
 
----
-
-## Memory arena for queries
-
-When a client queries all pods in a cluster, typical JSON serializers make dozens of small heap allocations. On FreeRTOS, repeatedly allocating and freeing small heap blocks fragments internal SRAM. Over time, memory fragmentation causes allocation failures even when total free memory appears adequate.
-
-To prevent fragmentation on read paths, Kube32 serializes query responses using a bump-allocated memory arena:
-
-```cpp
-// Preallocated 32 KB scratch buffer on Core 0
-std::vector<uint8_t> arena_buf(32768);
-kube32::mem::MonotonicArena arena(arena_buf.data(), arena_buf.size());
-
-std::vector<std::string> pod_records;
-store.list("/registry/pods/default/", pod_records);
-
-// Build Kubernetes Table format directly within the arena
-TableSerializer::serialize_pods_table(arena, pod_records);
-
-// Reset pointer to zero in O(1) time
-arena.reset();
-```
-
-### Memory allocation behavior
-
-| Metric | Typical JSON parser | Kube32 Radix store and arena |
-| :--- | :--- | :--- |
-| Allocations to read one pod | 12 heap allocations (`malloc`) | 0 heap allocations (bump pointer) |
-| Allocations to list 20 pods | ~240 heap allocations | 1 scratch buffer slice |
-| Lookup latency | O(log N) disk seek | O(K) memory traversal (under 5 microseconds) |
-| Heap fragmentation risk | High | Zero (arena resets in place) |
-
----
-
-## Concurrency and locking
-
-The radix store handles concurrent access across FreeRTOS tasks on both Xtensa cores using a mutex lock:
-
-```cpp
-class RadixTreeStore : public Store {
-public:
-    Status put(std::string_view key, std::string_view value, bool create_only = false) override;
-    Status get(std::string_view key, std::string& out_value) const override;
-    Status remove(std::string_view key) override;
-    Status list(std::string_view prefix, std::vector<std::string>& out_values) const override;
-private:
-    mutable osal::Mutex mutex_;
-    RadixNode* root_{nullptr};
-};
-```
-
-Tasks release the lock before streaming responses over sockets or serial ports. This keeps lock hold times short and prevents the HTTP server from stalling the scheduler loop.
+One mutex guards the tree. The API server copies what it needs out of the
+store and releases the lock before it serializes and streams a response, so
+a slow client does not hold up the scheduler or the controllers.

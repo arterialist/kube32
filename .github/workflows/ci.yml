@@ -1,0 +1,103 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  RUST_TOOLCHAIN: "1.96.0"
+
+jobs:
+  host:
+    name: Host simulator and unit tests (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-15]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Configure
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+      - name: Build
+        run: cmake --build build --parallel 4
+      - name: Test
+        # A per-test timeout turns a hang into a failure instead of a stalled job.
+        run: ctest --test-dir build --output-on-failure --timeout 300 --parallel 4
+
+  tessera-core:
+    name: Tessera core native tests
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install clang
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends clang
+      - name: make test
+        run: make -C apps/tessera/core test
+
+  kube32-cli:
+    name: kube32-cli tests
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+      # The build tests compile C with clang for wasm32 and link with rust-lld;
+      # without these tools they skip themselves instead of running.
+      - name: Install clang
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends clang
+      - name: Install Rust ${{ env.RUST_TOOLCHAIN }} with the wasm32 target
+        run: |
+          rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal --target wasm32-unknown-unknown
+          rustup default "$RUST_TOOLCHAIN"
+      - name: unittest
+        run: python3 -m unittest discover -s tools/tests -v
+
+  rust-sdk:
+    name: Rust SDK (wasm32-unknown-unknown)
+    runs-on: ubuntu-24.04
+    defaults:
+      run:
+        working-directory: sdk/rust
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install Rust ${{ env.RUST_TOOLCHAIN }} with the wasm32 target
+        run: |
+          rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal --target wasm32-unknown-unknown
+          rustup default "$RUST_TOOLCHAIN"
+      - name: Build the SDK and the example pods
+        run: cargo build --release --target wasm32-unknown-unknown --locked
+      - name: SDK unit tests (host target)
+        run: cargo test -p kube32-sdk --locked
+      - name: Check the example modules against the runtime ABI
+        run: |
+          for m in target/wasm32-unknown-unknown/release/*.wasm; do
+            python3 ../../tools/kube32-cli check "$m"
+          done
+
+  firmware:
+    name: Firmware (PlatformIO, esp32s3)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.platformio
+          key: platformio-${{ runner.os }}-${{ hashFiles('platformio.ini') }}
+      - name: Install PlatformIO
+        run: pip install platformio==6.1.18
+      - name: pio run -e esp32s3
+        run: pio run -e esp32s3

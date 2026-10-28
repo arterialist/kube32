@@ -1,3 +1,12 @@
+# A pod no node can take: it requests 4000Ki of heap memory on esp32-node-01,
+# more than any ESP32-S3 has. The scheduler leaves it Pending and records a
+# FailedScheduling event:
+#
+#   kubectl apply -f examples/oversized-pod.yaml
+#   kubectl get events --field-selector involvedObject.name=oversized-pod
+#
+# The image is the small echo pod embedded in the firmware; it is never pulled
+# because the pod is never bound to a node.
 apiVersion: v1
 kind: Pod
 metadata:
@@ -8,7 +17,7 @@ spec:
     kubernetes.io/hostname: esp32-node-01
   containers:
     - name: greedy-worker
-      image: wasm://untrusted/greedy:v1
+      image: wasm://embedded/echo:v1
       resources:
         requests:
           memory: 4000Ki

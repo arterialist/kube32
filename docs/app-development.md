@@ -67,7 +67,7 @@ links (`src/runtime/app_pod.cpp`, `src/runtime/host_functions.cpp`);
 | `k32_tone` | `i(iii)` | `hardware.kube32.io/speaker` |
 | `k32_fs_open/read/write/close/size/list/remove` | `i(iii)`, `i(iii)`, `i(iii)`, `i(i)`, `i(i)`, `i(iiii)`, `i(ii)` | `hardware.kube32.io/sd` and a volume claim ([microSD card](sd-card.md)) |
 | `esp32_delay_ms` | `v(i)` | nothing |
-| `esp32_gpio_*`, `esp32_adc_read`, `esp32_i2c_*`, `esp32_uart_*` | see `host_functions.cpp` | `esp32.io/*` resources ([GPIO peripheral firewall](workloads/gpio-blinker.md)) |
+| `esp32_gpio_*`, `esp32_adc_read`, `esp32_i2c_*`, `esp32_uart_*` | see `host_functions.cpp` | `esp32.io/*` resources ([GPIO and other peripherals](workloads/gpio-blinker.md)) |
 
 Every import is linked into every module; a module only lists the ones it
 calls, and that list says which manifest resources it needs.
@@ -280,9 +280,12 @@ print to the node log, and `key_read` always finds the queue empty:
 ```
 
 `kubectl logs` then shows `blink: done` and
-`[kube32] entrypoint returned, container completed`. `kubectl get pod` still
-reported the pod `Running` after that; the kubelet does not report the
-completion.
+`[kube32] entrypoint returned, container completed`. Since commit `ff03c3b`
+the kubelet then reports the pod `Succeeded`. A one-line C `app_main` that
+returned 0 was shown by `kubectl get pod` as `0/1 Completed`, with a
+`Completed` event saying `exited with code 0`. The return value is not read,
+though: the same module returning 3 got the same status and the same event.
+Completed pods are not restarted.
 
 ---
 
@@ -588,10 +591,12 @@ Details that matter:
   module included, into the `kubectl.kubernetes.io/last-applied-configuration`
   annotation: the stored pod for the counter was 19,755 bytes with `apply` and
   10,393 bytes with `create`.
-* **`--validate=false`.** The Kube32 API server publishes no OpenAPI schema
-  (`/openapi/v3` is an empty index, `/openapi/v2` is absent), so kubectl's
-  client-side validation fails with `the server could not find the requested
-  resource`. The same applies to hand-written manifests applied with kubectl.
+* **`--validate=false`.** `kube32-cli` still passes it. It dates from when
+  the server published no OpenAPI index. Since commit `f737ab6` the server
+  publishes one, and plain `kubectl apply` and `kubectl create` work: the
+  server rejects unknown top-level and `metadata` fields and does not check
+  nested ones ([Kubernetes API coverage](api-reference.md#kubectl-and-k9s)).
+  The flag is harmless and hand-written manifests do not need it.
 * **A running pod is not updated in place.** The kubelet deploys a pod the
   first time it sees it and ignores later changes to its manifest
   (`Kubelet::sync_assigned_pods` only compares pod names), so `deploy` stops
@@ -840,7 +845,7 @@ pod's `k32_log` lines.
 | Symptom | Cause |
 | --- | --- |
 | `kube32-cli check`: `unknown import env.<name>` | a misspelt import (C links with `--allow-undefined`, so typos become imports), or a runtime helper such as AssemblyScript's `abort` |
-| `error validating data: the server could not find the requested resource` from kubectl | client-side validation; pass `--validate=false` |
+| `strict decoding error: unknown field "..."` from kubectl | a misspelt top-level or `metadata` field in the manifest |
 | pod `Pending`, `FailedScheduling ... insufficient heap memory or peripheral resources` | the node's free heap is taken by other pods' `requests.memory` |
 | `503 {"error":"unavailable","message":"no request-handling pod on this node"}` | the pod named in `X-Kube32-Pod` is not on this node or exports no `k32_handle` |
 | `500 {"error":"pod_failure","message":"workload produced no response"}` | `k32_handle` returned (or trapped) before `k32_resp_begin` |

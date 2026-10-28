@@ -6,7 +6,7 @@ Runs N concurrent HTTP clients against the ingress for a fixed duration and
 reports measured latency percentiles, throughput and error counts per
 endpoint. Nothing here is simulated: every number comes from a real request.
 
-    tools/tessera_loadtest.py http://192.0.2.119 --clients 4 --seconds 60
+    tools/tessera_loadtest.py http://<control-plane-address> --clients 4 --seconds 60
 
 Endpoints are weighted roughly like a browser session: lists and board views
 dominate, writes are rare, search and analytics sit in between.
@@ -113,7 +113,7 @@ class Client(threading.Thread):
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("base", help="ingress base URL, e.g. http://192.0.2.119")
+    ap.add_argument("base", help="ingress base URL, e.g. http://<control-plane-address>")
     ap.add_argument("--clients", type=int, default=4)
     ap.add_argument("--seconds", type=int, default=60)
     ap.add_argument("--no-keepalive", action="store_true", help="open a new TCP connection per request")

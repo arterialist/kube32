@@ -1,115 +1,78 @@
-# Hardware specifications
+# Hardware
 
-<div class="blueprint-card">
-  <strong>Processor</strong>: Espressif ESP32-S3 dual-core Xtensa LX7 running at 240 MHz.<br>
-  <strong>Memory architecture</strong>: 384 KB ROM, 512 KB internal SRAM, optional external Quad/Octal SPI PSRAM.<br>
-  <strong>Radios</strong>: 2.4 GHz Wi-Fi (802.11 b/g/n) and ESP-NOW 2.0.
-</div>
+Kube32 has run on exactly two boards. Anything else that is an ESP32-S3 with
+8 MB of flash may work, but has not been tried.
 
-Kube32 runs on bare metal on physical ESP32-S3 silicon. This page outlines the pin mappings, memory allocations, and hardware boundaries.
+| Role | Board | PSRAM | Console |
+| --- | --- | --- | --- |
+| Control plane, `esp32-node-01` | Generic ESP32-S3 devkit | 2 MB, quad SPI | native USB-Serial/JTAG, and UART0 through the devkit's CH340 bridge |
+| Worker, `esp32-node-02` | M5Stack Cardputer | none | native USB-Serial/JTAG only (UART0's TX pin, GPIO 43, drives the speaker) |
 
----
+The role follows from PSRAM. The Cardputer's peripherals are enabled by the
+board profile stored with `K32_CMD:BOARD:cardputer`. Neither depends on the
+MAC address.
 
-## Board configurations
+## Firmware configuration
 
-```mermaid
-graph TD
-    subgraph N1["Node 1: Control plane (esp32-node-01)"]
-        direction TB
-        N1_CPU["Xtensa LX7 dual-core @ 240 MHz"]
-        N1_MEM["512 KB Internal SRAM & 8 MB Flash"]
-        N1_ROLE["API server & scheduler on Core 0"]
-        N1_CPU --- N1_MEM
-        N1_CPU --- N1_ROLE
-    end
+From `platformio.ini`, `sdkconfig.defaults` and `partitions.csv`:
 
-    subgraph N2["Node 2: Worker node (esp32-node-02)"]
-        direction TB
-        N2_CPU["Xtensa LX7 dual-core @ 240 MHz"]
-        N2_MEM["512 KB SRAM + 2-8 MB Quad/Octal PSRAM"]
-        N2_ROLE["Worker agent & Wasm3 VM on Core 1"]
-        N2_CPU --- N2_MEM
-        N2_CPU --- N2_ROLE
-    end
+| Item | Setting |
+| --- | --- |
+| Framework | ESP-IDF 5.5.3 through PlatformIO `espressif32 @ 6.13.0`, board definition `esp32-s3-devkitc-1` |
+| CPU | 240 MHz |
+| Flash | 8 MB, 80 MHz. `platformio.ini` says QIO; `scripts/flash.sh` writes the image with `--flash-mode dio` |
+| PSRAM | quad SPI at 80 MHz, optional (`CONFIG_SPIRAM_IGNORE_NOTFOUND`). Allocations over 4 KB go to PSRAM when present; 32 KB of internal RAM is kept back for DMA and the system. Octal PSRAM would need a different `sdkconfig` and has not been tried |
+| Network | lwIP with 32 sockets and 32 active TCP connections; TCP send buffer and window of 11,520 bytes; loopback enabled (the console relay uses it) |
+| Watchdogs | task watchdog 5 s (idle task on core 0 checked), interrupt watchdog 300 ms, brownout detector at level 7 |
+| C++ | exceptions on (`-fexceptions`); controller loops catch allocation failures instead of rebooting |
 
-    N1 <==>|"ESP-NOW 2.4 GHz radio link & SoftAP Wi-Fi"| N2
-```
+### Partition table
 
-### Node 1: Control plane node
-- **Processor**: ESP32-S3 dual-core Xtensa LX7 at 240 MHz.
-- **Internal SRAM**: 512 KB.
-- **External PSRAM**: Optional. The control plane, radix store, and scheduler run entirely inside internal SRAM.
-- **Flash storage**: 8 MB or 16 MB SPI Flash.
-- **Role**: Cluster control plane (`esp32-node-01`).
-- **Interfaces**: USB-CDC / JTAG or external USB-to-UART bridge.
+| Name | Offset | Size | Use |
+| --- | --- | --- | --- |
+| `nvs` | `0x9000` | 32 KB | board profile: Wi-Fi credentials, role, board, API address, access point switch |
+| `phy_init` | `0x11000` | 4 KB | radio calibration |
+| `factory` | `0x20000` | 2.5 MB | the application |
+| `storage` | `0x2A0000` | 4 MB | declared, not used: nothing mounts it |
+| `reserved` | `0x6A0000` | 1.4 MB | not used |
 
-### Node 2: Worker node
-- **Processor**: ESP32-S3 dual-core Xtensa LX7 at 240 MHz.
-- **Internal SRAM**: 512 KB.
-- **External PSRAM**: 2 MB to 8 MB Quad SPI or Octal SPI PSRAM.
-- **Role**: Workload execution node (`esp32-node-02`).
-- **Interfaces**: USB-CDC / JTAG or external USB-to-UART bridge.
+There is no OTA partition. Updating a board means flashing it over USB.
 
----
+## Cardputer pins
 
-## Node identity and MAC addressing
+| Function | GPIO |
+| --- | --- |
+| ST7789 LCD, 240x135, on SPI2 | MOSI 35, SCLK 36, CS 37, DC 34, RST 33, backlight 38 |
+| NS4168 I2S speaker | BCLK 41, DATA 42, LRCK 43 |
+| Key matrix | address lines 8, 9, 11; row inputs 13, 15, 3, 4, 5, 6, 7 |
+| microSD on SPI3, 20 MHz | MOSI 14, MISO 39, SCK 40, CS 12 |
 
-ESP32-S3 microcontrollers contain a factory-burned 48-bit MAC address in their one-time-programmable eFuse block:
+The display driver draws dirty rectangles through a 4 KB line buffer instead
+of keeping a framebuffer. The speaker driver disables its I2S channel between
+tones; without that, the DMA ring replayed and the amplifier hummed. The
+capability firewall does not yet reserve these pins; see
+[Capability firewall](architecture/capability-firewall.md#reserved-pins).
 
-- Each node derives its unique cluster identity from its eFuse MAC.
-- During boot, Node 1 initializes the Wi-Fi SoftAP interface (`Kube32-Cluster`) on IP `192.168.4.1`.
-- Worker nodes associate with the SoftAP as stations, receive DHCP assignments (`192.168.4.2` and above), and register themselves with the API server.
+## Memory
 
----
+The two boards have very different RAM budgets, so the firmware reserves
+memory for pods early in boot, before Wi-Fi fragments the heap:
 
-## Memory layout
+| Board | Reserved at boot |
+| --- | --- |
+| Without PSRAM | 67 KiB of internal RAM for one 64 KiB pod, a 40 KiB pod thread stack, and 1 KiB log rings per pod |
+| With PSRAM | one 1,340 KiB PSRAM block for one large pod (Tessera's core declares 1,280 KiB of linear memory) |
 
-The ESP32-S3 memory splits between the FreeRTOS kernel, networking buffers, and Kube32 components:
+The boot log prints `[MEM]` lines with the free internal RAM and PSRAM after
+each stage, and again every 30 s. `K32_CMD:STATUS` prints them on demand.
+Figures recorded in commit messages during development:
 
-```mermaid
-graph TD
-    subgraph InternalSRAM["Internal SRAM: 512 KB (0x3FC8_0000 - 0x3FCF_0000)"]
-        direction TB
-        M1["FreeRTOS kernel & system DRAM (128 KB)"]
-        M2["Internal heap (265 KB)<br>• In-memory radix store (Node 1)<br>• Wi-Fi TCP/IP & socket buffers"]
-        M3["DMA & peripheral reserved SRAM (32 KB)"]
-        M4["IRAM & instruction cache (87 KB)"]
-        M1 --- M2
-        M2 --- M3
-        M3 --- M4
-    end
+| Commit | Board | Figure |
+| --- | --- | --- |
+| `766a7c9` | control plane | internal RAM stayed above 120 KB with the 76 KB Tessera core loaded |
+| `f54968a` | control plane | PSRAM free was down to 42 KB with the core pod loaded, before the ingress stacks were cut from 96 KB to 64 KB |
+| `f54968a` | Cardputer | mounting the microSD card cost 28 KB of internal RAM before the FatFs buffer fix |
 
-    subgraph ExternalPSRAM["External SPI PSRAM: 2 MB - 8 MB (0x3C00_0000)"]
-        direction TB
-        P1["Wasm3 container linear memory sandboxes"]
-        P2["TinyML tensor buffers & inference models"]
-        P3["Shared IPC ring buffers"]
-        P1 --- P2
-        P2 --- P3
-    end
-```
-
-The firmware automatically detects whether external PSRAM is installed via `CONFIG_SPIRAM_IGNORE_NOTFOUND=y`. If external RAM is absent, the memory allocator restricts container allocations to available internal SRAM.
-
----
-
-## Pin allocations and capabilities
-
-| Physical pin | Hardware function | Matching capability | Description |
-| :--- | :--- | :--- | :--- |
-| **GPIO 10** | Digital output | `GPIO_WRITE` | General user output or status LED |
-| **GPIO 1** | Analog input | `ADC_READ` | ADC1 channel 0 analog sensor input |
-| **GPIO 43** | UART0 TX | System console | Dedicated to system console output |
-| **GPIO 44** | UART0 RX | System console | Dedicated to system console input |
-| **GPIO 19** | USB D- | Native JTAG/OTG | Hardware USB differential data minus |
-| **GPIO 20** | USB D+ | Native JTAG/OTG | Hardware USB differential data plus |
-
----
-
-## Watchdogs and brownout protection
-
-Kube32 configures hardware watchdogs to ensure reliable operation in headless environments:
-
-1. **Task watchdog (TWDT)**: Core tasks feed the watchdog on each loop iteration via `osal::System::feed_watchdog()`. If a task blocks longer than 5 seconds, FreeRTOS triggers an alert and resets the task.
-2. **Interrupt watchdog (IWDT)**: If an interrupt handler runs longer than 300 milliseconds, the hardware watchdog resets the core to prevent deadlocks.
-3. **Brownout detector**: Configured at a 2.7V threshold so sudden power dips during Wi-Fi transmission do not corrupt flash storage.
+Built from commit `f737ab6`, `firmware.bin` is 2,262,864 bytes, 86.3 % of
+the 2.5 MB application partition. Statically allocated RAM is 51,732 bytes,
+as reported by `pio run`.

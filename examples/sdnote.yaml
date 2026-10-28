@@ -10,7 +10,11 @@
 #
 #   kubectl --context kube32 apply -f examples/sdnote.yaml
 #   kubectl --context kube32 get events --field-selector involvedObject.name=sdnote
-#   curl http://<cardputer ip>:7000/log       (pod HTTP server on the worker)
+#   kubectl --context kube32 logs sdnote       (sdnote: appended to boot.log, bytes=...)
+#
+# GET /log is served only where a pod HTTP server runs: on the host simulator,
+# not on the Cardputer (boards without PSRAM do not start one). On the board,
+# K32_CMD:SD on the console lists boot.log and its size.
 apiVersion: v1
 kind: Pod
 metadata:

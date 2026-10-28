@@ -1,5 +1,5 @@
 site_name: Kube32
-site_description: Embedded Kubernetes Control Plane & WebAssembly Runtime for ESP32-S3 Microcontrollers
+site_description: Kubernetes-compatible control plane and WebAssembly runtime for the ESP32-S3
 site_url: https://arterialist.github.io/kube32/
 repo_name: arterialist/kube32
 repo_url: https://github.com/arterialist/kube32
@@ -49,25 +49,24 @@ extra_javascript:
 nav:
   - Overview: index.md
   - Getting started:
-      - Quickstart guide: quickstart.md
-      - Hardware specifications: hardware-spec.md
-      - Flashing and troubleshooting: flashing-troubleshooting.md
+      - Quick start: quickstart.md
+      - Hardware: hardware-spec.md
+      - Flashing and the serial console: flashing-troubleshooting.md
+  - Building apps:
+      - Writing app pods: app-development.md
+      - microSD card: sd-card.md
+      - GPIO and other peripherals: workloads/gpio-blinker.md
+      - Tessera demo: tessera.md
   - Architecture:
-      - System architecture: architecture/index.md
-      - Radix state store: architecture/radix-store.md
-      - Autonomous scheduler: architecture/scheduler.md
-      - Wasm3 runtime sandbox: architecture/wasm-runtime.md
+      - Overview: architecture/index.md
+      - Object store: architecture/radix-store.md
+      - Scheduler and controllers: architecture/scheduler.md
+      - Wasm runtime: architecture/wasm-runtime.md
       - Capability firewall: architecture/capability-firewall.md
-      - Virtual channel IPC: architecture/espnow-ipc.md
-  - Workloads and tutorials:
-      - Writing app pods (Rust, C, AssemblyScript): app-development.md
-      - GPIO peripheral firewall: workloads/gpio-blinker.md
-      - Distributed TinyML pipeline: workloads/distributed-pipeline.md
-      - Resource limits and OOM handling: workloads/resource-limits.md
+      - Events between nodes: architecture/espnow-ipc.md
   - Reference:
-      - CLI reference: cli-reference.md
-      - Kubernetes API matrix: api-reference.md
-      - microSD card (images and pod storage): sd-card.md
+      - Kubernetes API coverage: api-reference.md
+      - Tools: cli-reference.md
 
 markdown_extensions:
   - admonition

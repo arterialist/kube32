@@ -1,80 +1,79 @@
-# Hardware capability firewall
+# Capability firewall
 
-<div class="blueprint-card">
-  <strong>Component</strong>: <code>kube32::hal::CapabilityFirewall</code><br>
-  <strong>Enforcement boundary</strong>: Host function trap handler.<br>
-  <strong>Security model</strong>: Declarative peripheral capabilities with exclusive pin claims.
-</div>
+A pod reaches hardware and other nodes only through host functions, and the
+capability firewall (`src/hal/capability_firewall.cpp`) decides which of
+those calls a pod may make. It does two things:
 
-In cloud Kubernetes, containers request specific OS permissions through Linux capabilities like `CAP_NET_ADMIN` or `CAP_SYS_PTRACE`.
+- **At admission.** When the kubelet admits a pod, the firewall turns the
+  manifest's resource requests into a grant. It claims any specific pins,
+  buses or channels the grant names. If one is reserved or already owned by
+  another pod, the pod fails with `CapabilityAdmissionFailed`.
+- **On every call.** Each guarded host function checks the calling pod's
+  grant. A call without the grant returns `K32_ERR_PERM` (-1), and the node
+  logs a `[FIREWALL] denied <pod>: ...` line.
 
-On microcontrollers, the primary risk is unauthorized access to physical peripherals. Toggling the wrong GPIO line can cause an electrical short, corrupt SPI flash communication, or disrupt serial boot strapping. Kube32 introduces hardware-level capabilities declared in standard Kubernetes `securityContext` blocks. The capability firewall verifies these permissions every time a container calls a hardware host function.
+When the pod is removed, its claims are released.
 
----
+## What a manifest can ask for
 
-## Declaring hardware capabilities
+The firewall reads `resources.requests`, or `limits` when the container has
+no `requests` block.
 
-Capabilities are listed in the `securityContext.capabilities.add` array of the container specification:
+| Resource | Grants |
+| --- | --- |
+| `hardware.kube32.io/ipc: "1"` | `k32_event_emit`, `kube32_channel_open` |
+| `hardware.kube32.io/tft-display: "1"` | `k32_display_text`, `k32_display_rect`, `k32_display_bar` |
+| `hardware.kube32.io/keyboard: "1"` | `k32_key_read` |
+| `hardware.kube32.io/speaker: "1"` | `k32_tone` |
+| `hardware.kube32.io/sd: "1"` plus a volume claim | `k32_fs_*` in the pod's directory on the card ([microSD card](../sd-card.md)) |
+| `esp32.io/gpio-<N>` | pin N, read and write; the value is ignored |
+| `esp32.io/gpio: "<count>"` | that many free pins, lowest numbers first |
+| `esp32.io/adc1-channel-<0..9>`, or `esp32.io/adc: "<count>"` | ADC1 channels |
+| `esp32.io/i2c-bus-<0\|1>`, or `esp32.io/i2c: "<count>"` | I2C buses |
+| `esp32.io/uart-<1\|2>` | a UART port |
+
+Every `esp32.io/` key is also accepted with the `esp.io/` prefix.
+
+`securityContext.capabilities.add` can grant the first five by name:
+
+- `CHANNEL_IPC` (or `IPC`);
+- `DISPLAY` (or `TFT_DISPLAY`);
+- `KEYBOARD`;
+- `SPEAKER` (or `AUDIO`);
+- `SD` (or `SD_CARD`).
+
+Any other capability name is ignored without a warning. In particular,
+`GPIO_WRITE`, `GPIO_READ` and `ADC_READ`, which older versions of these
+docs showed, grant nothing.
+
+The Tessera HUD pod, for example (from `examples/tessera.yaml`):
 
 ```yaml
-apiVersion: v1
-kind: Pod
-metadata:
-  name: gpio-blinker
-  namespace: default
-spec:
-  containers:
-    - name: blinker-task
-      image: wasm://embedded/blinker:v1
-      securityContext:
-        capabilities:
-          add:
-            - GPIO_WRITE      # Grants permission to toggle designated output pins
-            - CHANNEL_IPC     # Grants permission to send and receive ESP-NOW frames
+resources:
+  requests:
+    memory: 64Ki
+    hardware.kube32.io/tft-display: "1"
+    hardware.kube32.io/keyboard: "1"
+    hardware.kube32.io/speaker: "1"
+    hardware.kube32.io/ipc: "1"
 ```
 
----
+## Reserved pins
 
-## Supported hardware capabilities
+These pins can never be claimed: 0, 19, 20, 26 to 32, 43 and 44
+(`KUBE32_RESERVED_GPIO_MASK` in `include/hal/capability_firewall.hpp`). That
+covers the boot strapping pin, native USB, the SPI flash and PSRAM bus, and
+UART0. Every other number up to 48 is treated as free.
 
-| Capability flag | Target peripheral | Permitted operations | Restricted operations |
-| :--- | :--- | :--- | :--- |
-| `GPIO_WRITE` | General purpose I/O | `gpio_set_level()` on assigned pins | Pin mode reconfiguration, strapping pins |
-| `GPIO_READ` | General purpose I/O | `gpio_get_level()` on assigned pins | Interrupt mask changes |
-| `ADC_READ` | Analog-to-digital converter | `adc1_get_raw()` on assigned channels | Reference voltage modifications |
-| `UART_READ` | Serial UART controller | Read bytes from secondary UART lines | Console UART0 access |
-| `CHANNEL_IPC` | Virtual channel layer | Send and receive on designated channel names | Raw 802.11 packet injection |
+The list is incomplete for the boards Kube32 runs on:
 
----
+- **Not reserved:** the other strapping pins (3, 45, 46) and the extra pins an
+  octal PSRAM uses (33 to 37).
+- **On the Cardputer**, a pod can claim pins that the firmware itself drives:
+  - the LCD (33 to 38);
+  - I2S (41 to 43; 43 is reserved only because it is also UART0 TX);
+  - the key matrix (3 to 9, 11, 13, 15);
+  - the microSD bus (12, 14, 39, 40).
 
-## Admission checks and runtime enforcement
-
-```mermaid
-graph TD
-    POD["Pod manifest submitted"] --> AUDIT["Admission audit"]
-    AUDIT --> PASS{"Valid peripheral requests?"}
-    PASS -->|No| REJ["Admission rejected<br/>Reason: Forbidden hardware access"]
-    PASS -->|Yes| REG["Register ACL entry in firewall"]
-
-    subgraph Runtime["Live container execution"]
-        GUEST["Wasm container"] --> CALL["Host function call<br/>esp32_gpio_write(pin, val)"]
-        CALL --> FW{"Firewall check:<br/>Has GPIO_WRITE and<br/>pin in authorized ACL?"}
-        FW -->|Yes| OK["Write to hardware register<br/>Output pin toggles"]
-        FW -->|No| BLOCK["Block call and return -1<br/>Emit security violation event"]
-    end
-
-    REG -->|"Configures ACL"| FW
-```
-
----
-
-## Preventing pin conflicts
-
-The capability firewall enforces three rules to protect physical hardware:
-
-1. **Exclusive pin ownership**: When Pod A acquires `GPIO_WRITE` on Pin 10, no other container can acquire Pin 10 until Pod A terminates.
-2. **System console lockout**: Pins 43 and 44 (UART0 console) and Pins 19 and 20 (USB-JTAG) are locked by the firmware. Any pod attempting to claim these pins is rejected immediately:
-   ```
-   Admission rejected: GPIO pin 43 is reserved for system console.
-   ```
-3. **Automatic pin release on pod termination**: When a pod is deleted, the Kubelet releases its peripheral claims and resets the pins to high-impedance input mode (`GPIO_MODE_INPUT`).
+No example uses the GPIO, ADC, I2C or UART functions; see
+[GPIO and other peripherals](../workloads/gpio-blinker.md) for their state.

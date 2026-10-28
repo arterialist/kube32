@@ -1,205 +1,161 @@
-# Quickstart guide
+# Quick start
 
-<div class="blueprint-card">
-  <strong>Execution target</strong>: Two connected ESP32-S3 microcontroller boards.<br>
-  <strong>Prerequisites</strong>: Python 3.10+, PlatformIO or esptool, and USB cables.<br>
-  <strong>Cluster access</strong>: USB serial or local Wi-Fi on port 6443.
-</div>
+Two ways to run Kube32: the host simulator, which needs nothing but a
+compiler, and the two-board cluster it was built for.
 
-This guide walks through compiling firmware, flashing two ESP32-S3 boards, and deploying your first WebAssembly container.
+## Host simulator
 
----
+Requirements:
 
-## 1. Hardware setup
+- CMake 3.16 or newer;
+- a C++17 compiler (Apple Clang or GCC);
+- Python 3, used by the build to embed the Wasm images;
+- `kubectl`.
 
-A minimal Kube32 cluster uses two ESP32-S3 boards:
+The commands and output below were run on macOS 27 with kubectl 1.33.
 
-| Node role | Recommended hardware | Interface | Memory specification |
-| :--- | :--- | :--- | :--- |
-| **Node 1 (Control plane)** | Standard ESP32-S3 | Native USB-CDC or USB-UART | 512 KB SRAM, 8 MB Flash |
-| **Node 2 (Worker)** | ESP32-S3 with PSRAM | Native USB-CDC or USB-UART | 512 KB SRAM, 2 MB - 8 MB PSRAM, 8 MB Flash |
-
-### Physical interconnect topology
-
-```mermaid
-graph TD
-    subgraph Host["Developer workstation"]
-        CLI["kube32-cli / kubectl"]
-    end
-
-    subgraph Cluster["Physical bare-metal cluster"]
-        subgraph Node1["Node 1: Control plane (esp32-node-01)"]
-            direction TB
-            N1_HW["ESP32-S3 (512 KB SRAM, 8 MB Flash)"]
-            N1_ROLES["API server, scheduler, radix store"]
-            N1_HW --- N1_ROLES
-        end
-
-        subgraph Node2["Node 2: Worker node (esp32-node-02)"]
-            direction TB
-            N2_HW["ESP32-S3 (512 KB SRAM, 2 MB - 8 MB PSRAM)"]
-            N2_ROLES["Worker agent, Wasm3 VM, firewall"]
-            N2_HW --- N2_ROLES
-        end
-    end
-
-    CLI -->|"USB serial link 1"| Node1
-    CLI -->|"USB serial link 2"| Node2
-    Node1 <==>|"Wi-Fi SoftAP (192.168.4.0/24)"| Node2
-    Node1 <==>|"ESP-NOW 2.4 GHz radio mesh"| Node2
+```
+$ cmake -S . -B build
+$ cmake --build build -j8
+$ ctest --test-dir build
+...
+100% tests passed out of 23
 ```
 
-### Cluster bootstrap and scheduling flow
+On Linux, 5 of the 23 test programs currently fail or hang; see
+[CONTRIBUTING.md](https://github.com/arterialist/kube32/blob/main/CONTRIBUTING.md#tests).
 
-```mermaid
-sequenceDiagram
-    autonumber
-    actor Dev as Developer
-    participant N1 as Node 1 (Control plane)
-    participant N2 as Node 2 (Worker)
+Start a standalone simulator: the API server on port 6443 and two simulated
+nodes, `esp32-node-01` and `esp32-node-02`, in one process. `--ingress-port`
+also serves the Tessera web app. The pod HTTP server is moved off its default
+port 7000 because macOS's AirPlay Receiver listens there.
 
-    N1->>N1: Start Wi-Fi SoftAP Kube32-Cluster
-    N1->>N1: Start HTTP API server on port 6443
-    N2->>N1: Associate over Wi-Fi, receive IP 192.168.4.2
-    N2->>N1: Register node via POST /api/v1/nodes
-
-    Dev->>N1: Apply gpio-blinker.yaml
-    N1->>N1: Store pod in radix tree
-    N1->>N1: Scheduler binds pod to esp32-node-02
-    N2->>N1: Kubelet polls pods via GET /api/v1/pods
-    N2->>N2: Firewall validates GPIO_WRITE
-    N2->>N2: Wasm3 runs container and toggles pin
+```
+$ ./build/kube32-sim --ingress-port 8080 --pod-port 17000
+...
+[INIT] Seeded simulated cluster nodes (esp32-node-01, esp32-node-02).
+[INIT] Node Lifecycle Controller active (NotReady: 15000ms, Evict: 30000ms).
+[INIT] Autonomous scheduler started with LeastAllocated scoring.
+[INIT] Deployment controller active.
+[READY] Kube32 API Server listening on http://0.0.0.0:6443
+...
+[APP] pod HTTP server on :17000 (2 workers)
+[APP] ingress on :8080 serving app 'tessera'
 ```
 
----
+In a second terminal, give kubectl a kubeconfig of its own, so your other
+contexts are not touched:
 
-## 2. Compile the firmware
+```
+$ export KUBECONFIG=$PWD/build/kubeconfig
+$ kubectl config set-cluster kube32-sim --server=http://127.0.0.1:6443
+$ kubectl config set-context kube32-sim --cluster=kube32-sim
+$ kubectl config use-context kube32-sim
+$ kubectl get nodes
+NAME            STATUS   ROLES    AGE   VERSION
+esp32-node-01   Ready    worker   2s    v1.33.0-kube32
+esp32-node-02   Ready    worker   2s    v1.33.0-kube32
+$ kubectl apply -f examples/tessera.yaml
+pod/tessera-core created
+pod/tessera-hud created
+service/tessera created
+$ kubectl get pods
+NAME           READY   STATUS    RESTARTS   AGE
+tessera-core   1/1     Running   0          3s
+tessera-hud    1/1     Running   0          3s
+$ kubectl logs tessera-core
+tessera: ready issues=10
+tessera: seeding target=2400
+tessera: seed chunk=10
+[kube32] container started (linear memory 1280 KiB, limit 1280 KiB)
+```
 
-Build the firmware using PlatformIO and the ESP-IDF framework:
+Open <http://127.0.0.1:8080/> and sign in as `mara`, password `demo`. Seeding
+the 2,400 issues takes about four minutes on the simulator, because it ticks
+pods once a second. The HUD pod's display and speaker calls go to the
+simulator's log as `[DISPLAY x,y] ...` and `[TONE] ...` lines.
 
-```bash
+The simulator's node capacity, OS image and kernel version are fixed values
+it declares, not measurements. Its "node memory" metric is the heap of the
+whole simulator process.
+
+Other simulator flags are listed in
+[CONTRIBUTING.md](https://github.com/arterialist/kube32/blob/main/CONTRIBUTING.md#host-simulator-and-unit-tests).
+To give the simulator a microSD card, set `KUBE32_SD_ROOT` to a directory
+([microSD card](sd-card.md#host-simulator)).
+
+## Two boards
+
+The cluster this was developed on is an ESP32-S3 devkit with 2 MB of quad
+PSRAM, which becomes the control plane, and an M5Stack Cardputer, which
+becomes the worker ([Hardware](hardware-spec.md)).
+
+Requirements: PlatformIO Core 6.1, Python 3 with `pyserial`, `kubectl`, and a
+2.4 GHz Wi-Fi network both boards can join.
+
+### 1. Build and flash
+
+```
 pio run -e esp32s3
+bash scripts/flash.sh <serial port of the first board> 921600
+bash scripts/flash.sh <serial port of the second board> 921600
 ```
 
-This compiles three target binaries in `.pio/build/esp32s3/`:
+Flash one board at a time, with nothing else holding its port. Over a native
+USB port each flash took about 26 s. Read
+[Flashing](flashing-troubleshooting.md#flashing) first if PlatformIO is not
+installed under the path the script expects.
 
-- `bootloader.bin` at offset `0x0000`
-- `partitions.bin` at offset `0x8000`
-- `firmware.bin` at offset `0x20000`
+### 2. Provision over the serial console
 
----
+Open each board's USB serial port at 115200 baud, for example with
+`python3 -m serial.tools.miniterm --echo <port> 115200`. Opening the port
+resets some boards; wait for the boot log to end. Every command below stores
+a value in NVS and reboots the board.
 
-## 3. Flash the boards
+On the Cardputer:
 
-Both boards run the unified firmware image. At boot time, the firmware automatically detects available memory (SRAM vs PSRAM) and starts the control plane or worker agent services.
-
-### Flash Node 1 (Control plane)
-Connect the first board to your workstation:
-
-```bash
-# Replace /dev/ttyACM0 with your board serial port
-bash scripts/flash.sh /dev/ttyACM0 460800
+```
+K32_CMD:BOARD:cardputer
+K32_CMD:WIFI:<ssid>:<password>
 ```
 
-### Flash Node 2 (Worker node)
-Connect the second board to your workstation:
+On the devkit:
 
-```bash
-# Replace /dev/ttyACM1 with your board serial port
-bash scripts/flash.sh /dev/ttyACM1 460800
+```
+K32_CMD:WIFI:<ssid>:<password>
+K32_CMD:AP:off
 ```
 
-!!! note
-    On macOS, serial devices typically appear as `/dev/cu.usbmodem*` or `/dev/cu.usbserial*`. On Linux, they appear as `/dev/ttyACM*` or `/dev/ttyUSB*`. On Windows, they appear as `COM*`.
+After the last reboot, the devkit's boot log has the line
+`[CONTROL-PLANE] API server http://<address>:6443, scheduler + node lifecycle active`.
+Give that address to the Cardputer:
 
----
-
-## 4. Check cluster status
-
-You can query cluster state over the USB serial interface or over local Wi-Fi.
-
-=== "Over USB serial"
-
-    ```bash
-    ./cli/kube32-cli --port /dev/ttyACM0 status
-    ```
-
-    Output:
-    ```
-    Connecting to Kube32 cluster at /dev/ttyACM0...
-
-    === CLUSTER NODES ===
-    NAME             STATUS     ROLES          INTERNAL-IP      ALLOCATABLE-MEM
-    ------------------------------------------------------------------------
-    esp32-node-01    Ready      control-plane  192.168.4.1      400Ki
-    esp32-node-02    Ready      worker         192.168.4.2      2048Ki
-
-    === CLUSTER PODS ===
-    NAMESPACE    NAME                     NODE             STATUS       MEMORY
-    ------------------------------------------------------------------------
-    (No active pods deployed)
-    ```
-
-=== "Over Wi-Fi"
-
-    Connect your workstation to the `Kube32-Cluster` Wi-Fi network with password `kube32password`, then run:
-
-    ```bash
-    ./cli/kube32-cli --server http://192.168.4.1:6443 status
-    ```
-
----
-
-## 5. Deploy a workload
-
-Deploy `examples/gpio-blinker.yaml`. This manifest requests permission to toggle a GPIO pin:
-
-```bash
-./cli/kube32-cli --port /dev/ttyACM0 apply -f examples/gpio-blinker.yaml
+```
+K32_CMD:API:<address>
 ```
 
-Output:
-```
-pod/gpio-blinker applied successfully -> scheduled to esp32-node-02 (HTTP 201)
-```
+The Cardputer's screen then shows `ready`, its own address and the app URL.
 
-Verify that the pod is running:
+### 3. Use the cluster
 
-```bash
-./cli/kube32-cli --port /dev/ttyACM0 status
 ```
-
-Output:
-```
-=== CLUSTER PODS ===
-NAMESPACE    NAME                     NODE             STATUS       MEMORY
-------------------------------------------------------------------------
-default      gpio-blinker             esp32-node-02    Running      32Ki
+kubectl config set-cluster kube32 --server=http://<address>:6443
+kubectl config set-context kube32 --cluster=kube32
+kubectl config use-context kube32
+kubectl get nodes
+kubectl apply -f examples/tessera.yaml
+kubectl get pods -o wide
 ```
 
----
+Both nodes were Ready about 10 s after a reset. Open `http://<address>/` for
+Tessera, and type on the Cardputer to see the keys arrive in the browser.
 
-## 6. Read live logs
+### Without an existing network
 
-Open a serial monitor on Node 2 to watch the container execute:
-
-```bash
-python3 -c "
-import serial
-with serial.Serial('/dev/ttyACM1', 115200) as s:
-    while True:
-        line = s.readline()
-        if line: print(line.decode('utf-8', errors='replace').strip())
-"
-```
-
-Output:
-```
-Kubelet: Sync assigned pods: found default/gpio-blinker on esp32-node-02
-Firewall: Auditing capabilities for default/gpio-blinker
-Firewall: Capability granted: GPIO_WRITE on pin 10
-Wasm3: Spawning container default/gpio-blinker with 32 KiB heap
-Container: GPIO pin 10 set to HIGH
-Container: GPIO pin 10 set to LOW
-Worker heartbeat: Node esp32-node-02, free heap 2235900 bytes
-```
+Without stored Wi-Fi credentials, the control plane starts an access point
+called `Kube32-Cluster`; its password is set in `src/main_esp32.cpp`. A
+worker without credentials joins that access point and looks for the API at
+`192.168.4.1`. This mode exists in the code, but it is not the configuration
+the measurements were made with: the Cardputer's connection to it was
+unstable.

@@ -1,96 +1,87 @@
-# ESP-NOW virtual channel IPC
+# Events between nodes
 
-<div class="blueprint-card">
-  <strong>Component</strong>: <code>kube32::ipc::ChannelManager</code> and <code>EspNowTransport</code>.<br>
-  <strong>Wire protocol</strong>: <code>K32C</code> embedded packet frame (magic <code>0x4B333243</code>, version <code>0x01</code>).<br>
-  <strong>Integrity</strong>: CRC16-CCITT frame checksum and 32-bit FNV-1a channel hashing.
-</div>
+Pods on different boards exchange small messages through a publish and
+subscribe layer in `src/ipc/channel.cpp`. On the boards it runs over two
+transports at once: ESP-NOW and UDP on port 7400. Each frame is sent on the
+transport through which the peer was discovered. This is the path the
+Tessera keypad uses: a key pressed on the Cardputer travels as an event to
+the core pod on the control plane, and from there to browsers as a
+server-sent event.
 
-In cloud Kubernetes, inter-pod networking relies on CNI plugins that manage overlay networks (such as VXLAN) across Linux network namespaces.
+## What a pod uses
 
-On microcontrollers, maintaining active TCP/IP sockets between boards consumes significant resources. Each open lwIP TCP socket requires 10 KB to 12 KB of RAM for send and receive buffers. TCP three-way handshakes, ARP resolutions, and retransmission state machines also add latency over 2.4 GHz Wi-Fi.
+| Call | Effect | Needs |
+| --- | --- | --- |
+| `k32_event_emit(topic, payload)` | publishes to local subscribers and to every known peer | `hardware.kube32.io/ipc` |
+| `kube32_channel_open(name, flags)` | opens a receive queue for frames published under `name` | `hardware.kube32.io/ipc` |
+| `kube32_channel_recv(handle, buf, cap, timeout_ms)` | reads one frame from that queue | an open handle |
+| `kube32_channel_send(handle, data, len)` | delivers to the queue on the same node only | an open handle |
+| `k32_event` export | the node calls it for each frame on `<app>.events` and `<app>.input` | exporting `k32_event` and `k32_alloc` |
 
-Kube32 bypasses the TCP/IP stack for inter-pod telemetry and sensor pipelines. It uses Espressif's connectionless ESP-NOW protocol to transmit raw 802.11 action frames directly between MAC addresses. Over this link, Kube32 runs a virtual channel protocol named `K32C`.
+`kube32_channel_send` does not cross nodes. The code has a remote-route
+table, but nothing fills it. To reach another board, use `k32_event_emit`.
 
----
+On the boards the app name is `tessera`, so the topics delivered to
+`k32_event` are `tessera.events` and `tessera.input`. The Tessera HUD pod:
 
-## Wire frame layout (`K32C`)
+- publishes key presses with `k32_event_emit("tessera.input", ...)`;
+- reads `tessera.events` through `kube32_channel_open` and
+  `kube32_channel_recv`.
 
-Inter-node frames use a compact 22-byte binary header:
+The core pod publishes on `tessera.events`, and the ingress turns those
+events into SSE for browsers.
 
-```
- 0                   1                   2                   3
- 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-|       Magic: 'K' '3' '2' 'C' (0x4B333243)                     |
-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-|  Version (1)  |   Flags (1)   |        Sequence number (2)    |
-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-|                 Channel hash (FNV-1a 32-bit)                  |
-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-|                 Sender hash  (FNV-1a 32-bit)                  |
-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-|                 Target hash  (FNV-1a 32-bit)                  |
-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-|  Frag index   |  Frag count   |      Payload length (2)       |
-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-|                    Payload data (0 - 200 bytes)               |
-|                              ...                              |
-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-|             CRC16-CCITT checksum (2 bytes)                    |
-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-```
+## Limits
 
-### Header fields
+| Item | Limit |
+| --- | --- |
+| `k32_event_emit` payload | 200 bytes; topic 1 to 64 bytes |
+| Published message | 1024 bytes, split into frames of up to 224 bytes of payload |
+| Reassembly | up to 32 fragments, 500 ms timeout, 8 messages in flight |
+| Receive queue per channel | 8 slots of 512 bytes on a board; 16 slots of 1024 bytes on the simulator |
+| Delivery | best effort: no acknowledgement, no retransmission |
 
-- **Magic (4 bytes)**: `0x4B333243` ("K32C"). Rejects non-Kube32 frames.
-- **Version (1 byte)**: Protocol version `0x01`.
-- **Channel hash (4 bytes)**: 32-bit FNV-1a hash of the channel name (for example, `fnv1a_32("audio.features")`).
-- **Sender and target hash (4 bytes each)**: FNV-1a hashes of the sending and receiving pod names.
-- **Payload length (2 bytes)**: Exact payload size, up to 200 bytes per frame.
-- **CRC16-CCITT (2 bytes)**: Checksum covering the full header and payload. Frames with invalid CRCs are dropped by the hardware interrupt handler.
+## Peer discovery
 
----
+Every node sends a HELLO frame every 3 s (every 2 s on the simulator). The
+frame carries the node's ID and name, and goes out:
 
-## Inter-node dataflow pipeline
+- to the ESP-NOW broadcast address (boards only);
+- to every known peer;
+- to UDP seed addresses.
 
-The virtual channel layer connects distributed processing stages across separate microcontrollers:
+Workers seed the control plane's address. Every 10 s the control plane seeds
+the `InternalIP` of every registered node. Seeding is what makes events flow
+when the two boards sit on different access points of the same network: they
+may then be on different Wi-Fi channels, and ESP-NOW frames never arrive. On
+such a network the keypad events used to stop at the worker; that is why the
+UDP transport exists (commit `464c402`). Peers never expire.
 
-```mermaid
-sequenceDiagram
-    autonumber
-    participant S1 as Stage 1: audio-preprocessor (Node 1)
-    participant CH1 as Node 1: ChannelManager
-    participant RF as ESP-NOW 2.4 GHz RF link
-    participant CH2 as Node 2: ChannelManager
-    participant S2 as Stage 2: keyword-classifier (Node 2)
+ESP-NOW runs unencrypted at a fixed 24 Mbps rate. The simulator uses UDP
+only, on port 7400 plus the node ID.
 
-    Note over S1,S2: Channel subscription
-    S2->>CH2: open(pod="keyword-classifier", channel="audio.features")
-    CH2->>RF: Send handshake: K32_PIPELINE_READY
-    RF-->>CH1: Deliver handshake
-    CH1-->>S1: Route established
+## Frame format
 
-    Note over S1,S2: Streaming inference data
-    S1->>S1: Sample ADC and extract 12 MFCC coefficients (52 bytes)
-    S1->>CH1: send(channel="audio.features", data=features)
-    CH1->>CH1: Assemble K32C frame and compute CRC16
-    CH1->>RF: esp_now_send(target_mac=24:dc:c3:45:67:02)
-    RF-->>CH2: Hardware ISR: recv_callback
-    CH2->>CH2: Validate CRC16 and FNV-1a channel hash
-    CH2->>CH2: Push payload into ring buffer
-    CH2-->>S2: recv() -> 52 bytes
-    S2->>S2: Allocate tensor in 2 MB PSRAM and run inference
-    Note over S2: Wake word detected (confidence: 99.1%)
-```
+Little-endian, packed, defined in `include/ipc/channel.hpp`:
 
----
+| Offset | Size | Field |
+| --- | --- | --- |
+| 0 | 4 | magic, the bytes `K32C` (`0x4332334B` read as a little-endian `u32`) |
+| 4 | 1 | version, `1` |
+| 5 | 1 | flags: `0x01` fragment, `0x02` first, `0x04` last, `0x10` HELLO; `0x08` (ack requested) is defined but unused |
+| 6 | 2 | sequence number |
+| 8 | 4 | FNV-1a hash of the channel or topic name |
+| 12 | 4 | FNV-1a hash of the sending pod |
+| 16 | 4 | FNV-1a hash of the target pod (ignored on receive) |
+| 20 | 1 | fragment index |
+| 21 | 1 | fragment count |
+| 22 | 2 | payload length, 0 to 224 |
+| 24 | n | payload |
+| 24 + n | 2 | CRC-16/CCITT-FALSE (polynomial `0x1021`, initial `0xFFFF`) over header and payload |
 
-## Protocol comparison
+A frame is at most 250 bytes, the ESP-NOW maximum. Frames with a bad magic,
+version, length or CRC are dropped.
 
-| Characteristic | Standard TCP/IP socket | Kube32 ESP-NOW virtual channel |
-| :--- | :--- | :--- |
-| Transfer latency | 20 ms - 45 ms (DHCP, ARP, TCP handshake) | Under 2.5 ms (direct MAC frame) |
-| Header overhead | 54 bytes (Ethernet + IP + TCP) | 22 bytes (K32C frame header) |
-| RAM buffering | ~12 KB per active TCP socket | 512-byte ring buffer per channel |
-| AP association required | Yes | No (direct radio frames) |
+Latency and throughput of this path have not been measured in isolation. The
+end-to-end keypad path (key, HUD, transport, core pod, browser) works on the
+boards; no timing for it has been recorded.
