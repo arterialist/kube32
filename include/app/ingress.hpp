@@ -46,7 +46,9 @@ private:
     bool head_sent_{false};
     bool ended_{false};
     size_t bytes_{0};
-    static constexpr size_t kChunk = 1400;   // one Wi-Fi TCP segment
+    // Four full segments per write: a sub-MSS write per chunk left lwIP's
+    // Nagle logic waiting one delayed-ACK round trip per 1400 bytes.
+    static constexpr size_t kChunk = 5760;
     size_t buf_len_{0};
     uint8_t buf_[kChunk];
 };

@@ -298,6 +298,26 @@ void console_task(void* arg) {
                 con.write("K32_OK profile stored, rebooting\n", 33);
                 vTaskDelay(pdMS_TO_TICKS(200));
                 esp_restart();
+            } else if (line == "K32_CMD:TASKS") {
+                // FreeRTOS task table: state, priority, core, stack high-water mark,
+                // cumulative run time (run-time statistics are enabled in sdkconfig).
+                UBaseType_t n = uxTaskGetNumberOfTasks();
+                auto* st = static_cast<TaskStatus_t*>(heap_caps_malloc((n + 4) * sizeof(TaskStatus_t), MALLOC_CAP_8BIT));
+                if (st) {
+                    configRUN_TIME_COUNTER_TYPE total = 0;
+                    UBaseType_t got = uxTaskGetSystemState(st, n + 4, &total);
+                    static const char* const states[] = {"running", "ready", "blocked", "suspended", "deleted", "invalid"};
+                    for (UBaseType_t i = 0; i < got; ++i) {
+                        char l[128];
+                        int ll = snprintf(l, sizeof(l), "K32_TASK %-18s %-9s prio=%2u core=%d stack_free=%6u run_ms=%llu\n",
+                                          st[i].pcTaskName, states[st[i].eCurrentState <= 5 ? st[i].eCurrentState : 5],
+                                          (unsigned)st[i].uxCurrentPriority, (int)xTaskGetCoreID(st[i].xHandle),
+                                          (unsigned)st[i].usStackHighWaterMark, (unsigned long long)(st[i].ulRunTimeCounter / 1000));
+                        con.write(l, static_cast<size_t>(ll));
+                    }
+                    heap_caps_free(st);
+                }
+                con.write("K32_OK tasks\n", 13);
             } else if (line.rfind("K32_CMD:KEY:", 0) == 0) {
                 // Inject keystrokes into the matrix keyboard queue ("\\n" = Enter,
                 // "\\b" = Backspace) so the input path can be exercised from a host.
@@ -529,7 +549,9 @@ void cluster_task(void* pv) {
     // The kubelet task parses manifests and loads/compiles Wasm modules (deep
     // recursion); workers with PSRAM get a generous stack.
     // Module parse + compile + k32_init (seeding) all run on the kubelet task.
-    kubelet_cfg.task_stack_size = ident.has_psram ? 49152 : 14336;   // k32_init is short since seeding moved to ticks
+    // Runs k32_init: on Xtensa the interpreter's op chain is not fully tail
+    // call optimised, so a seed chunk needs well over 40 KB of native stack.
+    kubelet_cfg.task_stack_size = ident.has_psram ? 65536 : 14336;
     kubelet_cfg.task_stack_in_psram = ident.has_psram;
     kubelet_cfg.control_plane = ident.is_control_plane;
     kubelet_cfg.core_affinity = 1;
@@ -649,7 +671,7 @@ void cluster_task(void* pv) {
     {
         kube32::osal::Thread::Config t_cfg;
         t_cfg.name = "k32_tick";
-        t_cfg.stack_size = ident.has_psram ? 49152 : 8192;
+        t_cfg.stack_size = ident.has_psram ? 65536 : 8192;   // same reason as the kubelet stack
         t_cfg.stack_in_psram = ident.has_psram;
         t_cfg.priority = 4;
         t_cfg.core_affinity = 1;

@@ -260,6 +260,10 @@ bool HttpKubeClient::register_node(const std::string& node_json, bool& out_confl
 
 bool HttpKubeClient::patch_node_status(const std::string& node_name, const std::string& patch_json) {
     HttpResponse resp = send_http_request("PATCH", "/api/v1/nodes/" + node_name, patch_json);
+    if (resp.status_code != 200) {
+        std::cout << "[KUBELET] node status patch failed: http " << resp.status_code
+                  << (resp.body.empty() ? std::string() : " " + resp.body.substr(0, 120)) << std::endl;
+    }
     return resp.status_code == 200;
 }
 

@@ -373,6 +373,7 @@ void HttpServer::run_acceptor() {
         if (FD_ISSET(listen_fd, &rfds)) {
             std::string client_ip;
             osal::Socket client = listen_sock_.accept(&client_ip);
+            if (client.is_valid()) client.set_tcp_nodelay(true);   // responses are written in large coalesced chunks
             if (!client.is_valid()) continue;
             metrics_.connections.fetch_add(1, std::memory_order_relaxed);
             client.set_tcp_nodelay(true);
