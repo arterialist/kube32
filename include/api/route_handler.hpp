@@ -131,6 +131,8 @@ private:
     EventRecorder events_;
     MetricsRegistry metrics_;
 
+    std::string openapi_v3_document(const std::string& path) const;
+    bool strict_fields_ok(RouteCategory category, const std::string& body, std::string& out_unknown) const;
     void seed_namespaces();
     // Shared helpers
     std::string list_json(const ResourceInfo& info, const std::vector<std::string>& jsons) const;

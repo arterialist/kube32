@@ -152,13 +152,40 @@ void test_discovery_and_method_enforcement() {
     assert(resp6.status_code == 404);
     assert(resp6.body.find("\"reason\":\"NotFound\"") != std::string::npos);
 
-    // 7. GET /openapi/v3 -> 200 {"paths":{}}
+    // 7. GET /openapi/v3 -> index of group versions; each group document lists
+    //    the fieldValidation parameter on its kinds' PATCH operations, and the
+    //    server enforces fieldValidation=Strict on top-level and metadata fields
     HttpRequest r7;
     r7.method = HttpMethod::Get;
     r7.path = "/openapi/v3";
     HttpResponse resp7 = handler.handle_request(r7, arena);
     assert(resp7.status_code == 200);
-    assert(resp7.body == "{\"paths\":{}}");
+    assert(resp7.body.find("\"api/v1\":{\"serverRelativeURL\":\"/openapi/v3/api/v1\"}") != std::string::npos);
+    assert(resp7.body.find("\"apis/apps/v1\"") != std::string::npos);
+    HttpRequest r7b;
+    r7b.method = HttpMethod::Get;
+    r7b.path = "/openapi/v3/api/v1";
+    HttpResponse resp7b = handler.handle_request(r7b, arena);
+    assert(resp7b.status_code == 200);
+    assert(resp7b.body.find("\"/api/v1/namespaces/{namespace}/pods/{name}\"") != std::string::npos);
+    assert(resp7b.body.find("\"kind\":\"Pod\"") != std::string::npos);
+    assert(resp7b.body.find("\"name\":\"fieldValidation\"") != std::string::npos);
+    HttpRequest r7c;
+    r7c.method = HttpMethod::Get;
+    r7c.path = "/openapi/v3/apis/nope/v1";
+    assert(handler.handle_request(r7c, arena).status_code == 404);
+    HttpRequest r7d;
+    r7d.method = HttpMethod::Post;
+    r7d.path = "/api/v1/namespaces/default/configmaps";
+    r7d.query_string = "fieldValidation=Strict";
+    r7d.body = "{\"apiVersion\":\"v1\",\"kind\":\"ConfigMap\",\"metadata\":{\"name\":\"x\"},\"dta\":{}}";
+    HttpResponse resp7d = handler.handle_request(r7d, arena);
+    assert(resp7d.status_code == 400);
+    assert(resp7d.body.find("unknown field \\\"dta\\\"") != std::string::npos);
+    r7d.body = "{\"apiVersion\":\"v1\",\"kind\":\"ConfigMap\",\"metadata\":{\"name\":\"x\",\"labelz\":{}},\"data\":{}}";
+    assert(handler.handle_request(r7d, arena).status_code == 400);
+    r7d.body = "{\"apiVersion\":\"v1\",\"kind\":\"ConfigMap\",\"metadata\":{\"name\":\"x\"},\"data\":{\"a\":\"b\"}}";
+    assert(handler.handle_request(r7d, arena).status_code == 201);
 
     // 8. GET /apis/events.k8s.io/v1 -> 200 APIResourceList
     HttpRequest r8;

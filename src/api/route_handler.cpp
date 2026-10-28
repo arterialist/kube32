@@ -151,7 +151,7 @@ RouteMatch RouteHandler::match_route(std::string_view path) {
         match.category = RouteCategory::NamespacesCollection;
         return match;
     }
-    if (path == "/openapi/v3") {
+    if (path == "/openapi/v3" || path.rfind("/openapi/v3/", 0) == 0) {
         match.category = RouteCategory::DiscoveryOpenApiV3;
         return match;
     }
@@ -471,6 +471,19 @@ HttpResponse RouteHandler::handle_request(const HttpRequest& req, mem::Monotonic
         return resp;
     }
 
+    // fieldValidation=Strict (what kubectl apply/create send by default, see
+    // openapi_v3_document): reject unknown top-level and metadata fields, as
+    // kube-apiserver does. Nested fields are not checked.
+    if ((req.method == HttpMethod::Post || req.method == HttpMethod::Put || req.method == HttpMethod::Patch) && !req.body.empty()) {
+        std::string fv;
+        if (query_param(req.query_string, "fieldValidation", fv) && fv == "Strict") {
+            std::string unknown;
+            if (!strict_fields_ok(match.category, req.body, unknown)) {
+                return make_status(400, "BadRequest", "strict decoding error: unknown field \"" + unknown + "\"");
+            }
+        }
+    }
+
     // ?watch=true on any collection becomes a long-lived stream owned by the hub
     if (req.method == HttpMethod::Get && (query_flag(req.query_string, "watch"))) {
         ResourceInfo info;
@@ -708,7 +721,8 @@ HttpResponse RouteHandler::handle_discovery(const HttpRequest& req, RouteCategor
             break;
 
         case RouteCategory::DiscoveryOpenApiV3:
-            resp.body = "{\"paths\":{}}";
+            resp.body = openapi_v3_document(req.path);
+            if (resp.body.empty()) return make_status(404, "NotFound", "no OpenAPI document for " + req.path);
             break;
 
         default:
@@ -1895,6 +1909,99 @@ bool RouteHandler::resource_info(RouteCategory c, ResourceInfo& out) {
         default:
             return false;
     }
+}
+
+// Minimal OpenAPI v3 for kubectl. kubectl apply/create validate with
+// fieldValidation=Strict when the group's OpenAPI document lists that query
+// parameter on the kind's PATCH operation; otherwise they need a full schema
+// for client-side validation (which kube32 does not serve). The documents
+// list exactly the kinds this server stores and the parameter it honours.
+std::string RouteHandler::openapi_v3_document(const std::string& path) const {
+    struct Kind { const char* gv_path; const char* group; const char* version; const char* kind; const char* plural; bool namespaced; };
+    static const Kind kKinds[] = {
+        {"api/v1", "", "v1", "Pod", "pods", true},
+        {"api/v1", "", "v1", "Node", "nodes", false},
+        {"api/v1", "", "v1", "Namespace", "namespaces", false},
+        {"api/v1", "", "v1", "Service", "services", true},
+        {"api/v1", "", "v1", "ConfigMap", "configmaps", true},
+        {"api/v1", "", "v1", "Secret", "secrets", true},
+        {"api/v1", "", "v1", "Event", "events", true},
+        {"apis/apps/v1", "apps", "v1", "Deployment", "deployments", true},
+        {"apis/apps/v1", "apps", "v1", "DaemonSet", "daemonsets", true},
+        {"apis/batch/v1", "batch", "v1", "Job", "jobs", true},
+        {"apis/coordination.k8s.io/v1", "coordination.k8s.io", "v1", "Lease", "leases", true},
+    };
+    if (path == "/openapi/v3") {
+        std::string out = "{\"paths\":{";
+        std::string last;
+        bool first = true;
+        for (const auto& k : kKinds) {
+            if (last == k.gv_path) continue;
+            last = k.gv_path;
+            if (!first) out += ",";
+            first = false;
+            out += std::string("\"") + k.gv_path + "\":{\"serverRelativeURL\":\"/openapi/v3/" + k.gv_path + "\"}";
+        }
+        out += "}}";
+        return out;
+    }
+    std::string gv = path.substr(std::string("/openapi/v3/").size());
+    std::string out = "{\"openapi\":\"3.0.0\",\"info\":{\"title\":\"kube32\",\"version\":\"v1.33.0-kube32\"},\"paths\":{";
+    bool any = false;
+    for (const auto& k : kKinds) {
+        if (gv != k.gv_path) continue;
+        if (any) out += ",";
+        any = true;
+        std::string item = std::string("/") + k.gv_path + (k.namespaced ? "/namespaces/{namespace}/" : "/") + k.plural + "/{name}";
+        out += "\"" + item + "\":{\"patch\":{\"x-kubernetes-group-version-kind\":{\"group\":\"" + k.group + "\",\"version\":\"" +
+               k.version + "\",\"kind\":\"" + k.kind + "\"},\"parameters\":[{\"name\":\"fieldValidation\",\"in\":\"query\",\"schema\":{\"type\":\"string\"}}]}}";
+    }
+    if (!any) return std::string();
+    out += "}}";
+    return out;
+}
+
+bool RouteHandler::strict_fields_ok(RouteCategory category, const std::string& body, std::string& out_unknown) const {
+    ResourceInfo info;
+    if (!resource_info(category, info)) return true;   // not a stored kind: nothing to check here
+    models::JsonValue doc;
+    std::string err;
+    if (!models::parse_json(body, doc, err) || !doc.is_object()) return true;   // the handler reports parse errors
+    static const char* const kCommon[] = {"apiVersion", "kind", "metadata"};
+    static const char* const kSpecStatus[] = {"spec", "status"};
+    static const char* const kConfigMap[] = {"data", "binaryData", "immutable"};
+    static const char* const kSecret[] = {"data", "stringData", "type", "immutable"};
+    static const char* const kEvent[] = {"involvedObject", "reason", "message", "source", "firstTimestamp", "lastTimestamp", "count",
+                                         "type", "eventTime", "series", "action", "related", "reportingComponent", "reportingInstance"};
+    static const char* const kLease[] = {"spec"};
+    static const char* const kMeta[] = {"name", "generateName", "namespace", "uid", "resourceVersion", "generation", "creationTimestamp",
+                                        "deletionTimestamp", "deletionGracePeriodSeconds", "labels", "annotations", "ownerReferences",
+                                        "finalizers", "managedFields", "selfLink"};
+    auto in = [](const std::string& key, const char* const* list, size_t n) {
+        for (size_t i = 0; i < n; ++i) if (key == list[i]) return true;
+        return false;
+    };
+    const std::string kind = info.kind;
+    for (const auto& kv : doc.obj_val) {
+        const std::string& key = kv.first;
+        bool ok = in(key, kCommon, 3);
+        if (!ok) {
+            if (kind == "ConfigMap") ok = in(key, kConfigMap, 3);
+            else if (kind == "Secret") ok = in(key, kSecret, 4);
+            else if (kind == "Event") ok = in(key, kEvent, sizeof(kEvent) / sizeof(kEvent[0]));
+            else if (kind == "Lease") ok = in(key, kLease, 1);
+            else ok = in(key, kSpecStatus, 2);
+        }
+        if (!ok) { out_unknown = key; return false; }
+    }
+    if (const models::JsonValue* meta = doc.get("metadata")) {
+        if (meta->is_object()) {
+            for (const auto& kv : meta->obj_val) {
+                if (!in(kv.first, kMeta, sizeof(kMeta) / sizeof(kMeta[0]))) { out_unknown = "metadata." + kv.first; return false; }
+            }
+        }
+    }
+    return true;
 }
 
 void RouteHandler::seed_namespaces() {
