@@ -2,6 +2,7 @@
 .pio/
 build/
 site/
+sdk/rust/target/
 
 # Python cache
 __pycache__/

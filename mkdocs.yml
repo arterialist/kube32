@@ -60,6 +60,7 @@ nav:
       - Capability firewall: architecture/capability-firewall.md
       - Virtual channel IPC: architecture/espnow-ipc.md
   - Workloads and tutorials:
+      - Writing app pods (Rust, C, AssemblyScript): app-development.md
       - GPIO peripheral firewall: workloads/gpio-blinker.md
       - Distributed TinyML pipeline: workloads/distributed-pipeline.md
       - Resource limits and OOM handling: workloads/resource-limits.md

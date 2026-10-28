@@ -1,0 +1,22 @@
+[package]
+name = "kube32-sdk"
+version = "0.1.0"
+edition = "2021"
+description = "no_std Rust bindings for the Kube32 WebAssembly pod ABI (include/runtime/k32_app_abi.h)"
+license = "Apache-2.0"
+publish = false
+
+[lib]
+crate-type = ["rlib"]
+
+[features]
+default = ["panic-handler"]
+# Defines the #[panic_handler] for wasm32 builds: logs "panic" through k32_log
+# and traps. Disable it when the application provides its own.
+panic-handler = []
+# k32_display_*, k32_key_read, k32_tone wrappers. Calls need the matching
+# hardware.kube32.io/* resource in the pod manifest.
+hardware = []
+# k32_fs_* wrappers (pod storage on the microSD card). Calls need
+# hardware.kube32.io/sd: "1" and a volume claim in the pod manifest.
+fs = []

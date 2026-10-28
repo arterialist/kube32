@@ -1,0 +1,21 @@
+# Link flags the Kube32 runtime needs when building a pod with plain
+# `cargo build --release --target wasm32-unknown-unknown` from this workspace.
+# `tools/kube32-cli build` passes the same flags itself (see docs/app-development.md).
+#
+#   stack-size       shadow stack for Rust locals (rustc's default is 1 MiB)
+#   initial/max      one 64 KiB page: the pod's whole linear memory; raise both
+#                    together (and the manifest's memory / esp32.io/psram) for
+#                    bigger apps
+[target.wasm32-unknown-unknown]
+rustflags = [
+    "-C", "link-arg=-zstack-size=16384",
+    "-C", "link-arg=--initial-memory=65536",
+    "-C", "link-arg=--max-memory=65536",
+]
+
+[target.wasm32v1-none]
+rustflags = [
+    "-C", "link-arg=-zstack-size=16384",
+    "-C", "link-arg=--initial-memory=65536",
+    "-C", "link-arg=--max-memory=65536",
+]

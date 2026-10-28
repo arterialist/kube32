@@ -1,0 +1,1501 @@
+#!/usr/bin/env python3
+"""
+kube32-cli: build, check, deploy and ship WebAssembly pods for Kube32.
+
+    kube32-cli build   <dir>         compile a C, Rust or AssemblyScript app to .wasm and check it
+    kube32-cli check   <file.wasm>   validate a module against the app ABI
+    kube32-cli deploy  <file.wasm>   create a Pod that carries the module inline (no reflash)
+    kube32-cli embed   <file.wasm>   copy the module into images/ for the next firmware build
+    kube32-cli sd-push <file.wasm>   copy the module onto a microSD card as kube32/images/<name>.wasm
+
+The ABI it checks against is include/runtime/k32_app_abi.h; the import
+signatures are the m3_LinkRawFunction calls in src/runtime/app_pod.cpp and
+src/runtime/host_functions.cpp, and the opcode table follows the wasm3 build
+flags in CMakeLists.txt and platformio.ini. Python standard library only.
+
+Exit codes:
+    0  success
+    1  input or toolchain problem (missing file or directory, compiler not found, build failed)
+    2  usage error (bad arguments)
+    3  the module does not satisfy the ABI (check failed)
+    4  kubectl failed
+    5  deploy: the pod already exists and --replace was not given
+"""
+import argparse
+import base64
+import glob
+import hashlib
+import json
+import os
+import re
+import shlex
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+
+VERSION = "0.2.0"
+
+EXIT_OK = 0
+EXIT_INPUT = 1
+EXIT_USAGE = 2
+EXIT_CHECK = 3
+EXIT_KUBECTL = 4
+EXIT_EXISTS = 5
+
+TOOLS_DIR = os.path.dirname(os.path.abspath(__file__))
+REPO_ROOT = os.path.dirname(TOOLS_DIR)
+
+PAGE = 65536
+MAX_REQUEST_BYTES = 16 * 1024   # K32_MAX_REQUEST_BYTES
+MAX_EVENT_BYTES = 200           # K32_MAX_EVENT_BYTES
+SD_IMAGE_LIMIT_NO_PSRAM = 256 * 1024     # kubelet.cpp sd_image_limit_bytes()
+SD_IMAGE_LIMIT_PSRAM = 2 * 1024 * 1024
+
+# ---------------------------------------------------------------------------
+# ABI tables (signatures in wasm3 notation: result then params, i=i32 I=i64)
+# ---------------------------------------------------------------------------
+# src/runtime/app_pod.cpp link_app_host_functions
+APP_IMPORTS = {
+    "k32_resp_begin": "v(iii)",
+    "k32_resp_header": "v(iiii)",
+    "k32_resp_write": "i(ii)",
+    "k32_resp_end": "v()",
+    "k32_event_emit": "i(iiii)",
+    "k32_time_ms": "I()",
+    "k32_log": "v(ii)",
+    "k32_random": "i()",
+    "k32_env_get": "i(iiii)",
+    "k32_mem_stats": "i(ii)",
+    "k32_display_text": "i(iiiiii)",
+    "k32_display_rect": "i(iiiii)",
+    "k32_display_bar": "i(iiiiiii)",
+    "k32_key_read": "i()",
+    "k32_tone": "i(iii)",
+    "k32_fs_open": "i(iii)",
+    "k32_fs_read": "i(iii)",
+    "k32_fs_write": "i(iii)",
+    "k32_fs_close": "i(i)",
+    "k32_fs_size": "i(i)",
+    "k32_fs_list": "i(iiii)",
+    "k32_fs_remove": "i(ii)",
+}
+# src/runtime/host_functions.cpp link_host_functions
+LOW_LEVEL_IMPORTS = {
+    "esp32_gpio_set_mode": "i(ii)",
+    "esp32_gpio_write": "i(ii)",
+    "esp32_gpio_read": "i(i)",
+    "esp32_adc_read": "i(i)",
+    "esp32_i2c_write": "i(iiii)",
+    "esp32_i2c_read": "i(iiii)",
+    "esp32_uart_write": "i(iii)",
+    "esp32_uart_read": "i(iii)",
+    "esp32_get_time_us": "I()",
+    "esp32_delay_ms": "v(i)",
+    "kube32_channel_open": "i(ii)",
+    "kube32_channel_send": "i(iii)",
+    "kube32_channel_recv": "i(iiii)",
+    "kube32_channel_close": "i(i)",
+}
+KNOWN_IMPORTS = dict(APP_IMPORTS)
+KNOWN_IMPORTS.update(LOW_LEVEL_IMPORTS)
+# GPIO/ADC/I2C/UART: granted by esp32.io/* resources, not by --hardware
+PERIPHERAL_IMPORTS = ("esp32_gpio_set_mode", "esp32_gpio_write", "esp32_gpio_read", "esp32_adc_read",
+                      "esp32_i2c_write", "esp32_i2c_read", "esp32_uart_write", "esp32_uart_read")
+
+# Exports the host looks up (k32_app_abi.h, app_pod.cpp, container_lifecycle.cpp)
+REQUEST_EXPORTS = {
+    "k32_init": "i()",
+    "k32_alloc": "i(i)",
+    "k32_handle": "i(ii)",
+    "k32_tick": "i(i)",
+    "k32_event": "i(iiii)",
+}
+ENTRY_EXPORTS = ("_start", "app_main", "main")   # searched in this order, called with no arguments
+ENTRY_SIGS = ("v()", "i()")
+
+# Which manifest resource an import needs (capability firewall)
+HARDWARE_FOR_IMPORT = {
+    "k32_display_text": "display",
+    "k32_display_rect": "display",
+    "k32_display_bar": "display",
+    "k32_key_read": "keyboard",
+    "k32_tone": "speaker",
+    "k32_event_emit": "ipc",
+    "kube32_channel_open": "ipc",
+    "kube32_channel_send": "ipc",
+    "kube32_channel_recv": "ipc",
+    "kube32_channel_close": "ipc",
+    "k32_fs_open": "sd",
+    "k32_fs_read": "sd",
+    "k32_fs_write": "sd",
+    "k32_fs_close": "sd",
+    "k32_fs_size": "sd",
+    "k32_fs_list": "sd",
+    "k32_fs_remove": "sd",
+}
+HARDWARE = {
+    # name: (resource key, securityContext capability) as src/hal/capability_firewall.cpp reads them
+    "display": ("hardware.kube32.io/tft-display", "DISPLAY"),
+    "keyboard": ("hardware.kube32.io/keyboard", "KEYBOARD"),
+    "speaker": ("hardware.kube32.io/speaker", "SPEAKER"),
+    "ipc": ("hardware.kube32.io/ipc", "CHANNEL_IPC"),
+    "sd": ("hardware.kube32.io/sd", "SD"),
+}
+HARDWARE_ORDER = ("ipc", "display", "keyboard", "speaker", "sd")
+HARDWARE_ALIASES = {"tft-display": "display", "tft": "display", "channel_ipc": "ipc", "channels": "ipc", "sd-card": "sd"}
+
+# ---------------------------------------------------------------------------
+# Quantities
+# ---------------------------------------------------------------------------
+_QUANTITY_RE = re.compile(r"^\s*(\d+)\s*([KMG]i?|k|m|g)?\s*$")
+
+
+def parse_quantity(text):
+    """Kubernetes quantity ('64Ki', '2Mi', '4096', '64K') to bytes."""
+    m = _QUANTITY_RE.match(str(text))
+    if not m:
+        raise ValueError("invalid quantity '%s' (expected e.g. 64Ki, 1280Ki, 2Mi, 65536)" % text)
+    n = int(m.group(1))
+    unit = m.group(2) or ""
+    mult = {
+        "": 1, "k": 1000, "K": 1000, "m": 1000 ** 2, "M": 1000 ** 2, "g": 1000 ** 3, "G": 1000 ** 3,
+        "Ki": 1024, "Mi": 1024 ** 2, "Gi": 1024 ** 3,
+    }[unit]
+    return n * mult
+
+
+def format_quantity(nbytes):
+    if nbytes and nbytes % (1024 * 1024) == 0:
+        return "%dMi" % (nbytes // (1024 * 1024))
+    if nbytes and nbytes % 1024 == 0:
+        return "%dKi" % (nbytes // 1024)
+    return str(nbytes)
+
+
+def fmt_bytes(n):
+    return "{:,}".format(n)
+
+
+# ---------------------------------------------------------------------------
+# Wasm binary reader
+# ---------------------------------------------------------------------------
+class WasmError(Exception):
+    pass
+
+
+class Reader:
+    def __init__(self, data, pos=0, end=None):
+        self.b = data
+        self.i = pos
+        self.end = len(data) if end is None else end
+
+    def eof(self):
+        return self.i >= self.end
+
+    def byte(self):
+        if self.i >= self.end:
+            raise WasmError("unexpected end of section at offset %d" % self.i)
+        v = self.b[self.i]
+        self.i += 1
+        return v
+
+    def peek(self):
+        if self.i >= self.end:
+            raise WasmError("unexpected end of section at offset %d" % self.i)
+        return self.b[self.i]
+
+    def uleb(self, bits=32):
+        r = s = 0
+        while True:
+            c = self.byte()
+            r |= (c & 0x7F) << s
+            s += 7
+            if not c & 0x80:
+                return r
+            if s >= bits + 7:
+                raise WasmError("LEB128 too long at offset %d" % self.i)
+
+    def u32(self):
+        return self.uleb(32)
+
+    def s_leb(self, bits):
+        r = s = 0
+        while True:
+            c = self.byte()
+            r |= (c & 0x7F) << s
+            s += 7
+            if not c & 0x80:
+                if s < bits and c & 0x40:
+                    r -= 1 << s
+                return r
+            if s > bits + 7:
+                raise WasmError("signed LEB128 too long at offset %d" % self.i)
+
+    def bytes(self, n):
+        if self.i + n > self.end:
+            raise WasmError("unexpected end of section at offset %d" % self.i)
+        v = self.b[self.i:self.i + n]
+        self.i += n
+        return v
+
+    def name(self):
+        n = self.u32()
+        return self.bytes(n).decode("utf-8", errors="replace")
+
+
+VALTYPE_LETTER = {0x7F: "i", 0x7E: "I", 0x7D: "f", 0x7C: "F", 0x7B: "v128", 0x70: "r", 0x6F: "e"}
+
+
+def sig_string(params, results):
+    """wasm3 notation: 'i(ii)' for (i32,i32)->i32, 'v()' for ()->()."""
+    if len(results) > 1:
+        res = "(" + "".join(VALTYPE_LETTER.get(t, "?") for t in results) + ")"
+    elif results:
+        res = VALTYPE_LETTER.get(results[0], "?")
+    else:
+        res = "v"
+    return res + "(" + "".join(VALTYPE_LETTER.get(t, "?") for t in params) + ")"
+
+
+class Module:
+    def __init__(self):
+        self.size = 0
+        self.types = []          # [(params, results)]
+        self.imports = []        # [(module, name, kind, typeidx or None)]
+        self.func_types = []     # type index per defined function
+        self.memories = []       # [(initial, max or None, flags)]
+        self.imported_memory = False
+        self.imported_table = False
+        self.tables = 0
+        self.globals = 0
+        self.exports = []        # [(name, kind, index)]
+        self.start = None
+        self.data_segments = 0
+        self.custom_sections = []
+        self.features = {}       # feature -> {opcode name: count}
+        self.unsupported = []    # [(func index or None, description)]
+        self.code_bytes = 0
+        self.data_bytes = 0
+
+    # --- lookups -----------------------------------------------------------
+    def import_funcs(self):
+        return [(m, n, t) for (m, n, k, t) in self.imports if k == 0]
+
+    def func_sig(self, index):
+        imported = self.import_funcs()
+        if index < len(imported):
+            t = imported[index][2]
+        else:
+            d = index - len(imported)
+            if d >= len(self.func_types):
+                return None
+            t = self.func_types[d]
+        if t >= len(self.types):
+            return None
+        return sig_string(*self.types[t])
+
+    def export_map(self):
+        return {name: (kind, idx) for (name, kind, idx) in self.exports}
+
+    def exported_func_sig(self, name):
+        kind_idx = self.export_map().get(name)
+        if not kind_idx or kind_idx[0] != 0:
+            return None
+        return self.func_sig(kind_idx[1])
+
+    def feature_note(self, feature, op):
+        d = self.features.setdefault(feature, {})
+        d[op] = d.get(op, 0) + 1
+
+
+KIND_NAMES = {0: "func", 1: "table", 2: "memory", 3: "global", 4: "tag"}
+
+
+def _read_limits(r):
+    flags = r.byte()
+    if flags & ~0x07:
+        raise WasmError("unknown limits flag 0x%02x" % flags)
+    wide = bool(flags & 0x04)
+    initial = r.uleb(64 if wide else 32)
+    maximum = r.uleb(64 if wide else 32) if flags & 0x01 else None
+    return initial, maximum, flags
+
+
+def _read_valtype_list(r):
+    n = r.u32()
+    return [r.byte() for _ in range(n)]
+
+
+def parse_module(data):
+    if len(data) < 8 or data[:4] != b"\0asm":
+        raise WasmError("not a WebAssembly module (missing \\0asm magic)")
+    version = int.from_bytes(data[4:8], "little")
+    if version != 1:
+        raise WasmError("unsupported wasm binary version %d" % version)
+    m = Module()
+    m.size = len(data)
+    r = Reader(data, 8)
+    while not r.eof():
+        sid = r.byte()
+        size = r.u32()
+        start = r.i
+        end = start + size
+        if end > len(data):
+            raise WasmError("section %d overruns the file" % sid)
+        s = Reader(data, start, end)
+        if sid == 0:
+            m.custom_sections.append(s.name())
+        elif sid == 1:
+            for _ in range(s.u32()):
+                form = s.byte()
+                if form != 0x60:
+                    raise WasmError("unsupported type form 0x%02x (GC types are not in this wasm3 build)" % form)
+                params = _read_valtype_list(s)
+                results = _read_valtype_list(s)
+                if 0x7B in params or 0x7B in results:
+                    m.unsupported.append((None, "the v128 value type (SIMD)"))
+                if len(results) > 1:
+                    m.feature_note("multi-value", "function type with %d results" % len(results))
+                m.types.append((params, results))
+        elif sid == 2:
+            for _ in range(s.u32()):
+                mod = s.name()
+                nm = s.name()
+                kind = s.byte()
+                if kind == 0:
+                    m.imports.append((mod, nm, 0, s.u32()))
+                elif kind == 1:
+                    s.byte()
+                    _read_limits(s)
+                    m.imported_table = True
+                    m.imports.append((mod, nm, 1, None))
+                elif kind == 2:
+                    _read_limits(s)
+                    m.imported_memory = True
+                    m.imports.append((mod, nm, 2, None))
+                elif kind == 3:
+                    s.byte()
+                    s.byte()
+                    m.imports.append((mod, nm, 3, None))
+                elif kind == 4:
+                    s.byte()
+                    s.u32()
+                    m.imports.append((mod, nm, 4, None))
+                else:
+                    raise WasmError("unknown import kind %d for %s.%s" % (kind, mod, nm))
+        elif sid == 3:
+            m.func_types = [s.u32() for _ in range(s.u32())]
+        elif sid == 4:
+            n = s.u32()
+            m.tables += n
+            for _ in range(n):
+                if s.peek() == 0x40:
+                    raise WasmError("table with an initializer expression (typed function references) is not in this wasm3 build")
+                s.byte()
+                _read_limits(s)
+        elif sid == 5:
+            for _ in range(s.u32()):
+                m.memories.append(_read_limits(s))
+        elif sid == 6:
+            m.globals = s.u32()
+            for _ in range(m.globals):
+                if s.byte() == 0x7B:
+                    m.unsupported.append((None, "a v128 global (SIMD)"))
+                s.byte()
+                _skip_const_expr(m, s)
+        elif sid == 7:
+            for _ in range(s.u32()):
+                nm = s.name()
+                kind = s.byte()
+                idx = s.u32()
+                m.exports.append((nm, kind, idx))
+        elif sid == 8:
+            m.start = s.u32()
+        elif sid == 10:
+            m.code_bytes = size
+            n = s.u32()
+            if n != len(m.func_types):
+                raise WasmError("code section has %d bodies for %d functions" % (n, len(m.func_types)))
+            n_imported = len(m.import_funcs())
+            for fi in range(n):
+                body_size = s.u32()
+                body = Reader(data, s.i, s.i + body_size)
+                _scan_body(m, body, n_imported + fi)
+                s.i += body_size
+        elif sid == 11:
+            m.data_bytes = size
+            n = s.u32()
+            m.data_segments = n
+            for _ in range(n):
+                flag = s.u32()
+                if flag == 1:
+                    m.feature_note("bulk-memory", "passive data segment")
+                else:
+                    if flag == 2:
+                        if s.u32() != 0:
+                            m.feature_note("multi-memory", "data segment for memory > 0")
+                    _skip_const_expr(m, s)
+                s.bytes(s.u32())
+        elif sid == 13:
+            m.unsupported.append((None, "a tag section (exception handling, disabled in this wasm3 build)"))
+        r.i = end
+    if r.i != len(data):
+        raise WasmError("trailing bytes after the last section")
+    return m
+
+
+EXTENDED_CONST = {0x6A: "i32.add", 0x6B: "i32.sub", 0x6C: "i32.mul", 0x7C: "i64.add", 0x7D: "i64.sub", 0x7E: "i64.mul"}
+
+
+def _skip_const_expr(m, r):
+    while True:
+        op = r.byte()
+        if op == 0x0B:
+            return
+        if op == 0x41:
+            r.s_leb(32)
+        elif op == 0x42:
+            r.s_leb(64)
+        elif op == 0x43:
+            r.bytes(4)
+        elif op == 0x44:
+            r.bytes(8)
+        elif op == 0x23:
+            r.u32()
+        elif op == 0xD0:
+            r.byte()
+        elif op == 0xD2:
+            r.u32()
+        elif op in EXTENDED_CONST:
+            m.feature_note("extended-const", EXTENDED_CONST[op])
+        else:
+            raise WasmError("unsupported opcode 0x%02x in a constant expression" % op)
+
+
+# ---------------------------------------------------------------------------
+# Opcode table of this wasm3 build
+# ---------------------------------------------------------------------------
+# third_party/wasm3/source/m3_compile.c with the flags of CMakeLists.txt and
+# platformio.ini: d_m3HasExceptionHandling=0, d_m3HasTypedRefs=0,
+# d_m3HasStackSwitching=0; reference types, tail calls, bulk memory,
+# sign extension, saturating conversions, multi-value, extended const,
+# multi-memory, memory64, wide arithmetic and atomics compiled in; no SIMD.
+# Features listed are the ones beyond the MVP; floating point is MVP and
+# compiled in (d_m3HasFloat=1).
+_NONE, _BLOCK, _U32, _BRTABLE, _CALLIND, _SELECT_T, _MEMARG, _MEMIDX, _S32, _S64, _F32, _F64, _REFTYPE = range(13)
+
+OPCODES = {}
+
+
+def _reg(lo, hi, kind, feature=None):
+    for op in range(lo, hi + 1):
+        OPCODES[op] = (kind, feature)
+
+
+_reg(0x00, 0x05, _NONE)
+_reg(0x02, 0x04, _BLOCK)
+_reg(0x0B, 0x0B, _NONE)
+_reg(0x0C, 0x0D, _U32)
+_reg(0x0E, 0x0E, _BRTABLE)
+_reg(0x0F, 0x0F, _NONE)
+_reg(0x10, 0x10, _U32)
+_reg(0x11, 0x11, _CALLIND)
+_reg(0x12, 0x12, _U32, "tail-call")
+_reg(0x13, 0x13, _CALLIND, "tail-call")
+_reg(0x1A, 0x1B, _NONE)
+_reg(0x1C, 0x1C, _SELECT_T, "reference-types")
+_reg(0x20, 0x24, _U32)
+_reg(0x25, 0x26, _U32, "reference-types")
+_reg(0x28, 0x3E, _MEMARG)
+_reg(0x3F, 0x40, _MEMIDX)
+_reg(0x41, 0x41, _S32)
+_reg(0x42, 0x42, _S64)
+_reg(0x43, 0x43, _F32)
+_reg(0x44, 0x44, _F64)
+_reg(0x45, 0xBF, _NONE)
+_reg(0xC0, 0xC4, _NONE, "sign-ext")
+_reg(0xD0, 0xD0, _REFTYPE, "reference-types")
+_reg(0xD1, 0xD1, _NONE, "reference-types")
+_reg(0xD2, 0xD2, _U32, "reference-types")
+
+# Present in the wasm3 sources, compiled out of this build
+DISABLED_OPCODES = {
+    0x08: "throw (exception handling, d_m3HasExceptionHandling=0)",
+    0x0A: "throw_ref (exception handling, d_m3HasExceptionHandling=0)",
+    0x1F: "try_table (exception handling, d_m3HasExceptionHandling=0)",
+    0x14: "call_ref (typed function references, d_m3HasTypedRefs=0)",
+    0x15: "return_call_ref (typed function references, d_m3HasTypedRefs=0)",
+    0xD4: "ref.as_non_null (typed function references, d_m3HasTypedRefs=0)",
+    0xD5: "br_on_null (typed function references, d_m3HasTypedRefs=0)",
+    0xD6: "br_on_non_null (typed function references, d_m3HasTypedRefs=0)",
+}
+
+OPCODE_NAMES = {
+    0x12: "return_call", 0x13: "return_call_indirect",
+    0x1C: "select t", 0x25: "table.get", 0x26: "table.set", 0xC0: "i32.extend8_s", 0xC1: "i32.extend16_s",
+    0xC2: "i64.extend8_s", 0xC3: "i64.extend16_s", 0xC4: "i64.extend32_s", 0xD0: "ref.null",
+    0xD1: "ref.is_null", 0xD2: "ref.func",
+}
+FC_OPS = {
+    0: ("i32.trunc_sat_f32_s", "nontrapping-fptoint", []), 1: ("i32.trunc_sat_f32_u", "nontrapping-fptoint", []),
+    2: ("i32.trunc_sat_f64_s", "nontrapping-fptoint", []), 3: ("i32.trunc_sat_f64_u", "nontrapping-fptoint", []),
+    4: ("i64.trunc_sat_f32_s", "nontrapping-fptoint", []), 5: ("i64.trunc_sat_f32_u", "nontrapping-fptoint", []),
+    6: ("i64.trunc_sat_f64_s", "nontrapping-fptoint", []), 7: ("i64.trunc_sat_f64_u", "nontrapping-fptoint", []),
+    8: ("memory.init", "bulk-memory", ["u32", "u32"]), 9: ("data.drop", "bulk-memory", ["u32"]),
+    10: ("memory.copy", "bulk-memory", ["u32", "u32"]), 11: ("memory.fill", "bulk-memory", ["u32"]),
+    12: ("table.init", "reference-types", ["u32", "u32"]), 13: ("elem.drop", "reference-types", ["u32"]),
+    14: ("table.copy", "reference-types", ["u32", "u32"]), 15: ("table.grow", "reference-types", ["u32"]),
+    16: ("table.size", "reference-types", ["u32"]), 17: ("table.fill", "reference-types", ["u32"]),
+    19: ("i64.add128", "wide-arithmetic", []), 20: ("i64.sub128", "wide-arithmetic", []),
+    21: ("i64.mul_wide_s", "wide-arithmetic", []), 22: ("i64.mul_wide_u", "wide-arithmetic", []),
+}
+
+
+def _read_memarg(m, r):
+    align = r.u32()
+    if align & 0x40:
+        if r.u32() != 0:
+            m.feature_note("multi-memory", "access to memory > 0")
+    r.uleb(64)
+
+
+def _scan_body(m, r, func_index):
+    for _ in range(r.u32()):      # locals
+        r.u32()
+        if r.byte() == 0x7B:
+            m.unsupported.append((func_index, "a v128 local (SIMD)"))
+            return
+    last = None
+    while not r.eof():
+        op = r.byte()
+        last = op
+        if op == 0xFC:
+            sub = r.u32()
+            if sub not in FC_OPS:
+                m.unsupported.append((func_index, "0xFC 0x%02x" % sub))
+                return
+            name, feature, imms = FC_OPS[sub]
+            for _imm in imms:
+                r.u32()
+            m.feature_note(feature, name)
+            continue
+        if op == 0xFD:
+            m.unsupported.append((func_index, "SIMD (0xFD prefix)"))
+            return
+        if op == 0xFE:
+            sub = r.u32()
+            if sub == 0x03:
+                r.byte()
+            elif sub <= 0x02 or 0x10 <= sub <= 0x4E:
+                _read_memarg(m, r)
+            else:
+                m.unsupported.append((func_index, "0xFE 0x%02x" % sub))
+                return
+            m.feature_note("atomics", "0xFE 0x%02x" % sub)
+            continue
+        if op in DISABLED_OPCODES:
+            m.unsupported.append((func_index, DISABLED_OPCODES[op]))
+            return
+        entry = OPCODES.get(op)
+        if entry is None:
+            m.unsupported.append((func_index, "opcode 0x%02x" % op))
+            return
+        kind, feature = entry
+        if feature:
+            m.feature_note(feature, OPCODE_NAMES.get(op, "0x%02x" % op))
+        if kind == _NONE:
+            pass
+        elif kind == _BLOCK:
+            b = r.peek()
+            if b == 0x40 or b in VALTYPE_LETTER:
+                r.byte()
+            else:
+                r.s_leb(33)
+                m.feature_note("multi-value", "block with a type index")
+        elif kind == _U32:
+            r.u32()
+        elif kind == _BRTABLE:
+            for _ in range(r.u32()):
+                r.u32()
+            r.u32()
+        elif kind == _CALLIND:
+            r.u32()
+            table = r.u32()
+            if table != 0:
+                m.feature_note("reference-types", "call_indirect on table %d" % table)
+        elif kind == _SELECT_T:
+            for _ in range(r.u32()):
+                r.byte()
+        elif kind == _MEMARG:
+            _read_memarg(m, r)
+        elif kind == _MEMIDX:
+            if r.u32() != 0:
+                m.feature_note("multi-memory", "memory.size/grow on memory > 0")
+        elif kind == _S32:
+            r.s_leb(32)
+        elif kind == _S64:
+            r.s_leb(64)
+        elif kind == _F32:
+            r.bytes(4)
+        elif kind == _F64:
+            r.bytes(8)
+        elif kind == _REFTYPE:
+            r.byte()
+    if last != 0x0B:
+        m.unsupported.append((func_index, "a body that does not end with 'end'"))
+
+
+# ---------------------------------------------------------------------------
+# ABI check
+# ---------------------------------------------------------------------------
+class CheckResult:
+    def __init__(self, path, module):
+        self.path = path
+        self.module = module
+        self.errors = []
+        self.warnings = []
+        self.kind = None             # "request", "event", "app_main"
+        self.entry = None
+        self.hardware = []           # inferred from imports, in HARDWARE_ORDER
+        self.peripheral_imports = []  # esp32_gpio_* and friends
+        self.memory_bytes = 0
+        self.memory_max_bytes = None
+
+    @property
+    def ok(self):
+        return not self.errors
+
+
+def check_module(path, data, memory_limit=None):
+    """Validates a module against the ABI. memory_limit is in bytes (None: not enforced)."""
+    try:
+        m = parse_module(data)
+    except WasmError as e:
+        res = CheckResult(path, None)
+        res.errors.append("malformed module: %s" % e)
+        return res
+    res = CheckResult(path, m)
+    err = res.errors.append
+    warn = res.warnings.append
+
+    # Imports: only functions, only from "env", only names the host links, with the host's signature
+    hw = set()
+    for (mod, name, kind, t) in m.imports:
+        if kind != 0:
+            err("import %s.%s is a %s; the host provides only functions" % (mod, name, KIND_NAMES.get(kind, kind)))
+            continue
+        if mod != "env":
+            err("import %s.%s: the host links functions into the \"env\" module only" % (mod, name))
+            continue
+        if name not in KNOWN_IMPORTS:
+            err("unknown import env.%s (the host does not provide it)" % name)
+            continue
+        sig = sig_string(*m.types[t]) if t < len(m.types) else "?"
+        if sig != KNOWN_IMPORTS[name]:
+            err("import env.%s has signature %s, the host links %s" % (name, sig, KNOWN_IMPORTS[name]))
+        if name in HARDWARE_FOR_IMPORT:
+            hw.add(HARDWARE_FOR_IMPORT[name])
+        if name in PERIPHERAL_IMPORTS:
+            res.peripheral_imports.append(name)
+    res.hardware = [h for h in HARDWARE_ORDER if h in hw]
+
+    # Memory: the host passes i32 offsets into memory 0, which the module defines
+    if m.imported_memory:
+        err("the module imports its memory; the host only runs modules that define their own")
+    if not m.memories and not m.imported_memory:
+        err("the module defines no linear memory")
+    if m.memories:
+        initial, maximum, flags = m.memories[0]
+        if flags & 0x04:
+            err("memory 0 is a 64-bit memory (memory64); the ABI passes 32-bit offsets")
+        if flags & 0x02:
+            warn("memory 0 is declared shared; pods run single-threaded")
+        if len(m.memories) > 1:
+            warn("the module defines %d memories; host imports read and write memory 0 only" % len(m.memories))
+        res.memory_bytes = initial * PAGE
+        res.memory_max_bytes = maximum * PAGE if maximum is not None else None
+        if maximum is None:
+            warn("memory has no maximum: memory.grow can run until the pod's limit traps it (link with --max-memory)")
+        if memory_limit is not None and res.memory_bytes > memory_limit:
+            err("memory: the module declares %s (%d pages) of linear memory but the limit is %s"
+                % (format_quantity(res.memory_bytes), initial, format_quantity(memory_limit)))
+
+    # Exports
+    ex = m.export_map()
+    has_handle = "k32_handle" in ex
+    entry = next((e for e in ENTRY_EXPORTS if e in ex), None)
+    for name, want in REQUEST_EXPORTS.items():
+        if name in ex:
+            got = m.exported_func_sig(name)
+            if got is None:
+                err("export %s is not a function" % name)
+            elif got != want:
+                err("export %s has signature %s, the host calls %s" % (name, got, want))
+    if entry:
+        got = m.exported_func_sig(entry)
+        if got is None:
+            err("export %s is not a function" % entry)
+        elif got not in ENTRY_SIGS:
+            err("export %s has signature %s; the host calls it with no arguments (v() or i())" % (entry, got))
+    event_like = any(n in ex for n in ("k32_init", "k32_tick", "k32_event"))
+    if has_handle:
+        res.kind = "request"
+    elif entry:
+        res.kind = "app_main"
+    elif event_like:
+        res.kind = "event"
+    else:
+        err("the module exports neither k32_handle (request pod) nor app_main, _start or main (app_main pod); exports: %s"
+            % (", ".join(sorted(ex)) or "none"))
+    res.entry = entry
+    if has_handle and entry:
+        warn("the module exports both k32_handle and %s: the host runs %s on the pod thread and serves requests between its calls" % (entry, entry))
+    if (has_handle or "k32_event" in ex) and "k32_alloc" not in ex:
+        err("k32_alloc is missing: the host copies requests and events into memory it obtains from k32_alloc")
+
+    # Opcodes and sections
+    for (fi, what) in m.unsupported:
+        where = "function %d uses" % fi if fi is not None else "the module has"
+        err("%s %s, which this wasm3 build does not run" % (where, what))
+    if m.start is not None:
+        warn("the module has a start function (index %d); it runs when the module is instantiated" % m.start)
+    if m.imported_table:
+        err("the module imports a table; the host provides none")
+    return res
+
+
+def hardware_for_name(text):
+    name = text.strip().lower()
+    name = HARDWARE_ALIASES.get(name, name)
+    if name not in HARDWARE:
+        raise ValueError("unknown hardware '%s' (expected display, keyboard, speaker, ipc, sd or none)" % text.strip())
+    return name
+
+
+def format_report(res):
+    lines = []
+    m = res.module
+    if m is None:
+        lines.append("%s: unreadable" % res.path)
+    else:
+        lines.append("%s: %s bytes (code %s, data %s)" % (res.path, fmt_bytes(m.size), fmt_bytes(m.code_bytes), fmt_bytes(m.data_bytes)))
+        if res.kind == "request":
+            lines.append("kind: request pod (k32_handle)")
+        elif res.kind == "event":
+            lines.append("kind: event pod (no k32_handle; k32_init/k32_tick/k32_event)")
+        elif res.kind == "app_main":
+            lines.append("kind: app_main pod (%s runs on the pod thread)" % res.entry)
+        else:
+            lines.append("kind: unknown")
+        funcs = sorted(n for (n, k, _i) in m.exports if k == 0)
+        others = sorted("%s [%s]" % (n, KIND_NAMES.get(k, k)) for (n, k, _i) in m.exports if k != 0)
+        lines.append("exports (%d): %s" % (len(m.exports), ", ".join(funcs + others) or "none"))
+        imps = [(mod, n) for (mod, n, k, _t) in m.imports]
+        if imps:
+            lines.append("imports (%d): %s" % (len(imps), ", ".join(n if mod == "env" else mod + "." + n for mod, n in sorted(imps))))
+        else:
+            lines.append("imports (0)")
+        if m.memories:
+            initial, maximum, _f = m.memories[0]
+            mx = "max %d page%s" % (maximum, "" if maximum == 1 else "s") if maximum is not None else "no maximum"
+            lines.append("memory: %d page%s = %s bytes (%s), %s" % (initial, "" if initial == 1 else "s", fmt_bytes(initial * PAGE),
+                                                                  format_quantity(initial * PAGE), mx))
+        if m.features:
+            parts = []
+            for feat in sorted(m.features):
+                ops = m.features[feat]
+                detail = ", ".join("%s x%d" % (op, cnt) for op, cnt in sorted(ops.items()))
+                parts.append("%s (%s)" % (feat, detail))
+            lines.append("features beyond MVP: " + "; ".join(parts))
+        else:
+            lines.append("features beyond MVP: none")
+        if res.hardware:
+            lines.append("hardware: %s  (manifest resources: %s)" % (", ".join(res.hardware), ", ".join(HARDWARE[h][0] for h in res.hardware)))
+        else:
+            lines.append("hardware: none")
+        if res.peripheral_imports:
+            lines.append("peripheral imports: %s  (granted by esp32.io/* resources, see docs/workloads/gpio-blinker.md)"
+                         % ", ".join(res.peripheral_imports))
+    for w in res.warnings:
+        lines.append("warning: " + w)
+    for e in res.errors:
+        lines.append("error: " + e)
+    lines.append("ok" if res.ok else "FAILED (%d error%s)" % (len(res.errors), "" if len(res.errors) == 1 else "s"))
+    return "\n".join(lines)
+
+
+def read_wasm(path):
+    if not os.path.isfile(path):
+        raise FileNotFoundError("no such file: %s" % path)
+    with open(path, "rb") as f:
+        return f.read()
+
+
+def err_exit(msg, code):
+    print("error: %s" % msg, file=sys.stderr)
+    return code
+
+
+# ---------------------------------------------------------------------------
+# build
+# ---------------------------------------------------------------------------
+# The flags apps/*/Makefile use for this runtime
+C_CFLAGS = ["--target=wasm32", "-O2", "-nostdlib", "-ffreestanding", "-fno-exceptions",
+            "-mcpu=mvp", "-msign-ext", "-mbulk-memory", "-Wall", "-Wextra"]
+
+
+def find_rust_lld():
+    cand = os.environ.get("RUST_LLD")
+    if cand and os.path.isfile(cand):
+        return cand
+    for name in ("wasm-ld", "rust-lld"):
+        p = shutil.which(name)
+        if p:
+            return p
+    hits = sorted(glob.glob(os.path.join(os.path.expanduser("~"), ".rustup", "toolchains", "*", "lib", "rustlib", "*", "bin", "rust-lld")))
+    return hits[0] if hits else None
+
+
+def detect_language(d):
+    if os.path.isfile(os.path.join(d, "Cargo.toml")):
+        return "rust"
+    if os.path.isfile(os.path.join(d, "asconfig.json")):
+        return "assemblyscript"
+    pkg = os.path.join(d, "package.json")
+    if os.path.isfile(pkg):
+        try:
+            with open(pkg) as f:
+                j = json.load(f)
+            deps = {}
+            deps.update(j.get("dependencies") or {})
+            deps.update(j.get("devDependencies") or {})
+            if "assemblyscript" in deps:
+                return "assemblyscript"
+        except (OSError, ValueError):
+            pass
+    if os.path.isfile(os.path.join(d, "Makefile")):
+        return "c-make"
+    if glob.glob(os.path.join(d, "*.c")):
+        return "c"
+    return None
+
+
+def run(cmd, cwd=None, env=None):
+    proc = subprocess.run(cmd, cwd=cwd, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    return proc.returncode, proc.stdout
+
+
+def build_c_sources(d, out_path, memory_bytes, stack_bytes, log):
+    clang = os.environ.get("CLANG", "clang")
+    if not shutil.which(clang):
+        return EXIT_INPUT, "clang not found in PATH (set CLANG=/path/to/clang)"
+    lld = find_rust_lld()
+    if not lld:
+        return EXIT_INPUT, "no wasm linker: install a Rust toolchain with rustup (it ships rust-lld) or put wasm-ld in PATH"
+    sources = sorted(glob.glob(os.path.join(d, "*.c")))
+    with tempfile.TemporaryDirectory(prefix="kube32-cli-") as objdir:
+        objs = []
+        for src in sources:
+            obj = os.path.join(objdir, os.path.splitext(os.path.basename(src))[0] + ".o")
+            cmd = [clang] + C_CFLAGS + ["-I" + os.path.join(REPO_ROOT, "include"), "-c", src, "-o", obj]
+            log(" ".join(shlex.quote(c) for c in cmd))
+            rc, outp = run(cmd)
+            if outp.strip():
+                log(outp.rstrip())
+            if rc != 0:
+                if not log.verbose:
+                    sys.stderr.write(outp)
+                return EXIT_INPUT, "clang failed on %s (exit %d)" % (src, rc)
+            objs.append(obj)
+        cmd = [lld, "-flavor", "wasm", "--no-entry", "--export-dynamic", "--allow-undefined",
+               "-z", "stack-size=%d" % stack_bytes, "--initial-memory=%d" % memory_bytes, "--max-memory=%d" % memory_bytes,
+               "-o", out_path] + objs
+        log(" ".join(shlex.quote(c) for c in cmd))
+        rc, outp = run(cmd)
+        if outp.strip():
+            log(outp.rstrip())
+        if rc != 0:
+            if not log.verbose:
+                sys.stderr.write(outp)
+            return EXIT_INPUT, "link failed (exit %d)" % rc
+    return EXIT_OK, None
+
+
+def makefile_wasm_outputs(d):
+    """The .wasm files the Makefile's commands write with -o, from a dry run (make -n -B)."""
+    rc, outp = run(["make", "-n", "-B", "-C", d])
+    if rc != 0:
+        return []
+    found = []
+    for line in outp.splitlines():
+        try:
+            words = shlex.split(line)
+        except ValueError:
+            continue
+        for i, w in enumerate(words[:-1]):
+            if w == "-o" and words[i + 1].endswith(".wasm"):
+                p = os.path.normpath(os.path.join(d, words[i + 1]))
+                if p not in found:
+                    found.append(p)
+    return found
+
+
+def build_c_make(d, artifact, log):
+    if not shutil.which("make"):
+        return EXIT_INPUT, None, "make not found in PATH"
+    candidates = [artifact] if artifact else makefile_wasm_outputs(d)
+    cmd = ["make", "-C", d]
+    log(" ".join(shlex.quote(c) for c in cmd))
+    rc, outp = run(cmd)
+    if outp.strip():
+        log(outp.rstrip())
+    if rc != 0:
+        if not log.verbose:
+            sys.stderr.write(outp)
+        return EXIT_INPUT, None, "make failed (exit %d)" % rc
+    existing = [p for p in candidates if os.path.isfile(p)]
+    if not existing:
+        return EXIT_INPUT, None, ("make finished but %s does not exist" % artifact if artifact else
+                                  "make finished but no command in the Makefile writes a .wasm with -o; pass --artifact <path>")
+    if len(existing) > 1:
+        return EXIT_INPUT, None, "the Makefile writes several modules (%s); pass --artifact <path>" % ", ".join(existing)
+    return EXIT_OK, existing[0], None
+
+
+def cargo_env():
+    """Prefers the rustup toolchain (~/.cargo/bin) over a distribution rustc earlier in PATH:
+    rustup targets such as wasm32-unknown-unknown only exist there."""
+    env = dict(os.environ)
+    rustup_bin = os.path.join(os.path.expanduser("~"), ".cargo", "bin")
+    if os.path.isfile(os.path.join(rustup_bin, "cargo")) and not env.get("CARGO"):
+        env["PATH"] = rustup_bin + os.pathsep + env.get("PATH", "")
+    return env
+
+
+def build_rust(d, target, memory_bytes, stack_bytes, log):
+    env = cargo_env()
+    cargo = env.get("CARGO") or shutil.which("cargo", path=env["PATH"])
+    if not cargo:
+        return EXIT_INPUT, None, None, "cargo not found in PATH (install Rust with rustup)"
+    manifest = os.path.join(d, "Cargo.toml")
+    rc, outp = run([cargo, "metadata", "--no-deps", "--format-version", "1", "--manifest-path", manifest], env=env)
+    if rc != 0:
+        sys.stderr.write(outp)
+        return EXIT_INPUT, None, None, "cargo metadata failed (exit %d)" % rc
+    meta = json.loads(outp)
+    pkg = next((p for p in meta.get("packages", [])
+                if os.path.realpath(p.get("manifest_path", "")) == os.path.realpath(manifest)), None)
+    if pkg is None:
+        return EXIT_INPUT, None, None, "no package with manifest %s in cargo metadata" % manifest
+    lib = next((t for t in pkg.get("targets", []) if "cdylib" in t.get("crate_types", [])), None)
+    if lib is None:
+        return EXIT_INPUT, None, None, "%s has no cdylib target: add [lib] crate-type = [\"cdylib\"] to Cargo.toml" % pkg["name"]
+    # RUSTFLAGS replaces any target.<triple>.rustflags from .cargo/config.toml, so
+    # the memory and stack sizes given here are the ones that reach the linker.
+    flags = ["-C", "link-arg=-zstack-size=%d" % stack_bytes,
+             "-C", "link-arg=--initial-memory=%d" % memory_bytes,
+             "-C", "link-arg=--max-memory=%d" % memory_bytes]
+    env["RUSTFLAGS"] = " ".join(([env["RUSTFLAGS"]] if env.get("RUSTFLAGS") else []) + flags)
+    cmd = [cargo, "build", "--release", "--lib", "--target", target, "--manifest-path", manifest]
+    log("RUSTFLAGS=%s %s" % (shlex.quote(env["RUSTFLAGS"]), " ".join(shlex.quote(c) for c in cmd)))
+    rc, outp = run(cmd, env=env)
+    if outp.strip():
+        log(outp.rstrip())
+    if rc != 0:
+        if not log.verbose:
+            sys.stderr.write(outp)
+        hint = ""
+        if "may not be installed" in outp or "can't find crate for `core`" in outp:
+            hint = "; install the target with: rustup target add %s" % target
+        return EXIT_INPUT, None, None, "cargo failed (exit %d)%s" % (rc, hint)
+    produced = os.path.join(meta["target_directory"], target, "release", lib["name"].replace("-", "_") + ".wasm")
+    if not os.path.isfile(produced):
+        return EXIT_INPUT, None, None, "cargo finished but %s does not exist" % produced
+    return EXIT_OK, produced, pkg["name"], None
+
+
+# AssemblyScript: no GC (stub runtime), no assertion code, abort() traps instead
+# of importing env.abort, which the host does not provide.
+ASC_FLAGS = ["--runtime", "stub", "--noAssert", "--use", "abort=", "-O3z"]
+
+
+def build_assemblyscript(d, out_path, memory_bytes, log):
+    asc = os.path.join(d, "node_modules", ".bin", "asc")
+    if not os.path.isfile(asc):
+        asc = shutil.which("asc")
+    if not asc:
+        return EXIT_INPUT, "asc not found: run 'npm install --save-dev assemblyscript' in %s" % d
+    entries = []
+    cfg = os.path.join(d, "asconfig.json")
+    if os.path.isfile(cfg):
+        try:
+            with open(cfg) as f:
+                entries = json.load(f).get("entries") or []
+        except (OSError, ValueError) as e:
+            return EXIT_INPUT, "cannot read %s: %s" % (cfg, e)
+    if not entries:
+        entries = ["assembly/index.ts"]
+    pages = memory_bytes // PAGE
+    cmd = [asc] + entries + ["-o", out_path] + ASC_FLAGS + ["--initialMemory", str(pages), "--maximumMemory", str(pages)]
+    log(" ".join(shlex.quote(c) for c in cmd))
+    rc, outp = run(cmd, cwd=d)
+    if outp.strip():
+        log(outp.rstrip())
+    if rc != 0:
+        if not log.verbose:
+            sys.stderr.write(outp)
+        return EXIT_INPUT, "asc failed (exit %d)" % rc
+    return EXIT_OK, None
+
+
+class Log:
+    def __init__(self, verbose):
+        self.verbose = verbose
+
+    def __call__(self, s):
+        if self.verbose:
+            print(s)
+
+
+def cmd_build(args):
+    d = os.path.abspath(args.dir)
+    if not os.path.isdir(d):
+        return err_exit("no such directory: %s" % args.dir, EXIT_INPUT)
+    lang = args.lang or detect_language(d)
+    if lang is None:
+        return err_exit("cannot tell how to build %s: no Cargo.toml, asconfig.json, package.json with assemblyscript, Makefile or *.c" % d, EXIT_INPUT)
+    try:
+        memory_bytes = parse_quantity(args.memory)
+        stack_bytes = parse_quantity(args.stack)
+    except ValueError as e:
+        return err_exit(str(e), EXIT_USAGE)
+    if memory_bytes == 0 or memory_bytes % PAGE:
+        return err_exit("--memory must be a non-zero multiple of 64Ki (one wasm page), got %s" % args.memory, EXIT_USAGE)
+    if stack_bytes >= memory_bytes:
+        return err_exit("--stack %s does not fit in --memory %s" % (args.stack, args.memory), EXIT_USAGE)
+    name = args.name or os.path.basename(d.rstrip(os.sep))
+    log = Log(args.verbose)
+    print("building %s (%s)" % (d, lang))
+
+    if lang == "c":
+        out_path = os.path.abspath(args.out) if args.out else os.path.join(d, "build", name + ".wasm")
+        os.makedirs(os.path.dirname(out_path), exist_ok=True)
+        rc, err = build_c_sources(d, out_path, memory_bytes, stack_bytes, log)
+        if rc != EXIT_OK:
+            return err_exit(err, rc)
+        produced = out_path
+    elif lang == "c-make":
+        rc, produced, err = build_c_make(d, os.path.abspath(args.artifact) if args.artifact else None, log)
+        if rc != EXIT_OK:
+            return err_exit(err, rc)
+        if args.out:
+            out_path = os.path.abspath(args.out)
+            os.makedirs(os.path.dirname(out_path), exist_ok=True)
+            if os.path.realpath(out_path) != os.path.realpath(produced):
+                shutil.copyfile(produced, out_path)
+            produced = out_path
+    elif lang == "rust":
+        rc, built, pkg_name, err = build_rust(d, args.target, memory_bytes, stack_bytes, log)
+        if rc != EXIT_OK:
+            return err_exit(err, rc)
+        name = args.name or pkg_name
+        out_path = os.path.abspath(args.out) if args.out else os.path.join(d, "build", name + ".wasm")
+        os.makedirs(os.path.dirname(out_path), exist_ok=True)
+        shutil.copyfile(built, out_path)
+        produced = out_path
+    elif lang == "assemblyscript":
+        out_path = os.path.abspath(args.out) if args.out else os.path.join(d, "build", name + ".wasm")
+        os.makedirs(os.path.dirname(out_path), exist_ok=True)
+        rc, err = build_assemblyscript(d, out_path, memory_bytes, log)
+        if rc != EXIT_OK:
+            return err_exit(err, rc)
+        produced = out_path
+    else:
+        return err_exit("unknown language '%s' (expected c, rust or assemblyscript)" % lang, EXIT_USAGE)
+
+    rel = os.path.relpath(produced)
+    res = check_module(produced if rel.startswith("..") else rel, read_wasm(produced))
+    print(format_report(res))
+    return EXIT_OK if res.ok else EXIT_CHECK
+
+
+# ---------------------------------------------------------------------------
+# check
+# ---------------------------------------------------------------------------
+def cmd_check(args):
+    limit = None
+    if args.memory:
+        try:
+            limit = parse_quantity(args.memory)
+        except ValueError as e:
+            return err_exit(str(e), EXIT_USAGE)
+    try:
+        data = read_wasm(args.file)
+    except FileNotFoundError as e:
+        return err_exit(str(e), EXIT_INPUT)
+    res = check_module(args.file, data, memory_limit=limit)
+    print(format_report(res))
+    return EXIT_OK if res.ok else EXIT_CHECK
+
+
+# ---------------------------------------------------------------------------
+# deploy
+# ---------------------------------------------------------------------------
+_NAME_RE = re.compile(r"^[a-z0-9]([-a-z0-9]*[a-z0-9])?$")
+_CLAIM_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,31}$")      # CapabilityFirewall::valid_sd_claim
+_ENV_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
+
+def q(s):
+    """A YAML scalar: JSON strings are valid YAML."""
+    return json.dumps(s, ensure_ascii=False)
+
+
+def render_manifest(name, namespace, node, data, kind, memory_bytes, psram_bytes, hardware, env, port,
+                    image=None, sd_claim=None):
+    """Pod manifest (YAML). Without `image` the module travels in the kube32.io/wasm-base64 annotation."""
+    digest = hashlib.sha256(data).hexdigest()
+    out = []
+    a = out.append
+    a("apiVersion: v1")
+    a("kind: Pod")
+    a("metadata:")
+    a("  name: %s" % name)
+    a("  namespace: %s" % namespace)
+    a("  labels:")
+    a("    app: %s" % name)
+    a("  annotations:")
+    if image is None:
+        a("    kube32.io/wasm-base64: %s" % q(base64.b64encode(data).decode("ascii")))
+    a("    kube32.io/wasm-sha256: %s" % q(digest))
+    a("    kube32.io/wasm-size: %s" % q(str(len(data))))
+    a("spec:")
+    if node:
+        a("  nodeSelector:")
+        a("    kubernetes.io/hostname: %s" % node)
+    a("  restartPolicy: Always")
+    if "sd" in hardware:
+        a("  volumes:")
+        a("    - name: data")
+        a("      persistentVolumeClaim:")
+        a("        claimName: %s" % sd_claim)
+    a("  containers:")
+    a("    - name: %s" % name)
+    # The kubelet tries its embedded registry before the annotation, keyed by
+    # the last path component before ':' (ImageRegistry::normalize_key). With
+    # the digest in that component an embedded image of the same name cannot
+    # shadow the inline module.
+    a("      image: %s" % q(image or "wasm://inline/%s-%s" % (name, digest[:12])))
+    if kind == "request" and port:
+        a("      ports:")
+        a("        - containerPort: %d" % port)
+        a("          name: http")
+    if env:
+        a("      env:")
+        for k, v in env:
+            a("        - name: %s" % k)
+            a("          value: %s" % q(v))
+    a("      resources:")
+    a("        requests:")
+    a("          memory: %s" % format_quantity(memory_bytes))
+    if psram_bytes:
+        a("          esp32.io/psram: %s" % format_quantity(psram_bytes))
+    for hw in hardware:
+        a("          %s: \"1\"" % HARDWARE[hw][0])
+    a("        limits:")
+    a("          memory: %s" % format_quantity(memory_bytes))
+    if psram_bytes:
+        a("          esp32.io/psram: %s" % format_quantity(psram_bytes))
+    if hardware:
+        a("      securityContext:")
+        a("        capabilities:")
+        a("          add: [%s]" % ", ".join(q(HARDWARE[hw][1]) for hw in hardware))
+    return "\n".join(out) + "\n"
+
+
+def parse_env(items):
+    env = []
+    for item in items or []:
+        if "=" not in item:
+            raise ValueError("--env expects KEY=VALUE, got '%s'" % item)
+        k, v = item.split("=", 1)
+        if not _ENV_RE.match(k):
+            raise ValueError("invalid environment variable name '%s'" % k)
+        env.append((k, v))
+    return env
+
+
+def parse_hardware(text):
+    """--hardware: None (infer), or a list; '' and 'none' grant nothing."""
+    if text is None:
+        return None
+    out = []
+    for item in text.split(","):
+        if not item.strip() or item.strip().lower() == "none":
+            continue
+        hw = hardware_for_name(item)
+        if hw not in out:
+            out.append(hw)
+    return [h for h in HARDWARE_ORDER if h in out]
+
+
+def kubectl_base(args):
+    cmd = [args.kubectl or "kubectl"]
+    if args.kubeconfig:
+        cmd += ["--kubeconfig", args.kubeconfig]
+    if args.context:
+        cmd += ["--context", args.context]
+    if args.server:
+        cmd += ["--server", args.server]
+    return cmd
+
+
+def kubectl(cmd, stdin=None):
+    proc = subprocess.run(cmd, input=stdin, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    return proc.returncode, proc.stdout, proc.stderr
+
+
+def cmd_deploy(args):
+    try:
+        data = read_wasm(args.file)
+    except FileNotFoundError as e:
+        return err_exit(str(e), EXIT_INPUT)
+    name = args.name or os.path.splitext(os.path.basename(args.file))[0]
+    if not _NAME_RE.match(name) or len(name) > 63:
+        return err_exit("invalid pod name '%s' (lowercase letters, digits and '-', at most 63 characters; pass --name)" % name, EXIT_USAGE)
+    try:
+        memory_bytes = parse_quantity(args.memory)
+        psram_bytes = parse_quantity(args.psram) if args.psram else 0
+        env = parse_env(args.env)
+        hardware = parse_hardware(args.hardware)
+    except ValueError as e:
+        return err_exit(str(e), EXIT_USAGE)
+    if args.image is not None and not args.image.startswith("wasm://"):
+        return err_exit("--image must be a wasm:// reference such as wasm://sd/%s or wasm://embedded/%s:v1" % (name, name), EXIT_USAGE)
+
+    # kubelet.cpp: the sandbox is max(limits.memory, esp32.io/psram), at least one page
+    sandbox = max(memory_bytes, psram_bytes, PAGE)
+    res = check_module(args.file, data, memory_limit=sandbox)
+    if not res.ok:
+        print(format_report(res))
+        if res.memory_bytes > sandbox:
+            print("hint: pass --memory %s, or --psram %s on a node with PSRAM" % (format_quantity(res.memory_bytes), format_quantity(res.memory_bytes)),
+                  file=sys.stderr)
+        return EXIT_CHECK
+    if hardware is None:
+        hardware = list(res.hardware)
+    else:
+        for hw in res.hardware:
+            if hw not in hardware:
+                print("warning: the module imports %s functions but --hardware does not grant '%s': those calls will return K32_ERR_PERM"
+                      % (hw, hw), file=sys.stderr)
+    sd_claim = None
+    if "sd" in hardware:
+        sd_claim = args.sd_claim or name
+        if not _CLAIM_RE.match(sd_claim):
+            return err_exit("invalid sd volume claim '%s' (1..32 characters of a-z, 0-9 and '-', not starting with '-'); pass --sd-claim" % sd_claim,
+                            EXIT_USAGE)
+    elif args.sd_claim:
+        return err_exit("--sd-claim needs the sd hardware (--hardware ...,sd, or a module that imports k32_fs_*)", EXIT_USAGE)
+    manifest = render_manifest(name, args.namespace, args.node, data, res.kind, memory_bytes, psram_bytes, hardware, env, args.port,
+                               image=args.image, sd_claim=sd_claim)
+    if args.dry_run:
+        sys.stdout.write(manifest)
+        return EXIT_OK
+
+    base = kubectl_base(args)
+    if not shutil.which(base[0]):
+        return err_exit("%s not found in PATH" % base[0], EXIT_INPUT)
+    rc, out, errout = kubectl(base + ["get", "pod", name, "-n", args.namespace, "-o", "jsonpath={.metadata.annotations.kube32\\.io/wasm-sha256}"])
+    if rc == 0:
+        if not args.replace:
+            have = out.strip()
+            print("error: pod %s/%s already exists (module sha256 %s, this file %s); the kubelet does not restart a running pod "
+                  "when its manifest changes: pass --replace to delete and recreate it"
+                  % (args.namespace, name, (have[:12] or "unknown"), hashlib.sha256(data).hexdigest()[:12]), file=sys.stderr)
+            return EXIT_EXISTS
+        rc, out, errout = kubectl(base + ["delete", "pod", name, "-n", args.namespace, "--wait=true", "--timeout=%ds" % args.timeout])
+        sys.stdout.write(out)
+        if rc != 0:
+            sys.stderr.write(errout)
+            return err_exit("kubectl delete failed (exit %d)" % rc, EXIT_KUBECTL)
+    elif "NotFound" not in errout and "not found" not in errout:
+        sys.stderr.write(errout)
+        return err_exit("kubectl get pod failed (exit %d)" % rc, EXIT_KUBECTL)
+
+    # create, not apply: apply would copy the whole manifest, module included,
+    # into the kubectl.kubernetes.io/last-applied-configuration annotation.
+    # --validate=false: the Kube32 API server publishes no OpenAPI schema
+    # (/openapi/v3 is an empty index, /openapi/v2 is absent), so kubectl's
+    # client-side validation cannot run; this manifest is generated above.
+    rc, out, errout = kubectl(base + ["create", "--validate=false", "-f", "-"], stdin=manifest)
+    sys.stdout.write(out)
+    if rc != 0:
+        sys.stderr.write(errout)
+        return err_exit("kubectl create failed (exit %d)" % rc, EXIT_KUBECTL)
+    where = ("image %s" % args.image) if args.image else ("%s bytes inline" % fmt_bytes(len(data)))
+    print("deployed %s/%s: %s, %s linear memory%s, hardware: %s"
+          % (args.namespace, name, where, format_quantity(sandbox), " (PSRAM)" if psram_bytes > memory_bytes else "",
+             ", ".join(hardware) or "none"))
+    return EXIT_OK
+
+
+# ---------------------------------------------------------------------------
+# embed
+# ---------------------------------------------------------------------------
+_IMAGE_RE = re.compile(r"^[a-z0-9][a-z0-9._-]*$")
+
+
+def cmd_embed(args):
+    try:
+        data = read_wasm(args.file)
+    except FileNotFoundError as e:
+        return err_exit(str(e), EXIT_INPUT)
+    name = args.name or os.path.splitext(os.path.basename(args.file))[0]
+    if not _IMAGE_RE.match(name):
+        return err_exit("invalid image name '%s' (lowercase letters, digits, '.', '_' and '-'; pass --name)" % name, EXIT_USAGE)
+    res = check_module(args.file, data)
+    if not res.ok:
+        print(format_report(res))
+        return EXIT_CHECK
+    images_dir = os.path.abspath(args.images_dir) if args.images_dir else os.path.join(REPO_ROOT, "images")
+    if not os.path.isdir(images_dir):
+        return err_exit("images directory does not exist: %s" % images_dir, EXIT_INPUT)
+    dest = os.path.join(images_dir, name + ".wasm")
+    if os.path.exists(dest) and not args.force:
+        return err_exit("%s exists; pass --force to replace it" % dest, EXIT_INPUT)
+    shutil.copyfile(args.file, dest)
+    print("embedded %s (%s bytes)" % (dest, fmt_bytes(len(data))))
+    print("image: wasm://embedded/%s:v1" % name)
+    print("next: firmware: pio run -e esp32s3 (the pre-build step regenerates the image table)")
+    print("      host simulator: cmake -S . -B build && cmake --build build (configure picks up new files in images/)")
+    return EXIT_OK
+
+
+# ---------------------------------------------------------------------------
+# sd-push
+# ---------------------------------------------------------------------------
+_SD_TOKEN_RE = re.compile(r"^[A-Za-z0-9_-][A-Za-z0-9._-]*$")   # image_registry.cpp valid_image_token
+
+
+def cmd_sd_push(args):
+    try:
+        data = read_wasm(args.file)
+    except FileNotFoundError as e:
+        return err_exit(str(e), EXIT_INPUT)
+    name = args.name or os.path.splitext(os.path.basename(args.file))[0]
+    if not _SD_TOKEN_RE.match(name) or len(name) > 48:
+        return err_exit("invalid image name '%s' (1..48 characters of A-Z, a-z, 0-9, '.', '_', '-', not starting with '.'; pass --name)" % name,
+                        EXIT_USAGE)
+    if args.tag is not None and (not _SD_TOKEN_RE.match(args.tag) or len(args.tag) > 24):
+        return err_exit("invalid tag '%s' (1..24 characters of A-Z, a-z, 0-9, '.', '_', '-', not starting with '.')" % args.tag, EXIT_USAGE)
+    if not os.path.isdir(args.to):
+        return err_exit("%s is not a directory: mount the card and pass its mount point, e.g. --to /Volumes/CARD" % args.to, EXIT_INPUT)
+    res = check_module(args.file, data)
+    if not res.ok:
+        print(format_report(res))
+        return EXIT_CHECK
+    images_dir = os.path.join(args.to, "kube32", "images")
+    try:
+        os.makedirs(images_dir, exist_ok=True)
+    except OSError as e:
+        return err_exit("cannot create %s: %s" % (images_dir, e.strerror or e), EXIT_INPUT)
+    fname = name + ("-" + args.tag if args.tag else "") + ".wasm"     # sd_image_relative_path()
+    dest = os.path.join(images_dir, fname)
+    previous = os.path.getsize(dest) if os.path.isfile(dest) else None
+    tmp = dest + ".part"
+    try:
+        with open(tmp, "wb") as f:
+            f.write(data)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, dest)
+    except OSError as e:
+        return err_exit("cannot write %s: %s" % (dest, e.strerror or e), EXIT_INPUT)
+    verb = "replaced" if previous is not None else "copied"
+    print("%s %s (%s bytes%s)" % (verb, dest, fmt_bytes(len(data)), (", was %s" % fmt_bytes(previous)) if previous is not None else ""))
+    print("image: wasm://sd/%s%s" % (name, ":" + args.tag if args.tag else ""))
+    if len(data) > SD_IMAGE_LIMIT_PSRAM:
+        print("warning: %s bytes is over the 2 MiB the kubelet pulls from a card on any node" % fmt_bytes(len(data)), file=sys.stderr)
+    elif len(data) > SD_IMAGE_LIMIT_NO_PSRAM:
+        print("warning: %s bytes is over the 256 KiB a node without PSRAM pulls from its card" % fmt_bytes(len(data)), file=sys.stderr)
+    return EXIT_OK
+
+
+# ---------------------------------------------------------------------------
+# main
+# ---------------------------------------------------------------------------
+def build_parser():
+    p = argparse.ArgumentParser(prog="kube32-cli", description="Build, check, deploy and ship Kube32 WebAssembly pods.",
+                                epilog="exit codes: 0 ok, 1 input/toolchain problem, 2 usage, 3 ABI check failed, 4 kubectl failed, "
+                                       "5 deploy: pod exists (pass --replace)")
+    p.add_argument("--version", action="version", version="kube32-cli " + VERSION)
+    sub = p.add_subparsers(dest="command")
+
+    b = sub.add_parser("build", help="compile a C, Rust or AssemblyScript app directory to .wasm and check it")
+    b.add_argument("dir")
+    b.add_argument("--lang", choices=["c", "c-make", "rust", "assemblyscript"], help="override language detection")
+    b.add_argument("--name", help="module name (default: crate name or directory name)")
+    b.add_argument("-o", "--out", help="output path (default: <dir>/build/<name>.wasm; Makefile projects: where the Makefile writes it)")
+    b.add_argument("--artifact", help="Makefile projects: the .wasm the Makefile produces, when the dry run cannot tell")
+    b.add_argument("--memory", default="64Ki", help="linear memory, initial = maximum, multiple of 64Ki (default 64Ki); not used for Makefile projects")
+    b.add_argument("--stack", default="16Ki", help="shadow stack for C and Rust (default 16Ki)")
+    b.add_argument("--target", default="wasm32-unknown-unknown", help="Rust target (default wasm32-unknown-unknown)")
+    b.add_argument("-v", "--verbose", action="store_true", help="print the compiler commands and their output")
+    b.set_defaults(func=cmd_build)
+
+    c = sub.add_parser("check", help="validate a .wasm against the app ABI and this runtime's opcode set")
+    c.add_argument("file")
+    c.add_argument("--memory", help="fail when the module declares more linear memory than this (e.g. 64Ki, 1280Ki)")
+    c.set_defaults(func=cmd_check)
+
+    d = sub.add_parser("deploy", help="create a Pod that carries the module in the kube32.io/wasm-base64 annotation (no reflash)")
+    d.add_argument("file")
+    d.add_argument("--name", help="pod name (default: file stem)")
+    d.add_argument("--node", help="pin to a node (spec.nodeSelector kubernetes.io/hostname)")
+    d.add_argument("--namespace", default="default")
+    d.add_argument("--memory", default="64Ki", help="resources memory request and limit (default 64Ki)")
+    d.add_argument("--psram", help="esp32.io/psram request and limit; the Wasm sandbox is max(memory, psram)")
+    d.add_argument("--hardware", help="comma list of ipc, display, keyboard, speaker, sd, or 'none' (default: inferred from the module's imports)")
+    d.add_argument("--sd-claim", help="volume claim for the sd hardware (default: the pod name)")
+    d.add_argument("--env", action="append", metavar="K=V", help="container environment variable (repeatable)")
+    d.add_argument("--image", help="use this wasm:// reference (wasm://sd/<name>, wasm://embedded/<name>:v1) instead of carrying the module inline")
+    d.add_argument("--port", type=int, default=7000, help="containerPort for request pods (default 7000)")
+    d.add_argument("--replace", action="store_true", help="delete an existing pod of that name first")
+    d.add_argument("--timeout", type=int, default=60, help="seconds to wait for the old pod to go away with --replace (default 60)")
+    d.add_argument("--dry-run", action="store_true", help="print the manifest instead of creating the pod")
+    d.add_argument("--context", help="kubectl context (default: the current context)")
+    d.add_argument("--kubeconfig", help="kubectl kubeconfig path")
+    d.add_argument("--server", help="kubectl API server URL")
+    d.add_argument("--kubectl", help="kubectl binary (default: kubectl from PATH)")
+    d.set_defaults(func=cmd_deploy)
+
+    e = sub.add_parser("embed", help="copy a checked module into images/ so the next firmware build embeds it")
+    e.add_argument("file")
+    e.add_argument("--name", help="image name (default: file stem); pods reference wasm://embedded/<name>:v1")
+    e.add_argument("--force", action="store_true", help="replace an existing image")
+    e.add_argument("--images-dir", help="images directory (default: <repo>/images)")
+    e.set_defaults(func=cmd_embed)
+
+    s = sub.add_parser("sd-push", help="copy a checked module onto a mounted microSD card as kube32/images/<name>.wasm")
+    s.add_argument("file")
+    s.add_argument("--to", required=True, help="the card's mount point, e.g. /Volumes/CARD")
+    s.add_argument("--name", help="image name (default: file stem); pods reference wasm://sd/<name>")
+    s.add_argument("--tag", help="image tag: written as <name>-<tag>.wasm, referenced as wasm://sd/<name>:<tag>")
+    s.set_defaults(func=cmd_sd_push)
+    return p
+
+
+def main(argv=None):
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    if not args.command:
+        parser.print_help()
+        return EXIT_USAGE
+    return args.func(args)
+
+
+if __name__ == "__main__":
+    sys.exit(main())
