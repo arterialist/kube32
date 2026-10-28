@@ -187,6 +187,12 @@ u32        session_active(void);
 int status_from_name(const char* s, u32 len);         /* -1 if unknown */
 int user_from_name(const char* s, u32 len);
 
+#if defined(K32_NATIVE)
+/* Test helper: recounts issues/comments and compares with the stored
+ * counters (issue_t.comment_count, chains, issue_live, comment_live). */
+int  store_verify_counts(void);
+#endif
+
 /* request latency */
 void stats_record_request(u32 dur_us, int is_error);
 

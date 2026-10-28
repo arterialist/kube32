@@ -12,6 +12,13 @@ extern "C" {
 void  kube32_pool_reserve(size_t bytes);           /* call once at boot; 0 disables (internal RAM) */
 void  kube32_pool_reserve_external(size_t bytes);  /* same, from external PSRAM */
 void* kube32_pool_alloc(size_t bytes);             /* NULL when unavailable */
+/* Boards without PSRAM also reserve one pod thread stack at boot, when a
+ * contiguous block is still available; later the heap is too fragmented. */
+void   kube32_pool_reserve_stack(size_t bytes);
+void*  kube32_pool_stack_alloc(size_t bytes);      /* NULL when taken or too small */
+int    kube32_pool_stack_free(void* ptr);
+size_t kube32_pool_stack_size(void);
+size_t kube32_pool_stack_available(void);          /* bytes free for scheduling purposes */
 int   kube32_pool_owns(const void* ptr);
 size_t kube32_pool_block_size(void);
 int   kube32_pool_free(void* ptr);                 /* 1 when the pointer was pooled */

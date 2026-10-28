@@ -20,6 +20,7 @@ struct Thread::Impl {
     bool is_valid{false};
     bool joinable{false};
     bool caps_task{false};   // created with xTaskCreatePinnedToCoreWithCaps (PSRAM stack)
+    StaticTask_t* static_tcb{nullptr};   // task control block for a caller-provided stack
     EntryFn entry{nullptr};
     void* arg{nullptr};
     Config config;
@@ -55,6 +56,13 @@ Thread::~Thread() {
         if (impl_->join_sem) {
             vSemaphoreDelete(impl_->join_sem);
         }
+        if (impl_->static_tcb) {
+            // vTaskDelete(NULL) in the trampoline runs after join_sem is given;
+            // give the kernel a tick to finish removing the task before the
+            // control block memory is reused.
+            vTaskDelay(pdMS_TO_TICKS(20));
+            heap_caps_free(impl_->static_tcb);
+        }
         delete impl_;
         impl_ = nullptr;
     }
@@ -88,6 +96,31 @@ bool Thread::start(EntryFn entry, void* arg, const Config& config) {
 
     BaseType_t core = (config.core_affinity < 0) ? tskNO_AFFINITY : config.core_affinity;
     BaseType_t rc = pdFAIL;
+    if (config.stack_buffer) {
+        // Caller-owned stack (reserved at boot): a static task. The control
+        // block is kept until this Thread is destroyed, which happens after
+        // join(), so the kernel never sees it go away underneath a live task.
+        if (!impl_->static_tcb) impl_->static_tcb = static_cast<StaticTask_t*>(heap_caps_calloc(1, sizeof(StaticTask_t), MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
+        if (impl_->static_tcb) {
+            impl_->handle = xTaskCreateStaticPinnedToCore(
+                Impl::freertos_trampoline,
+                config.name ? config.name : "k32_task",
+                static_cast<uint32_t>(config.stack_size),
+                impl_,
+                config.priority,
+                static_cast<StackType_t*>(config.stack_buffer),
+                impl_->static_tcb,
+                core
+            );
+            rc = impl_->handle ? pdPASS : pdFAIL;
+        }
+        if (rc == pdPASS) {
+            impl_->is_valid = true;
+            impl_->joinable = true;
+            return true;
+        }
+        return false;
+    }
 #if CONFIG_SPIRAM_ALLOW_STACK_EXTERNAL_MEMORY
     if (config.stack_in_psram && heap_caps_get_free_size(MALLOC_CAP_SPIRAM) > config.stack_size + 4096) {
         // Big worker stacks live in PSRAM so internal SRAM stays for Wi-Fi, lwIP and DMA.

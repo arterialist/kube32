@@ -16,12 +16,12 @@ static void one(const char* label, const char* method, const char* path, const c
     int64_t t0 = now_us();
     int st = hx_request(method, path, cookie, body);
     int64_t dt = now_us() - t0;
-    printf("  %-34s %3d %6u B %6u cmp %5u term %5u stop %5u post | %6u putc %5u bulk %6u bulkB %6u scanB %4u key %4u int %3u flush %6lld us\n", label, st, shim.body_len,
+    printf("  %-34s %3d %6u B %6u cmp %5u term %5u stop %5u post | %6u putc %5u bulk %6u bulkB %6u scanB %4u key %4u int %3u flush | %7u loop %5u scan %6lld us\n", label, st, shim.body_len,
            k32_prof.cmp_calls - before.cmp_calls, k32_prof.term_cmps - before.term_cmps,
            k32_prof.stop_cmps - before.stop_cmps, k32_prof.posting_steps - before.posting_steps,
            k32_prof.jw_putc - before.jw_putc, k32_prof.jw_writes - before.jw_writes, k32_prof.jw_write_bytes - before.jw_write_bytes,
            k32_prof.jw_scan_bytes - before.jw_scan_bytes, k32_prof.jw_keys - before.jw_keys, k32_prof.jw_ints - before.jw_ints,
-           k32_prof.resp_writes - before.resp_writes, (long long)dt);
+           k32_prof.resp_writes - before.resp_writes, k32_prof.loop_iters - before.loop_iters, k32_prof.scan_issues - before.scan_issues, (long long)dt);
 }
 
 int main(void) {

@@ -1,4 +1,5 @@
 #include "runtime/container_lifecycle.hpp"
+#include "runtime/pod_memory_pool.h"
 #include <cstdint>
 #include "runtime/pod_log.hpp"
 #if defined(ESP_PLATFORM)
@@ -271,6 +272,13 @@ bool ContainerLifecycleController::start() {
                                                       std::to_string(status_.memory_used_bytes / 1024) + " KiB, limit " +
                                                       std::to_string(config_.memory_limit_bytes / 1024) + " KiB)");
 
+    // Request-handling pods (k32_handle/k32_tick/k32_event, no _start or
+    // app_main) are driven by the host's own threads; a worker thread would
+    // only sleep, so none is created and no stack is reserved for it.
+    if (!find_export_locked("_start") && !find_export_locked("app_main") && !find_export_locked("main")) {
+        return true;
+    }
+
     osal::Thread::Config t_cfg;
     thread_name_ = "pod_" + config_.pod_id;
     t_cfg.name = thread_name_.c_str();
@@ -283,9 +291,32 @@ bool ContainerLifecycleController::start() {
     t_cfg.priority = 5;
     t_cfg.core_affinity = 1;
     t_cfg.stack_in_psram = true;   // falls back to internal RAM on boards without PSRAM
+#if defined(ESP_PLATFORM)
+    if (osal::System::get_total_psram_bytes() == 0 && kube32_pool_stack_size() > 0) {
+        // Internal RAM fragments quickly once Wi-Fi is up; the stack reserved
+        // at boot is the only reliable source of a 48 KB block.
+        pod_stack_ = kube32_pool_stack_alloc(kube32_pool_stack_size());
+        if (!pod_stack_) {
+            status_.phase = ContainerPhase::Failed;
+            status_.ready = false;
+            status_.exit_message = "no pod thread stack available";
+            return false;
+        }
+        t_cfg.stack_buffer = pod_stack_;
+        t_cfg.stack_size = kube32_pool_stack_size();
+    }
+#endif
 
     worker_thread_ = std::make_unique<osal::Thread>();
-    return worker_thread_->start(worker_thread_entry, this, t_cfg);
+    bool ok = worker_thread_->start(worker_thread_entry, this, t_cfg);
+    if (!ok) {
+        worker_thread_.reset();
+        if (pod_stack_) { kube32_pool_stack_free(pod_stack_); pod_stack_ = nullptr; }
+        status_.phase = ContainerPhase::Failed;
+        status_.ready = false;
+        status_.exit_message = "pod thread could not be created";
+    }
+    return ok;
 }
 
 bool ContainerLifecycleController::pause() {
@@ -374,7 +405,8 @@ bool ContainerLifecycleController::stop(uint32_t grace_period_ms) {
         // Clean completion or gas trap caught: synchronously join worker thread to prevent UAF
         if (worker_thread_ && worker_thread_->is_joinable()) {
             worker_thread_->join();
-            worker_thread_.reset();
+            worker_thread_.reset();   // waits for the kernel to retire a static task
+            if (pod_stack_) { kube32_pool_stack_free(pod_stack_); pod_stack_ = nullptr; }
             std::cout << "[RUNTIME] " << config_.pod_id << ": stopped (" << status_.termination_reason << ")" << std::endl;
             PodLogStore::runtime().append(config_.pod_id, "[kube32] container stopped (" +
                                                               (status_.termination_reason.empty() ? std::string("stop requested by kubelet") : status_.termination_reason) + ")");
@@ -475,6 +507,11 @@ int32_t ContainerLifecycleController::call_function(const std::string& fn_name, 
 
 bool ContainerLifecycleController::has_export(const char* fn_name) const {
     osal::LockGuard guard(mutex_);
+    return find_export_locked(fn_name);
+}
+
+// Caller holds mutex_.
+bool ContainerLifecycleController::find_export_locked(const char* fn_name) const {
     if (!m3_runtime_ || !fn_name) return false;
     IM3Function fn = nullptr;
     M3Result r = m3_FindFunction(&fn, reinterpret_cast<IM3Runtime>(m3_runtime_), fn_name);

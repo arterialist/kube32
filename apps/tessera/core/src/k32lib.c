@@ -14,8 +14,8 @@ typedef u32 __attribute__((aligned(1), may_alias)) u32u;
 
 void* memcpy(void* dst, const void* src, size_t n) {
     u8* d = (u8*)dst; const u8* s = (const u8*)src;
-    while (n >= 4) { *(u32u*)d = *(const u32u*)s; d += 4; s += 4; n -= 4; }
-    while (n--) *d++ = *s++;
+    while (n >= 4) { K32_PROF(loop_iters); *(u32u*)d = *(const u32u*)s; d += 4; s += 4; n -= 4; }
+    while (n--) { K32_PROF(loop_iters); *d++ = *s++; }
     return dst;
 }
 void* memmove(void* dst, const void* src, size_t n) {
@@ -43,7 +43,7 @@ int memcmp(const void* a, const void* b, size_t n) {
     for (size_t i = 0; i < n; i++) { if (x[i] != y[i]) return (int)x[i] - (int)y[i]; }
     return 0;
 }
-size_t strlen(const char* s) { size_t n = 0; while (s[n]) n++; return n; }
+size_t strlen(const char* s) { size_t n = 0; while (s[n]) { K32_PROF(loop_iters); n++; } return n; }
 
 /* ---- strings ------------------------------------------------------------- */
 int k32_streq(const char* a, u32 alen, const char* lit) {
@@ -73,7 +73,7 @@ static const char k_dd[201] =
 /* writes v right-aligned into tmp[..end), returns the start index */
 static u32 fmt_u32_rev(char* tmp, u32 end, u32 v) {
     u32 i = end;
-    while (v >= 100) { u32 q = v / 100; u32 r = v - q * 100; i -= 2; tmp[i] = k_dd[r * 2]; tmp[i + 1] = k_dd[r * 2 + 1]; v = q; }
+    while (v >= 100) { K32_PROF(loop_iters); u32 q = v / 100; u32 r = v - q * 100; i -= 2; tmp[i] = k_dd[r * 2]; tmp[i + 1] = k_dd[r * 2 + 1]; v = q; }
     if (v >= 10) { i -= 2; tmp[i] = k_dd[v * 2]; tmp[i + 1] = k_dd[v * 2 + 1]; }
     else tmp[--i] = (char)('0' + v);
     return i;
@@ -307,6 +307,7 @@ void k32_topk_push(k32_topk* t, u16 v) {
     }
     u32 lo = 0, hi = t->n;
     while (lo < hi) {
+        K32_PROF(loop_iters);
         u32 mid = (lo + hi) / 2;
         if (t->cmp(t->a[mid], v, t->ctx) < 0) lo = mid + 1; else hi = mid;
     }
@@ -356,6 +357,7 @@ static void jw_write(k32_jw* w, const char* s, u32 n) {
     k32_prof.jw_write_bytes += n;
 #endif
     while (n) {
+        K32_PROF(loop_iters);
         u32 room = w->cap - w->len;
         if (room == 0) {
             if (w->flush) { k32_jw_flush(w); room = w->cap; }
@@ -404,6 +406,7 @@ void k32_jw_escaped(k32_jw* w, const char* s, u32 len) {
 #endif
     u32 run = 0;
     for (u32 i = 0; i < len; i++) {
+        K32_PROF(loop_iters);
         u8 c = (u8)s[i];
         if (!jw_esc_tab[c]) continue;
         if (i > run) jw_write(w, s + run, i - run);

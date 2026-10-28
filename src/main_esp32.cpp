@@ -33,6 +33,7 @@
 #include "osal/socket.hpp"
 #include "hal/tft_keyboard_hardware.hpp"
 #include "runtime/pod_memory_pool.h"
+#include "runtime/pod_log.hpp"
 
 #include <cstdio>
 #include <cstring>
@@ -425,6 +426,8 @@ void cluster_task(void* pv) {
     // Wi-Fi and lwIP fragment the heap, so a 64 KiB pod can still be placed.
     if (!ident.has_psram) {
         kube32_pool_reserve(67 * 1024);
+        kube32_pool_reserve_stack(49152);   // one pod thread stack, while a contiguous block still exists
+        kube32::runtime::PodLogStore::runtime().set_ring_capacity(1024);   // 300 KB SRAM: a short log per pod
     } else {
         // Keep the largest PSRAM block whole for a big data pod (24 Wasm pages
         // plus header) before task stacks and buffers fragment the heap.
@@ -551,7 +554,7 @@ void cluster_task(void* pv) {
     // Module parse + compile + k32_init (seeding) all run on the kubelet task.
     // Runs k32_init: on Xtensa the interpreter's op chain is not fully tail
     // call optimised, so a seed chunk needs well over 40 KB of native stack.
-    kubelet_cfg.task_stack_size = ident.has_psram ? 65536 : 14336;
+    kubelet_cfg.task_stack_size = ident.has_psram ? 65536 : 12288;
     kubelet_cfg.task_stack_in_psram = ident.has_psram;
     kubelet_cfg.control_plane = ident.is_control_plane;
     kubelet_cfg.core_affinity = 1;
@@ -671,7 +674,7 @@ void cluster_task(void* pv) {
     {
         kube32::osal::Thread::Config t_cfg;
         t_cfg.name = "k32_tick";
-        t_cfg.stack_size = ident.has_psram ? 65536 : 8192;   // same reason as the kubelet stack
+        t_cfg.stack_size = ident.has_psram ? 65536 : 4096;   // same reason as the kubelet stack; display boards host no ticking pods
         t_cfg.stack_in_psram = ident.has_psram;
         t_cfg.priority = 4;
         t_cfg.core_affinity = 1;

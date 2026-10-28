@@ -11,6 +11,9 @@ static size_t s_block_size = 0;
 static std::atomic<bool> s_in_use{false};
 static bool s_external = false;
 static const size_t k_threshold = 48 * 1024;
+static void* s_stack = nullptr;
+static size_t s_stack_size = 0;
+static std::atomic<bool> s_stack_in_use{false};
 
 extern "C" {
 
@@ -41,6 +44,32 @@ size_t kube32_pool_available(int* out_external) {
 }
 
 size_t kube32_pool_threshold(void) { return k_threshold; }
+
+void kube32_pool_reserve_stack(size_t bytes) {
+    if (s_stack || bytes == 0) return;
+#if defined(ESP_PLATFORM)
+    s_stack = heap_caps_malloc(bytes, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+#else
+    s_stack = std::malloc(bytes);
+#endif
+    s_stack_size = s_stack ? bytes : 0;
+}
+
+void* kube32_pool_stack_alloc(size_t bytes) {
+    if (!s_stack || bytes > s_stack_size) return nullptr;
+    bool expected = false;
+    if (!s_stack_in_use.compare_exchange_strong(expected, true)) return nullptr;
+    return s_stack;
+}
+
+int kube32_pool_stack_free(void* ptr) {
+    if (!ptr || ptr != s_stack) return 0;
+    s_stack_in_use.store(false);
+    return 1;
+}
+
+size_t kube32_pool_stack_size(void) { return s_stack_size; }
+size_t kube32_pool_stack_available(void) { return (s_stack && !s_stack_in_use.load()) ? s_stack_size : 0; }
 size_t kube32_pool_block_size(void) { return s_block_size; }
 
 void* kube32_pool_alloc(size_t bytes) {

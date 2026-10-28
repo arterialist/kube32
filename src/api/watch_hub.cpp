@@ -1,4 +1,5 @@
 #include "api/watch_hub.hpp"
+#include <iostream>
 #include "osal/system.hpp"
 
 #include <cerrno>
@@ -85,6 +86,7 @@ bool WatchHub::add_watch(osal::Socket sock, WatchSpec spec) {
         return false;
     }
     streams_.push_back(std::move(s));
+    std::cout << "[API] watch stream opened (" << streams_.size() << "/" << options_.max_streams << " in use)" << std::endl;
     return true;
 }
 
@@ -341,6 +343,7 @@ void WatchHub::run() {
                     finish(*streams_[i]);
                     streams_.erase(streams_.begin() + static_cast<long>(i));
                     dropped_.fetch_add(1, std::memory_order_relaxed);
+                    std::cout << "[API] watch stream closed (" << streams_.size() << "/" << options_.max_streams << " in use)" << std::endl;
                 } else {
                     ++i;
                 }

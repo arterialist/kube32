@@ -89,7 +89,7 @@ bool Kubelet::start() {
     // initialises Wasm modules (seconds on a 240 MHz core).
     osal::Thread::Config h_cfg;
     h_cfg.name = "k32_kubelet_hb";
-    h_cfg.stack_size = 12288;
+    h_cfg.stack_size = config_.task_stack_in_psram ? 12288 : 8192;   // JSON for lease + status patch
     h_cfg.priority = config_.task_priority;
     h_cfg.core_affinity = config_.core_affinity;
     h_cfg.stack_in_psram = config_.task_stack_in_psram;
@@ -389,7 +389,15 @@ bool Kubelet::deploy_and_start_pod(const models::KubePod& pod_in, const std::str
         return fail_pod("CrashLoopBackOff", deploy_err, 1);
     }
     record_pod_event(rec, "Created", "Created container " + rec.container_name, false);
-    runtime_.start(pod_key);
+    if (!runtime_.start(pod_key)) {
+        // Typically the pod thread's stack could not be allocated; say so
+        // instead of reporting a container that does not exist as Running.
+        std::string why = "failed to start container " + rec.container_name + ": cannot create pod thread (out of memory)";
+        std::cout << "[KUBELET] " << pod_key << ": " << why << std::endl;
+        record_pod_event(rec, "Failed", "Error: " + why, true);
+        runtime_.terminate(pod_key);
+        return fail_pod("CrashLoopBackOff", why, 1);
+    }
     std::cout << "[KUBELET] " << pod_key << ": running image " << image_key << " (" << image_len
               << " bytes, limit " << rec.memory_limit_bytes / 1024 << " KiB)" << std::endl;
     record_pod_event(rec, "Started", "Started container " + rec.container_name, false);

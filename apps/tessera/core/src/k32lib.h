@@ -29,6 +29,8 @@ typedef struct {
     u32 jw_scan_bytes;  /* bytes that went through the escape scanner */
     u32 jw_keys, jw_ints;
     u32 resp_writes;    /* k32_resp_write calls (flushes) */
+    u32 loop_iters;     /* loop iterations on the response path (memcpy words, scans, digits, labels, candidate scan) */
+    u32 scan_issues;    /* issues visited by the candidate scan */
 } k32_prof_t;
 extern k32_prof_t k32_prof;
 #define K32_PROF(field) ((void)(k32_prof.field++))

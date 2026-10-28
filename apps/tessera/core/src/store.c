@@ -272,3 +272,26 @@ void stats_record_request(u32 dur_us, int is_error) {
     g.lat_ring[g.lat_n % T_LAT_RING] = dur_us;
     g.lat_n++;
 }
+
+#if defined(K32_NATIVE)
+int store_verify_counts(void) {
+    u32 live = 0, clive = 0;
+    for (u32 id = 1; id <= g.issue_count; id++) {
+        const issue_t* it = &g.issues[id - 1];
+        /* recount this issue's comments from the comment table */
+        u32 n = 0, last = 0;
+        for (u32 cid = 1; cid <= g.comment_count; cid++) if (g.comments[cid - 1].issue == id) { n++; last = cid; }
+        if (n != it->comment_count) return -1;
+        if ((n == 0) != (it->comment_head == 0)) return -2;
+        if (it->comment_tail != last) return -3;
+        /* the chain visits exactly those comments, in id order */
+        u32 walked = 0, prev = 0, cid = it->comment_head;
+        while (cid) { if (cid <= prev || g.comments[cid - 1].issue != id) return -4; walked++; prev = cid; cid = g.comments[cid - 1].next; }
+        if (walked != n) return -5;
+        if (!(it->flags & ISSUE_DELETED)) { live++; clive += n; }
+    }
+    if (live != g.issue_live) return -6;
+    if (clive != g.comment_live) return -7;
+    return 0;
+}
+#endif

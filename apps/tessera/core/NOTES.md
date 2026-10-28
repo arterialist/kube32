@@ -136,7 +136,8 @@ both counters per request.
 
 `k32_topk` keeps a sorted u16 array of size k: one comparator call against
 the k-th best, and binary search + memmove only when the candidate beats it.
-`h_issues_list` scans newest-first for descending orders so arrivals tend to
+`h_issues_list` keeps the k-th best as a (primary, secondary, id) u32 triple and
+rejects candidates inline without calling the comparator; it scans newest-first for descending orders so arrivals tend to
 follow the sort order (for `sort=key&order=desc` that is 2,449 compares
 instead of 14,344 with an ascending scan); the result does not depend on the
 scan order because `cmp_issue` is strict for every key (id tiebreaker, flipped

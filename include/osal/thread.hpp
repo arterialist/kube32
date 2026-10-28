@@ -16,8 +16,9 @@ public:
         uint32_t priority;   // FreeRTOS priority (1..24) or POSIX priority
         int core_affinity;   // -1: any/no affinity, 0: Core 0, 1: Core 1
         bool stack_in_psram; // ESP32: allocate the stack from external RAM when present
+        void* stack_buffer;  // ESP32: run on this caller-owned stack (stack_size bytes) instead of allocating one
 
-        Config() : name("k32_task"), stack_size(8192), priority(5), core_affinity(-1), stack_in_psram(false) {}
+        Config() : name("k32_task"), stack_size(8192), priority(5), core_affinity(-1), stack_in_psram(false), stack_buffer(nullptr) {}
     };
 
     Thread();

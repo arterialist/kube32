@@ -20,6 +20,7 @@ NodeTelemetry NodeStatusReporter::collect_telemetry() const {
     int pool_external = 0;
     size_t pool_free = kube32_pool_available(&pool_external);
     if (pool_external) t.free_psram_bytes += pool_free; else t.free_heap_bytes += pool_free;
+    t.free_heap_bytes += kube32_pool_stack_available();
     t.cpu_freq_mhz = osal::System::get_cpu_freq_mhz();
     t.uptime_ms = osal::System::get_uptime_ms();
 

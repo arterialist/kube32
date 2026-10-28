@@ -78,6 +78,7 @@ public:
 
     // Introspection used by the application ABI host
     bool has_export(const char* fn_name) const;
+    bool find_export_locked(const char* fn_name) const;   // mutex_ held by caller
     uint8_t* guest_memory(size_t& out_size) const;
     void* m3_runtime_handle() const { return m3_runtime_; }
     const ContainerConfig& config() const { return config_; }
@@ -97,6 +98,7 @@ private:
     const uint8_t* wasm_view_{nullptr};       // bytes the module was parsed from
     size_t wasm_view_len_{0};
     std::atomic<bool> stop_requested_{false};
+    void* pod_stack_{nullptr};               // boot-reserved stack (boards without PSRAM)
     std::atomic<bool> pause_requested_{false};
 
     // Low-level Wasm3 opaque pointers

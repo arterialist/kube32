@@ -3,6 +3,7 @@
  */
 #include "harness.h"
 #include "../src/index.h"
+#include "../src/store.h"
 #include <stdlib.h>
 
 static int failures = 0, checks = 0;
@@ -639,6 +640,8 @@ int main(void) {
     CHECK(L.term_count > 100 && L.posting_count > 5000, "index populated: %u terms, %u postings", L.term_count, L.posting_count);
     rc = index_verify();
     CHECK(rc == 0, "index verified after seeding (rc=%d)", rc);
+    rc = store_verify_counts();
+    CHECK(rc == 0, "stored comment counters equal a recount after seeding (rc=%d)", rc);
 
     test_auth();
     test_bootstrap();
@@ -655,6 +658,8 @@ int main(void) {
     /* index integrity after every mutation above: postings match a fresh tokenization, none reference deleted issues */
     rc = index_verify();
     CHECK(rc == 0, "index verified after mutations (rc=%d)", rc);
+    rc = store_verify_counts();
+    CHECK(rc == 0, "stored comment counters equal a recount after mutations (rc=%d)", rc);
     req_nocookie("GET", "/api/stats", 0);
     CHECK(shim.oversized_events == 0, "all events under 200 bytes");
     printf("%s: %d checks, %d failures\n", failures ? "FAILED" : "PASS", checks, failures);

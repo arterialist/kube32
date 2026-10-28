@@ -185,9 +185,9 @@ candidate is compared once against the current k-th best and only inserted
 k = page x limit for lists, 40 per board column and `limit` for search. The
 issue comparator is a strict total order (id is the final tiebreaker), so a
 page is exactly what a full sort would return. The scan rejects a
-candidate against the current k-th best with one u64 sort-key compare
-(`sort_key`, the same order packed into an integer) and only calls the
-comparator for actual inserts. `make profile` prints the work per request;
+candidate against the current k-th best with one or two 32-bit compares
+(`sort_key`: the same order as a (primary, secondary, id) triple, no call,
+no i64 math) and only calls the comparator for actual inserts. `make profile` prints the work per request;
 on the seeded 2400-issue set `GET /api/issues?limit=1` costs 0 comparator
 calls instead of 45,285 (heapsort over every candidate), `limit=50` 461,
 `page=10&limit=50` 4,491, the board 2,413 instead of 19,431. Under wasm3 a comparator call is an indirect call

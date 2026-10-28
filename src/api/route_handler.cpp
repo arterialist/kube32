@@ -1,4 +1,5 @@
 #include "api/route_handler.hpp"
+#include <iostream>
 #include "api/table_serializer.hpp"
 #include "api/selectors.hpp"
 #include "api/watch_hub.hpp"
@@ -459,8 +460,12 @@ HttpResponse RouteHandler::handle_request(const HttpRequest& req, mem::Monotonic
     RouteMatch match = match_route(req.path);
 
     // This server speaks JSON only. Typed kubectl clients may send protobuf
-    // first; 415 makes client-go retry the request as JSON.
-    if (!req.body.empty() && req.content_type.rfind("application/vnd.kubernetes.protobuf", 0) == 0) {
+    // first; 415 makes client-go retry the request as JSON. Access reviews
+    // are the exception: k9s posts them as protobuf on every view and does
+    // not retry, and the answer does not depend on the body (always allowed).
+    bool protobuf_body = !req.body.empty() && req.content_type.rfind("application/vnd.kubernetes.protobuf", 0) == 0;
+    bool body_free_review = (match.category == RouteCategory::SelfSubjectAccessReviews || match.category == RouteCategory::SelfSubjectRulesReviews);
+    if (protobuf_body && !body_free_review) {
         HttpResponse resp = make_status(415, "UnsupportedMediaType",
                                         "the body could not be decoded: application/vnd.kubernetes.protobuf is not supported, send application/json");
         return resp;
@@ -1999,6 +2004,7 @@ HttpResponse RouteHandler::handle_watch(const HttpRequest& req, const RouteMatch
     }
 
     if (!watch_hub_->has_capacity()) {
+        std::cout << "[API] watch refused for " << req.path << ": " << watch_hub_->options().max_streams << " streams already open" << std::endl;
         return make_status(429, "TooManyRequests",
                            "watch limit reached (" + std::to_string(watch_hub_->options().max_streams) + " concurrent streams)");
     }

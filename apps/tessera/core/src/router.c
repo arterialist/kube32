@@ -67,7 +67,7 @@ static void write_assignee(k32_jw* w, const issue_t* it) {
 }
 static void write_labels(k32_jw* w, u16 mask) {
     k32_jw_arr_begin(w);
-    for (int i = 0; i < T_MAX_LABELS; i++) if (mask & (1u << i)) k32_jw_int(w, i);
+    for (int i = 0; i < T_MAX_LABELS; i++) { K32_PROF(loop_iters); if (mask & (1u << i)) k32_jw_int(w, i); }
     k32_jw_arr_end(w);
 }
 static void write_text(k32_jw* w, const char* s, u32 len, int needs_escape) {
@@ -304,23 +304,28 @@ static int cmp_issue(u16 a, u16 b, void* vctx) {
     return c->desc ? -r : r;
 }
 
-/* The same order as cmp_issue packed into one u64 (updated/created are u32
- * packed seconds, priority < 8, id < 2^16), so the scan can reject a
- * candidate against the current k-th best with one integer compare instead
- * of an interpreted indirect call. Not used for SORT_SCORE (scores can
- * exceed 16 bits). */
-static u64 sort_key(const sort_ctx* c, u16 id) {
-    const issue_t* x = &g.issues[id - 1];
-    switch (c->key) {
-        case SORT_CREATED:  return ((u64)x->created << 16) | id;
-        case SORT_KEY:      return id;
+/* The same order as cmp_issue as a (primary, secondary, id) triple of u32s,
+ * so the candidate scan can reject against the current k-th best with one
+ * or two 32-bit compares (no interpreted indirect call, no i64 math).
+ * Not used for SORT_SCORE. */
+typedef struct { u32 a, b; u16 id; } skey_t;
+static inline skey_t sort_key(u8 key, const issue_t* x, u16 id) {
+    skey_t k; k.id = id;
+    switch (key) {
+        case SORT_CREATED:  k.a = x->created;  k.b = 0; break;
+        case SORT_KEY:      k.a = id;          k.b = 0; break;
         case SORT_PRIORITY:
-        case SORT_BOARD:    return ((u64)x->priority << 48) | ((u64)x->updated << 16) | id;
-        default:            return ((u64)x->updated << 16) | id;
+        case SORT_BOARD:    k.a = x->priority; k.b = x->updated; break;
+        default:            k.a = x->updated;  k.b = 0; break;
     }
+    return k;
 }
-/* 1 when a candidate with key ky beats the current k-th best (kth) */
-static int beats_kth(const sort_ctx* c, u64 ky, u64 kth) { return c->desc ? ky > kth : ky < kth; }
+/* 1 when candidate c beats the current k-th best k under the order direction */
+static inline int beats_kth(int desc, const skey_t* c, const skey_t* k) {
+    if (c->a != k->a) return desc ? c->a > k->a : c->a < k->a;
+    if (c->b != k->b) return desc ? c->b > k->b : c->b < k->b;
+    return desc ? c->id > k->id : c->id < k->id;
+}
 
 /* ---- handlers ------------------------------------------------------------ */
 static int h_login(req_t* rq) {
@@ -506,18 +511,23 @@ static int h_issues_list(req_t* rq) {
     u16* cand = (u16*)scratch_alloc((k ? k : 1) * sizeof(u16));
     if (!cand) return resp_error(500, "internal", "out of scratch", 0, 0);
     k32_topk top; k32_topk_init(&top, cand, k, cmp_issue, &sc);
-    u32 n = 0; u64 kth = 0;
+    u32 n = 0; skey_t kth = { 0, 0, 0 };
+    const int any_filter = f.project || f.status_mask || f.assignee != -1 || f.label >= 0 || f.priority >= 0 || f.qmask;
+    const issue_t* issues = g.issues; const u32 count = g.issue_count;
     /* Scan newest-first for descending orders: arrivals then tend to follow
-     * the sort order, so most candidates fail the single k-th-best compare.
-     * The selection itself does not depend on the scan order. */
-    for (u32 i = 0; i < g.issue_count; i++) {
-        u32 id = sc.desc ? g.issue_count - i : i + 1;
-        const issue_t* it = issue_by_id(id);
-        if (!it || !issue_matches(it, id, &f)) continue;
+     * the sort order, so most candidates fail the k-th-best compare. The
+     * selection itself does not depend on the scan order. Everything in the
+     * loop is inline: this runs once per issue in the table. */
+    for (u32 i = 0; i < count; i++) {
+        K32_PROF(loop_iters); K32_PROF(scan_issues);
+        u32 id = sc.desc ? count - i : i + 1;
+        const issue_t* it = &issues[id - 1];
+        if (it->flags & ISSUE_DELETED) continue;
+        if (any_filter && !issue_matches(it, id, &f)) continue;
         n++;
-        if (top.n == top.k && !beats_kth(&sc, sort_key(&sc, (u16)id), kth)) continue;
+        if (top.n == top.k) { skey_t c = sort_key(sc.key, it, (u16)id); if (!beats_kth(sc.desc, &c, &kth)) continue; }
         k32_topk_push(&top, (u16)id);
-        if (top.n == top.k) kth = sort_key(&sc, top.a[top.n - 1]);
+        if (top.n == top.k) { u16 last = top.a[top.n - 1]; kth = sort_key(sc.key, &issues[last - 1], last); }
     }
     k32_jw w;
     resp_begin_json(&w, 200);
@@ -771,16 +781,19 @@ static int h_board(req_t* rq) {
     u16* cand = (u16*)scratch_alloc(T_STATUS_N * BOARD_LIMIT * sizeof(u16));
     if (!cand) return resp_error(500, "internal", "out of scratch", 0, 0);
     sort_ctx sc = { SORT_BOARD, 1, 0 };
-    k32_topk col[T_STATUS_N]; u32 counts[T_STATUS_N] = { 0 }; u64 kth[T_STATUS_N] = { 0 };
+    k32_topk col[T_STATUS_N]; u32 counts[T_STATUS_N] = { 0 }; skey_t kth[T_STATUS_N];
+    memset(kth, 0, sizeof kth);
     for (int s = 0; s < T_STATUS_N; s++) k32_topk_init(&col[s], cand + s * BOARD_LIMIT, BOARD_LIMIT, cmp_issue, &sc);
+    const issue_t* issues = g.issues;
     for (u32 id = g.issue_count; id >= 1; id--) {      /* newest first: board order is updated desc within a priority */
-        const issue_t* it = issue_by_id(id);
-        if (!it || (project && it->project != project) || it->status >= T_STATUS_N) continue;
+        K32_PROF(loop_iters); K32_PROF(scan_issues);
+        const issue_t* it = &issues[id - 1];
+        if ((it->flags & ISSUE_DELETED) || (project && it->project != project) || it->status >= T_STATUS_N) continue;
         u8 st = it->status; counts[st]++;
         k32_topk* t = &col[st];
-        if (t->n == t->k && !beats_kth(&sc, sort_key(&sc, (u16)id), kth[st])) continue;
+        if (t->n == t->k) { skey_t c = sort_key(SORT_BOARD, it, (u16)id); if (!beats_kth(1, &c, &kth[st])) continue; }
         k32_topk_push(t, (u16)id);
-        if (t->n == t->k) kth[st] = sort_key(&sc, t->a[t->n - 1]);
+        if (t->n == t->k) { u16 last = t->a[t->n - 1]; kth[st] = sort_key(SORT_BOARD, &issues[last - 1], last); }
     }
     k32_jw w;
     resp_begin_json(&w, 200);
