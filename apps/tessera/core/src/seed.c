@@ -8,7 +8,7 @@
 #include "index.h"
 
 static const char* const k_components[] = {
-    "feed ranking", "upload pipeline", "search autocomplete", "billing service", "notification worker", "ios app",
+    "feed ranking", "upload pipeline", "search autocomplete", "billing service", "notification worker", "iOS app",
     "android app", "web client", "cdn cache", "auth provider", "export job", "image resizer",
     "comment threads", "rate limiter", "analytics etl", "album sync", "share links", "onboarding flow",
     "push gateway", "email digest", "avatar service", "video transcoder", "stories feed", "tag suggestions",
@@ -96,6 +96,8 @@ static void sb_put(sb* b, const char* s) {
     b->len += n;
 }
 static void sb_cap_first(sb* b) {
+    /* Leave mixed-case brand words alone ("iOS app" stays "iOS app") */
+    if (b->len > 1 && b->buf[1] >= 'A' && b->buf[1] <= 'Z') return;
     if (b->len && b->buf[0] >= 'a' && b->buf[0] <= 'z') b->buf[0] = (char)(b->buf[0] - 32);
 }
 static const char* pick(k32_rng* r, const char* const* list, u32 n) { return list[k32_rng_range(r, n)]; }
