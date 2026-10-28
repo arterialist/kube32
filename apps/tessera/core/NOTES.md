@@ -143,6 +143,22 @@ scan order because `cmp_issue` is strict for every key (id tiebreaker, flipped
 with the rest under `desc`). `analytics` keeps its full sort (it needs the
 median).
 
+## Response writer
+
+On the board a response cost ~25 us per output byte on top of the fixed
+work: every byte went through `jw_putc` (call, capacity check, two
+increments), keys paid `strlen` plus the escape switch per character and
+numbers an i64 division per digit. Now `jw_write` memcpy's runs into the
+4 KiB buffer, `k32_jw_escaped` scans with a 256-entry class table and copies
+the runs between escapes, literal keys are complete `"key":` fragments
+written with one copy (`k32_jw_keylit`; the four dynamic keys keep
+`k32_jw_key`), `k32_fmt_u32/i64` use a two-digit table with u32 arithmetic
+(one i64 division splits a 13-digit timestamp), and `issue_t.flags` /
+`comment_t.flags` carry `*_ESC` bits set at insert time (and on PATCH) that
+say whether the text contains a byte JSON must escape; clean text is copied
+without a scan. Escaped copies are not stored: that would double user text
+and the tokenizer must see the raw bytes.
+
 ## Memory primitives
 
 `memcpy`, `memmove` and `memset` copy four bytes per iteration (unaligned

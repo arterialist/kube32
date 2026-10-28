@@ -160,6 +160,8 @@ int issue_create(u8 project, const char* title, u32 tlen, const char* desc, u32 
     it->labels = labels & ((1u << T_LABELS_N) - 1u);
     it->project = project; it->status = status; it->priority = priority;
     it->assignee = assignee; it->reporter = reporter; it->estimate = estimate;
+    if (k32_jw_needs_escape(title, tlen)) it->flags |= ISSUE_TITLE_ESC;
+    if (dlen && k32_jw_needs_escape(desc, dlen)) it->flags |= ISSUE_DESC_ESC;
     g.issue_count++; g.issue_live++;
     return (int)g.issue_count;
 }
@@ -188,6 +190,7 @@ int comment_add(u32 issue_id, u8 author, const char* body, u32 len, i64 ts) {
     memset(c, 0, sizeof *c);
     c->created = ts_pack(ts); c->body_off = off; c->body_len = (u16)len;
     c->issue = (u16)issue_id; c->author = author; c->next = 0;
+    if (k32_jw_needs_escape(body, len)) c->flags |= COMMENT_ESC;
     if (it->comment_tail) {
         comment_t* t = comment_by_id(it->comment_tail);
         if (t) t->next = (u16)cid;

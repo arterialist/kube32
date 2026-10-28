@@ -30,7 +30,8 @@
 enum { ST_BACKLOG = 0, ST_TODO, ST_IN_PROGRESS, ST_REVIEW, ST_DONE };
 enum { OP_CREATE = 0, OP_UPDATE, OP_COMMENT, OP_DELETE };
 enum { F_NONE = 0, F_TITLE, F_DESCRIPTION, F_STATUS, F_PRIORITY, F_ASSIGNEE, F_LABELS, F_ESTIMATE };
-enum { ISSUE_DELETED = 1 };
+enum { ISSUE_DELETED = 1, ISSUE_TITLE_ESC = 2, ISSUE_DESC_ESC = 4 };   /* *_ESC: text contains bytes JSON must escape */
+enum { COMMENT_ESC = 1 };
 
 typedef struct { const char* username; const char* name; const char* initials; const char* color; } user_t;
 typedef struct { const char* key; const char* name; const char* color; } project_t;

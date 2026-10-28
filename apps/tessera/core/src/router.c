@@ -3,7 +3,7 @@
 #include "seed.h"
 #include "k32_host.h"
 
-#define RESP_BUF 1536
+#define RESP_BUF 4096
 #define BODY_MAX 8192
 #define LIST_LIMIT_MAX 50
 #define LIST_LIMIT_DEFAULT 25
@@ -32,8 +32,8 @@ static int resp_error(int status, const char* code, const char* msg, const char*
     k32_jw w;
     resp_begin_json(&w, status);
     k32_jw_obj_begin(&w);
-    k32_jw_key(&w, "error"); k32_jw_cstr(&w, code);
-    k32_jw_key(&w, "message");
+    k32_jw_keylit(&w, "error"); k32_jw_cstr(&w, code);
+    k32_jw_keylit(&w, "message");
     if (detail) {
         k32_jw_raw(&w, "\"", 1); k32_jw_escaped(&w, msg, (u32)strlen(msg)); k32_jw_escaped(&w, detail, dlen); k32_jw_raw(&w, "\"", 1);
     } else k32_jw_cstr(&w, msg);
@@ -51,16 +51,16 @@ static int resp_empty(int status) {
 static void write_user(k32_jw* w, int id) {
     const user_t* u = &t_users[id];
     k32_jw_obj_begin(w);
-    k32_jw_key(w, "id"); k32_jw_int(w, id);
-    k32_jw_key(w, "username"); k32_jw_cstr(w, u->username);
-    k32_jw_key(w, "name"); k32_jw_cstr(w, u->name);
-    k32_jw_key(w, "initials"); k32_jw_cstr(w, u->initials);
-    k32_jw_key(w, "color"); k32_jw_cstr(w, u->color);
+    k32_jw_keylit(w, "id"); k32_jw_int(w, id);
+    k32_jw_keylit(w, "username"); k32_jw_cstr(w, u->username);
+    k32_jw_keylit(w, "name"); k32_jw_cstr(w, u->name);
+    k32_jw_keylit(w, "initials"); k32_jw_cstr(w, u->initials);
+    k32_jw_keylit(w, "color"); k32_jw_cstr(w, u->color);
     k32_jw_obj_end(w);
 }
 static void write_key(k32_jw* w, u32 id) {
     char kb[24]; u32 kl = issue_key(id, kb, sizeof kb);
-    k32_jw_str(w, kb, kl);
+    k32_jw_str_raw(w, kb, kl);      /* "<PROJECT>-<id>": never needs escaping */
 }
 static void write_assignee(k32_jw* w, const issue_t* it) {
     if (it->assignee == T_NO_USER) k32_jw_null(w); else k32_jw_int(w, it->assignee);
@@ -70,21 +70,24 @@ static void write_labels(k32_jw* w, u16 mask) {
     for (int i = 0; i < T_MAX_LABELS; i++) if (mask & (1u << i)) k32_jw_int(w, i);
     k32_jw_arr_end(w);
 }
+static void write_text(k32_jw* w, const char* s, u32 len, int needs_escape) {
+    if (needs_escape) k32_jw_str(w, s, len); else k32_jw_str_raw(w, s, len);
+}
 static void write_issue_fields(k32_jw* w, u32 id, const issue_t* it, int full) {
-    k32_jw_key(w, "id"); k32_jw_int(w, id);
-    k32_jw_key(w, "key"); write_key(w, id);
-    k32_jw_key(w, "project"); k32_jw_int(w, it->project);
-    k32_jw_key(w, "title"); k32_jw_str(w, str_at(it->title_off), it->title_len);
-    if (full) { k32_jw_key(w, "description"); k32_jw_str(w, it->desc_len ? str_at(it->desc_off) : "", it->desc_len); }
-    k32_jw_key(w, "status"); k32_jw_cstr(w, t_status_names[it->status < T_STATUS_N ? it->status : 0]);
-    k32_jw_key(w, "priority"); k32_jw_int(w, it->priority);
-    k32_jw_key(w, "assignee"); write_assignee(w, it);
-    k32_jw_key(w, "reporter"); k32_jw_int(w, it->reporter);
-    k32_jw_key(w, "labels"); write_labels(w, it->labels);
-    k32_jw_key(w, "estimate"); k32_jw_int(w, it->estimate);
-    k32_jw_key(w, "created"); k32_jw_int(w, ts_ms(it->created));
-    k32_jw_key(w, "updated"); k32_jw_int(w, ts_ms(it->updated));
-    k32_jw_key(w, "comment_count"); k32_jw_int(w, it->comment_count);
+    k32_jw_keylit(w, "id"); k32_jw_int(w, id);
+    k32_jw_keylit(w, "key"); write_key(w, id);
+    k32_jw_keylit(w, "project"); k32_jw_int(w, it->project);
+    k32_jw_keylit(w, "title"); write_text(w, str_at(it->title_off), it->title_len, it->flags & ISSUE_TITLE_ESC);
+    if (full) { k32_jw_keylit(w, "description"); write_text(w, it->desc_len ? str_at(it->desc_off) : "", it->desc_len, it->flags & ISSUE_DESC_ESC); }
+    k32_jw_keylit(w, "status"); k32_jw_cstr(w, t_status_names[it->status < T_STATUS_N ? it->status : 0]);
+    k32_jw_keylit(w, "priority"); k32_jw_int(w, it->priority);
+    k32_jw_keylit(w, "assignee"); write_assignee(w, it);
+    k32_jw_keylit(w, "reporter"); k32_jw_int(w, it->reporter);
+    k32_jw_keylit(w, "labels"); write_labels(w, it->labels);
+    k32_jw_keylit(w, "estimate"); k32_jw_int(w, it->estimate);
+    k32_jw_keylit(w, "created"); k32_jw_int(w, ts_ms(it->created));
+    k32_jw_keylit(w, "updated"); k32_jw_int(w, ts_ms(it->updated));
+    k32_jw_keylit(w, "comment_count"); k32_jw_int(w, it->comment_count);
 }
 static void write_issue(k32_jw* w, u32 id, const issue_t* it, int full) {
     k32_jw_obj_begin(w);
@@ -93,11 +96,11 @@ static void write_issue(k32_jw* w, u32 id, const issue_t* it, int full) {
 }
 static void write_comment(k32_jw* w, u32 cid, const comment_t* c) {
     k32_jw_obj_begin(w);
-    k32_jw_key(w, "id"); k32_jw_int(w, cid);
-    k32_jw_key(w, "issue"); k32_jw_int(w, c->issue);
-    k32_jw_key(w, "author"); k32_jw_int(w, c->author);
-    k32_jw_key(w, "body"); k32_jw_str(w, str_at(c->body_off), c->body_len);
-    k32_jw_key(w, "created"); k32_jw_int(w, ts_ms(c->created));
+    k32_jw_keylit(w, "id"); k32_jw_int(w, cid);
+    k32_jw_keylit(w, "issue"); k32_jw_int(w, c->issue);
+    k32_jw_keylit(w, "author"); k32_jw_int(w, c->author);
+    k32_jw_keylit(w, "body"); write_text(w, str_at(c->body_off), c->body_len, c->flags & COMMENT_ESC);
+    k32_jw_keylit(w, "created"); k32_jw_int(w, ts_ms(c->created));
     k32_jw_obj_end(w);
 }
 static void write_act_value(k32_jw* w, u8 field, i32 v) {
@@ -113,20 +116,20 @@ static void write_act_value(k32_jw* w, u8 field, i32 v) {
 }
 static void write_activity(k32_jw* w, const act_t* a) {
     k32_jw_obj_begin(w);
-    k32_jw_key(w, "id"); k32_jw_int(w, a->id);
-    k32_jw_key(w, "ts"); k32_jw_int(w, a->ts);
-    k32_jw_key(w, "actor"); k32_jw_int(w, a->actor);
-    k32_jw_key(w, "issue"); k32_jw_int(w, a->issue);
-    k32_jw_key(w, "key"); write_key(w, a->issue);
-    k32_jw_key(w, "op"); k32_jw_cstr(w, t_op_names[a->op < 4 ? a->op : 0]);
-    k32_jw_key(w, "field"); k32_jw_cstr(w, t_field_names[a->field < 8 ? a->field : 0]);
+    k32_jw_keylit(w, "id"); k32_jw_int(w, a->id);
+    k32_jw_keylit(w, "ts"); k32_jw_int(w, a->ts);
+    k32_jw_keylit(w, "actor"); k32_jw_int(w, a->actor);
+    k32_jw_keylit(w, "issue"); k32_jw_int(w, a->issue);
+    k32_jw_keylit(w, "key"); write_key(w, a->issue);
+    k32_jw_keylit(w, "op"); k32_jw_cstr(w, t_op_names[a->op < 4 ? a->op : 0]);
+    k32_jw_keylit(w, "field"); k32_jw_cstr(w, t_field_names[a->field < 8 ? a->field : 0]);
     if (a->op == OP_COMMENT) {
         char tmp[16];
-        k32_jw_key(w, "from"); k32_jw_cstr(w, "");
-        k32_jw_key(w, "to"); k32_jw_str(w, tmp, k32_fmt_i64(tmp, sizeof tmp, a->to));
+        k32_jw_keylit(w, "from"); k32_jw_cstr(w, "");
+        k32_jw_keylit(w, "to"); k32_jw_str(w, tmp, k32_fmt_i64(tmp, sizeof tmp, a->to));
     } else {
-        k32_jw_key(w, "from"); write_act_value(w, a->field, a->from);
-        k32_jw_key(w, "to"); write_act_value(w, a->field, a->to);
+        k32_jw_keylit(w, "from"); write_act_value(w, a->field, a->from);
+        k32_jw_keylit(w, "to"); write_act_value(w, a->field, a->to);
     }
     k32_jw_obj_end(w);
 }
@@ -143,12 +146,12 @@ void events_issue(const char* op, u32 id, u8 actor) {
     char buf[K32_MAX_EVENT_BYTES]; k32_jw w;
     k32_jw_init(&w, buf, sizeof buf, 0, 0);
     k32_jw_obj_begin(&w);
-    k32_jw_key(&w, "type"); k32_jw_cstr(&w, "issue");
-    k32_jw_key(&w, "op"); k32_jw_cstr(&w, op);
-    k32_jw_key(&w, "key"); write_key(&w, id);
-    k32_jw_key(&w, "status"); k32_jw_cstr(&w, t_status_names[it->status < T_STATUS_N ? it->status : 0]);
-    k32_jw_key(&w, "actor"); k32_jw_int(&w, actor);
-    k32_jw_key(&w, "title"); k32_jw_str_max(&w, str_at(it->title_off), it->title_len, 96);
+    k32_jw_keylit(&w, "type"); k32_jw_cstr(&w, "issue");
+    k32_jw_keylit(&w, "op"); k32_jw_cstr(&w, op);
+    k32_jw_keylit(&w, "key"); write_key(&w, id);
+    k32_jw_keylit(&w, "status"); k32_jw_cstr(&w, t_status_names[it->status < T_STATUS_N ? it->status : 0]);
+    k32_jw_keylit(&w, "actor"); k32_jw_int(&w, actor);
+    k32_jw_keylit(&w, "title"); k32_jw_str_max(&w, str_at(it->title_off), it->title_len, 96);
     k32_jw_obj_end(&w);
     emit(&w);
 }
@@ -156,10 +159,10 @@ void events_comment(u32 issue_id, u32 comment_id, u8 author) {
     char buf[K32_MAX_EVENT_BYTES]; k32_jw w;
     k32_jw_init(&w, buf, sizeof buf, 0, 0);
     k32_jw_obj_begin(&w);
-    k32_jw_key(&w, "type"); k32_jw_cstr(&w, "comment");
-    k32_jw_key(&w, "key"); write_key(&w, issue_id);
-    k32_jw_key(&w, "author"); k32_jw_int(&w, author);
-    k32_jw_key(&w, "id"); k32_jw_int(&w, comment_id);
+    k32_jw_keylit(&w, "type"); k32_jw_cstr(&w, "comment");
+    k32_jw_keylit(&w, "key"); write_key(&w, issue_id);
+    k32_jw_keylit(&w, "author"); k32_jw_int(&w, author);
+    k32_jw_keylit(&w, "id"); k32_jw_int(&w, comment_id);
     k32_jw_obj_end(&w);
     emit(&w);
 }
@@ -167,8 +170,8 @@ void events_hud(const char* text, u32 len) {
     char buf[K32_MAX_EVENT_BYTES]; k32_jw w;
     k32_jw_init(&w, buf, sizeof buf, 0, 0);
     k32_jw_obj_begin(&w);
-    k32_jw_key(&w, "type"); k32_jw_cstr(&w, "hud");
-    k32_jw_key(&w, "text"); k32_jw_str_max(&w, text, len, 160);
+    k32_jw_keylit(&w, "type"); k32_jw_cstr(&w, "hud");
+    k32_jw_keylit(&w, "text"); k32_jw_str_max(&w, text, len, 160);
     k32_jw_obj_end(&w);
     emit(&w);
 }
@@ -301,6 +304,24 @@ static int cmp_issue(u16 a, u16 b, void* vctx) {
     return c->desc ? -r : r;
 }
 
+/* The same order as cmp_issue packed into one u64 (updated/created are u32
+ * packed seconds, priority < 8, id < 2^16), so the scan can reject a
+ * candidate against the current k-th best with one integer compare instead
+ * of an interpreted indirect call. Not used for SORT_SCORE (scores can
+ * exceed 16 bits). */
+static u64 sort_key(const sort_ctx* c, u16 id) {
+    const issue_t* x = &g.issues[id - 1];
+    switch (c->key) {
+        case SORT_CREATED:  return ((u64)x->created << 16) | id;
+        case SORT_KEY:      return id;
+        case SORT_PRIORITY:
+        case SORT_BOARD:    return ((u64)x->priority << 48) | ((u64)x->updated << 16) | id;
+        default:            return ((u64)x->updated << 16) | id;
+    }
+}
+/* 1 when a candidate with key ky beats the current k-th best (kth) */
+static int beats_kth(const sort_ctx* c, u64 ky, u64 kth) { return c->desc ? ky > kth : ky < kth; }
+
 /* ---- handlers ------------------------------------------------------------ */
 static int h_login(req_t* rq) {
     k32_jfield f[MAX_FIELDS];
@@ -324,8 +345,8 @@ static int h_login(req_t* rq) {
     resp_begin_json(&w, 200);
     k32_resp_header("Set-Cookie", 10, cookie, cl);
     k32_jw_obj_begin(&w);
-    k32_jw_key(&w, "user"); write_user(&w, uid);
-    k32_jw_key(&w, "now"); k32_jw_int(&w, rq->now);
+    k32_jw_keylit(&w, "user"); write_user(&w, uid);
+    k32_jw_keylit(&w, "now"); k32_jw_int(&w, rq->now);
     k32_jw_obj_end(&w);
     resp_finish(&w);
     return 200;
@@ -342,8 +363,8 @@ static int h_me(req_t* rq) {
     k32_jw w;
     resp_begin_json(&w, 200);
     k32_jw_obj_begin(&w);
-    k32_jw_key(&w, "user"); write_user(&w, rq->user);
-    k32_jw_key(&w, "now"); k32_jw_int(&w, rq->now);
+    k32_jw_keylit(&w, "user"); write_user(&w, rq->user);
+    k32_jw_keylit(&w, "now"); k32_jw_int(&w, rq->now);
     k32_jw_obj_end(&w);
     resp_finish(&w);
     return 200;
@@ -357,39 +378,39 @@ static int h_bootstrap(req_t* rq) {
     k32_jw w;
     resp_begin_json(&w, 200);
     k32_jw_obj_begin(&w);
-    k32_jw_key(&w, "now"); k32_jw_int(&w, rq->now);
-    k32_jw_key(&w, "users"); k32_jw_arr_begin(&w);
+    k32_jw_keylit(&w, "now"); k32_jw_int(&w, rq->now);
+    k32_jw_keylit(&w, "users"); k32_jw_arr_begin(&w);
     for (int i = 0; i < T_USERS_N; i++) write_user(&w, i);
     k32_jw_arr_end(&w);
-    k32_jw_key(&w, "projects"); k32_jw_arr_begin(&w);
+    k32_jw_keylit(&w, "projects"); k32_jw_arr_begin(&w);
     for (int i = 0; i < T_PROJECTS_N; i++) {
         k32_jw_obj_begin(&w);
-        k32_jw_key(&w, "id"); k32_jw_int(&w, i + 1);
-        k32_jw_key(&w, "key"); k32_jw_cstr(&w, t_projects[i].key);
-        k32_jw_key(&w, "name"); k32_jw_cstr(&w, t_projects[i].name);
-        k32_jw_key(&w, "color"); k32_jw_cstr(&w, t_projects[i].color);
+        k32_jw_keylit(&w, "id"); k32_jw_int(&w, i + 1);
+        k32_jw_keylit(&w, "key"); k32_jw_cstr(&w, t_projects[i].key);
+        k32_jw_keylit(&w, "name"); k32_jw_cstr(&w, t_projects[i].name);
+        k32_jw_keylit(&w, "color"); k32_jw_cstr(&w, t_projects[i].color);
         k32_jw_obj_end(&w);
     }
     k32_jw_arr_end(&w);
-    k32_jw_key(&w, "labels"); k32_jw_arr_begin(&w);
+    k32_jw_keylit(&w, "labels"); k32_jw_arr_begin(&w);
     for (int i = 0; i < T_LABELS_N; i++) {
         k32_jw_obj_begin(&w);
-        k32_jw_key(&w, "id"); k32_jw_int(&w, i);
-        k32_jw_key(&w, "name"); k32_jw_cstr(&w, t_labels[i].name);
-        k32_jw_key(&w, "color"); k32_jw_cstr(&w, t_labels[i].color);
+        k32_jw_keylit(&w, "id"); k32_jw_int(&w, i);
+        k32_jw_keylit(&w, "name"); k32_jw_cstr(&w, t_labels[i].name);
+        k32_jw_keylit(&w, "color"); k32_jw_cstr(&w, t_labels[i].color);
         k32_jw_obj_end(&w);
     }
     k32_jw_arr_end(&w);
-    k32_jw_key(&w, "statuses"); k32_jw_arr_begin(&w);
+    k32_jw_keylit(&w, "statuses"); k32_jw_arr_begin(&w);
     for (int i = 0; i < T_STATUS_N; i++) k32_jw_cstr(&w, t_status_names[i]);
     k32_jw_arr_end(&w);
-    k32_jw_key(&w, "priorities"); k32_jw_arr_begin(&w);
+    k32_jw_keylit(&w, "priorities"); k32_jw_arr_begin(&w);
     for (int i = 0; i < T_PRIO_N; i++) k32_jw_cstr(&w, t_prio_names[i]);
     k32_jw_arr_end(&w);
-    k32_jw_key(&w, "counts"); k32_jw_obj_begin(&w);
-    k32_jw_key(&w, "open"); k32_jw_int(&w, (i64)g.issue_live - by_status[ST_DONE]);
-    k32_jw_key(&w, "total"); k32_jw_int(&w, g.issue_live);
-    k32_jw_key(&w, "by_status"); k32_jw_obj_begin(&w);
+    k32_jw_keylit(&w, "counts"); k32_jw_obj_begin(&w);
+    k32_jw_keylit(&w, "open"); k32_jw_int(&w, (i64)g.issue_live - by_status[ST_DONE]);
+    k32_jw_keylit(&w, "total"); k32_jw_int(&w, g.issue_live);
+    k32_jw_keylit(&w, "by_status"); k32_jw_obj_begin(&w);
     for (int i = 0; i < T_STATUS_N; i++) { k32_jw_key(&w, t_status_names[i]); k32_jw_int(&w, by_status[i]); }
     k32_jw_obj_end(&w);
     k32_jw_obj_end(&w);
@@ -485,26 +506,30 @@ static int h_issues_list(req_t* rq) {
     u16* cand = (u16*)scratch_alloc((k ? k : 1) * sizeof(u16));
     if (!cand) return resp_error(500, "internal", "out of scratch", 0, 0);
     k32_topk top; k32_topk_init(&top, cand, k, cmp_issue, &sc);
-    u32 n = 0;
+    u32 n = 0; u64 kth = 0;
     /* Scan newest-first for descending orders: arrivals then tend to follow
      * the sort order, so most candidates fail the single k-th-best compare.
      * The selection itself does not depend on the scan order. */
     for (u32 i = 0; i < g.issue_count; i++) {
         u32 id = sc.desc ? g.issue_count - i : i + 1;
         const issue_t* it = issue_by_id(id);
-        if (it && issue_matches(it, id, &f)) { n++; k32_topk_push(&top, (u16)id); }
+        if (!it || !issue_matches(it, id, &f)) continue;
+        n++;
+        if (top.n == top.k && !beats_kth(&sc, sort_key(&sc, (u16)id), kth)) continue;
+        k32_topk_push(&top, (u16)id);
+        if (top.n == top.k) kth = sort_key(&sc, top.a[top.n - 1]);
     }
     k32_jw w;
     resp_begin_json(&w, 200);
     k32_jw_obj_begin(&w);
-    k32_jw_key(&w, "items"); k32_jw_arr_begin(&w);
+    k32_jw_keylit(&w, "items"); k32_jw_arr_begin(&w);
     for (u32 i = start; i < top.n && i < start + limit; i++) write_issue(&w, cand[i], &g.issues[cand[i] - 1], 0);
     k32_jw_arr_end(&w);
-    k32_jw_key(&w, "total"); k32_jw_int(&w, n);
-    k32_jw_key(&w, "page"); k32_jw_int(&w, page);
-    k32_jw_key(&w, "limit"); k32_jw_int(&w, limit);
-    k32_jw_key(&w, "took_us"); k32_jw_int(&w, (k32_time_ms() - rq->t0_ms) * 1000);
-    k32_jw_key(&w, "now"); k32_jw_int(&w, rq->now);
+    k32_jw_keylit(&w, "total"); k32_jw_int(&w, n);
+    k32_jw_keylit(&w, "page"); k32_jw_int(&w, page);
+    k32_jw_keylit(&w, "limit"); k32_jw_int(&w, limit);
+    k32_jw_keylit(&w, "took_us"); k32_jw_int(&w, (k32_time_ms() - rq->t0_ms) * 1000);
+    k32_jw_keylit(&w, "now"); k32_jw_int(&w, rq->now);
     k32_jw_obj_end(&w);
     resp_finish(&w);
     return 200;
@@ -518,7 +543,7 @@ static int h_issue_get(req_t* rq, u32 id) {
     resp_begin_json(&w, 200);
     k32_jw_obj_begin(&w);
     write_issue_fields(&w, id, it, 1);
-    k32_jw_key(&w, "comments"); k32_jw_arr_begin(&w);
+    k32_jw_keylit(&w, "comments"); k32_jw_arr_begin(&w);
     u32 cid = it->comment_head, guard = 0;
     while (cid && guard++ < 65535) {
         const comment_t* c = comment_by_id(cid);
@@ -527,14 +552,14 @@ static int h_issue_get(req_t* rq, u32 id) {
         cid = c->next;
     }
     k32_jw_arr_end(&w);
-    k32_jw_key(&w, "activity"); k32_jw_arr_begin(&w);
+    k32_jw_keylit(&w, "activity"); k32_jw_arr_begin(&w);
     u32 avail = act_available(), shown = 0;
     for (u32 i = 0; i < avail && shown < 20; i++) {
         const act_t* a = act_at(i);
         if (a && a->issue == id) { write_activity(&w, a); shown++; }
     }
     k32_jw_arr_end(&w);
-    k32_jw_key(&w, "now"); k32_jw_int(&w, rq->now);
+    k32_jw_keylit(&w, "now"); k32_jw_int(&w, rq->now);
     k32_jw_obj_end(&w);
     resp_finish(&w);
     return 200;
@@ -660,6 +685,7 @@ static int h_issue_patch(req_t* rq, u32 id) {
         int rc = str_replace(&it->title_off, &tl, in.title, in.tlen, T_TITLE_MAX);
         if (rc < 0) { index_add_issue(id); return resp_error(507, "insufficient_storage", "string arena is full", 0, 0); }
         it->title_len = (u8)tl;
+        it->flags = (u8)((it->flags & ~ISSUE_TITLE_ESC) | (k32_jw_needs_escape(in.title, in.tlen) ? ISSUE_TITLE_ESC : 0));
         act_push(rq->now, actor, OP_UPDATE, (u16)id, F_TITLE, 0, 0); changed++;
     }
     if (in.has_desc) {
@@ -668,6 +694,7 @@ static int h_issue_patch(req_t* rq, u32 id) {
             int rc = str_replace(&it->desc_off, &it->desc_len, in.desc, in.dlen, T_DESC_MAX);
             if (rc < 0) { index_add_issue(id); return resp_error(507, "insufficient_storage", "string arena is full", 0, 0); }
         }
+        it->flags = (u8)((it->flags & ~ISSUE_DESC_ESC) | (in.dlen && k32_jw_needs_escape(in.desc, in.dlen) ? ISSUE_DESC_ESC : 0));
         act_push(rq->now, actor, OP_UPDATE, (u16)id, F_DESCRIPTION, 0, 0); changed++;
     }
     if (text_changed) index_add_issue(id);
@@ -744,27 +771,32 @@ static int h_board(req_t* rq) {
     u16* cand = (u16*)scratch_alloc(T_STATUS_N * BOARD_LIMIT * sizeof(u16));
     if (!cand) return resp_error(500, "internal", "out of scratch", 0, 0);
     sort_ctx sc = { SORT_BOARD, 1, 0 };
-    k32_topk col[T_STATUS_N]; u32 counts[T_STATUS_N] = { 0 };
+    k32_topk col[T_STATUS_N]; u32 counts[T_STATUS_N] = { 0 }; u64 kth[T_STATUS_N] = { 0 };
     for (int s = 0; s < T_STATUS_N; s++) k32_topk_init(&col[s], cand + s * BOARD_LIMIT, BOARD_LIMIT, cmp_issue, &sc);
     for (u32 id = g.issue_count; id >= 1; id--) {      /* newest first: board order is updated desc within a priority */
         const issue_t* it = issue_by_id(id);
-        if (it && (!project || it->project == project) && it->status < T_STATUS_N) { counts[it->status]++; k32_topk_push(&col[it->status], (u16)id); }
+        if (!it || (project && it->project != project) || it->status >= T_STATUS_N) continue;
+        u8 st = it->status; counts[st]++;
+        k32_topk* t = &col[st];
+        if (t->n == t->k && !beats_kth(&sc, sort_key(&sc, (u16)id), kth[st])) continue;
+        k32_topk_push(t, (u16)id);
+        if (t->n == t->k) kth[st] = sort_key(&sc, t->a[t->n - 1]);
     }
     k32_jw w;
     resp_begin_json(&w, 200);
     k32_jw_obj_begin(&w);
-    k32_jw_key(&w, "now"); k32_jw_int(&w, rq->now);
-    k32_jw_key(&w, "columns"); k32_jw_obj_begin(&w);
+    k32_jw_keylit(&w, "now"); k32_jw_int(&w, rq->now);
+    k32_jw_keylit(&w, "columns"); k32_jw_obj_begin(&w);
     for (int s = 0; s < T_STATUS_N; s++) {
         k32_jw_key(&w, t_status_names[s]); k32_jw_arr_begin(&w);
         for (u32 i = 0; i < col[s].n; i++) write_issue(&w, col[s].a[i], &g.issues[col[s].a[i] - 1], 0);
         k32_jw_arr_end(&w);
     }
     k32_jw_obj_end(&w);
-    k32_jw_key(&w, "truncated"); k32_jw_obj_begin(&w);
+    k32_jw_keylit(&w, "truncated"); k32_jw_obj_begin(&w);
     for (int s = 0; s < T_STATUS_N; s++) if (counts[s] > BOARD_LIMIT) { k32_jw_key(&w, t_status_names[s]); k32_jw_bool(&w, 1); }
     k32_jw_obj_end(&w);
-    k32_jw_key(&w, "limit"); k32_jw_int(&w, BOARD_LIMIT);
+    k32_jw_keylit(&w, "limit"); k32_jw_int(&w, BOARD_LIMIT);
     k32_jw_obj_end(&w);
     resp_finish(&w);
     return 200;
@@ -790,25 +822,25 @@ static int h_search(req_t* rq) {
     k32_jw w;
     resp_begin_json(&w, 200);
     k32_jw_obj_begin(&w);
-    k32_jw_key(&w, "items"); k32_jw_arr_begin(&w);
+    k32_jw_keylit(&w, "items"); k32_jw_arr_begin(&w);
     for (u32 i = 0; i < top.n; i++) {
         u16 hid = best[i];
         const issue_t* it = &g.issues[hid - 1];
         k32_jw_obj_begin(&w);
-        k32_jw_key(&w, "key"); write_key(&w, hid);
-        k32_jw_key(&w, "title"); k32_jw_str(&w, str_at(it->title_off), it->title_len);
-        k32_jw_key(&w, "status"); k32_jw_cstr(&w, t_status_names[it->status < T_STATUS_N ? it->status : 0]);
-        k32_jw_key(&w, "priority"); k32_jw_int(&w, it->priority);
-        k32_jw_key(&w, "assignee"); write_assignee(&w, it);
-        k32_jw_key(&w, "updated"); k32_jw_int(&w, ts_ms(it->updated));
-        k32_jw_key(&w, "score"); k32_jw_int(&w, scores[hid]);
+        k32_jw_keylit(&w, "key"); write_key(&w, hid);
+        k32_jw_keylit(&w, "title"); write_text(&w, str_at(it->title_off), it->title_len, it->flags & ISSUE_TITLE_ESC);
+        k32_jw_keylit(&w, "status"); k32_jw_cstr(&w, t_status_names[it->status < T_STATUS_N ? it->status : 0]);
+        k32_jw_keylit(&w, "priority"); k32_jw_int(&w, it->priority);
+        k32_jw_keylit(&w, "assignee"); write_assignee(&w, it);
+        k32_jw_keylit(&w, "updated"); k32_jw_int(&w, ts_ms(it->updated));
+        k32_jw_keylit(&w, "score"); k32_jw_int(&w, scores[hid]);
         k32_jw_obj_end(&w);
     }
     k32_jw_arr_end(&w);
-    k32_jw_key(&w, "took_us"); k32_jw_int(&w, (k32_time_ms() - rq->t0_ms) * 1000);
-    k32_jw_key(&w, "scanned"); k32_jw_int(&w, scanned);
-    k32_jw_key(&w, "total"); k32_jw_int(&w, hits);
-    k32_jw_key(&w, "now"); k32_jw_int(&w, rq->now);
+    k32_jw_keylit(&w, "took_us"); k32_jw_int(&w, (k32_time_ms() - rq->t0_ms) * 1000);
+    k32_jw_keylit(&w, "scanned"); k32_jw_int(&w, scanned);
+    k32_jw_keylit(&w, "total"); k32_jw_int(&w, hits);
+    k32_jw_keylit(&w, "now"); k32_jw_int(&w, rq->now);
     k32_jw_obj_end(&w);
     resp_finish(&w);
     return 200;
@@ -852,39 +884,39 @@ static int h_analytics(req_t* rq) {
     k32_jw w;
     resp_begin_json(&w, 200);
     k32_jw_obj_begin(&w);
-    k32_jw_key(&w, "now"); k32_jw_int(&w, rq->now);
-    k32_jw_key(&w, "by_status"); k32_jw_obj_begin(&w);
+    k32_jw_keylit(&w, "now"); k32_jw_int(&w, rq->now);
+    k32_jw_keylit(&w, "by_status"); k32_jw_obj_begin(&w);
     for (int i = 0; i < T_STATUS_N; i++) { k32_jw_key(&w, t_status_names[i]); k32_jw_int(&w, by_status[i]); }
     k32_jw_obj_end(&w);
-    k32_jw_key(&w, "by_priority"); k32_jw_arr_begin(&w);
+    k32_jw_keylit(&w, "by_priority"); k32_jw_arr_begin(&w);
     for (int i = 0; i < T_PRIO_N; i++) k32_jw_int(&w, by_prio[i]);
     k32_jw_arr_end(&w);
-    k32_jw_key(&w, "by_assignee"); k32_jw_arr_begin(&w);
+    k32_jw_keylit(&w, "by_assignee"); k32_jw_arr_begin(&w);
     for (int u = 1; u < T_USERS_N; u++) {
         k32_jw_obj_begin(&w);
-        k32_jw_key(&w, "user"); k32_jw_int(&w, u);
-        k32_jw_key(&w, "open"); k32_jw_int(&w, open_by_user[u]);
-        k32_jw_key(&w, "done"); k32_jw_int(&w, done_by_user[u]);
+        k32_jw_keylit(&w, "user"); k32_jw_int(&w, u);
+        k32_jw_keylit(&w, "open"); k32_jw_int(&w, open_by_user[u]);
+        k32_jw_keylit(&w, "done"); k32_jw_int(&w, done_by_user[u]);
         k32_jw_obj_end(&w);
     }
     k32_jw_arr_end(&w);
-    k32_jw_key(&w, "created_per_day"); k32_jw_arr_begin(&w);
+    k32_jw_keylit(&w, "created_per_day"); k32_jw_arr_begin(&w);
     for (u32 i = 0; i < days; i++) k32_jw_int(&w, created_pd[i]);
     k32_jw_arr_end(&w);
-    k32_jw_key(&w, "resolved_per_day"); k32_jw_arr_begin(&w);
+    k32_jw_keylit(&w, "resolved_per_day"); k32_jw_arr_begin(&w);
     for (u32 i = 0; i < days; i++) k32_jw_int(&w, resolved_pd[i]);
     k32_jw_arr_end(&w);
-    k32_jw_key(&w, "cycle_time_hours"); k32_jw_obj_begin(&w);
-    k32_jw_key(&w, "p50"); k32_jw_int(&w, p50);
-    k32_jw_key(&w, "p90"); k32_jw_int(&w, p90);
+    k32_jw_keylit(&w, "cycle_time_hours"); k32_jw_obj_begin(&w);
+    k32_jw_keylit(&w, "p50"); k32_jw_int(&w, p50);
+    k32_jw_keylit(&w, "p90"); k32_jw_int(&w, p90);
     k32_jw_obj_end(&w);
-    k32_jw_key(&w, "open_age_buckets"); k32_jw_obj_begin(&w);
-    k32_jw_key(&w, "lt1d"); k32_jw_int(&w, age[0]);
-    k32_jw_key(&w, "lt7d"); k32_jw_int(&w, age[1]);
-    k32_jw_key(&w, "lt30d"); k32_jw_int(&w, age[2]);
-    k32_jw_key(&w, "gte30d"); k32_jw_int(&w, age[3]);
+    k32_jw_keylit(&w, "open_age_buckets"); k32_jw_obj_begin(&w);
+    k32_jw_keylit(&w, "lt1d"); k32_jw_int(&w, age[0]);
+    k32_jw_keylit(&w, "lt7d"); k32_jw_int(&w, age[1]);
+    k32_jw_keylit(&w, "lt30d"); k32_jw_int(&w, age[2]);
+    k32_jw_keylit(&w, "gte30d"); k32_jw_int(&w, age[3]);
     k32_jw_obj_end(&w);
-    k32_jw_key(&w, "took_us"); k32_jw_int(&w, (k32_time_ms() - rq->t0_ms) * 1000);
+    k32_jw_keylit(&w, "took_us"); k32_jw_int(&w, (k32_time_ms() - rq->t0_ms) * 1000);
     k32_jw_obj_end(&w);
     resp_finish(&w);
     return 200;
@@ -896,11 +928,11 @@ static int h_activity(req_t* rq) {
     k32_jw w;
     resp_begin_json(&w, 200);
     k32_jw_obj_begin(&w);
-    k32_jw_key(&w, "items"); k32_jw_arr_begin(&w);
+    k32_jw_keylit(&w, "items"); k32_jw_arr_begin(&w);
     u32 avail = act_available();
     for (u32 i = 0; i < avail && i < limit; i++) { const act_t* a = act_at(i); if (a) write_activity(&w, a); }
     k32_jw_arr_end(&w);
-    k32_jw_key(&w, "now"); k32_jw_int(&w, rq->now);
+    k32_jw_keylit(&w, "now"); k32_jw_int(&w, rq->now);
     k32_jw_obj_end(&w);
     resp_finish(&w);
     return 200;
@@ -918,42 +950,42 @@ static int h_stats(req_t* rq) {
     k32_jw w;
     resp_begin_json(&w, 200);
     k32_jw_obj_begin(&w);
-    k32_jw_key(&w, "issues"); k32_jw_int(&w, g.issue_live);
-    k32_jw_key(&w, "comments"); k32_jw_int(&w, g.comment_live);
-    k32_jw_key(&w, "users"); k32_jw_int(&w, T_HUMAN_USERS);
-    k32_jw_key(&w, "sessions"); k32_jw_int(&w, session_active());
+    k32_jw_keylit(&w, "issues"); k32_jw_int(&w, g.issue_live);
+    k32_jw_keylit(&w, "comments"); k32_jw_int(&w, g.comment_live);
+    k32_jw_keylit(&w, "users"); k32_jw_int(&w, T_HUMAN_USERS);
+    k32_jw_keylit(&w, "sessions"); k32_jw_int(&w, session_active());
     if (!seed_finished()) {                   /* present only while the data set is incomplete */
         u32 done, total; seed_progress(&done, &total);
-        k32_jw_key(&w, "seeding"); k32_jw_obj_begin(&w);
-        k32_jw_key(&w, "done"); k32_jw_int(&w, done);
-        k32_jw_key(&w, "total"); k32_jw_int(&w, total);
+        k32_jw_keylit(&w, "seeding"); k32_jw_obj_begin(&w);
+        k32_jw_keylit(&w, "done"); k32_jw_int(&w, done);
+        k32_jw_keylit(&w, "total"); k32_jw_int(&w, total);
         k32_jw_obj_end(&w);
     }
-    k32_jw_key(&w, "index"); k32_jw_obj_begin(&w);
-    k32_jw_key(&w, "terms"); k32_jw_int(&w, g.term_count);
-    k32_jw_key(&w, "postings"); k32_jw_int(&w, g.posting_count);
+    k32_jw_keylit(&w, "index"); k32_jw_obj_begin(&w);
+    k32_jw_keylit(&w, "terms"); k32_jw_int(&w, g.term_count);
+    k32_jw_keylit(&w, "postings"); k32_jw_int(&w, g.posting_count);
     k32_jw_obj_end(&w);
-    k32_jw_key(&w, "memory"); k32_jw_obj_begin(&w);
-    k32_jw_key(&w, "used"); k32_jw_int(&w, used);
-    k32_jw_key(&w, "limit"); k32_jw_int(&w, limit);
+    k32_jw_keylit(&w, "memory"); k32_jw_obj_begin(&w);
+    k32_jw_keylit(&w, "used"); k32_jw_int(&w, used);
+    k32_jw_keylit(&w, "limit"); k32_jw_int(&w, limit);
     k32_jw_obj_end(&w);
-    k32_jw_key(&w, "arena"); k32_jw_obj_begin(&w);
-    k32_jw_key(&w, "used"); k32_jw_int(&w, arena_used());
-    k32_jw_key(&w, "size"); k32_jw_int(&w, g.arena.size);
-    k32_jw_key(&w, "tables"); k32_jw_int(&w, g.fixed_bytes);
-    k32_jw_key(&w, "strings"); k32_jw_int(&w, g.string_bytes);
-    k32_jw_key(&w, "postings"); k32_jw_int(&w, g.posting_bytes);
-    k32_jw_key(&w, "postings_leaked"); k32_jw_int(&w, g.posting_leaked);
+    k32_jw_keylit(&w, "arena"); k32_jw_obj_begin(&w);
+    k32_jw_keylit(&w, "used"); k32_jw_int(&w, arena_used());
+    k32_jw_keylit(&w, "size"); k32_jw_int(&w, g.arena.size);
+    k32_jw_keylit(&w, "tables"); k32_jw_int(&w, g.fixed_bytes);
+    k32_jw_keylit(&w, "strings"); k32_jw_int(&w, g.string_bytes);
+    k32_jw_keylit(&w, "postings"); k32_jw_int(&w, g.posting_bytes);
+    k32_jw_keylit(&w, "postings_leaked"); k32_jw_int(&w, g.posting_leaked);
     k32_jw_obj_end(&w);
-    k32_jw_key(&w, "requests"); k32_jw_obj_begin(&w);
-    k32_jw_key(&w, "total"); k32_jw_int(&w, g.req_total);
-    k32_jw_key(&w, "errors"); k32_jw_int(&w, g.req_errors);
-    k32_jw_key(&w, "avg_us"); k32_jw_int(&w, avg);
-    k32_jw_key(&w, "p99_us"); k32_jw_int(&w, p99);
-    k32_jw_key(&w, "last_us"); k32_jw_int(&w, g.req_last_us);
+    k32_jw_keylit(&w, "requests"); k32_jw_obj_begin(&w);
+    k32_jw_keylit(&w, "total"); k32_jw_int(&w, g.req_total);
+    k32_jw_keylit(&w, "errors"); k32_jw_int(&w, g.req_errors);
+    k32_jw_keylit(&w, "avg_us"); k32_jw_int(&w, avg);
+    k32_jw_keylit(&w, "p99_us"); k32_jw_int(&w, p99);
+    k32_jw_keylit(&w, "last_us"); k32_jw_int(&w, g.req_last_us);
     k32_jw_obj_end(&w);
-    k32_jw_key(&w, "uptime_ms"); k32_jw_int(&w, rq->uptime);
-    k32_jw_key(&w, "now"); k32_jw_int(&w, rq->now);
+    k32_jw_keylit(&w, "uptime_ms"); k32_jw_int(&w, rq->uptime);
+    k32_jw_keylit(&w, "now"); k32_jw_int(&w, rq->now);
     k32_jw_obj_end(&w);
     resp_finish(&w);
     return 200;

@@ -63,22 +63,46 @@ int k32_strcmp(const char* a, u32 alen, const char* b, u32 blen) {
 int k32_starts_with(const char* s, u32 len, const char* prefix, u32 plen) {
     return len >= plen && memcmp(s, prefix, plen) == 0;
 }
+/* Decimal formatting: two digits per division through a 200-byte table,
+ * u32 arithmetic whenever the value fits (ids, counts, sizes), one i64
+ * division to split a wider value into a 9-digit low part. */
+static const char k_dd[201] =
+    "00010203040506070809101112131415161718192021222324252627282930313233343536373839"
+    "40414243444546474849505152535455565758596061626364656667686970717273747576777879"
+    "8081828384858687888990919293949596979899";
+/* writes v right-aligned into tmp[..end), returns the start index */
+static u32 fmt_u32_rev(char* tmp, u32 end, u32 v) {
+    u32 i = end;
+    while (v >= 100) { u32 q = v / 100; u32 r = v - q * 100; i -= 2; tmp[i] = k_dd[r * 2]; tmp[i + 1] = k_dd[r * 2 + 1]; v = q; }
+    if (v >= 10) { i -= 2; tmp[i] = k_dd[v * 2]; tmp[i + 1] = k_dd[v * 2 + 1]; }
+    else tmp[--i] = (char)('0' + v);
+    return i;
+}
 u32 k32_fmt_u32(char* out, u32 cap, u32 v) {
-    char tmp[12]; u32 n = 0;
-    do { tmp[n++] = (char)('0' + v % 10); v /= 10; } while (v);
+    char tmp[12];
+    u32 i = fmt_u32_rev(tmp, 12, v), n = 12 - i;
     if (n > cap) return 0;
-    for (u32 i = 0; i < n; i++) out[i] = tmp[n - 1 - i];
+    memcpy(out, tmp + i, n);
     return n;
 }
 u32 k32_fmt_i64(char* out, u32 cap, i64 v) {
-    char tmp[24]; u32 n = 0; int neg = v < 0;
+    char tmp[24]; int neg = v < 0;
     uint64_t u = neg ? (uint64_t)(-(v + 1)) + 1u : (uint64_t)v;
-    do { tmp[n++] = (char)('0' + u % 10); u /= 10; } while (u);
+    u32 i = 24;
+    while (u > 0xFFFFFFFFull) {
+        uint64_t q = u / 1000000000ull; u32 lo = (u32)(u - q * 1000000000ull);
+        /* 9 digits, zero padded */
+        u32 j = fmt_u32_rev(tmp, i, lo);
+        while (i - j < 9) tmp[--j] = '0';
+        i = j; u = q;
+    }
+    i = fmt_u32_rev(tmp, i, (u32)u);
+    u32 n = 24 - i;
     if (n + (u32)neg > cap) return 0;
     u32 o = 0;
     if (neg) out[o++] = '-';
-    for (u32 i = 0; i < n; i++) out[o++] = tmp[n - 1 - i];
-    return o;
+    memcpy(out + o, tmp + i, n);
+    return o + n;
 }
 u32 k32_fmt_hex32(char* out, u32 cap, u32 v) {
     static const char hx[] = "0123456789abcdef";
@@ -304,26 +328,46 @@ void k32_sort_u32(u32* a, u32 n) {
     }
 }
 
-/* ---- JSON writer --------------------------------------------------------- */
+/* ---- JSON writer ---------------------------------------------------------
+ * Every byte used to pass through jw_putc (call + capacity check + two
+ * increments). The hot paths now copy runs with the word-wide memcpy:
+ * jw_write for literals, keys, numbers and strings known to need no
+ * escaping; k32_jw_escaped scans with a 256-entry class table and copies
+ * the runs between escapes. */
 void k32_jw_init(k32_jw* w, char* buf, u32 cap, k32_jw_flush_fn flush, void* ctx) {
     w->buf = buf; w->cap = cap; w->len = 0; w->flush = flush; w->ctx = ctx;
     w->depth = 0; w->after_key = 0; w->truncated = 0; w->total = 0;
     w->first[0] = 1;
 }
 void k32_jw_flush(k32_jw* w) {
-    if (w->len && w->flush) { w->flush(w->ctx, w->buf, w->len); w->len = 0; }
+    if (w->len && w->flush) { K32_PROF(resp_writes); w->flush(w->ctx, w->buf, w->len); w->len = 0; }
 }
 static void jw_putc(k32_jw* w, char c) {
+    K32_PROF(jw_putc);
     if (w->len >= w->cap) {
         if (w->flush) k32_jw_flush(w);
         else { w->truncated = 1; return; }
     }
     w->buf[w->len++] = c; w->total++;
 }
-void k32_jw_raw(k32_jw* w, const char* s, u32 len) {
-    for (u32 i = 0; i < len; i++) jw_putc(w, s[i]);
+static void jw_write(k32_jw* w, const char* s, u32 n) {
+    K32_PROF(jw_writes);
+#if defined(K32_NATIVE)
+    k32_prof.jw_write_bytes += n;
+#endif
+    while (n) {
+        u32 room = w->cap - w->len;
+        if (room == 0) {
+            if (w->flush) { k32_jw_flush(w); room = w->cap; }
+            else { w->truncated = 1; return; }
+        }
+        u32 c = n < room ? n : room;
+        memcpy(w->buf + w->len, s, c);
+        w->len += c; w->total += c; s += c; n -= c;
+    }
 }
-void k32_jw_lit(k32_jw* w, const char* s) { k32_jw_raw(w, s, (u32)strlen(s)); }
+void k32_jw_raw(k32_jw* w, const char* s, u32 len) { jw_write(w, s, len); }
+void k32_jw_lit(k32_jw* w, const char* s) { jw_write(w, s, (u32)strlen(s)); }
 static void jw_sep(k32_jw* w) {
     if (w->after_key) { w->after_key = 0; return; }
     if (!w->first[w->depth]) jw_putc(w, ',');
@@ -342,31 +386,58 @@ void k32_jw_obj_begin(k32_jw* w) { jw_open(w, '{'); }
 void k32_jw_obj_end(k32_jw* w)   { jw_close(w, '}'); }
 void k32_jw_arr_begin(k32_jw* w) { jw_open(w, '['); }
 void k32_jw_arr_end(k32_jw* w)   { jw_close(w, ']'); }
+/* 1 for bytes that need escaping: < 0x20, '"', '\\', 0x7f */
+static const u8 jw_esc_tab[256] = {
+    1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1, 1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,
+    0,0,1,0,0,0,0,0,0,0,0,0,0,0,0,0, 0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
+    0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0, 0,0,0,0,0,0,0,0,0,0,0,0,1,0,0,0,
+    0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0, 0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1,
+};
+int k32_jw_needs_escape(const char* s, u32 len) {
+    for (u32 i = 0; i < len; i++) if (jw_esc_tab[(u8)s[i]]) return 1;
+    return 0;
+}
 void k32_jw_escaped(k32_jw* w, const char* s, u32 len) {
     static const char hx[] = "0123456789abcdef";
+#if defined(K32_NATIVE)
+    k32_prof.jw_scan_bytes += len;
+#endif
+    u32 run = 0;
     for (u32 i = 0; i < len; i++) {
         u8 c = (u8)s[i];
+        if (!jw_esc_tab[c]) continue;
+        if (i > run) jw_write(w, s + run, i - run);
+        run = i + 1;
+        char e[6]; u32 n = 2; e[0] = '\\';
         switch (c) {
-            case '"':  jw_putc(w, '\\'); jw_putc(w, '"'); break;
-            case '\\': jw_putc(w, '\\'); jw_putc(w, '\\'); break;
-            case '\n': jw_putc(w, '\\'); jw_putc(w, 'n'); break;
-            case '\r': jw_putc(w, '\\'); jw_putc(w, 'r'); break;
-            case '\t': jw_putc(w, '\\'); jw_putc(w, 't'); break;
-            default:
-                if (c < 0x20 || c == 0x7f) {
-                    jw_putc(w, '\\'); jw_putc(w, 'u'); jw_putc(w, '0'); jw_putc(w, '0');
-                    jw_putc(w, hx[c >> 4]); jw_putc(w, hx[c & 15]);
-                } else jw_putc(w, (char)c);
+            case '"':  e[1] = '"'; break;
+            case '\\': e[1] = '\\'; break;
+            case '\n': e[1] = 'n'; break;
+            case '\r': e[1] = 'r'; break;
+            case '\t': e[1] = 't'; break;
+            default:   e[1] = 'u'; e[2] = '0'; e[3] = '0'; e[4] = hx[c >> 4]; e[5] = hx[c & 15]; n = 6; break;
         }
+        jw_write(w, e, n);
     }
+    if (len > run) jw_write(w, s + run, len - run);
+}
+void k32_jw_keyn(k32_jw* w, const char* frag, u32 n) {
+    K32_PROF(jw_keys);
+    jw_sep(w);
+    jw_write(w, frag, n);
+    w->after_key = 1;
 }
 void k32_jw_key(k32_jw* w, const char* key) {
+    K32_PROF(jw_keys);
     jw_sep(w);
-    jw_putc(w, '"'); k32_jw_escaped(w, key, (u32)strlen(key)); jw_putc(w, '"'); jw_putc(w, ':');
+    jw_putc(w, '"'); k32_jw_escaped(w, key, (u32)strlen(key)); jw_write(w, "\":", 2);
     w->after_key = 1;
 }
 void k32_jw_str(k32_jw* w, const char* s, u32 len) {
     jw_sep(w); jw_putc(w, '"'); k32_jw_escaped(w, s, len); jw_putc(w, '"');
+}
+void k32_jw_str_raw(k32_jw* w, const char* s, u32 len) {
+    jw_sep(w); jw_putc(w, '"'); jw_write(w, s, len); jw_putc(w, '"');
 }
 static u32 esc_len(u8 c) {
     if (c == '"' || c == '\\' || c == '\n' || c == '\r' || c == '\t') return 2;
@@ -386,11 +457,12 @@ void k32_jw_str_max(k32_jw* w, const char* s, u32 len, u32 max_escaped) {
 }
 void k32_jw_cstr(k32_jw* w, const char* s) { k32_jw_str(w, s, (u32)strlen(s)); }
 void k32_jw_int(k32_jw* w, i64 v) {
+    K32_PROF(jw_ints);
     char tmp[24]; u32 n = k32_fmt_i64(tmp, sizeof tmp, v);
-    jw_sep(w); k32_jw_raw(w, tmp, n);
+    jw_sep(w); jw_write(w, tmp, n);
 }
-void k32_jw_bool(k32_jw* w, int v) { jw_sep(w); k32_jw_lit(w, v ? "true" : "false"); }
-void k32_jw_null(k32_jw* w) { jw_sep(w); k32_jw_lit(w, "null"); }
+void k32_jw_bool(k32_jw* w, int v) { jw_sep(w); if (v) jw_write(w, "true", 4); else jw_write(w, "false", 5); }
+void k32_jw_null(k32_jw* w) { jw_sep(w); jw_write(w, "null", 4); }
 
 /* ---- JSON reader --------------------------------------------------------- */
 typedef struct { char* b; u32 len; u32 pos; } jr;

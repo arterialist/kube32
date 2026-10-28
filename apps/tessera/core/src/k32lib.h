@@ -13,6 +13,7 @@ typedef uint16_t u16;
 typedef uint32_t u32;
 typedef int32_t  i32;
 typedef int64_t  i64;
+typedef uint64_t u64;
 
 /* ---- work counters (native builds only; compiled out of the wasm) ------- */
 #if defined(K32_NATIVE)
@@ -22,6 +23,12 @@ typedef struct {
     u32 stop_cmps;      /* string compares in stopword lookups */
     u32 posting_steps;  /* postings visited by find/remove scans */
     u32 compactions;    /* posting region compactions */
+    u32 jw_putc;        /* single-byte writes (separators, quotes, braces) */
+    u32 jw_writes;      /* bulk writes (memcpy) */
+    u32 jw_write_bytes; /* bytes written in bulk */
+    u32 jw_scan_bytes;  /* bytes that went through the escape scanner */
+    u32 jw_keys, jw_ints;
+    u32 resp_writes;    /* k32_resp_write calls (flushes) */
 } k32_prof_t;
 extern k32_prof_t k32_prof;
 #define K32_PROF(field) ((void)(k32_prof.field++))
@@ -99,8 +106,12 @@ void k32_jw_obj_begin(k32_jw* w);
 void k32_jw_obj_end(k32_jw* w);
 void k32_jw_arr_begin(k32_jw* w);
 void k32_jw_arr_end(k32_jw* w);
-void k32_jw_key(k32_jw* w, const char* key);
+void k32_jw_key(k32_jw* w, const char* key);        /* dynamic key (escaped) */
+void k32_jw_keyn(k32_jw* w, const char* frag, u32 n);   /* complete "\"key\":" fragment */
+#define k32_jw_keylit(w, lit) k32_jw_keyn((w), "\"" lit "\":", (u32)sizeof(lit) + 2u)   /* literal key, one memcpy */
 void k32_jw_str(k32_jw* w, const char* s, u32 len);
+void k32_jw_str_raw(k32_jw* w, const char* s, u32 len);  /* no escaping: caller checked k32_jw_needs_escape */
+int  k32_jw_needs_escape(const char* s, u32 len);
 void k32_jw_str_max(k32_jw* w, const char* s, u32 len, u32 max_escaped);
 void k32_jw_cstr(k32_jw* w, const char* s);
 void k32_jw_int(k32_jw* w, i64 v);

@@ -16,9 +16,12 @@ static void one(const char* label, const char* method, const char* path, const c
     int64_t t0 = now_us();
     int st = hx_request(method, path, cookie, body);
     int64_t dt = now_us() - t0;
-    printf("  %-34s %3d %7u cmp %7u term %7u stop %7u post  %6lld us\n", label, st,
+    printf("  %-34s %3d %6u B %6u cmp %5u term %5u stop %5u post | %6u putc %5u bulk %6u bulkB %6u scanB %4u key %4u int %3u flush %6lld us\n", label, st, shim.body_len,
            k32_prof.cmp_calls - before.cmp_calls, k32_prof.term_cmps - before.term_cmps,
-           k32_prof.stop_cmps - before.stop_cmps, k32_prof.posting_steps - before.posting_steps, (long long)dt);
+           k32_prof.stop_cmps - before.stop_cmps, k32_prof.posting_steps - before.posting_steps,
+           k32_prof.jw_putc - before.jw_putc, k32_prof.jw_writes - before.jw_writes, k32_prof.jw_write_bytes - before.jw_write_bytes,
+           k32_prof.jw_scan_bytes - before.jw_scan_bytes, k32_prof.jw_keys - before.jw_keys, k32_prof.jw_ints - before.jw_ints,
+           k32_prof.resp_writes - before.resp_writes, (long long)dt);
 }
 
 int main(void) {
@@ -56,7 +59,7 @@ int main(void) {
     snprintf(p_comment, sizeof p_comment, "/api/issues/%s/comments", k1);
     snprintf(p_title, sizeof p_title, "/api/issues/%s", k1);
     snprintf(p_status, sizeof p_status, "/api/issues/%s", k3);
-    printf("  %-34s %3s %7s %7s %7s %7s\n", "request", "st", "cmp", "term", "stop", "post");
+    printf("  %-34s %3s %8s %10s %10s %10s %10s | per-byte writer work: putc = single-byte writes, bulk = memcpy runs, scanB = bytes through the escape scanner\n", "request", "st", "bytes", "cmp", "term", "stop", "post");
     one("GET /api/issues?limit=1", "GET", "/api/issues?limit=1", 0);
     one("GET /api/issues?limit=50", "GET", "/api/issues?limit=50", 0);
     one("GET /api/issues?limit=50&page=10", "GET", "/api/issues?limit=50&page=10", 0);
@@ -64,6 +67,8 @@ int main(void) {
     one("GET /api/issues?status=done&sort=priority", "GET", "/api/issues?status=done&sort=priority&order=desc", 0);
     one("GET /api/issues?q=wifi&limit=25", "GET", "/api/issues?q=wifi&limit=25", 0);
     one("GET /api/board?project=1", "GET", "/api/board?project=1", 0);
+    one("GET /api/board (all)", "GET", "/api/board", 0);
+    one("GET /api/issues/<k1> (full)", "GET", p_title, 0);
     one("GET /api/search?q=wifi", "GET", "/api/search?q=wifi", 0);
     one("GET /api/search?q=wi (prefix)", "GET", "/api/search?q=wi", 0);
     one("GET /api/search?q=lease+timer", "GET", "/api/search?q=lease+timer", 0);
