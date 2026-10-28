@@ -16,3 +16,10 @@ __pycache__/
 .DS_Store
 *.swp
 *~
+
+# generated at build time by tools/embed_assets.py
+src/embedded/embedded_blobs_esp.cpp
+src/embedded/embedded_files.cmake
+
+# agent scratch notes, never part of the release
+.agents/

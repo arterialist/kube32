@@ -8,11 +8,18 @@
 #include "kubelet/kubelet.hpp"
 #include "ipc/channel.hpp"
 #include "net/mdns_discovery.hpp"
+#include "app/app_wiring.hpp"
+#include "osal/system.hpp"
+#include "runtime/image_registry.hpp"
+#include "embedded/embedded_blobs.hpp"
+#include "runtime/pod_log.hpp"
+#include "models/kube_models.hpp"
 
 #include <csignal>
 #include <iostream>
 #include <atomic>
 #include <string>
+#include <vector>
 
 static std::atomic<bool> g_sim_running{true};
 
@@ -34,6 +41,13 @@ struct SimOptions {
     uint32_t not_ready_timeout_ms{15000};
     uint32_t eviction_timeout_ms{30000};
     uint32_t reconcile_interval_ms{1000};
+    // Application plumbing
+    uint16_t ingress_port{0};      // control plane: serve the app on this port
+    uint16_t pod_port{7000};       // every node: request-handling pods listen here
+    std::string app_name{"tessera"};
+    std::string core_pod{"tessera-core"};
+    std::string upstream_ip{"127.0.0.1"};
+    std::vector<std::string> peers; // "name:id:ipc_port" static peers for UDP channels
 };
 
 static SimOptions parse_sim_args(int argc, char* argv[]) {
@@ -54,6 +68,12 @@ static SimOptions parse_sim_args(int argc, char* argv[]) {
         else if (arg == "--not-ready-timeout" && i + 1 < argc) opts.not_ready_timeout_ms = std::stoul(argv[++i]);
         else if (arg == "--eviction-timeout" && i + 1 < argc) opts.eviction_timeout_ms = std::stoul(argv[++i]);
         else if (arg == "--reconcile-interval" && i + 1 < argc) opts.reconcile_interval_ms = std::stoul(argv[++i]);
+        else if (arg == "--ingress-port" && i + 1 < argc) opts.ingress_port = static_cast<uint16_t>(std::stoi(argv[++i]));
+        else if (arg == "--pod-port" && i + 1 < argc) opts.pod_port = static_cast<uint16_t>(std::stoi(argv[++i]));
+        else if (arg == "--app" && i + 1 < argc) opts.app_name = argv[++i];
+        else if (arg == "--core-pod" && i + 1 < argc) opts.core_pod = argv[++i];
+        else if (arg == "--upstream-ip" && i + 1 < argc) opts.upstream_ip = argv[++i];
+        else if (arg == "--peer" && i + 1 < argc) opts.peers.push_back(argv[++i]);
     }
 
     if (!has_role) {
@@ -123,6 +143,21 @@ static void seed_default_cluster_nodes(kube32::storage::Store& store) {
                         "\"esp.io/i2c\":\"2\",\"esp32.io/i2c\":\"2\",\"esp.io/psram\":\"3840Ki\",\"esp32.io/psram\":\"3840Ki\"}"
                         "}}";
 
+    // Seeded objects get the same identity fields the API server stamps on
+    // registration (uid, creationTimestamp) so AGE is measured, not guessed.
+    for (std::string* n : {&node1, &node2}) {
+        kube32::models::JsonValue doc;
+        std::string err;
+        if (kube32::models::parse_json(*n, doc, err)) {
+            kube32::models::JsonValue* meta = doc.get_mut("metadata");
+            if (meta) {
+                meta->set("uid", kube32::models::JsonValue{kube32::models::JsonType::String, false, 0, kube32::models::generate_uid(), {}, {}});
+                std::string now = kube32::models::now_rfc3339();
+                if (!now.empty()) meta->set("creationTimestamp", kube32::models::JsonValue{kube32::models::JsonType::String, false, 0, now, {}, {}});
+            }
+            *n = doc.to_string();
+        }
+    }
     store.put("/registry/nodes/esp32-node-01", node1, true);
     store.put("/registry/nodes/esp32-node-02", node2, true);
 }
@@ -135,6 +170,10 @@ int main(int argc, char* argv[]) {
 #endif
 
     SimOptions opts = parse_sim_args(argc, argv);
+
+    // Host has memory to spare: 16 KiB per pod log ring (the device keeps 2 KiB)
+    kube32::runtime::PodLogStore::runtime().set_ring_capacity(16 * 1024);
+    kube32::runtime::PodLogStore::apiserver().set_ring_capacity(16 * 1024);
 
     std::cout << "==================================================================" << std::endl;
     std::cout << "  Kube32 Embedded Cluster Host Simulation Daemon (kube32-sim)     " << std::endl;
@@ -149,6 +188,30 @@ int main(int argc, char* argv[]) {
 
     // Initialize Channel IPC
     kube32::ipc::ChannelManager::instance().init(opts.node_id, opts.ipc_port - opts.node_id);
+    kube32::ipc::ChannelManager::instance().set_local_identity(opts.node_id, opts.node_name);
+    for (const auto& p : opts.peers) {
+        // name:id:port
+        size_t c1 = p.find(':');
+        size_t c2 = (c1 == std::string::npos) ? std::string::npos : p.find(':', c1 + 1);
+        if (c1 == std::string::npos || c2 == std::string::npos) continue;
+        kube32::ipc::PeerInfo info;
+        info.node_name = p.substr(0, c1);
+        info.node_id = static_cast<uint32_t>(std::stoul(p.substr(c1 + 1, c2 - c1 - 1)));
+        info.endpoint.is_espnow = false;
+        info.endpoint.ip_address = "127.0.0.1";
+        info.endpoint.udp_port = static_cast<uint16_t>(std::stoul(p.substr(c2 + 1)));
+        info.endpoint.node_id = info.node_id;
+        kube32::ipc::ChannelManager::instance().add_peer(info);
+    }
+    kube32::ipc::ChannelManager::instance().start_background(2000);
+
+    // Local image registry from the embedded table
+    {
+        size_t n = 0;
+        const auto* imgs = kube32::embedded::images(n);
+        kube32::runtime::ImageRegistry::instance().add_all(imgs, n);
+        std::cout << "[INIT] Image registry: " << n << " embedded image(s)" << std::endl;
+    }
 
     if (opts.role == "worker") {
         // WORKER ROLE
@@ -188,11 +251,31 @@ int main(int argc, char* argv[]) {
         std::cout << "[READY] Kubelet worker agent running for " << opts.node_name
                   << " -> connected to http://" << master_host << ":" << master_port << std::endl;
 
+        kube32::app::AppWiringOptions aw;
+        aw.app_name = opts.app_name;
+        aw.core_pod = opts.core_pod;
+        aw.local_node_name = opts.node_name;
+        aw.run_pod_server = true;
+        aw.pod_port = opts.pod_port;
+        aw.pod_workers = 2;
+        aw.pod_worker_stack = 262144;
+        kube32::app::AppWiring wiring(aw);
+        wiring.start();
+
+        uint64_t last_tick = 0;
         while (g_sim_running.load()) {
             kube32::osal::Thread::sleep_ms(250);
+            uint64_t now = kube32::osal::System::get_uptime_ms();
+            if (now - last_tick >= 1000) {
+                last_tick = now;
+                for (const auto& id : kube32::runtime::AppPodHost::instance().list_pods()) {
+                    kube32::runtime::AppPodHost::instance().tick(id, static_cast<uint32_t>(now));
+                }
+            }
         }
 
         std::cout << "\n[SHUTDOWN] Stopping Kubelet worker agent..." << std::endl;
+        wiring.stop();
         kubelet->stop();
         kube32::ipc::ChannelManager::instance().shutdown();
         kube32::osal::Socket::cleanup_networking();
@@ -247,6 +330,8 @@ int main(int argc, char* argv[]) {
     http_opts.port = opts.port;
     http_opts.backlog = 20;
     http_opts.rx_buffer_size = 16384;
+    http_opts.watch_streams = 16;        // k9s opens several informers at once
+    http_opts.watch_stack_bytes = 65536;
     auto server = std::make_unique<kube32::api::HttpServer>(http_opts, *store, scheduler.get());
 
     // Connect Lease updates to Node Lifecycle Controller
@@ -282,6 +367,7 @@ int main(int argc, char* argv[]) {
         wasm_runtime = kube32::runtime::create_wasm_runtime();
         kube32::kubelet::KubeletConfig kubelet_cfg;
         kubelet_cfg.node_name = "esp32-node-01";
+        kubelet_cfg.control_plane = true;
         kubelet_cfg.api_server_host = "127.0.0.1";
         kubelet_cfg.api_server_port = opts.port;
         kubelet_cfg.node_ip = "127.0.0.1";
@@ -299,11 +385,39 @@ int main(int argc, char* argv[]) {
 
     std::cout << "[READY] Ready for native kubectl and E2E test suite interactions." << std::endl;
 
+    std::unique_ptr<kube32::app::AppWiring> wiring;
+    if (opts.ingress_port > 0) {
+        kube32::app::AppWiringOptions aw;
+        aw.app_name = opts.app_name;
+        aw.core_pod = opts.core_pod;
+        aw.local_node_name = (opts.role == "standalone") ? "esp32-node-01" : opts.node_name;
+        aw.store = store.get();
+        aw.upstream_override_ip = opts.upstream_ip;
+        aw.run_ingress = true;
+        aw.ingress_port = opts.ingress_port;
+        aw.ingress_workers = 4;
+        aw.ingress_worker_stack = 262144;
+        aw.run_pod_server = (opts.role == "standalone");
+        aw.pod_port = opts.pod_port;
+        aw.pod_worker_stack = 262144;
+        wiring = std::make_unique<kube32::app::AppWiring>(aw);
+        wiring->start();
+    }
+
+    uint64_t last_tick = 0;
     while (g_sim_running.load()) {
         kube32::osal::Thread::sleep_ms(250);
+        uint64_t now = kube32::osal::System::get_uptime_ms();
+        if (now - last_tick >= 1000) {
+            last_tick = now;
+            for (const auto& id : kube32::runtime::AppPodHost::instance().list_pods()) {
+                kube32::runtime::AppPodHost::instance().tick(id, static_cast<uint32_t>(now));
+            }
+        }
     }
 
     std::cout << "\n[SHUTDOWN] Intercepted termination signal. Stopping services..." << std::endl;
+    if (wiring) wiring->stop();
     if (local_kubelet) local_kubelet->stop();
     if (local_kubelet2) local_kubelet2->stop();
     mdns->stop_service_announcement();

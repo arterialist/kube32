@@ -1,0 +1,96 @@
+# Tessera: an issue tracker that runs as two WebAssembly pods on the cluster.
+#
+#   tessera-core  on esp32-node-01 (control plane, 2 MB PSRAM): all data,
+#                 search index, analytics and the HTTP API inside one Wasm
+#                 linear memory. The ingress on the same node calls it directly.
+#   tessera-hud   on esp32-node-02 (display board, no PSRAM): live counters on
+#                 the LCD, keyboard input into the app, beep on new issues.
+#
+# The ingress on esp32-node-01 (port 80) serves the web frontend from flash
+# and proxies /api/* to tessera-core. Deploy with:
+#   kubectl --context kube32 apply -f examples/tessera.yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  name: tessera-core
+  namespace: default
+  labels:
+    app: tessera
+    tier: core
+spec:
+  nodeSelector:
+    kubernetes.io/hostname: esp32-node-01
+  restartPolicy: Always
+  containers:
+    - name: core
+      image: wasm://embedded/tessera-core:v1
+      ports:
+        - containerPort: 7000
+          name: http
+      env:
+        - name: SEED_ISSUES
+          value: "2400"
+        - name: SEED_COMMENTS
+          value: "4800"
+        - name: EPOCH_BASE_MS
+          value: "1793059200000"
+      resources:
+        requests:
+          memory: 48Ki                 # internal SRAM for the interpreter and stacks
+          esp32.io/psram: 1280Ki       # Wasm linear memory lives in external PSRAM
+          hardware.kube32.io/ipc: "1"
+        limits:
+          memory: 48Ki
+          esp32.io/psram: 1280Ki
+      securityContext:
+        capabilities:
+          add: ["CHANNEL_IPC"]
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: tessera-hud
+  namespace: default
+  labels:
+    app: tessera
+    tier: hud
+spec:
+  nodeSelector:
+    kubernetes.io/hostname: esp32-node-02
+  restartPolicy: Always
+  containers:
+    - name: hud
+      image: wasm://embedded/tessera-hud:v1
+      env:
+        - name: HUD_TITLE
+          value: "TESSERA"
+      resources:
+        requests:
+          memory: 64Ki
+          hardware.kube32.io/tft-display: "1"
+          hardware.kube32.io/keyboard: "1"
+          hardware.kube32.io/speaker: "1"
+          hardware.kube32.io/ipc: "1"
+        limits:
+          memory: 64Ki
+      securityContext:
+        capabilities:
+          add: ["CHANNEL_IPC", "DISPLAY", "KEYBOARD", "SPEAKER"]
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: tessera
+  namespace: default
+  labels:
+    app: tessera
+spec:
+  type: ClusterIP
+  selector:
+    app: tessera
+    tier: core
+  ports:
+    - name: http
+      port: 80
+      targetPort: 7000
+      protocol: TCP

@@ -4,6 +4,9 @@
 
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
+#include <freertos/idf_additions.h>
+#include <esp_heap_caps.h>
+#include <sdkconfig.h>
 #include <freertos/semphr.h>
 #include <esp_timer.h>
 #include <esp_task_wdt.h>
@@ -16,12 +19,14 @@ struct Thread::Impl {
     SemaphoreHandle_t join_sem{nullptr};
     bool is_valid{false};
     bool joinable{false};
+    bool caps_task{false};   // created with xTaskCreatePinnedToCoreWithCaps (PSRAM stack)
     EntryFn entry{nullptr};
     void* arg{nullptr};
     Config config;
 
     static void freertos_trampoline(void* user_ptr) {
         auto* impl = static_cast<Impl*>(user_ptr);
+        bool caps = false;
         if (impl && impl->entry) {
             impl->entry(impl->arg);
         }
@@ -31,8 +36,14 @@ struct Thread::Impl {
         }
 
         if (impl) {
+            caps = impl->caps_task;
             impl->is_valid = false;
         }
+#if CONFIG_SPIRAM_ALLOW_STACK_EXTERNAL_MEMORY
+        if (caps) {
+            vTaskDeleteWithCaps(nullptr);   // frees the external stack through the timer task
+        }
+#endif
         vTaskDelete(nullptr);
     }
 };
@@ -76,15 +87,34 @@ bool Thread::start(EntryFn entry, void* arg, const Config& config) {
     }
 
     BaseType_t core = (config.core_affinity < 0) ? tskNO_AFFINITY : config.core_affinity;
-    BaseType_t rc = xTaskCreatePinnedToCore(
-        Impl::freertos_trampoline,
-        config.name ? config.name : "k32_task",
-        static_cast<uint32_t>(config.stack_size),
-        impl_,
-        config.priority,
-        &impl_->handle,
-        core
-    );
+    BaseType_t rc = pdFAIL;
+#if CONFIG_SPIRAM_ALLOW_STACK_EXTERNAL_MEMORY
+    if (config.stack_in_psram && heap_caps_get_free_size(MALLOC_CAP_SPIRAM) > config.stack_size + 4096) {
+        // Big worker stacks live in PSRAM so internal SRAM stays for Wi-Fi, lwIP and DMA.
+        rc = xTaskCreatePinnedToCoreWithCaps(
+            Impl::freertos_trampoline,
+            config.name ? config.name : "k32_task",
+            static_cast<uint32_t>(config.stack_size),
+            impl_,
+            config.priority,
+            &impl_->handle,
+            core,
+            MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT
+        );
+        impl_->caps_task = (rc == pdPASS);
+    }
+#endif
+    if (rc != pdPASS) {
+        rc = xTaskCreatePinnedToCore(
+            Impl::freertos_trampoline,
+            config.name ? config.name : "k32_task",
+            static_cast<uint32_t>(config.stack_size),
+            impl_,
+            config.priority,
+            &impl_->handle,
+            core
+        );
+    }
 
     if (rc == pdPASS) {
         impl_->is_valid = true;
@@ -130,15 +160,35 @@ bool Thread::create(EntryFn entry, void* arg, const Config& config) {
         }
     };
     auto* ctx = new TempContext{entry, arg};
-    BaseType_t rc = xTaskCreatePinnedToCore(
-        TempContext::runner,
-        config.name ? config.name : "k32_task",
-        static_cast<uint32_t>(config.stack_size),
-        ctx,
-        config.priority,
-        nullptr,
-        core
-    );
+    BaseType_t rc = pdFAIL;
+#if CONFIG_SPIRAM_ALLOW_STACK_EXTERNAL_MEMORY
+    if (config.stack_in_psram && heap_caps_get_free_size(MALLOC_CAP_SPIRAM) > config.stack_size + 4096) {
+        // Detached tasks never return (vTaskDelete in the runner), so the
+        // externally allocated stack is never reclaimed; that is fine for the
+        // long-lived service threads this is used for.
+        rc = xTaskCreatePinnedToCoreWithCaps(
+            TempContext::runner,
+            config.name ? config.name : "k32_task",
+            static_cast<uint32_t>(config.stack_size),
+            ctx,
+            config.priority,
+            nullptr,
+            core,
+            MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT
+        );
+    }
+#endif
+    if (rc != pdPASS) {
+        rc = xTaskCreatePinnedToCore(
+            TempContext::runner,
+            config.name ? config.name : "k32_task",
+            static_cast<uint32_t>(config.stack_size),
+            ctx,
+            config.priority,
+            nullptr,
+            core
+        );
+    }
     if (rc != pdPASS) {
         delete ctx;
         return false;

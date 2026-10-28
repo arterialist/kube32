@@ -4,6 +4,7 @@
 
 #include <cstring>
 #include <algorithm>
+#include <cstdio>
 #include <iostream>
 
 #if defined(KUBE32_TARGET_ESP32)
@@ -11,6 +12,9 @@
 #include "esp_wifi.h"
 #include "esp_mac.h"
 #include "esp_log.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
+#include "freertos/task.h"
 static const char* TAG = "Kube32Ipc";
 #endif
 
@@ -46,8 +50,8 @@ uint16_t crc16_ccitt(const uint8_t* data, size_t len, uint16_t init) {
 // =============================================================================
 // Lock-Free SPSC RingBuffer Implementation
 // =============================================================================
-RingBuffer::RingBuffer(size_t capacity)
-    : capacity_(capacity), mask_(capacity - 1), slots_(capacity) {
+RingBuffer::RingBuffer(size_t capacity, size_t slot_size)
+    : capacity_(capacity), mask_(capacity - 1), slot_size_(slot_size), slots_(capacity), payload_(capacity * slot_size) {
     head_.store(0, std::memory_order_relaxed);
     tail_.store(0, std::memory_order_relaxed);
 }
@@ -67,7 +71,7 @@ size_t RingBuffer::size() const {
 }
 
 bool RingBuffer::push(uint32_t sender_hash, const uint8_t* data, size_t len) {
-    if (!data || len > K32C_RING_SLOT_SIZE) return false;
+    if (!data || len > slot_size_) return false;
 
     osal::LockGuard guard(producer_mutex_);
 
@@ -81,7 +85,7 @@ bool RingBuffer::push(uint32_t sender_hash, const uint8_t* data, size_t len) {
     size_t index = current_head & mask_;
     slots_[index].sender_hash = sender_hash;
     slots_[index].len = static_cast<uint16_t>(len);
-    std::memcpy(slots_[index].data, data, len);
+    std::memcpy(payload_.data() + index * slot_size_, data, len);
 
     // Release fence guarantees payload is committed before updating head
     head_.store(current_head + 1, std::memory_order_release);
@@ -101,7 +105,7 @@ int32_t RingBuffer::pop(uint8_t* out_buf, size_t max_len, uint32_t timeout_ms, u
     if (current_head != current_tail) {
         size_t index = current_tail & mask_;
         size_t copy_len = std::min<size_t>(max_len, slots_[index].len);
-        std::memcpy(out_buf, slots_[index].data, copy_len);
+        std::memcpy(out_buf, payload_.data() + index * slot_size_, copy_len);
         if (out_sender_hash) *out_sender_hash = slots_[index].sender_hash;
 
         tail_.store(current_tail + 1, std::memory_order_release);
@@ -129,7 +133,7 @@ int32_t RingBuffer::pop(uint8_t* out_buf, size_t max_len, uint32_t timeout_ms, u
 
     size_t index = current_tail & mask_;
     size_t copy_len = std::min<size_t>(max_len, slots_[index].len);
-    std::memcpy(out_buf, slots_[index].data, copy_len);
+    std::memcpy(out_buf, payload_.data() + index * slot_size_, copy_len);
     if (out_sender_hash) *out_sender_hash = slots_[index].sender_hash;
 
     tail_.store(current_tail + 1, std::memory_order_release);
@@ -150,10 +154,17 @@ public:
         if (running_.load()) return true;
         if (!sock_.create(osal::SocketType::Udp)) return false;
         sock_.set_reuse_addr(true);
-        if (!sock_.bind("0.0.0.0", port_)) {
+        bool bound = false;
+        for (int attempt = 0; attempt < 20 && !bound; ++attempt) {
+            bound = sock_.bind("0.0.0.0", port_);
+            if (!bound) osal::Thread::sleep_ms(100);
+        }
+        if (!bound) {
+            std::cout << "[IPC] UDP transport failed to bind port " << port_ << std::endl;
             sock_.close();
             return false;
         }
+        std::cout << "[IPC] UDP channel transport listening on port " << port_ << std::endl;
         sock_.set_timeout(100, 100);
 
         running_.store(true);
@@ -195,9 +206,12 @@ private:
         while (running_.load()) {
             ssize_t n = sock_.recvfrom(buffer, sizeof(buffer), &sender_ip, &sender_port);
             if (n >= static_cast<ssize_t>(K32C_HEADER_LEN + K32C_CRC_LEN)) {
-                ChannelManager::instance().on_frame_received(buffer, static_cast<size_t>(n));
+                NodeEndpoint src;
+                src.is_espnow = false;
+                src.ip_address = sender_ip;
+                src.udp_port = sender_port;
+                ChannelManager::instance().on_frame_received(buffer, static_cast<size_t>(n), &src);
             }
-            osal::Thread::sleep_ms(1);
         }
     }
 
@@ -220,6 +234,19 @@ public:
     bool start() override {
         if (esp_now_init() != ESP_OK) return false;
         esp_now_register_recv_cb(recv_callback);
+        esp_now_register_send_cb(send_callback);
+        s_send_sem = xSemaphoreCreateBinary();
+        // Default ESP-NOW rate is 1 Mbps; raise it so fragmented messages move
+        // at tens of KB/s instead of a few. Both nodes accept any rate on RX.
+        wifi_mode_t mode = WIFI_MODE_NULL;
+        esp_wifi_get_mode(&mode);
+        wifi_interface_t ifx = (mode == WIFI_MODE_AP || mode == WIFI_MODE_APSTA) ? WIFI_IF_AP : WIFI_IF_STA;
+        esp_wifi_config_espnow_rate(ifx, WIFI_PHY_RATE_24M);
+        if (mode == WIFI_MODE_APSTA) esp_wifi_config_espnow_rate(WIFI_IF_STA, WIFI_PHY_RATE_24M);
+        ifx_ = ifx;
+        // Broadcast peer for HELLO frames
+        static const uint8_t bcast[6] = {0xff, 0xff, 0xff, 0xff, 0xff, 0xff};
+        ensure_peer(bcast);
         running_ = true;
         return true;
     }
@@ -233,25 +260,49 @@ public:
 
     int32_t send_frame(const NodeEndpoint& target, const uint8_t* frame, size_t len) override {
         if (!running_) return IPC_ERR_IO;
-        esp_now_peer_info_t peer_info = {};
-        std::memcpy(peer_info.peer_addr, target.mac_address, 6);
-        peer_info.channel = 0;
-        peer_info.encrypt = false;
-        if (!esp_now_is_peer_exist(target.mac_address)) {
-            esp_now_add_peer(&peer_info);
-        }
+        ensure_peer(target.mac_address);
+        // Serialize sends: ESP-NOW has one in-flight frame per peer and
+        // returns ESP_ERR_ESPNOW_NO_MEM when flooded.
+        osal::LockGuard guard(send_mutex_);
+        xSemaphoreTake(s_send_sem, 0);
         esp_err_t err = esp_now_send(target.mac_address, frame, len);
-        return (err == ESP_OK) ? IPC_OK : IPC_ERR_IO;
+        if (err != ESP_OK) return IPC_ERR_IO;
+        if (xSemaphoreTake(s_send_sem, pdMS_TO_TICKS(30)) != pdTRUE) return IPC_ERR_TIMEDOUT;
+        return s_last_send_ok ? IPC_OK : IPC_ERR_HOSTUNREACH;
     }
 
 private:
+    static SemaphoreHandle_t s_send_sem;
+    static volatile bool s_last_send_ok;
+    osal::Mutex send_mutex_;
+    wifi_interface_t ifx_{WIFI_IF_STA};
+
+    void ensure_peer(const uint8_t* mac) {
+        if (esp_now_is_peer_exist(mac)) return;
+        esp_now_peer_info_t peer_info = {};
+        std::memcpy(peer_info.peer_addr, mac, 6);
+        peer_info.channel = 0;
+        peer_info.encrypt = false;
+        peer_info.ifidx = ifx_;
+        esp_now_add_peer(&peer_info);
+    }
+
+    static void send_callback(const wifi_tx_info_t* info, esp_now_send_status_t status) {
+        (void)info;
+        s_last_send_ok = (status == ESP_NOW_SEND_SUCCESS);
+        if (s_send_sem) xSemaphoreGive(s_send_sem);
+    }
+
     static void recv_callback(const esp_now_recv_info_t* info, const uint8_t* data, int len) {
-        if (data && len >= static_cast<int>(K32C_HEADER_LEN + K32C_CRC_LEN)) {
-            ChannelManager::instance().on_frame_received(data, static_cast<size_t>(len));
+        // Runs on the Wi-Fi task: copy out and let the dispatcher thread parse it
+        if (data && len >= static_cast<int>(K32C_HEADER_LEN + K32C_CRC_LEN) && len <= 250) {
+            ChannelManager::instance().enqueue_raw_frame((info && info->src_addr) ? info->src_addr : nullptr, data, static_cast<size_t>(len));
         }
     }
     bool running_{false};
 };
+SemaphoreHandle_t EspNowTransport::s_send_sem = nullptr;
+volatile bool EspNowTransport::s_last_send_ok = false;
 #endif
 
 // =============================================================================
@@ -278,10 +329,25 @@ bool ChannelManager::init(uint32_t node_id, uint16_t base_udp_port) {
         initialized_ = true;
         return true;
     }
+    std::cout << "[IPC] channel transport failed to start (node " << node_id << ")" << std::endl;
+    transport_.reset();
     return false;
 }
 
 void ChannelManager::shutdown() {
+    background_running_.store(false);
+    if (dispatch_thread_) {
+        dispatch_thread_->join();
+        dispatch_thread_.reset();
+    }
+    {
+        osal::LockGuard sguard(sub_mutex_);
+        subs_.clear();
+    }
+    {
+        osal::LockGuard pguard(peer_mutex_);
+        peers_.clear();
+    }
     osal::LockGuard guard(mutex_);
     if (transport_) {
         transport_->stop();
@@ -315,7 +381,11 @@ int32_t ChannelManager::open(const std::string& pod_id, const std::string& chann
     if (VirtualChannelRoutingTable::instance().lookup_route(channel_uri, existing_route) && existing_route.local_ring) {
         ch.in_ring = existing_route.local_ring;
     } else {
+#if defined(KUBE32_TARGET_ESP32)
+        ch.in_ring = std::make_shared<RingBuffer>(8, 512);
+#else
         ch.in_ring = std::make_shared<RingBuffer>(K32C_RING_SLOT_COUNT);
+#endif
         VirtualChannelRoutingTable::instance().register_local_channel(pod_id, channel_uri, ch.in_ring);
     }
 
@@ -353,12 +423,18 @@ int32_t ChannelManager::send(const std::string& pod_id, int32_t handle, const ui
 
     // Remote delivery: Frame packetization & transport dispatch
     if (!transport_) return IPC_ERR_IO;
-
-    uint16_t seq = seq_generator_.fetch_add(1);
     uint32_t target_hash = fnv1a_32(route.target_pod);
+    send_frames_to(route.remote_endpoint, channel_hash, sender_hash, target_hash, data, len, 0);
+    return static_cast<int32_t>(len);
+}
 
+int32_t ChannelManager::send_frames_to(const NodeEndpoint& ep, uint32_t channel_hash, uint32_t sender_hash, uint32_t target_hash,
+                                       const uint8_t* data, size_t len, uint8_t extra_flags) {
+    if (!transport_) return IPC_ERR_IO;
+    uint16_t seq = seq_generator_.fetch_add(1);
     size_t frag_count = (len + K32C_MAX_PAYLOAD_CHUNK - 1) / K32C_MAX_PAYLOAD_CHUNK;
     if (frag_count == 0) frag_count = 1;
+    if (frag_count > 32) frag_count = 32; // receiver caps reassembly at 32 fragments
 
     for (size_t i = 0; i < frag_count; ++i) {
         size_t offset = i * K32C_MAX_PAYLOAD_CHUNK;
@@ -367,6 +443,7 @@ int32_t ChannelManager::send(const std::string& pod_id, int32_t handle, const ui
         K32CPacket pkt = {};
         pkt.header.magic = K32C_MAGIC;
         pkt.header.version = K32C_VERSION;
+        pkt.header.flags = extra_flags;
         pkt.header.seq_num = seq;
         pkt.header.channel_hash = channel_hash;
         pkt.header.sender_hash = sender_hash;
@@ -374,24 +451,228 @@ int32_t ChannelManager::send(const std::string& pod_id, int32_t handle, const ui
         pkt.header.frag_index = static_cast<uint8_t>(i);
         pkt.header.frag_count = static_cast<uint8_t>(frag_count);
         pkt.header.payload_len = static_cast<uint16_t>(chunk_len);
-
         if (frag_count > 1) pkt.header.flags |= K32C_FLAG_FRAGMENT;
         if (i == 0) pkt.header.flags |= K32C_FLAG_FIRST_FRAG;
         if (i == frag_count - 1) pkt.header.flags |= K32C_FLAG_LAST_FRAG;
-
-        if (chunk_len > 0) {
-            std::memcpy(pkt.payload, data + offset, chunk_len);
-        }
+        if (chunk_len > 0) std::memcpy(pkt.payload, data + offset, chunk_len);
 
         size_t frame_bytes = K32C_HEADER_LEN + chunk_len;
         uint16_t crc = crc16_ccitt(reinterpret_cast<const uint8_t*>(&pkt), frame_bytes);
         std::memcpy(pkt.payload + chunk_len, &crc, 2);
 
-        int32_t res = transport_->send_frame(route.remote_endpoint, reinterpret_cast<const uint8_t*>(&pkt), frame_bytes + 2);
-        if (res != IPC_OK) return res;
+        int32_t res = transport_->send_frame(ep, reinterpret_cast<const uint8_t*>(&pkt), frame_bytes + 2);
+        if (res == IPC_OK) stats_.frames_sent.fetch_add(1, std::memory_order_relaxed);
+        else { stats_.send_errors.fetch_add(1, std::memory_order_relaxed); return res; }
     }
+    return IPC_OK;
+}
 
+// =============================================================================
+// Topic publish/subscribe and peers
+// =============================================================================
+int32_t ChannelManager::publish(const std::string& pod_id, const std::string& topic, const uint8_t* data, size_t len) {
+    if (!data && len > 0) return IPC_ERR_FAULT;
+    if (len > K32C_RING_SLOT_SIZE) return IPC_ERR_INVAL;
+    uint32_t channel_hash = fnv1a_32(topic);
+    uint32_t sender_hash = fnv1a_32(pod_id);
+
+    // Local pods and host subscribers
+    deliver_local(channel_hash, sender_hash, data, len);
+
+    // Remote peers
+    std::vector<PeerInfo> targets = peers();
+    for (const auto& p : targets) {
+        if (p.node_id == local_node_id_) continue;
+        int32_t rc = send_frames_to(p.endpoint, channel_hash, sender_hash, 0, data, len, 0);
+        static int traced = 0;
+        if (traced < 8) { traced++; printf("[TRACE] ipc tx -> node %u len=%u rc=%d\n", (unsigned)p.node_id, (unsigned)len, (int)rc); }
+    }
     return static_cast<int32_t>(len);
+}
+
+void ChannelManager::deliver_local(uint32_t channel_hash, uint32_t sender_hash, const uint8_t* data, size_t len) {
+    ChannelRoute route;
+    if (VirtualChannelRoutingTable::instance().lookup_route_by_hash(channel_hash, route) && route.is_local && route.local_ring) {
+        if (route.local_ring->push(sender_hash, data, len)) {
+            stats_.frames_delivered.fetch_add(1, std::memory_order_relaxed);
+        }
+    }
+    bool has_sub = false;
+    {
+        osal::LockGuard guard(sub_mutex_);
+        for (const auto& sub : subs_) {
+            if (sub.topic_hash == channel_hash) { has_sub = true; break; }
+        }
+    }
+    if (has_sub && dispatch_ring_) {
+        // Prefix the payload with the channel hash so the dispatcher can route it
+        uint8_t tmp[264];
+        if (len + 4 <= sizeof(tmp) && len + 4 <= dispatch_ring_->slot_size()) {
+            std::memcpy(tmp, &channel_hash, 4);
+            if (len > 0) std::memcpy(tmp + 4, data, len);
+            dispatch_ring_->push(sender_hash, tmp, len + 4);
+        }
+    }
+}
+
+uint32_t ChannelManager::subscribe(const std::string& topic, TopicCallback cb) {
+    osal::LockGuard guard(sub_mutex_);
+    Subscription s;
+    s.id = next_sub_id_++;
+    s.topic_hash = fnv1a_32(topic);
+    s.topic = topic;
+    s.cb = std::move(cb);
+    subs_.push_back(std::move(s));
+    return subs_.back().id;
+}
+
+void ChannelManager::unsubscribe(uint32_t id) {
+    osal::LockGuard guard(sub_mutex_);
+    for (auto it = subs_.begin(); it != subs_.end(); ++it) {
+        if (it->id == id) { subs_.erase(it); return; }
+    }
+}
+
+void ChannelManager::enqueue_raw_frame(const uint8_t* src_mac, const uint8_t* frame, size_t len) {
+    if (!rx_ring_ || len + 6 > rx_ring_->slot_size()) return;
+    uint8_t tmp[6 + 250];
+    if (src_mac) std::memcpy(tmp, src_mac, 6); else std::memset(tmp, 0, 6);
+    std::memcpy(tmp + 6, frame, len);
+    rx_ring_->push(0xFFFFFFFFu, tmp, len + 6);
+}
+
+void ChannelManager::dispatch_loop() {
+    uint8_t buf[264];
+    while (background_running_.load()) {
+        uint32_t sender = 0;
+        uint64_t now = osal::System::get_uptime_ms();
+        if (hello_interval_ms_ > 0 && now - last_hello_ms_ >= hello_interval_ms_) {
+            last_hello_ms_ = now;
+            send_hello();
+        }
+        // Raw frames from the ESP-NOW callback
+        if (rx_ring_) {
+            int32_t rn;
+            while ((rn = rx_ring_->pop(buf, sizeof(buf), 0, &sender)) > 6) {
+                NodeEndpoint src;
+                src.is_espnow = true;
+                std::memcpy(src.mac_address, buf, 6);
+                on_frame_received(buf + 6, static_cast<size_t>(rn - 6), &src);
+            }
+        }
+        int32_t n = dispatch_ring_ ? dispatch_ring_->pop(buf, sizeof(buf), 20, &sender) : IPC_ERR_TIMEDOUT;
+        if (n < 4) {
+            osal::System::feed_watchdog();
+            continue;
+        }
+        uint32_t hash = 0;
+        std::memcpy(&hash, buf, 4);
+        std::vector<Subscription> matched;
+        {
+            osal::LockGuard guard(sub_mutex_);
+            for (const auto& sub : subs_) if (sub.topic_hash == hash) matched.push_back(sub);
+        }
+        for (const auto& sub : matched) {
+            if (sub.cb) sub.cb(sub.topic, sender, buf + 4, static_cast<size_t>(n - 4));
+        }
+        osal::System::feed_watchdog();
+    }
+}
+
+bool ChannelManager::start_background(uint32_t hello_interval_ms, size_t dispatcher_stack_bytes, bool stack_in_psram) {
+    if (background_running_.load()) return true;
+    hello_interval_ms_ = hello_interval_ms;
+    // Events are capped at K32_MAX_EVENT_BYTES (200) + 4 bytes of topic hash
+    if (!dispatch_ring_) dispatch_ring_ = std::make_shared<RingBuffer>(8, 256);
+#if defined(KUBE32_TARGET_ESP32)
+    if (!rx_ring_) rx_ring_ = std::make_shared<RingBuffer>(8, 264);
+#endif
+    background_running_.store(true);
+    dispatch_thread_ = std::make_unique<osal::Thread>();
+    osal::Thread::Config cfg;
+    cfg.name = "k32_ipc_disp";
+    cfg.stack_size = dispatcher_stack_bytes;
+    cfg.stack_in_psram = stack_in_psram;
+    cfg.priority = 5;
+    bool ok = dispatch_thread_->start([](void* p) { static_cast<ChannelManager*>(p)->dispatch_loop(); }, this, cfg);
+    if (!ok) background_running_.store(false);
+    return ok;
+}
+
+void ChannelManager::set_local_identity(uint32_t node_id, const std::string& node_name) {
+    local_node_id_ = node_id;
+    local_node_name_ = node_name;
+}
+
+void ChannelManager::add_peer(const PeerInfo& peer) {
+    osal::LockGuard guard(peer_mutex_);
+    PeerInfo& slot = peers_[peer.node_id];
+    uint32_t count = slot.hello_count;
+    slot = peer;
+    slot.hello_count = count;
+    if (slot.last_seen_ms == 0) slot.last_seen_ms = osal::System::get_uptime_ms();
+}
+
+std::vector<PeerInfo> ChannelManager::peers() const {
+    osal::LockGuard guard(peer_mutex_);
+    std::vector<PeerInfo> out;
+    for (const auto& kv : peers_) out.push_back(kv.second);
+    return out;
+}
+
+bool ChannelManager::find_peer_by_name(const std::string& node_name, PeerInfo& out) const {
+    osal::LockGuard guard(peer_mutex_);
+    for (const auto& kv : peers_) {
+        if (kv.second.node_name == node_name) { out = kv.second; return true; }
+    }
+    return false;
+}
+
+void ChannelManager::send_hello() {
+    if (!transport_ || !initialized_) return;
+    uint8_t payload[64];
+    std::memcpy(payload, &local_node_id_, 4);
+    size_t name_len = std::min<size_t>(local_node_name_.size(), sizeof(payload) - 4);
+    std::memcpy(payload + 4, local_node_name_.data(), name_len);
+    uint32_t hash = fnv1a_32(K32C_HELLO_TOPIC, std::strlen(K32C_HELLO_TOPIC));
+    uint32_t sender = fnv1a_32(local_node_name_);
+#if defined(KUBE32_TARGET_ESP32)
+    NodeEndpoint bcast;
+    bcast.is_espnow = true;
+    std::memset(bcast.mac_address, 0xff, 6);
+    send_frames_to(bcast, hash, sender, 0, payload, 4 + name_len, K32C_FLAG_PING);
+#else
+    for (const auto& p : peers()) {
+        if (p.node_id == local_node_id_) continue;
+        send_frames_to(p.endpoint, hash, sender, 0, payload, 4 + name_len, K32C_FLAG_PING);
+    }
+#endif
+}
+
+void ChannelManager::handle_hello(const K32CHeader* hdr, const uint8_t* payload, size_t len, const NodeEndpoint* source) {
+    (void)hdr;
+    if (len < 4) return;
+    uint32_t node_id = 0;
+    std::memcpy(&node_id, payload, 4);
+    if (node_id == local_node_id_) return;
+    stats_.hello_rx.fetch_add(1, std::memory_order_relaxed);
+    PeerInfo info;
+    info.node_id = node_id;
+    info.node_name.assign(reinterpret_cast<const char*>(payload + 4), len - 4);
+    if (source) info.endpoint = *source;
+    info.endpoint.node_id = node_id;
+    if (info.endpoint.udp_port == 0) info.endpoint.udp_port = 7400;
+    osal::LockGuard guard(peer_mutex_);
+    auto it = peers_.find(node_id);
+    bool is_new = (it == peers_.end());
+    PeerInfo& slot = peers_[node_id];
+    uint32_t count = is_new ? 0 : slot.hello_count;
+    slot = info;
+    slot.hello_count = count + 1;
+    slot.last_seen_ms = osal::System::get_uptime_ms();
+    if (is_new) {
+        std::cout << "[IPC] Discovered peer node " << info.node_name << " (id " << node_id << ")" << std::endl << std::flush;
+    }
 }
 
 int32_t ChannelManager::recv(const std::string& pod_id, int32_t handle, uint8_t* out_buf, size_t max_len, uint32_t timeout_ms) {
@@ -430,7 +711,7 @@ int32_t ChannelManager::close(const std::string& pod_id, int32_t handle) {
     return IPC_OK;
 }
 
-void ChannelManager::on_frame_received(const uint8_t* frame, size_t len) {
+void ChannelManager::on_frame_received(const uint8_t* frame, size_t len, const NodeEndpoint* source) {
     stats_.frames_received.fetch_add(1, std::memory_order_relaxed);
 
     if (len < K32C_HEADER_LEN + K32C_CRC_LEN) return;
@@ -438,8 +719,6 @@ void ChannelManager::on_frame_received(const uint8_t* frame, size_t len) {
     const auto* hdr = reinterpret_cast<const K32CHeader*>(frame);
     if (hdr->magic != K32C_MAGIC || hdr->version != K32C_VERSION) {
         stats_.bad_magic_errors.fetch_add(1, std::memory_order_relaxed);
-        std::cout << "[IPC-RX] Dropped frame: invalid magic 0x" << std::hex << hdr->magic
-                  << " (expected 0x" << K32C_MAGIC << ")" << std::dec << std::endl << std::flush;
         return;
     }
     if (hdr->payload_len > K32C_MAX_PAYLOAD_CHUNK || (K32C_HEADER_LEN + hdr->payload_len + K32C_CRC_LEN) > len) return;
@@ -450,25 +729,20 @@ void ChannelManager::on_frame_received(const uint8_t* frame, size_t len) {
     std::memcpy(&packet_crc, frame + K32C_HEADER_LEN + hdr->payload_len, 2);
     if (expected_crc != packet_crc) {
         stats_.crc_errors.fetch_add(1, std::memory_order_relaxed);
-        std::cout << "[IPC-RX] Dropped frame: CRC mismatch (expected=0x" << std::hex << expected_crc
-                  << " got=0x" << packet_crc << std::dec << ")" << std::endl << std::flush;
         return; // Drop corrupted frame
     }
 
-    std::cout << "[IPC-RX] Accepted valid K32C frame: chan=0x" << std::hex << hdr->channel_hash
-              << " sender=0x" << hdr->sender_hash
-              << " len=" << std::dec << hdr->payload_len << std::endl << std::flush;
-
-    // Route lookup
-    ChannelRoute route;
-    if (!VirtualChannelRoutingTable::instance().lookup_route_by_hash(hdr->channel_hash, route)) return;
-    if (!route.is_local || !route.local_ring) return;
+    // Peer discovery frames never reach pods
+    if (hdr->flags & K32C_FLAG_PING) {
+        handle_hello(hdr, frame + K32C_HEADER_LEN, hdr->payload_len, source);
+        return;
+    }
 
     // Single-frame message fast path
     if (hdr->frag_count <= 1) {
-        if (route.local_ring->push(hdr->sender_hash, frame + K32C_HEADER_LEN, hdr->payload_len)) {
-            stats_.frames_delivered.fetch_add(1, std::memory_order_relaxed);
-        }
+        static int traced = 0;
+        if (traced < 8) { traced++; printf("[TRACE] ipc rx frame chan=%08x len=%u\n", (unsigned)hdr->channel_hash, (unsigned)hdr->payload_len); }
+        deliver_local(hdr->channel_hash, hdr->sender_hash, frame + K32C_HEADER_LEN, hdr->payload_len);
         return;
     }
 
@@ -536,11 +810,14 @@ void ChannelManager::on_frame_received(const uint8_t* frame, size_t len) {
     }
 
     if (entry.received_frags == entry.total_frags) {
-        if (route.local_ring->push(entry.sender_hash, entry.buffer, entry.total_bytes)) {
-            stats_.frames_delivered.fetch_add(1, std::memory_order_relaxed);
-            stats_.reassembled_msgs.fetch_add(1, std::memory_order_relaxed);
-        }
+        uint8_t done[K32C_RING_SLOT_SIZE];
+        size_t total = entry.total_bytes;
+        std::memcpy(done, entry.buffer, total);
+        uint32_t ch = entry.channel_hash;
+        uint32_t snd = entry.sender_hash;
         reassembly_table_.erase(reassembly_key);
+        stats_.reassembled_msgs.fetch_add(1, std::memory_order_relaxed);
+        deliver_local(ch, snd, done, total);
     }
 }
 

@@ -131,8 +131,7 @@ static const void* raw_esp32_adc_read(IM3Runtime runtime, IM3ImportContext _ctx,
     }
 
 #if defined(KUBE32_TARGET_ESP32)
-    // ESP32 ADC oneshot read stub/driver
-    *reinterpret_cast<int32_t*>(_sp) = 1850;
+    *reinterpret_cast<int32_t*>(_sp) = esp32_adc_read(channel);
 #else
     int32_t res = hal::MockHal::instance().adc1_read(channel);
     *reinterpret_cast<int32_t*>(_sp) = res;
@@ -443,9 +442,36 @@ int32_t esp32_gpio_read(uint32_t pin) {
 #endif
 }
 
+#if defined(KUBE32_TARGET_ESP32)
+static adc_oneshot_unit_handle_t s_adc1_handle = nullptr;
+static uint16_t s_adc1_configured_mask = 0;
+static std::mutex s_adc_mutex;
+
+static bool adc1_prepare(uint32_t channel) {
+    std::lock_guard<std::mutex> lock(s_adc_mutex);
+    if (!s_adc1_handle) {
+        adc_oneshot_unit_init_cfg_t init_cfg = {};
+        init_cfg.unit_id = ADC_UNIT_1;
+        init_cfg.ulp_mode = ADC_ULP_MODE_DISABLE;
+        if (adc_oneshot_new_unit(&init_cfg, &s_adc1_handle) != ESP_OK) return false;
+    }
+    if (!(s_adc1_configured_mask & (1u << channel))) {
+        adc_oneshot_chan_cfg_t ch_cfg = {};
+        ch_cfg.atten = ADC_ATTEN_DB_12;
+        ch_cfg.bitwidth = ADC_BITWIDTH_DEFAULT;
+        if (adc_oneshot_config_channel(s_adc1_handle, static_cast<adc_channel_t>(channel), &ch_cfg) != ESP_OK) return false;
+        s_adc1_configured_mask |= (1u << channel);
+    }
+    return true;
+}
+#endif
+
 int32_t esp32_adc_read(uint32_t channel) {
 #if defined(KUBE32_TARGET_ESP32)
-    return 1850;
+    if (channel >= 10 || !adc1_prepare(channel)) return hal::HAL_ERR_NODEV;
+    int raw = 0;
+    esp_err_t err = adc_oneshot_read(s_adc1_handle, static_cast<adc_channel_t>(channel), &raw);
+    return (err == ESP_OK) ? raw : hal::HAL_ERR_IO;
 #else
     return hal::MockHal::instance().adc1_read(channel);
 #endif

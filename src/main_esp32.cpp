@@ -1,422 +1,651 @@
+// Kube32 firmware entry point for ESP32-S3.
+//
+// One image boots both cluster roles; the factory MAC selects the role.
+//   esp32-node-01  control plane + ingress + local kubelet, SoftAP host,
+//                  integrated display/keyboard/speaker exposed to pods
+//   esp32-node-02  worker: kubelet, pod HTTP server, Wi-Fi station
+//
+// Nothing application specific lives here: workloads arrive as Wasm pods
+// through the Kubernetes API, images come from the embedded registry, and
+// hardware reaches pods only through capability-gated host functions.
+
+#if defined(KUBE32_TARGET_ESP32)
+
 #include "storage/store.hpp"
 #include "scheduler/scheduler.hpp"
 #include "controller/node_lifecycle_controller.hpp"
 #include "api/http_server.hpp"
 #include "runtime/wasm_runtime.hpp"
+#include "runtime/app_pod.hpp"
+#include "runtime/image_registry.hpp"
+#include "embedded/embedded_blobs.hpp"
 #include "kubelet/kubelet.hpp"
 #include "ipc/channel.hpp"
 #include "net/network_manager.hpp"
+#include "app/app_wiring.hpp"
 #include "osal/thread.hpp"
+#include "osal/system.hpp"
+#include "osal/socket.hpp"
 #include "hal/tft_keyboard_hardware.hpp"
+#include "runtime/pod_memory_pool.h"
 
 #include <cstdio>
 #include <cstring>
 #include <memory>
-#include <iostream>
-#include <unistd.h>
-#include <fcntl.h>
+#include <string>
 
-#if defined(KUBE32_TARGET_ESP32)
 #include "esp_system.h"
 #include "esp_wifi.h"
 #include "esp_event.h"
+#include "esp_random.h"
 #include "nvs_flash.h"
+#include "nvs.h"
 #include "esp_mac.h"
 #include "esp_log.h"
 #include "esp_heap_caps.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "driver/usb_serial_jtag.h"
+#include "driver/uart.h"
+#include "driver/uart_vfs.h"
 
-static const char* TAG = "Kube32Main";
+static const char* TAG = "Kube32";
 
-// Known MAC Addresses for the Connected Physical Hardware
-static const char* NODE2_MAC = "02:00:00:00:00:01"; // 2MB PSRAM (Worker Node 02)
+// Role selection is capability based: the board with external PSRAM hosts the
+// control plane, the API server, the ingress and the large data pod; a board
+// without PSRAM is a worker. Board peripherals come from a profile stored in
+// NVS ("board" = "cardputer" enables the ST7789 display, matrix keyboard and
+// I2S speaker). Both can be set over the console:
+//   K32_CMD:ROLE:control-plane|worker|auto
+//   K32_CMD:BOARD:cardputer|generic
 
-static void kube32_cluster_task(void* pvParameters) {
-    (void)pvParameters;
+namespace {
 
-    // 2. Read Factory MAC Address
+struct NodeIdentity {
+    bool is_control_plane{true};
+    bool has_display{false};
+    bool has_psram{false};
+    std::string name;
+    uint16_t id{1};
+    std::string mac;
+};
+
+NodeIdentity detect_identity() {
     uint8_t mac[6] = {0};
     esp_read_mac(mac, ESP_MAC_WIFI_STA);
     char mac_str[24];
-    snprintf(mac_str, sizeof(mac_str), "%02x:%02x:%02x:%02x:%02x:%02x",
-             mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+    snprintf(mac_str, sizeof(mac_str), "%02x:%02x:%02x:%02x:%02x:%02x", mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+    NodeIdentity id;
+    id.mac = mac_str;
+    id.has_psram = heap_caps_get_total_size(MALLOC_CAP_SPIRAM) > 0;
+    id.has_display = false;
+    nvs_handle_t h;
+    char role[24] = {0}, board[24] = {0};
+    size_t len = sizeof(role), blen = sizeof(board);
+    if (nvs_open("k32", NVS_READONLY, &h) == ESP_OK) {
+        if (nvs_get_str(h, "role", role, &len) != ESP_OK) role[0] = 0;
+        if (nvs_get_str(h, "board", board, &blen) != ESP_OK) board[0] = 0;
+        nvs_close(h);
+    }
+    bool control_plane = id.has_psram;
+    if (role[0]) control_plane = (std::strcmp(role, "control-plane") == 0);
+    if (board[0]) id.has_display = (std::strcmp(board, "cardputer") == 0 || std::strcmp(board, "display") == 0);
+    id.is_control_plane = control_plane;
+    id.name = control_plane ? "esp32-node-01" : "esp32-node-02";
+    id.id = control_plane ? 1 : 2;
+    return id;
+}
 
-    printf("\n");
+// Reads one string from the "k32" NVS namespace; empty when absent.
+std::string read_nvs_str(const char* key) {
+    nvs_handle_t h;
+    if (nvs_open("k32", NVS_READONLY, &h) != ESP_OK) return {};
+    char v[65] = {0};
+    size_t vl = sizeof(v);
+    bool ok = nvs_get_str(h, key, v, &vl) == ESP_OK;
+    nvs_close(h);
+    return ok ? std::string(v) : std::string();
+}
+
+bool read_nvs_wifi(std::string& ssid, std::string& pass) {
+    nvs_handle_t h;
+    if (nvs_open("k32", NVS_READONLY, &h) != ESP_OK) return false;
+    char s[33] = {0}, p[65] = {0};
+    size_t sl = sizeof(s), pl = sizeof(p);
+    bool ok = (nvs_get_str(h, "wifi_ssid", s, &sl) == ESP_OK) && (nvs_get_str(h, "wifi_pass", p, &pl) == ESP_OK);
+    nvs_close(h);
+    if (!ok || !s[0]) return false;
+    ssid = s;
+    pass = p;
+    return true;
+}
+
+// ---------------------------------------------------------------------------
+// Console transport. Generic boards listen on both the native USB-Serial-JTAG
+// port and UART0 (CH340-style bridges) and answer on whichever carried the
+// command. Boards whose profile uses the UART0 pins for peripherals (the
+// display board drives I2S on GPIO 43) use USB only.
+// ---------------------------------------------------------------------------
+struct Console {
+    bool uart_enabled{false};
+    bool last_from_usb{true};
+    void init(bool usb_only) {
+        if (!usb_serial_jtag_is_driver_installed()) {
+            usb_serial_jtag_driver_config_t cfg = { .tx_buffer_size = 4096, .rx_buffer_size = 4096 };
+            usb_serial_jtag_driver_install(&cfg);
+        }
+        uart_enabled = !usb_only;
+        if (uart_enabled) {
+            if (!uart_is_driver_installed(UART_NUM_0)) {
+                uart_driver_install(UART_NUM_0, 8192, 8192, 0, nullptr, 0);
+            }
+            // Route printf/ESP_LOG through the driver so a log line and a protocol
+            // frame can never interleave byte-wise.
+            uart_vfs_dev_use_driver(UART_NUM_0);
+        }
+    }
+    int read(char* buf, size_t cap, uint32_t timeout_ms) {
+        int n = usb_serial_jtag_read_bytes(buf, cap, pdMS_TO_TICKS(uart_enabled ? timeout_ms / 2 : timeout_ms));
+        if (n > 0) { last_from_usb = true; return n; }
+        if (!uart_enabled) return n;
+        n = uart_read_bytes(UART_NUM_0, buf, cap, pdMS_TO_TICKS(timeout_ms / 2));
+        if (n > 0) last_from_usb = false;
+        return n;
+    }
+    void write(const char* data, size_t len) {
+        if (last_from_usb || !uart_enabled) {
+            size_t off = 0;
+            while (off < len) {
+                int n = usb_serial_jtag_write_bytes(data + off, len - off, pdMS_TO_TICKS(200));
+                if (n <= 0) break;
+                off += static_cast<size_t>(n);
+            }
+        } else {
+            uart_write_bytes(UART_NUM_0, data, len);
+        }
+    }
+};
+
+// Forwards one raw HTTP request to a server over loopback, or over the cluster
+// network when this node does not host the port (workers forward to the control
+// plane). The request must carry "Connection: close".
+static std::string s_forward_host = "127.0.0.1";
+std::string loopback_http(uint16_t port, const std::string& request) {
+    std::string response;
+    kube32::osal::Socket sock;
+    if (!sock.create(kube32::osal::SocketType::Tcp) || !sock.connect(s_forward_host.c_str(), port, 2000)) {
+        return "HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+    }
+    sock.set_timeout(8000, 5000);
+    if (!sock.send_all(request.data(), request.size())) {
+        return "HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+    }
+    char buf[1024];
+    while (true) {
+        ssize_t n = sock.recv(buf, sizeof(buf));
+        if (n <= 0) break;
+        response.append(buf, static_cast<size_t>(n));
+        if (response.size() > 256 * 1024) break;
+    }
+    return response;
+}
+
+static uint32_t crc32_bytes(const uint8_t* p, size_t n) {
+    uint32_t c = 0xFFFFFFFFu;
+    for (size_t i = 0; i < n; ++i) {
+        c ^= p[i];
+        for (int k = 0; k < 8; ++k) c = (c >> 1) ^ (0xEDB88320u & (0u - (c & 1u)));
+    }
+    return ~c;
+}
+
+// Console protocol (line oriented, binary-safe payloads):
+//   K32_HTTP <port> <len> [crc32hex]\n<len bytes of HTTP request> -> K32_RESP <len>\n<bytes>
+//   A CRC mismatch answers K32_ERR crc so the gateway can resend.
+//   K32_CMD:STATUS                                       -> telemetry line
+//   K32_CMD:WIFI:<ssid>:<password>                       -> stored in NVS, reboot
+//   K32_CMD:REBOOT
+void console_task(void* arg) {
+    auto* ctx = static_cast<std::pair<Console*, NodeIdentity*>*>(arg);
+    Console& con = *ctx->first;
+    NodeIdentity& ident = *ctx->second;
+    std::string line;
+    char rx[256];
+    while (true) {
+        int n = con.read(rx, sizeof(rx), 50);
+        if (n <= 0) continue;
+        for (int i = 0; i < n; ++i) {
+            char c = rx[i];
+            if (c != '\n' && c != '\r') {
+                if (line.size() < 512) line.push_back(c);
+                continue;
+            }
+            if (line.empty()) continue;
+            if (line.rfind("K32_HTTP ", 0) == 0) {
+                unsigned port = 0, len = 0, crc = 0;
+                int fields = sscanf(line.c_str() + 9, "%u %u %x", &port, &len, &crc);
+                if (fields >= 2 && len > 0 && len < 64 * 1024) {
+                    std::string req;
+                    req.reserve(len);
+                    // Bytes left in rx after the newline belong to the payload
+                    for (int j = i + 1; j < n && req.size() < len; ++j) req.push_back(rx[j]);
+                    i = n;
+                    uint32_t waited = 0;
+                    while (req.size() < len && waited < 5000) {
+                        int m = con.read(rx, sizeof(rx) < (len - req.size()) ? sizeof(rx) : (len - req.size()), 100);
+                        if (m > 0) req.append(rx, static_cast<size_t>(m)); else waited += 100;
+                    }
+                    if (fields == 3 && crc32_bytes(reinterpret_cast<const uint8_t*>(req.data()), req.size()) != crc) {
+                        con.write("K32_ERR crc\n", 12);
+                        line.clear();
+                        continue;
+                    }
+                    std::string resp = loopback_http(static_cast<uint16_t>(port), req);
+                    char hdr[40];
+                    int hl = snprintf(hdr, sizeof(hdr), "K32_RESP %u\n", static_cast<unsigned>(resp.size()));
+                    // One write per frame: the UART driver keeps it contiguous on the wire
+                    std::string frame;
+                    frame.reserve(static_cast<size_t>(hl) + resp.size());
+                    frame.append(hdr, static_cast<size_t>(hl));
+                    frame.append(resp);
+                    con.write(frame.data(), frame.size());
+                }
+            } else if (line == "K32_CMD:STATUS") {
+                char buf[256];
+                int l = snprintf(buf, sizeof(buf),
+                    "K32_STATUS node=%s role=%s mac=%s free_heap=%u min_free_heap=%u free_psram=%u uptime_ms=%llu pods=%u\n",
+                    ident.name.c_str(), ident.is_control_plane ? "control-plane" : "worker", ident.mac.c_str(),
+                    (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
+                    (unsigned)heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
+                    (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM),
+                    (unsigned long long)kube32::osal::System::get_uptime_ms(),
+                    (unsigned)kube32::runtime::AppPodHost::instance().list_pods().size());
+                con.write(buf, static_cast<size_t>(l));
+            } else if (line.rfind("K32_CMD:WIFI:", 0) == 0) {
+                std::string rest = line.substr(13);
+                size_t sep = rest.find(':');
+                std::string ssid = (sep == std::string::npos) ? rest : rest.substr(0, sep);
+                std::string pass = (sep == std::string::npos) ? "" : rest.substr(sep + 1);
+                nvs_handle_t h;
+                if (nvs_open("k32", NVS_READWRITE, &h) == ESP_OK) {
+                    if (ssid.empty()) { nvs_erase_key(h, "wifi_ssid"); nvs_erase_key(h, "wifi_pass"); }
+                    else { nvs_set_str(h, "wifi_ssid", ssid.c_str()); nvs_set_str(h, "wifi_pass", pass.c_str()); }
+                    nvs_commit(h);
+                    nvs_close(h);
+                }
+                con.write("K32_OK wifi stored, rebooting\n", 30);
+                vTaskDelay(pdMS_TO_TICKS(200));
+                esp_restart();
+            } else if (line.rfind("K32_CMD:BOARD:", 0) == 0 || line.rfind("K32_CMD:ROLE:", 0) == 0 || line.rfind("K32_CMD:AP:", 0) == 0 || line.rfind("K32_CMD:API:", 0) == 0) {
+                // Profile keys: board=<cardputer|generic>, role=<auto|worker>, ap=<on|off>, api=<control plane host|auto>
+                bool is_board = line.rfind("K32_CMD:BOARD:", 0) == 0;
+                bool is_ap = line.rfind("K32_CMD:AP:", 0) == 0;
+                bool is_api = line.rfind("K32_CMD:API:", 0) == 0;
+                std::string value = line.substr(is_board ? 14 : (is_ap ? 11 : (is_api ? 12 : 13)));
+                nvs_handle_t h;
+                if (nvs_open("k32", NVS_READWRITE, &h) == ESP_OK) {
+                    const char* key = is_board ? "board" : (is_ap ? "ap" : (is_api ? "api" : "role"));
+                    if (value.empty() || value == "auto" || value == "generic" || value == "on") nvs_erase_key(h, key);
+                    else nvs_set_str(h, key, value.c_str());
+                    nvs_commit(h);
+                    nvs_close(h);
+                }
+                con.write("K32_OK profile stored, rebooting\n", 33);
+                vTaskDelay(pdMS_TO_TICKS(200));
+                esp_restart();
+            } else if (line == "K32_CMD:SCAN") {
+                // 2.4 GHz networks as seen by this radio (the only band an ESP32 has)
+                wifi_scan_config_t sc = {};
+                sc.show_hidden = false;
+                if (esp_wifi_scan_start(&sc, true) == ESP_OK) {
+                    uint16_t n = 0;
+                    esp_wifi_scan_get_ap_num(&n);
+                    if (n > 20) n = 20;
+                    wifi_ap_record_t* recs = static_cast<wifi_ap_record_t*>(calloc(n ? n : 1, sizeof(wifi_ap_record_t)));
+                    if (recs && esp_wifi_scan_get_ap_records(&n, recs) == ESP_OK) {
+                        for (uint16_t i = 0; i < n; ++i) {
+                            char l[96];
+                            int ll = snprintf(l, sizeof(l), "K32_AP ssid=\"%s\" rssi=%d ch=%u auth=%d\n", (const char*)recs[i].ssid, recs[i].rssi, recs[i].primary, (int)recs[i].authmode);
+                            con.write(l, static_cast<size_t>(ll));
+                        }
+                    }
+                    free(recs);
+                    con.write("K32_OK scan done\n", 17);
+                } else {
+                    con.write("K32_ERR scan failed\n", 20);
+                }
+            } else if (line == "K32_CMD:REBOOT") {
+                con.write("K32_OK rebooting\n", 17);
+                vTaskDelay(pdMS_TO_TICKS(100));
+                esp_restart();
+            }
+            line.clear();
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Hardware hooks for pods on the display node
+// ---------------------------------------------------------------------------
+void install_hardware_hooks(bool has_display) {
+    kube32::runtime::AppPlatformHooks hooks;
+    hooks.random = []() -> uint32_t { return esp_random(); };
+    if (has_display) {
+        hooks.display_text = [](int32_t x, int32_t y, const char* text, size_t len, uint32_t fg, uint32_t bg) -> int32_t {
+            kube32::hal::display_draw_string_n(x, y, text, len, static_cast<uint16_t>(fg), static_cast<uint16_t>(bg));
+            return 0;
+        };
+        hooks.display_rect = [](int32_t x, int32_t y, int32_t w, int32_t h, uint32_t color) -> int32_t {
+            kube32::hal::display_fill_rect(x, y, w, h, static_cast<uint16_t>(color));
+            return 0;
+        };
+        hooks.display_bar = [](int32_t x, int32_t y, int32_t w, int32_t h, uint32_t pct, uint32_t fg, uint32_t bg) -> int32_t {
+            kube32::hal::display_draw_bar(x, y, w, h, pct, static_cast<uint16_t>(fg), static_cast<uint16_t>(bg));
+            return 0;
+        };
+        hooks.key_read = []() -> int32_t {
+            int k = kube32::hal::keyboard_pop();
+            return (k < 0) ? -11 : k;
+        };
+        hooks.tone = [](uint32_t f, uint32_t ms, uint32_t vol) -> int32_t {
+            kube32::hal::play_tone(f, ms, static_cast<uint8_t>(vol));
+            return 0;
+        };
+    }
+    kube32::runtime::set_app_platform_hooks(hooks);
+}
+
+void print_banner(const NodeIdentity& id) {
+    printf("\n================================================================\n");
+    printf("  KUBE32  Kubernetes control plane + Wasm runtime on ESP32-S3\n");
     printf("================================================================\n");
-    printf("     _  ___   _ ___  ______ ___ ___ \n");
-    printf("    | |/ / | | | _ )|__ /_  )  \\/  /\n");
-    printf("    | ' <| |_| | _ \\ |_ \\/ /| |\\/| |\n");
-    printf("    |_|\\_\\\\___/|___/|___/___|_|  |_|\n");
-    printf("  Embedded Kubernetes Control Plane & WebAssembly Runtime\n");
-    printf("================================================================\n");
-    printf("[BOOT] Chip: ESP32-S3 (Xtensa LX7 @ 240MHz)\n");
-    printf("[BOOT] Hardware MAC: %s\n", mac_str);
-    printf("[BOOT] Free Internal SRAM: %u bytes\n", (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
-    printf("[BOOT] Free PSRAM:         %u bytes\n", (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
-    printf("[BOOT] Total Free Heap:    %u bytes\n", (unsigned)esp_get_free_heap_size());
-    printf("----------------------------------------------------------------\n");
+    printf("[BOOT] MAC %s -> %s (%s%s%s)\n", id.mac.c_str(), id.name.c_str(), id.is_control_plane ? "control-plane" : "worker",
+           id.has_psram ? ", psram" : "", id.has_display ? ", display board" : "");
+    printf("[BOOT] Free internal SRAM: %u bytes | PSRAM: %u bytes\n",
+           (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
+           (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
+}
 
-    // 3. Determine Node Role based on physical device MAC
-    bool is_node2 = (std::strcmp(mac_str, NODE2_MAC) == 0);
-    std::string node_name = is_node2 ? "esp32-node-02" : "esp32-node-01";
-    uint16_t node_id = is_node2 ? 2 : 1;
+void log_memory(const char* stage) {
+    printf("[MEM] %-22s internal free %6u (min %6u)  psram free %7u\n", stage,
+           (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
+           (unsigned)heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
+           (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
+}
 
-    // 4. Initialize Network Layer
+void cluster_task(void* pv) {
+    (void)pv;
+    static NodeIdentity ident = detect_identity();
+    static Console console;
+    print_banner(ident);
+
+    // Without PSRAM, reserve one Wasm page (+ interpreter headroom) now, before
+    // Wi-Fi and lwIP fragment the heap, so a 64 KiB pod can still be placed.
+    if (!ident.has_psram) {
+        kube32_pool_reserve(67 * 1024);
+    } else {
+        // Keep the largest PSRAM block whole for a big data pod (24 Wasm pages
+        // plus header) before task stacks and buffers fragment the heap.
+        kube32_pool_reserve_external(1340 * 1024);   // 20 pages + header
+    }
+    printf("[MEM] reserved %u bytes for pod linear memory\n", (unsigned)kube32_pool_block_size());
+
+    // Peripherals of the integrated display board
+    bool has_display = false;
+    if (ident.has_display) {
+        has_display = kube32::hal::init_display_and_backlight();
+        kube32::hal::init_speaker();
+        kube32::hal::init_keyboard_scanner();
+    }
+    install_hardware_hooks(has_display);
+    log_memory("after peripherals");
+
+    // Network
     kube32::net::WifiConfig wifi_cfg;
     wifi_cfg.ap_ssid = "Kube32-Cluster";
     wifi_cfg.ap_password = "kube32password";
     wifi_cfg.ssid = "Kube32-Cluster";
     wifi_cfg.password = "kube32password";
-
+    std::string uplink_ssid, uplink_pass;
+    // Stored Wi-Fi credentials put the node on an existing network instead of
+    // the cluster access point. A worker on an external network also needs the
+    // control plane address (K32_CMD:API:<host>).
+    bool uplink = read_nvs_wifi(uplink_ssid, uplink_pass);
+    std::string api_host = read_nvs_str("api");
+    if (api_host.empty()) api_host = "192.168.4.1";
+    // K32_CMD:AP:off turns the cluster access point off (uplink only), useful
+    // when a misbehaving station keeps flapping and disturbing the radio.
+    bool ap_enabled = true;
+    {
+        nvs_handle_t h;
+        char v[8] = {0};
+        size_t vl = sizeof(v);
+        if (nvs_open("k32", NVS_READONLY, &h) == ESP_OK) {
+            if (nvs_get_str(h, "ap", v, &vl) == ESP_OK && std::strcmp(v, "off") == 0) ap_enabled = false;
+            nvs_close(h);
+        }
+    }
+    if (uplink) {
+        wifi_cfg.ssid = uplink_ssid;
+        wifi_cfg.password = uplink_pass;
+    }
     auto net_mgr = kube32::net::create_network_manager();
-    if (!net_mgr->init(wifi_cfg)) {
-        ESP_LOGE(TAG, "Failed to initialize NetworkManager");
-    }
-
-    if (is_node2) {
-        printf("[ROLE] Booting as Worker Node: %s (Node ID: %u)\n", node_name.c_str(), node_id);
+    net_mgr->init(wifi_cfg);
+    if (ident.is_control_plane) {
+        if (uplink && !ap_enabled) net_mgr->start_station();
+        else if (uplink) net_mgr->start_station_and_softap();
+        else net_mgr->start_softap();
+    } else {
         net_mgr->start_station();
-    } else {
-        printf("[ROLE] Booting as Master Control Plane: %s (Node ID: %u)\n", node_name.c_str(), node_id);
-        printf("[HARDWARE] Initializing ST7789 Color TFT Display & Backlight (GPIO 38)...\n");
-        kube32::hal::init_display_and_backlight();
-        kube32::hal::init_speaker();
-        kube32::hal::play_boot_chime();
-        kube32::hal::init_keyboard_scanner();
-        net_mgr->start_softap();
+    }
+    std::string ip = net_mgr->get_ip_address();
+    printf("[NET] %s ip=%s%s\n", net_mgr->current_mode() == kube32::net::NetworkMode::Station ? "station" : "softap", ip.c_str(), uplink ? " (+uplink)" : "");
+    log_memory("after wifi");
+
+    // Channels and peer discovery
+    kube32::ipc::ChannelManager::instance().init(ident.id, 7400);
+    kube32::ipc::ChannelManager::instance().set_local_identity(ident.id, ident.name);
+    // The dispatcher delivers events into Wasm pods (interpreter recursion):
+    // generous when the stack can live in PSRAM.
+    kube32::ipc::ChannelManager::instance().start_background(3000, ident.has_psram ? 32768 : 4096, ident.has_psram);
+
+    // Local image registry
+    {
+        size_t n = 0;
+        const auto* imgs = kube32::embedded::images(n);
+        kube32::runtime::ImageRegistry::instance().add_all(imgs, n);
+        printf("[IMAGES] %u embedded image(s):", (unsigned)n);
+        for (size_t i = 0; i < n; ++i) printf(" %s(%u)", imgs[i].name, (unsigned)imgs[i].len);
+        printf("\n");
     }
 
-    std::string ip = net_mgr->get_ip_address();
-    printf("[NET] Node IP Address: %s\n", ip.c_str());
+    auto wasm_runtime = kube32::runtime::create_wasm_runtime();
+    std::unique_ptr<kube32::storage::Store> store;
+    std::unique_ptr<kube32::controller::NodeLifecycleController> node_lifecycle;
+    std::unique_ptr<kube32::scheduler::Scheduler> scheduler;
+    std::unique_ptr<kube32::api::HttpServer> api_server;
+    std::unique_ptr<kube32::kubelet::Kubelet> kubelet;
+    std::unique_ptr<kube32::app::AppWiring> wiring;
 
-    // 5. Initialize Virtual Channel IPC (ESP-NOW transport)
-    printf("[IPC] Initializing ESP-NOW Virtual Channel Transport...\n");
-    kube32::ipc::ChannelManager::instance().init(node_id, 7400);
+    kube32::kubelet::KubeletConfig kubelet_cfg;
+    kubelet_cfg.node_name = ident.name;
+    kubelet_cfg.node_ip = ip;
+    kubelet_cfg.heartbeat_interval_ms = 5000;
+    kubelet_cfg.sync_frequency_ms = 2000;
+    // The kubelet task parses manifests and loads/compiles Wasm modules (deep
+    // recursion); workers with PSRAM get a generous stack.
+    // Module parse + compile + k32_init (seeding) all run on the kubelet task.
+    kubelet_cfg.task_stack_size = ident.has_psram ? 65536 : 14336;
+    kubelet_cfg.task_stack_in_psram = ident.has_psram;
+    kubelet_cfg.control_plane = ident.is_control_plane;
+    kubelet_cfg.core_affinity = 1;
 
-    if (is_node2) {
-        // -------------------------------------------------------------
-        // WORKER NODE (esp32-node-02)
-        // -------------------------------------------------------------
-        std::string master_host = "192.168.4.1";
-        uint16_t master_port = 6443;
-
-        printf("[WORKER] Connecting Kubelet to Master at http://%s:%u...\n", master_host.c_str(), master_port);
-
-        auto wasm_runtime = kube32::runtime::create_wasm_runtime();
-        kube32::kubelet::KubeletConfig kubelet_cfg;
-        kubelet_cfg.node_name = node_name;
-        kubelet_cfg.api_server_host = master_host;
-        kubelet_cfg.api_server_port = master_port;
-        kubelet_cfg.node_ip = ip;
-        kubelet_cfg.heartbeat_interval_ms = 5000;
-
-        auto kubelet = std::make_unique<kube32::kubelet::Kubelet>(kubelet_cfg, *wasm_runtime);
-        if (!kubelet->start()) {
-            ESP_LOGE(TAG, "Failed to start Kubelet worker agent");
-            return;
-        }
-
-        printf("[WORKER] Kubelet agent online. Listening for Pods and IPC messages...\n");
-
-        // -------------------------------------------------------------
-        // DISTRIBUTED COMPUTING PIPELINE (Milestone 6)
-        // Coarse-Grained Pipeline Partitioning (Dataflow)
-        // Stage 1: audio-preprocessor (esp32-node-01, ADC / 32KiB)
-        // Stage 2: keyword-classifier (esp32-node-02, 2MB PSRAM / 48KiB)
-        // Virtual Channel: "audio.features"
-        // -------------------------------------------------------------
-        printf("[PIPELINE] Deploying Stage 2 workload: default/keyword-classifier\n");
-        int32_t chan_hdl = kube32::ipc::ChannelManager::instance().open("keyword-classifier", "audio.features", 0);
-        printf("[PIPELINE] Subscribed to virtual channel 'audio.features' (handle: %d)\n", (int)chan_hdl);
-
-        // Pre-configure route to Stage 1 on Node 1 (02:00:00:00:00:02)
-        kube32::ipc::NodeEndpoint node1_ep;
-        node1_ep.node_id = 1;
-        node1_ep.is_espnow = true;
-        node1_ep.mac_address[0] = 0x48; node1_ep.mac_address[1] = 0xca;
-        node1_ep.mac_address[2] = 0x43; node1_ep.mac_address[3] = 0x3f;
-        node1_ep.mac_address[4] = 0x3b; node1_ep.mac_address[5] = 0xf4;
-        node1_ep.udp_port = 7400;
-        kube32::ipc::VirtualChannelRoutingTable::instance().register_remote_route("audio-preprocessor", node1_ep);
-
-        printf("[PIPELINE] Inter-Node Channel Route established -> esp32-node-01 (02:00:00:00:00:02:7400)\n");
-        printf("[POOL] Memory Pooling Active: esp32-node-01 (512KiB) + esp32-node-02 (2048KiB PSRAM) = 2560KiB Cluster Pool\n");
-
-        // Transmit pipeline ready signal to Node 1 via ESP-NOW
-        const char* ready_sig = "K32_PIPELINE_READY:esp32-node-02";
-        kube32::ipc::ChannelManager::instance().send("keyword-classifier", chan_hdl,
-                                                     reinterpret_cast<const uint8_t*>(ready_sig), std::strlen(ready_sig));
-
-        printf("[PIPELINE] Worker Node listening for live over-the-air ESP-NOW frames from Stage 1...\n");
-
-        struct MfccFeatures {
-            float energy;
-            float coefficients[12];
-        } __attribute__((packed));
-
-        uint32_t iter = 0;
-        uint8_t rx_buf[256] = {0};
-
-        while (true) {
-            int32_t rx_bytes = kube32::ipc::ChannelManager::instance().recv("keyword-classifier", chan_hdl, rx_buf, sizeof(rx_buf), 100);
-            if (rx_bytes > 0) {
-                if (rx_bytes == sizeof(MfccFeatures)) {
-                    auto* recv_feats = reinterpret_cast<MfccFeatures*>(rx_buf);
-                    printf("[PIPELINE-OTA-RX] Accepted live RF packet from esp32-node-01 (%d bytes)\n", (int)rx_bytes);
-                    printf("[PIPELINE-OTA-RX] Energy Level: %.3f | Features: [%.2f, %.2f, %.2f, ...]\n",
-                           recv_feats->energy, recv_feats->coefficients[0], recv_feats->coefficients[1], recv_feats->coefficients[2]);
-                    
-                    // Allocate TinyML tensor in external Quad PSRAM
-                    void* psram_tensor = heap_caps_malloc(2048, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-                    printf("[PIPELINE-PSRAM] Allocated TinyML feature tensor at %p in 2MB Quad PSRAM\n", psram_tensor);
-                    printf("[PIPELINE-PSRAM] TinyML Inference on PSRAM -> Keyword 'WAKE_WORD_DETECTED' (confidence: 99.1%%)\n");
-                    printf("[PIPELINE-PSRAM] Distributed Pipeline Silicon Execution: COMPLETE & VERIFIED\n");
-                    if (psram_tensor) heap_caps_free(psram_tensor);
-                } else if (std::memcmp(rx_buf, "K32_PIPELINE_READY", 18) == 0) {
-                    printf("[PIPELINE] Handshake acknowledged: %s\n", (const char*)rx_buf);
-                }
-            }
-
-            vTaskDelay(pdMS_TO_TICKS(100));
-            iter++;
-            if (iter % 25 == 0) {
-                printf("[WORKER-HEARTBEAT] Node: %s (iter %u) | Free Heap: %u bytes (PSRAM: %u) | Pipeline: ACTIVE\n",
-                       node_name.c_str(), iter / 25,
-                       (unsigned)esp_get_free_heap_size(),
-                       (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
-            }
-        }
-    } else {
-        // -------------------------------------------------------------
-        // CONTROL PLANE + LOCAL AGENT (esp32-node-01 / Master)
-        // -------------------------------------------------------------
-        printf("[CONTROL-PLANE] Initializing Radix State Store...\n");
+    if (ident.is_control_plane) {
         kube32::storage::StoreOptions store_opts;
         store_opts.base_path = "/littlefs";
-        store_opts.enable_flash_persistence = false; // RAM-backed for fast boot
-        auto store = kube32::storage::create_radix_store(store_opts);
+        store_opts.enable_flash_persistence = false;
+        store = kube32::storage::create_radix_store(store_opts);
 
-        // Pre-register both physical hardware nodes into cluster registry
-        std::string node1_manifest = 
-            "{\"kind\":\"Node\",\"apiVersion\":\"v1\","
-            "\"metadata\":{\"name\":\"esp32-node-01\",\"labels\":{"
-            "\"kubernetes.io/hostname\":\"esp32-node-01\","
-            "\"kubernetes.io/arch\":\"xtensa\","
-            "\"node-role.kubernetes.io/control-plane\":\"\","
-            "\"node-role.kubernetes.io/master\":\"\"}},"
-            "\"spec\":{\"unschedulable\":false},"
-            "\"status\":{"
-            "\"conditions\":[{\"type\":\"Ready\",\"status\":\"True\",\"reason\":\"KubeletReady\"}],"
-            "\"addresses\":[{\"type\":\"InternalIP\",\"address\":\"192.168.4.1\"}],"
-            "\"allocatable\":{\"cpu\":\"2\",\"memory\":\"400Ki\",\"hardware.kube32.io/gpio\":\"12\"},"
-            "\"capacity\":{\"cpu\":\"2\",\"memory\":\"512Ki\",\"hardware.kube32.io/gpio\":\"16\"}}}";
-
-        std::string node2_manifest = 
-            "{\"kind\":\"Node\",\"apiVersion\":\"v1\","
-            "\"metadata\":{\"name\":\"esp32-node-02\",\"labels\":{"
-            "\"kubernetes.io/hostname\":\"esp32-node-02\","
-            "\"kubernetes.io/arch\":\"xtensa\","
-            "\"node-role.kubernetes.io/worker\":\"\"}},"
-            "\"spec\":{\"unschedulable\":false},"
-            "\"status\":{"
-            "\"conditions\":[{\"type\":\"Ready\",\"status\":\"True\",\"reason\":\"KubeletReady\"}],"
-            "\"addresses\":[{\"type\":\"InternalIP\",\"address\":\"192.168.4.2\"}],"
-            "\"allocatable\":{\"cpu\":\"2\",\"memory\":\"2048Ki\",\"hardware.kube32.io/gpio\":\"14\"},"
-            "\"capacity\":{\"cpu\":\"2\",\"memory\":\"2048Ki\",\"hardware.kube32.io/gpio\":\"18\"}}}";
-
-        store->put("/registry/nodes/esp32-node-01", node1_manifest, true);
-        store->put("/registry/nodes/esp32-node-02", node2_manifest, true);
-        printf("[CONTROL-PLANE] Initialized nodes in cluster registry: esp32-node-01, esp32-node-02\n");
-
-        // Start Node Lifecycle Controller
         kube32::controller::NodeLifecycleConfig nl_cfg;
         nl_cfg.check_interval_ms = 1000;
         nl_cfg.not_ready_threshold_ms = 15000;
         nl_cfg.eviction_threshold_ms = 30000;
-        auto node_lifecycle = std::make_unique<kube32::controller::NodeLifecycleController>(*store, nl_cfg);
+        node_lifecycle = std::make_unique<kube32::controller::NodeLifecycleController>(*store, nl_cfg);
         node_lifecycle->start();
-        printf("[CONTROL-PLANE] Node Lifecycle Controller active (NotReady: 15s, Evict: 30s)\n");
 
-        // Start Autonomous Scheduler
         kube32::scheduler::SchedulerConfig sched_cfg;
         sched_cfg.strategy = kube32::scheduler::ScoringStrategy::LeastAllocated;
-        sched_cfg.reconcile_interval_ms = 1000;
+        sched_cfg.reconcile_interval_ms = 3000;
         sched_cfg.node_heartbeat_timeout_ms = 30000;
-        auto scheduler = kube32::scheduler::create_scheduler(*store, sched_cfg);
+        scheduler = kube32::scheduler::create_scheduler(*store, sched_cfg);
         scheduler->start();
-        printf("[CONTROL-PLANE] Autonomous Scheduler active (LeastAllocated)\n");
 
-        // Start Kubernetes API Server on port 6443
         kube32::api::HttpServerOptions http_opts;
         http_opts.host = "0.0.0.0";
         http_opts.port = 6443;
-        http_opts.backlog = 8;
+        http_opts.backlog = 4;
         http_opts.rx_buffer_size = 4096;
-        auto server = std::make_unique<kube32::api::HttpServer>(http_opts, *store, scheduler.get());
-        server->start();
-        printf("[CONTROL-PLANE] Kubernetes API Server listening on http://0.0.0.0:6443\n");
-        printf("[CONTROL-PLANE] Connect via: kubectl --server=http://%s:6443 get nodes -o wide\n", ip.c_str());
+        http_opts.workers = ident.has_psram ? 2 : 1;
+        http_opts.worker_stack_bytes = 16384; // pod admission + scheduler run on this stack
+        http_opts.worker_stack_in_psram = ident.has_psram;
+        http_opts.worker_core_affinity = 1;
+        http_opts.name = "k32_api";
+        api_server = std::make_unique<kube32::api::HttpServer>(http_opts, *store, scheduler.get());
+        api_server->route_handler().set_lease_callback([nl = node_lifecycle.get()](const std::string& node) {
+            if (nl) nl->record_node_lease(node);
+        });
+        if (!api_server->start()) ESP_LOGE(TAG, "API server failed to start");
+        printf("[CONTROL-PLANE] API server http://%s:6443, scheduler + node lifecycle active\n", ip.c_str());
 
-        // Start local Kubelet agent on Node 1
-        auto wasm_runtime = kube32::runtime::create_wasm_runtime();
-        kube32::kubelet::KubeletConfig kubelet_cfg;
-        kubelet_cfg.node_name = node_name;
         kubelet_cfg.api_server_host = "127.0.0.1";
         kubelet_cfg.api_server_port = 6443;
-        kubelet_cfg.node_ip = ip;
-        kubelet_cfg.heartbeat_interval_ms = 5000;
-
-        auto kubelet = std::make_unique<kube32::kubelet::Kubelet>(kubelet_cfg, *wasm_runtime);
+        kubelet = std::make_unique<kube32::kubelet::Kubelet>(kubelet_cfg, *wasm_runtime);
         kubelet->start();
-        printf("[CONTROL-PLANE] Local Kubelet agent online for %s\n", node_name.c_str());
 
-        // Register route to Node 2 for ESP-NOW Virtual Channel
-        kube32::ipc::NodeEndpoint node2_ep;
-        node2_ep.node_id = 2;
-        node2_ep.is_espnow = true;
-        node2_ep.mac_address[0] = 0x3c; node2_ep.mac_address[1] = 0x84;
-        node2_ep.mac_address[2] = 0x27; node2_ep.mac_address[3] = 0xd8;
-        node2_ep.mac_address[4] = 0x6f; node2_ep.mac_address[5] = 0x50;
-        node2_ep.udp_port = 7400;
-        kube32::ipc::VirtualChannelRoutingTable::instance().register_remote_route("keyword-classifier", node2_ep);
-        int32_t node1_chan_hdl = kube32::ipc::ChannelManager::instance().open("audio-preprocessor", "audio.features", 0);
-        printf("[PIPELINE] Node 1 subscribed to 'audio.features' (handle: %d), route registered -> Node 2 (02:00:00:00:00:01)\n", (int)node1_chan_hdl);
+        kube32::app::AppWiringOptions aw;
+        aw.app_name = "tessera";
+        aw.core_pod = "tessera-core";
+        aw.local_node_name = ident.name;
+        aw.store = store.get();
+        aw.run_ingress = true;
+        aw.ingress_port = 80;
+        aw.ingress_workers = ident.has_psram ? 2 : 1;
+        aw.ingress_worker_stack = ident.has_psram ? 98304 : 8192;   // local pod calls run the interpreter here
+        aw.ingress_rx_buffer = ident.has_psram ? 4096 : 2560;
+        aw.run_pod_server = ident.has_psram;        // request-handling pods live on PSRAM nodes
+        aw.pod_workers = 1;
+        aw.pod_worker_stack = 65536;
+        aw.pod_port = 7000;
+        aw.core_affinity = 1;
+        aw.stacks_in_psram = ident.has_psram;
+        aw.cluster_events_from_hub = false;
+        wiring = std::make_unique<kube32::app::AppWiring>(aw);
+        wiring->start();
+    } else {
+        kubelet_cfg.api_server_host = api_host;
+        kubelet_cfg.api_server_port = 6443;
+        kubelet = std::make_unique<kube32::kubelet::Kubelet>(kubelet_cfg, *wasm_runtime);
+        kubelet->start();
+        printf("[WORKER] kubelet -> http://%s:6443\n", api_host.c_str());
 
-        // Install USB-SERIAL-JTAG driver if not already initialized
-        if (!usb_serial_jtag_is_driver_installed()) {
-            usb_serial_jtag_driver_config_t usj_cfg = {
-                .tx_buffer_size = 4096,
-                .rx_buffer_size = 4096,
-            };
-            usb_serial_jtag_driver_install(&usj_cfg);
-        }
-        printf("[CONTROL-PLANE] USB-SERIAL-JTAG driver online for interactive CLI\n");
-
-        std::string line_accum;
-        char usj_buf[256];
-        static uint8_t arena_buf[4096];
-        kube32::mem::MonotonicArena arena(arena_buf, sizeof(arena_buf));
-
-        while (true) {
-            int n = usb_serial_jtag_read_bytes(usj_buf, sizeof(usj_buf) - 1, pdMS_TO_TICKS(20));
-            if (n > 0) {
-                usj_buf[n] = '\0';
-                for (int i = 0; i < n; ++i) {
-                    char c = usj_buf[i];
-                    if (c == '\n' || c == '\r') {
-                        if (line_accum.empty()) continue;
-
-                        if (line_accum.rfind("K32_REQ:", 0) == 0) {
-                            // Format: K32_REQ:<METHOD>:<URI>[:<BODY>]
-                            std::string req_str = line_accum.substr(8);
-                            size_t sep1 = req_str.find(':');
-                            if (sep1 != std::string::npos) {
-                                std::string method_str = req_str.substr(0, sep1);
-                                std::string rest = req_str.substr(sep1 + 1);
-                                size_t sep2 = rest.find(':');
-                                std::string uri = (sep2 != std::string::npos) ? rest.substr(0, sep2) : rest;
-                                std::string body = (sep2 != std::string::npos) ? rest.substr(sep2 + 1) : "";
-
-                                kube32::api::HttpRequest req;
-                                req.method = kube32::api::parse_http_method(method_str);
-                                req.raw_uri = uri;
-                                kube32::api::normalize_uri(req.raw_uri, req.path, req.query_string);
-                                req.body = body;
-                                req.content_length = body.size();
-                                req.content_type = "application/json";
-
-                                arena.reset();
-                                auto resp = server->route_handler().handle_request(req, arena, nullptr);
-                                printf("\n[K32-RESP-START]:%d:%s\n%s\n[K32-RESP-END]\n",
-                                       resp.status_code,
-                                       (resp.status_code == 200 ? "OK" : resp.status_code == 201 ? "Created" : "Error"),
-                                       resp.body.c_str());
-                            }
-                        } else if (line_accum.rfind("K32_CMD:DISPLAY:", 0) == 0) {
-                            std::string disp_text = line_accum.substr(16);
-                            kube32::hal::display_fill_rect(8, 36, 224, 70, kube32::hal::COLOR_BG_DARK);
-                            kube32::hal::display_draw_string(8, 36, disp_text.c_str(), kube32::hal::COLOR_CYAN, kube32::hal::COLOR_BG_DARK);
-                            printf("[HARDWARE-DISPLAY] Physical screen updated: '%s'\n", disp_text.c_str());
-                        } else if (line_accum.rfind("K32_CMD:BEEP:", 0) == 0) {
-                            std::string beep_args = line_accum.substr(13);
-                            uint32_t freq = 1000;
-                            uint32_t dur = 100;
-                            uint8_t vol = 20;
-
-                            size_t c1 = beep_args.find(':');
-                            if (c1 != std::string::npos) {
-                                freq = std::strtoul(beep_args.substr(0, c1).c_str(), nullptr, 10);
-                                std::string rest = beep_args.substr(c1 + 1);
-                                size_t c2 = rest.find(':');
-                                if (c2 != std::string::npos) {
-                                    dur = std::strtoul(rest.substr(0, c2).c_str(), nullptr, 10);
-                                    vol = (uint8_t)std::strtoul(rest.substr(c2 + 1).c_str(), nullptr, 10);
-                                } else {
-                                    dur = std::strtoul(rest.c_str(), nullptr, 10);
-                                }
-                            } else {
-                                freq = std::strtoul(beep_args.c_str(), nullptr, 10);
-                            }
-                            kube32::hal::play_tone(freq, dur, vol);
-                            printf("[HARDWARE-SPEAKER] Played tone %u Hz (%u ms, vol: %u%%) via NS4168 I2S (single shot)\n", (unsigned)freq, (unsigned)dur, (unsigned)vol);
-                        } else if (line_accum == "K32_CMD:PIPELINE_TRANSMIT") {
-                            struct MfccFeatures {
-                                float energy;
-                                float coefficients[12];
-                            } __attribute__((packed)) features = {
-                                0.875f,
-                                { 1.25f, -0.42f, 0.91f, 2.14f, -1.08f, 0.35f, 0.72f, -0.19f, 1.48f, -0.83f, 0.41f, 0.65f }
-                            };
-                            printf("[PIPELINE-OTA-TX] Transmitting Stage 1 MFCC features (52 bytes) over ESP-NOW to Node 2 (02:00:00:00:00:01)...\n");
-                            int32_t sent = kube32::ipc::ChannelManager::instance().send(
-                                "audio-preprocessor", node1_chan_hdl,
-                                reinterpret_cast<const uint8_t*>(&features), sizeof(features)
-                            );
-                            printf("[PIPELINE-OTA-TX] ESP-NOW transmission result: %d (0 = OK)\n", (int)sent);
-                        } else if (line_accum == "K32_CMD:STATUS") {
-                            char stat_buf[256];
-                            std::vector<std::string> nodes, pods;
-                            store->list("/registry/nodes/", nodes);
-                            store->list("/registry/pods/", pods);
-                            int slen = std::snprintf(stat_buf, sizeof(stat_buf),
-                                "\n=== KUBE32 CLUSTER TELEMETRY ===\nRole: Master Control Plane (esp32-node-01)\nFree Internal SRAM: %u bytes\nRegistered Nodes: %zu | Active Pods: %zu\n=== END TELEMETRY ===\n",
-                                (unsigned)esp_get_free_heap_size(), nodes.size(), pods.size());
-                            usb_serial_jtag_write_bytes(stat_buf, slen, pdMS_TO_TICKS(50));
-                            printf("%s", stat_buf);
-                        }
-                        line_accum.clear();
-                    } else {
-                        line_accum += c;
-                    }
-                }
-            }
-            vTaskDelay(pdMS_TO_TICKS(50));
+        kube32::app::AppWiringOptions aw;
+        aw.app_name = "tessera";
+        aw.core_pod = "tessera-core";
+        aw.local_node_name = ident.name;
+        aw.run_pod_server = ident.has_psram;
+        aw.pod_port = 7000;
+        aw.pod_workers = 2;
+        aw.pod_worker_stack = 24576;
+        aw.core_affinity = 1;
+        aw.stacks_in_psram = ident.has_psram;
+        wiring = std::make_unique<kube32::app::AppWiring>(aw);
+        wiring->start();
+        if (has_display) {
+            kube32::hal::display_fill_rect(0, 0, kube32::hal::LCD_WIDTH, 18, 0x194B);
+            kube32::hal::display_draw_string(6, 5, "KUBE32  worker node", kube32::hal::COLOR_GREEN, 0x194B);
+            std::string l = "node " + ident.name + "  " + ip;
+            kube32::hal::display_draw_string(6, 28, l.c_str(), kube32::hal::COLOR_WHITE, kube32::hal::COLOR_BG_DARK);
+            std::string app_url = "app  http://" + api_host + "/";
+            kube32::hal::display_draw_string(6, 40, app_url.c_str(), kube32::hal::COLOR_CYAN, kube32::hal::COLOR_BG_DARK);
+            kube32::hal::display_draw_string(6, 52, "waiting for pods...", kube32::hal::COLOR_WHITE, kube32::hal::COLOR_BG_DARK);
         }
     }
+    log_memory("cluster services up");
 
-    vTaskDelete(nullptr);
+    // Console on a small task of its own
+    console.init(ident.has_display);   // USB-Serial-JTAG on the display board, UART0 (CH340) on the devkit
+    if (!ident.is_control_plane) s_forward_host = api_host;   // workers relay console HTTP to the control plane
+    static std::pair<Console*, NodeIdentity*> console_ctx(&console, &ident);
+    xTaskCreatePinnedToCore(console_task, "k32_console", 4096, &console_ctx, 4, nullptr, 0);
+
+    // Pod ticks run the interpreter, so they get a thread with a stack sized
+    // for it rather than this 9 KB task. A pod that returns >0 from k32_tick
+    // has background work left (incremental seeding, for example) and is
+    // ticked again after a short yield so requests interleave; otherwise 1 Hz.
+    {
+        kube32::osal::Thread::Config t_cfg;
+        t_cfg.name = "k32_tick";
+        t_cfg.stack_size = ident.has_psram ? 65536 : 8192;
+        t_cfg.stack_in_psram = ident.has_psram;
+        t_cfg.priority = 4;
+        t_cfg.core_affinity = 1;
+        kube32::osal::Thread::create([](void*) {
+            while (true) {
+                bool busy = false;
+                uint32_t now = static_cast<uint32_t>(kube32::osal::System::get_uptime_ms());
+                for (const auto& id : kube32::runtime::AppPodHost::instance().list_pods()) {
+                    if (kube32::runtime::AppPodHost::instance().tick(id, now) > 0) busy = true;
+                }
+                vTaskDelay(pdMS_TO_TICKS(busy ? 10 : 1000));
+            }
+        }, nullptr, t_cfg);
+    }
+
+    // Housekeeping: stats line for the display pod, memory log
+    uint32_t iter = 0;
+    uint64_t last_req = 0;
+    while (true) {
+        vTaskDelay(pdMS_TO_TICKS(1000));
+        iter++;
+        uint64_t now = kube32::osal::System::get_uptime_ms();
+        if (ident.is_control_plane && wiring && wiring->ingress_server()) {
+            uint64_t reqs = wiring->ingress_server()->metrics().requests.load();
+            uint32_t rps = static_cast<uint32_t>(reqs - last_req);
+            last_req = reqs;
+            char ev[160];
+            int l = snprintf(ev, sizeof(ev), "{\"t\":\"stats\",\"rps\":%u,\"viewers\":%u,\"heap_kb\":%u,\"uptime_s\":%u}",
+                             rps, (unsigned)wiring->ingress()->sse().count(),
+                             (unsigned)(heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT) / 1024), (unsigned)(now / 1000));
+            kube32::ipc::ChannelManager::instance().publish("ingress", "tessera.events", reinterpret_cast<const uint8_t*>(ev), static_cast<size_t>(l));
+            if (iter % 2 == 0 && wiring->ingress()->sse().count() > 0) {
+                wiring->ingress()->sse().broadcast("cluster", wiring->ingress()->build_cluster_json());
+            }
+        }
+        if (iter % 30 == 0) log_memory("steady state");
+        if (iter < 180 && iter % 5 == 0 && wiring) {
+            uint32_t age = 0;
+            std::string cur = kube32::runtime::AppPodHost::instance().in_flight(age);
+            auto* ing = wiring->ingress_server();
+            printf("[DIAG] t=%us ingress{req=%llu active=%u queued=%u err=%llu} inflight='%s' age=%ums heap=%u\n",
+                   iter, ing ? (unsigned long long)ing->metrics().requests.load() : 0ull,
+                   ing ? (unsigned)ing->metrics().active.load() : 0u, ing ? (unsigned)ing->queued() : 0u,
+                   ing ? (unsigned long long)ing->metrics().errors.load() : 0ull,
+                   cur.c_str(), (unsigned)age, (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
+        }
+        kube32::osal::System::feed_watchdog();
+    }
 }
 
+} // namespace
+
 extern "C" void app_main() {
-    // 1. Initialize NVS Flash
     esp_err_t ret = nvs_flash_init();
     if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
         ESP_ERROR_CHECK(nvs_flash_erase());
         ret = nvs_flash_init();
     }
     ESP_ERROR_CHECK(ret);
-
-    // 2. Spawn dedicated cluster task with 32KB stack pinned to Core 0
-    xTaskCreatePinnedToCore(
-        kube32_cluster_task,
-        "k32_cluster",
-        32768,
-        nullptr,
-        5,
-        nullptr,
-        0
-    );
+    xTaskCreatePinnedToCore(cluster_task, "k32_cluster", 9216, nullptr, 5, nullptr, 0);
 }
+
 #endif

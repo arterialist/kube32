@@ -19,11 +19,14 @@ constexpr int32_t HAL_ERR_INVAL    = -22;   // -EINVAL (Invalid argument)
 constexpr int32_t HAL_ERR_TIMEDOUT = -110;  // -ETIMEDOUT (I/O transfer timeout)
 
 enum class PeripheralType : uint8_t {
-    GPIO = 0,
-    ADC1 = 1,
-    I2C  = 2,
-    UART = 3,
-    IPC  = 4
+    GPIO     = 0,
+    ADC1     = 1,
+    I2C      = 2,
+    UART     = 3,
+    IPC      = 4,
+    Display  = 5,   // On-board TFT panel (hardware.kube32.io/tft-display)
+    Keyboard = 6,   // On-board matrix keyboard (hardware.kube32.io/keyboard)
+    Speaker  = 7    // On-board I2S speaker (hardware.kube32.io/speaker)
 };
 
 enum class AccessMode : uint8_t {
@@ -46,7 +49,10 @@ enum class SecurityAction : uint8_t {
 };
 
 // Capabilities bitmask definitions
-constexpr uint32_t KUBE32_CAP_IPC = (1U << 0);
+constexpr uint32_t KUBE32_CAP_IPC      = (1U << 0);
+constexpr uint32_t KUBE32_CAP_DISPLAY  = (1U << 1);
+constexpr uint32_t KUBE32_CAP_KEYBOARD = (1U << 2);
+constexpr uint32_t KUBE32_CAP_SPEAKER  = (1U << 3);
 
 // 24-Byte Ultra-Compact Device Grant Representation
 #pragma pack(push, 1)
@@ -84,6 +90,10 @@ struct DeviceGrant {
 
     inline bool is_ipc_permitted() const {
         return (capabilities_mask & KUBE32_CAP_IPC) != 0;
+    }
+
+    inline bool has_capability(uint32_t cap_bit) const {
+        return (capabilities_mask & cap_bit) != 0;
     }
 };
 #pragma pack(pop)

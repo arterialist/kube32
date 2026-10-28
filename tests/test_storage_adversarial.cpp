@@ -4,6 +4,7 @@
 #include "osal/thread.hpp"
 
 #include <cassert>
+#include <cstdlib>
 #include <iostream>
 #include <vector>
 #include <string>
@@ -580,10 +581,24 @@ void test_adversarial_power_failure_crash_simulation() {
     // Ephemeral leases must NOT exist
     assert(recovered_store->get("/registry/leases/kube-node-lease/node-0", dummy).code == StatusCode::NotFound);
 
-    // Current version must be greater than max recovered resourceVersion (209)
-    assert(recovered_store->current_version() > 209);
-    std::cout << "  -> Recovered current_version: " << recovered_store->current_version() 
-              << " (> 209)" << std::endl;
+    // The store is the resourceVersion authority: every recovered object carries
+    // the version the store assigned at write time, and the recovered
+    // current_version must be above the largest of them (35 persistent writes).
+    {
+        std::vector<std::string> all_jsons;
+        recovered_store->list("/registry/", all_jsons);
+        uint64_t max_rv = 0;
+        for (const auto& j : all_jsons) {
+            size_t p = j.find("\"resourceVersion\":\"");
+            assert(p != std::string::npos);
+            uint64_t rv = std::strtoull(j.c_str() + p + 19, nullptr, 10);
+            if (rv > max_rv) max_rv = rv;
+        }
+        assert(max_rv >= 35);
+        assert(recovered_store->current_version() > max_rv);
+        std::cout << "  -> Recovered current_version: " << recovered_store->current_version()
+                  << " (> max stored resourceVersion " << max_rv << ")" << std::endl;
+    }
 
     // 6. Post-recovery operability: verify puts and lists succeed
     std::vector<std::string> pod_list;

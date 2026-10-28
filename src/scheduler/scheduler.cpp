@@ -1,4 +1,5 @@
 #include "scheduler/scheduler.hpp"
+#include "api/event_recorder.hpp"
 #include "models/kube_models.hpp"
 #include "osal/thread.hpp"
 
@@ -119,21 +120,15 @@ ResourceSpec extract_node_allocatable(const std::string& node_json) {
     models::JsonValue doc;
     std::string err;
     if (!models::parse_json(node_json, doc, err) || !doc.is_object()) {
-        spec.memory_bytes = 240 * 1024;
-        spec.gpio_pins = 14;
-        spec.i2c_buses = 2;
-        spec.adc_channels = 2;
-        spec.psram_bytes = 3840 * 1024;
+        // No reported status means no known capacity: nothing fits until the
+        // kubelet reports what the board actually has.
         return spec;
     }
 
     const models::JsonValue* status = doc.get("status");
     if (!status || !status->is_object()) {
-        spec.memory_bytes = 240 * 1024;
-        spec.gpio_pins = 14;
-        spec.i2c_buses = 2;
-        spec.adc_channels = 2;
-        spec.psram_bytes = 3840 * 1024;
+        // No reported status means no known capacity: nothing fits until the
+        // kubelet reports what the board actually has.
         return spec;
     }
 
@@ -142,11 +137,8 @@ ResourceSpec extract_node_allocatable(const std::string& node_json) {
         alloc = status->get("capacity");
     }
     if (!alloc || !alloc->is_object()) {
-        spec.memory_bytes = 240 * 1024;
-        spec.gpio_pins = 14;
-        spec.i2c_buses = 2;
-        spec.adc_channels = 2;
-        spec.psram_bytes = 3840 * 1024;
+        // No reported status means no known capacity: nothing fits until the
+        // kubelet reports what the board actually has.
         return spec;
     }
 
@@ -457,7 +449,7 @@ public:
         reconcile_thread_ = std::make_unique<osal::Thread>();
         osal::Thread::Config cfg;
         cfg.name = "k32_sched";
-        cfg.stack_size = 8192;
+        cfg.stack_size = 16384;   // manifest DOM parsing + scoring
         bool started = reconcile_thread_->start([](void* p) {
             auto* self = static_cast<SchedulerImpl*>(p);
             self->run_reconcile_loop();
@@ -716,6 +708,20 @@ private:
             }
 
             in_out_pod_json = pod_doc.to_string();
+            {
+                api::EventSpec ev;
+                const models::JsonValue* pmeta = pod_doc.get("metadata");
+                ev.involved.kind = "Pod";
+                ev.involved.name = pmeta ? pmeta->get_string("name", "") : "";
+                ev.involved.namespace_name = pmeta ? pmeta->get_string("namespace", "default") : "default";
+                ev.involved.uid = pmeta ? pmeta->get_string("uid", "") : "";
+                ev.reason = "FailedScheduling";
+                ev.message = "0/" + std::to_string(node_jsons.size()) +
+                             " nodes are available: insufficient heap memory or peripheral resources";
+                ev.warning = true;
+                ev.component = "default-scheduler";
+                events_.record(ev);
+            }
             return {false, "", "0/" + std::to_string(node_jsons.size()) + " nodes available"};
         }
 
@@ -733,59 +739,45 @@ private:
             spec->set("nodeName", models::JsonValue{models::JsonType::String, false, 0, winner.name, {}, {}});
         }
 
-        // Mutate status
+        // Status after binding: Pending with PodScheduled=True. Phase, IPs,
+        // start time and container states are reported by the kubelet once
+        // the workload actually runs; nothing is claimed before then.
         models::JsonValue status_val;
-        status_val.type = models::JsonType::Object;
-        status_val.set("phase", models::JsonValue{models::JsonType::String, false, 0, "Running", {}, {}});
-        status_val.set("hostIP", models::JsonValue{models::JsonType::String, false, 0, winner.ip, {}, {}});
-        status_val.set("podIP", models::JsonValue{models::JsonType::String, false, 0, winner.ip, {}, {}});
-        status_val.set("startTime", models::JsonValue{models::JsonType::String, false, 0, "2026-10-26T07:00:00Z", {}, {}});
+        const models::JsonValue* prev_status = pod_doc.get("status");
+        if (prev_status && prev_status->is_object()) status_val = *prev_status;
+        else status_val.type = models::JsonType::Object;
+        status_val.set("phase", models::JsonValue{models::JsonType::String, false, 0, "Pending", {}, {}});
+        status_val.remove("reason");
+        status_val.remove("message");
 
-        // Conditions
         models::JsonValue conds_arr;
         conds_arr.type = models::JsonType::Array;
-        const char* cond_types[] = {"PodScheduled", "Initialized", "Ready", "ContainersReady"};
-        for (const char* ct : cond_types) {
+        {
             models::JsonValue c;
             c.type = models::JsonType::Object;
-            c.set("type", models::JsonValue{models::JsonType::String, false, 0, ct, {}, {}});
+            c.set("type", models::JsonValue{models::JsonType::String, false, 0, "PodScheduled", {}, {}});
             c.set("status", models::JsonValue{models::JsonType::String, false, 0, "True", {}, {}});
+            std::string now = models::now_rfc3339();
+            if (!now.empty()) c.set("lastTransitionTime", models::JsonValue{models::JsonType::String, false, 0, now, {}, {}});
             conds_arr.arr_val.push_back(std::move(c));
         }
         status_val.set("conditions", std::move(conds_arr));
+        status_val.remove("containerStatuses");
 
-        // Container statuses
-        models::JsonValue cstatus_arr;
-        cstatus_arr.type = models::JsonType::Array;
-
-        std::string container_name = "app";
-        std::string image_name = "wasm://app";
-        if (spec) {
-            const models::JsonValue* containers = spec->get("containers");
-            if (containers && containers->is_array() && !containers->arr_val.empty()) {
-                container_name = containers->arr_val[0].get_string("name", "app");
-                image_name = containers->arr_val[0].get_string("image", "wasm://app");
-            }
+        {
+            api::EventSpec ev;
+            const models::JsonValue* pmeta = pod_doc.get("metadata");
+            std::string pname = pmeta ? pmeta->get_string("name", "") : "";
+            std::string pns = pmeta ? pmeta->get_string("namespace", "default") : "default";
+            ev.involved.kind = "Pod";
+            ev.involved.name = pname;
+            ev.involved.namespace_name = pns;
+            ev.involved.uid = pmeta ? pmeta->get_string("uid", "") : "";
+            ev.reason = "Scheduled";
+            ev.message = "Successfully assigned " + pns + "/" + pname + " to " + winner.name;
+            ev.component = "default-scheduler";
+            events_.record(ev);
         }
-
-        models::JsonValue cs0;
-        cs0.type = models::JsonType::Object;
-        cs0.set("name", models::JsonValue{models::JsonType::String, false, 0, container_name, {}, {}});
-        cs0.set("ready", models::JsonValue{models::JsonType::Boolean, true, 0, "", {}, {}});
-        cs0.set("restartCount", models::JsonValue{models::JsonType::Number, false, 0, "", {}, {}});
-        cs0.set("image", models::JsonValue{models::JsonType::String, false, 0, image_name, {}, {}});
-
-        models::JsonValue running_state;
-        running_state.type = models::JsonType::Object;
-        running_state.set("startedAt", models::JsonValue{models::JsonType::String, false, 0, "2026-10-26T07:00:00Z", {}, {}});
-
-        models::JsonValue state_obj;
-        state_obj.type = models::JsonType::Object;
-        state_obj.set("running", std::move(running_state));
-        cs0.set("state", std::move(state_obj));
-
-        cstatus_arr.arr_val.push_back(std::move(cs0));
-        status_val.set("containerStatuses", std::move(cstatus_arr));
 
         pod_doc.set("status", std::move(status_val));
         in_out_pod_json = pod_doc.to_string();
@@ -795,6 +787,7 @@ private:
 
     storage::Store& store_;
     SchedulerConfig config_;
+    api::EventRecorder events_{store_, 64};
     osal::Mutex mutex_;
     std::vector<std::shared_ptr<Predicate>> predicates_;
     std::vector<std::pair<std::shared_ptr<Scorer>, float>> scorers_;

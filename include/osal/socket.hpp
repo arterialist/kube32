@@ -64,6 +64,8 @@ public:
 
     bool is_valid() const { return fd_ >= 0; }
     int native_handle() const { return fd_; }
+    // Gives up ownership of the descriptor without closing it.
+    int release() { int fd = fd_; fd_ = -1; return fd; }
 
     // Platform networking initialization
     static bool init_networking();

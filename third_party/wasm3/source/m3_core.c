@@ -142,14 +142,27 @@ void* m3_Realloc_Impl (void* i_ptr, size_t i_newSize, size_t i_oldSize)
 
 #else
 
+// Kube32: large allocations (linear memory) may come from a block reserved at
+// boot on nodes without PSRAM. See include/runtime/pod_memory_pool.h.
+extern void*  kube32_pool_alloc(size_t bytes);
+extern int    kube32_pool_owns(const void* ptr);
+extern int    kube32_pool_free(void* ptr);
+extern size_t kube32_pool_block_size(void);
+extern void*  kube32_rt_calloc(size_t bytes);
+extern void*  kube32_rt_realloc(void* ptr, size_t bytes);
+extern void   kube32_rt_free(void* ptr);
+
 void* m3_Malloc_Impl (size_t i_size)
 {
-    return calloc(i_size, 1);
+    void* pooled = kube32_pool_alloc(i_size);
+    if (pooled) return pooled;
+    return kube32_rt_calloc(i_size);
 }
 
 void m3_Free_Impl (void* io_ptr)
 {
-    free(io_ptr);
+    if (kube32_pool_free(io_ptr)) return;
+    kube32_rt_free(io_ptr);
 }
 
 void* m3_Realloc_Impl (void* i_ptr, size_t i_newSize, size_t i_oldSize)
@@ -158,7 +171,22 @@ void* m3_Realloc_Impl (void* i_ptr, size_t i_newSize, size_t i_oldSize)
         return i_ptr;
     }
 
-    void* newPtr = realloc(i_ptr, i_newSize);
+    if (!i_ptr) {
+        return m3_Malloc_Impl(i_newSize);   // first allocation of a linear memory: try the pool
+    }
+    if (kube32_pool_owns(i_ptr)) {
+        if (i_newSize <= kube32_pool_block_size()) {
+            if (i_newSize > i_oldSize) memset((u8*)i_ptr + i_oldSize, 0x0, i_newSize - i_oldSize);
+            return i_ptr;
+        }
+        void* moved = kube32_rt_calloc(i_newSize);
+        if (!moved) return NULL;
+        memcpy(moved, i_ptr, i_oldSize);
+        kube32_pool_free(i_ptr);
+        return moved;
+    }
+
+    void* newPtr = kube32_rt_realloc(i_ptr, i_newSize);
 
     if (M3_LIKELY(newPtr)) {
         if (i_newSize > i_oldSize) {

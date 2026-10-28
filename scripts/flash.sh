@@ -7,8 +7,12 @@ set -e
 PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$PROJECT_DIR"
 
-PORT="${1:-/dev/cu.usbmodem578E0184461}"
+PORT="${1:-${KUBE32_SERIAL_PORT:-}}"
 BAUD="${2:-460800}"
+if [ -z "$PORT" ]; then
+    echo "usage: scripts/flash.sh <serial port> [baud]   (or set KUBE32_SERIAL_PORT)" >&2
+    exit 2
+fi
 
 echo "================================================================="
 echo "  Kube32 Production ESP32-S3 Silicon Flasher"

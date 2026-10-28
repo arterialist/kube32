@@ -90,7 +90,7 @@ else()
     )
     add_library(wasm3 STATIC ${WASM3_SRCS})
     target_include_directories(wasm3 PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/third_party/wasm3/source)
-    target_compile_definitions(wasm3 PUBLIC d_m3CodePageAlignSize=4096)
+    target_compile_definitions(wasm3 PUBLIC d_m3CodePageAlignSize=4096 d_m3HasExceptionHandling=0 d_m3HasTypedRefs=0 d_m3HasStackSwitching=0 d_m3HasSnapshots=0 d_m3RecordBacktraces=0)
 
     # Core Library: OSAL, Memory Architecture, Storage Engine, API Server, Scheduler, HAL, Runtime, Kubelet
     set(KUBE32_CORE_SRCS
@@ -112,6 +112,10 @@ else()
         src/controller/node_lifecycle_controller.cpp
         src/ipc/channel.cpp
         src/api/table_serializer.cpp
+        src/api/selectors.cpp
+        src/api/watch_hub.cpp
+        src/api/event_recorder.cpp
+        src/api/metrics_registry.cpp
         src/api/route_handler.cpp
         src/api/http_server.cpp
         src/scheduler/scheduler.cpp
@@ -120,9 +124,28 @@ else()
         src/runtime/host_functions.cpp
         src/runtime/container_lifecycle.cpp
         src/runtime/wasm_runtime.cpp
+        src/runtime/app_pod.cpp
+        src/runtime/pod_log.cpp
+        src/runtime/image_registry.cpp
+        src/runtime/pod_memory_pool.cpp
+        src/app/ingress.cpp
+        src/app/app_wiring.cpp
         src/kubelet/node_status_reporter.cpp
+        src/kubelet/metrics_provider.cpp
         src/kubelet/kube_api_client.cpp
         src/kubelet/kubelet.cpp
+        ${CMAKE_BINARY_DIR}/generated/embedded_blobs.cpp
+    )
+
+    # Embedded images (images/*.wasm) and web assets (images/web/*) are turned
+    # into a generated source so the host simulator serves the same bytes as
+    # the firmware.
+    file(GLOB KUBE32_EMBED_INPUTS ${CMAKE_CURRENT_SOURCE_DIR}/images/*.wasm ${CMAKE_CURRENT_SOURCE_DIR}/images/web/*/*)
+    add_custom_command(
+        OUTPUT ${CMAKE_BINARY_DIR}/generated/embedded_blobs.cpp
+        COMMAND python3 ${CMAKE_CURRENT_SOURCE_DIR}/tools/embed_assets.py --host-out ${CMAKE_BINARY_DIR}/generated
+        DEPENDS ${KUBE32_EMBED_INPUTS} ${CMAKE_CURRENT_SOURCE_DIR}/tools/embed_assets.py
+        COMMENT "Embedding Wasm images and web assets"
     )
 
     add_library(kube32_core STATIC

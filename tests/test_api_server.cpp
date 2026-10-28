@@ -167,7 +167,8 @@ void test_discovery_and_method_enforcement() {
     HttpResponse resp8 = handler.handle_request(r8, arena);
     assert(resp8.status_code == 200);
     assert(resp8.body.find("\"groupVersion\":\"events.k8s.io/v1\"") != std::string::npos);
-    assert(resp8.body.find("\"resources\":[]") != std::string::npos);
+    assert(resp8.body.find("\"name\":\"events\"") != std::string::npos);
+    assert(resp8.body.find("\"kind\":\"Event\"") != std::string::npos);
 
     // 9. Arena scratchpad offset > 0 verification
     assert(arena.get_offset() > 0);

@@ -29,6 +29,8 @@ public:
     virtual bool init(const WifiConfig& config) = 0;
     virtual bool start_station() = 0;
     virtual bool start_softap() = 0;
+    // Joins an upstream network as a station while still hosting the cluster AP.
+    virtual bool start_station_and_softap() { return start_softap(); }
     virtual bool disconnect() = 0;
 
     virtual bool is_connected() const = 0;

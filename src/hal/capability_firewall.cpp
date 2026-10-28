@@ -294,12 +294,41 @@ bool CapabilityFirewall::register_pod(const std::string& pod_id, const std::stri
                         allocated_uart_mask_ |= (1U << port);
                         claimed_uarts.push_back(port);
                     }
-                    // Virtual Channel IPC: "kube32.io/ipc": "1" or "true"
-                    else if (key == "kube32.io/ipc") {
+                    // Virtual Channel IPC: "kube32.io/ipc" / "hardware.kube32.io/ipc": "1" or "true"
+                    else if (key == "kube32.io/ipc" || key == "hardware.kube32.io/ipc") {
                         if (val_str == "1" || val_str == "true") {
                             grant.capabilities_mask |= KUBE32_CAP_IPC;
                         }
                     }
+                    // On-board peripherals exposed as extended resources
+                    else if (key == "hardware.kube32.io/tft-display") {
+                        if (val_str != "0") grant.capabilities_mask |= KUBE32_CAP_DISPLAY;
+                    }
+                    else if (key == "hardware.kube32.io/keyboard") {
+                        if (val_str != "0") grant.capabilities_mask |= KUBE32_CAP_KEYBOARD;
+                    }
+                    else if (key == "hardware.kube32.io/speaker") {
+                        if (val_str != "0") grant.capabilities_mask |= KUBE32_CAP_SPEAKER;
+                    }
+                }
+            }
+
+            // securityContext.capabilities.add: [CHANNEL_IPC, DISPLAY, KEYBOARD, SPEAKER]
+            for (const auto& c : containers->arr_val) {
+                if (!c.is_object()) continue;
+                const models::JsonValue* sc = c.get("securityContext");
+                if (!sc || !sc->is_object()) continue;
+                const models::JsonValue* caps = sc->get("capabilities");
+                if (!caps || !caps->is_object()) continue;
+                const models::JsonValue* add = caps->get("add");
+                if (!add || !add->is_array()) continue;
+                for (const auto& cap : add->arr_val) {
+                    if (!cap.is_string()) continue;
+                    const std::string& name = cap.str_val;
+                    if (name == "CHANNEL_IPC" || name == "IPC") grant.capabilities_mask |= KUBE32_CAP_IPC;
+                    else if (name == "DISPLAY" || name == "TFT_DISPLAY") grant.capabilities_mask |= KUBE32_CAP_DISPLAY;
+                    else if (name == "KEYBOARD") grant.capabilities_mask |= KUBE32_CAP_KEYBOARD;
+                    else if (name == "SPEAKER" || name == "AUDIO") grant.capabilities_mask |= KUBE32_CAP_SPEAKER;
                 }
             }
         }
@@ -499,6 +528,15 @@ bool CapabilityFirewall::check_permission(const std::string& pod_id, PeripheralT
             break;
         case PeripheralType::IPC:
             permitted = grant.is_ipc_permitted();
+            break;
+        case PeripheralType::Display:
+            permitted = grant.has_capability(KUBE32_CAP_DISPLAY);
+            break;
+        case PeripheralType::Keyboard:
+            permitted = grant.has_capability(KUBE32_CAP_KEYBOARD);
+            break;
+        case PeripheralType::Speaker:
+            permitted = grant.has_capability(KUBE32_CAP_SPEAKER);
             break;
     }
 

@@ -1,4 +1,5 @@
 #include "kubelet/kubelet.hpp"
+#include "runtime/image_registry.hpp"
 #include "kubelet/node_status_reporter.hpp"
 #include "kubelet/kube_api_client.hpp"
 #include "runtime/wasm_runtime.hpp"
@@ -401,6 +402,12 @@ void test_http_chunked_response_decoding() {
 }
 
 int main() {
+    // Pods in these tests reference images that must exist in the local registry
+    static const uint8_t k_min_wasm[] = {0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00};
+    for (const char* key : {"sensor", "gpio", "trap", "trap2", "app", "test"}) {
+        kube32::runtime::ImageRegistry::instance().add({key, k_min_wasm, sizeof(k_min_wasm)});
+    }
+
     std::cout << "========================================" << std::endl;
     std::cout << " Running ESP32 Kubelet Node Agent Tests " << std::endl;
     std::cout << "========================================" << std::endl;

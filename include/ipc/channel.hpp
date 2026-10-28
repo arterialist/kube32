@@ -7,6 +7,8 @@
 #include <vector>
 #include <atomic>
 #include <map>
+#include <functional>
+#include <string_view>
 
 #include "osal/mutex.hpp"
 #include "osal/condition_variable.hpp"
@@ -85,13 +87,15 @@ uint16_t crc16_ccitt(const uint8_t* data, size_t len, uint16_t init = 0xFFFF);
 struct RingSlot {
     uint32_t sender_hash{0};
     uint16_t len{0};
-    uint8_t  data[K32C_RING_SLOT_SIZE];
 };
 
+// Slot payloads live in one flat allocation of capacity * slot_size bytes so a
+// ring sized for 200-byte events costs 2 KB instead of 16 KB.
 class RingBuffer {
 public:
-    explicit RingBuffer(size_t capacity = K32C_RING_SLOT_COUNT);
+    explicit RingBuffer(size_t capacity = K32C_RING_SLOT_COUNT, size_t slot_size = K32C_RING_SLOT_SIZE);
     ~RingBuffer() = default;
+    size_t slot_size() const { return slot_size_; }
 
     RingBuffer(const RingBuffer&) = delete;
     RingBuffer& operator=(const RingBuffer&) = delete;
@@ -110,7 +114,9 @@ public:
 private:
     const size_t capacity_;
     const size_t mask_;
+    const size_t slot_size_;
     std::vector<RingSlot> slots_;
+    std::vector<uint8_t> payload_;
 
     alignas(64) std::atomic<uint32_t> head_{0}; // Written by Producer
     alignas(64) std::atomic<uint32_t> tail_{0}; // Written by Consumer
@@ -182,6 +188,18 @@ struct ChannelHandle {
     std::shared_ptr<RingBuffer> in_ring; // Allocated for listening/recv
 };
 
+// Node peers discovered through HELLO frames (ESP-NOW broadcast) or added
+// statically (host simulation).
+struct PeerInfo {
+    uint32_t node_id{0};
+    std::string node_name;
+    NodeEndpoint endpoint;
+    uint64_t last_seen_ms{0};
+    uint32_t hello_count{0};
+};
+
+constexpr const char* K32C_HELLO_TOPIC = "k32.hello";
+
 class ChannelManager {
 public:
     static ChannelManager& instance();
@@ -190,21 +208,45 @@ public:
     void shutdown();
     bool is_initialized() const;
 
+    // ---- Topic publish/subscribe (host-side consumers) --------------------
+    using TopicCallback = std::function<void(std::string_view topic, uint32_t sender_hash, const uint8_t* data, size_t len)>;
+    // Delivers to the local ring for the topic (if a pod opened it), to every
+    // host subscriber, and to every known peer node. Returns bytes or error.
+    int32_t publish(const std::string& pod_id, const std::string& topic, const uint8_t* data, size_t len);
+    uint32_t subscribe(const std::string& topic, TopicCallback cb);
+    void unsubscribe(uint32_t id);
+
+    // ---- Peers -------------------------------------------------------------
+    void set_local_identity(uint32_t node_id, const std::string& node_name);
+    void add_peer(const PeerInfo& peer);
+    std::vector<PeerInfo> peers() const;
+    bool find_peer_by_name(const std::string& node_name, PeerInfo& out) const;
+    uint32_t local_node_id() const { return local_node_id_; }
+    // Starts the periodic HELLO announcement and the dispatcher thread.
+    bool start_background(uint32_t hello_interval_ms = 3000, size_t dispatcher_stack_bytes = 8192, bool stack_in_psram = false);
+    void send_hello();
+    // ESP-NOW receive callback entry: copies the frame for the dispatcher thread.
+    void enqueue_raw_frame(const uint8_t* src_mac, const uint8_t* frame, size_t len);
+
     // Workload API primitives
     int32_t open(const std::string& pod_id, const std::string& channel_uri, uint32_t flags);
     int32_t send(const std::string& pod_id, int32_t handle, const uint8_t* data, size_t len);
     int32_t recv(const std::string& pod_id, int32_t handle, uint8_t* out_buf, size_t max_len, uint32_t timeout_ms);
     int32_t close(const std::string& pod_id, int32_t handle);
 
-    // Frame ingress hook (invoked by UDP or ESP-NOW receiver thread)
-    void on_frame_received(const uint8_t* frame, size_t len);
+    // Frame ingress hook (invoked by UDP or ESP-NOW receiver thread). The
+    // source endpoint lets HELLO frames populate the peer table.
+    void on_frame_received(const uint8_t* frame, size_t len, const NodeEndpoint* source = nullptr);
 
     struct ChannelStats {
         std::atomic<uint64_t> frames_received{0};
         std::atomic<uint64_t> frames_delivered{0};
+        std::atomic<uint64_t> frames_sent{0};
+        std::atomic<uint64_t> send_errors{0};
         std::atomic<uint64_t> crc_errors{0};
         std::atomic<uint64_t> bad_magic_errors{0};
         std::atomic<uint64_t> reassembled_msgs{0};
+        std::atomic<uint64_t> hello_rx{0};
     };
     ChannelStats& stats() { return stats_; }
 
@@ -234,6 +276,34 @@ private:
     };
     osal::Mutex reassembly_mutex_;
     std::map<uint64_t, ReassemblyEntry> reassembly_table_;
+
+    // Peers and identity
+    mutable osal::Mutex peer_mutex_;
+    std::map<uint32_t, PeerInfo> peers_;
+    uint32_t local_node_id_{0};
+    std::string local_node_name_;
+
+    // Host subscribers and dispatcher
+    struct Subscription {
+        uint32_t id;
+        uint32_t topic_hash;
+        std::string topic;
+        TopicCallback cb;
+    };
+    mutable osal::Mutex sub_mutex_;
+    std::vector<Subscription> subs_;
+    uint32_t next_sub_id_{1};
+    std::shared_ptr<RingBuffer> dispatch_ring_;
+    std::shared_ptr<RingBuffer> rx_ring_;      // raw ESP-NOW frames awaiting parsing
+    std::unique_ptr<osal::Thread> dispatch_thread_;
+    std::atomic<bool> background_running_{false};
+    uint32_t hello_interval_ms_{3000};
+    uint64_t last_hello_ms_{0};
+
+    void deliver_local(uint32_t channel_hash, uint32_t sender_hash, const uint8_t* data, size_t len);
+    int32_t send_frames_to(const NodeEndpoint& ep, uint32_t channel_hash, uint32_t sender_hash, uint32_t target_hash, const uint8_t* data, size_t len, uint8_t extra_flags);
+    void dispatch_loop();
+    void handle_hello(const K32CHeader* hdr, const uint8_t* payload, size_t len, const NodeEndpoint* source);
 };
 
 // =============================================================================

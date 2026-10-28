@@ -21,9 +21,21 @@
 #include "m3_core.h"
 #include "m3_host.h"
 
+#if defined(ESP_PLATFORM)
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#endif
+
+// Kube32: on FreeRTOS the current task's stack bounds are known, which lets the
+// interpreter trap on deep recursion (m3Err_trapStackOverflow) instead of
+// corrupting memory. Other bare systems keep answering NULL (no probe).
 void* m3_HostStackBase (void)
 {
+#if defined(ESP_PLATFORM)
+    return (void*) pxTaskGetStackStart(NULL);
+#else
     return NULL;
+#endif
 }
 
 void m3_HostInstallInterruptHandler (IM3Runtime io_runtime)

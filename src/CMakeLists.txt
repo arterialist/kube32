@@ -25,6 +25,10 @@ set(KUBE32_APP_SRCS
     api/http_server.cpp
     api/route_handler.cpp
     api/table_serializer.cpp
+    api/selectors.cpp
+    api/watch_hub.cpp
+    api/event_recorder.cpp
+    api/metrics_registry.cpp
     controller/node_lifecycle_controller.cpp
     hal/capability_firewall.cpp
     hal/mock_hal.cpp
@@ -32,6 +36,7 @@ set(KUBE32_APP_SRCS
     ipc/channel.cpp
     kubelet/kube_api_client.cpp
     kubelet/kubelet.cpp
+    kubelet/metrics_provider.cpp
     kubelet/node_status_reporter.cpp
     mem/memory_tier.cpp
     mem/monotonic_arena.cpp
@@ -48,6 +53,13 @@ set(KUBE32_APP_SRCS
     runtime/container_lifecycle.cpp
     runtime/host_functions.cpp
     runtime/wasm_runtime.cpp
+    runtime/app_pod.cpp
+    runtime/pod_log.cpp
+    runtime/image_registry.cpp
+    runtime/pod_memory_pool.cpp
+    app/ingress.cpp
+    app/app_wiring.cpp
+    embedded/embedded_blobs_esp.cpp
     scheduler/scheduler.cpp
     storage/littlefs_journal.cpp
     storage/radix_tree.cpp
@@ -73,4 +85,5 @@ idf_component_register(
         driver
         esp_driver_gpio
         esp_lcd
+        esp_adc
 )

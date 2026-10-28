@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Empirical Adversarial Hardware Verification Suite for Milestone 6 Iteration 2
-Target Port: /dev/cu.usbmodem578E0184461 (ESP32-S3 Dev Board, 2MB PSRAM, Worker Node 02)
+Target Port: $KUBE32_SERIAL_PORT (ESP32-S3 board console)
 
 Adversarial Challenges:
 1. Reset Permutation & State Trap Verification:
@@ -25,7 +25,7 @@ import re
 import serial
 import termios
 
-TARGET_PORT = "/dev/cu.usbmodem578E0184461"
+TARGET_PORT = os.environ.get("KUBE32_SERIAL_PORT", "")  # set to the worker board's console, e.g. /dev/cu.usbmodemXXXX
 BAUD_RATE = 115200
 
 def clear_hupcl(port: serial.Serial) -> None:
