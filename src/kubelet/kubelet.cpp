@@ -169,6 +169,7 @@ void Kubelet::run_loop() {
 }
 
 void Kubelet::reconcile_node_registration() {
+    refresh_node_ip();
     if (registered_.load()) return;
 
     NodeTelemetry t = status_reporter_->collect_telemetry();
@@ -183,7 +184,17 @@ void Kubelet::reconcile_node_registration() {
     }
 }
 
+void Kubelet::refresh_node_ip() {
+    if (!config_.node_ip_provider) return;
+    std::string ip = config_.node_ip_provider();
+    if (ip.empty() || ip == "0.0.0.0" || ip == config_.node_ip) return;
+    config_.node_ip = ip;
+    status_reporter_->set_node_ip(ip);
+    std::cout << "[KUBELET] node address is now " << ip << std::endl;
+}
+
 void Kubelet::report_heartbeat() {
+    refresh_node_ip();
     uint64_t now_ms = osal::System::get_uptime_ms();
     // renewTime carries the real wall clock, or nothing while it is unset
     api_client_->renew_node_lease(config_.node_name, 40, models::now_rfc3339());

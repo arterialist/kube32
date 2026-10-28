@@ -4,6 +4,8 @@
 
 #include <cstring>
 #include <cstdio>
+#include <cerrno>
+#include <cstring>
 #include <cctype>
 #include <vector>
 #include <algorithm>
@@ -376,10 +378,15 @@ void HttpServer::run_acceptor() {
         if (FD_ISSET(listen_fd, &rfds)) {
             std::string client_ip;
             osal::Socket client = listen_sock_.accept(&client_ip);
-            if (client.is_valid()) client.set_tcp_nodelay(true);   // responses are written in large coalesced chunks
-            if (!client.is_valid()) continue;
+            if (!client.is_valid()) {
+                // Usually EMFILE/ENFILE: lwIP's socket table is full and the
+                // peer's SYN is being dropped. Say so, a few times per boot.
+                static int logged = 0;
+                if (logged < 8) { logged++; printf("[HTTP] %s accept failed: errno %d (%s)\n", options_.name, errno, strerror(errno)); }
+                continue;
+            }
             metrics_.connections.fetch_add(1, std::memory_order_relaxed);
-            client.set_tcp_nodelay(true);
+            client.set_tcp_nodelay(true);   // responses are written in large coalesced chunks
             int fd = client.native_handle();
             osal::LockGuard guard(queue_mutex_);
             if (queue_.size() >= options_.accept_queue_depth) {
@@ -613,7 +620,7 @@ size_t HttpServer::serve_one(Worker& w, osal::Socket& sock, const std::string& c
             }
             conn.set_close(); // Kubernetes responses keep the historical close semantics
             if (!resp.is_chunked) conn.send_simple(resp.status_code, resp.content_type, resp.body);
-            else conn.mark_responded();
+            else conn.mark_responded(resp.status_code);
         } else {
             conn.send_simple(404, "application/json", "{\"error\":\"not_found\"}");
         }

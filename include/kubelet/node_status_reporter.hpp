@@ -36,6 +36,7 @@ public:
 
     const std::string& node_name() const { return node_name_; }
     const std::string& node_ip() const { return node_ip_; }
+    void set_node_ip(const std::string& ip) { node_ip_ = ip; }
 
 private:
     std::string node_name_;

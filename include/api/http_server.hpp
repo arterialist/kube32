@@ -73,7 +73,7 @@ public:
     bool end_chunked();
     // Raw head + body passthrough used by the proxy. Marks the request answered.
     bool send_raw(const void* data, size_t len);
-    void mark_responded() { responded_ = true; }
+    void mark_responded(int status = 0) { responded_ = true; if (status) status_ = status; }
     // Handlers that keep the socket (SSE, upgrades) take ownership here.
     osal::Socket take_socket();
 

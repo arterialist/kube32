@@ -609,6 +609,7 @@ void cluster_task(void* pv) {
     kube32::kubelet::KubeletConfig kubelet_cfg;
     kubelet_cfg.node_name = ident.name;
     kubelet_cfg.node_ip = ip;
+    kubelet_cfg.node_ip_provider = [nm = net_mgr.get()]() { return nm->get_ip_address(); };
     kubelet_cfg.heartbeat_interval_ms = 5000;
     kubelet_cfg.sync_frequency_ms = 2000;
     // The kubelet task parses manifests and loads/compiles Wasm modules (deep

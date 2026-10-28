@@ -8,6 +8,7 @@
 #include "osal/mutex.hpp"
 
 #include <string>
+#include <functional>
 #include <vector>
 #include <map>
 #include <memory>
@@ -52,6 +53,7 @@ struct KubeletConfig {
     std::string api_server_host{"127.0.0.1"};
     uint16_t api_server_port{6443};
     std::string node_ip{"127.0.0.1"};
+    std::function<std::string()> node_ip_provider;   // re-read before registering/heartbeating (DHCP may arrive late)
     bool control_plane{false};
     
     // Cadence intervals in milliseconds
@@ -82,6 +84,7 @@ public:
 
     // Core reconciler loops (invoked sequentially by the main task loop)
     void reconcile_node_registration();
+    void refresh_node_ip();
     void report_heartbeat();
     void sync_assigned_pods();
     void monitor_and_report_pod_statuses();
