@@ -33,6 +33,7 @@
 #include "osal/system.hpp"
 #include "osal/socket.hpp"
 #include "hal/tft_keyboard_hardware.hpp"
+#include "hal/sd_card.hpp"
 #include "runtime/pod_memory_pool.h"
 #include "runtime/pod_log.hpp"
 #include "models/kube_models.hpp"
@@ -42,6 +43,8 @@
 #include <cstdlib>
 #include <memory>
 #include <string>
+#include <dirent.h>
+#include <sys/stat.h>
 
 #include "esp_system.h"
 #include "esp_wifi.h"
@@ -201,6 +204,28 @@ std::string loopback_http(uint16_t port, const std::string& request) {
     return response;
 }
 
+// One "K32_SD <path> <size|dir>" line per entry under `path`, two levels deep
+// (images/ and volumes/<claim>/), at most 64 entries.
+static void console_list_sd(Console& con, const std::string& path, int depth, int& budget) {
+    DIR* d = opendir(path.c_str());
+    if (!d) return;
+    while (budget > 0) {
+        struct dirent* e = readdir(d);
+        if (!e) break;
+        if (e->d_name[0] == '.') continue;
+        std::string child = path + "/" + e->d_name;
+        struct stat st;
+        bool is_dir = (stat(child.c_str(), &st) == 0) && S_ISDIR(st.st_mode);
+        char l[160];
+        int ll = is_dir ? snprintf(l, sizeof(l), "K32_SD %s/ dir\n", child.c_str())
+                        : snprintf(l, sizeof(l), "K32_SD %s %lld\n", child.c_str(), (long long)st.st_size);
+        con.write(l, static_cast<size_t>(ll));
+        budget--;
+        if (is_dir && depth > 1) console_list_sd(con, child, depth - 1, budget);
+    }
+    closedir(d);
+}
+
 static uint32_t crc32_bytes(const uint8_t* p, size_t n) {
     uint32_t c = 0xFFFFFFFFu;
     for (size_t i = 0; i < n; ++i) {
@@ -355,6 +380,22 @@ void console_task(void* arg) {
                 vTaskDelay(pdMS_TO_TICKS(100));
                 REG_WRITE(RTC_CNTL_OPTION1_REG, RTC_CNTL_FORCE_DOWNLOAD_BOOT);
                 esp_restart();
+            } else if (line == "K32_CMD:SD") {
+                // Card state, measured figures and what is on it under /sd/kube32
+                kube32::hal::SdInfo si = kube32::hal::sd_info();
+                char l[256];
+                int ll;
+                if (si.mounted) {
+                    ll = snprintf(l, sizeof(l), "K32_SD mounted=1 name=%s type=%s total_bytes=%llu free_bytes=%llu spi_khz=%u path=/sd\n",
+                                  si.name.c_str(), si.type.c_str(), (unsigned long long)si.total_bytes, (unsigned long long)si.free_bytes, (unsigned)si.bus_khz);
+                    con.write(l, static_cast<size_t>(ll));
+                    int budget = 64;
+                    console_list_sd(con, "/sd/kube32", 3, budget);
+                } else {
+                    ll = snprintf(l, sizeof(l), "K32_SD mounted=0 error=\"%s\"\n", si.error.c_str());
+                    con.write(l, static_cast<size_t>(ll));
+                }
+                con.write("K32_OK sd\n", 10);
             } else if (line == "K32_CMD:KEYPOP") {
                 // Pops one key from the matrix queue on the host side (bypasses pods)
                 int k = kube32::hal::keyboard_pop();
@@ -503,6 +544,16 @@ void cluster_task(void* pv) {
         has_display = kube32::hal::init_display_and_backlight();
         kube32::hal::init_speaker();
         kube32::hal::init_keyboard_scanner();
+    }
+    // microSD slot of the display board: its own SPI bus (SPI3), FAT at /sd
+    if (ident.has_display) {
+        if (kube32::hal::sd_mount()) {
+            kube32::hal::SdInfo si = kube32::hal::sd_info();
+            printf("[SD] %s %s mounted at /sd: %llu MB total, %llu MB free, SPI3 %u kHz\n", si.type.c_str(), si.name.c_str(),
+                   (unsigned long long)(si.total_bytes / (1024 * 1024)), (unsigned long long)(si.free_bytes / (1024 * 1024)), (unsigned)si.bus_khz);
+        } else {
+            printf("[SD] not mounted: %s\n", kube32::hal::sd_info().error.c_str());
+        }
     }
     install_hardware_hooks(has_display);
     log_memory("after peripherals");
@@ -707,22 +758,25 @@ void cluster_task(void* pv) {
         aw.app_name = "tessera";
         aw.core_pod = "tessera-core";
         aw.local_node_name = ident.name;
-        aw.run_pod_server = ident.has_psram;
+        // Pods with a card volume are worth reaching over HTTP (GET /log on
+        // sdnote): one 12 KB worker when a card is mounted on a no-PSRAM board.
+        aw.run_pod_server = ident.has_psram || kube32::hal::sd_is_mounted();
         aw.pod_port = 7000;
-        aw.pod_workers = 2;
-        aw.pod_worker_stack = 24576;
+        aw.pod_workers = ident.has_psram ? 2 : 1;
+        aw.pod_worker_stack = ident.has_psram ? 24576 : 12288;
         aw.core_affinity = 1;
         aw.stacks_in_psram = ident.has_psram;
         wiring = std::make_unique<kube32::app::AppWiring>(aw);
         wiring->start();
         if (has_display) {
             kube32::hal::display_fill_rect(0, 0, kube32::hal::LCD_WIDTH, 18, 0x194B);
-            kube32::hal::display_draw_string(6, 5, "KUBE32  worker node", kube32::hal::COLOR_GREEN, 0x194B);
-            std::string l = "node " + ident.name + "  " + ip;
+            // The boot screen stays product-neutral on purpose: what runs the
+            // board is not announced on the display, the apps draw their own UI.
+            kube32::hal::display_draw_string(6, 5, "ready", kube32::hal::COLOR_GREEN, 0x194B);
+            std::string l = ip;
             kube32::hal::display_draw_string(6, 28, l.c_str(), kube32::hal::COLOR_WHITE, kube32::hal::COLOR_BG_DARK);
-            std::string app_url = "app  http://" + api_host + "/";
+            std::string app_url = "http://" + api_host + "/";
             kube32::hal::display_draw_string(6, 40, app_url.c_str(), kube32::hal::COLOR_CYAN, kube32::hal::COLOR_BG_DARK);
-            kube32::hal::display_draw_string(6, 52, "waiting for pods...", kube32::hal::COLOR_WHITE, kube32::hal::COLOR_BG_DARK);
         }
     }
     log_memory("cluster services up");

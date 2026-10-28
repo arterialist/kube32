@@ -121,6 +121,7 @@ else()
         src/api/http_server.cpp
         src/scheduler/scheduler.cpp
         src/hal/capability_firewall.cpp
+        src/hal/sd_card.cpp
         src/hal/mock_hal.cpp
         src/runtime/host_functions.cpp
         src/runtime/container_lifecycle.cpp
@@ -128,6 +129,7 @@ else()
         src/runtime/app_pod.cpp
         src/runtime/pod_log.cpp
         src/runtime/image_registry.cpp
+        src/runtime/pod_fs.cpp
         src/runtime/pod_memory_pool.cpp
         src/app/ingress.cpp
         src/app/app_wiring.cpp
@@ -324,6 +326,14 @@ else()
     )
     target_link_libraries(test_m4_adversarial_ipc PRIVATE kube32_core)
     add_test(NAME test_m4_adversarial_ipc COMMAND test_m4_adversarial_ipc)
+
+    # 22. microSD card: HAL over KUBE32_SD_ROOT, pod storage ABI, images pulled from the card
+    add_executable(test_sd_card
+        tests/test_sd_card.cpp
+    )
+    target_link_libraries(test_sd_card PRIVATE kube32_core)
+    target_compile_definitions(test_sd_card PRIVATE KUBE32_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}")
+    add_test(NAME test_sd_card COMMAND test_sd_card)
 
 endif()
 

@@ -50,6 +50,37 @@ std::vector<std::string> ImageRegistry::list() const {
     return out;
 }
 
+static bool valid_image_token(const std::string& s, size_t max_len) {
+    if (s.empty() || s.size() > max_len || s[0] == '.') return false;
+    for (char c : s) {
+        bool ok = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '.' || c == '_' || c == '-';
+        if (!ok) return false;
+    }
+    return true;
+}
+
+bool parse_sd_image_ref(const std::string& image_ref, std::string& out_name, std::string& out_tag) {
+    out_name.clear();
+    out_tag.clear();
+    std::string s = image_ref;
+    if (s.rfind("wasm://", 0) == 0) s = s.substr(7);
+    if (s.rfind("sd/", 0) != 0) return false;
+    s = s.substr(3);
+    if (s.find('/') != std::string::npos || s.find('@') != std::string::npos) return false;
+    size_t colon = s.find(':');
+    std::string name = (colon == std::string::npos) ? s : s.substr(0, colon);
+    std::string tag = (colon == std::string::npos) ? std::string() : s.substr(colon + 1);
+    if (!valid_image_token(name, 48)) return false;
+    if (colon != std::string::npos && !valid_image_token(tag, 24)) return false;
+    out_name = name;
+    out_tag = tag;
+    return true;
+}
+
+std::string sd_image_relative_path(const std::string& name, const std::string& tag) {
+    return "kube32/images/" + name + (tag.empty() ? std::string() : "-" + tag) + ".wasm";
+}
+
 bool base64_decode(const std::string& in, std::vector<uint8_t>& out) {
     static const int8_t table[256] = {
         -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1, -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,

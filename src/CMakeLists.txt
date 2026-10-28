@@ -33,6 +33,7 @@ set(KUBE32_APP_SRCS
     controller/deployment_controller.cpp
     hal/capability_firewall.cpp
     hal/mock_hal.cpp
+    hal/sd_card.cpp
     hal/tft_keyboard_hardware.cpp
     ipc/channel.cpp
     kubelet/kube_api_client.cpp
@@ -57,6 +58,7 @@ set(KUBE32_APP_SRCS
     runtime/app_pod.cpp
     runtime/pod_log.cpp
     runtime/image_registry.cpp
+    runtime/pod_fs.cpp
     runtime/pod_memory_pool.cpp
     app/ingress.cpp
     app/app_wiring.cpp
@@ -87,4 +89,8 @@ idf_component_register(
         esp_driver_gpio
         esp_lcd
         esp_adc
+        esp_driver_spi
+        esp_driver_sdspi
+        sdmmc
+        fatfs
 )

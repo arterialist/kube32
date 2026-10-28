@@ -7,6 +7,7 @@
 #endif
 #include "runtime/host_functions.hpp"
 #include "runtime/app_pod.hpp"
+#include "runtime/pod_fs.hpp"
 #include "osal/system.hpp"
 #include "osal/socket.hpp"
 
@@ -60,11 +61,21 @@ void ContainerLifecycleController::cleanup_runtime() {
     }
 }
 
+bool ContainerLifecycleController::deploy(std::vector<uint8_t>&& wasm_bytes) {
+    {
+        osal::LockGuard guard(mutex_);
+        wasm_bytecode_ = std::move(wasm_bytes);
+    }
+    return deploy(wasm_bytecode_.data(), wasm_bytecode_.size());
+}
+
 bool ContainerLifecycleController::deploy(const uint8_t* wasm_bytes, size_t len) {
     osal::LockGuard guard(mutex_);
     osal::LockGuard<osal::RecursiveMutex> global_guard(s_wasm3_global_mutex);
 
     cleanup_runtime();
+    // A fresh instance starts with no SD files open (also on restart)
+    PodFs::instance().release_pod(config_.pod_id);
 
     if (!wasm_bytes || len == 0) {
         status_.phase = ContainerPhase::Failed;

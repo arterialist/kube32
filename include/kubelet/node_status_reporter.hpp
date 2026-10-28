@@ -20,6 +20,10 @@ struct NodeTelemetry {
     uint32_t allocatable_i2c_count{2};
     uint32_t total_adc_count{2};
     uint32_t allocatable_adc_count{2};
+    // microSD card (hardware.kube32.io/sd): measured at collection, absent without a card
+    bool sd_present{false};
+    uint64_t sd_total_bytes{0};
+    uint64_t sd_free_bytes{0};
 };
 
 class NodeStatusReporter {

@@ -21,6 +21,7 @@ struct PodSecurityRecord {
     DeviceGrant grant;
     SecurityAction action{SecurityAction::LogAndDeny};
     uint32_t violation_count{0};
+    std::string sd_claim;   // spec.volumes[*]["kube32.io/sd"].claim: directory under /sd/kube32/volumes/
 };
 
 class CapabilityFirewall {
@@ -43,6 +44,11 @@ public:
 
     // Context Pointer Lookup for Wasm3 Userdata Binding
     const PodSecurityRecord* get_pod_security_record(const std::string& pod_id) const;
+
+    // SD volume claim of a pod granted hardware.kube32.io/sd; empty otherwise.
+    std::string sd_claim(const std::string& pod_id) const;
+    // A claim is a directory name: 1..32 characters of [a-z0-9-], no leading '-'.
+    static bool valid_sd_claim(const std::string& claim);
 
     // Global Telemetry & Status
     uint64_t get_allocated_gpio_mask() const;

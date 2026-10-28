@@ -66,6 +66,7 @@ nav:
   - Reference:
       - CLI reference: cli-reference.md
       - Kubernetes API matrix: api-reference.md
+      - microSD card (images and pod storage): sd-card.md
 
 markdown_extensions:
   - admonition

@@ -1,0 +1,37 @@
+# sdnote: a pod that keeps a file on the Cardputer's microSD card.
+#
+# The image is NOT embedded in the firmware: it is pulled from the card at
+# /sd/kube32/images/sdnote.wasm (build it with `make -C apps/sdnote`, copy
+# images/sd/sdnote.wasm to the card as /kube32/images/sdnote.wasm).
+#
+# The pod requests the card (hardware.kube32.io/sd) and names its volume
+# claim: every k32_fs_* path is relative to /sd/kube32/volumes/notes/.
+# On start it appends a line to boot.log; GET /log serves the file.
+#
+#   kubectl --context kube32 apply -f examples/sdnote.yaml
+#   kubectl --context kube32 get events --field-selector involvedObject.name=sdnote
+#   curl http://<cardputer ip>:7000/log       (pod HTTP server on the worker)
+apiVersion: v1
+kind: Pod
+metadata:
+  name: sdnote
+  namespace: default
+  labels:
+    app: sdnote
+spec:
+  nodeSelector:
+    kubernetes.io/hostname: esp32-node-02
+  restartPolicy: Always
+  volumes:
+    - name: data
+      persistentVolumeClaim:
+        claimName: notes            # -> /sd/kube32/volumes/notes/ (kube32.io/sd: {claim: notes} is accepted too)
+  containers:
+    - name: sdnote
+      image: wasm://sd/sdnote
+      resources:
+        requests:
+          memory: 64Ki
+          hardware.kube32.io/sd: "1"
+        limits:
+          memory: 64Ki

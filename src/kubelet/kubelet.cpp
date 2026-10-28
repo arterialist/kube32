@@ -1,5 +1,6 @@
 #include "kubelet/kubelet.hpp"
 #include "hal/capability_firewall.hpp"
+#include "hal/sd_card.hpp"
 #include "runtime/image_registry.hpp"
 #include "runtime/wasm_runtime.hpp"
 #include "runtime/pod_log.hpp"
@@ -8,10 +9,84 @@
 
 #include <functional>
 #include <iostream>
+#include <new>
+#include <cerrno>
+#include <cstring>
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <unistd.h>
 
 namespace kube32::kubelet {
 
 // Pods whose image resolves to nothing fail with ErrImagePull, as on Kubernetes.
+
+// Largest module the kubelet pulls from the card into RAM: a board without
+// PSRAM has about 90 KB free at steady state, so anything bigger than 256 KiB
+// can never be placed and is refused up front with a clear reason.
+static uint64_t sd_image_limit_bytes() {
+#if defined(ESP_PLATFORM)
+    return (osal::System::get_total_psram_bytes() > 0) ? (2u * 1024u * 1024u) : (256u * 1024u);
+#else
+    return 2u * 1024u * 1024u;
+#endif
+}
+
+// Reads <sd root>/kube32/images/<name>[-<tag>].wasm into `out` (sized from
+// the file, filled 4 KiB at a time). On failure `why` says what happened.
+static bool pull_sd_image(const std::string& name, const std::string& tag, std::vector<uint8_t>& out, std::string& out_path, std::string& why) {
+    out.clear();
+    std::string root = hal::sd_root_path();
+    if (root.empty()) {
+        std::string reason = hal::sd_info().error;
+        why = "no sd card mounted on this node" + (reason.empty() ? std::string() : " (" + reason + ")");
+        return false;
+    }
+    out_path = root + "/" + runtime::sd_image_relative_path(name, tag);
+    struct stat st;
+    if (::stat(out_path.c_str(), &st) != 0) {
+        why = out_path + " not found on the sd card";
+        return false;
+    }
+    if (!S_ISREG(st.st_mode) || st.st_size <= 0) {
+        why = out_path + " is not a regular file or is empty";
+        return false;
+    }
+    const uint64_t size = static_cast<uint64_t>(st.st_size);
+    const uint64_t limit = sd_image_limit_bytes();
+    if (size > limit) {
+        why = out_path + " is " + std::to_string(size) + " bytes, over the " + std::to_string(limit / 1024) + " KiB limit of this board" +
+              (limit < (1024u * 1024u) ? " (no PSRAM)" : "");
+        return false;
+    }
+    try {
+        out.resize(static_cast<size_t>(size));
+    } catch (const std::bad_alloc&) {
+        why = "cannot allocate " + std::to_string(size) + " bytes for " + out_path + " (free heap " +
+              std::to_string(osal::System::get_free_heap_bytes()) + ")";
+        return false;
+    }
+    int fd = ::open(out_path.c_str(), O_RDONLY);
+    if (fd < 0) {
+        why = out_path + ": open failed (errno " + std::to_string(errno) + ")";
+        out.clear(); out.shrink_to_fit();
+        return false;
+    }
+    size_t got = 0;
+    while (got < out.size()) {
+        size_t chunk = out.size() - got;
+        if (chunk > 4096) chunk = 4096;
+        ssize_t n = ::read(fd, out.data() + got, chunk);
+        if (n <= 0) {
+            why = out_path + ": read failed at byte " + std::to_string(got) + " (errno " + std::to_string(errno) + ")";
+            ::close(fd);
+            out.clear(); out.shrink_to_fit();
+            return false;
+        }
+        got += static_cast<size_t>(n);
+    }
+    ::close(fd);
+    return true;
+}
 
 Kubelet::Kubelet(const KubeletConfig& config,
                  runtime::Runtime& runtime,
@@ -330,20 +405,71 @@ bool Kubelet::deploy_and_start_pod(const models::KubePod& pod_in, const std::str
         return false;
     }
 
-    // Resolve the container image: embedded registry first, inline annotation second
+    // A pod with an SD volume needs the card; say so instead of letting every
+    // k32_fs_* call fail later.
+    if (!hal::CapabilityFirewall::instance().sd_claim(pod_key).empty() && !hal::sd_is_mounted()) {
+        std::string reason = hal::sd_info().error;
+        std::string why = "hardware.kube32.io/sd requested but no sd card is mounted on this node" + (reason.empty() ? std::string() : " (" + reason + ")");
+        hal::CapabilityFirewall::instance().unregister_pod(pod_key);
+        rec.execution_phase = PodExecutionPhase::Failed;
+        rec.last_error_message = why;
+        active_pods_[pod_key] = rec;
+        std::string status_patch = "{\"status\":{\"phase\":\"Failed\",\"reason\":\"CapabilityAdmissionFailed\",\"message\":\"" + json_escape(why) +
+                                   "\",\"containerStatuses\":[{\"name\":\"" + pod.name + "\",\"ready\":false,\"restartCount\":0,"
+                                   "\"state\":{\"terminated\":{\"exitCode\":1,\"reason\":\"CapabilityAdmissionFailed\"}}}]}}";
+        api_client_->patch_pod_status(pod.namespace_name, pod.name, status_patch);
+        record_pod_event(rec, "Failed", "Error: " + why, true);
+        return false;
+    }
+
+    // Resolve the container image: the card for wasm://sd/..., else the
+    // embedded registry, else the inline annotation
     const uint8_t* image_bytes = nullptr;
     size_t image_len = 0;
-    std::vector<uint8_t> inline_bytes;
+    std::vector<uint8_t> inline_bytes;   // heap image the runtime takes over
     std::string image_key;
-    const runtime::EmbeddedImage* img = runtime::ImageRegistry::instance().resolve(pod.image, &image_key);
-    if (img) {
-        image_bytes = img->data;
-        image_len = img->len;
+    std::string image_source = "embedded registry";
+    std::string sd_name, sd_tag;
+    if (runtime::parse_sd_image_ref(pod.image, sd_name, sd_tag)) {
+        image_key = sd_name + (sd_tag.empty() ? std::string() : ":" + sd_tag);
+        image_source = "sd card";
+        record_pod_event(rec, "Pulling", "Pulling image \"" + pod.image + "\" from the sd card", false);
+        std::string sd_path, why;
+        uint64_t t_pull = osal::System::get_uptime_ms();
+        if (!pull_sd_image(sd_name, sd_tag, inline_bytes, sd_path, why)) {
+            std::cout << "[KUBELET] " << pod_key << ": image '" << pod.image << "': " << why << std::endl;
+            record_pod_event(rec, "Failed", "Failed to pull image \"" + pod.image + "\": " + why, true);
+            return [&]() {
+                rec.execution_phase = PodExecutionPhase::Failed;
+                rec.last_error_message = why;
+                active_pods_[pod_key] = rec;
+                hal::CapabilityFirewall::instance().unregister_pod(pod_key);
+                std::string status_patch = "{\"status\":{\"phase\":\"Failed\",\"reason\":\"ErrImagePull\",\"message\":\"" + json_escape(why) +
+                                           "\",\"containerStatuses\":[{\"name\":\"" + pod.name + "\",\"image\":\"" + pod.image + "\",\"ready\":false,\"restartCount\":0,"
+                                           "\"state\":{\"waiting\":{\"reason\":\"ErrImagePull\",\"message\":\"" + json_escape(why) + "\"}}}]}}";
+                api_client_->patch_pod_status(pod.namespace_name, pod.name, status_patch);
+                return false;
+            }();
+        }
+        image_bytes = inline_bytes.data();
+        image_len = inline_bytes.size();
+        std::cout << "[KUBELET] " << pod_key << ": pulled " << sd_path << " (" << image_len << " bytes, "
+                  << (osal::System::get_uptime_ms() - t_pull) << " ms)" << std::endl;
+        record_pod_event(rec, "Pulled", "Successfully pulled image \"" + pod.image + "\" in " +
+                                        std::to_string(osal::System::get_uptime_ms() - t_pull) + "ms (" +
+                                        std::to_string(image_len) + " bytes, sd card, " + sd_path + ")", false);
     } else {
-        auto ann = pod.annotations.find("kube32.io/wasm-base64");
-        if (ann != pod.annotations.end() && runtime::base64_decode(ann->second, inline_bytes)) {
-            image_bytes = inline_bytes.data();
-            image_len = inline_bytes.size();
+        const runtime::EmbeddedImage* img = runtime::ImageRegistry::instance().resolve(pod.image, &image_key);
+        if (img) {
+            image_bytes = img->data;
+            image_len = img->len;
+        } else {
+            auto ann = pod.annotations.find("kube32.io/wasm-base64");
+            if (ann != pod.annotations.end() && runtime::base64_decode(ann->second, inline_bytes)) {
+                image_bytes = inline_bytes.data();
+                image_len = inline_bytes.size();
+                image_source = "inline annotation";
+            }
         }
     }
 
@@ -377,8 +503,10 @@ bool Kubelet::deploy_and_start_pod(const models::KubePod& pod_in, const std::str
         record_pod_event(rec, "Failed", "Failed to pull image \"" + pod.image + "\": not present in the node image registry", true);
         return fail_pod("ErrImagePull", "image " + pod.image + " not present in the node image registry", 1);
     }
-    record_pod_event(rec, "Pulled", "Container image \"" + pod.image + "\" already present on machine (" +
-                                    std::to_string(image_len) + " bytes" + (inline_bytes.empty() ? ", embedded registry)" : ", inline annotation)"), false);
+    if (image_source != "sd card") {
+        record_pod_event(rec, "Pulled", "Container image \"" + pod.image + "\" already present on machine (" +
+                                        std::to_string(image_len) + " bytes, " + image_source + ")", false);
+    }
 
     // Wasm linear memory budget: an explicit PSRAM request (esp32.io/psram) is
     // the sandbox size on PSRAM nodes; otherwise limits.memory, then
@@ -393,7 +521,10 @@ bool Kubelet::deploy_and_start_pod(const models::KubePod& pod_in, const std::str
     spec.memory_limit_bytes = rec.memory_limit_bytes;
     spec.stack_size_bytes = 16 * 1024;
     spec.env = pod.env;
-    bool deployed = runtime_.deploy_workload_ex(pod_key, image_bytes, image_len, spec, deploy_err);
+    // Heap images move into the runtime (no second copy); flash images are used in place
+    bool deployed = inline_bytes.empty()
+        ? runtime_.deploy_workload_ex(pod_key, image_bytes, image_len, spec, deploy_err)
+        : runtime_.deploy_workload_owned(pod_key, std::move(inline_bytes), spec, deploy_err);
     if (!deployed) {
         std::cout << "[KUBELET] " << pod_key << ": deploy failed: " << deploy_err << std::endl;
         record_pod_event(rec, "Failed", "Error: failed to create container " + rec.container_name + ": " + deploy_err, true);

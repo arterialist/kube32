@@ -116,6 +116,8 @@ bool CapabilityFirewall::register_pod(const std::string& pod_id, const std::stri
     }
 
     DeviceGrant grant;
+    std::string sd_claim;
+    bool sd_requested = false;
     uint32_t generic_gpio_count = 0;
     uint32_t generic_i2c_count = 0;
     uint32_t generic_adc_count = 0;
@@ -310,6 +312,10 @@ bool CapabilityFirewall::register_pod(const std::string& pod_id, const std::stri
                     else if (key == "hardware.kube32.io/speaker") {
                         if (val_str != "0") grant.capabilities_mask |= KUBE32_CAP_SPEAKER;
                     }
+                    // microSD volume: "hardware.kube32.io/sd": "1" plus a spec.volumes claim
+                    else if (key == "hardware.kube32.io/sd") {
+                        if (val_str != "0") sd_requested = true;
+                    }
                 }
             }
 
@@ -329,9 +335,46 @@ bool CapabilityFirewall::register_pod(const std::string& pod_id, const std::stri
                     else if (name == "DISPLAY" || name == "TFT_DISPLAY") grant.capabilities_mask |= KUBE32_CAP_DISPLAY;
                     else if (name == "KEYBOARD") grant.capabilities_mask |= KUBE32_CAP_KEYBOARD;
                     else if (name == "SPEAKER" || name == "AUDIO") grant.capabilities_mask |= KUBE32_CAP_SPEAKER;
+                    else if (name == "SD" || name == "SD_CARD") sd_requested = true;
                 }
             }
         }
+
+        // volumes: [{name: data, "kube32.io/sd": {claim: tessera}}], or the
+        // standard shape kubectl validates: [{name: data, persistentVolumeClaim: {claimName: tessera}}]
+        const models::JsonValue* volumes = spec->get("volumes");
+        if (volumes && volumes->is_array()) {
+            for (const auto& v : volumes->arr_val) {
+                if (!v.is_object()) continue;
+                const models::JsonValue* sd = v.get("kube32.io/sd");
+                const models::JsonValue* pvc = v.get("persistentVolumeClaim");
+                std::string claim;
+                if (sd && sd->is_object()) claim = sd->get_string("claim", "");
+                else if (pvc && pvc->is_object()) claim = pvc->get_string("claimName", "");
+                else continue;
+                if (claim.empty()) claim = v.get_string("name", "");
+                if (!valid_sd_claim(claim)) {
+                    cleanup_claimed();
+                    out_error = "Invalid kube32.io/sd volume claim '" + claim + "' (1..32 chars of a-z, 0-9, '-')";
+                    return false;
+                }
+                if (!sd_claim.empty() && sd_claim != claim) {
+                    cleanup_claimed();
+                    out_error = "A pod may mount one kube32.io/sd volume (claims '" + sd_claim + "' and '" + claim + "')";
+                    return false;
+                }
+                sd_claim = claim;
+            }
+        }
+    }
+
+    if (sd_requested) {
+        if (sd_claim.empty()) {
+            cleanup_claimed();
+            out_error = "hardware.kube32.io/sd requested but spec.volumes names no kube32.io/sd claim";
+            return false;
+        }
+        grant.capabilities_mask |= KUBE32_CAP_SD;
     }
 
     if (generic_gpio_count > 0 && !allocate_generic_gpios(generic_gpio_count, grant, pod_id, claimed_gpios, out_error)) {
@@ -352,9 +395,25 @@ bool CapabilityFirewall::register_pod(const std::string& pod_id, const std::stri
     record.grant = grant;
     record.action = SecurityAction::LogAndDeny;
     record.violation_count = 0;
+    record.sd_claim = sd_requested ? sd_claim : std::string();
     pod_records_[pod_id] = record;
 
     return true;
+}
+
+bool CapabilityFirewall::valid_sd_claim(const std::string& claim) {
+    if (claim.empty() || claim.size() > 32 || claim[0] == '-') return false;
+    for (char c : claim) {
+        if (!((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '-')) return false;
+    }
+    return true;
+}
+
+std::string CapabilityFirewall::sd_claim(const std::string& pod_id) const {
+    osal::LockGuard guard(mutex_);
+    auto it = pod_records_.find(pod_id);
+    if (it == pod_records_.end() || !it->second.grant.has_capability(KUBE32_CAP_SD)) return std::string();
+    return it->second.sd_claim;
 }
 
 bool CapabilityFirewall::grant_capabilities(const std::string& pod_id, const DeviceGrant& grant, std::string& out_error) {
@@ -538,6 +597,9 @@ bool CapabilityFirewall::check_permission(const std::string& pod_id, PeripheralT
         case PeripheralType::Speaker:
             permitted = grant.has_capability(KUBE32_CAP_SPEAKER);
             break;
+        case PeripheralType::SdCard:
+            permitted = grant.has_capability(KUBE32_CAP_SD);
+            break;
     }
 
     if (!permitted) {
@@ -582,7 +644,7 @@ void CapabilityFirewall::log_violation(const std::string& pod_id, PeripheralType
     static int logged = 0;
     if (logged >= 16) return;
     logged++;
-    static const char* const names[] = {"gpio", "adc", "i2c", "uart", "ipc", "display", "keyboard", "speaker"};   // PeripheralType order
+    static const char* const names[] = {"gpio", "adc", "i2c", "uart", "ipc", "display", "keyboard", "speaker", "sd"};   // PeripheralType order
     unsigned ti = static_cast<unsigned>(type);
     std::cout << "[FIREWALL] denied " << pod_id << ": " << (ti < sizeof(names) / sizeof(names[0]) ? names[ti] : "peripheral")
               << " " << target << " " << (mode == AccessMode::Write ? "write" : "read") << std::endl;

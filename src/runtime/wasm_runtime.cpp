@@ -4,6 +4,7 @@
 #endif
 #include "runtime/container_lifecycle.hpp"
 #include "runtime/app_pod.hpp"
+#include "runtime/pod_fs.hpp"
 #include "runtime/k32_app_abi.h"
 #include "osal/mutex.hpp"
 
@@ -41,6 +42,15 @@ bool WasmRuntime::deploy_workload(const std::string& pod_id, const uint8_t* wasm
 }
 
 bool WasmRuntime::deploy_workload_ex(const std::string& pod_id, const uint8_t* wasm_bytes, size_t len, const DeploySpec& spec, std::string& out_error) {
+    return deploy_impl(pod_id, wasm_bytes, len, nullptr, spec, out_error);
+}
+
+bool WasmRuntime::deploy_workload_owned(const std::string& pod_id, std::vector<uint8_t>&& wasm_bytes, const DeploySpec& spec, std::string& out_error) {
+    std::vector<uint8_t> owned = std::move(wasm_bytes);
+    return deploy_impl(pod_id, owned.data(), owned.size(), &owned, spec, out_error);
+}
+
+bool WasmRuntime::deploy_impl(const std::string& pod_id, const uint8_t* wasm_bytes, size_t len, std::vector<uint8_t>* owned, const DeploySpec& spec, std::string& out_error) {
     out_error.clear();
     osal::LockGuard guard(impl_->mutex);
 
@@ -63,9 +73,11 @@ bool WasmRuntime::deploy_workload_ex(const std::string& pod_id, const uint8_t* w
     const size_t psram_before = heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
 #endif
     auto controller = std::make_unique<ContainerLifecycleController>(config);
-    if (!controller->deploy(wasm_bytes, len)) {
+    bool deployed = owned ? controller->deploy(std::move(*owned)) : controller->deploy(wasm_bytes, len);
+    if (!deployed) {
         out_error = controller->get_status().exit_message;
         AppPodHost::instance().unregister_pod(pod_id);
+        PodFs::instance().release_pod(pod_id);
         return false;
     }
 
@@ -88,6 +100,7 @@ bool WasmRuntime::deploy_workload_ex(const std::string& pod_id, const uint8_t* w
         if (init_rc != 0) {
             out_error = "k32_init returned " + std::to_string(init_rc);
             AppPodHost::instance().unregister_pod(pod_id);
+            PodFs::instance().release_pod(pod_id);
             auto it = impl_->containers.find(pod_id);
             if (it != impl_->containers.end()) {
                 std::unique_ptr<ContainerLifecycleController> dead = std::move(it->second);
@@ -131,6 +144,7 @@ bool WasmRuntime::restart(const std::string& pod_id) {
 bool WasmRuntime::terminate(const std::string& pod_id) {
     std::unique_ptr<ContainerLifecycleController> target;
     AppPodHost::instance().unregister_pod(pod_id);
+    PodFs::instance().release_pod(pod_id);
     {
         osal::LockGuard guard(impl_->mutex);
         auto it = impl_->containers.find(pod_id);

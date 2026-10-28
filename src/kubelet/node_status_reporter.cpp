@@ -3,8 +3,16 @@
 #include "runtime/pod_memory_pool.h"
 #include "osal/system.hpp"
 #include "hal/capability_firewall.hpp"
+#include "hal/sd_card.hpp"
 
 namespace kube32::kubelet {
+
+// Exact byte count as a Kubernetes quantity: "30Mi"/"512Ki" when it divides, else plain bytes.
+static std::string bytes_quantity(uint64_t bytes) {
+    if (bytes > 0 && bytes % (1024ULL * 1024ULL) == 0) return std::to_string(bytes / (1024ULL * 1024ULL)) + "Mi";
+    if (bytes > 0 && bytes % 1024ULL == 0) return std::to_string(bytes / 1024ULL) + "Ki";
+    return std::to_string(bytes);
+}
 
 NodeStatusReporter::NodeStatusReporter(const std::string& node_name, const std::string& node_ip, bool control_plane)
     : node_name_(node_name), node_ip_(node_ip), control_plane_(control_plane) {}
@@ -58,6 +66,11 @@ NodeTelemetry NodeStatusReporter::collect_telemetry() const {
     t.allocatable_adc_count = (2 >= allocated_adc_count) ? (2 - allocated_adc_count) : 0;
     t.total_adc_count = 2;
 
+    hal::SdInfo sd = hal::sd_info();
+    t.sd_present = sd.mounted;
+    t.sd_total_bytes = sd.mounted ? sd.total_bytes : 0;
+    t.sd_free_bytes = sd.mounted ? sd.free_bytes : 0;
+
     return t;
 }
 
@@ -98,12 +111,17 @@ std::string NodeStatusReporter::build_registration_json(const NodeTelemetry& tel
     json += "\"esp.io/gpio\":\"" + cap_gpio + "\",\"esp32.io/gpio\":\"" + cap_gpio + "\",";
     json += "\"esp.io/i2c\":\"" + cap_i2c + "\",\"esp32.io/i2c\":\"" + cap_i2c + "\",";
     json += "\"esp.io/adc\":\"" + cap_adc + "\",\"esp32.io/adc\":\"" + cap_adc + "\",";
-    json += "\"esp.io/psram\":\"" + cap_psram + "\",\"esp32.io/psram\":\"" + cap_psram + "\"},";
+    json += "\"esp.io/psram\":\"" + cap_psram + "\",\"esp32.io/psram\":\"" + cap_psram + "\"";
+    // The card: capacity is its size, allocatable the free space, both measured
+    if (telemetry.sd_present) json += ",\"hardware.kube32.io/sd\":\"" + bytes_quantity(telemetry.sd_total_bytes) + "\"";
+    json += "},";
     json += "\"allocatable\":{\"memory\":\"" + alloc_mem + "\",\"cpu\":\"2\",";
     json += "\"esp.io/gpio\":\"" + alloc_gpio + "\",\"esp32.io/gpio\":\"" + alloc_gpio + "\",";
     json += "\"esp.io/i2c\":\"" + alloc_i2c + "\",\"esp32.io/i2c\":\"" + alloc_i2c + "\",";
     json += "\"esp.io/adc\":\"" + alloc_adc + "\",\"esp32.io/adc\":\"" + alloc_adc + "\",";
-    json += "\"esp.io/psram\":\"" + alloc_psram + "\",\"esp32.io/psram\":\"" + alloc_psram + "\"}";
+    json += "\"esp.io/psram\":\"" + alloc_psram + "\",\"esp32.io/psram\":\"" + alloc_psram + "\"";
+    if (telemetry.sd_present) json += ",\"hardware.kube32.io/sd\":\"" + bytes_quantity(telemetry.sd_free_bytes) + "\"";
+    json += "}";
     json += "}}";
 
     return json;
@@ -138,6 +156,7 @@ std::string NodeStatusReporter::build_heartbeat_patch_json(const NodeTelemetry& 
     json += "\"esp.io/i2c\":\"" + alloc_i2c + "\",\"esp32.io/i2c\":\"" + alloc_i2c + "\",";
     json += "\"esp.io/adc\":\"" + alloc_adc + "\",\"esp32.io/adc\":\"" + alloc_adc + "\",";
     json += "\"esp.io/psram\":\"" + alloc_psram + "\",\"esp32.io/psram\":\"" + alloc_psram + "\"";
+    if (telemetry.sd_present) json += ",\"hardware.kube32.io/sd\":\"" + bytes_quantity(telemetry.sd_free_bytes) + "\"";
     json += "}}}";
 
     return json;

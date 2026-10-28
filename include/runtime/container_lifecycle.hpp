@@ -55,6 +55,9 @@ public:
 
     // Lifecycle transitions
     bool deploy(const uint8_t* wasm_bytes, size_t len);
+    // Takes ownership of a heap image (pulled from the card or decoded from a
+    // manifest) so no second copy is ever made; kept for restarts.
+    bool deploy(std::vector<uint8_t>&& wasm_bytes);
     bool start();
     bool pause();
     bool resume();

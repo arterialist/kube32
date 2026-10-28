@@ -46,11 +46,54 @@ extern "C" {
 #define K32_HANDLE_ERR_NO_RESPONSE   (-1)
 #define K32_HANDLE_ERR_BAD_REQUEST   (-2)
 
-/* Hardware error codes mirror hal_types.hpp */
-#define K32_OK          0
-#define K32_ERR_PERM   (-1)
-#define K32_ERR_INVAL  (-22)
-#define K32_ERR_AGAIN  (-11)
+/* Error codes (negative POSIX errno values, mirroring hal_types.hpp) */
+#define K32_OK               0
+#define K32_ERR_PERM        (-1)    /* capability not granted to this pod            */
+#define K32_ERR_NOENT       (-2)    /* no such file or directory                     */
+#define K32_ERR_IO          (-5)    /* card I/O error                                 */
+#define K32_ERR_BADF        (-9)    /* fd not open, or opened for the other direction */
+#define K32_ERR_AGAIN       (-11)
+#define K32_ERR_NOMEM       (-12)
+#define K32_ERR_FAULT       (-14)   /* pointer/length outside linear memory           */
+#define K32_ERR_EXIST       (-17)   /* K32_FS_O_EXCL and the file exists              */
+#define K32_ERR_NODEV       (-19)   /* no card mounted on this node                   */
+#define K32_ERR_ISDIR       (-21)
+#define K32_ERR_INVAL       (-22)   /* bad path (absolute, "..", empty), bad flags    */
+#define K32_ERR_MFILE       (-24)   /* 4 files already open (per pod or node-wide)    */
+#define K32_ERR_NOSPC       (-28)   /* card full                                      */
+#define K32_ERR_NAMETOOLONG (-36)   /* path longer than K32_FS_MAX_PATH               */
+
+/* ---- Pod storage (microSD volume) -------------------------------------
+ * A pod gets a directory of its own on the node's microSD card when its
+ * manifest requests the resource and names a volume claim:
+ *
+ *   spec:
+ *     volumes:
+ *       - name: data
+ *         kube32.io/sd: { claim: tessera }      # -> /sd/kube32/volumes/tessera/
+ *     containers:
+ *       - resources:
+ *           requests: { hardware.kube32.io/sd: "1" }
+ *
+ * Every k32_fs_* path is relative to that directory: "boot.log",
+ * "logs/today.txt". Absolute paths and ".." components are rejected with
+ * K32_ERR_INVAL. Without the grant every call returns K32_ERR_PERM; on a
+ * node without a card, K32_ERR_NODEV. File descriptors are small integers
+ * (0..3); a pod may hold at most K32_FS_MAX_FDS open at once. One read or
+ * write call moves at most K32_FS_MAX_IO bytes; loop for more. See
+ * docs/sd-card.md. */
+#define K32_FS_MAX_PATH   96     /* bytes, relative to the volume root */
+#define K32_FS_MAX_FDS    4      /* open files per pod */
+#define K32_FS_MAX_IO     4096   /* bytes per k32_fs_read / k32_fs_write / k32_fs_list call */
+
+/* Flags for k32_fs_open (Linux values) */
+#define K32_FS_O_RDONLY   0x0000
+#define K32_FS_O_WRONLY   0x0001
+#define K32_FS_O_RDWR     0x0002
+#define K32_FS_O_CREAT    0x0040
+#define K32_FS_O_EXCL     0x0080
+#define K32_FS_O_TRUNC    0x0200
+#define K32_FS_O_APPEND   0x0400
 
 /* Limits enforced by the host */
 #define K32_MAX_REQUEST_BYTES   (16 * 1024)
@@ -89,6 +132,15 @@ K32_IMPORT("k32_display_rect") int32_t k32_display_rect(int32_t x, int32_t y, in
 K32_IMPORT("k32_display_bar")  int32_t k32_display_bar(int32_t x, int32_t y, int32_t w, int32_t h, uint32_t pct, uint32_t fg565, uint32_t bg565);
 K32_IMPORT("k32_key_read")     int32_t k32_key_read(void);    /* next key code (ASCII), K32_ERR_AGAIN when empty */
 K32_IMPORT("k32_tone")         int32_t k32_tone(uint32_t freq_hz, uint32_t duration_ms, uint32_t volume_pct);
+
+/* ---- Pod storage imports, gated by hardware.kube32.io/sd -------------- */
+K32_IMPORT("k32_fs_open")   int32_t k32_fs_open(const char* path, uint32_t path_len, uint32_t flags);   /* fd (0..3) or error */
+K32_IMPORT("k32_fs_read")   int32_t k32_fs_read(int32_t fd, void* buf, uint32_t len);                   /* bytes read, 0 at end, or error */
+K32_IMPORT("k32_fs_write")  int32_t k32_fs_write(int32_t fd, const void* buf, uint32_t len);            /* bytes written or error */
+K32_IMPORT("k32_fs_close")  int32_t k32_fs_close(int32_t fd);                                           /* 0 or error */
+K32_IMPORT("k32_fs_size")   int32_t k32_fs_size(int32_t fd);                                            /* file size in bytes or error */
+K32_IMPORT("k32_fs_list")   int32_t k32_fs_list(const char* dir, uint32_t dir_len, char* out, uint32_t out_cap); /* bytes written: "name\n" per entry, directories end in "/" */
+K32_IMPORT("k32_fs_remove") int32_t k32_fs_remove(const char* path, uint32_t path_len);                 /* 0 or error; removes a file or an empty directory */
 
 /* Existing low-level imports (see host_functions.cpp) remain available:
  * esp32_gpio_set_mode, esp32_gpio_write, esp32_gpio_read, esp32_adc_read,

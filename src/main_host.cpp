@@ -1,4 +1,5 @@
 #include "osal/socket.hpp"
+#include "hal/sd_card.hpp"
 #include "osal/thread.hpp"
 #include "storage/store.hpp"
 #include "scheduler/scheduler.hpp"
@@ -212,6 +213,15 @@ int main(int argc, char* argv[]) {
         const auto* imgs = kube32::embedded::images(n);
         kube32::runtime::ImageRegistry::instance().add_all(imgs, n);
         std::cout << "[INIT] Image registry: " << n << " embedded image(s)" << std::endl;
+    }
+
+    // Simulated microSD card: a host directory named by KUBE32_SD_ROOT
+    if (kube32::hal::sd_mount()) {
+        kube32::hal::SdInfo si = kube32::hal::sd_info();
+        std::cout << "[SD] simulated card (directory) " << kube32::hal::sd_root_path() << ": " << (si.total_bytes / (1024 * 1024))
+                  << " MB total, " << (si.free_bytes / (1024 * 1024)) << " MB free" << std::endl;
+    } else {
+        std::cout << "[SD] " << kube32::hal::sd_info().error << std::endl;
     }
 
     if (opts.role == "worker") {

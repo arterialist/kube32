@@ -1,5 +1,6 @@
 #include "runtime/app_pod.hpp"
 #include "runtime/pod_log.hpp"
+#include "runtime/pod_fs.hpp"
 #include "runtime/k32_app_abi.h"
 #include "hal/capability_firewall.hpp"
 #include "osal/system.hpp"
@@ -320,6 +321,92 @@ static const void* raw_tone(IM3Runtime rt, IM3ImportContext ictx, uint64_t* sp, 
     return m3Err_none;
 }
 
+// Pod storage imports ----------------------------------------------------------
+// Permission is checked inside PodFs on every call; these only marshal guest
+// memory. Guest pointers are validated against linear memory before use.
+static const void* raw_fs_open(IM3Runtime rt, IM3ImportContext ictx, uint64_t* sp, void* mem) {
+    uint32_t off = static_cast<uint32_t>(sp[1]);
+    uint32_t len = static_cast<uint32_t>(sp[2]);
+    uint32_t flags = static_cast<uint32_t>(sp[3]);
+    if (len > K32_FS_MAX_PATH || !guest_range_ok(mem, off, len)) {
+        *reinterpret_cast<int32_t*>(sp) = (len > K32_FS_MAX_PATH) ? K32_ERR_NAMETOOLONG : K32_ERR_FAULT;
+        return m3Err_none;
+    }
+    std::string pod_id = pod_for(rt, ictx);
+    *reinterpret_cast<int32_t*>(sp) = PodFs::instance().open(pod_id, std::string_view(static_cast<const char*>(mem) + off, len), flags);
+    return m3Err_none;
+}
+
+static const void* raw_fs_read(IM3Runtime rt, IM3ImportContext ictx, uint64_t* sp, void* mem) {
+    int32_t fd = static_cast<int32_t>(sp[1]);
+    uint32_t off = static_cast<uint32_t>(sp[2]);
+    uint32_t len = static_cast<uint32_t>(sp[3]);
+    if (len > K32_FS_MAX_IO) len = K32_FS_MAX_IO;
+    if (!guest_range_ok(mem, off, len)) {
+        *reinterpret_cast<int32_t*>(sp) = K32_ERR_FAULT;
+        return m3Err_none;
+    }
+    std::string pod_id = pod_for(rt, ictx);
+    *reinterpret_cast<int32_t*>(sp) = PodFs::instance().read(pod_id, fd, static_cast<uint8_t*>(mem) + off, len);
+    return m3Err_none;
+}
+
+static const void* raw_fs_write(IM3Runtime rt, IM3ImportContext ictx, uint64_t* sp, void* mem) {
+    int32_t fd = static_cast<int32_t>(sp[1]);
+    uint32_t off = static_cast<uint32_t>(sp[2]);
+    uint32_t len = static_cast<uint32_t>(sp[3]);
+    if (len > K32_FS_MAX_IO) len = K32_FS_MAX_IO;
+    if (!guest_range_ok(mem, off, len)) {
+        *reinterpret_cast<int32_t*>(sp) = K32_ERR_FAULT;
+        return m3Err_none;
+    }
+    std::string pod_id = pod_for(rt, ictx);
+    *reinterpret_cast<int32_t*>(sp) = PodFs::instance().write(pod_id, fd, static_cast<const uint8_t*>(mem) + off, len);
+    return m3Err_none;
+}
+
+static const void* raw_fs_close(IM3Runtime rt, IM3ImportContext ictx, uint64_t* sp, void*) {
+    int32_t fd = static_cast<int32_t>(sp[1]);
+    std::string pod_id = pod_for(rt, ictx);
+    *reinterpret_cast<int32_t*>(sp) = PodFs::instance().close(pod_id, fd);
+    return m3Err_none;
+}
+
+static const void* raw_fs_size(IM3Runtime rt, IM3ImportContext ictx, uint64_t* sp, void*) {
+    int32_t fd = static_cast<int32_t>(sp[1]);
+    std::string pod_id = pod_for(rt, ictx);
+    *reinterpret_cast<int32_t*>(sp) = PodFs::instance().size(pod_id, fd);
+    return m3Err_none;
+}
+
+static const void* raw_fs_list(IM3Runtime rt, IM3ImportContext ictx, uint64_t* sp, void* mem) {
+    uint32_t doff = static_cast<uint32_t>(sp[1]);
+    uint32_t dlen = static_cast<uint32_t>(sp[2]);
+    uint32_t ooff = static_cast<uint32_t>(sp[3]);
+    uint32_t ocap = static_cast<uint32_t>(sp[4]);
+    if (ocap > K32_FS_MAX_IO) ocap = K32_FS_MAX_IO;
+    if (dlen > K32_FS_MAX_PATH || !guest_range_ok(mem, doff, dlen) || !guest_range_ok(mem, ooff, ocap)) {
+        *reinterpret_cast<int32_t*>(sp) = (dlen > K32_FS_MAX_PATH) ? K32_ERR_NAMETOOLONG : K32_ERR_FAULT;
+        return m3Err_none;
+    }
+    std::string pod_id = pod_for(rt, ictx);
+    *reinterpret_cast<int32_t*>(sp) = PodFs::instance().list(pod_id, std::string_view(static_cast<const char*>(mem) + doff, dlen),
+                                                             static_cast<char*>(mem) + ooff, ocap);
+    return m3Err_none;
+}
+
+static const void* raw_fs_remove(IM3Runtime rt, IM3ImportContext ictx, uint64_t* sp, void* mem) {
+    uint32_t off = static_cast<uint32_t>(sp[1]);
+    uint32_t len = static_cast<uint32_t>(sp[2]);
+    if (len > K32_FS_MAX_PATH || !guest_range_ok(mem, off, len)) {
+        *reinterpret_cast<int32_t*>(sp) = (len > K32_FS_MAX_PATH) ? K32_ERR_NAMETOOLONG : K32_ERR_FAULT;
+        return m3Err_none;
+    }
+    std::string pod_id = pod_for(rt, ictx);
+    *reinterpret_cast<int32_t*>(sp) = PodFs::instance().remove(pod_id, std::string_view(static_cast<const char*>(mem) + off, len));
+    return m3Err_none;
+}
+
 void link_app_host_functions(IM3Module module, const std::string& pod_id) {
     if (!module) return;
     IM3Runtime rt = m3_GetModuleRuntime(module);
@@ -342,6 +429,13 @@ void link_app_host_functions(IM3Module module, const std::string& pod_id) {
     m3_LinkRawFunction(module, "env", "k32_display_bar",  "i(iiiiiii)", &raw_display_bar);
     m3_LinkRawFunction(module, "env", "k32_key_read",     "i()",        &raw_key_read);
     m3_LinkRawFunction(module, "env", "k32_tone",         "i(iii)",     &raw_tone);
+    m3_LinkRawFunction(module, "env", "k32_fs_open",      "i(iii)",     &raw_fs_open);
+    m3_LinkRawFunction(module, "env", "k32_fs_read",      "i(iii)",     &raw_fs_read);
+    m3_LinkRawFunction(module, "env", "k32_fs_write",     "i(iii)",     &raw_fs_write);
+    m3_LinkRawFunction(module, "env", "k32_fs_close",     "i(i)",       &raw_fs_close);
+    m3_LinkRawFunction(module, "env", "k32_fs_size",      "i(i)",       &raw_fs_size);
+    m3_LinkRawFunction(module, "env", "k32_fs_list",      "i(iiii)",    &raw_fs_list);
+    m3_LinkRawFunction(module, "env", "k32_fs_remove",    "i(ii)",      &raw_fs_remove);
 }
 
 // -----------------------------------------------------------------------------

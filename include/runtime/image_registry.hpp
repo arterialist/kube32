@@ -5,6 +5,8 @@
 //
 // Image references accepted by the kubelet:
 //   wasm://embedded/<name>[:tag]   -> looked up by <name> in the embedded table
+//   wasm://sd/<name>[:tag]         -> /sd/kube32/images/<name>[-<tag>].wasm on the
+//                                    node's microSD card (pulled by the kubelet)
 //   wasm://<anything>/<name>[:tag] -> same lookup by the last path component
 //   any image + annotation "kube32.io/wasm-base64" -> module bytes decoded from
 //                                                    the annotation (small modules)
@@ -43,5 +45,11 @@ private:
 
 // RFC 4648 base64 decoder used for inline module annotations.
 bool base64_decode(const std::string& in, std::vector<uint8_t>& out);
+
+// wasm://sd/<name>[:tag]: true when `image_ref` names a card image. Name and
+// tag are limited to [A-Za-z0-9._-] (no leading '.'), 48 and 24 bytes.
+bool parse_sd_image_ref(const std::string& image_ref, std::string& out_name, std::string& out_tag);
+// "kube32/images/<name>[-<tag>].wasm", relative to the card's mount point.
+std::string sd_image_relative_path(const std::string& name, const std::string& tag);
 
 } // namespace kube32::runtime
