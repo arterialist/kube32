@@ -79,7 +79,7 @@ static void test_auth(void) {
     CHECK(strstr(shim.body, "\"error\":\"unauthorized\"") != 0, "401 error shape");
     CHECK(req_nocookie("GET", "/api/me", 0) == 401, "me without session");
     CHECK(req_nocookie("POST", "/api/auth/login", "{\"username\":\"mara\",\"password\":\"nope\"}") == 401, "bad password");
-    CHECK(req_nocookie("POST", "/api/auth/login", "{\"username\":\"hud\",\"password\":\"demo\"}") == 401, "system user cannot log in");
+    CHECK(req_nocookie("POST", "/api/auth/login", "{\"username\":\"keypad\",\"password\":\"demo\"}") == 401, "system user cannot log in");
     CHECK(req_nocookie("POST", "/api/auth/login", "{\"username\":\"mara\"") == 400, "malformed json login");
     CHECK(req_nocookie("POST", "/api/auth/login", "{\"username\":\"mara\",\"password\":\"demo\"}") == 200, "login ok");
     CHECK(strstr(shim.body, "\"username\":\"mara\"") != 0, "login returns user");
@@ -107,7 +107,7 @@ static void test_bootstrap(void) {
           strstr(shim.body, "\"statuses\":[\"backlog\",\"todo\",\"in_progress\",\"review\",\"done\"]") &&
           strstr(shim.body, "\"priorities\":[\"none\",\"low\",\"medium\",\"high\",\"urgent\"]") &&
           strstr(shim.body, "\"counts\":{\"open\":"), "bootstrap shape");
-    CHECK(count_substr(shim.body, "\"username\":") == 9, "9 users (8 + hud)");
+    CHECK(count_substr(shim.body, "\"username\":") == 9, "9 users (8 + keypad)");
     CHECK(count_substr(shim.body, "\"key\":\"") == 3, "3 projects");
     CHECK(array_len(shim.body, "statuses") == 5, "statuses");
     CHECK(jint(shim.body, "total") == 500, "total 500, got %ld", jint(shim.body, "total"));
@@ -185,9 +185,9 @@ static void test_list(void) {
     CHECK(req("GET", "/api/issues?sort=bogus", 0) == 400, "unknown sort");
     CHECK(req("GET", "/api/issues?order=sideways", 0) == 400, "unknown order");
     /* q uses the index */
-    CHECK(req("GET", "/api/issues?q=wifi&limit=50", 0) == 200, "list with q");
+    CHECK(req("GET", "/api/issues?q=upload&limit=50", 0) == 200, "list with q");
     long lq = jint(shim.body, "total");
-    req("GET", "/api/search?q=wifi&limit=50", 0);
+    req("GET", "/api/search?q=upload&limit=50", 0);
     CHECK(lq == jint(shim.body, "total"), "list q total equals search total (%ld)", lq);
 }
 
@@ -199,13 +199,13 @@ static void test_get(void) {
     CHECK(strcmp(kb, last_key) == 0, "key round trip");
     long cc = jint(shim.body, "comment_count");
     CHECK(cc == count_substr(shim.body, "\"body\":\""), "comment_count matches comments array (%ld)", cc);
-    CHECK(req("GET", "/api/issues/TES-99999", 0) == 404 && strstr(shim.body, "\"error\":\"not_found\""), "404 unknown issue");
+    CHECK(req("GET", "/api/issues/WEB-99999", 0) == 404 && strstr(shim.body, "\"error\":\"not_found\""), "404 unknown issue");
     CHECK(req("GET", "/api/issues/XXX-1", 0) == 404, "404 unknown project");
-    CHECK(req("GET", "/api/issues/TES-abc", 0) == 404, "404 bad id");
+    CHECK(req("GET", "/api/issues/WEB-abc", 0) == 404, "404 bad id");
     /* key with the wrong project prefix must not resolve */
     snprintf(path, sizeof path, "/api/issues/%s", last_key);
     req("GET", path, 0); long proj = jint(shim.body, "project");
-    const char* other = proj == 1 ? "HUD" : "TES";
+    const char* other = proj == 1 ? "IOS" : "WEB";
     snprintf(path, sizeof path, "/api/issues/%s-%s", other, strchr(last_key, '-') + 1);
     CHECK(req("GET", path, 0) == 404, "wrong project prefix is 404");
     CHECK(req("GET", "/api/nope", 0) == 404, "unknown route");
@@ -238,7 +238,7 @@ static void test_create_patch_comment_delete(void) {
     int st = req("POST", "/api/issues", "{\"title\":\"Zebra quartz \\\"locomotive\\\" overflow\",\"description\":\"The flux capacitor \\u00e9mits smoke\\nwhen idle\",\"project\":2,\"status\":\"todo\",\"priority\":3,\"assignee\":4,\"labels\":[0,\"perf\"],\"estimate\":5}");
     CHECK(st == 201, "create 201, got %d: %s", st, shim.body);
     jstr(shim.body, "key", created_key, sizeof created_key);
-    CHECK(strncmp(created_key, "HUD-", 4) == 0, "key uses project prefix: %s", created_key);
+    CHECK(strncmp(created_key, "IOS-", 4) == 0, "key uses project prefix: %s", created_key);
     CHECK(strstr(shim.body, "\"title\":\"Zebra quartz \\\"locomotive\\\" overflow\"") != 0, "title escaped on output");
     CHECK(strstr(shim.body, "\"description\":\"The flux capacitor \xc3\xa9mits smoke\\nwhen idle\"") != 0, "description unescaped then re-escaped");
     CHECK(strstr(shim.body, "\"labels\":[0,2]") && strstr(shim.body, "\"estimate\":5") && strstr(shim.body, "\"assignee\":4") && strstr(shim.body, "\"reporter\":2") && strstr(shim.body, "\"status\":\"todo\""), "create fields");
@@ -270,14 +270,14 @@ static void test_create_patch_comment_delete(void) {
     CHECK(strstr(shim.body, "\"op\":\"create\"") != 0, "create activity");
     req("GET", "/api/analytics", 0);
     CHECK(jint(shim.body, "done") == done_before + 1, "analytics resolved count +1 (%ld -> %ld)", done_before, jint(shim.body, "done"));
-    CHECK(req("PATCH", "/api/issues/TES-99999", "{\"status\":\"done\"}") == 404, "patch 404");
+    CHECK(req("PATCH", "/api/issues/WEB-99999", "{\"status\":\"done\"}") == 404, "patch 404");
 
     /* comment */
     snprintf(path, sizeof path, "/api/issues/%s/comments", created_key);
     shim_reset_events();
     CHECK(req("POST", path, "{\"body\":\"\"}") == 400, "empty comment");
     CHECK(req("POST", path, "{}") == 400, "missing body");
-    st = req("POST", path, "{\"body\":\"Pangolin confirms the overflow on node-02\"}");
+    st = req("POST", path, "{\"body\":\"Pangolin confirms the overflow on staging\"}");
     CHECK(st == 201, "comment 201");
     long cid = jint(shim.body, "id");
     CHECK(cid > 0 && strstr(shim.body, "\"author\":2") && strstr(shim.body, "\"body\":\"Pangolin confirms") && strstr(shim.body, "\"created\":") && strstr(shim.body, "\"issue\":"), "comment shape");
@@ -323,7 +323,7 @@ static void test_search_ranking(void) {
     CHECK(strstr(shim.body, "\"scanned\":") && strstr(shim.body, "\"took_us\":") && strstr(shim.body, "\"items\":[{\"key\":\"") && strstr(shim.body, "\"score\":"), "search shape");
     CHECK(req("GET", "/api/search?q=", 0) == 200 && jint(shim.body, "total") == 0, "empty query");
     CHECK(req("GET", "/api/search?q=the", 0) == 200, "stopword-only query");
-    CHECK(req("GET", "/api/search?q=wifi&limit=3", 0) == 200 && count_items(shim.body) == 3 && jint(shim.body, "total") > 3, "search limit");
+    CHECK(req("GET", "/api/search?q=upload&limit=3", 0) == 200 && count_items(shim.body) == 3 && jint(shim.body, "total") > 3, "search limit");
     CHECK(req("GET", "/api/search?q=%E2%9C%93+wifi", 0) == 200, "url encoded non-ascii");
     /* clean up so later counts stay simple */
     char path[64];
@@ -597,7 +597,7 @@ static void test_topk_equivalence(void) {
     }
     /* search: a smaller limit is a prefix of a larger one, and the order is score desc, updated desc, key desc */
     {
-        static const char* qs[] = { "wifi", "node", "lease+timer", "dr" };
+        static const char* qs[] = { "upload", "feed", "cache+key", "th" };
         int ok = 1;
         for (int qi = 0; qi < 4 && ok; qi++) {
             char path[96]; snprintf(path, sizeof path, "/api/search?q=%s&limit=50", qs[qi]);

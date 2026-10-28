@@ -1,77 +1,78 @@
 /*
- * Deterministic seed data. Titles, descriptions and comments are assembled
- * from word lists so that full-text search over them is meaningful.
+ * Deterministic seed data for a fictional photo-sharing product. Titles,
+ * descriptions and comments are assembled from word lists so that full-text
+ * search over them is meaningful.
  */
 #include "seed.h"
 #include "store.h"
 #include "index.h"
 
 static const char* const k_components[] = {
-    "wifi driver", "esp-now link", "scheduler", "kubelet", "radix store", "flash journal",
-    "ingress proxy", "sse stream", "display driver", "keyboard matrix", "i2c bus", "spi dma path",
-    "psram allocator", "wasm3 runtime", "gas meter", "lease controller", "mdns responder",
-    "chunked encoder", "cookie parser", "audio amplifier", "adc sampler", "uart console",
-    "ota updater", "littlefs mount", "watchdog", "metrics api", "capability firewall",
-    "pod sandbox", "event bus", "token bucket", "search index", "board view", "session cache",
-    "json writer", "request router", "heartbeat timer", "node agent", "tft backlight",
+    "feed ranking", "upload pipeline", "search autocomplete", "billing service", "notification worker", "ios app",
+    "android app", "web client", "cdn cache", "auth provider", "export job", "image resizer",
+    "comment threads", "rate limiter", "analytics etl", "album sync", "share links", "onboarding flow",
+    "push gateway", "email digest", "avatar service", "video transcoder", "stories feed", "tag suggestions",
+    "payment webhook", "session store", "admin console", "dark mode", "offline cache", "deep links",
+    "map view", "face grouping", "backup importer", "activity feed", "spam filter", "api gateway",
+    "trash recovery", "profile page",
 };
 static const char* const k_symptoms[] = {
-    "crashes", "hangs", "leaks memory", "drops frames", "times out", "returns stale data",
-    "corrupts state", "stalls", "reboots the node", "logs garbage", "double-frees a buffer",
-    "ignores backpressure", "misreports uptime", "truncates output", "starves the api server",
-    "spins at 100% cpu", "loses the lease", "reorders events", "panics on empty input",
-    "overflows its ring buffer", "sends duplicate frames", "fails crc validation",
+    "crashes", "hangs", "leaks memory", "drops the session", "times out", "returns stale results",
+    "corrupts captions", "stalls", "logs out everyone", "shows a blank screen", "double-charges the card",
+    "ignores the retry", "misreports the count", "truncates captions", "starves the queue",
+    "spins at 100% cpu", "loses uploads", "reorders the feed", "fails on empty albums",
+    "overflows the queue", "sends duplicate emails", "fails checksum validation",
 };
 static const char* const k_conditions[] = {
-    "after reconnect", "under load", "on cold boot", "when psram is full", "during ota",
-    "with three pods scheduled", "after 24h uptime", "on node-02", "when the link is lossy",
-    "at 240 mhz", "with chunked bodies", "on brownout", "after failover", "when kubectl times out",
-    "with large manifests", "while the keyboard is held", "when sse clients disconnect",
-    "with search queries over 8 tokens", "after a journal replay", "when the heap is fragmented",
+    "after the tuesday deploy", "under load", "on first launch", "when storage is full", "during a migration",
+    "with three tabs open", "after 24h idle", "on the canary", "on slow 3g",
+    "on safari", "with large uploads", "with 2fa enabled", "after failover", "when the token expires",
+    "for accounts over 10k photos", "while a video is uploading", "when the app is backgrounded",
+    "with search queries over 8 words", "after a cache purge", "on low-end android phones",
 };
 static const char* const k_actions[] = {
     "Refactor", "Harden", "Add", "Remove", "Document", "Benchmark", "Rewrite", "Expose",
     "Tune", "Cache", "Throttle", "Validate", "Instrument", "Migrate", "Split", "Simplify",
 };
 static const char* const k_goals[] = {
-    "to cut heap usage", "for the 256 kb nodes", "before the demo", "to unblock the hud pod",
-    "behind a feature flag", "with a ring buffer", "using dma", "without blocking the api server",
-    "for faster boot", "to match kubectl output", "to survive brownout", "with crc32 checks",
-    "to keep p99 under 20 ms", "so the board view stays responsive", "for the keyboard input path",
-    "to stay under the 1536 ki pod limit",
+    "to cut memory usage", "for the free tier", "before the launch", "to unblock the ios release",
+    "behind a feature flag", "with a job queue", "using a cdn", "without blocking the api",
+    "for faster cold start", "to match the design spec", "to survive a region outage", "with idempotency keys",
+    "to keep p99 under 200 ms", "so the feed stays responsive", "for the onboarding flow",
+    "to stay under the storage quota",
 };
 static const char* const k_nouns[] = {
-    "espnow frame", "crc", "dma descriptor", "gpio irq", "i2c ack", "spi clock", "udp socket",
-    "http header", "json payload", "tcp window", "flash sector", "heap block", "ring buffer",
-    "mutex", "semaphore", "queue", "timer", "lease", "manifest", "pod spec", "cookie",
-    "posting list", "term dictionary", "activity ring", "scratch arena", "session token",
-    "retry counter", "frame reassembly table", "backlight pwm", "tone generator",
+    "upload token", "checksum", "thumbnail", "push token", "oauth callback", "retry policy", "websocket",
+    "http header", "json payload", "cursor", "storage bucket", "cache key", "job queue",
+    "mutex", "semaphore", "queue", "timer", "feature flag", "manifest", "release build", "cookie",
+    "search index", "term dictionary", "activity feed", "scratch buffer", "session token",
+    "retry counter", "dedupe table", "signed url", "rate limit",
 };
-static const char* const k_nodes[] = {
-    "esp32-node-01", "esp32-node-02", "the host simulator", "a fresh board", "the ci rig",
+static const char* const k_envs[] = {
+    "staging", "the canary", "production", "a fresh install", "the ci pipeline",
 };
 static const char* const k_details[] = {
-    "a steady climb", "zero activity", "bursts every 2 s", "a crc mismatch", "retries piling up",
-    "a 300 ms gap", "two owners for one lease", "an off-by-one in the page count",
-    "frames arriving out of order", "a heap low-water mark of 11 kb",
+    "a steady climb", "zero activity", "bursts every 2 s", "a checksum mismatch", "retries piling up",
+    "a 300 ms gap", "two owners for one album", "an off-by-one in the page count",
+    "photos arriving out of order", "a memory low-water mark of 11 mb",
 };
 static const char* const k_adjectives[] = {
     "suspicious", "fine", "unrelated", "saturated", "starved", "racy", "stuck", "healthy",
 };
 static const char* const k_steps[] = {
-    "deploy two pods and pull the antenna", "run kubectl get pods in a loop",
-    "hold enter on the keyboard for 10 s", "power cycle node-02 mid-request",
+    "open two tabs and sign out of one", "run the export job in a loop",
+    "hold refresh on the feed for 10 s", "kill the app mid-upload",
     "send 50 searches in a row", "patch the same issue from two tabs",
     "open the board with 40 cards per column", "let the session idle for a day",
-    "post a 1000 char description", "replay the journal twice",
+    "post a 1000 char description", "replay the webhook twice",
 };
 static const char* const k_expected[] = {
-    "no frame loss", "the lease renews within 5 s", "the hud redraws once", "a clean 404",
-    "heap returns to baseline", "the comment shows up in every browser", "p99 stays flat",
-    "the card moves without a refetch", "a 400 with a validation message", "boot in under 2 s",
+    "no lost uploads", "the token refreshes within 5 s", "the feed redraws once", "a clean 404",
+    "memory returns to baseline", "the comment shows up in every browser", "p99 stays flat",
+    "the card moves without a refetch", "a 400 with a validation message", "cold start under 2 s",
 };
 static const char* const k_comment_tpl[] = {
-    "Reproduced on {node}, {detail}.",
+    "Reproduced on {env}, {detail}.",
     "Caused by the {noun}, I think.",
     "Bumping priority, this blocks {goal}.",
     "Fixed on the branch, please verify.",
@@ -106,7 +107,7 @@ static void expand(sb* b, k32_rng* r, const char* tpl) {
             while (*e && *e != '}') e++;
             u32 n = (u32)(e - p - 1);
             const char* s = "";
-            if (k32_streq(p + 1, n, "node")) s = pick(r, k_nodes, COUNT(k_nodes));
+            if (k32_streq(p + 1, n, "env")) s = pick(r, k_envs, COUNT(k_envs));
             else if (k32_streq(p + 1, n, "detail")) s = pick(r, k_details, COUNT(k_details));
             else if (k32_streq(p + 1, n, "noun")) s = pick(r, k_nouns, COUNT(k_nouns));
             else if (k32_streq(p + 1, n, "component")) s = pick(r, k_components, COUNT(k_components));
@@ -144,9 +145,9 @@ static void make_title(sb* b, k32_rng* r) {
 }
 static void make_desc(sb* b, k32_rng* r) {
     static const char* const s1[] = {
-        "Observed on {node}: the {component} {symptom} {condition}.",
-        "Seen {condition} on {node}; the {component} {symptom} within a minute.",
-        "While testing the {component} on {node} it {symptom} {condition}.",
+        "Observed on {env}: the {component} {symptom} {condition}.",
+        "Seen {condition} on {env}; the {component} {symptom} within a minute.",
+        "While testing the {component} on {env} it {symptom} {condition}.",
     };
     static const char* const s2[] = {
         " Logs show {detail}.",

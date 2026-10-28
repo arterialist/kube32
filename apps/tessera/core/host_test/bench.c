@@ -14,8 +14,8 @@ static const char* names[C_N] = { "list", "search", "get", "board", "analytics",
 static int64_t samples[C_N][10000]; static int counts[C_N];
 static int64_t all[10000];
 
-static const char* words[] = { "wifi", "driver", "crash", "psram", "lease", "journal", "keyboard", "frame", "timeout", "heap",
-                               "espnow", "scheduler", "dma", "brownout", "crc", "display", "search", "session", "cookie", "ota" };
+static const char* words[] = { "upload", "feed", "crash", "cache", "token", "webhook", "safari", "thumbnail", "timeout", "memory",
+                               "billing", "export", "album", "canary", "checksum", "search", "session", "cookie", "deploy", "queue" };
 
 int main(void) {
     shim.quiet = 1;
@@ -69,9 +69,9 @@ int main(void) {
         } else if (r < 95) {
             cat = C_WRITE;
             int k = rand() % 3;
-            if (k == 0) st = hx_request("POST", "/api/issues", cookie, "{\"title\":\"Bench issue about the wifi driver timeout\",\"description\":\"created by the benchmark under load\",\"project\":1,\"priority\":2,\"labels\":[0,4]}");
+            if (k == 0) st = hx_request("POST", "/api/issues", cookie, "{\"title\":\"Bench issue about the upload pipeline timeout\",\"description\":\"created by the benchmark under load\",\"project\":1,\"priority\":2,\"labels\":[0,4]}");
             else if (k == 1) { snprintf(path, sizeof path, "/api/issues/%s", keys[rand() % nkeys]); st = hx_request("PATCH", path, cookie, (rand() % 2) ? "{\"status\":\"done\"}" : "{\"status\":\"in_progress\",\"priority\":3}"); }
-            else { snprintf(path, sizeof path, "/api/issues/%s/comments", keys[rand() % nkeys]); st = hx_request("POST", path, cookie, "{\"body\":\"bench comment about the psram allocator\"}"); }
+            else { snprintf(path, sizeof path, "/api/issues/%s/comments", keys[rand() % nkeys]); st = hx_request("POST", path, cookie, "{\"body\":\"bench comment about the image resizer\"}"); }
         } else {
             cat = C_STATS;
             st = hx_request("GET", (rand() % 2) ? "/api/stats" : "/api/bootstrap", 0, 0);

@@ -5,7 +5,7 @@
 store_t g;
 
 const user_t t_users[T_USERS_N] = {
-    { "hud",    "HUD Keyboard",     "HK", "#8b8f9a" },
+    { "keypad", "Office Keypad",    "KP", "#8b8f9a" },
     { "mara",   "Mara Okafor",      "MO", "#f0a05a" },
     { "dimitri","Dimitri Volkov",   "DV", "#5b8def" },
     { "sana",   "Sana Iqbal",       "SI", "#3dbf8a" },
@@ -16,13 +16,13 @@ const user_t t_users[T_USERS_N] = {
     { "ines",   "Ines Carvalho",    "IC", "#f06292" },
 };
 const project_t t_projects[T_PROJECTS_N] = {
-    { "TES", "Tessera Core",   "#5b8def" },
-    { "HUD", "Tessera HUD",    "#3dbf8a" },
-    { "ING", "Ingress & Link", "#f0a05a" },
+    { "WEB", "Web App",        "#5b8def" },
+    { "IOS", "iOS App",        "#3dbf8a" },
+    { "API", "Platform API",   "#f0a05a" },
 };
 const label_t t_labels[T_LABELS_N] = {
-    { "bug", "#e5484d" }, { "feature", "#5b8def" }, { "perf", "#e2b93b" }, { "hardware", "#b36ae2" },
-    { "wifi", "#2bb7c9" }, { "espnow", "#3dbf8a" }, { "display", "#f0a05a" }, { "keyboard", "#f06292" },
+    { "bug", "#e5484d" }, { "feature", "#5b8def" }, { "perf", "#e2b93b" }, { "ios", "#b36ae2" },
+    { "android", "#2bb7c9" }, { "web", "#3dbf8a" }, { "billing", "#f0a05a" }, { "search", "#f06292" },
     { "docs", "#8b8f9a" }, { "infra", "#6c8ebf" }, { "security", "#c0392b" }, { "flaky", "#d4a017" },
 };
 const char* const t_status_names[T_STATUS_N] = { "backlog", "todo", "in_progress", "review", "done" };

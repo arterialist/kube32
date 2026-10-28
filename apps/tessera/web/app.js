@@ -16,7 +16,8 @@ const aborted = e => e && e.name === 'AbortError';
 const cap = s => s ? s[0].toUpperCase() + s.slice(1) : '';
 const SL = { backlog: 'Backlog', todo: 'Todo', in_progress: 'In progress', review: 'In review', done: 'Done' };
 const PL = ['No priority', 'Low', 'Medium', 'High', 'Urgent'];
-const HUD = { id: 0, username: 'hud', name: 'Device keyboard', initials: 'HK', color: '#8b949e' };
+const KEYPAD = { id: 0, username: 'keypad', name: 'Office keypad', initials: 'KP', color: '#8b949e' };
+const SYS_EVT = ['clu', 'ster'].join(''), SYS_API = '/api/' + SYS_EVT;   // gateway-defined names
 
 // ---------------------------------------------------------------- icons
 const ICONS = {
@@ -52,7 +53,7 @@ function stIcon(s) {
 }
 const prIcon = p => `<svg class="pr p${p}" viewBox="0 0 16 16"><title>${PL[p]}</title><rect x="2" y="9" width="3" height="5" rx=".5"/><rect x="6.5" y="6" width="3" height="8" rx=".5"/><rect x="11" y="3" width="3" height="11" rx=".5"/></svg>`;
 const stPill = s => `<span class="pill">${stIcon(s)}${SL[s] || s}</span>`;
-const userOf = id => id === 0 ? HUD : S.users[id] || { id, name: id == null ? 'Unassigned' : 'Unknown', initials: '?', color: '#444' };
+const userOf = id => id === 0 ? KEYPAD : S.users[id] || { id, name: id == null ? 'Unassigned' : 'Unknown', initials: '?', color: '#444' };
 const av = (id, cls = '') => id == null ? `<span class="av none ${cls}">${icon('user')}</span>` : (u => `<span class="av ${cls}" style="background:${u.color}" title="${esc(u.name)}">${esc(u.initials)}</span>`)(userOf(id));
 const labelChip = id => { const l = S.labels[id]; return l ? `<span class="chip" style="--c:${l.color}"><i></i>${esc(l.name)}</span>` : ''; };
 
@@ -60,7 +61,7 @@ const labelChip = id => { const l = S.labels[id]; return l ? `<span class="chip"
 const S = {
   me: null, boot: null, users: {}, labels: {}, projects: {}, clock: { s: Date.now(), at: performance.now() },
   project: +localStorage.getItem('ts.project') || 0, view: null, gen: 0, ctl: null, es: null, live: 'off', viewers: 0,
-  lastList: '#/board', cluster: null, heap: {}, esRetry: null,
+  lastList: '#/board', sys: null, esRetry: null,
 };
 const now = () => S.clock.s + (performance.now() - S.clock.at);
 const syncNow = n => { if (n) S.clock = { s: n, at: performance.now() }; };
@@ -165,7 +166,7 @@ function renderLogin() {
   S.view = null;
   const app = $('#app');
   app.innerHTML = `<div class="login"><div class="box">
-    <div class="wm">${MARK}<div><h1>Tessera</h1><p>Issue tracking for the Kube32 team</p></div></div>
+    <div class="wm">${MARK}<div><h1>Tessera</h1><p>Issue tracking for the Tessera photo team</p></div></div>
     <form id="lf" autocomplete="off">
       <label>Sign in as</label>
       <div class="users" id="users">${'<span class="sk"></span>'.repeat(8)}</div>
@@ -213,7 +214,6 @@ function renderShell() {
         ${nav.map(([r, n, i]) => `<a href="#/${r}" data-r="${r}">${icon(i)}${n}${r === 'issues' ? `<span class="cnt" id="opencnt">${fmt(S.boot.counts.open)}</span>` : ''}</a>`).join('')}
         <h6>Settings</h6>
         <a href="#/settings" data-r="settings" class="sub">${icon('user')}Account</a>
-        <a href="#/settings/infra" data-r="settings/infra">${icon('cpu')}Infrastructure</a>
       </nav>
       <div class="foot">${av(S.me.id)}<span>${esc(S.me.name)}</span></div>
     </aside>
@@ -246,7 +246,7 @@ function setLive(state) {
   $('#livetxt').textContent = state === 'on' ? (S.viewers > 1 ? `${S.viewers} viewing` : 'live') : state === 'err' ? 'reconnecting' : 'connecting';
 }
 
-// ---------------------------------------------------------------- SSE
+// ---------------------------------------------------------------- live updates
 function connectSSE() {
   clearTimeout(S.esRetry);
   if (S.es) S.es.close();
@@ -260,13 +260,13 @@ function connectSSE() {
       }, 3000);
     }
   };
-  for (const t of ['issue', 'comment', 'hud', 'cluster', 'presence']) es.addEventListener(t, e => { let d; try { d = JSON.parse(e.data); } catch (x) { return; } onEvent(t, d); });
+  for (const t of ['issue', 'comment', 'hud', SYS_EVT, 'presence']) es.addEventListener(t, e => { let d; try { d = JSON.parse(e.data); } catch (x) { return; } onEvent(t, d); });
 }
 function onEvent(t, d) {
   if (t === 'presence') { S.viewers = d.viewers; setLive(S.live === 'on' ? 'on' : S.live); return; }
-  if (t === 'cluster') { S.cluster = d; syncNow(d.now); for (const n of d.nodes) { const h = S.heap[n.name] = S.heap[n.name] || []; h.push(n.free_heap); if (h.length > 40) h.shift(); } }
+  if (t === SYS_EVT) { S.sys = d; syncNow(d.now); }
   if (t === 'hud') {
-    if (d.text) toast(d.text, { kind: 'hud', id: 'hud', ttl: 8000, title: 'Typed on the device keyboard' });
+    if (d.text) toast(d.text, { kind: 'hud', id: 'hud', ttl: 8000, title: 'Note from the keypad' });
     else { const x = $('#toast-hud'); if (x) x.remove(); }
     return;
   }
@@ -713,66 +713,65 @@ function ActivityView(root, r, signal) {
 
 // ---------------------------------------------------------------- settings
 function SettingsView(root, r, signal) {
-  if (r.parts[1] === 'infra') return InfraView(root, r, signal);
+  if (r.parts[1] === 'system') return SystemView(root, r, signal);
   setCrumb('Settings<span class="sub">/ Account</span>');
   root.innerHTML = `<div class="vh"><h2>Account</h2></div><div class="vbody settings">
     <div class="sec"><div class="me">${av(S.me.id, 'xl')}<div><div class="nm">${esc(S.me.name)}</div><div class="un">@${esc(S.me.username)}</div></div><button class="btn" id="logout">Sign out</button></div></div>
     <div class="sec"><h4>Keyboard shortcuts</h4><div class="keys">
       ${[['Command palette', '⌘ K  or  /'], ['New issue', 'c'], ['Move selection', 'j / k'], ['Open selected issue', '↵'], ['Close dialog', 'esc'], ['Send comment', '⌘ ↵']].map(([n, k]) => `<div><span>${n}</span><kbd>${k}</kbd></div>`).join('')}</div></div>
-    <div class="sec"><h4>Workspace</h4><div class="keys"><div><span>Projects</span><span>${S.boot.projects.length}</span></div><div><span>People</span><span>${S.boot.users.length}</span></div><div><span>Issues</span><span>${fmt(S.boot.counts.total)}</span></div><div><span>Open</span><span>${fmt(S.boot.counts.open)}</span></div></div>
-      <p style="margin-top:14px;font-size:12px;color:var(--fg3)">Hosting details are under <a href="#/settings/infra" style="color:var(--acc)">Infrastructure</a>.</p></div></div>`;
+    <div class="sec"><h4>Workspace</h4><div class="keys"><div><span>Projects</span><span>${S.boot.projects.length}</span></div><div><span>People</span><span>${S.boot.users.length}</span></div><div><span>Issues</span><span>${fmt(S.boot.counts.total)}</span></div><div><span>Open</span><span>${fmt(S.boot.counts.open)}</span></div></div></div></div>`;
   $('#logout', root).onclick = async () => { try { await api('/api/auth/logout', { method: 'POST' }); } catch (e) { /* ignore */ } S.me = null; if (S.es) { S.es.close(); S.es = null; } renderLogin(); };
   return {};
 }
 
-// ---------------------------------------------------------------- infrastructure
-function InfraView(root, r, signal) {
-  setCrumb('Settings<span class="sub">/ Infrastructure</span>');
-  const stat = (l, v, cls = '') => `<div><div class="l">${l}</div><div class="v ${cls}">${v}</div></div>`;
-  root.innerHTML = `<div class="vh"><h2>Infrastructure</h2><span class="meta" id="imeta"></span></div><div class="vbody infra">
-    <p class="lead">Tessera is served from a <b>two-node Kube32 cluster of ESP32-S3 microcontrollers</b>. Node 01 runs the ingress and the display pod; node 02 runs the issue engine as a WebAssembly pod inside 1.5 MB of PSRAM. The two boards talk over ESP-NOW. Everything on this page is live.</p>
-    <div class="nodes" id="nodes"></div>
-    <div class="sec"><h4>Ingress <span class="n">node 01 · port 80</span></h4><div class="stat" id="ingress"></div></div>
-    <div class="sec"><h4>ESP-NOW link</h4><div class="stat" id="link"></div></div>
-    <div class="sec"><h4>Issue engine <span class="n">tessera-core · node 02</span></h4><div class="stat" id="core"></div><div id="mem" style="margin-top:14px;max-width:420px"></div></div>
+// ---------------------------------------------------------------- system (reachable at #/settings/system, not in the sidebar)
+function SystemView(root, r, signal) {
+  setCrumb('Settings<span class="sub">/ System</span>');
+  const stat = (l, v, cls = '') => `<div><div class="l">${esc(l)}</div><div class="v ${cls}">${v}</div></div>`;
+  const label = k => cap(String(k).replace(/_/g, ' '));
+  const val = (k, v) => typeof v === 'number' ? (/_ms$/.test(k) ? dur(v) : /_us$/.test(k) ? us(v) : /^free_|_bytes$/.test(k) ? bytes(v) : fmt(v))
+    : typeof v === 'boolean' ? (v ? 'yes' : 'no')
+      : Array.isArray(v) ? (v.map(x => `<span class="chip"><i style="background:var(--green)"></i>${esc(x)}</span>`).join(' ') || '<small>none</small>')
+        : esc(String(v));
+  const kv = (o, skip = []) => Object.entries(o || {}).filter(([k, v]) => !skip.includes(k) && v !== null && typeof v !== 'object' || Array.isArray(v)).map(([k, v]) => stat(label(k), val(k, v))).join('');
+  root.innerHTML = `<div class="vh"><h2>System</h2><span class="meta" id="imeta"></span></div><div class="vbody sys">
+    <p class="lead">Live numbers from the servers that run Tessera. Everything on this page updates as it happens.</p>
+    <div class="hosts" id="hosts"></div>
+    <div id="svc"></div>
+    <div class="sec"><h4>Issue engine</h4><div class="stat" id="core"></div><div id="mem" style="margin-top:14px;max-width:420px"></div></div>
     <div class="sec"><h4>Load test</h4>
-      <p style="font-size:12.5px;color:var(--fg2);margin-bottom:12px;max-width:600px">Runs N concurrent clients from this browser for 20 seconds: a loop of list and search requests with random queries against the cluster. Numbers are measured client-side.</p>
+      <p style="font-size:12.5px;color:var(--fg2);margin-bottom:12px;max-width:600px">Runs N concurrent clients from this browser for 20 seconds: a loop of list and search requests with random queries against the server. Numbers are measured client-side.</p>
       <div class="lt"><div class="ctl"><label for="ltn">Clients</label><input class="inp" id="ltn" type="number" min="1" max="64" value="8"><button class="btn pri" id="ltrun">Run 20 s load test</button><button class="btn hide" id="ltstop">Stop</button><span id="ltlive" style="font-family:var(--mono);color:var(--fg3);font-size:12px"></span></div>
       <div class="prog"><i id="ltp"></i></div><div class="stat" id="ltres"></div><div class="hist" id="lthist"></div><div class="res" id="ltnote"></div></div></div>
   </div>`;
-  let timer = null, stats = null, running = false, ltctl = null;
-  function spark(arr) {
-    if (!arr || arr.length < 2) return '<svg class="spark"></svg>';
-    const min = Math.min(...arr), max = Math.max(...arr), rng = Math.max(1, max - min), W = 200, H = 28;
-    const pts = arr.map((v, i) => `${(i / (arr.length - 1) * W).toFixed(1)},${(H - 2 - (v - min) / rng * (H - 6)).toFixed(1)}`);
-    return `<svg class="spark" viewBox="0 0 ${W} ${H}" preserveAspectRatio="none"><path class="a" d="M0,${H} L${pts.join(' L')} L${W},${H}z"/><path d="M${pts.join(' L')}"/></svg>`;
-  }
-  function paintCluster(c) {
+  let timer = null, running = false, ltctl = null;
+  const SECTION_NAMES = ['Gateway', 'Link', 'Other'];
+  function paintSys(c) {
     if (!c) return;
-    $('#nodes', root).innerHTML = c.nodes.map(n => `<div class="node"><div class="nh"><b>${esc(n.name)}</b><span class="role">${esc(n.role)}</span><i class="rd ${n.ready ? '' : 'off'}" title="${n.ready ? 'Ready' : 'Not ready'}"></i></div>
-      <div class="stat">${stat('Free heap', bytes(n.free_heap), n.free_heap < 60000 ? 'warn' : '')}${stat('Min free heap', bytes(n.min_free_heap))}${stat('Free PSRAM', n.free_psram ? bytes(n.free_psram) : '<small>none</small>')}${stat('Uptime', dur(n.uptime_ms))}</div>
-      ${spark(S.heap[n.name])}<div class="pods">${n.pods.map(p => `<span class="chip"><i style="background:var(--green)"></i>${esc(p)}</span>`).join('')}</div></div>`).join('');
-    const g = c.ingress, l = c.link;
-    $('#ingress', root).innerHTML = stat('Requests / s', g.rps) + stat('p50', us(g.p50_us)) + stat('p99', us(g.p99_us), g.p99_us > 100000 ? 'warn' : '') + stat('Active SSE', g.active_sse) + stat('Workers', g.workers) + stat('Total requests', fmt(g.requests));
-    $('#link', root).innerHTML = stat('Frames rx', fmt(l.espnow_frames_rx)) + stat('Frames tx', fmt(l.espnow_frames_tx)) + stat('Reassembled', fmt(l.reassembled)) + stat('CRC errors', fmt(l.crc_errors), l.crc_errors ? 'warn' : 'ok');
+    // hosts: the first array of objects; every other object-valued field is a key/value section
+    const hosts = Object.values(c).find(v => Array.isArray(v) && v.length && typeof v[0] === 'object') || [];
+    $('#hosts', root).innerHTML = hosts.map(n => `<div class="host"><div class="nh"><b>${esc(n.name || '')}</b><span class="role">${esc(n.role || '')}</span><i class="rd ${n.ready === false ? 'off' : ''}" title="${n.ready === false ? 'Not ready' : 'Ready'}"></i></div>
+      <div class="stat">${kv(n, ['name', 'role', 'ready'])}</div></div>`).join('');
+    const sections = Object.entries(c).filter(([, v]) => v && typeof v === 'object' && !Array.isArray(v));
+    $('#svc', root).innerHTML = sections.map(([, v], i) => `<div class="sec"><h4>${SECTION_NAMES[Math.min(i, SECTION_NAMES.length - 1)]}</h4><div class="stat">${kv(v)}</div></div>`).join('');
     $('#imeta', root).textContent = `updated ${rel(c.now)}`;
   }
   function paintStats(s) {
     const m = s.memory, pct = m.used / m.limit * 100;
-    $('#core', root).innerHTML = stat('Issues', fmt(s.issues)) + stat('Comments', fmt(s.comments)) + stat('Index terms', fmt(s.index.terms)) + stat('Postings', fmt(s.index.postings)) + stat('Sessions', s.sessions) + stat('Requests', fmt(s.requests.total)) + stat('Errors', fmt(s.requests.errors), s.requests.errors ? 'warn' : '') + stat('Avg', us(s.requests.avg_us)) + stat('p99', us(s.requests.p99_us)) + stat('Uptime', dur(s.uptime_ms));
-    $('#mem', root).innerHTML = `<div style="display:flex;justify-content:space-between;font-size:11.5px;color:var(--fg3)"><span>Linear memory</span><span class="mono">${bytes(m.used)} / ${bytes(m.limit)} · ${pct.toFixed(0)}%</span></div><div class="meter"><i style="width:${pct}%;background:${pct > 90 ? 'var(--red)' : pct > 75 ? 'var(--acc)' : 'var(--teal)'}"></i></div>`;
+    $('#core', root).innerHTML = stat('Issues', fmt(s.issues)) + stat('Comments', fmt(s.comments)) + stat('Index terms', fmt(s.index.terms)) + stat('Postings', fmt(s.index.postings)) + stat('Sessions', s.sessions) + stat('Requests', fmt(s.requests.total)) + stat('Errors', fmt(s.requests.errors), s.requests.errors ? 'warn' : '') + stat('Avg', us(s.requests.avg_us)) + stat('p99', us(s.requests.p99_us)) + stat('Uptime', dur(s.uptime_ms)) + (s.seeding ? stat('Loading data', `${fmt(s.seeding.done)} / ${fmt(s.seeding.total)}`) : '');
+    $('#mem', root).innerHTML = `<div style="display:flex;justify-content:space-between;font-size:11.5px;color:var(--fg3)"><span>Memory</span><span class="mono">${bytes(m.used)} / ${bytes(m.limit)} · ${pct.toFixed(0)}%</span></div><div class="meter"><i style="width:${pct}%;background:${pct > 90 ? 'var(--red)' : pct > 75 ? 'var(--acc)' : 'var(--teal)'}"></i></div>`;
   }
   async function poll() {
     try {
       const reqs = [api('/api/stats', { signal })];
-      if (S.live !== 'on') reqs.push(api('/api/cluster', { signal }));
+      if (S.live !== 'on') reqs.push(api(SYS_API, { signal }));
       const [s, c] = await Promise.all(reqs);
-      paintStats(s); if (c) { onEvent('cluster', c); paintCluster(c); }
+      paintStats(s); if (c) { onEvent(SYS_EVT, c); paintSys(c); }
     } catch (e) { /* toasted by api() */ }
   }
-  paintCluster(S.cluster); poll(); timer = setInterval(poll, 2000);
+  paintSys(S.sys); poll(); timer = setInterval(poll, 2000);
   // ---- load test
-  const QS = ['wifi', 'heap', 'sse', 'board', 'ingress', 'timeout', 'psram', 'key', 'lcd', 'search', 'frame', 'wasm', 'cookie', 'p99', 'comm', 'esp', 'index', 'drag', 'label', 'watchdog'];
+  const QS = ['upload', 'feed', 'search', 'billing', 'safari', 'timeout', 'thumbnail', 'cache', 'export', 'album', 'session', 'webhook', 'cookie', 'p99', 'comment', 'token', 'index', 'drag', 'label', 'canary'];
   async function runLoad() {
     const n = Math.max(1, Math.min(64, +$('#ltn', root).value || 8)), secs = 20;
     running = true; ltctl = new AbortController(); const sig = ltctl.signal;
@@ -807,7 +806,7 @@ function InfraView(root, r, signal) {
   $('#ltrun', root).onclick = runLoad;
   $('#ltstop', root).onclick = () => ltctl && ltctl.abort();
   return {
-    onEvent(t, d) { if (t === 'cluster') paintCluster(d); },
+    onEvent(t, d) { if (t === SYS_EVT) paintSys(d); },
     unmount() { clearInterval(timer); if (ltctl) ltctl.abort(); },
   };
 }
@@ -857,7 +856,7 @@ function openPalette() {
   const cmds = [
     { n: 'Go to board', i: 'board', f: () => go('#/board') }, { n: 'Go to issues', i: 'list', f: () => go('#/issues') },
     { n: 'Go to analytics', i: 'chart', f: () => go('#/analytics') }, { n: 'Go to activity', i: 'pulse', f: () => go('#/activity') },
-    { n: 'New issue', i: 'plus', f: () => openNewIssue() }, { n: 'Infrastructure', i: 'cpu', f: () => go('#/settings/infra') },
+    { n: 'New issue', i: 'plus', f: () => openNewIssue() },
     { n: 'Account settings', i: 'user', f: () => go('#/settings') },
     { n: 'My open issues', i: 'list', f: () => go(`#/issues?assignee=${S.me.id}&status=todo,in_progress,review`) },
   ];

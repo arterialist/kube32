@@ -52,7 +52,7 @@ int main(void) {
     hx_request("POST", "/api/auth/login", 0, "{\"username\":\"mara\",\"password\":\"demo\"}");
     snprintf(cookie, sizeof cookie, "tsid=%.16s", shim.headers[0].value + 5);
     /* real keys of two old issues for the mutation requests */
-    char k1[24] = "TES-1", k3[24] = "TES-3";
+    char k1[24] = "WEB-1", k3[24] = "WEB-3";
     hx_request("GET", "/api/issues?sort=key&order=asc&limit=3", cookie, 0);
     { const char* p = strstr(shim.body, "\"key\":\""); if (p) sscanf(p + 7, "%15[^\"]", k1); p = p ? strstr(p + 7, "\"key\":\"") : 0; p = p ? strstr(p + 7, "\"key\":\"") : 0; if (p) sscanf(p + 7, "%15[^\"]", k3); }
     char p_comment[64], p_title[64], p_status[64];
@@ -65,16 +65,16 @@ int main(void) {
     one("GET /api/issues?limit=50&page=10", "GET", "/api/issues?limit=50&page=10", 0);
     one("GET /api/issues?sort=key&order=desc", "GET", "/api/issues?sort=key&order=desc&limit=25", 0);
     one("GET /api/issues?status=done&sort=priority", "GET", "/api/issues?status=done&sort=priority&order=desc", 0);
-    one("GET /api/issues?q=wifi&limit=25", "GET", "/api/issues?q=wifi&limit=25", 0);
+    one("GET /api/issues?q=upload&limit=25", "GET", "/api/issues?q=upload&limit=25", 0);
     one("GET /api/board?project=1", "GET", "/api/board?project=1", 0);
     one("GET /api/board (all)", "GET", "/api/board", 0);
     one("GET /api/issues/<k1> (full)", "GET", p_title, 0);
-    one("GET /api/search?q=wifi", "GET", "/api/search?q=wifi", 0);
-    one("GET /api/search?q=wi (prefix)", "GET", "/api/search?q=wi", 0);
-    one("GET /api/search?q=lease+timer", "GET", "/api/search?q=lease+timer", 0);
-    one("POST /api/issues (create)", "POST", "/api/issues", "{\"title\":\"Bench issue about the wifi driver timeout\",\"description\":\"Observed on esp32-node-02: the scheduler stalls under load. Logs show retries piling up.\",\"project\":1,\"priority\":2,\"labels\":[0,4]}");
-    one("POST .../comments (old issue)", "POST", p_comment, "{\"body\":\"Reproduced on the ci rig, a crc mismatch after reconnect.\"}");
-    one("PATCH ... (title, old issue)", "PATCH", p_title, "{\"title\":\"Renamed wifi driver issue under load\"}");
+    one("GET /api/search?q=upload", "GET", "/api/search?q=upload", 0);
+    one("GET /api/search?q=up (prefix)", "GET", "/api/search?q=up", 0);
+    one("GET /api/search?q=cache+key", "GET", "/api/search?q=cache+key", 0);
+    one("POST /api/issues (create)", "POST", "/api/issues", "{\"title\":\"Bench issue about the upload pipeline timeout\",\"description\":\"Observed on staging: the export job stalls under load. Logs show retries piling up.\",\"project\":1,\"priority\":2,\"labels\":[0,4]}");
+    one("POST .../comments (old issue)", "POST", p_comment, "{\"body\":\"Reproduced on the canary, a checksum mismatch after the deploy.\"}");
+    one("PATCH ... (title, old issue)", "PATCH", p_title, "{\"title\":\"Renamed upload pipeline issue under load\"}");
     one("PATCH ... (status only)", "PATCH", p_status, "{\"status\":\"done\"}");
     one("GET /api/analytics", "GET", "/api/analytics", 0);
     one("GET /api/stats", "GET", "/api/stats", 0);

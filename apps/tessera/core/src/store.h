@@ -10,7 +10,7 @@
 
 #define T_STATUS_N     5
 #define T_PRIO_N       5
-#define T_USERS_N      9      /* id 0 is the "hud" system user */
+#define T_USERS_N      9      /* id 0 is the "keypad" system user */
 #define T_HUMAN_USERS  8
 #define T_PROJECTS_N   3
 #define T_LABELS_N     12
