@@ -638,6 +638,27 @@ void Kubelet::handle_pod_failure(LocalPodRecord& rec, const std::string& exit_ms
     handle_pod_failure(rec, cs);
 }
 
+// The entry point returned normally: the pod has run to completion. kube32
+// does not restart completed containers, so the pod is reported as
+// Succeeded (what Kubernetes shows for restartPolicy Never/OnFailure).
+void Kubelet::handle_pod_completion(LocalPodRecord& rec, const runtime::ContainerStatus& cs) {
+    rec.execution_phase = PodExecutionPhase::Completed;
+    const std::string now = models::now_rfc3339();
+    const std::string cname = rec.container_name.empty() ? rec.name : rec.container_name;
+    std::string status_patch;
+    status_patch.reserve(400);
+    status_patch += "{\"status\":{\"phase\":\"Succeeded\",";
+    status_patch += "\"conditions\":[{\"type\":\"Ready\",\"status\":\"False\",\"reason\":\"PodCompleted\"},"
+                    "{\"type\":\"ContainersReady\",\"status\":\"False\",\"reason\":\"PodCompleted\"}],";
+    status_patch += "\"containerStatuses\":[{\"name\":\"" + cname + "\",\"ready\":false,\"started\":false,";
+    status_patch += "\"restartCount\":" + std::to_string(rec.restart_count) + ",";
+    status_patch += "\"state\":{\"terminated\":{\"exitCode\":0,\"reason\":\"Completed\"" +
+                    (now.empty() ? std::string() : ",\"finishedAt\":\"" + now + "\"") + "}}}]}}";
+    api_client_->patch_pod_status(rec.namespace_name, rec.name, status_patch);
+    (void)cs;
+    record_pod_event(rec, "Completed", "Container " + cname + " exited with code 0", false);
+}
+
 void Kubelet::monitor_and_report_pod_statuses() {
     last_status_report_ms_ = osal::System::get_uptime_ms();
 
@@ -649,6 +670,9 @@ void Kubelet::monitor_and_report_pod_statuses() {
         runtime::ContainerStatus cs = runtime_.get_status(pod_key);
         if (cs.phase == runtime::ContainerPhase::Failed && rec.execution_phase != PodExecutionPhase::Failed) {
             handle_pod_failure(rec, cs);
+        } else if (cs.phase == runtime::ContainerPhase::Terminated && cs.exit_code == 0 &&
+                   rec.execution_phase != PodExecutionPhase::Completed) {
+            handle_pod_completion(rec, cs);
         }
         ship_pod_logs_locked(pod_key, rec);
     }

@@ -895,8 +895,14 @@ HttpResponse RouteHandler::handle_nodes(const HttpRequest& req, const RouteMatch
     } else if (req.method == HttpMethod::Get) {
         HttpResponse resp;
         resp.status_code = 200;
-        resp.content_type = "application/json";
-        resp.body = existing_json;
+        // kubectl get <kind> <name> asks for a Table; answer with one row
+        if (req.as_table) {
+            resp.content_type = "application/json;as=Table;v=v1;g=meta.k8s.io";
+            resp.body = TableSerializer::build_nodes_table_json(std::vector<std::string>{existing_json}, store_.current_version());
+        } else {
+            resp.content_type = "application/json";
+            resp.body = existing_json;
+        }
         return resp;
     } else if (req.method == HttpMethod::Delete) {
         store_.remove(key);
@@ -1158,8 +1164,14 @@ HttpResponse RouteHandler::handle_pods(const HttpRequest& req, const RouteMatch&
     } else if (req.method == HttpMethod::Get) {
         HttpResponse resp;
         resp.status_code = 200;
-        resp.content_type = "application/json";
-        resp.body = existing_json;
+        // kubectl get <kind> <name> asks for a Table; answer with one row
+        if (req.as_table) {
+            resp.content_type = "application/json;as=Table;v=v1;g=meta.k8s.io";
+            resp.body = TableSerializer::build_pods_table_json(std::vector<std::string>{existing_json}, store_.current_version());
+        } else {
+            resp.content_type = "application/json";
+            resp.body = existing_json;
+        }
         return resp;
     } else if (req.method == HttpMethod::Delete) {
         // Graceful deletion, as kube-apiserver does it: a pod bound to a node
@@ -1438,8 +1450,14 @@ HttpResponse RouteHandler::handle_deployments(const HttpRequest& req, const Rout
     } else if (req.method == HttpMethod::Get) {
         HttpResponse resp;
         resp.status_code = 200;
-        resp.content_type = "application/json";
-        resp.body = existing_json;
+        // kubectl get <kind> <name> asks for a Table; answer with one row
+        if (req.as_table) {
+            resp.content_type = "application/json;as=Table;v=v1;g=meta.k8s.io";
+            resp.body = TableSerializer::build_deployments_table_json(std::vector<std::string>{existing_json}, store_.current_version());
+        } else {
+            resp.content_type = "application/json";
+            resp.body = existing_json;
+        }
         return resp;
     } else if (req.method == HttpMethod::Delete) {
         store_.remove(key);

@@ -88,6 +88,7 @@ public:
     void report_heartbeat();
     void sync_assigned_pods();
     void monitor_and_report_pod_statuses();
+    void handle_pod_completion(LocalPodRecord& rec, const runtime::ContainerStatus& cs);
 
     // Query local state
     const KubeletConfig& config() const { return config_; }
