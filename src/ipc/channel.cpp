@@ -508,9 +508,7 @@ int32_t ChannelManager::publish(const std::string& pod_id, const std::string& to
     std::vector<PeerInfo> targets = peers();
     for (const auto& p : targets) {
         if (p.node_id == local_node_id_) continue;
-        int32_t rc = send_frames_to(p.endpoint, channel_hash, sender_hash, 0, data, len, 0);
-        static int traced = 0;
-        if (traced < 8) { traced++; printf("[TRACE] ipc tx -> node %u len=%u rc=%d\n", (unsigned)p.node_id, (unsigned)len, (int)rc); }
+        send_frames_to(p.endpoint, channel_hash, sender_hash, 0, data, len, 0);
     }
     return static_cast<int32_t>(len);
 }
@@ -786,8 +784,6 @@ void ChannelManager::on_frame_received(const uint8_t* frame, size_t len, const N
 
     // Single-frame message fast path
     if (hdr->frag_count <= 1) {
-        static int traced = 0;
-        if (traced < 8) { traced++; printf("[TRACE] ipc rx frame chan=%08x len=%u\n", (unsigned)hdr->channel_hash, (unsigned)hdr->payload_len); }
         deliver_local(hdr->channel_hash, hdr->sender_hash, frame + K32C_HEADER_LEN, hdr->payload_len);
         return;
     }

@@ -89,7 +89,7 @@ bool Kubelet::start() {
     // initialises Wasm modules (seconds on a 240 MHz core).
     osal::Thread::Config h_cfg;
     h_cfg.name = "k32_kubelet_hb";
-    h_cfg.stack_size = config_.task_stack_in_psram ? 12288 : 8192;   // JSON for lease + status patch
+    h_cfg.stack_size = config_.task_stack_in_psram ? 12288 : 10240;  // JSON for lease + status patch (1.7 KB spare at 8 KB on the worker)
     h_cfg.priority = config_.task_priority;
     h_cfg.core_affinity = config_.core_affinity;
     h_cfg.stack_in_psram = config_.task_stack_in_psram;

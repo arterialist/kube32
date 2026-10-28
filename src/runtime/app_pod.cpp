@@ -10,20 +10,7 @@
 #include <cstring>
 #include <cstdio>
 #include <mutex>
-#if defined(ESP_PLATFORM)
-#include "freertos/FreeRTOS.h"
-#include "freertos/task.h"
-static void k32_stack_probe(const char* where) {
-    static uint32_t s_calls = 0;
-    if (s_calls < 6 || (++s_calls % 40) == 1) {
-        ++s_calls;
-        printf("[STACK] %s call#%u free=%u bytes task=%s\n", where, (unsigned)s_calls,
-               (unsigned)uxTaskGetStackHighWaterMark(nullptr), pcTaskGetName(nullptr));
-    }
-}
-#else
-static void k32_stack_probe(const char*) {}
-#endif
+
 
 namespace kube32::runtime {
 
@@ -143,7 +130,6 @@ static const void* raw_resp_header(IM3Runtime rt, IM3ImportContext, uint64_t* sp
 }
 
 static const void* raw_resp_write(IM3Runtime rt, IM3ImportContext, uint64_t* sp, void* mem) {
-    k32_stack_probe("resp_write");
     uint32_t off = static_cast<uint32_t>(sp[1]);
     uint32_t len = static_cast<uint32_t>(sp[2]);
     CallContext* c = ctx_for(rt);
@@ -225,7 +211,6 @@ static const void* raw_env_get(IM3Runtime rt, IM3ImportContext ictx, uint64_t* s
     uint32_t klen = static_cast<uint32_t>(sp[2]);
     uint32_t ooff = static_cast<uint32_t>(sp[3]);
     uint32_t ocap = static_cast<uint32_t>(sp[4]);
-    k32_stack_probe("env_get");
     if (klen == 0 || klen > 64 || !guest_range_ok(mem, koff, klen) || !guest_range_ok(mem, ooff, ocap)) {
         *reinterpret_cast<int32_t*>(sp) = hal::HAL_ERR_FAULT;
         return m3Err_none;
@@ -283,7 +268,6 @@ static const void* raw_display_text(IM3Runtime rt, IM3ImportContext ictx, uint64
 }
 
 static const void* raw_display_rect(IM3Runtime rt, IM3ImportContext ictx, uint64_t* sp, void*) {
-    k32_stack_probe("display_rect");
     std::string pod_id = pod_for(rt, ictx);
     if (!hal::CapabilityFirewall::instance().check_permission(pod_id, hal::PeripheralType::Display, 0, hal::AccessMode::Write)) {
         *reinterpret_cast<int32_t*>(sp) = hal::HAL_ERR_PERM;
@@ -311,21 +295,12 @@ static const void* raw_display_bar(IM3Runtime rt, IM3ImportContext ictx, uint64_
 }
 
 static const void* raw_key_read(IM3Runtime rt, IM3ImportContext ictx, uint64_t* sp, void*) {
-    k32_stack_probe("key_read");
     std::string pod_id = pod_for(rt, ictx);
     if (!hal::CapabilityFirewall::instance().check_permission(pod_id, hal::PeripheralType::Keyboard, 0, hal::AccessMode::Read)) {
         *reinterpret_cast<int32_t*>(sp) = hal::HAL_ERR_PERM;
         return m3Err_none;
     }
     int32_t key = s_hooks.key_read ? s_hooks.key_read() : hal::HAL_ERR_NODEV;
-    {
-        static int raw_traced = 0;   // first few results whatever they are, to see which hook answers
-        if (raw_traced < 3) { raw_traced++; printf("[TRACE] key_read hook=%s result=%d\n", s_hooks.key_read ? "set" : "none", (int)key); }
-    }
-    if (key >= 0) {
-        static int traced = 0;
-        if (traced < 8) { traced++; printf("[TRACE] key_read -> %d ('%c') for %s\n", (int)key, (key >= 32 && key < 127) ? (char)key : '.', pod_id.c_str()); }
-    }
     *reinterpret_cast<int32_t*>(sp) = key;
     return m3Err_none;
 }
@@ -590,7 +565,6 @@ int32_t AppPodHost::handle(const std::string& pod_id, const AppRequest& req, App
 
     uint64_t t0 = osal::Thread::get_time_us();
     int32_t status;
-    k32_stack_probe("handle");
     {
         osal::LockGuard call_guard(*cm);
         // Entry may have been unregistered while we waited

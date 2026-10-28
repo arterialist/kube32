@@ -180,9 +180,6 @@ void ContainerLifecycleController::worker_thread_main() {
     }
 
     if (entry_fn) {
-#if defined(ESP_PLATFORM)
-        printf("[STACK] pod thread before entry: free=%u bytes\n", (unsigned)uxTaskGetStackHighWaterMark(nullptr));
-#endif
         M3Result r = m3_CallV(entry_fn);
 
         if (r == m3Err_none) {

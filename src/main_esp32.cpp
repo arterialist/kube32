@@ -488,7 +488,7 @@ void cluster_task(void* pv) {
     // Wi-Fi and lwIP fragment the heap, so a 64 KiB pod can still be placed.
     if (!ident.has_psram) {
         kube32_pool_reserve(67 * 1024);
-        kube32_pool_reserve_stack(49152);   // one pod thread stack, while a contiguous block still exists
+        kube32_pool_reserve_stack(40960);   // one pod thread stack (HUD peaks at ~33 KB), while a contiguous block still exists
         kube32::runtime::PodLogStore::runtime().set_ring_capacity(1024);   // 300 KB SRAM: a short log per pod
     } else {
         // Keep the largest PSRAM block whole for a big data pod (24 Wasm pages
@@ -797,16 +797,6 @@ void cluster_task(void* pv) {
             }
         }
         if (iter % 30 == 0) log_memory("steady state");
-        if (iter < 180 && iter % 5 == 0 && wiring) {
-            uint32_t age = 0;
-            std::string cur = kube32::runtime::AppPodHost::instance().in_flight(age);
-            auto* ing = wiring->ingress_server();
-            printf("[DIAG] t=%us ingress{req=%llu active=%u queued=%u err=%llu} inflight='%s' age=%ums heap=%u\n",
-                   iter, ing ? (unsigned long long)ing->metrics().requests.load() : 0ull,
-                   ing ? (unsigned)ing->metrics().active.load() : 0u, ing ? (unsigned)ing->queued() : 0u,
-                   ing ? (unsigned long long)ing->metrics().errors.load() : 0ull,
-                   cur.c_str(), (unsigned)age, (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
-        }
         kube32::osal::System::feed_watchdog();
     }
 }

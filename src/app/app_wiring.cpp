@@ -14,14 +14,7 @@ void install_default_platform_hooks() {
     runtime::AppPlatformHooks hooks = runtime::app_platform_hooks();
     if (!hooks.event_emit) {
         hooks.event_emit = [](const std::string& pod_id, std::string_view topic, const uint8_t* data, size_t len) -> int32_t {
-            int32_t rc = ipc::ChannelManager::instance().publish(pod_id, std::string(topic), data, len);
-            static int traced = 0;
-            if (traced < 8) {
-                traced++;
-                printf("[TRACE] emit pod=%s topic=%.*s len=%u rc=%d peers=%u\n", pod_id.c_str(), (int)topic.size(), topic.data(), (unsigned)len, (int)rc,
-                       (unsigned)ipc::ChannelManager::instance().peers().size());
-            }
-            return rc;
+            return ipc::ChannelManager::instance().publish(pod_id, std::string(topic), data, len);
         };
     }
     if (!hooks.random) {
@@ -134,8 +127,6 @@ bool AppWiring::start() {
     std::string events_topic = opts_.app_name + ".events";
     std::string input_topic = opts_.app_name + ".input";
     sub_input_ = ipc::ChannelManager::instance().subscribe(input_topic, [input_topic](std::string_view, uint32_t, const uint8_t* data, size_t len) {
-        static int traced = 0;
-        if (traced < 8) { traced++; printf("[TRACE] input event len=%u -> %u pod(s): %.*s\n", (unsigned)len, (unsigned)runtime::AppPodHost::instance().list_pods().size(), (int)(len > 80 ? 80 : len), (const char*)data); }
         runtime::AppPodHost::instance().broadcast_event(input_topic, data, len);
     });
     sub_stats_ = ipc::ChannelManager::instance().subscribe(events_topic, [events_topic](std::string_view, uint32_t, const uint8_t* data, size_t len) {
