@@ -92,7 +92,7 @@ Write requests honour `dryRun=All` in the query string or in a `DeleteOptions` r
 ## Limitations
 
 - Server-side apply and JSON Patch return `415 UnsupportedMediaType`; use `kubectl apply` without `--server-side`.
-- Request bodies must be JSON, except `ConfigMap`, `Secret`, `Namespace`, `SelfSubjectAccessReview` and `SelfSubjectRulesReview`, which also accept protobuf (`kubectl create configmap|secret|namespace` works); other kinds in protobuf return `415 UnsupportedMediaType` with the reason.
+- Request bodies must be JSON, except `ConfigMap`, `Secret`, `Namespace`, `Service`, `Deployment`, `Job`, `SelfSubjectAccessReview` and `SelfSubjectRulesReview`, which also accept protobuf (`kubectl create configmap|secret|namespace|deployment|job|service` works); other kinds in protobuf return `415 UnsupportedMediaType` with the reason.
 - A persisted create or update that exceeds the object store capacity returns `500 InternalError` (`object store is full: X of Y bytes in use, N more needed`), checked before writing; shrinking writes always pass, and a lost create race returns `409 AlreadyExists`.
 - There is no RBAC; authenticated callers have full access to all resources.
 - `Endpoints` and `EndpointSlice` are read-only and do not support `watch`.

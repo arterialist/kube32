@@ -745,8 +745,9 @@ HttpResponse RouteHandler::handle_request(const HttpRequest& req, mem::Monotonic
         }
     }
 
-    // Typed clients send ConfigMaps, Secrets and Namespaces as protobuf
-    // (kubectl create configmap|secret|namespace) and do not retry as JSON
+    // Typed clients send ConfigMaps, Secrets, Namespaces, Services,
+    // Deployments and Jobs as protobuf (kubectl create ...) and do not retry
+    // as JSON
     HttpRequest converted;
     const HttpRequest* effective = &req;
     if (!req.body.empty() && req.content_type.rfind("application/vnd.kubernetes.protobuf", 0) == 0) {

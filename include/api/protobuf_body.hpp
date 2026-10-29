@@ -3,8 +3,10 @@
 // Request bodies in the Kubernetes protobuf encoding
 // (application/vnd.kubernetes.protobuf) converted to the JSON the API server
 // works with. Typed clients such as `kubectl create configmap`, `create
-// secret` and `create namespace` send them and do not fall back to JSON.
-// Supported kinds: v1 ConfigMap, Secret and Namespace.
+// secret`, `create namespace`, `create deployment`, `create job` and `create
+// service` send them and do not fall back to JSON.
+// Supported kinds: v1 ConfigMap, Secret, Namespace and Service, apps/v1
+// Deployment and batch/v1 Job.
 
 #include <string>
 #include <string_view>

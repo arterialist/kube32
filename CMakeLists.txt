@@ -328,6 +328,11 @@ else()
     target_link_libraries(test_kubelet PRIVATE kube32_core)
     add_test(NAME test_kubelet COMMAND test_kubelet)
 
+    # Typed-client protobuf request bodies
+    add_executable(test_protobuf_body tests/test_protobuf_body.cpp)
+    target_link_libraries(test_protobuf_body PRIVATE kube32_core)
+    add_test(NAME test_protobuf_body COMMAND test_protobuf_body)
+
     # Service calls, bundle files, sub-page memory limits, the kubelet's
     # streamed API reads and node storage over HTTP (pods: apps/svcprobe)
     foreach(t test_service_calls test_pod_assets test_pod_memory_caps test_kubelet_api_stream test_node_storage)
