@@ -81,11 +81,14 @@ bool mount_internal_flash(std::string& error) {
     }
     if (psram) {
         // Tasks with PSRAM stacks (pods, the kubelet, API workers) reach the
-        // volume through this internal-RAM stack
+        // volume and the journal partition through the storage task
         s_call_ready = xSemaphoreCreateBinary();
         s_call_done = xSemaphoreCreateBinary();
         if (s_call_ready && s_call_done) {
-            xTaskCreatePinnedToCore(storage_task, "k32_storage", kStorageTaskStackBytes, nullptr, 5, &s_storage_task, tskNO_AFFINITY);
+            // Above every caller (API workers run at 5 and 6, pods' threads
+            // lower), below lwIP and Wi-Fi: a waiting caller is never
+            // starved by a task of its own priority
+            xTaskCreatePinnedToCore(storage_task, "k32_storage", kStorageTaskStackBytes, nullptr, 10, &s_storage_task, tskNO_AFFINITY);
         }
     }
     return true;
