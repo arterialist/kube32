@@ -607,6 +607,17 @@ bool ContainerLifecycleController::is_running() const {
 }
 
 int32_t ContainerLifecycleController::call_function(const std::string& fn_name, const std::vector<int32_t>& args) {
+#if defined(ESP_PLATFORM)
+    // The shared interpreter stack is taken before this pod's call lock, as
+    // in a nested in-process call (pod A on the stack calling pod B): taking
+    // them in the other order could leave A waiting for B's call lock while
+    // B's caller waits for the stack.
+    if (kube32_interp_stack_active() && !kube32_interp_stack_base_for(__builtin_frame_address(0))) {
+        int32_t rc = -1;
+        run_on_interpreter_stack([&]() { rc = call_function(fn_name, args); });
+        return rc;
+    }
+#endif
     // Calls into the module are serialized by call_mutex_; mutex_ (status)
     // is not held while the guest runs, so status queries do not wait for a
     // call that is blocked in a host function (a service call, for example).

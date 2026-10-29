@@ -692,6 +692,16 @@ void cluster_task(void* pv) {
         // Keep the largest PSRAM block whole for a big data pod (20 Wasm pages
         // plus header) before task stacks and buffers fragment the heap.
         kube32_pool_reserve_external(20 * 64 * 1024 + 4096);   // 20 Wasm pages plus wasm3's memory header
+        // One shared interpreter stack here too: the interpreter recursion
+        // peaks near 56 KB, and a stack that size on each thread that calls
+        // into pods (kubelet, ticks, events, ingress, pod server) would take
+        // the PSRAM a 2 MB board's pods need.
+        const size_t interp_size = 64 * 1024;
+        void* interp = heap_caps_malloc(interp_size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        if (interp) {
+            kube32_interp_stack_set(interp, interp_size);
+            kube32::runtime::AppPodHost::instance().set_event_thread_stack(8192, true);
+        }
     }
     printf("[MEM] reserved %u bytes for pod linear memory\n", (unsigned)kube32_pool_block_size());
 
@@ -854,12 +864,9 @@ void cluster_task(void* pv) {
     kubelet_cfg.node_ip_provider = [nm = net_mgr.get()]() { return nm->get_ip_address(); };
     kubelet_cfg.heartbeat_interval_ms = 5000;
     kubelet_cfg.sync_frequency_ms = 2000;
-    // The kubelet task parses manifests and loads/compiles Wasm modules (deep
-    // recursion); workers with PSRAM get a generous stack.
-    // Module parse + compile + k32_init (seeding) all run on the kubelet task.
-    // Runs k32_init: on Xtensa the interpreter's op chain is not fully tail
-    // call optimised, so a seed chunk needs well over 40 KB of native stack.
-    kubelet_cfg.task_stack_size = ident.has_psram ? 65536 : 12288;
+    // The kubelet task parses manifests and loads and compiles Wasm modules;
+    // k32_init runs on the shared interpreter stack.
+    kubelet_cfg.task_stack_size = kube32_interp_stack_active() ? (ident.has_psram ? 24576 : 12288) : 65536;
     kubelet_cfg.task_stack_in_psram = ident.has_psram;
     // Without PSRAM a large API answer (a list of pods carrying modules
     // inline) would take the heap the node runs on: refused instead
@@ -990,12 +997,12 @@ void cluster_task(void* pv) {
 
         // Pods here behind a Service are reached by service calls from other
         // nodes through the pod HTTP server; the ingress calls them in-process.
-        // One worker: its stack (PSRAM) holds one request pod's interpreter.
+        // One worker; the pod's interpreter runs on the shared stack.
         {
             kube32::app::PodServerOptions po;
             po.port = 7000;
             po.workers = 1;
-            po.worker_stack = 49152;
+            po.worker_stack = kube32_interp_stack_active() ? 16384 : 49152;
             po.core_affinity = 1;
             po.stacks_in_psram = ident.has_psram;
             if (s_api_token_set) po.token = api_token;
@@ -1017,12 +1024,10 @@ void cluster_task(void* pv) {
         io.address = [nm = net_mgr.get()]() { return nm->get_ip_address(); };
         io.port = 80;
         // One worker: calls into a pod are serialized per pod anyway, and SSE
-        // streams leave the worker once their head is sent. Each worker stack
-        // holds a local pod call (the interpreter recursion peaks near 56 KB),
-        // so a second one would cost 64 KB of PSRAM that a second app's pod
-        // needs more.
+        // streams leave the worker once their head is sent. Local pod calls
+        // run on the shared interpreter stack.
         io.workers = 1;
-        io.worker_stack = ident.has_psram ? 65536 : 8192;
+        io.worker_stack = kube32_interp_stack_active() ? (ident.has_psram ? 16384 : 8192) : 65536;
         io.rx_buffer = ident.has_psram ? 4096 : 2560;
         io.core_affinity = 1;
         io.stacks_in_psram = ident.has_psram;
@@ -1091,7 +1096,7 @@ void cluster_task(void* pv) {
     {
         kube32::osal::Thread::Config t_cfg;
         t_cfg.name = "k32_tick";
-        t_cfg.stack_size = ident.has_psram ? 65536 : 4096;   // same reason as the kubelet stack; display boards host no ticking pods
+        t_cfg.stack_size = kube32_interp_stack_active() ? (ident.has_psram ? 8192 : 4096) : 65536;
         t_cfg.stack_in_psram = ident.has_psram;
         t_cfg.priority = 4;
         t_cfg.core_affinity = 1;

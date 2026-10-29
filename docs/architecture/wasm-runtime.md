@@ -8,7 +8,7 @@ The build disables exception handling, typed function references, stack switchin
 
 | Kind | Exports | Execution |
 | --- | --- | --- |
-| Request pod | `k32_alloc`, `k32_handle`, and optionally `k32_init`, `k32_tick`, `k32_event` | Runs on the caller thread, or on the shared 40 KiB interpreter stack on boards without PSRAM. Calls are serialized per pod. `k32_init` runs once at creation, and a non-zero return fails the pod. |
+| Request pod | `k32_alloc`, `k32_handle`, and optionally `k32_init`, `k32_tick`, `k32_event` | Runs on the node's shared interpreter stack (64 KiB in PSRAM, or 40 KiB of internal RAM on boards without PSRAM). Calls are serialized across the node. `k32_init` runs once at creation, and a non-zero return fails the pod. |
 | Entry-point pod | `_start`, `app_main`, or `main` | Runs on a dedicated pod thread until the function returns. Requires a board with PSRAM. |
 
 ## Images
@@ -24,7 +24,7 @@ Unresolved images or images too large for node memory fail the pod with `ErrImag
 ## Memory
 
 - Linear memory is capped by `limits.memory` or `requests.memory`, raised to `esp32.io/psram` if larger, with a 64 KiB default. Limits below `64Ki` cap the backing of the first Wasm page to that byte limit; `memory.grow` past the limit returns -1 and accesses past it trap.
-- At boot, PSRAM nodes reserve one 1,284 KiB PSRAM block (`20 * 64 KiB + 4 KiB` header). Nodes without PSRAM reserve one 67 KiB internal RAM block and one shared 40 KiB interpreter stack.
+- At boot, PSRAM nodes reserve one 1,284 KiB PSRAM block (`20 * 64 KiB + 4 KiB` header) and one shared 64 KiB interpreter stack in PSRAM. Nodes without PSRAM reserve one 67 KiB internal RAM block and one shared 40 KiB interpreter stack.
 - On boards without PSRAM, the 67 KiB pool block holds one large linear memory (>= 48 KiB and at least half the block) from its start and places smaller pod allocations (wasm3 runtime, compiled code, small linear memories) from its end. Every pod allocation comes from the pool block first and falls back to the general heap only when the block is full, except while a pod whose linear memory needs >= 48 KiB loads, when its runtime structures go to the general heap so the block stays whole. The general heap stays for the kubelet, Wi-Fi, and lwIP, with 16 KiB reserved for the system.
 - The per-pod wasm3 value stack defaults to 4 KiB when the pod memory limit is 64 KiB or less and 16 KiB above. The pod annotation `kube32.io/wasm-stack` sets it between `512` and `64Ki`. C and Rust locals use a shadow stack in linear memory.
 
@@ -33,10 +33,10 @@ Unresolved images or images too large for node memory fail the pod with `ErrImag
 | Thread | Stack, with PSRAM / without PSRAM | Role |
 | --- | --- | --- |
 | `pod_<ns>/<name>` | 64 KiB PSRAM / not supported | Dedicated thread per entry-point pod (PSRAM boards only). |
-| `k32_tick` | 64 KiB PSRAM / 4 KiB internal | Calls `k32_tick(uptime_ms)` at 1 Hz, or every 10 ms while a pod returns > 0. |
-| `k32_events` | 32 KiB PSRAM / 6 KiB internal | Runs while any pod subscribes via `kube32.io/event-topics` and dispatches messages to `k32_event`. |
+| `k32_tick` | 8 KiB PSRAM / 4 KiB internal | Calls `k32_tick(uptime_ms)` at 1 Hz, or every 10 ms while a pod returns > 0. |
+| `k32_events` | 8 KiB PSRAM / 6 KiB internal | Runs while any pod subscribes via `kube32.io/event-topics` and dispatches messages to `k32_event`. |
 
-On boards without PSRAM, all host-initiated pod calls (`k32_init`, `k32_alloc`, `k32_handle`, `k32_tick`, `k32_event`) switch onto the shared 40 KiB interpreter stack and run serialized across the node. `k32_init` runs from `k32_kubelet` (64 KiB PSRAM stack or 12 KiB internal stack), and `k32_handle` runs from the ingress worker or pod server thread. Run `K32_CMD:TASKS` to inspect native stack sizes and high-water marks.
+All host-initiated pod calls (`k32_init`, `k32_alloc`, `k32_handle`, `k32_tick`, `k32_event`) switch onto the shared interpreter stack (64 KiB in PSRAM, or 40 KiB of internal RAM without PSRAM) and run serialized across the node. `k32_init` runs from `k32_kubelet` (24 KiB PSRAM stack or 12 KiB internal stack), and `k32_handle` runs from the ingress worker or pod server thread. Run `K32_CMD:TASKS` to inspect native stack sizes and high-water marks.
 
 ## Execution budget
 
