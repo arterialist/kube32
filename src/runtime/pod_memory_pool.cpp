@@ -236,10 +236,10 @@ void* kube32_pool_alloc(size_t bytes) {
 //     A pod whose linear memory wants the block whole asks for the general
 //     heap first while it loads (kube32_pool_prefer_general).
 // Bytes pods hold in the general heap and in PSRAM are counted. The general
-// heap keeps a reserve for the system that pods are never given: on the
-// board 16 KiB of internal RAM stay free for the kubelet, Wi-Fi and lwIP; the
-// host simulator models a board's heap with a budget instead
-// (kube32_pool_set_heap_budget).
+// heap keeps a reserve for the system that pods are never given: 16 KiB of
+// internal RAM stay free for the kubelet, Wi-Fi and lwIP, 24 KiB on a board
+// without PSRAM; the host simulator models a board's heap with a budget
+// instead (kube32_pool_set_heap_budget).
 static std::atomic<int> s_prefer_general{0};
 static std::atomic<size_t> s_general_bytes{0};
 static std::atomic<size_t> s_psram_bytes{0};
@@ -261,9 +261,7 @@ static size_t general_size(void* p) {
 // its general heap also absorbs the network's bursts (lwIP send buffers and
 // Wi-Fi frames, measured near 25 KB while a pod streams a large response)
 static size_t system_reserve() {
-#if defined(ESP_PLATFORM)
     if (s_block && !s_external) return 24 * 1024;
-#endif
     return k_system_reserve_default;
 }
 
@@ -299,8 +297,9 @@ size_t kube32_pool_system_reserve(void) { return system_reserve(); }
 size_t kube32_pool_pod_room(size_t memory_bytes, size_t* out_capacity) {
     size_t room = 0;
     if (s_heap_budget) {
+        // The simulator's --psram 0 admits as the board does, on the pool alone
         const size_t used = s_general_bytes.load() + system_reserve();
-        room = s_heap_budget > used ? s_heap_budget - used : 0;
+        if (!(s_block && !s_external)) room = s_heap_budget > used ? s_heap_budget - used : 0;
     } else {
 #if defined(ESP_PLATFORM)
         // Without PSRAM a pod is admitted on the pool block alone: general

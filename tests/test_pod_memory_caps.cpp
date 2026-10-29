@@ -273,7 +273,7 @@ int main() {
         auto client = std::make_unique<ListClient>();
         ListClient* c = client.get();
         const std::string img = base64(probe);
-        c->add("first", "{\"limits\":{\"memory\":\"40Ki\"}}", img);
+        c->add("first", "{\"limits\":{\"memory\":\"32Ki\"}}", img);
         c->add("huge", "{\"limits\":{\"memory\":\"128Ki\"}}", img);
         kubelet::KubeletConfig cfg;
         cfg.node_name = "n1";
@@ -289,7 +289,7 @@ int main() {
         assert(c->count(c->events, "\"reason\":\"OutOfmemory\"") == 1);
         assert(!wrt->is_deployed("default/huge"));
 
-        c->add("second", "{\"limits\":{\"memory\":\"40Ki\"}}", img);
+        c->add("second", "{\"limits\":{\"memory\":\"32Ki\"}}", img);
         k.sync_assigned_pods();
         k.sync_assigned_pods();
         assert(k.get_pod_record("default/second", rec) && rec.execution_phase == kubelet::PodExecutionPhase::InsufficientMemory);
