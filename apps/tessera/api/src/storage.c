@@ -192,12 +192,21 @@ int storage_tick(void) {
             load_apply();
             return 1;
         case STG_READY:
-            /* after an append of unknown outcome: reload if the log is not what the store holds */
+            /* after an append of unknown outcome: the records that reached the log are
+             * loaded; a log that is shorter or another one is loaded again whole */
             if (g.stg.verify && k32_time_ms() >= g.stg.retry_at) {
                 u32 last, log;
                 if (db_stats(&last, &log)) {
                     g.stg.verify = 0;
-                    if (log != g.stg.log_id || last != g.stg.seq) { g.stg.reload = 1; return 1; }
+                    if (log != g.stg.log_id || last < g.stg.seq) { g.stg.reload = 1; return 1; }
+                    if (last > g.stg.seq) {
+                        g.stg.target = last;
+                        g.stg.page_len = g.stg.page_pos = 0;
+                        g.stg.state = STG_LOADING;
+                        g.stg.load_started = k32_time_ms();
+                        log_msg("catching up to records=", last);
+                        return 1;
+                    }
                 }
             }
             return 0;

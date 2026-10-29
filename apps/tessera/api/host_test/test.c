@@ -630,13 +630,17 @@ static void test_db_unreachable(void) {
     CHECK(req_nocookie("GET", "/api/stats", 0) == 200 && strstr(shim.body, "\"reachable\":true"), "reachable again");
     /* tessera-db restarts (pod restart on the Cardputer): the API carries on */
     /* the append lands but the answer is lost: the client gets 503, the next tick
-     * compares with tessera-db's stats, reloads, and the change shows up */
+     * compares with tessera-db's stats, loads the record it missed (no reload),
+     * and the change shows up */
     db->lose_replies = 1;
     CHECK(req("POST", cpath, "{\"body\":\"stored without an answer\"}") == 503 && g.stg.verify, "lost reply is 503 and marks the outcome unknown");
     CHECK(tdb_state()->last_seq == g.stg.seq + 1, "but the record is on the card");
-    CHECK(k32_tick(0) == 1 && g.stg.reload, "the next tick finds the log ahead");
+    uint32_t issues_before = g.issue_count;
+    CHECK(k32_tick(0) == 1 && !g.stg.reload && g.stg.state == STG_LOADING && g.stg.target == g.stg.seq + 1,
+          "the next tick finds the log one record ahead and loads just that record");
     hx_load_complete();
     CHECK(req("GET", "/api/search?q=answer", 0) == 200 && jint(shim.body, "total") >= 1, "the change without an answer is loaded");
+    CHECK(g.issue_count == issues_before && store_verify_counts() == 0 && index_verify() == 0, "the store was kept, not loaded again");
     /* same with no tick in between: the next write's expect check catches it */
     db->lose_replies = 1;
     CHECK(req("POST", cpath, "{\"body\":\"second unanswered\"}") == 503, "lost reply");
