@@ -55,6 +55,7 @@
 #include "runtime/pod_log.hpp"
 #include "models/kube_models.hpp"
 
+#include <atomic>
 #include <cstdio>
 #include <cstring>
 #include <cstdlib>
@@ -641,17 +642,35 @@ void print_banner(const NodeIdentity& id) {
            (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
 }
 
+// Size of the most recent allocation the heap refused, and how many were
+// refused since the last [MEM] line (Wi-Fi's own retries included)
+std::atomic<uint32_t> s_alloc_fail_bytes{0};
+std::atomic<uint32_t> s_alloc_fail_count{0};
+
+void on_alloc_failed(size_t size, uint32_t caps, const char* function_name) {
+    (void)caps;
+    (void)function_name;
+    s_alloc_fail_bytes.store(static_cast<uint32_t>(size));
+    s_alloc_fail_count.fetch_add(1);
+}
+
 void log_memory(const char* stage) {
-    printf("[MEM] %-22s internal free %6u (min %6u)  psram free %7u\n", stage,
+    char failed[64] = "";
+    if (const uint32_t n = s_alloc_fail_count.exchange(0)) {
+        snprintf(failed, sizeof(failed), "  %u failed alloc(s), last %u bytes", (unsigned)n, (unsigned)s_alloc_fail_bytes.load());
+    }
+    printf("[MEM] %-22s internal free %6u (min %6u, largest %6u)  psram free %7u%s\n", stage,
            (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
            (unsigned)heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
-           (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
+           (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
+           (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM), failed);
 }
 
 void cluster_task(void* pv) {
     (void)pv;
     static NodeIdentity ident = detect_identity();
     static Console console;
+    heap_caps_register_failed_alloc_callback(on_alloc_failed);
     print_banner(ident);
 
     // Without PSRAM, reserve one Wasm page (+ interpreter headroom) now, before
