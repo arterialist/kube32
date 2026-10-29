@@ -56,6 +56,7 @@
 #include "runtime/pod_log.hpp"
 #include "models/kube_models.hpp"
 
+#include <algorithm>
 #include <atomic>
 #include <cstdio>
 #include <cstring>
@@ -1350,6 +1351,22 @@ void cluster_task(void* pv) {
             }
         } catch (const std::exception& e) {
             printf("[IPC] peer seeding skipped: %s\n", e.what());
+        }
+        if (!ident.is_control_plane && kubelet && iter % 10 == 0) {
+            // A station can stay associated with an access point that no
+            // longer knows it: a control plane that restarts its AP within
+            // the beacon timeout drops the worker's frames while its beacons
+            // keep the link up. Join again when the API server has not
+            // answered a pod sync for a minute on a link that looks up.
+            static uint64_t quiet_since = kube32::osal::System::get_uptime_ms();
+            const uint64_t now = kube32::osal::System::get_uptime_ms();
+            const uint64_t heard = std::max(kubelet->last_sync_ok_ms(), quiet_since);
+            if (net_mgr->station_has_ip() && now - heard > 60000) {
+                printf("[NET] no answer from the control plane for %u s on a connected link, joining the access point again\n",
+                       (unsigned)((now - heard) / 1000));
+                net_mgr->rejoin();
+                quiet_since = now;
+            }
         }
         if (iter % 30 == 0) log_memory("steady state");
         kube32::osal::System::feed_watchdog();

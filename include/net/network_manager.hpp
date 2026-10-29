@@ -32,8 +32,13 @@ public:
     // Joins an upstream network as a station while still hosting the cluster AP.
     virtual bool start_station_and_softap() { return start_softap(); }
     virtual bool disconnect() = 0;
+    // Station: leaves the access point and joins it again (the station
+    // rejoins by itself after any disconnect). False without a station.
+    virtual bool rejoin() { return false; }
 
     virtual bool is_connected() const = 0;
+    // Station: associated and holding an address
+    virtual bool station_has_ip() const { return false; }
     virtual NetworkMode current_mode() const = 0;
     virtual std::string get_ip_address() const = 0;
     virtual std::string get_mac_address() const = 0;

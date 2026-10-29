@@ -253,7 +253,13 @@ public:
         return true;
     }
 
+    bool rejoin() override {
+        if (mode_ != NetworkMode::Station && mode_ != NetworkMode::StationAndSoftAP) return false;
+        return esp_wifi_disconnect() == ESP_OK;
+    }
+
     bool is_connected() const override { return connected_; }
+    bool station_has_ip() const override { return sta_has_ip_; }
     NetworkMode current_mode() const override { return mode_; }
 
     std::string get_ip_address() const override {

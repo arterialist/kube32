@@ -132,6 +132,8 @@ public:
     const KubeletConfig& config() const { return config_; }
     std::vector<std::string> get_active_pod_keys() const;
     bool get_pod_record(const std::string& pod_key, LocalPodRecord& out_record) const;
+    // Uptime of the last pod sync pass that listed pods from the API server, 0 before the first
+    uint64_t last_sync_ok_ms() const { return last_sync_ok_ms_.load(); }
 
     // Ships new log records of every local pod to the API server (called from
     // the status loop; public for tests).
