@@ -1,5 +1,6 @@
 #include "hal/capability_firewall.hpp"
 #include "models/kube_models.hpp"
+#include <cctype>
 #include <iostream>
 
 namespace kube32::hal {
@@ -14,7 +15,9 @@ CapabilityFirewall::CapabilityFirewall() {
 }
 
 void CapabilityFirewall::reset() {
+    bus_release_all();
     osal::LockGuard guard(mutex_);
+    profile_ = BoardProfile{};
     pod_records_.clear();
     for (auto& o : gpio_owners_) o.clear();
     for (auto& o : adc1_owners_) o.clear();
@@ -26,12 +29,53 @@ void CapabilityFirewall::reset() {
     allocated_uart_mask_ = 0;
 }
 
+void CapabilityFirewall::set_board_profile(const BoardProfile& profile) {
+    osal::LockGuard guard(mutex_);
+    profile_ = profile;
+    profile_.i2c_bus_mask &= KUBE32_CHIP_I2C_MASK;
+    profile_.uart_port_mask &= KUBE32_CHIP_UART_MASK;
+}
+
+BoardProfile CapabilityFirewall::board_profile() const {
+    osal::LockGuard guard(mutex_);
+    return profile_;
+}
+
+uint64_t CapabilityFirewall::claimable_gpio_mask_locked() const {
+    return KUBE32_SAFE_GPIO_MASK & ~profile_.reserved_gpio_mask;
+}
+
+uint16_t CapabilityFirewall::claimable_adc1_mask_locked() const {
+    uint64_t pins = claimable_gpio_mask_locked();
+    uint16_t mask = 0;
+    for (uint32_t ch = 0; ch < KUBE32_ADC1_CHANNELS; ++ch) {
+        if (pins & (1ULL << (ch + 1))) mask |= static_cast<uint16_t>(1U << ch);
+    }
+    return mask;
+}
+
+uint64_t CapabilityFirewall::claimable_gpio_mask() const {
+    osal::LockGuard guard(mutex_);
+    return claimable_gpio_mask_locked();
+}
+
+uint16_t CapabilityFirewall::claimable_adc1_mask() const {
+    osal::LockGuard guard(mutex_);
+    return claimable_adc1_mask_locked();
+}
+
+uint8_t CapabilityFirewall::claimable_i2c_mask() const {
+    osal::LockGuard guard(mutex_);
+    return profile_.i2c_bus_mask;
+}
+
 bool CapabilityFirewall::allocate_generic_gpios(uint32_t count, DeviceGrant& grant, const std::string& pod_id, std::vector<uint32_t>& out_claimed, std::string& out_error) {
     uint32_t allocated = 0;
     std::vector<uint32_t> claimed_pins;
 
+    const uint64_t claimable = claimable_gpio_mask_locked();
     for (uint32_t pin = 1; pin < 64 && allocated < count; ++pin) {
-        if ((KUBE32_SAFE_GPIO_MASK & (1ULL << pin)) == 0) continue;
+        if ((claimable & (1ULL << pin)) == 0) continue;
         if (!gpio_owners_[pin].empty()) continue;
 
         claimed_pins.push_back(pin);
@@ -58,13 +102,14 @@ bool CapabilityFirewall::allocate_generic_i2c(uint32_t count, DeviceGrant& grant
     std::vector<uint32_t> claimed_buses;
 
     for (uint32_t bus = 0; bus < 2 && allocated < count; ++bus) {
+        if ((profile_.i2c_bus_mask & (1U << bus)) == 0) continue;
         if (!i2c_owners_[bus].empty()) continue;
         claimed_buses.push_back(bus);
         allocated++;
     }
 
     if (allocated < count) {
-        out_error = "Insufficient allocatable I2C buses: requested " + std::to_string(count);
+        out_error = "Insufficient allocatable I2C buses: requested " + std::to_string(count) + ", available " + std::to_string(allocated);
         return false;
     }
 
@@ -81,14 +126,16 @@ bool CapabilityFirewall::allocate_generic_adc(uint32_t count, DeviceGrant& grant
     uint32_t allocated = 0;
     std::vector<uint32_t> claimed_channels;
 
-    for (uint32_t ch = 0; ch < 10 && allocated < count; ++ch) {
+    const uint16_t claimable = claimable_adc1_mask_locked();
+    for (uint32_t ch = 0; ch < KUBE32_ADC1_CHANNELS && allocated < count; ++ch) {
+        if ((claimable & (1U << ch)) == 0) continue;
         if (!adc1_owners_[ch].empty()) continue;
         claimed_channels.push_back(ch);
         allocated++;
     }
 
     if (allocated < count) {
-        out_error = "Insufficient allocatable ADC1 channels: requested " + std::to_string(count);
+        out_error = "Insufficient allocatable ADC1 channels: requested " + std::to_string(count) + ", available " + std::to_string(allocated);
         return false;
     }
 
@@ -102,8 +149,24 @@ bool CapabilityFirewall::allocate_generic_adc(uint32_t count, DeviceGrant& grant
 }
 
 bool CapabilityFirewall::register_pod(const std::string& pod_id, const std::string& pod_manifest_json, std::string& out_error) {
-    osal::LockGuard guard(mutex_);
+    std::vector<BusAssignment> buses;
+    {
+        osal::LockGuard guard(mutex_);
+        if (!register_pod_locked(pod_id, pod_manifest_json, buses, out_error)) return false;
+    }
+    return install_buses(pod_id, buses, out_error);
+}
 
+// Driver installs take milliseconds and touch no firewall state: they run
+// without the lock, so host calls of other pods are not held up.
+bool CapabilityFirewall::install_buses(const std::string& pod_id, const std::vector<BusAssignment>& buses, std::string& out_error) {
+    if (buses.empty() || bus_install(pod_id, buses, out_error)) return true;
+    unregister_pod(pod_id);
+    return false;
+}
+
+bool CapabilityFirewall::register_pod_locked(const std::string& pod_id, const std::string& pod_manifest_json, std::vector<BusAssignment>& out_buses,
+                                             std::string& out_error) {
     if (pod_records_.find(pod_id) != pod_records_.end()) {
         out_error = "Pod already registered in capability firewall: " + pod_id;
         return false;
@@ -118,9 +181,12 @@ bool CapabilityFirewall::register_pod(const std::string& pod_id, const std::stri
     DeviceGrant grant;
     std::string sd_claim;
     bool sd_requested = false;
+    bool card_volume = false;
     uint32_t generic_gpio_count = 0;
     uint32_t generic_i2c_count = 0;
+    uint32_t generic_uart_count = 0;
     uint32_t generic_adc_count = 0;
+    std::map<std::string, std::string> bus_annotations;   // kube32.io/i2c-bus-N, kube32.io/uart-N
 
     std::vector<uint32_t> claimed_gpios;
     std::vector<uint32_t> claimed_adcs;
@@ -153,6 +219,11 @@ bool CapabilityFirewall::register_pod(const std::string& pod_id, const std::stri
             std::string ipc_ann = annotations->get_string("kube32.io/ipc", "");
             if (ipc_ann == "true" || ipc_ann == "1") {
                 grant.capabilities_mask |= KUBE32_CAP_IPC;
+            }
+            for (const auto& kv : annotations->obj_val) {
+                if ((kv.first.rfind("kube32.io/i2c-bus-", 0) == 0 || kv.first.rfind("kube32.io/uart-", 0) == 0) && kv.second.is_string()) {
+                    bus_annotations[kv.first] = kv.second.str_val;
+                }
             }
         }
     }
@@ -189,6 +260,11 @@ bool CapabilityFirewall::register_pod(const std::string& pod_id, const std::stri
                             out_error = "Security Violation: Pin GPIO " + std::to_string(pin) + " is reserved or unsafe.";
                             return false;
                         }
+                        if ((profile_.reserved_gpio_mask & (1ULL << pin)) != 0) {
+                            cleanup_claimed();
+                            out_error = "Security Violation: Pin GPIO " + std::to_string(pin) + " is used by the " + profile_.name + " board.";
+                            return false;
+                        }
                         if (!gpio_owners_[pin].empty() && gpio_owners_[pin] != pod_id) {
                             cleanup_claimed();
                             out_error = "Hardware Collision: GPIO " + std::to_string(pin) + " already claimed by " + gpio_owners_[pin];
@@ -217,9 +293,15 @@ bool CapabilityFirewall::register_pod(const std::string& pod_id, const std::stri
                             out_error = "Invalid ADC1 channel key format: " + key;
                             return false;
                         }
-                        if (ch >= 10) {
+                        if (ch >= KUBE32_ADC1_CHANNELS) {
                             cleanup_claimed();
                             out_error = "Invalid ADC1 channel: " + std::to_string(ch) + " (Max 9)";
+                            return false;
+                        }
+                        if ((claimable_adc1_mask_locked() & (1U << ch)) == 0) {
+                            cleanup_claimed();
+                            out_error = "Security Violation: ADC1 channel " + std::to_string(ch) + " (GPIO " + std::to_string(ch + 1) +
+                                        ") is used by the " + profile_.name + " board.";
                             return false;
                         }
                         if (!adc1_owners_[ch].empty() && adc1_owners_[ch] != pod_id) {
@@ -254,6 +336,11 @@ bool CapabilityFirewall::register_pod(const std::string& pod_id, const std::stri
                             out_error = "Invalid I2C bus: " + std::to_string(bus) + " (ESP32-S3 has buses 0 and 1)";
                             return false;
                         }
+                        if ((profile_.i2c_bus_mask & (1U << bus)) == 0) {
+                            cleanup_claimed();
+                            out_error = "I2C bus " + std::to_string(bus) + " is not offered by the " + profile_.name + " board";
+                            return false;
+                        }
                         if (!i2c_owners_[bus].empty() && i2c_owners_[bus] != pod_id) {
                             cleanup_claimed();
                             out_error = "Hardware Collision: I2C bus " + std::to_string(bus) + " claimed by " + i2c_owners_[bus];
@@ -270,6 +357,12 @@ bool CapabilityFirewall::register_pod(const std::string& pod_id, const std::stri
                             generic_i2c_count += std::stoul(val_str);
                         } catch (...) {}
                     }
+                    // Generic UART: "esp.io/uart": "1" or "esp32.io/uart": "1"
+                    else if (key == "esp.io/uart" || key == "esp32.io/uart") {
+                        try {
+                            generic_uart_count += std::stoul(val_str);
+                        } catch (...) {}
+                    }
                     // Specific UART Port: "esp32.io/uart-1": "1" or "esp.io/uart-1": "1"
                     else if (key.rfind("esp32.io/uart-", 0) == 0 || key.rfind("esp.io/uart-", 0) == 0) {
                         size_t prefix_len = (key.rfind("esp32.io/uart-", 0) == 0) ? 14 : 12;
@@ -284,6 +377,11 @@ bool CapabilityFirewall::register_pod(const std::string& pod_id, const std::stri
                         if (port == 0 || port > 2) {
                             cleanup_claimed();
                             out_error = "Invalid UART port: " + std::to_string(port) + " (UART0 is console; allowed 1, 2)";
+                            return false;
+                        }
+                        if ((profile_.uart_port_mask & (1U << port)) == 0) {
+                            cleanup_claimed();
+                            out_error = "UART" + std::to_string(port) + " is not offered by the " + profile_.name + " board";
                             return false;
                         }
                         if (!uart_owners_[port].empty() && uart_owners_[port] != pod_id) {
@@ -319,7 +417,7 @@ bool CapabilityFirewall::register_pod(const std::string& pod_id, const std::stri
                 }
             }
 
-            // securityContext.capabilities.add: [CHANNEL_IPC, DISPLAY, KEYBOARD, SPEAKER]
+            // securityContext.capabilities.add: [CHANNEL_IPC, DISPLAY, KEYBOARD, SPEAKER, SD, SERVICE_CALL]
             for (const auto& c : containers->arr_val) {
                 if (!c.is_object()) continue;
                 const models::JsonValue* sc = c.get("securityContext");
@@ -336,12 +434,13 @@ bool CapabilityFirewall::register_pod(const std::string& pod_id, const std::stri
                     else if (name == "KEYBOARD") grant.capabilities_mask |= KUBE32_CAP_KEYBOARD;
                     else if (name == "SPEAKER" || name == "AUDIO") grant.capabilities_mask |= KUBE32_CAP_SPEAKER;
                     else if (name == "SD" || name == "SD_CARD") sd_requested = true;
+                    else if (name == "SERVICE_CALL") grant.capabilities_mask |= KUBE32_CAP_SERVICE_CALL;
                 }
             }
         }
 
-        // volumes: [{name: data, "kube32.io/sd": {claim: tessera}}], or the
-        // standard shape kubectl validates: [{name: data, persistentVolumeClaim: {claimName: tessera}}]
+        // volumes: [{name: data, "kube32.io/sd": {claim: notes}}], or the
+        // standard shape kubectl validates: [{name: data, persistentVolumeClaim: {claimName: notes}}]
         const models::JsonValue* volumes = spec->get("volumes");
         if (volumes && volumes->is_array()) {
             for (const auto& v : volumes->arr_val) {
@@ -349,7 +448,7 @@ bool CapabilityFirewall::register_pod(const std::string& pod_id, const std::stri
                 const models::JsonValue* sd = v.get("kube32.io/sd");
                 const models::JsonValue* pvc = v.get("persistentVolumeClaim");
                 std::string claim;
-                if (sd && sd->is_object()) claim = sd->get_string("claim", "");
+                if (sd && sd->is_object()) { claim = sd->get_string("claim", ""); card_volume = true; }
                 else if (pvc && pvc->is_object()) claim = pvc->get_string("claimName", "");
                 else continue;
                 if (claim.empty()) claim = v.get_string("name", "");
@@ -368,20 +467,31 @@ bool CapabilityFirewall::register_pod(const std::string& pod_id, const std::stri
         }
     }
 
-    if (sd_requested) {
-        if (sd_claim.empty()) {
-            cleanup_claimed();
-            out_error = "hardware.kube32.io/sd requested but spec.volumes names no kube32.io/sd claim";
-            return false;
-        }
-        grant.capabilities_mask |= KUBE32_CAP_SD;
+    if (sd_requested && sd_claim.empty()) {
+        cleanup_claimed();
+        out_error = "hardware.kube32.io/sd requested but spec.volumes names no kube32.io/sd claim";
+        return false;
     }
+    // A volume lives on the node's storage root; kube32.io/sd volumes and
+    // hardware.kube32.io/sd requests insist on the card
+    if (!sd_claim.empty()) grant.capabilities_mask |= KUBE32_CAP_SD;
 
-    if (generic_gpio_count > 0 && !allocate_generic_gpios(generic_gpio_count, grant, pod_id, claimed_gpios, out_error)) {
+    // Buses first, then their pins, then pins handed out by count: a bus's
+    // default pins must not go to the same pod as plain GPIOs.
+    if (generic_i2c_count > 0 && !allocate_generic_i2c(generic_i2c_count, grant, pod_id, claimed_i2cs, out_error)) {
         cleanup_claimed();
         return false;
     }
-    if (generic_i2c_count > 0 && !allocate_generic_i2c(generic_i2c_count, grant, pod_id, claimed_i2cs, out_error)) {
+    if (generic_uart_count > 0 && !allocate_generic_uart(generic_uart_count, grant, pod_id, claimed_uarts, out_error)) {
+        cleanup_claimed();
+        return false;
+    }
+    std::vector<BusAssignment> buses;
+    if (!claim_bus_pins(pod_id, grant, bus_annotations, buses, claimed_gpios, out_error)) {
+        cleanup_claimed();
+        return false;
+    }
+    if (generic_gpio_count > 0 && !allocate_generic_gpios(generic_gpio_count, grant, pod_id, claimed_gpios, out_error)) {
         cleanup_claimed();
         return false;
     }
@@ -395,8 +505,11 @@ bool CapabilityFirewall::register_pod(const std::string& pod_id, const std::stri
     record.grant = grant;
     record.action = SecurityAction::LogAndDeny;
     record.violation_count = 0;
-    record.sd_claim = sd_requested ? sd_claim : std::string();
+    record.sd_claim = sd_claim;
+    record.card_required = !sd_claim.empty() && (sd_requested || card_volume);
+    record.buses = buses;
     pod_records_[pod_id] = record;
+    out_buses = std::move(buses);
 
     return true;
 }
@@ -409,6 +522,12 @@ bool CapabilityFirewall::valid_sd_claim(const std::string& claim) {
     return true;
 }
 
+bool CapabilityFirewall::volume_needs_card(const std::string& pod_id) const {
+    osal::LockGuard guard(mutex_);
+    auto it = pod_records_.find(pod_id);
+    return it != pod_records_.end() && it->second.card_required;
+}
+
 std::string CapabilityFirewall::sd_claim(const std::string& pod_id) const {
     osal::LockGuard guard(mutex_);
     auto it = pod_records_.find(pod_id);
@@ -417,8 +536,16 @@ std::string CapabilityFirewall::sd_claim(const std::string& pod_id) const {
 }
 
 bool CapabilityFirewall::grant_capabilities(const std::string& pod_id, const DeviceGrant& grant, std::string& out_error) {
-    osal::LockGuard guard(mutex_);
+    std::vector<BusAssignment> buses;
+    {
+        osal::LockGuard guard(mutex_);
+        if (!grant_capabilities_locked(pod_id, grant, buses, out_error)) return false;
+    }
+    return install_buses(pod_id, buses, out_error);
+}
 
+bool CapabilityFirewall::grant_capabilities_locked(const std::string& pod_id, const DeviceGrant& grant, std::vector<BusAssignment>& out_buses,
+                                                   std::string& out_error) {
     if (pod_records_.find(pod_id) != pod_records_.end()) {
         out_error = "Pod already registered in capability firewall: " + pod_id;
         return false;
@@ -426,7 +553,7 @@ bool CapabilityFirewall::grant_capabilities(const std::string& pod_id, const Dev
 
     // Validate GPIO mask against safety mask and collisions
     uint64_t combined_gpio = grant.gpio_read_mask | grant.gpio_write_mask;
-    if ((combined_gpio & KUBE32_RESERVED_GPIO_MASK) != 0) {
+    if ((combined_gpio & ~claimable_gpio_mask_locked()) != 0) {
         out_error = "Security Violation: Requested GPIOs contain reserved pins";
         return false;
     }
@@ -451,7 +578,8 @@ bool CapabilityFirewall::grant_capabilities(const std::string& pod_id, const Dev
     std::vector<uint32_t> claimed_adcs;
     for (uint32_t ch = 0; ch < 16; ++ch) {
         if ((grant.adc1_channel_mask & (1U << ch)) != 0) {
-            if (ch >= 10 || (!adc1_owners_[ch].empty() && adc1_owners_[ch] != pod_id)) {
+            if (ch >= KUBE32_ADC1_CHANNELS || (claimable_adc1_mask_locked() & (1U << ch)) == 0 ||
+                (!adc1_owners_[ch].empty() && adc1_owners_[ch] != pod_id)) {
                 for (uint32_t p : claimed_gpios) {
                     gpio_owners_[p].clear();
                     allocated_gpio_mask_ &= ~(1ULL << p);
@@ -472,7 +600,7 @@ bool CapabilityFirewall::grant_capabilities(const std::string& pod_id, const Dev
     std::vector<uint32_t> claimed_i2cs;
     for (uint32_t b = 0; b < 8; ++b) {
         if ((grant.i2c_bus_mask & (1U << b)) != 0) {
-            if (b >= 2 || (!i2c_owners_[b].empty() && i2c_owners_[b] != pod_id)) {
+            if (b >= 2 || (profile_.i2c_bus_mask & (1U << b)) == 0 || (!i2c_owners_[b].empty() && i2c_owners_[b] != pod_id)) {
                 for (uint32_t p : claimed_gpios) {
                     gpio_owners_[p].clear();
                     allocated_gpio_mask_ &= ~(1ULL << p);
@@ -497,7 +625,7 @@ bool CapabilityFirewall::grant_capabilities(const std::string& pod_id, const Dev
     std::vector<uint32_t> claimed_uarts;
     for (uint32_t u = 0; u < 8; ++u) {
         if ((grant.uart_port_mask & (1U << u)) != 0) {
-            if (u == 0 || u > 2 || (!uart_owners_[u].empty() && uart_owners_[u] != pod_id)) {
+            if (u == 0 || u > 2 || (profile_.uart_port_mask & (1U << u)) == 0 || (!uart_owners_[u].empty() && uart_owners_[u] != pod_id)) {
                 for (uint32_t p : claimed_gpios) {
                     gpio_owners_[p].clear();
                     allocated_gpio_mask_ &= ~(1ULL << p);
@@ -523,16 +651,174 @@ bool CapabilityFirewall::grant_capabilities(const std::string& pod_id, const Dev
         }
     }
 
+    // Granted buses run on the board's default pins
+    std::vector<BusAssignment> buses;
+    std::vector<uint32_t> bus_pins;
+    if (!claim_bus_pins(pod_id, grant, {}, buses, bus_pins, out_error)) {
+        for (uint32_t p : claimed_gpios) { gpio_owners_[p].clear(); allocated_gpio_mask_ &= ~(1ULL << p); }
+        for (uint32_t p : bus_pins) { gpio_owners_[p].clear(); allocated_gpio_mask_ &= ~(1ULL << p); }
+        for (uint32_t c : claimed_adcs) { adc1_owners_[c].clear(); allocated_adc1_mask_ &= ~(1U << c); }
+        for (uint32_t b : claimed_i2cs) { i2c_owners_[b].clear(); allocated_i2c_mask_ &= ~(1U << b); }
+        for (uint32_t u : claimed_uarts) { uart_owners_[u].clear(); allocated_uart_mask_ &= ~(1U << u); }
+        return false;
+    }
+
     PodSecurityRecord record;
     record.pod_id = pod_id;
     record.grant = grant;
     record.action = SecurityAction::LogAndDeny;
     record.violation_count = 0;
+    record.buses = buses;
     pod_records_[pod_id] = record;
+    out_buses = std::move(buses);
     return true;
 }
 
+// "sda=8,scl=9,hz=400000" -> {sda: 8, scl: 9, hz: 400000}; false when an item
+// is not <name>=<decimal number>.
+static bool parse_bus_spec(const std::string& spec, std::map<std::string, uint32_t>& out) {
+    auto trim = [](std::string v) {
+        while (!v.empty() && (v.front() == ' ' || v.front() == '\t')) v.erase(v.begin());
+        while (!v.empty() && (v.back() == ' ' || v.back() == '\t')) v.pop_back();
+        return v;
+    };
+    size_t start = 0;
+    while (start <= spec.size()) {
+        size_t end = spec.find(',', start);
+        if (end == std::string::npos) end = spec.size();
+        std::string item = trim(spec.substr(start, end - start));
+        start = end + 1;
+        if (item.empty()) continue;
+        size_t eq = item.find('=');
+        if (eq == std::string::npos) return false;
+        std::string key = trim(item.substr(0, eq));
+        std::string val = trim(item.substr(eq + 1));
+        if (key.empty() || val.empty() || val.size() > 9) return false;
+        for (char c : val) if (c < '0' || c > '9') return false;
+        for (auto& c : key) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+        out[key] = static_cast<uint32_t>(std::stoul(val));
+    }
+    return true;
+}
+
+bool CapabilityFirewall::claim_bus_pins(const std::string& pod_id, const DeviceGrant& grant, const std::map<std::string, std::string>& annotations,
+                                        std::vector<BusAssignment>& out_buses, std::vector<uint32_t>& out_claimed_pins, std::string& out_error) {
+    auto claim_pin = [&](uint32_t pin, const std::string& what) {
+        if (pin >= 64 || (KUBE32_SAFE_GPIO_MASK & (1ULL << pin)) == 0) {
+            out_error = "Security Violation: Pin GPIO " + std::to_string(pin) + " (" + what + ") is reserved or unsafe.";
+            return false;
+        }
+        if ((profile_.reserved_gpio_mask & (1ULL << pin)) != 0) {
+            out_error = "Security Violation: Pin GPIO " + std::to_string(pin) + " (" + what + ") is used by the " + profile_.name + " board.";
+            return false;
+        }
+        if (!gpio_owners_[pin].empty()) {
+            out_error = gpio_owners_[pin] == pod_id ? "GPIO " + std::to_string(pin) + " (" + what + ") is claimed twice by the pod"
+                                                    : "Hardware Collision: GPIO " + std::to_string(pin) + " (" + what + ") already claimed by " + gpio_owners_[pin];
+            return false;
+        }
+        gpio_owners_[pin] = pod_id;
+        allocated_gpio_mask_ |= (1ULL << pin);
+        out_claimed_pins.push_back(pin);
+        return true;
+    };
+    struct Kind {
+        BusKind kind;
+        uint8_t mask;
+        uint32_t first, last;
+        const char* name;          // "I2C", "UART"
+        const char* annotation;    // "kube32.io/i2c-bus-", "kube32.io/uart-"
+        const char* pin_a;         // "sda", "tx"
+        const char* pin_b;         // "scl", "rx"
+        const char* speed;         // "hz", "baud"
+        uint32_t speed_default, speed_min, speed_max;
+        const BusPins* defaults;
+    };
+    const Kind kinds[] = {
+        {BusKind::I2c, grant.i2c_bus_mask, 0, 1, "I2C", "kube32.io/i2c-bus-", "sda", "scl", "hz", kDefaultI2cHz, 1000, 1000000, profile_.i2c_pins},
+        {BusKind::Uart, grant.uart_port_mask, 1, 2, "UART", "kube32.io/uart-", "tx", "rx", "baud", kDefaultUartBaud, 300, 5000000, profile_.uart_pins},
+    };
+    for (const Kind& k : kinds) {
+        for (uint32_t n = k.first; n <= k.last; ++n) {
+            if ((k.mask & (1U << n)) == 0) continue;
+            const std::string label = std::string(k.name) + std::to_string(n);
+            const std::string key = k.annotation + std::to_string(n);
+            BusAssignment b;
+            b.kind = k.kind;
+            b.index = static_cast<uint8_t>(n);
+            b.speed = k.speed_default;
+            int32_t pa = k.defaults[n].a, pb = k.defaults[n].b;
+            auto it = annotations.find(key);
+            if (it != annotations.end()) {
+                std::map<std::string, uint32_t> v;
+                if (!parse_bus_spec(it->second, v) || !v.count(k.pin_a) || !v.count(k.pin_b)) {
+                    out_error = "Invalid " + key + " \"" + it->second + "\" (want \"" + k.pin_a + "=<pin>," + k.pin_b + "=<pin>[," + k.speed + "=<n>]\")";
+                    return false;
+                }
+                for (const auto& kv : v) {
+                    if (kv.first != k.pin_a && kv.first != k.pin_b && kv.first != k.speed) {
+                        out_error = "Invalid " + key + ": unknown setting \"" + kv.first + "\"";
+                        return false;
+                    }
+                }
+                pa = static_cast<int32_t>(v[k.pin_a]);
+                pb = static_cast<int32_t>(v[k.pin_b]);
+                if (v.count(k.speed)) b.speed = v[k.speed];
+                if (b.speed < k.speed_min || b.speed > k.speed_max) {
+                    out_error = "Invalid " + key + ": " + k.speed + " must be " + std::to_string(k.speed_min) + ".." + std::to_string(k.speed_max);
+                    return false;
+                }
+            } else if (pa < 0 || pb < 0) {
+                out_error = label + " has no default pins on the " + profile_.name + " board: set annotation " + key + ": \"" + k.pin_a + "=<pin>," +
+                            k.pin_b + "=<pin>\"";
+                return false;
+            }
+            if (pa == pb) {
+                out_error = "Invalid " + key + ": " + k.pin_a + " and " + k.pin_b + " are the same pin";
+                return false;
+            }
+            if (!claim_pin(static_cast<uint32_t>(pa), label + " " + k.pin_a) || !claim_pin(static_cast<uint32_t>(pb), label + " " + k.pin_b)) return false;
+            b.pin_a = static_cast<uint8_t>(pa);
+            b.pin_b = static_cast<uint8_t>(pb);
+            out_buses.push_back(b);
+        }
+    }
+    return true;
+}
+
+bool CapabilityFirewall::allocate_generic_uart(uint32_t count, DeviceGrant& grant, const std::string& pod_id, std::vector<uint32_t>& out_claimed, std::string& out_error) {
+    std::vector<uint32_t> ports;
+    for (uint32_t port = 1; port <= 2 && ports.size() < count; ++port) {
+        if ((profile_.uart_port_mask & (1U << port)) == 0 || !uart_owners_[port].empty()) continue;
+        ports.push_back(port);
+    }
+    if (ports.size() < count) {
+        out_error = "Insufficient allocatable UART ports: requested " + std::to_string(count) + ", available " + std::to_string(ports.size());
+        return false;
+    }
+    for (uint32_t port : ports) {
+        grant.uart_port_mask |= (1U << port);
+        uart_owners_[port] = pod_id;
+        allocated_uart_mask_ |= (1U << port);
+        out_claimed.push_back(port);
+    }
+    return true;
+}
+
+uint8_t CapabilityFirewall::claimable_uart_mask() const {
+    osal::LockGuard guard(mutex_);
+    return profile_.uart_port_mask;
+}
+
+std::vector<BusAssignment> CapabilityFirewall::pod_buses(const std::string& pod_id) const {
+    osal::LockGuard guard(mutex_);
+    auto it = pod_records_.find(pod_id);
+    return it == pod_records_.end() ? std::vector<BusAssignment>() : it->second.buses;
+}
+
 void CapabilityFirewall::unregister_pod(const std::string& pod_id) {
+    // The driver goes before the pins are free for anyone else
+    bus_release(pod_id);
     osal::LockGuard guard(mutex_);
     pod_records_.erase(pod_id);
     for (size_t i = 0; i < gpio_owners_.size(); ++i) {
@@ -600,6 +886,9 @@ bool CapabilityFirewall::check_permission(const std::string& pod_id, PeripheralT
         case PeripheralType::SdCard:
             permitted = grant.has_capability(KUBE32_CAP_SD);
             break;
+        case PeripheralType::ServiceCall:
+            permitted = grant.has_capability(KUBE32_CAP_SERVICE_CALL);
+            break;
     }
 
     if (!permitted) {
@@ -644,7 +933,7 @@ void CapabilityFirewall::log_violation(const std::string& pod_id, PeripheralType
     static int logged = 0;
     if (logged >= 16) return;
     logged++;
-    static const char* const names[] = {"gpio", "adc", "i2c", "uart", "ipc", "display", "keyboard", "speaker", "sd"};   // PeripheralType order
+    static const char* const names[] = {"gpio", "adc", "i2c", "uart", "ipc", "display", "keyboard", "speaker", "sd", "service-call"};   // PeripheralType order
     unsigned ti = static_cast<unsigned>(type);
     std::cout << "[FIREWALL] denied " << pod_id << ": " << (ti < sizeof(names) / sizeof(names[0]) ? names[ti] : "peripheral")
               << " " << target << " " << (mode == AccessMode::Write ? "write" : "read") << std::endl;

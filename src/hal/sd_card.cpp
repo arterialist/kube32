@@ -34,6 +34,10 @@ static constexpr const char* SD_MOUNT_POINT = "/sd";
 static sdmmc_card_t* s_card = nullptr;
 static bool s_bus_ready = false;
 
+uint64_t sd_gpio_mask() {
+    return (1ULL << PIN_SD_MOSI) | (1ULL << PIN_SD_MISO) | (1ULL << PIN_SD_SCK) | (1ULL << PIN_SD_CS);
+}
+
 static void refresh_space_locked() {
     uint64_t total = 0, free_b = 0;
     if (s_card && esp_vfs_fat_info(SD_MOUNT_POINT, &total, &free_b) == ESP_OK) {
@@ -122,6 +126,8 @@ std::string sd_root_path() {
 }
 
 #else // host simulator
+
+uint64_t sd_gpio_mask() { return 0; }
 
 } // namespace kube32::hal
 

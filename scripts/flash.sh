@@ -1,7 +1,10 @@
 #!/usr/bin/env bash
-# ==============================================================================
-# Kube32 Dual Physical ESP32-S3 Firmware Flasher & Verifier
-# ==============================================================================
+# Flash a kube32 build to one ESP32-S3 board.
+#
+#   scripts/flash.sh <serial port> [baud]
+#
+# Builds the esp32s3 environment first if the images are missing. PlatformIO
+# is taken from PATH, then from $PLATFORMIO_CORE_DIR or ~/.platformio.
 set -e
 
 PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -14,23 +17,42 @@ if [ -z "$PORT" ]; then
     exit 2
 fi
 
-echo "================================================================="
-echo "  Kube32 Production ESP32-S3 Silicon Flasher"
-echo "  Target Port: $PORT"
-echo "  Baud Rate:   $BAUD"
-echo "================================================================="
+PENV="${PLATFORMIO_CORE_DIR:-$HOME/.platformio}/penv/bin"
+if command -v pio >/dev/null 2>&1; then
+    PIO=pio
+elif [ -x "$PENV/pio" ]; then
+    PIO="$PENV/pio"
+else
+    PIO=""
+fi
+# esptool ships inside PlatformIO's virtualenv; a system python3 works too
+# once `pip install esptool` has run.
+if [ -x "$PENV/python3" ] && "$PENV/python3" -c "import esptool" 2>/dev/null; then
+    PYTHON="$PENV/python3"
+elif python3 -c "import esptool" 2>/dev/null; then
+    PYTHON=python3
+else
+    echo "esptool not found: looked for it in $PENV/python3 and in python3 on PATH." >&2
+    echo "Install PlatformIO Core (https://platformio.org/install/cli) or run 'pip install esptool'." >&2
+    exit 1
+fi
+
+echo "flashing $PORT at $BAUD baud"
 
 BOOTLOADER=".pio/build/esp32s3/bootloader.bin"
 PARTITIONS=".pio/build/esp32s3/partitions.bin"
 FIRMWARE=".pio/build/esp32s3/firmware.bin"
 
 if [ ! -f "$FIRMWARE" ] || [ ! -f "$BOOTLOADER" ] || [ ! -f "$PARTITIONS" ]; then
-    echo "[BUILD] Compiling firmware via PlatformIO..."
-    ~/.platformio/penv/bin/pio run -e esp32s3
+    if [ -z "$PIO" ]; then
+        echo "no firmware images in .pio/build/esp32s3 and no pio to build them:" >&2
+        echo "pio is neither on PATH nor in $PENV. Install PlatformIO Core or set PLATFORMIO_CORE_DIR." >&2
+        exit 1
+    fi
+    "$PIO" run -e esp32s3
 fi
 
-echo "[FLASH] Executing hardware flashing on physical silicon..."
-~/.platformio/penv/bin/python3 - <<EOF
+"$PYTHON" - <<EOF
 import sys, time, os
 import esptool
 
@@ -40,7 +62,6 @@ bootloader = "$BOOTLOADER"
 partitions = "$PARTITIONS"
 firmware = "$FIRMWARE"
 
-print(f"[*] Connecting to ESP32-S3 on {port} at {baud} baud...")
 
 # CH340-style USB-UART bridges (VID 0x1a86) drop bytes with esptool's default
 # block size; they get 256-byte paced blocks. Native USB-Serial/JTAG ports
@@ -56,7 +77,7 @@ try:
 except Exception:
     pass
 if bridge:
-    print("[*] USB-UART bridge detected: 256-byte paced blocks")
+    print("USB-UART bridge: writing 256-byte paced blocks")
     esptool.loader.ESPLoader.ESP_RAM_BLOCK = 256
     esptool.loader.StubMixin.FLASH_WRITE_SIZE = 256
     esptool.loader.ESPLoader.FLASH_WRITE_SIZE = 256
@@ -85,9 +106,6 @@ sys.argv = [
 ]
 
 esptool._main()
-print("[+] Flashing complete on silicon!")
 EOF
 
-echo "================================================================="
-echo "  Hardware Flashing Successful! Board hard reset triggered."
-echo "================================================================="
+echo "flashed $PORT"

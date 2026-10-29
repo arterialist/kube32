@@ -27,7 +27,8 @@ enum class PeripheralType : uint8_t {
     Display  = 5,   // On-board TFT panel (hardware.kube32.io/tft-display)
     Keyboard = 6,   // On-board matrix keyboard (hardware.kube32.io/keyboard)
     Speaker  = 7,   // On-board I2S speaker (hardware.kube32.io/speaker)
-    SdCard   = 8    // microSD volume of the pod (hardware.kube32.io/sd)
+    SdCard   = 8,   // microSD volume of the pod (hardware.kube32.io/sd)
+    ServiceCall = 9 // k32_http_call to Services (securityContext capability SERVICE_CALL)
 };
 
 enum class AccessMode : uint8_t {
@@ -55,6 +56,7 @@ constexpr uint32_t KUBE32_CAP_DISPLAY  = (1U << 1);
 constexpr uint32_t KUBE32_CAP_KEYBOARD = (1U << 2);
 constexpr uint32_t KUBE32_CAP_SPEAKER  = (1U << 3);
 constexpr uint32_t KUBE32_CAP_SD       = (1U << 4);   // k32_fs_* on the pod's SD volume
+constexpr uint32_t KUBE32_CAP_SERVICE_CALL = (1U << 5);   // k32_http_call
 
 // 24-Byte Ultra-Compact Device Grant Representation
 #pragma pack(push, 1)

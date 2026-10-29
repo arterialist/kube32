@@ -8,7 +8,8 @@
 
 namespace kube32::hal {
 
-// Pinout of the integrated display/keyboard/speaker board used as node 1
+// Pinout of the M5Stack Cardputer (board profile "cardputer"): display,
+// speaker and keyboard matrix
 constexpr int PIN_LCD_MOSI      = 35;
 constexpr int PIN_LCD_SCLK      = 36;
 constexpr int PIN_LCD_CS        = 37;
@@ -51,6 +52,10 @@ bool display_available();
 // Speaker (NS4168 over I2S)
 bool init_speaker();
 void play_tone(uint32_t freq_hz, uint32_t duration_ms, uint8_t volume_pct = 20);
+
+// GPIOs driven by the display, speaker and keyboard drivers above, for the
+// board profile's reserved pins.
+uint64_t peripheral_gpio_mask();
 
 // Keyboard matrix. Key presses queue up (16 deep); pods drain the queue.
 bool init_keyboard_scanner();

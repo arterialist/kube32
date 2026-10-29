@@ -1,9 +1,15 @@
 // Kube32 firmware entry point for ESP32-S3.
 //
-// One image boots both cluster roles; the factory MAC selects the role.
-//   esp32-node-01  control plane + ingress + local kubelet, SoftAP host,
-//                  integrated display/keyboard/speaker exposed to pods
-//   esp32-node-02  worker: kubelet, pod HTTP server, Wi-Fi station
+// One image boots both cluster roles. A board with PSRAM becomes the control
+// plane and any other board a worker; the NVS key "role" (K32_CMD:ROLE:)
+// overrides that, and the NVS key "board" (K32_CMD:BOARD:) selects the
+// peripheral profile.
+//   control plane  API server, scheduler, controllers, object store, ingress
+//                  on port 80 and a local kubelet
+//   worker         kubelet; with the "cardputer" profile the display, keypad,
+//                  speaker and microSD card are exposed to pods
+// A node is named by the NVS key "name" (K32_CMD:NAME:), or "esp32-" and the
+// last three bytes of its Wi-Fi MAC address when that is not set.
 //
 // Nothing application specific lives here: workloads arrive as Wasm pods
 // through the Kubernetes API, images come from the embedded registry, and
@@ -15,6 +21,8 @@
 #include "scheduler/scheduler.hpp"
 #include "controller/node_lifecycle_controller.hpp"
 #include "controller/deployment_controller.hpp"
+#include "controller/workload_controller.hpp"
+#include "hal/capability_firewall.hpp"
 #include "kubelet/metrics_provider.hpp"
 #include "esp_sntp.h"
 #include "soc/rtc_cntl_reg.h"
@@ -28,12 +36,21 @@
 #include "kubelet/kubelet.hpp"
 #include "ipc/channel.hpp"
 #include "net/network_manager.hpp"
-#include "app/app_wiring.hpp"
+#include "app/ingress_controller.hpp"
+#include "app/pod_server.hpp"
+#include "app/service_client.hpp"
+#include "app/node_storage_api.hpp"
+#include "api/node_proxy.hpp"
+#include "kubelet/kube_api_client.hpp"
 #include "osal/thread.hpp"
 #include "osal/system.hpp"
 #include "osal/socket.hpp"
 #include "hal/tft_keyboard_hardware.hpp"
 #include "hal/sd_card.hpp"
+#include "hal/node_storage.hpp"
+#include "storage/flash_log.hpp"
+#include "api/timestamp_backfill.hpp"
+#include "osal/tls.hpp"
 #include "runtime/pod_memory_pool.h"
 #include "runtime/pod_log.hpp"
 #include "models/kube_models.hpp"
@@ -79,9 +96,25 @@ struct NodeIdentity {
     bool has_display{false};
     bool has_psram{false};
     std::string name;
-    uint16_t id{1};
+    uint32_t id{1};       // channel node id, from the MAC address
     std::string mac;
 };
+
+// RFC 1123 label: what a Node name needs to be usable as kubernetes.io/hostname
+bool valid_node_name(const std::string& n) {
+    if (n.empty() || n.size() > 63 || n.front() == '-' || n.back() == '-') return false;
+    for (char c : n) if (!((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '-')) return false;
+    return true;
+}
+
+// Bearer tokens: printable, no spaces, 16 to 128 characters
+bool valid_token(const std::string& t) {
+    if (t.size() < 16 || t.size() > 128) return false;
+    for (char c : t) if (c <= ' ' || c > '~') return false;
+    return true;
+}
+
+std::string read_nvs_str(const char* key);
 
 NodeIdentity detect_identity() {
     uint8_t mac[6] = {0};
@@ -104,8 +137,12 @@ NodeIdentity detect_identity() {
     if (role[0]) control_plane = (std::strcmp(role, "control-plane") == 0);
     if (board[0]) id.has_display = (std::strcmp(board, "cardputer") == 0 || std::strcmp(board, "display") == 0);
     id.is_control_plane = control_plane;
-    id.name = control_plane ? "esp32-node-01" : "esp32-node-02";
-    id.id = control_plane ? 1 : 2;
+    char derived[16];
+    snprintf(derived, sizeof(derived), "esp32-%02x%02x%02x", mac[3], mac[4], mac[5]);
+    std::string stored = read_nvs_str("name");
+    id.name = valid_node_name(stored) ? stored : std::string(derived);
+    id.id = (static_cast<uint32_t>(mac[3]) << 16) | (static_cast<uint32_t>(mac[4]) << 8) | mac[5];
+    if (id.id == 0) id.id = 1;
     return id;
 }
 
@@ -113,11 +150,32 @@ NodeIdentity detect_identity() {
 std::string read_nvs_str(const char* key) {
     nvs_handle_t h;
     if (nvs_open("k32", NVS_READONLY, &h) != ESP_OK) return {};
-    char v[65] = {0};
+    char v[129] = {0};
     size_t vl = sizeof(v);
     bool ok = nvs_get_str(h, key, v, &vl) == ESP_OK;
     nvs_close(h);
     return ok ? std::string(v) : std::string();
+}
+
+bool read_nvs_blob(const char* key, std::string& out) {
+    nvs_handle_t h;
+    if (nvs_open("k32", NVS_READONLY, &h) != ESP_OK) return false;
+    size_t len = 0;
+    bool ok = nvs_get_blob(h, key, nullptr, &len) == ESP_OK && len > 0 && len < 4096;
+    if (ok) {
+        out.assign(len, '\0');
+        ok = nvs_get_blob(h, key, &out[0], &len) == ESP_OK;
+    }
+    nvs_close(h);
+    return ok;
+}
+
+void write_nvs_blob(const char* key, const std::string& value) {
+    nvs_handle_t h;
+    if (nvs_open("k32", NVS_READWRITE, &h) != ESP_OK) return;
+    nvs_set_blob(h, key, value.data(), value.size());
+    nvs_commit(h);
+    nvs_close(h);
 }
 
 bool read_nvs_wifi(std::string& ssid, std::string& pass) {
@@ -189,6 +247,9 @@ struct Console {
 // plane). The request must carry "Connection: close".
 static std::string s_forward_host = "127.0.0.1";
 static kube32::api::HttpServer* s_api_server = nullptr;       // for console toggles
+static kube32::storage::Store* s_store = nullptr;             // control plane: journal figures for the console
+static bool s_api_token_set = false;
+static kube32::osal::TlsServer* s_tls = nullptr;               // control plane: the API server's certificate
 static kube32::api::HttpServer* s_ingress_server = nullptr;
 std::string loopback_http(uint16_t port, const std::string& request) {
     std::string response;
@@ -245,7 +306,11 @@ static uint32_t crc32_bytes(const uint8_t* p, size_t n) {
 //   K32_HTTP <port> <len> [crc32hex]\n<len bytes of HTTP request> -> K32_RESP <len>\n<bytes>
 //   A CRC mismatch answers K32_ERR crc so the gateway can resend.
 //   K32_CMD:STATUS                                       -> telemetry line
+//   K32_CMD:STORE                                        -> object store journal figures
 //   K32_CMD:WIFI:<ssid>:<password>                       -> stored in NVS, reboot
+//   K32_CMD:NAME:<node name>|auto                        -> stored in NVS, reboot
+//   K32_CMD:TOKEN:<API bearer token>|off                 -> stored in NVS, reboot
+//   K32_CMD:CERT                                         -> the API server's TLS certificate (PEM)
 //   K32_CMD:REBOOT
 void console_task(void* arg) {
     auto* ctx = static_cast<std::pair<Console*, NodeIdentity*>*>(arg);
@@ -293,16 +358,74 @@ void console_task(void* arg) {
                     con.write(frame.data(), frame.size());
                 }
             } else if (line == "K32_CMD:STATUS") {
-                char buf[256];
+                char buf[384];
                 int l = snprintf(buf, sizeof(buf),
-                    "K32_STATUS node=%s role=%s mac=%s free_heap=%u min_free_heap=%u free_psram=%u uptime_ms=%llu pods=%u\n",
+                    "K32_STATUS node=%s role=%s mac=%s free_heap=%u min_free_heap=%u largest_block=%u pod_pool_free=%u free_psram=%u uptime_ms=%llu pods=%u storage=%s auth=%s tls=%s\n",
                     ident.name.c_str(), ident.is_control_plane ? "control-plane" : "worker", ident.mac.c_str(),
                     (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
                     (unsigned)heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
+                    (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
+                    (unsigned)kube32_pool_available(nullptr),
                     (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM),
                     (unsigned long long)kube32::osal::System::get_uptime_ms(),
-                    (unsigned)kube32::runtime::AppPodHost::instance().list_pods().size());
+                    (unsigned)kube32::runtime::AppPodHost::instance().list_pods().size(),
+                    kube32::hal::storage_medium_name(kube32::hal::node_storage_info().medium), s_api_token_set ? "token" : "off",
+                    s_tls ? "on" : "off");
                 con.write(buf, static_cast<size_t>(l));
+            } else if (line == "K32_CMD:STORE") {
+                kube32::storage::PersistenceStats ps;
+                char buf[320];
+                int l;
+                if (s_store && s_store->persistence_stats(ps)) {
+                    l = snprintf(buf, sizeof(buf),
+                        "K32_STORE journal=%s keys=%u live_bytes=%u capacity_bytes=%u sectors=%u/%u pending=%u records=%llu bytes=%llu moved=%llu unchanged=%llu errors=%llu revision=%llu\n",
+                        kube32::hal::node_storage_path("store/journal.img").c_str(), (unsigned)ps.live_keys, (unsigned)ps.live_bytes,
+                        (unsigned)ps.capacity_bytes, (unsigned)ps.used_sectors, (unsigned)ps.sector_count, (unsigned)ps.pending_keys,
+                        (unsigned long long)ps.records_written, (unsigned long long)ps.bytes_written, (unsigned long long)ps.records_moved,
+                        (unsigned long long)ps.unchanged_skipped, (unsigned long long)ps.write_errors,
+                        (unsigned long long)s_store->current_version());
+                } else {
+                    l = snprintf(buf, sizeof(buf), "K32_STORE journal=none\n");
+                }
+                con.write(buf, static_cast<size_t>(l));
+            } else if (line == "K32_CMD:CERT") {
+                if (s_tls) {
+                    const std::string& pem = s_tls->certificate_pem();
+                    size_t start = 0;
+                    while (start < pem.size()) {
+                        size_t end = pem.find('\n', start);
+                        if (end == std::string::npos) end = pem.size();
+                        std::string l = "K32_CERT " + pem.substr(start, end - start) + "\n";
+                        con.write(l.data(), l.size());
+                        start = end + 1;
+                    }
+                    con.write("K32_OK cert\n", 12);
+                } else {
+                    con.write("K32_ERR no TLS on this node\n", 28);
+                }
+            } else if (line.rfind("K32_CMD:NAME:", 0) == 0 || line.rfind("K32_CMD:TOKEN:", 0) == 0) {
+                // Node name (a DNS-1123 label, "auto" for the MAC-derived one)
+                // and API bearer token ("off" disables authentication)
+                const bool is_name = line.rfind("K32_CMD:NAME:", 0) == 0;
+                std::string value = line.substr(is_name ? 13 : 14);
+                const bool clear = is_name ? (value == "auto") : (value == "off");
+                if (!clear && !(is_name ? valid_node_name(value) : valid_token(value))) {
+                    const char* why = is_name ? "K32_ERR name must be a DNS-1123 label (a-z, 0-9, '-', at most 63)\n"
+                                              : "K32_ERR token must be 16 to 128 printable characters without spaces\n";
+                    con.write(why, std::strlen(why));
+                } else {
+                    nvs_handle_t h;
+                    if (nvs_open("k32", NVS_READWRITE, &h) == ESP_OK) {
+                        const char* key = is_name ? "name" : "token";
+                        if (clear) nvs_erase_key(h, key); else nvs_set_str(h, key, value.c_str());
+                        nvs_commit(h);
+                        nvs_close(h);
+                    }
+                    const char* ok = is_name ? "K32_OK name stored, rebooting\n" : "K32_OK token stored, rebooting\n";
+                    con.write(ok, std::strlen(ok));
+                    vTaskDelay(pdMS_TO_TICKS(200));
+                    esp_restart();
+                }
             } else if (line.rfind("K32_CMD:WIFI:", 0) == 0) {
                 std::string rest = line.substr(13);
                 size_t sep = rest.find(':');
@@ -535,12 +658,21 @@ void cluster_task(void* pv) {
     // Wi-Fi and lwIP fragment the heap, so a 64 KiB pod can still be placed.
     if (!ident.has_psram) {
         kube32_pool_reserve(67 * 1024);
-        kube32_pool_reserve_stack(40960);   // one pod thread stack (HUD peaks at ~33 KB), while a contiguous block still exists
+        // One stack for the interpreter, while a contiguous block still
+        // exists: every call into a pod (k32_init, k32_handle, k32_tick,
+        // k32_event) runs on it, so the threads that make those calls need
+        // no large stacks of their own. Xtensa has no tail calls, so the
+        // interpreter holds a native frame per instruction until a function
+        // returns: a request handler needs 20-40 KB.
+        kube32_pool_reserve_stack(40960);
+        size_t interp_size = kube32_pool_stack_size();
+        kube32_interp_stack_set(kube32_pool_stack_alloc(interp_size), interp_size);
+        kube32::runtime::AppPodHost::instance().set_event_thread_stack(6144, false);
         kube32::runtime::PodLogStore::runtime().set_ring_capacity(1024);   // 300 KB SRAM: a short log per pod
     } else {
-        // Keep the largest PSRAM block whole for a big data pod (24 Wasm pages
+        // Keep the largest PSRAM block whole for a big data pod (20 Wasm pages
         // plus header) before task stacks and buffers fragment the heap.
-        kube32_pool_reserve_external(1340 * 1024);   // 20 pages + header
+        kube32_pool_reserve_external(20 * 64 * 1024 + 4096);   // 20 Wasm pages plus wasm3's memory header
     }
     printf("[MEM] reserved %u bytes for pod linear memory\n", (unsigned)kube32_pool_block_size());
 
@@ -551,20 +683,44 @@ void cluster_task(void* pv) {
         kube32::hal::init_speaker();
         kube32::hal::init_keyboard_scanner();
     }
-    // microSD slot of the display board: its own SPI bus (SPI3), FAT at /sd
-    if (ident.has_display) {
-        const size_t sd_heap_before = heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
-        bool sd_ok = kube32::hal::sd_mount();
-        printf("[SD] mount cost %d bytes of internal RAM\n", (int)((long)sd_heap_before - (long)heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT)));
-        if (sd_ok) {
-            kube32::hal::SdInfo si = kube32::hal::sd_info();
-            printf("[SD] %s %s mounted at /sd: %llu MB total, %llu MB free, SPI3 %u kHz\n", si.type.c_str(), si.name.c_str(),
-                   (unsigned long long)(si.total_bytes / (1024 * 1024)), (unsigned long long)(si.free_bytes / (1024 * 1024)), (unsigned)si.bus_khz);
+    // Node storage: the microSD card of the display board (its own SPI bus,
+    // FAT at /sd) when one is inserted, otherwise the internal flash
+    // "storage" partition (FAT with wear levelling at /data). One of the two.
+    {
+        bool ok = kube32::hal::node_storage_mount(ident.has_display);
+        kube32::hal::NodeStorageInfo si = kube32::hal::node_storage_info();
+        if (ok) {
+            printf("[STORAGE] %s at %s: %llu KB total, %llu KB free; mount took %lld bytes internal RAM, %lld bytes PSRAM\n",
+                   kube32::hal::storage_medium_name(si.medium), si.root.c_str(), (unsigned long long)(si.total_bytes / 1024),
+                   (unsigned long long)(si.free_bytes / 1024), (long long)si.internal_ram_bytes, (long long)si.psram_bytes);
+            if (si.medium == kube32::hal::StorageMedium::SdCard) {
+                kube32::hal::SdInfo card = kube32::hal::sd_info();
+                printf("[SD] %s %s, SPI3 %u kHz\n", card.type.c_str(), card.name.c_str(), (unsigned)card.bus_khz);
+            }
         } else {
-            printf("[SD] not mounted: %s\n", kube32::hal::sd_info().error.c_str());
+            printf("[STORAGE] none: %s\n", si.error.c_str());
         }
     }
     install_hardware_hooks(has_display);
+    kube32::app::install_default_platform_hooks();   // event_emit through the channel layer
+    // What pods may claim: the chip's pins minus those the board's own
+    // peripherals use, and the buses the board has pins for. A bare devkit
+    // offers both I2C controllers and UART1/UART2 (defaults: I2C0 on GPIO
+    // 8/9, UART1 on 17/18). The Cardputer's only free connector is the Grove
+    // port (GPIO 2 and 1), so it offers I2C0 or UART1 there.
+    {
+        kube32::hal::BoardProfile profile;
+        profile.name = ident.has_display ? "cardputer" : "generic";
+        if (ident.has_display) {
+            profile.reserved_gpio_mask = kube32::hal::peripheral_gpio_mask() | kube32::hal::sd_gpio_mask();
+            profile.i2c_bus_mask = 0x1;
+            profile.i2c_pins[0] = {2, 1};     // Grove SDA, SCL
+            profile.i2c_pins[1] = {};
+            profile.uart_port_mask = 0x2;
+            profile.uart_pins[1] = {2, 1};    // Grove TX, RX
+        }
+        kube32::hal::CapabilityFirewall::instance().set_board_profile(profile);
+    }
     log_memory("after peripherals");
 
     // Network
@@ -618,6 +774,11 @@ void cluster_task(void* pv) {
             printf("[CLOCK] synchronized, unix time %lld\n", (long long)(tv ? tv->tv_sec : 0));
         });
         esp_sntp_init();
+        // Objects, leases and events get wall-clock timestamps from the start when
+        // the clock answers within a few seconds; whatever is created before
+        // it does is stamped afterwards (api/timestamp_backfill.hpp)
+        for (int i = 0; i < 100 && kube32::osal::System::get_unix_time_ms() == 0; ++i) vTaskDelay(pdMS_TO_TICKS(100));
+        if (kube32::osal::System::get_unix_time_ms() == 0) printf("[CLOCK] not synchronized yet, continuing\n");
     }
 
     // Node CPU utilisation for metrics.k8s.io: cumulative run time of every
@@ -662,9 +823,11 @@ void cluster_task(void* pv) {
     std::unique_ptr<kube32::controller::NodeLifecycleController> node_lifecycle;
     std::unique_ptr<kube32::scheduler::Scheduler> scheduler;
     std::unique_ptr<kube32::controller::DeploymentController> deployments;
+    std::unique_ptr<kube32::controller::WorkloadController> workloads;
     std::unique_ptr<kube32::api::HttpServer> api_server;
     std::unique_ptr<kube32::kubelet::Kubelet> kubelet;
-    std::unique_ptr<kube32::app::AppWiring> wiring;
+    std::unique_ptr<kube32::app::IngressController> ingress;
+    std::unique_ptr<kube32::app::PodServer> pod_server;
 
     kube32::kubelet::KubeletConfig kubelet_cfg;
     kubelet_cfg.node_name = ident.name;
@@ -679,14 +842,51 @@ void cluster_task(void* pv) {
     // call optimised, so a seed chunk needs well over 40 KB of native stack.
     kubelet_cfg.task_stack_size = ident.has_psram ? 65536 : 12288;
     kubelet_cfg.task_stack_in_psram = ident.has_psram;
+    // Without PSRAM a large API answer (a list of pods carrying modules
+    // inline) would take the heap the node runs on: refused instead
+    kubelet_cfg.api_max_body = ident.has_psram ? 0 : 16 * 1024;
     kubelet_cfg.control_plane = ident.is_control_plane;
     kubelet_cfg.core_affinity = 1;
+    // K32_CMD:TOKEN: the API server checks it, every kubelet sends it
+    const std::string api_token = read_nvs_str("token");
+    s_api_token_set = valid_token(api_token);
+    if (s_api_token_set) kubelet_cfg.api_token = api_token;
+    kubelet_cfg.node_labels["kube32.io/board"] = ident.has_display ? "cardputer" : "generic";
 
     if (ident.is_control_plane) {
+        // The object store's journal lives on the node storage root; without
+        // one the cluster state is kept in RAM only
         kube32::storage::StoreOptions store_opts;
-        store_opts.base_path = "/littlefs";
         store_opts.enable_flash_persistence = false;
+        static std::unique_ptr<kube32::storage::FlashRegion> journal;
+        const kube32::hal::NodeStorageInfo storage_info = kube32::hal::node_storage_info();
+        const std::string journal_dir = kube32::hal::node_storage_path("store");
+        if (!journal_dir.empty() && kube32::hal::node_storage_make_dirs(journal_dir)) {
+            // 1 MiB on internal flash (the rest is for volumes and logs), 4 MiB on a card
+            const size_t journal_bytes = storage_info.medium == kube32::hal::StorageMedium::SdCard ? 4u << 20 : 1u << 20;
+            kube32::hal::node_storage_call([&]() {
+                journal = kube32::storage::create_file_flash_region(journal_dir + "/journal.img", journal_bytes);
+            });
+        }
+        if (journal) {
+            store_opts.enable_flash_persistence = true;
+            store_opts.flash_region = journal.get();
+        } else {
+            printf("[STORE] no journal (node storage: %s): cluster state is kept in RAM only\n",
+                   storage_info.error.empty() ? "not mounted" : storage_info.error.c_str());
+        }
         store = kube32::storage::create_radix_store(store_opts);
+        if (journal) {
+            const uint64_t t0 = kube32::osal::System::get_uptime_ms();
+            kube32::storage::Status rs = kube32::storage::Status::Ok();
+            kube32::hal::node_storage_call([&]() { rs = store->recover(); });
+            std::vector<std::string> keys;
+            store->list("/registry/", keys);
+            printf("[STORE] journal %s/journal.img: %u object(s) recovered in %llu ms, revision %llu%s\n", journal_dir.c_str(),
+                   (unsigned)keys.size(), (unsigned long long)(kube32::osal::System::get_uptime_ms() - t0),
+                   (unsigned long long)store->current_version(), rs.ok() ? "" : (" (" + rs.message + ")").c_str());
+        }
+        s_store = store.get();
 
         kube32::controller::NodeLifecycleConfig nl_cfg;
         nl_cfg.check_interval_ms = 1000;
@@ -705,6 +905,12 @@ void cluster_task(void* pv) {
         deployments = std::make_unique<kube32::controller::DeploymentController>(*store, scheduler.get());
         deployments->start();
 
+        kube32::controller::WorkloadControllerConfig wc_cfg;
+        wc_cfg.reconcile_interval_ms = 1000;
+        wc_cfg.stack_in_psram = ident.has_psram;
+        workloads = std::make_unique<kube32::controller::WorkloadController>(*store, scheduler.get(), wc_cfg);
+        workloads->start();
+
         kube32::api::HttpServerOptions http_opts;
         http_opts.host = "0.0.0.0";
         http_opts.port = 6443;
@@ -719,66 +925,126 @@ void cluster_task(void* pv) {
         http_opts.watch_streams = ident.has_psram ? 8 : 4;
         http_opts.watch_stack_bytes = 16384;
         http_opts.watch_stack_in_psram = ident.has_psram;
+        // HTTPS on the same port: kubectl sends a bearer token only over TLS.
+        // The key and self-signed certificate are made once and kept in NVS.
+        {
+            static std::unique_ptr<kube32::osal::TlsServer> tls;
+            std::string tls_error;
+            const uint64_t t0 = kube32::osal::System::get_uptime_ms();
+            const size_t ram0 = heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+            tls = kube32::osal::TlsServer::create({ident.name}, {ip},
+                [](std::string& key, std::string& cert) { return read_nvs_blob("tls_key", key) && read_nvs_blob("tls_crt", cert); },
+                [](const std::string& key, const std::string& cert) { write_nvs_blob("tls_key", key); write_nvs_blob("tls_crt", cert); },
+                tls_error);
+            if (tls) {
+                http_opts.tls = tls.get();
+                s_tls = tls.get();
+                printf("[TLS] API server certificate ready in %llu ms (%d bytes internal RAM): https://%s:6443, tls-server-name kube32-apiserver\n",
+                       (unsigned long long)(kube32::osal::System::get_uptime_ms() - t0),
+                       (int)((long)ram0 - (long)heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT)), ip.c_str());
+            } else {
+                printf("[TLS] off: %s\n", tls_error.c_str());
+            }
+        }
         api_server = std::make_unique<kube32::api::HttpServer>(http_opts, *store, scheduler.get());
-        api_server->route_handler().set_lease_callback([nl = node_lifecycle.get()](const std::string& node) {
-            if (nl) nl->record_node_lease(node);
-        });
+        if (s_api_token_set) api_server->route_handler().set_bearer_token(api_token);
+        // Node proxy (/api/v1/nodes/<node>/proxy/...): this node's storage
+        // in-process, the workers' through their kubelet endpoint
+        static std::unique_ptr<kube32::api::NodeProxyHandler> node_proxy;
+        node_proxy = std::make_unique<kube32::api::NodeProxyHandler>(*store, api_server->route_handler(), ident.name,
+            [](kube32::api::HttpConnection& conn, std::string_view path) {
+                if (!kube32::app::is_node_storage_path(path)) return false;
+                return kube32::app::serve_node_storage(conn, path, std::string(), 8u * 1024 * 1024);
+            });
+        if (s_api_token_set) node_proxy->set_node_token(api_token);
+        api_server->set_handler(node_proxy.get());
         if (!api_server->start()) ESP_LOGE(TAG, "API server failed to start");
+
+        // k32_http_call: Services resolved from the store
+        static std::unique_ptr<kube32::app::ServiceClient> service_client;
+        kube32::app::ServiceClientOptions sc_opts;
+        sc_opts.pool_size = 4;
+        service_client = std::make_unique<kube32::app::ServiceClient>(kube32::app::make_store_service_resolver(*store), sc_opts);
+        kube32::app::install_service_client(service_client.get());
         s_api_server = api_server.get();
         printf("[CONTROL-PLANE] API server http://%s:6443, scheduler + node lifecycle active\n", ip.c_str());
+
+        // Pods here behind a Service are reached by service calls from other
+        // nodes through the pod HTTP server; the ingress calls them in-process.
+        // One worker: its stack (PSRAM) holds one request pod's interpreter.
+        {
+            kube32::app::PodServerOptions po;
+            po.port = 7000;
+            po.workers = 1;
+            po.worker_stack = 49152;
+            po.core_affinity = 1;
+            po.stacks_in_psram = ident.has_psram;
+            if (s_api_token_set) po.token = api_token;
+            pod_server = std::make_unique<kube32::app::PodServer>(po);
+            if (pod_server->start()) kubelet_cfg.kubelet_port = po.port;
+        }
 
         kubelet_cfg.api_server_host = "127.0.0.1";
         kubelet_cfg.api_server_port = 6443;
         kubelet = std::make_unique<kube32::kubelet::Kubelet>(kubelet_cfg, *wasm_runtime);
         kubelet->start();
 
-        kube32::app::AppWiringOptions aw;
-        aw.app_name = "tessera";
-        aw.core_pod = "tessera-core";
-        aw.local_node_name = ident.name;
-        aw.store = store.get();
-        aw.run_ingress = true;
-        aw.ingress_port = 80;
-        aw.ingress_workers = ident.has_psram ? 2 : 1;
-        aw.ingress_worker_stack = ident.has_psram ? 65536 : 8192;   // local pod calls run the interpreter here (same depth as the kubelet's k32_init)
-        aw.ingress_rx_buffer = ident.has_psram ? 4096 : 2560;
-        // The ingress calls a local request-handling pod directly; the pod
-        // HTTP server only matters on worker nodes that host such pods. Not
-        // starting it here keeps 64 KB of PSRAM for the pod runtime itself.
-        aw.run_pod_server = false;
-        aw.pod_workers = 1;
-        aw.pod_worker_stack = 65536;
-        aw.pod_port = 7000;
-        aw.core_affinity = 1;
-        aw.stacks_in_psram = ident.has_psram;
-        aw.cluster_events_from_hub = false;
-        wiring = std::make_unique<kube32::app::AppWiring>(aw);
-        wiring->start();
+        // Ingress controller on port 80, routes from networking.k8s.io/v1
+        // Ingress objects. It calls request-handling pods on this node
+        // directly.
+        kube32::app::IngressControllerOptions io;
+        io.store = store.get();
+        io.local_node_name = ident.name;
+        io.address = [nm = net_mgr.get()]() { return nm->get_ip_address(); };
+        io.port = 80;
+        // One worker: calls into a pod are serialized per pod anyway, and SSE
+        // streams leave the worker once their head is sent. Each worker stack
+        // holds a local pod call (the interpreter recursion peaks near 56 KB),
+        // so a second one would cost 64 KB of PSRAM that a second app's pod
+        // needs more.
+        io.workers = 1;
+        io.worker_stack = ident.has_psram ? 65536 : 8192;
+        io.rx_buffer = ident.has_psram ? 4096 : 2560;
+        io.core_affinity = 1;
+        io.stacks_in_psram = ident.has_psram;
+        ingress = std::make_unique<kube32::app::IngressController>(io);
+        ingress->start();
     } else {
         kubelet_cfg.api_server_host = api_host;
         kubelet_cfg.api_server_port = 6443;
         // The control plane may sit on another access point: reach it over UDP too
         kube32::ipc::ChannelManager::instance().add_seed_peer(api_host, 7400);
+
+        // The pod HTTP server: the ingress controller and other nodes' service
+        // calls reach request-handling pods here, and it is the kubelet
+        // endpoint for node storage. A board without PSRAM runs one worker
+        // whose stack holds one request pod's interpreter.
+        kube32::app::PodServerOptions po;
+        po.port = 7000;
+        po.workers = ident.has_psram ? 2 : 1;
+        // Without PSRAM pods are interpreted on the shared interpreter stack;
+        // the worker's own stack only serves HTTP and node storage
+        po.worker_stack = ident.has_psram ? 24576 : 12288;   // FATFS over SPI for node storage needs about 10 KB
+        po.rx_buffer = ident.has_psram ? 4096 : 2048;
+        po.core_affinity = 1;
+        po.stacks_in_psram = ident.has_psram;
+        if (s_api_token_set) po.token = api_token;
+        pod_server = std::make_unique<kube32::app::PodServer>(po);
+        if (pod_server->start()) kubelet_cfg.kubelet_port = po.port;
+
+        // k32_http_call: Services and their Endpoints read from the API server
+        static std::shared_ptr<kube32::kubelet::HttpKubeClient> svc_api;
+        svc_api = std::make_shared<kube32::kubelet::HttpKubeClient>(api_host, 6443);
+        if (s_api_token_set) svc_api->set_bearer_token(api_token);
+        if (!ident.has_psram) svc_api->set_max_body(16 * 1024);
+        static std::unique_ptr<kube32::app::ServiceClient> service_client;
+        service_client = std::make_unique<kube32::app::ServiceClient>(kube32::app::make_api_service_resolver(
+            [](const std::string& path, std::string& body) { return svc_api->get(path, body); }));
+        kube32::app::install_service_client(service_client.get());
+
         kubelet = std::make_unique<kube32::kubelet::Kubelet>(kubelet_cfg, *wasm_runtime);
         kubelet->start();
         printf("[WORKER] kubelet -> http://%s:6443\n", api_host.c_str());
-
-        kube32::app::AppWiringOptions aw;
-        aw.app_name = "tessera";
-        aw.core_pod = "tessera-core";
-        aw.local_node_name = ident.name;
-        // Pods with a card volume are worth reaching over HTTP (GET /log on
-        // sdnote): one 12 KB worker when a card is mounted on a no-PSRAM board.
-        // Boards without PSRAM cannot spare 16 KB for a pod HTTP server next to
-        // the HUD; request-handling pods belong on PSRAM nodes.
-        aw.run_pod_server = ident.has_psram;
-        aw.pod_port = 7000;
-        aw.pod_workers = ident.has_psram ? 2 : 1;
-        aw.pod_worker_stack = ident.has_psram ? 24576 : 12288;
-        aw.core_affinity = 1;
-        aw.stacks_in_psram = ident.has_psram;
-        wiring = std::make_unique<kube32::app::AppWiring>(aw);
-        wiring->start();
         if (has_display) {
             kube32::hal::display_fill_rect(0, 0, kube32::hal::LCD_WIDTH, 18, 0x194B);
             // The boot screen stays product-neutral on purpose: what runs the
@@ -795,7 +1061,7 @@ void cluster_task(void* pv) {
     // Console on a small task of its own
     console.init(ident.has_display);   // USB-Serial-JTAG on the display board, UART0 (CH340) on the devkit
     if (!ident.is_control_plane) s_forward_host = api_host;   // workers relay console HTTP to the control plane
-    if (wiring) s_ingress_server = wiring->ingress_server();
+    if (ingress) s_ingress_server = ingress->server();
     static std::pair<Console*, NodeIdentity*> console_ctx(&console, &ident);
     xTaskCreatePinnedToCore(console_task, "k32_console", 4096, &console_ctx, 4, nullptr, 0);
 
@@ -822,30 +1088,22 @@ void cluster_task(void* pv) {
         }, nullptr, t_cfg);
     }
 
-    // Housekeeping: stats line for the display pod, memory log
+    // Housekeeping: ingress controller tick (routing table, Ingress status,
+    // stats topics, telemetry streams), peer seeding, memory log
     uint32_t iter = 0;
-    uint64_t last_req = 0;
     while (true) {
         vTaskDelay(pdMS_TO_TICKS(1000));
         iter++;
-        uint64_t now = kube32::osal::System::get_uptime_ms();
-        if (ident.is_control_plane && wiring && wiring->ingress_server()) {
-            uint64_t reqs = wiring->ingress_server()->metrics().requests.load();
-            uint32_t rps = static_cast<uint32_t>(reqs - last_req);
-            last_req = reqs;
-            char ev[160];
-            int l = snprintf(ev, sizeof(ev), "{\"t\":\"stats\",\"rps\":%u,\"viewers\":%u,\"heap_kb\":%u,\"uptime_s\":%u}",
-                             rps, (unsigned)wiring->ingress()->sse().count(),
-                             (unsigned)(heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT) / 1024), (unsigned)(now / 1000));
-            kube32::ipc::ChannelManager::instance().publish("ingress", "tessera.events", reinterpret_cast<const uint8_t*>(ev), static_cast<size_t>(l));
-            if (iter % 2 == 0 && wiring->ingress()->sse().count() > 0) {
-                // Telemetry is best effort: an allocation failure skips one update
-                // instead of aborting the node
-                try {
-                    wiring->ingress()->sse().broadcast("cluster", wiring->ingress()->build_cluster_json());
-                } catch (const std::exception& e) {
-                    printf("[INGRESS] telemetry skipped: %s\n", e.what());
-                }
+        if (ingress) ingress->tick();
+        if (store) {
+            // Changes reach the journal here, on this task's internal-RAM stack
+            kube32::hal::node_storage_call([&]() { store->flush(false); });
+            // Objects made before the clock was set get their timestamps once it is
+            static int backfills = 0;
+            if (backfills < 2 && kube32::osal::System::get_unix_time_ms() != 0 && (backfills == 0 || iter % 60 == 0)) {
+                size_t n = kube32::api::backfill_timestamps(*store);
+                if (n) printf("[CLOCK] timestamps set on %u object(s) created before the clock synchronized\n", (unsigned)n);
+                ++backfills;
             }
         }
         if (ident.is_control_plane && store && iter % 10 == 0) try {

@@ -11,9 +11,9 @@
 //!   GET  /env         {"greeting":"<GREETING>"} or {"greeting":null}
 //!   anything else     404
 //!
-//! `events_seen` counts the events on EVENT_TOPIC delivered to `k32_event`:
-//! the node hands `<app>.events` to every pod that exports it, this one
-//! included. `event` is "denied" when the manifest does not grant
+//! `events_seen` counts the events on EVENT_TOPIC delivered to `k32_event`,
+//! which happens when the pod's manifest lists that topic in the annotation
+//! `kube32.io/event-topics`. `event` is "denied" when the manifest does not grant
 //! `hardware.kube32.io/ipc` (the capability firewall answers K32_ERR_PERM).
 //!
 //! Build: cargo build --release --target wasm32-unknown-unknown   (in sdk/rust)

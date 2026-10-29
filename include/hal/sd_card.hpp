@@ -37,4 +37,8 @@ SdInfo sd_info();
 // not mounted.
 std::string sd_root_path();
 
+// GPIOs of the card's SPI bus on the board (0 on the host), for the board
+// profile's reserved pins.
+uint64_t sd_gpio_mask();
+
 } // namespace kube32::hal

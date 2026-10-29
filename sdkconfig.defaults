@@ -48,6 +48,13 @@ CONFIG_FATFS_MAX_LFN=255
 
 CONFIG_LWIP_MAX_ACTIVE_TCP=32
 
-# FatFs sizes its buffers by max(SD sector, wear-levelling sector); no internal
-# flash FAT is used, so keep both at 512 bytes (saves ~24 KB with an SD card)
+# FatFs sizes its buffers by max(SD sector, wear-levelling sector): 512 bytes
+# for both keeps them small on the card and on the internal flash FAT that
+# boards without a card mount as their storage
 CONFIG_WL_SECTOR_SIZE_512=y
+
+# TLS on the API port (control plane): mbedTLS memory comes from PSRAM where
+# a board has it (esp_mbedtls_mem_calloc in src/osal/tls_mbedtls.cpp), and
+# record buffers are allocated per record instead of held per connection
+CONFIG_MBEDTLS_CUSTOM_MEM_ALLOC=y
+CONFIG_MBEDTLS_DYNAMIC_BUFFER=y

@@ -1,6 +1,7 @@
 #if defined(KUBE32_TARGET_ESP32)
 
 #include "hal/tft_keyboard_hardware.hpp"
+#include <initializer_list>
 #include "esp_log.h"
 #include "esp_heap_caps.h"
 #include "driver/spi_master.h"
@@ -438,6 +439,16 @@ static void keyboard_task(void* pvParameters) {
 
         vTaskDelay(pdMS_TO_TICKS(20));
     }
+}
+
+uint64_t peripheral_gpio_mask() {
+    uint64_t mask = 0;
+    for (int pin : {PIN_LCD_MOSI, PIN_LCD_SCLK, PIN_LCD_CS, PIN_LCD_DC, PIN_LCD_RST, PIN_LCD_BACKLIGHT,
+                    PIN_I2S_BCLK, PIN_I2S_DATA, PIN_I2S_LRCK, PIN_SPEAKER, PIN_KB_A0, PIN_KB_A1, PIN_KB_A2}) {
+        mask |= 1ULL << pin;
+    }
+    for (gpio_num_t row : KB_ROWS) mask |= 1ULL << static_cast<int>(row);
+    return mask;
 }
 
 bool init_keyboard_scanner() {

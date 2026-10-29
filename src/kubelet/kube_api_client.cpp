@@ -6,6 +6,9 @@
 #include <iostream>
 #include <cstring>
 #include <cctype>
+#include <cstdlib>
+#include <strings.h>
+#include <new>
 
 namespace kube32::kubelet {
 
@@ -160,20 +163,17 @@ std::string HttpKubeClient::decode_chunked_body(std::string_view raw_body) {
     return decoded;
 }
 
-HttpKubeClient::HttpResponse HttpKubeClient::send_http_request(const char* method, const std::string& path, const std::string& body) {
-    HttpResponse resp;
-    resp.status_code = 0;
-
+// Streams one exchange: the request goes out, the response head is parsed
+// and the body (chunked or not) reaches `on_data` as it arrives, so no copy
+// of the whole response is ever made. Returns the status, 0 when the server
+// could not be reached or the response was malformed.
+int HttpKubeClient::stream_request(const char* method, const std::string& path, const std::string& body,
+                                   const std::function<bool(const char*, size_t)>& on_data, long* out_content_length) {
+    if (out_content_length) *out_content_length = -1;
     osal::Socket sock;
-    if (!sock.create(osal::SocketType::Tcp)) {
-        return resp;
-    }
-
+    if (!sock.create(osal::SocketType::Tcp)) return 0;
     sock.set_timeout(3000, 3000);
-
-    if (!sock.connect(host_.c_str(), port_)) {
-        return resp;
-    }
+    if (!sock.connect(host_.c_str(), port_)) return 0;
 
     std::string req;
     req.reserve(256 + body.size());
@@ -186,62 +186,101 @@ HttpKubeClient::HttpResponse HttpKubeClient::send_http_request(const char* metho
     req += "Accept: application/json\r\n";
     req += "Content-Type: application/json\r\n";
     req += "Content-Length: " + std::to_string(body.size()) + "\r\n";
+    if (!token_.empty()) req += "Authorization: Bearer " + token_ + "\r\n";
     req += "Connection: close\r\n\r\n";
     req += body;
+    if (!sock.send_all(req.data(), req.size())) return 0;
+    std::string().swap(req);
 
-    if (!sock.send_all(req.data(), req.size())) {
-        return resp;
-    }
-
-    std::string raw_response;
-    char buf[4096];
-    while (true) {
+    char buf[1024];
+    std::string head;
+    int status = 0;
+    bool chunked = false;
+    // Chunked decoding: bytes left in the current chunk, or reading a size line
+    size_t chunk_left = 0;
+    bool in_size_line = true;
+    bool skip_crlf = false;
+    char size_line[20];
+    size_t size_len = 0;
+    bool done = false;
+    bool stop = false;
+    auto feed = [&](const char* p, size_t len) {
+        if (!chunked) {
+            if (!on_data(p, len)) stop = true;
+            return;
+        }
+        while (len > 0 && !done && !stop) {
+            if (skip_crlf) {
+                if (*p == '\n') skip_crlf = false;
+                ++p; --len;
+            } else if (in_size_line) {
+                char c = *p++; --len;
+                if (c == '\n') {
+                    size_line[size_len] = '\0';
+                    chunk_left = std::strtoul(size_line, nullptr, 16);
+                    size_len = 0;
+                    in_size_line = false;
+                    if (chunk_left == 0) done = true;
+                } else if (size_len + 1 < sizeof(size_line)) {
+                    size_line[size_len++] = c;
+                }
+            } else {
+                size_t take = len < chunk_left ? len : chunk_left;
+                if (!on_data(p, take)) { stop = true; return; }
+                p += take; len -= take; chunk_left -= take;
+                if (chunk_left == 0) { in_size_line = true; skip_crlf = true; }
+            }
+        }
+    };
+    while (!done && !stop) {
         int n = sock.recv(buf, sizeof(buf));
         if (n <= 0) break;
-        raw_response.append(buf, n);
-    }
-
-    if (raw_response.empty()) {
-        return resp;
-    }
-
-    // Parse HTTP Status
-    size_t line_end = raw_response.find("\r\n");
-    if (line_end != std::string::npos) {
-        std::string status_line = raw_response.substr(0, line_end);
-        // Expect: "HTTP/1.1 200 OK"
-        size_t sp1 = status_line.find(' ');
-        if (sp1 != std::string::npos) {
-            size_t sp2 = status_line.find(' ', sp1 + 1);
-            std::string code_str = (sp2 != std::string::npos) ?
-                status_line.substr(sp1 + 1, sp2 - sp1 - 1) :
-                status_line.substr(sp1 + 1);
-            try {
-                resp.status_code = std::stoi(code_str);
-            } catch (...) {}
+        if (status != 0) {
+            feed(buf, static_cast<size_t>(n));
+            continue;
         }
-    }
-
-    // Extract Headers and Body
-    size_t header_end = raw_response.find("\r\n\r\n");
-    size_t header_sep_len = 4;
-    if (header_end == std::string::npos) {
-        header_end = raw_response.find("\n\n");
-        header_sep_len = 2;
-    }
-
-    if (header_end != std::string::npos) {
-        std::string_view headers_view(raw_response.data(), header_end);
-        std::string_view raw_body(raw_response.data() + header_end + header_sep_len,
-                                  raw_response.size() - (header_end + header_sep_len));
-
-        if (is_chunked_transfer_encoding(headers_view)) {
-            resp.body = decode_chunked_body(raw_body);
-        } else {
-            resp.body = std::string(raw_body);
+        head.append(buf, static_cast<size_t>(n));
+        size_t end = head.find("\r\n\r\n");
+        if (end == std::string::npos) {
+            if (head.size() > 4096) return 0;
+            continue;
         }
+        size_t sp = head.find(' ');
+        if (sp == std::string::npos) return 0;
+        status = std::atoi(head.c_str() + sp + 1);
+        if (status <= 0) return 0;
+        chunked = is_chunked_transfer_encoding(std::string_view(head.data(), end));
+        if (out_content_length) {
+            for (size_t cl = head.find('\n'); cl != std::string::npos && cl < end; cl = head.find('\n', cl + 1)) {
+                if (head.size() - cl > 16 && strncasecmp(head.c_str() + cl + 1, "content-length:", 15) == 0) {
+                    *out_content_length = std::strtol(head.c_str() + cl + 16, nullptr, 10);
+                    break;
+                }
+            }
+        }
+        // Body bytes that arrived with the head
+        if (head.size() > end + 4) feed(head.data() + end + 4, head.size() - end - 4);
+        std::string().swap(head);
     }
+    return status;
+}
 
+HttpKubeClient::HttpResponse HttpKubeClient::send_http_request(const char* method, const std::string& path, const std::string& body) {
+    HttpResponse resp;
+    bool too_big = false;
+    resp.status_code = stream_request(method, path, body, [&](const char* data, size_t len) {
+        if (max_body_ && resp.body.size() + len > max_body_) {
+            too_big = true;
+            return false;
+        }
+        resp.body.append(data, len);
+        return true;
+    });
+    if (too_big) {
+        std::cout << "[KUBELET] " << method << " " << path.substr(0, 80) << ": response over " << max_body_ << " bytes, dropped" << std::endl;
+        resp.status_code = 0;
+        std::string().swap(resp.body);
+    }
     return resp;
 }
 
@@ -269,8 +308,8 @@ bool HttpKubeClient::patch_node_status(const std::string& node_name, const std::
 
 bool HttpKubeClient::renew_node_lease(const std::string& node_name, uint32_t duration_sec, const std::string& renew_time_iso8601) {
     std::string path = "/apis/coordination.k8s.io/v1/namespaces/kube-node-lease/leases/" + node_name;
-    // renewTime is omitted while the node has no wall clock; the control plane
-    // timestamps the renewal on arrival (NodeLifecycleController).
+    // renewTime is omitted while the node has no wall clock; the API server
+    // stamps the renewal on arrival.
     std::string lease_json = "{\"apiVersion\":\"coordination.k8s.io/v1\",\"kind\":\"Lease\","
                              "\"metadata\":{\"name\":\"" + node_name + "\",\"namespace\":\"kube-node-lease\"},"
                              "\"spec\":{\"holderIdentity\":\"" + node_name + "\","
@@ -309,25 +348,163 @@ bool HttpKubeClient::list_pods(std::vector<models::KubePod>& out_pods) {
     return true;
 }
 
-bool HttpKubeClient::list_pods_raw(std::vector<std::pair<models::KubePod, std::string>>& out_pods_with_manifest) {
-    std::string path = node_filter_.empty() ? std::string("/api/v1/pods") : ("/api/v1/pods?fieldSelector=spec.nodeName%3D" + node_filter_);
-    HttpResponse resp = send_http_request("GET", path, "");
-    if (resp.status_code != 200) {
-        return false;
-    }
+namespace {
 
-    models::JsonValue doc;
-    std::string err;
-    if (!models::parse_json(resp.body, doc, err) || !doc.is_object()) {
-        return false;
-    }
-
-    const models::JsonValue* items = doc.get("items");
-    if (items && items->is_array()) {
-        for (const auto& item : items->arr_val) {
-            std::string manifest_str = item.to_string();
-            out_pods_with_manifest.emplace_back(models::parse_pod_manifest(manifest_str), std::move(manifest_str));
+// Splits a list response into its items as the bytes arrive: each element of
+// the top-level "items" array is handed over as one JSON text.
+class ListItemSplitter {
+public:
+    explicit ListItemSplitter(std::function<void(std::string&&)> on_item) : on_item_(std::move(on_item)) {}
+    void feed(const char* p, size_t n) {
+        for (size_t i = 0; i < n; ++i) {
+            const char c = p[i];
+            const bool in_item = in_items_ && depth_ >= 3;
+            if (in_item) item_.push_back(c);
+            if (in_string_) {
+                if (escape_) escape_ = false;
+                else if (c == '\\') escape_ = true;
+                else if (c == '"') {
+                    in_string_ = false;
+                    if (depth_ == 1 && !in_items_) last_key_ = key_;
+                } else if (depth_ == 1 && key_.size() < 16) key_.push_back(c);
+                continue;
+            }
+            switch (c) {
+                case '"':
+                    in_string_ = true;
+                    key_.clear();
+                    break;
+                case '{':
+                case '[':
+                    if (c == '[' && depth_ == 1 && last_key_ == "items") in_items_ = true;
+                    ++depth_;
+                    if (in_items_ && depth_ == 3 && c == '{') { item_.clear(); item_.push_back('{'); }
+                    break;
+                case '}':
+                case ']':
+                    --depth_;
+                    if (depth_ == 0) complete_ = true;
+                    if (in_items_ && depth_ == 2 && c == '}') {
+                        on_item_(std::move(item_));
+                        item_.clear();
+                    } else if (in_items_ && depth_ == 1) {
+                        in_items_ = false;
+                        last_key_.clear();
+                    }
+                    break;
+                default:
+                    break;
+            }
         }
+    }
+    // The whole document arrived (its outermost value closed)
+    bool complete() const { return complete_; }
+private:
+    std::function<void(std::string&&)> on_item_;
+    bool complete_{false};
+    std::string item_;
+    std::string key_, last_key_;
+    int depth_{0};
+    bool in_string_{false};
+    bool escape_{false};
+    bool in_items_{false};
+};
+
+// Finds "kube32.io/wasm-base64":"<value>" in a stream and decodes the value
+class InlineImageExtractor {
+public:
+    explicit InlineImageExtractor(std::vector<uint8_t>& out) : out_(out) {}
+    void feed(const char* p, size_t n) {
+        static const char kKey[] = "\"kube32.io/wasm-base64\":\"";
+        for (size_t i = 0; i < n && !done_; ++i) {
+            const char c = p[i];
+            if (!in_value_) {
+                if (c == kKey[matched_]) {
+                    if (++matched_ == sizeof(kKey) - 1) in_value_ = true;
+                } else {
+                    matched_ = (c == kKey[0]) ? 1 : 0;
+                }
+                continue;
+            }
+            if (c == '"') { done_ = true; break; }
+            if (c == '\\') continue;   // "\/" is an escaped '/'
+            int v = (c >= 'A' && c <= 'Z') ? c - 'A' : (c >= 'a' && c <= 'z') ? c - 'a' + 26 : (c >= '0' && c <= '9') ? c - '0' + 52
+                  : (c == '+' || c == '-') ? 62 : (c == '/' || c == '_') ? 63 : -1;
+            if (v < 0) continue;   // padding, whitespace
+            acc_ = (acc_ << 6) | static_cast<uint32_t>(v);
+            bits_ += 6;
+            if (bits_ >= 8) {
+                bits_ -= 8;
+                out_.push_back(static_cast<uint8_t>((acc_ >> bits_) & 0xFF));
+            }
+        }
+    }
+    bool found() const { return done_; }
+private:
+    std::vector<uint8_t>& out_;
+    size_t matched_{0};
+    bool in_value_{false};
+    bool done_{false};
+    uint32_t acc_{0};
+    int bits_{0};
+};
+
+} // namespace
+
+bool HttpKubeClient::list_pods_raw(std::vector<std::pair<models::KubePod, std::string>>& out_pods_with_manifest) {
+    std::string path = node_filter_.empty() ? std::string("/api/v1/pods?inlineImages=omit")
+                                            : ("/api/v1/pods?fieldSelector=spec.nodeName%3D" + node_filter_ + "&inlineImages=omit");
+    bool unreadable = false;
+    ListItemSplitter splitter([&](std::string&& item) {
+        models::KubePod pod = models::parse_pod_manifest(item);
+        // An item that does not parse (out of memory) must not read as a pod gone
+        if (pod.name.empty()) unreadable = true;
+        out_pods_with_manifest.emplace_back(std::move(pod), std::move(item));
+    });
+    int status = stream_request("GET", path, "", [&](const char* data, size_t len) {
+        splitter.feed(data, len);
+        return true;
+    });
+    // A list cut short (connection lost, node out of memory) is no list: the
+    // pods missing from it must not be taken as deleted
+    if (status != 200 || !splitter.complete() || unreadable) {
+        out_pods_with_manifest.clear();
+        return false;
+    }
+    return true;
+}
+
+bool HttpKubeClient::get_pod_image(const std::string& ns, const std::string& name, std::vector<uint8_t>& out, std::string& why) {
+    out.clear();
+    InlineImageExtractor ex(out);
+    bool reserved = false;
+    long content_length = -1;
+    int status = 0;
+    try {
+        status = stream_request("GET", "/api/v1/namespaces/" + ns + "/pods/" + name, "", [&](const char* data, size_t len) {
+            if (!reserved) {
+                reserved = true;
+                // The image is most of the pod: three quarters of the response
+                // bounds it, one allocation instead of repeated growth
+                if (content_length > 0) out.reserve(static_cast<size_t>(content_length) / 4 * 3);
+            }
+            ex.feed(data, len);
+            return !ex.found();
+        }, &content_length);
+    } catch (const std::bad_alloc&) {
+        why = "not enough memory for the image of pod " + ns + "/" + name + " (" + std::to_string(content_length) + " byte pod)";
+        std::vector<uint8_t>().swap(out);
+        return false;
+    }
+    if (status != 200) {
+        why = "pod " + ns + "/" + name + ": http " + std::to_string(status);
+        out.clear();
+        return false;
+    }
+    if (!ex.found() || out.empty()) {
+        why = "pod " + ns + "/" + name + " has no kube32.io/wasm-base64 annotation";
+        out.clear();
+        return false;
     }
     return true;
 }
@@ -355,6 +532,12 @@ bool HttpKubeClient::create_event(const std::string& ns, const std::string& even
 bool HttpKubeClient::push_pod_logs(const std::string& ns, const std::string& name, const std::string& ndjson) {
     HttpResponse resp = send_http_request("POST", "/api/v1/namespaces/" + ns + "/pods/" + name + "/log", ndjson);
     return resp.status_code == 200;
+}
+
+int HttpKubeClient::get(const std::string& path, std::string& out_body) {
+    HttpResponse resp = send_http_request("GET", path, "");
+    out_body = std::move(resp.body);
+    return resp.status_code;
 }
 
 bool HttpKubeClient::delete_pod(const std::string& ns, const std::string& name) {

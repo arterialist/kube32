@@ -22,6 +22,7 @@ enum class PodExecutionPhase {
     ContainerCreating,
     Running,
     CrashLoopBackOff,
+    CreateContainerConfigError,   // env references could not be resolved; retried after next_restart_allowed_ms
     Terminating,
     Completed,
     Failed
@@ -34,25 +35,41 @@ struct LocalPodRecord {
     std::string container_name;
     std::string image;
     PodExecutionPhase execution_phase{PodExecutionPhase::Pending};
-    uint32_t restart_count{0};
+    std::string restart_policy{"Always"};    // spec.restartPolicy
+    uint32_t restart_count{0};               // containers restarted so far (status restartCount)
+    uint32_t crash_streak{0};                // restarts since the container last ran 10 minutes
     uint64_t started_at_ms{0};
-    uint64_t next_restart_allowed_ms{0};
+    uint64_t next_restart_allowed_ms{0};     // end of the CrashLoopBackOff delay, or of the wait before a config retry
+    bool restart_due{false};                 // a container exited and the next start is a restart
+    // Last terminated container, reported as lastState after a restart
+    int32_t last_exit_code{0};
+    std::string last_reason;
+    std::string last_finished_at;
     std::string last_error_message;
     std::string pod_ip;
     uint32_t memory_limit_bytes{64 * 1024};
     uint64_t requested_gpio_mask{0};
     // Log shipping and metrics rate state
     uint64_t shipped_log_seq{0};
+    uint64_t log_instance_start_seq{0};      // runtime log lines up to this seq were written before the last (re)start
     bool has_cpu_sample{false};
     uint64_t last_cpu_busy_us{0};
     uint64_t last_cpu_wall_us{0};
 };
 
 struct KubeletConfig {
-    std::string node_name{"esp32-node-01"};
+    std::string node_name;                 // DNS-1123 label, unique in the cluster
     std::string api_server_host{"127.0.0.1"};
     uint16_t api_server_port{6443};
+    std::string api_token;                 // bearer token for the API server, empty when it has none
+    size_t api_max_body{0};                // largest API response kept in memory (0: no limit)
+    // Labels the node sets on its Node object besides kubernetes.io/hostname,
+    // kubernetes.io/arch and the role label (for example kube32.io/board).
+    std::map<std::string, std::string> node_labels;
     std::string node_ip{"127.0.0.1"};
+    // Port of this node's kubelet endpoint (the pod HTTP server: node storage
+    // through the API server's node proxy), 0 when the node runs none
+    uint16_t kubelet_port{0};
     std::function<std::string()> node_ip_provider;   // re-read before registering/heartbeating (DHCP may arrive late)
     bool control_plane{false};
     
@@ -61,6 +78,13 @@ struct KubeletConfig {
     uint32_t heartbeat_interval_ms{5000};
     uint32_t pod_status_frequency_ms{2000};
     uint32_t memory_pressure_threshold_bytes{24576}; // 24 KiB DRAM threshold
+    // The node reports Ready only while the pod sync loop keeps completing:
+    // NotReady once the last completed pass is older than this.
+    uint32_t sync_stall_threshold_ms{60000};
+    // Restart back-off (restartPolicy Always/OnFailure): initial delay,
+    // doubled per consecutive restart up to the maximum, as in Kubernetes.
+    uint32_t restart_backoff_initial_ms{10000};
+    uint32_t restart_backoff_max_ms{300000};
 
     // Task & concurrency configuration
     size_t task_stack_size{65536};
@@ -108,8 +132,17 @@ private:
     void run_loop();
     void run_heartbeat_loop();
 
-    // Pod lifecycle actions
-    bool deploy_and_start_pod(const models::KubePod& pod, const std::string& manifest_json);
+    // Fills the Ready condition from the health of the pod sync loop.
+    void fill_ready_condition(NodeTelemetry& t) const;
+
+    // Pod lifecycle actions. `previous` carries restart state when the pod
+    // is being restarted after a back-off.
+    bool deploy_and_start_pod(const models::KubePod& pod, const std::string& manifest_json, const LocalPodRecord* previous = nullptr);
+    // The container ended (exit, trap or failed start): restart it after a
+    // back-off when restartPolicy asks for it, otherwise report the pod
+    // Succeeded or Failed. Releases the container either way.
+    void handle_container_exit(const std::string& pod_key, LocalPodRecord& rec, int32_t exit_code,
+                               const std::string& reason, const std::string& message);
     bool terminate_pod(const std::string& pod_key);
     void handle_pod_failure(LocalPodRecord& rec, const runtime::ContainerStatus& cs);
     void handle_pod_failure(LocalPodRecord& rec, const std::string& exit_msg, int32_t exit_code = 137, const std::string& reason = "ContainerFailed");
@@ -136,6 +169,8 @@ private:
     uint64_t last_sync_ms_{0};
     uint64_t last_status_report_ms_{0};
     uint32_t heartbeat_failures_{0};
+    std::atomic<uint64_t> last_sync_ok_ms_{0};     // end of the last pod sync pass that listed pods
+    std::atomic<bool> heartbeat_due_{false};       // send the next heartbeat without waiting
 
     // Local state map: key = namespace/name
     std::map<std::string, LocalPodRecord> active_pods_;

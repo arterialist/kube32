@@ -90,7 +90,7 @@ else()
     )
     add_library(wasm3 STATIC ${WASM3_SRCS})
     target_include_directories(wasm3 PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/third_party/wasm3/source)
-    target_compile_definitions(wasm3 PUBLIC d_m3CodePageAlignSize=4096 d_m3HasExceptionHandling=0 d_m3HasTypedRefs=0 d_m3HasStackSwitching=0 d_m3HasSnapshots=0 d_m3RecordBacktraces=0)
+    target_compile_definitions(wasm3 PUBLIC d_m3CodePageAlignSize=4096 d_m3MaxFunctionStackHeight=1024 d_m3HasExceptionHandling=0 d_m3HasTypedRefs=0 d_m3HasStackSwitching=0 d_m3HasSnapshots=0 d_m3RecordBacktraces=0)
 
     # Core Library: OSAL, Memory Architecture, Storage Engine, API Server, Scheduler, HAL, Runtime, Kubelet
     set(KUBE32_CORE_SRCS
@@ -99,11 +99,15 @@ else()
         src/osal/condition_variable_posix.cpp
         src/osal/timer_posix.cpp
         src/osal/socket_posix.cpp
+        src/osal/tls_mbedtls.cpp
+        src/osal/tls_openssl.cpp
         src/osal/system_posix.cpp
         src/mem/memory_tier.cpp
         src/mem/monotonic_arena.cpp
         src/storage/radix_tree.cpp
         src/storage/littlefs_journal.cpp
+        src/storage/flash_log.cpp
+        src/storage/persist_policy.cpp
         src/storage/store.cpp
         src/models/kube_models.cpp
         src/models/kube_lease.cpp
@@ -111,6 +115,7 @@ else()
         src/net/mdns_discovery.cpp
         src/controller/node_lifecycle_controller.cpp
         src/controller/deployment_controller.cpp
+        src/controller/workload_controller.cpp
         src/ipc/channel.cpp
         src/api/table_serializer.cpp
         src/api/selectors.cpp
@@ -119,9 +124,15 @@ else()
         src/api/metrics_registry.cpp
         src/api/route_handler.cpp
         src/api/http_server.cpp
+        src/api/version_info.cpp
+        src/api/timestamp_backfill.cpp
+        src/api/node_proxy.cpp
+        src/api/protobuf_body.cpp
         src/scheduler/scheduler.cpp
         src/hal/capability_firewall.cpp
         src/hal/sd_card.cpp
+        src/hal/node_storage.cpp
+        src/hal/pod_buses.cpp
         src/hal/mock_hal.cpp
         src/runtime/host_functions.cpp
         src/runtime/container_lifecycle.cpp
@@ -131,19 +142,26 @@ else()
         src/runtime/image_registry.cpp
         src/runtime/pod_fs.cpp
         src/runtime/pod_memory_pool.cpp
-        src/app/ingress.cpp
-        src/app/app_wiring.cpp
+        src/runtime/pod_assets.cpp
+        src/app/ingress_controller.cpp
+        src/app/ingress_routes.cpp
+        src/app/pod_server.cpp
+        src/app/service_client.cpp
+        src/app/node_storage_api.cpp
         src/kubelet/node_status_reporter.cpp
         src/kubelet/metrics_provider.cpp
         src/kubelet/kube_api_client.cpp
         src/kubelet/kubelet.cpp
+        src/kubelet/pod_env.cpp
         ${CMAKE_BINARY_DIR}/generated/embedded_blobs.cpp
     )
 
-    # Embedded images (images/*.wasm) and web assets (images/web/*) are turned
-    # into a generated source so the host simulator serves the same bytes as
-    # the firmware.
-    file(GLOB KUBE32_EMBED_INPUTS ${CMAKE_CURRENT_SOURCE_DIR}/images/*.wasm ${CMAKE_CURRENT_SOURCE_DIR}/images/web/*/*)
+    # Embedded images (images/*.wasm) and static bundles (images/web/<bundle>/)
+    # are turned into a generated source so the host simulator serves the same
+    # bytes as the firmware.
+    file(GLOB KUBE32_EMBED_INPUTS ${CMAKE_CURRENT_SOURCE_DIR}/images/*.wasm)
+    file(GLOB_RECURSE KUBE32_EMBED_BUNDLE_INPUTS CONFIGURE_DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/images/web/*)
+    list(APPEND KUBE32_EMBED_INPUTS ${KUBE32_EMBED_BUNDLE_INPUTS})
     add_custom_command(
         OUTPUT ${CMAKE_BINARY_DIR}/generated/embedded_blobs.cpp
         COMMAND python3 ${CMAKE_CURRENT_SOURCE_DIR}/tools/embed_assets.py --host-out ${CMAKE_BINARY_DIR}/generated
@@ -151,14 +169,53 @@ else()
         COMMENT "Embedding Wasm images and web assets"
     )
 
+    # Build identity for GET /version (commit, tree state, build time). The
+    # header is regenerated when a source file or the git checkout changes.
+    set(KUBE32_BUILD_INFO_H ${CMAKE_BINARY_DIR}/generated/kube32_build_info.h)
+    file(GLOB_RECURSE KUBE32_BUILD_INFO_INPUTS CONFIGURE_DEPENDS
+         ${CMAKE_CURRENT_SOURCE_DIR}/src/*.cpp ${CMAKE_CURRENT_SOURCE_DIR}/src/*.c
+         ${CMAKE_CURRENT_SOURCE_DIR}/include/*.hpp ${CMAKE_CURRENT_SOURCE_DIR}/include/*.h)
+    foreach(git_file HEAD index logs/HEAD)
+        if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/.git/${git_file})
+            list(APPEND KUBE32_BUILD_INFO_INPUTS ${CMAKE_CURRENT_SOURCE_DIR}/.git/${git_file})
+        endif()
+    endforeach()
+    add_custom_command(
+        OUTPUT ${KUBE32_BUILD_INFO_H}
+        COMMAND ${CMAKE_COMMAND} -DSOURCE_DIR=${CMAKE_CURRENT_SOURCE_DIR} -DOUTPUT=${KUBE32_BUILD_INFO_H}
+                -P ${CMAKE_CURRENT_SOURCE_DIR}/cmake/kube32_build_info.cmake
+        DEPENDS ${KUBE32_BUILD_INFO_INPUTS} ${CMAKE_CURRENT_SOURCE_DIR}/cmake/kube32_build_info.cmake
+        COMMENT "Recording build info"
+    )
+
     add_library(kube32_core STATIC
         ${KUBE32_CORE_SRCS}
+        ${KUBE32_BUILD_INFO_H}
     )
     target_include_directories(kube32_core PUBLIC
         ${CMAKE_CURRENT_SOURCE_DIR}/include
         ${CMAKE_CURRENT_SOURCE_DIR}/third_party/wasm3/source
     )
+    target_include_directories(kube32_core PRIVATE ${CMAKE_BINARY_DIR}/generated)
     target_link_libraries(kube32_core PUBLIC wasm3 pthread)
+
+    # TLS on the simulator's API port (--tls): OpenSSL when the host has it
+    # (Homebrew keeps it outside the default search path)
+    if(APPLE AND NOT OPENSSL_ROOT_DIR)
+        foreach(prefix /opt/homebrew/opt/openssl@3 /usr/local/opt/openssl@3)
+            if(EXISTS ${prefix}/include/openssl/ssl.h)
+                set(OPENSSL_ROOT_DIR ${prefix})
+            endif()
+        endforeach()
+    endif()
+    find_package(OpenSSL 3 QUIET)
+    if(OpenSSL_FOUND)
+        target_compile_definitions(kube32_core PUBLIC KUBE32_HAS_OPENSSL=1)
+        target_link_libraries(kube32_core PUBLIC OpenSSL::SSL OpenSSL::Crypto)
+        message(STATUS "[Kube32] Simulator TLS: OpenSSL ${OPENSSL_VERSION}")
+    else()
+        message(STATUS "[Kube32] Simulator TLS: off (OpenSSL 3 not found)")
+    endif()
 
     # Simulation Binary (kube32-sim)
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/src/main_host.cpp")
@@ -187,12 +244,12 @@ else()
     target_link_libraries(test_memory PRIVATE kube32_core)
     add_test(NAME test_memory COMMAND test_memory)
 
-    # 3. Memory Architecture Adversarial Stress & Hardening Tests
-    add_executable(test_memory_adversarial
-        tests/test_memory_adversarial.cpp
+    # 3. Memory architecture edge cases, concurrency and overflow defenses
+    add_executable(test_memory_edge_cases
+        tests/test_memory_edge_cases.cpp
     )
-    target_link_libraries(test_memory_adversarial PRIVATE kube32_core)
-    add_test(NAME test_memory_adversarial COMMAND test_memory_adversarial)
+    target_link_libraries(test_memory_edge_cases PRIVATE kube32_core)
+    add_test(NAME test_memory_edge_cases COMMAND test_memory_edge_cases)
 
     # 4. Storage Engine Baseline Tests
     add_executable(test_storage
@@ -201,14 +258,21 @@ else()
     target_link_libraries(test_storage PRIVATE kube32_core)
     add_test(NAME test_storage COMMAND test_storage)
 
-    # 5. Storage Engine Adversarial Stress & Hardening Tests
-    add_executable(test_storage_adversarial
-        tests/test_storage_adversarial.cpp
+    # 5. Storage engine edge cases, CAS conflicts and crash recovery
+    add_executable(test_storage_edge_cases
+        tests/test_storage_edge_cases.cpp
     )
-    target_link_libraries(test_storage_adversarial PRIVATE kube32_core)
-    add_test(NAME test_storage_adversarial COMMAND test_storage_adversarial)
+    target_link_libraries(test_storage_edge_cases PRIVATE kube32_core)
+    add_test(NAME test_storage_edge_cases COMMAND test_storage_edge_cases)
 
-    # 6. Kubernetes API Server & Route Handler Tests (Milestone 2)
+    # 5b. Object store on raw flash: log-structured journal, power cuts, reclamation, write coalescing
+    add_executable(test_store_flash_journal
+        tests/test_store_flash_journal.cpp
+    )
+    target_link_libraries(test_store_flash_journal PRIVATE kube32_core)
+    add_test(NAME test_store_flash_journal COMMAND test_store_flash_journal)
+
+    # 6. Kubernetes API server and route handler
     add_executable(test_api_server
         tests/test_api_server.cpp
     )
@@ -222,110 +286,126 @@ else()
     target_link_libraries(test_api_streams PRIVATE kube32_core)
     add_test(NAME test_api_streams COMMAND test_api_streams)
 
-    # 7. Autonomous Scheduler & Predicate Tests (Milestone 2)
+    # 6c. Authentication, dry run, pagination, patch types, Endpoints, generation, Deployment conditions
+    add_executable(test_api_control_plane
+        tests/test_api_control_plane.cpp
+    )
+    target_link_libraries(test_api_control_plane PRIVATE kube32_core)
+    add_test(NAME test_api_control_plane COMMAND test_api_control_plane)
+
+    # 7. Scheduler and predicates
     add_executable(test_scheduler
         tests/test_scheduler.cpp
     )
     target_link_libraries(test_scheduler PRIVATE kube32_core)
     add_test(NAME test_scheduler COMMAND test_scheduler)
 
-    # 8. Autonomous Scheduler Adversarial Stress Tests (Milestone 2)
-    add_executable(test_scheduler_adversarial
-        tests/test_scheduler_adversarial.cpp
+    # 8. Scheduler quantity parsing, capacity boundaries and OCC binding
+    add_executable(test_scheduler_edge_cases
+        tests/test_scheduler_edge_cases.cpp
     )
-    target_link_libraries(test_scheduler_adversarial PRIVATE kube32_core)
-    add_test(NAME test_scheduler_adversarial COMMAND test_scheduler_adversarial)
+    target_link_libraries(test_scheduler_edge_cases PRIVATE kube32_core)
+    add_test(NAME test_scheduler_edge_cases COMMAND test_scheduler_edge_cases)
 
-    # 9. Hardware Abstraction Layer & Capability Firewall Tests (Milestone 3)
+    # 9. Hardware abstraction layer and capability firewall
     add_executable(test_capability_firewall
         tests/test_capability_firewall.cpp
     )
     target_link_libraries(test_capability_firewall PRIVATE kube32_core)
     add_test(NAME test_capability_firewall COMMAND test_capability_firewall)
 
-    # 10. Wasm3 Sandboxed Runtime & Trap Containment Tests (Milestone 3)
+    # 10. Wasm3 sandboxed runtime and trap containment
     add_executable(test_wasm_runtime
         tests/test_wasm_runtime.cpp
     )
     target_link_libraries(test_wasm_runtime PRIVATE kube32_core)
     add_test(NAME test_wasm_runtime COMMAND test_wasm_runtime)
 
-    # 11. ESP32 Node Agent Kubelet & Reconciler Tests (Milestone 3)
+    # 11. Kubelet node agent and reconciler
     add_executable(test_kubelet
         tests/test_kubelet.cpp
     )
     target_link_libraries(test_kubelet PRIVATE kube32_core)
     add_test(NAME test_kubelet COMMAND test_kubelet)
 
-    # 12. Milestone 3 Adversarial Sandboxing & Fault Containment Tests
-    add_executable(test_m3_adversarial
-        tests/test_m3_adversarial.cpp
-    )
-    target_link_libraries(test_m3_adversarial PRIVATE kube32_core)
-    add_test(NAME test_m3_adversarial COMMAND test_m3_adversarial)
+    # Service calls, bundle files, sub-page memory limits, the kubelet's
+    # streamed API reads and node storage over HTTP (pods: apps/svcprobe)
+    foreach(t test_service_calls test_pod_assets test_pod_memory_caps test_kubelet_api_stream test_node_storage)
+        add_executable(${t} tests/${t}.cpp)
+        target_link_libraries(${t} PRIVATE kube32_core)
+        target_compile_definitions(${t} PRIVATE KUBE32_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}")
+        add_test(NAME ${t} COMMAND ${t})
+    endforeach()
 
-    # 13. HAL Capability Firewall & Peripheral Collision Adversarial Tests (Milestone 3)
-    add_executable(test_hal_adversarial
-        tests/test_hal_adversarial.cpp
+    # 12. Container fault containment, memory quotas and restart back-off
+    add_executable(test_container_faults
+        tests/test_container_faults.cpp
     )
-    target_link_libraries(test_hal_adversarial PRIVATE kube32_core)
-    add_test(NAME test_hal_adversarial COMMAND test_hal_adversarial)
+    target_link_libraries(test_container_faults PRIVATE kube32_core)
+    add_test(NAME test_container_faults COMMAND test_container_faults)
 
-    # 14. Milestone 3 Iteration 2 Challenger 4 Adversarial Re-Verification Suite
-    add_executable(test_m3_challenger_4
-        tests/test_m3_challenger_4.cpp
+    # 13. HAL peripheral access control, collisions and sensor emulation from wasm
+    add_executable(test_hal_peripherals
+        tests/test_hal_peripherals.cpp
     )
-    target_link_libraries(test_m3_challenger_4 PRIVATE kube32_core)
-    add_test(NAME test_m3_challenger_4 COMMAND test_m3_challenger_4)
+    target_link_libraries(test_hal_peripherals PRIVATE kube32_core)
+    add_test(NAME test_hal_peripherals COMMAND test_hal_peripherals)
 
-    # 15. Milestone 3 Iteration 3 Challenger 6 Concurrency & Thread Lifecycle Suite
-    add_executable(test_m3_challenger_6
-        tests/test_m3_challenger_6.cpp
+    # 14. Container termination of non-yielding guests and pin rollback
+    add_executable(test_container_termination
+        tests/test_container_termination.cpp
     )
-    target_link_libraries(test_m3_challenger_6 PRIVATE kube32_core)
-    add_test(NAME test_m3_challenger_6 COMMAND test_m3_challenger_6)
+    target_link_libraries(test_container_termination PRIVATE kube32_core)
+    add_test(NAME test_container_termination COMMAND test_container_termination)
 
-    # 16. Milestone 3 Iteration 3 Challenger 5 HTTP Chunked Stream Stress Suite
-    add_executable(test_chunked_stress
-        tests/test_chunked_stress.cpp
+    # 15. Container stop grace periods, destruction and pin rollback contention
+    add_executable(test_container_grace_period
+        tests/test_container_grace_period.cpp
     )
-    target_link_libraries(test_chunked_stress PRIVATE kube32_core)
-    add_test(NAME test_chunked_stress COMMAND test_chunked_stress)
+    target_link_libraries(test_container_grace_period PRIVATE kube32_core)
+    add_test(NAME test_container_grace_period COMMAND test_container_grace_period)
 
-    # 17. Milestone 3 Iteration 4 Challenger 7 Thread Name Length & Concurrency Suite
-    add_executable(test_m3_thread_names
-        tests/test_m3_thread_names.cpp
+    # 16. HTTP chunked-body decoder fuzzing
+    add_executable(test_chunked_decoder
+        tests/test_chunked_decoder.cpp
     )
-    target_link_libraries(test_m3_thread_names PRIVATE kube32_core)
-    add_test(NAME test_m3_thread_names COMMAND test_m3_thread_names)
+    target_link_libraries(test_chunked_decoder PRIVATE kube32_core)
+    add_test(NAME test_chunked_decoder COMMAND test_chunked_decoder)
 
-    # 18. Milestone 4 Low-Latency Virtual Channel IPC Tests
+    # 17. Thread name lengths and concurrency
+    add_executable(test_thread_names
+        tests/test_thread_names.cpp
+    )
+    target_link_libraries(test_thread_names PRIVATE kube32_core)
+    add_test(NAME test_thread_names COMMAND test_thread_names)
+
+    # 18. Virtual channel IPC
     add_executable(test_channel_ipc
         tests/test_channel_ipc.cpp
     )
     target_link_libraries(test_channel_ipc PRIVATE kube32_core)
     add_test(NAME test_channel_ipc COMMAND test_channel_ipc)
 
-    # 19. Milestone 4 Node Lease API & NodeLifecycleController Tests
+    # 19. Node lease API and node lifecycle controller
     add_executable(test_lease_controller
         tests/test_lease_controller.cpp
     )
     target_link_libraries(test_lease_controller PRIVATE kube32_core)
     add_test(NAME test_lease_controller COMMAND test_lease_controller)
 
-    # 20. Milestone 4 ZeroConf mDNS Service Discovery Tests
+    # 20. mDNS service discovery
     add_executable(test_mdns_discovery
         tests/test_mdns_discovery.cpp
     )
     target_link_libraries(test_mdns_discovery PRIVATE kube32_core)
     add_test(NAME test_mdns_discovery COMMAND test_mdns_discovery)
 
-    # 21. Milestone 4 Adversarial IPC, Concurrency & Wire Packet Corruption Tests
-    add_executable(test_m4_adversarial_ipc
-        tests/test_m4_adversarial_ipc.cpp
+    # 21. Channel IPC concurrency, wire packet corruption and wasm sandbox boundaries
+    add_executable(test_channel_ipc_stress
+        tests/test_channel_ipc_stress.cpp
     )
-    target_link_libraries(test_m4_adversarial_ipc PRIVATE kube32_core)
-    add_test(NAME test_m4_adversarial_ipc COMMAND test_m4_adversarial_ipc)
+    target_link_libraries(test_channel_ipc_stress PRIVATE kube32_core)
+    add_test(NAME test_channel_ipc_stress COMMAND test_channel_ipc_stress)
 
     # 22. microSD card: HAL over KUBE32_SD_ROOT, pod storage ABI, images pulled from the card
     add_executable(test_sd_card
@@ -334,6 +414,41 @@ else()
     target_link_libraries(test_sd_card PRIVATE kube32_core)
     target_compile_definitions(test_sd_card PRIVATE KUBE32_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}")
     add_test(NAME test_sd_card COMMAND test_sd_card)
+
+    # 23. Ingress controller: networking.k8s.io/v1 routing, service resolution, static bundles, event streams
+    add_executable(test_ingress
+        tests/test_ingress.cpp
+    )
+    target_link_libraries(test_ingress PRIVATE kube32_core)
+    add_test(NAME test_ingress COMMAND test_ingress)
+
+    # 24. Kubelet node status: hardware pin admission, trap exit codes, node telemetry
+    add_executable(test_kubelet_node_status
+        tests/test_kubelet_node_status.cpp
+    )
+    target_link_libraries(test_kubelet_node_status PRIVATE kube32_core)
+    add_test(NAME test_kubelet_node_status COMMAND test_kubelet_node_status)
+
+    # 25. Pipeline memory pooling, K32C wire fuzzing, watchdog and yield behaviour
+    add_executable(test_ipc_pipeline
+        tests/test_ipc_pipeline.cpp
+    )
+    target_link_libraries(test_ipc_pipeline PRIVATE kube32_core)
+    add_test(NAME test_ipc_pipeline COMMAND test_ipc_pipeline)
+
+    # Container environment: service links, ConfigMap/Secret references, CreateContainerConfigError
+    add_executable(test_container_env
+        tests/test_container_env.cpp
+    )
+    target_link_libraries(test_container_env PRIVATE kube32_core)
+    add_test(NAME test_container_env COMMAND test_container_env)
+
+    # I2C and UART for pods: admission, driver lifecycle, node capacity, the i2cscan example
+    add_executable(test_pod_buses
+        tests/test_pod_buses.cpp
+    )
+    target_link_libraries(test_pod_buses PRIVATE kube32_core)
+    add_test(NAME test_pod_buses COMMAND test_pod_buses)
 
 endif()
 

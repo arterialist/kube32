@@ -1,12 +1,17 @@
 #include "kubelet/kubelet.hpp"
+#include "kubelet/pod_env.hpp"
+#include <cstdlib>
 #include "hal/capability_firewall.hpp"
 #include "hal/sd_card.hpp"
+#include "hal/node_storage.hpp"
 #include "runtime/image_registry.hpp"
 #include "runtime/wasm_runtime.hpp"
 #include "runtime/pod_log.hpp"
 #include "models/kube_models.hpp"
+#include "models/kube_lease.hpp"
 #include "osal/system.hpp"
 
+#include <algorithm>
 #include <functional>
 #include <iostream>
 #include <new>
@@ -19,6 +24,15 @@
 namespace kube32::kubelet {
 
 // Pods whose image resolves to nothing fail with ErrImagePull, as on Kubernetes.
+
+static bool pod_phase_is_terminal(const std::string& manifest) {
+    models::JsonValue doc;
+    std::string err;
+    if (!models::parse_json(manifest, doc, err) || !doc.is_object()) return false;
+    const models::JsonValue* st = doc.get("status");
+    const std::string phase = st ? st->get_string("phase", "") : "";
+    return phase == "Succeeded" || phase == "Failed";
+}
 
 // Largest module the kubelet pulls from the card into RAM: a board without
 // PSRAM has about 90 KB free at steady state, so anything bigger than 256 KiB
@@ -95,9 +109,13 @@ Kubelet::Kubelet(const KubeletConfig& config,
     if (!api_client_) {
         auto client = std::make_unique<HttpKubeClient>(config_.api_server_host, config_.api_server_port);
         client->set_node_filter(config_.node_name);
+        client->set_bearer_token(config_.api_token);
+        client->set_max_body(config_.api_max_body);
         api_client_ = std::move(client);
     }
     status_reporter_ = std::make_unique<NodeStatusReporter>(config_.node_name, config_.node_ip, config_.control_plane);
+    status_reporter_->set_labels(config_.node_labels);
+    status_reporter_->set_kubelet_port(config_.kubelet_port);
     metrics_ = create_platform_metrics_provider();
     // Unique per process lifetime: the mirror resets its duplicate filter when it changes
     log_epoch_ = osal::Thread::get_time_us() ^ (static_cast<uint64_t>(std::hash<std::string>{}(config_.node_name)) << 20);
@@ -183,7 +201,7 @@ void Kubelet::run_heartbeat_loop() {
         try {
             if (registered_.load()) {
                 uint64_t now = osal::System::get_uptime_ms();
-                if (now - last_heartbeat_ms_ >= config_.heartbeat_interval_ms) {
+                if (heartbeat_due_.exchange(false) || now - last_heartbeat_ms_ >= config_.heartbeat_interval_ms) {
                     report_heartbeat();
                 }
             }
@@ -248,11 +266,15 @@ void Kubelet::reconcile_node_registration() {
     if (registered_.load()) return;
 
     NodeTelemetry t = status_reporter_->collect_telemetry();
+    fill_ready_condition(t);
     std::string reg_json = status_reporter_->build_registration_json(t);
 
     bool conflict = false;
     bool ok = api_client_->register_node(reg_json, conflict);
     if (ok) {
+        // The Node object survived this kubelet (a worker reboot): bring its
+        // labels, nodeInfo and capacity up to date with this boot.
+        if (conflict) api_client_->patch_node_status(config_.node_name, reg_json);
         registered_.store(true);
         report_heartbeat();
         last_heartbeat_ms_ = osal::System::get_uptime_ms();
@@ -272,29 +294,50 @@ void Kubelet::report_heartbeat() {
     refresh_node_ip();
     uint64_t now_ms = osal::System::get_uptime_ms();
     // renewTime carries the real wall clock, or nothing while it is unset
-    api_client_->renew_node_lease(config_.node_name, 40, models::now_rfc3339());
+    // The lease outlives three missed heartbeats: the control plane marks the
+    // node NotReady once it expires (NodeLifecycleController)
+    const uint32_t lease_s = std::max<uint32_t>(15, (3 * config_.heartbeat_interval_ms + 999) / 1000);
+    api_client_->renew_node_lease(config_.node_name, lease_s, models::now_micro_time());
 
     NodeTelemetry t = status_reporter_->collect_telemetry();
+    fill_ready_condition(t);
     bool memory_pressure = (t.free_heap_bytes < config_.memory_pressure_threshold_bytes);
     std::string patch = status_reporter_->build_heartbeat_patch_json(t, memory_pressure);
     if (!api_client_->patch_node_status(config_.node_name, patch)) {
-        // The control plane lost us (reboot, RAM-only store): register again
+        // Two rejected heartbeats in a row: the control plane restarted or
+        // lost this node (a control plane without storage keeps its state in
+        // RAM), so register again; a Node that survived answers 409 and is
+        // updated. Local pods keep running; the next pod sync compares them
+        // with the pods the API server has bound to this node.
         heartbeat_failures_++;
         if (heartbeat_failures_ >= 2) {
             std::cout << "[KUBELET] heartbeat rejected, re-registering node " << config_.node_name << std::endl;
             registered_.store(false);
             heartbeat_failures_ = 0;
-            {
-                osal::LockGuard guard(state_mutex_);
-                // Pods will be re-sent by the control plane; local records stay so
-                // running workloads survive the control plane's restart
-            }
         }
     } else {
         heartbeat_failures_ = 0;
         push_metrics_sample();
     }
     last_heartbeat_ms_ = now_ms;
+}
+
+void Kubelet::fill_ready_condition(NodeTelemetry& t) const {
+    const uint64_t last = last_sync_ok_ms_.load();
+    const uint64_t now = osal::System::get_uptime_ms();
+    if (last == 0) {
+        t.ready = false;
+        t.ready_reason = "KubeletNotReady";
+        t.ready_message = "kubelet has not completed a pod sync yet";
+    } else if (now > last && now - last > config_.sync_stall_threshold_ms) {
+        t.ready = false;
+        t.ready_reason = "KubeletNotReady";
+        t.ready_message = "pod sync loop last completed " + std::to_string((now - last) / 1000) + "s ago";
+    } else {
+        t.ready = true;
+        t.ready_reason = "KubeletReady";
+        t.ready_message = "kubelet is posting ready status";
+    }
 }
 
 void Kubelet::sync_assigned_pods() {
@@ -317,6 +360,9 @@ void Kubelet::sync_assigned_pods() {
                 terminating.emplace_back(pod.namespace_name, pod.name);
                 continue;
             }
+            // A pod that already Succeeded or Failed is never started again,
+            // also not after this node or the control plane restarted
+            if (active_pods_.find(key) == active_pods_.end() && pod_phase_is_terminal(item.second)) continue;
             desired[key] = item;
         }
     }
@@ -330,11 +376,40 @@ void Kubelet::sync_assigned_pods() {
         api_client_->delete_pod(tp.first, tp.second);
     }
 
-    // 1. Detect Additions
+    // 1. Detect additions, and restart containers whose back-off has passed
+    const uint64_t now_ms = osal::System::get_uptime_ms();
     for (const auto& kv : desired) {
         const std::string& key = kv.first;
-        if (active_pods_.find(key) == active_pods_.end()) {
-            deploy_and_start_pod(kv.second.first, kv.second.second);
+        auto it = active_pods_.find(key);
+        if (it == active_pods_.end()) {
+            try {
+                deploy_and_start_pod(kv.second.first, kv.second.second);
+            } catch (const std::bad_alloc&) {
+                // Nothing of the attempt is kept; the pod waits like a
+                // container that could not be created, then is tried again
+                runtime_.terminate(key);
+                hal::CapabilityFirewall::instance().unregister_pod(key);
+                LocalPodRecord rec;
+                rec.name = kv.second.first.name;
+                rec.namespace_name = kv.second.first.namespace_name;
+                rec.uid = kv.second.first.uid;
+                rec.execution_phase = PodExecutionPhase::CreateContainerConfigError;
+                rec.last_error_message = "not enough memory on the node to start the container";
+                rec.next_restart_allowed_ms = osal::System::get_uptime_ms() + config_.restart_backoff_initial_ms;
+                active_pods_[key] = rec;
+                std::cout << "[KUBELET] " << key << ": not enough memory to start the pod (free heap "
+                          << osal::System::get_free_heap_bytes() << "), next try in " << config_.restart_backoff_initial_ms / 1000 << " s" << std::endl;
+            }
+        } else if (it->second.execution_phase == PodExecutionPhase::CrashLoopBackOff && now_ms >= it->second.next_restart_allowed_ms) {
+            LocalPodRecord previous = it->second;
+            active_pods_.erase(it);
+            std::cout << "[KUBELET] " << key << ": restarting container (restart " << (previous.restart_count + 1) << ")" << std::endl;
+            deploy_and_start_pod(kv.second.first, kv.second.second, &previous);
+        } else if (it->second.execution_phase == PodExecutionPhase::CreateContainerConfigError && now_ms >= it->second.next_restart_allowed_ms) {
+            // A ConfigMap or Secret the environment needs may exist by now
+            LocalPodRecord previous = it->second;
+            active_pods_.erase(it);
+            deploy_and_start_pod(kv.second.first, kv.second.second, &previous);
         }
     }
 
@@ -350,9 +425,14 @@ void Kubelet::sync_assigned_pods() {
     for (const auto& key : to_remove) {
         terminate_pod(key);
     }
+
+    // A completed pass is what the node's Ready condition reports on; the
+    // first one is announced right away instead of at the next heartbeat.
+    const uint64_t done = osal::System::get_uptime_ms();
+    if (last_sync_ok_ms_.exchange(done > 0 ? done : 1) == 0) heartbeat_due_.store(true);
 }
 
-bool Kubelet::deploy_and_start_pod(const models::KubePod& pod_in, const std::string& manifest_json) {
+bool Kubelet::deploy_and_start_pod(const models::KubePod& pod_in, const std::string& manifest_json, const LocalPodRecord* previous) {
     // Callers may hand us a partially filled struct; the manifest is the truth
     models::KubePod pod = pod_in;
     if (pod.image.empty() && !manifest_json.empty()) {
@@ -361,8 +441,14 @@ bool Kubelet::deploy_and_start_pod(const models::KubePod& pod_in, const std::str
         pod.env = parsed.env;
         pod.annotations = parsed.annotations;
         pod.labels = parsed.labels;
+        pod.restart_policy = parsed.restart_policy;
+        if (pod.uid.empty()) pod.uid = parsed.uid;
+        if (pod.container_name.empty()) pod.container_name = parsed.container_name;
         if (pod.memory_limit_bytes == 0) pod.memory_limit_bytes = parsed.memory_limit_bytes;
-        if (parsed.memory_request_bytes != 16 * 1024) pod.memory_request_bytes = parsed.memory_request_bytes;
+        if (parsed.memory_request_set) {
+            pod.memory_request_bytes = parsed.memory_request_bytes;
+            pod.memory_request_set = true;
+        }
         if (pod.psram_request_bytes == 0) pod.psram_request_bytes = parsed.psram_request_bytes;
     }
     std::string pod_key = pod.namespace_name + "/" + pod.name;
@@ -370,6 +456,20 @@ bool Kubelet::deploy_and_start_pod(const models::KubePod& pod_in, const std::str
     LocalPodRecord rec;
     rec.name = pod.name;
     rec.namespace_name = pod.namespace_name;
+    rec.restart_policy = pod.restart_policy;
+    // A start after a container exited is a restart; a retry of a container
+    // that could not be created is not.
+    const bool restarting = previous && (previous->execution_phase == PodExecutionPhase::CrashLoopBackOff || previous->restart_due);
+    if (previous) {
+        rec.restart_count = previous->restart_count + (restarting ? 1 : 0);
+        rec.crash_streak = previous->crash_streak;
+        rec.last_exit_code = previous->last_exit_code;
+        rec.last_reason = previous->last_reason;
+        rec.last_finished_at = previous->last_finished_at;
+        rec.shipped_log_seq = previous->shipped_log_seq;
+    }
+    // Lines after this one belong to the container instance started now
+    rec.log_instance_start_seq = runtime::PodLogStore::runtime().last_seq(pod_key);
     rec.uid = pod.uid;
     rec.image = pod.image;
     rec.container_name = pod.container_name.empty() ? pod.name : pod.container_name;
@@ -379,7 +479,9 @@ bool Kubelet::deploy_and_start_pod(const models::KubePod& pod_in, const std::str
     rec.pod_ip = config_.node_ip;
     rec.memory_limit_bytes = (pod.memory_request_bytes > 0) ? pod.memory_request_bytes : (64 * 1024);
 
-    // Register capabilities with firewall
+    // Register capabilities with firewall. A start that failed half way (out
+    // of memory) may have left the pod's claims behind: they are its own.
+    hal::CapabilityFirewall::instance().unregister_pod(pod_key);
     std::string firewall_err;
     if (!hal::CapabilityFirewall::instance().register_pod(pod_key, manifest_json, firewall_err)) {
         rec.execution_phase = PodExecutionPhase::Failed;
@@ -395,7 +497,7 @@ bool Kubelet::deploy_and_start_pod(const models::KubePod& pod_in, const std::str
         status_patch += "\"containerStatuses\":[{";
         status_patch += "\"name\":\"" + pod.name + "\",";
         status_patch += "\"ready\":false,";
-        status_patch += "\"restartCount\":0,";
+        status_patch += "\"restartCount\":" + std::to_string(rec.restart_count) + ",";
         status_patch += "\"state\":{\"terminated\":{\"exitCode\":1,\"reason\":\"CapabilityAdmissionFailed\"}}";
         status_patch += "}]";
         status_patch += "}}";
@@ -405,21 +507,60 @@ bool Kubelet::deploy_and_start_pod(const models::KubePod& pod_in, const std::str
         return false;
     }
 
-    // A pod with an SD volume needs the card; say so instead of letting every
-    // k32_fs_* call fail later.
-    if (!hal::CapabilityFirewall::instance().sd_claim(pod_key).empty() && !hal::sd_is_mounted()) {
-        std::string reason = hal::sd_info().error;
-        std::string why = "hardware.kube32.io/sd requested but no sd card is mounted on this node" + (reason.empty() ? std::string() : " (" + reason + ")");
+    // A pod with a volume needs node storage, and a kube32.io/sd volume the
+    // card; say so instead of letting every k32_fs_* call fail later.
+    const bool has_volume = !hal::CapabilityFirewall::instance().sd_claim(pod_key).empty();
+    const bool needs_card = hal::CapabilityFirewall::instance().volume_needs_card(pod_key);
+    if ((needs_card && !hal::sd_is_mounted()) || (has_volume && hal::node_storage_root().empty())) {
+        std::string reason = needs_card ? hal::sd_info().error : hal::node_storage_info().error;
+        std::string why = (needs_card ? "the pod's volume needs a microSD card (kube32.io/sd) and none is mounted on this node"
+                                      : "the pod has a volume and this node has no storage mounted") +
+                          (reason.empty() ? std::string() : " (" + reason + ")");
         hal::CapabilityFirewall::instance().unregister_pod(pod_key);
         rec.execution_phase = PodExecutionPhase::Failed;
         rec.last_error_message = why;
         active_pods_[pod_key] = rec;
         std::string status_patch = "{\"status\":{\"phase\":\"Failed\",\"reason\":\"CapabilityAdmissionFailed\",\"message\":\"" + json_escape(why) +
-                                   "\",\"containerStatuses\":[{\"name\":\"" + pod.name + "\",\"ready\":false,\"restartCount\":0,"
+                                   "\",\"containerStatuses\":[{\"name\":\"" + pod.name + "\",\"ready\":false,\"restartCount\":" + std::to_string(rec.restart_count) + ","
                                    "\"state\":{\"terminated\":{\"exitCode\":1,\"reason\":\"CapabilityAdmissionFailed\"}}}]}}";
         api_client_->patch_pod_status(pod.namespace_name, pod.name, status_patch);
         record_pod_event(rec, "Failed", "Error: " + why, true);
         return false;
+    }
+
+    // Container environment: service links, envFrom and env with valueFrom.
+    // A missing ConfigMap, Secret or key leaves the container uncreated
+    // (CreateContainerConfigError) and is retried, as on Kubernetes.
+    std::vector<std::pair<std::string, std::string>> container_env = pod.env;
+    if (!manifest_json.empty()) {
+        PodEnvContext ectx;
+        ectx.api_get = [this](const std::string& path, std::string& body) { return api_client_->get(path, body); };
+        ectx.node_name = config_.node_name;
+        ectx.node_ip = config_.node_ip;
+        // The control plane's kubelet reaches the API on loopback; pods are
+        // given the address the rest of the network uses.
+        ectx.api_host = (config_.api_server_host == "127.0.0.1" || config_.api_server_host == "localhost") ? config_.node_ip : config_.api_server_host;
+        ectx.api_port = config_.api_server_port;
+        std::string env_err;
+        if (!build_container_env(manifest_json, ectx, container_env, env_err)) {
+            hal::CapabilityFirewall::instance().unregister_pod(pod_key);
+            if (previous) rec.restart_count = previous->restart_count;
+            rec.restart_due = restarting;
+            rec.execution_phase = PodExecutionPhase::CreateContainerConfigError;
+            rec.last_error_message = env_err;
+            rec.next_restart_allowed_ms = osal::System::get_uptime_ms() + config_.restart_backoff_initial_ms;
+            active_pods_[pod_key] = rec;
+            std::cout << "[KUBELET] " << pod_key << ": CreateContainerConfigError: " << env_err << std::endl;
+            std::string status_patch = "{\"status\":{\"phase\":\"Pending\","
+                                       "\"conditions\":[{\"type\":\"Ready\",\"status\":\"False\",\"reason\":\"ContainersNotReady\"},"
+                                       "{\"type\":\"ContainersReady\",\"status\":\"False\",\"reason\":\"ContainersNotReady\"}],"
+                                       "\"containerStatuses\":[{\"name\":\"" + rec.container_name + "\",\"image\":\"" + pod.image +
+                                       "\",\"ready\":false,\"started\":false,\"restartCount\":" + std::to_string(rec.restart_count) + ","
+                                       "\"state\":{\"waiting\":{\"reason\":\"CreateContainerConfigError\",\"message\":\"" + json_escape(env_err) + "\"}}}]}}";
+            api_client_->patch_pod_status(pod.namespace_name, pod.name, status_patch);
+            record_pod_event(rec, "Failed", "Error: " + env_err, true);
+            return false;
+        }
     }
 
     // Resolve the container image: the card for wasm://sd/..., else the
@@ -430,6 +571,8 @@ bool Kubelet::deploy_and_start_pod(const models::KubePod& pod_in, const std::str
     std::string image_key;
     std::string image_source = "embedded registry";
     std::string sd_name, sd_tag;
+    std::string asset_bundle, asset_directory;   // k32_resp_asset: the image's bundle
+    std::string image_error;                      // why an inline image could not be read
     if (runtime::parse_sd_image_ref(pod.image, sd_name, sd_tag)) {
         image_key = sd_name + (sd_tag.empty() ? std::string() : ":" + sd_tag);
         image_source = "sd card";
@@ -445,7 +588,7 @@ bool Kubelet::deploy_and_start_pod(const models::KubePod& pod_in, const std::str
                 active_pods_[pod_key] = rec;
                 hal::CapabilityFirewall::instance().unregister_pod(pod_key);
                 std::string status_patch = "{\"status\":{\"phase\":\"Failed\",\"reason\":\"ErrImagePull\",\"message\":\"" + json_escape(why) +
-                                           "\",\"containerStatuses\":[{\"name\":\"" + pod.name + "\",\"image\":\"" + pod.image + "\",\"ready\":false,\"restartCount\":0,"
+                                           "\",\"containerStatuses\":[{\"name\":\"" + pod.name + "\",\"image\":\"" + pod.image + "\",\"ready\":false,\"restartCount\":" + std::to_string(rec.restart_count) + ","
                                            "\"state\":{\"waiting\":{\"reason\":\"ErrImagePull\",\"message\":\"" + json_escape(why) + "\"}}}]}}";
                 api_client_->patch_pod_status(pod.namespace_name, pod.name, status_patch);
                 return false;
@@ -453,6 +596,7 @@ bool Kubelet::deploy_and_start_pod(const models::KubePod& pod_in, const std::str
         }
         image_bytes = inline_bytes.data();
         image_len = inline_bytes.size();
+        asset_directory = hal::sd_root_path() + "/kube32/images/" + sd_name;
         std::cout << "[KUBELET] " << pod_key << ": pulled " << sd_path << " (" << image_len << " bytes, "
                   << (osal::System::get_uptime_ms() - t_pull) << " ms)" << std::endl;
         record_pod_event(rec, "Pulled", "Successfully pulled image \"" + pod.image + "\" in " +
@@ -463,12 +607,23 @@ bool Kubelet::deploy_and_start_pod(const models::KubePod& pod_in, const std::str
         if (img) {
             image_bytes = img->data;
             image_len = img->len;
+            asset_bundle = img->name;
         } else {
             auto ann = pod.annotations.find("kube32.io/wasm-base64");
-            if (ann != pod.annotations.end() && runtime::base64_decode(ann->second, inline_bytes)) {
-                image_bytes = inline_bytes.data();
-                image_len = inline_bytes.size();
-                image_source = "inline annotation";
+            if (ann != pod.annotations.end()) {
+                // Pod lists carry the annotation empty: the module comes with
+                // the pod itself, decoded as it streams in
+                std::string why;
+                bool ok = ann->second.empty() ? api_client_->get_pod_image(pod.namespace_name, pod.name, inline_bytes, why)
+                                              : runtime::base64_decode(ann->second, inline_bytes);
+                if (ok) {
+                    image_bytes = inline_bytes.data();
+                    image_len = inline_bytes.size();
+                    image_source = "inline annotation";
+                } else if (!why.empty()) {
+                    std::cout << "[KUBELET] " << pod_key << ": inline image: " << why << std::endl;
+                    image_error = why;
+                }
             }
         }
     }
@@ -488,7 +643,7 @@ bool Kubelet::deploy_and_start_pod(const models::KubePod& pod_in, const std::str
         status_patch += "\"name\":\"" + pod.name + "\",";
         status_patch += "\"image\":\"" + pod.image + "\",";
         status_patch += "\"ready\":false,";
-        status_patch += "\"restartCount\":0,";
+        status_patch += "\"restartCount\":" + std::to_string(rec.restart_count) + ",";
         status_patch += "\"state\":{\"waiting\":{\"reason\":\"" + reason + "\",\"message\":\"" + message + "\"}}";
         status_patch += "}]";
         status_patch += "}}";
@@ -500,8 +655,9 @@ bool Kubelet::deploy_and_start_pod(const models::KubePod& pod_in, const std::str
     if (!image_bytes || image_len == 0) {
         std::cout << "[KUBELET] " << pod_key << ": image '" << pod.image << "' (key '" << image_key
                   << "') not found in local registry" << std::endl;
-        record_pod_event(rec, "Failed", "Failed to pull image \"" + pod.image + "\": not present in the node image registry", true);
-        return fail_pod("ErrImagePull", "image " + pod.image + " not present in the node image registry", 1);
+        const std::string why = image_error.empty() ? "not present in the node image registry" : image_error;
+        record_pod_event(rec, "Failed", "Failed to pull image \"" + pod.image + "\": " + why, true);
+        return fail_pod("ErrImagePull", "image " + pod.image + ": " + json_escape(why), 1);
     }
     if (image_source != "sd card") {
         record_pod_event(rec, "Pulled", "Container image \"" + pod.image + "\" already present on machine (" +
@@ -510,17 +666,65 @@ bool Kubelet::deploy_and_start_pod(const models::KubePod& pod_in, const std::str
 
     // Wasm linear memory budget: an explicit PSRAM request (esp32.io/psram) is
     // the sandbox size on PSRAM nodes; otherwise limits.memory, then
-    // requests.memory, then one 64 KiB page.
-    uint64_t mem = pod.memory_limit_bytes > 0 ? pod.memory_limit_bytes : pod.memory_request_bytes;
+    // requests.memory, then one 64 KiB page. A budget below one page caps the
+    // pod's first page at that size (ContainerConfig::memory_limit_bytes).
+    uint64_t mem = pod.memory_limit_bytes > 0 ? pod.memory_limit_bytes
+                 : (pod.memory_request_set ? pod.memory_request_bytes : 64 * 1024);
     if (pod.psram_request_bytes > mem) mem = pod.psram_request_bytes;
-    if (mem < 64 * 1024) mem = 64 * 1024;
     rec.memory_limit_bytes = static_cast<uint32_t>(mem);
 
     std::string deploy_err;
     runtime::DeploySpec spec;
     spec.memory_limit_bytes = rec.memory_limit_bytes;
     spec.stack_size_bytes = 16 * 1024;
-    spec.env = pod.env;
+    spec.env = std::move(container_env);
+    spec.asset_bundle = asset_bundle;
+    spec.asset_directory = asset_directory;
+    // kube32.io/execution-budget: wasm3 gas units per call, or "off" for an
+    // unmetered (faster, uninterruptible) pod. Default: metered.
+    {
+        auto it = pod.annotations.find("kube32.io/execution-budget");
+        if (it != pod.annotations.end()) {
+            if (it->second == "off" || it->second == "0") {
+                spec.gas_budget_per_call = 0;
+            } else {
+                char* end = nullptr;
+                unsigned long long v = std::strtoull(it->second.c_str(), &end, 10);
+                if (end && *end == '\0' && v > 0) spec.gas_budget_per_call = v;
+                else std::cout << "[KUBELET] " << pod_key << ": ignoring kube32.io/execution-budget \"" << it->second << "\" (want a number or \"off\")" << std::endl;
+            }
+        }
+    }
+    // kube32.io/wasm-stack: the module's operand stack (default 4 KiB for
+    // pods of at most one page, 16 KiB above), 512 bytes to 64 KiB
+    {
+        auto it = pod.annotations.find("kube32.io/wasm-stack");
+        if (it != pod.annotations.end()) {
+            uint64_t v = models::parse_quantity(it->second);
+            if (v >= 512 && v <= 64 * 1024) {
+                spec.stack_size_bytes = static_cast<uint32_t>(v);
+                spec.stack_size_set = true;
+            } else {
+                std::cout << "[KUBELET] " << pod_key << ": ignoring kube32.io/wasm-stack \"" << it->second << "\" (want 512 to 64Ki)" << std::endl;
+            }
+        }
+    }
+    // kube32.io/event-topics: channel topics delivered to the pod's k32_event,
+    // separated by commas or whitespace.
+    {
+        auto it = pod.annotations.find("kube32.io/event-topics");
+        if (it != pod.annotations.end()) {
+            std::string topic;
+            for (char c : it->second + ",") {
+                if (c == ',' || c == ' ' || c == '\t' || c == '\n') {
+                    if (!topic.empty()) spec.event_topics.push_back(topic);
+                    topic.clear();
+                } else {
+                    topic.push_back(c);
+                }
+            }
+        }
+    }
     // Heap images move into the runtime (no second copy); flash images are used in place
     bool deployed = inline_bytes.empty()
         ? runtime_.deploy_workload_ex(pod_key, image_bytes, image_len, spec, deploy_err)
@@ -528,7 +732,9 @@ bool Kubelet::deploy_and_start_pod(const models::KubePod& pod_in, const std::str
     if (!deployed) {
         std::cout << "[KUBELET] " << pod_key << ": deploy failed: " << deploy_err << std::endl;
         record_pod_event(rec, "Failed", "Error: failed to create container " + rec.container_name + ": " + deploy_err, true);
-        return fail_pod("CrashLoopBackOff", deploy_err, 1);
+        LocalPodRecord& stored = (active_pods_[pod_key] = rec);
+        handle_container_exit(pod_key, stored, 128, "StartError", deploy_err);
+        return false;
     }
     record_pod_event(rec, "Created", "Created container " + rec.container_name, false);
     if (!runtime_.start(pod_key)) {
@@ -538,7 +744,9 @@ bool Kubelet::deploy_and_start_pod(const models::KubePod& pod_in, const std::str
         std::cout << "[KUBELET] " << pod_key << ": " << why << std::endl;
         record_pod_event(rec, "Failed", "Error: " + why, true);
         runtime_.terminate(pod_key);
-        return fail_pod("CrashLoopBackOff", why, 1);
+        LocalPodRecord& stored = (active_pods_[pod_key] = rec);
+        handle_container_exit(pod_key, stored, 128, "StartError", why);
+        return false;
     }
     std::cout << "[KUBELET] " << pod_key << ": running image " << image_key << " (" << image_len
               << " bytes, limit " << rec.memory_limit_bytes / 1024 << " KiB)" << std::endl;
@@ -557,7 +765,7 @@ bool Kubelet::deploy_and_start_pod(const models::KubePod& pod_in, const std::str
     status_patch += "\"phase\":\"Running\",";
     status_patch += "\"podIP\":\"" + rec.pod_ip + "\",";
     status_patch += "\"hostIP\":\"" + config_.node_ip + "\",";
-    if (!now.empty()) status_patch += "\"startTime\":\"" + now + "\",";
+    if (!now.empty() && !previous) status_patch += "\"startTime\":\"" + now + "\",";
     status_patch += "\"conditions\":[";
     status_patch += "{\"type\":\"PodScheduled\",\"status\":\"True\"},";
     status_patch += "{\"type\":\"Initialized\",\"status\":\"True\"},";
@@ -568,8 +776,12 @@ bool Kubelet::deploy_and_start_pod(const models::KubePod& pod_in, const std::str
     status_patch += "\"image\":\"" + pod.image + "\",";
     status_patch += "\"ready\":true,";
     status_patch += "\"started\":true,";
-    status_patch += "\"restartCount\":0,";
+    status_patch += "\"restartCount\":" + std::to_string(rec.restart_count) + ",";
     status_patch += "\"state\":{\"running\":{" + (now.empty() ? std::string() : "\"startedAt\":\"" + now + "\"") + "}}";
+    if (rec.restart_count > 0) {
+        status_patch += ",\"lastState\":{\"terminated\":{\"exitCode\":" + std::to_string(rec.last_exit_code) + ",\"reason\":\"" + rec.last_reason + "\"" +
+                        (rec.last_finished_at.empty() ? std::string() : ",\"finishedAt\":\"" + rec.last_finished_at + "\"") + "}}";
+    }
     status_patch += "}]";
     status_patch += "}}";
 
@@ -594,17 +806,13 @@ bool Kubelet::terminate_pod(const std::string& pod_key) {
     return true;
 }
 
+// The container ended and restartPolicy does not restart it: the pod is Failed.
 void Kubelet::handle_pod_failure(LocalPodRecord& rec, const runtime::ContainerStatus& cs) {
     rec.execution_phase = PodExecutionPhase::Failed;
     rec.last_error_message = !cs.exit_message.empty() ? cs.exit_message : cs.termination_reason;
-    if (cs.restart_count > static_cast<int>(rec.restart_count)) {
-        rec.restart_count = static_cast<uint32_t>(cs.restart_count);
-    } else {
-        rec.restart_count++;
-    }
 
     int32_t exit_code = (cs.exit_code != 0) ? cs.exit_code : 137;
-    std::string reason = !cs.termination_reason.empty() ? cs.termination_reason : "RuntimeTrap";
+    std::string reason = !cs.termination_reason.empty() ? cs.termination_reason : "Error";
     const std::string now = models::now_rfc3339();
 
     std::string status_patch;
@@ -638,9 +846,8 @@ void Kubelet::handle_pod_failure(LocalPodRecord& rec, const std::string& exit_ms
     handle_pod_failure(rec, cs);
 }
 
-// The entry point returned normally: the pod has run to completion. kube32
-// does not restart completed containers, so the pod is reported as
-// Succeeded (what Kubernetes shows for restartPolicy Never/OnFailure).
+// The entry point returned 0 and restartPolicy (Never or OnFailure) does not
+// restart it: the pod is Succeeded.
 void Kubelet::handle_pod_completion(LocalPodRecord& rec, const runtime::ContainerStatus& cs) {
     rec.execution_phase = PodExecutionPhase::Completed;
     const std::string now = models::now_rfc3339();
@@ -659,20 +866,92 @@ void Kubelet::handle_pod_completion(LocalPodRecord& rec, const runtime::Containe
     record_pod_event(rec, "Completed", "Container " + cname + " exited with code 0", false);
 }
 
+void Kubelet::handle_container_exit(const std::string& pod_key, LocalPodRecord& rec, int32_t exit_code,
+                                    const std::string& reason, const std::string& message) {
+    const bool failed = (exit_code != 0);
+    const bool restart = rec.restart_policy == "Always" || (rec.restart_policy == "OnFailure" && failed);
+    const uint64_t now = osal::System::get_uptime_ms();
+    const std::string finished = models::now_rfc3339();
+    const std::string cname = rec.container_name.empty() ? rec.name : rec.container_name;
+
+    // The container is gone either way: free its memory, thread and claims.
+    runtime_.terminate(pod_key);
+    hal::CapabilityFirewall::instance().unregister_pod(pod_key);
+
+    if (!restart) {
+        runtime::ContainerStatus cs;
+        cs.exit_code = exit_code;
+        cs.termination_reason = reason;
+        cs.exit_message = message;
+        if (failed) {
+            cs.phase = runtime::ContainerPhase::Failed;
+            handle_pod_failure(rec, cs);
+        } else {
+            cs.phase = runtime::ContainerPhase::Terminated;
+            handle_pod_completion(rec, cs);
+        }
+        return;
+    }
+
+    // CrashLoopBackOff: 10 s, doubled per restart up to 5 minutes; a container
+    // that ran for 10 minutes starts the sequence over.
+    if (rec.started_at_ms > 0 && now - rec.started_at_ms >= 600000) rec.crash_streak = 0;
+    uint64_t delay = config_.restart_backoff_initial_ms;
+    for (uint32_t i = 0; i < rec.crash_streak && delay < config_.restart_backoff_max_ms; ++i) delay *= 2;
+    if (delay > config_.restart_backoff_max_ms) delay = config_.restart_backoff_max_ms;
+    rec.crash_streak++;
+    rec.next_restart_allowed_ms = now + delay;
+    rec.execution_phase = PodExecutionPhase::CrashLoopBackOff;
+    rec.last_exit_code = exit_code;
+    rec.last_reason = reason;
+    rec.last_finished_at = finished;
+    rec.last_error_message = message;
+
+    const std::string backoff = "back-off " + std::to_string(delay / 1000) + "s restarting failed container=" + cname +
+                                " pod=" + rec.name + "_" + rec.namespace_name + "(" + rec.uid + ")";
+    std::string status_patch;
+    status_patch.reserve(640);
+    status_patch += "{\"status\":{\"phase\":\"Running\",";
+    status_patch += "\"conditions\":[{\"type\":\"Ready\",\"status\":\"False\",\"reason\":\"ContainersNotReady\"},"
+                    "{\"type\":\"ContainersReady\",\"status\":\"False\",\"reason\":\"ContainersNotReady\"}],";
+    status_patch += "\"containerStatuses\":[{\"name\":\"" + cname + "\",\"image\":\"" + rec.image + "\",\"ready\":false,\"started\":false,";
+    status_patch += "\"restartCount\":" + std::to_string(rec.restart_count) + ",";
+    status_patch += "\"state\":{\"waiting\":{\"reason\":\"CrashLoopBackOff\",\"message\":\"" + json_escape(backoff) + "\"}},";
+    status_patch += "\"lastState\":{\"terminated\":{\"exitCode\":" + std::to_string(exit_code) + ",\"reason\":\"" + reason + "\",\"message\":\"" +
+                    json_escape(message) + "\"" + (finished.empty() ? std::string() : ",\"finishedAt\":\"" + finished + "\"") + "}}";
+    status_patch += "}]}}";
+    api_client_->patch_pod_status(rec.namespace_name, rec.name, status_patch);
+    std::cout << "[KUBELET] " << pod_key << ": container " << cname << " exited (" << reason << ", exit code " << exit_code
+              << "), restartPolicy " << rec.restart_policy << ": restarting in " << delay / 1000 << " s" << std::endl;
+    record_pod_event(rec, "BackOff", "Back-off restarting failed container " + cname + " in pod " + rec.name + "_" +
+                                     rec.namespace_name + "(" + rec.uid + ")", true);
+}
+
 void Kubelet::monitor_and_report_pod_statuses() {
     last_status_report_ms_ = osal::System::get_uptime_ms();
+    // Containers whose stop outlasted a host call give their memory back once it returns
+    runtime_.reap_stopped();
 
     osal::LockGuard guard(state_mutex_);
     for (auto& kv : active_pods_) {
         const std::string& pod_key = kv.first;
         LocalPodRecord& rec = kv.second;
 
-        runtime::ContainerStatus cs = runtime_.get_status(pod_key);
-        if (cs.phase == runtime::ContainerPhase::Failed && rec.execution_phase != PodExecutionPhase::Failed) {
-            handle_pod_failure(rec, cs);
-        } else if (cs.phase == runtime::ContainerPhase::Terminated && cs.exit_code == 0 &&
-                   rec.execution_phase != PodExecutionPhase::Completed) {
-            handle_pod_completion(rec, cs);
+        // Only a running container can end; pods waiting out a back-off or in a
+        // final phase no longer have one.
+        if (rec.execution_phase == PodExecutionPhase::Running) {
+            runtime::ContainerStatus cs = runtime_.get_status(pod_key);
+            if (cs.phase == runtime::ContainerPhase::Failed) {
+                // Trap or forced stop: 128 + signal and reason Error, or OOMKilled (runtime::describe_trap)
+                handle_container_exit(pod_key, rec, cs.exit_code != 0 ? cs.exit_code : 137,
+                                      cs.termination_reason.empty() ? "Error" : cs.termination_reason,
+                                      cs.exit_message.empty() ? cs.termination_reason : cs.exit_message);
+            } else if (cs.phase == runtime::ContainerPhase::Terminated && cs.exit_message != "Pod not found") {
+                // The entry point returned; its return value is the exit code
+                handle_container_exit(pod_key, rec, cs.exit_code,
+                                      cs.exit_code == 0 ? "Completed" : (cs.termination_reason.empty() ? "Error" : cs.termination_reason),
+                                      cs.exit_message);
+            }
         }
         ship_pod_logs_locked(pod_key, rec);
     }
@@ -689,9 +968,12 @@ void Kubelet::ship_pod_logs_locked(const std::string& pod_key, LocalPodRecord& r
     std::string body;
     body.reserve(recs.size() * 64);
     for (const auto& r : recs) {
+        // "r": the container instance (restart count) that wrote the line,
+        // which is what the API server keeps a previous log by
+        const uint32_t instance = (r.seq <= rec.log_instance_start_seq && rec.restart_count > 0) ? rec.restart_count - 1 : rec.restart_count;
         body += "{\"epoch\":" + std::to_string(log_epoch_) + ",\"seq\":" + std::to_string(r.seq) +
                 ",\"t\":" + std::to_string(r.unix_ms) + ",\"u\":" + std::to_string(r.uptime_ms) +
-                ",\"m\":\"" + json_escape(r.text) + "\"}\n";
+                ",\"r\":" + std::to_string(instance) + ",\"m\":\"" + json_escape(r.text) + "\"}\n";
     }
     if (api_client_->push_pod_logs(rec.namespace_name, rec.name, body)) {
         rec.shipped_log_seq = recs.back().seq;

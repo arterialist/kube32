@@ -5,6 +5,8 @@
 #include <string_view>
 #include <vector>
 #include <memory>
+#include <functional>
+#include <cstdint>
 
 namespace kube32::kubelet {
 
@@ -26,6 +28,16 @@ public:
     virtual bool push_metrics(const std::string& /*node_name*/, const std::string& /*sample_json*/) { return true; }
     // Finalizes a terminating pod (DELETE with gracePeriodSeconds=0).
     virtual bool delete_pod(const std::string& /*ns*/, const std::string& /*name*/) { return true; }
+    // GET of an API path (ConfigMaps, Secrets, Services, pods by label for the
+    // container environment). Returns the HTTP status, 0 when unreachable.
+    virtual int get(const std::string& /*path*/, std::string& out_body) { out_body.clear(); return 0; }
+    // Module bytes of a pod's inline image (annotation kube32.io/wasm-base64),
+    // fetched with the pod and decoded as it streams in. Pod lists leave the
+    // annotation's value out (see list_pods_raw).
+    virtual bool get_pod_image(const std::string& /*ns*/, const std::string& /*name*/, std::vector<uint8_t>& /*out*/, std::string& why) {
+        why = "not supported by this client";
+        return false;
+    }
 };
 
 // Standard HTTP/1.1 REST Client implementation for Kubelet
@@ -44,8 +56,18 @@ public:
     bool push_pod_logs(const std::string& ns, const std::string& name, const std::string& ndjson) override;
     bool push_metrics(const std::string& node_name, const std::string& sample_json) override;
     bool delete_pod(const std::string& ns, const std::string& name) override;
+    int get(const std::string& path, std::string& out_body) override;
+    bool get_pod_image(const std::string& ns, const std::string& name, std::vector<uint8_t>& out, std::string& why) override;
     // Restricts list_pods_raw to pods bound to this node (server-side fieldSelector).
+    // The list asks the server to leave inline image annotations empty
+    // (?inlineImages=omit) and is split into pods as it streams in, so a
+    // kubelet never holds the whole response or a JSON tree of it.
     void set_node_filter(const std::string& node_name) { node_filter_ = node_name; }
+    // Sent as "Authorization: Bearer <token>" on every request when not empty.
+    void set_bearer_token(const std::string& token) { token_ = token; }
+    // Largest response body get() and the status calls keep (0: no limit); a
+    // larger one fails (status 0) instead of exhausting a small heap.
+    void set_max_body(size_t bytes) { max_body_ = bytes; }
 
     // Helper functions for HTTP response chunk decoding
     static bool is_chunked_transfer_encoding(std::string_view headers);
@@ -58,10 +80,14 @@ private:
     };
 
     HttpResponse send_http_request(const char* method, const std::string& path, const std::string& body);
+    int stream_request(const char* method, const std::string& path, const std::string& body,
+                       const std::function<bool(const char*, size_t)>& on_data, long* out_content_length = nullptr);
 
     std::string host_;
     uint16_t port_;
     std::string node_filter_;
+    std::string token_;
+    size_t max_body_{0};
 };
 
 } // namespace kube32::kubelet
