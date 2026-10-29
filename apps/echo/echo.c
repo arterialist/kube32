@@ -1,6 +1,9 @@
-/* Minimal request-handling pod used to test the ingress, proxy and SSE path
- * before the real application is ready. Echoes the request block as JSON and
- * emits an event on every POST. */
+/* Minimal request-handling pod: echoes the request block as JSON and
+ * publishes {"type":"echo","n":<requests>} on the channel topic "echo.events"
+ * for every POST. GET .../ui/<file> answers with a file of the image's
+ * bundle (images/web/echo/) through k32_resp_asset. examples/echo.yaml routes
+ * /echo to it with an Ingress and serves that topic as Server-Sent Events on
+ * /echo/events. */
 #include "../../include/runtime/k32_app_abi.h"
 
 static unsigned char scratch[8192];
@@ -35,8 +38,29 @@ static void put_escaped(const unsigned char* p, uint32_t len) {
     if (o) k32_resp_write(out, o);
 }
 
+/* "GET <prefix>/ui/<file>[?query]": the bundle file, index.html for "/ui/" */
+static int serve_ui(const unsigned char* req, uint32_t len) {
+    if (len < 8 || req[0] != 'G' || req[1] != 'E' || req[2] != 'T' || req[3] != ' ') return 0;
+    uint32_t end = 4;
+    while (end < len && req[end] != ' ' && req[end] != '?' && req[end] != '\n') end++;
+    for (uint32_t i = 4; i + 4 <= end; i++) {
+        if (req[i] == '/' && req[i + 1] == 'u' && req[i + 2] == 'i' && (i + 3 == end || req[i + 3] == '/')) {
+            uint32_t start = (i + 3 < end) ? i + 4 : end;
+            const char* file = (start < end) ? (const char*)req + start : "index.html";
+            uint32_t flen = (start < end) ? end - start : 10;
+            if (k32_resp_asset(file, flen, 0) == 0) return 1;
+            k32_resp_begin(404, "text/plain", 10);
+            k32_resp_write("no such file\n", 13);
+            k32_resp_end();
+            return 1;
+        }
+    }
+    return 0;
+}
+
 K32_EXPORT("k32_handle") int32_t k32_handle(uint32_t ptr, uint32_t len) {
     const unsigned char* req = (const unsigned char*)(uintptr_t)ptr;
+    if (serve_ui(req, len)) return 200;
     requests++;
     int is_post = (len > 4 && req[0] == 'P' && req[1] == 'O');
     k32_resp_begin(200, "application/json", 16);
@@ -59,14 +83,29 @@ K32_EXPORT("k32_handle") int32_t k32_handle(uint32_t ptr, uint32_t len) {
     k32_resp_write("\"}", 2);
     k32_resp_end();
     if (is_post) {
-        const char* ev = "{\"op\":\"echo\",\"n\":1}";
-        k32_event_emit("tessera.events", 14, ev, slen(ev));
+        char ev[48];
+        unsigned o = 0;
+        const char* head = "{\"type\":\"echo\",\"n\":";
+        for (unsigned i = 0; head[i]; i++) ev[o++] = head[i];
+        v = requests; t = 0;
+        do { tmp[t++] = (char)('0' + v % 10); v /= 10; } while (v);
+        while (t) ev[o++] = tmp[--t];
+        ev[o++] = '}';
+        k32_event_emit("echo.events", 11, ev, o);
     }
     return 200;
 }
 
+/* Topics named in the pod's kube32.io/event-topics annotation arrive here */
 K32_EXPORT("k32_event") int32_t k32_event(uint32_t tptr, uint32_t tlen, uint32_t ptr, uint32_t len) {
-    (void)tptr; (void)tlen; (void)ptr; (void)len;
-    k32_log("echo got event", 14);
+    char line[96];
+    unsigned o = 0;
+    const char* head = "echo got event on ";
+    for (unsigned i = 0; head[i]; i++) line[o++] = head[i];
+    for (uint32_t i = 0; i < tlen && o < 60; i++) line[o++] = ((const char*)(uintptr_t)tptr)[i];
+    line[o++] = ':';
+    line[o++] = ' ';
+    for (uint32_t i = 0; i < len && o < sizeof line; i++) line[o++] = ((const char*)(uintptr_t)ptr)[i];
+    k32_log(line, o);
     return 0;
 }

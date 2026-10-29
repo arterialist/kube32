@@ -1,8 +1,9 @@
 # sdnote: a pod that keeps a file on the Cardputer's microSD card.
 #
 # The image is NOT embedded in the firmware: it is pulled from the card at
-# /sd/kube32/images/sdnote.wasm (build it with `make -C apps/sdnote`, copy
-# images/sd/sdnote.wasm to the card as /kube32/images/sdnote.wasm).
+# /sd/kube32/images/sdnote.wasm. Build it with `make -C apps/sdnote` and put
+# it on the node's card over the network:
+#   tools/kube32-cli sd-push images/sd/sdnote.wasm --node <cardputer node>
 #
 # The pod requests the card (hardware.kube32.io/sd) and names its volume
 # claim: every k32_fs_* path is relative to /sd/kube32/volumes/notes/.
@@ -12,9 +13,10 @@
 #   kubectl --context kube32 get events --field-selector involvedObject.name=sdnote
 #   kubectl --context kube32 logs sdnote       (sdnote: appended to boot.log, bytes=...)
 #
-# GET /log is served only where a pod HTTP server runs: on the host simulator,
-# not on the Cardputer (boards without PSRAM do not start one). On the board,
-# K32_CMD:SD on the console lists boot.log and its size.
+# GET /log is answered by the node's pod HTTP server (port 7000, header
+# X-Kube32-Pod: default/sdnote); the file itself can be read through the API
+# server too:
+#   kubectl get --raw /api/v1/nodes/<node>/proxy/storage/volumes/notes/boot.log
 apiVersion: v1
 kind: Pod
 metadata:
@@ -24,7 +26,7 @@ metadata:
     app: sdnote
 spec:
   nodeSelector:
-    kubernetes.io/hostname: esp32-node-02
+    kube32.io/board: cardputer
   restartPolicy: Always
   volumes:
     - name: data
@@ -35,7 +37,7 @@ spec:
       image: wasm://sd/sdnote
       resources:
         requests:
-          memory: 64Ki
+          memory: 16Ki
           hardware.kube32.io/sd: "1"
         limits:
-          memory: 64Ki
+          memory: 16Ki

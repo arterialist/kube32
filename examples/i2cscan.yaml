@@ -1,0 +1,33 @@
+# i2cscan: scans I2C bus 0 every 10 s and logs the addresses that answer.
+#
+# The pod claims the bus (esp32.io/i2c-bus-0). While it runs, the node keeps
+# the I2C driver installed on the bus's pins: the ones in the
+# kube32.io/i2c-bus-0 annotation, or the board's default pins without it
+# (GPIO 8/9 on a devkit, the Grove port GPIO 2/1 on the Cardputer). Deleting
+# the pod removes the driver and frees the pins. Without SCAN_EVERY_MS the
+# pod scans once and completes.
+#   kubectl --context kube32 apply -f examples/i2cscan.yaml
+#   kubectl --context kube32 logs i2cscan
+apiVersion: v1
+kind: Pod
+metadata:
+  name: i2cscan
+  namespace: default
+  # annotations:
+  #   kube32.io/i2c-bus-0: "sda=8,scl=9,hz=400000"
+spec:
+  restartPolicy: Never
+  containers:
+    - name: i2cscan
+      image: wasm://embedded/i2cscan
+      env:
+        - name: I2C_BUS
+          value: "0"
+        - name: SCAN_EVERY_MS
+          value: "10000"
+      resources:
+        requests:
+          memory: 64Ki
+          esp32.io/i2c-bus-0: "1"
+        limits:
+          memory: 64Ki                 # one Wasm page

@@ -1,0 +1,33 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>echo</title>
+<style>
+body{font:14px/1.5 system-ui,sans-serif;margin:24px;max-width:720px;color:#1d1f23;background:#fafafa}
+button{font:inherit;padding:6px 14px;cursor:pointer}
+pre{background:#fff;border:1px solid #ddd;padding:10px;white-space:pre-wrap;word-break:break-all;min-height:2em}
+#viewers{color:#666}
+</style>
+</head>
+<body>
+<h1>echo</h1>
+<p>A request-handling pod behind its own Ingress. <code>POST /echo/hello</code> answers with the request the pod saw and publishes an event on the channel topic <code>echo.events</code>, which the ingress controller streams on <code>/echo/events</code>.</p>
+<p><button id="send">POST /echo/hello</button> <span id="viewers"></span></p>
+<h2>Response</h2>
+<pre id="resp"></pre>
+<h2>Events</h2>
+<pre id="events"></pre>
+<script>
+const $ = id => document.getElementById(id);
+$('send').onclick = async () => {
+  const r = await fetch('/echo/hello', { method: 'POST', body: 'hi from the browser' });
+  $('resp').textContent = r.status + ' ' + await r.text();
+};
+const es = new EventSource('/echo/events');
+es.addEventListener('echo', e => { $('events').textContent = new Date().toLocaleTimeString() + '  ' + e.data + '\n' + $('events').textContent; });
+es.addEventListener('presence', e => { $('viewers').textContent = JSON.parse(e.data).viewers + ' viewing'; });
+</script>
+</body>
+</html>

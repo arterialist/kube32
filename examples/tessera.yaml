@@ -1,37 +1,88 @@
-# Tessera: an issue tracker that runs as two WebAssembly pods on the cluster.
+# Tessera: an issue tracker made of four WebAssembly pods, routed by an
+# Ingress like any other app on the cluster.
 #
-#   tessera-core  on esp32-node-01 (control plane, 2 MB PSRAM): all data,
-#                 search index, analytics and the HTTP API inside one Wasm
-#                 linear memory. The ingress on the same node calls it directly.
-#   tessera-hud   on esp32-node-02 (display board, no PSRAM): live counters on
-#                 the LCD, keyboard input into the app, beep on new issues.
+#   tessera-web   control plane: serves the web client from its image bundle
+#                 (images/web/tessera-web/) and answers client routes with
+#                 index.html.
+#   tessera-api   control plane (PSRAM): the HTTP API, search index and
+#                 analytics in one Wasm linear memory. Loads every record from
+#                 tessera-db at startup and writes each change through to it
+#                 before answering. Receives the keypad's channel topic
+#                 tessera.input and publishes tessera.events.
+#   tessera-db    Cardputer: the store of record, an append-only log on the
+#                 microSD card (volume claim tessera-db).
+#   tessera-hud   Cardputer: live counters on the LCD and keyboard input into
+#                 the app (a k32_tick/k32_event pod; silent unless HUD_SOUND=1).
 #
-# The ingress on esp32-node-01 (port 80) serves the web frontend from flash
-# and proxies /api/* to tessera-core. Deploy with:
+# The Ingress "tessera" sends / to tessera-web and /api to tessera-api,
+# streams tessera.events plus cluster telemetry and viewer counts as
+# Server-Sent Events on /events, answers /api/cluster with the cluster
+# telemetry and publishes its traffic once a second on tessera.events for
+# the HUD.
+#
+# An empty card is an empty tracker. For the sample data run
+# `make -C apps/tessera dataset` and copy apps/tessera/build/card/kube32 to
+# the root of the card. Deploy with:
 #   kubectl --context kube32 apply -f examples/tessera.yaml
 apiVersion: v1
 kind: Pod
 metadata:
-  name: tessera-core
+  name: tessera-db
   namespace: default
   labels:
     app: tessera
-    tier: core
+    tier: db
 spec:
   nodeSelector:
-    kubernetes.io/hostname: esp32-node-01
+    kube32.io/board: cardputer
+  restartPolicy: Always
+  volumes:
+    - name: data
+      persistentVolumeClaim:
+        claimName: tessera-db          # -> /sd/kube32/volumes/tessera-db/
+  containers:
+    - name: db
+      image: wasm://embedded/tessera-db:v1
+      ports:
+        - containerPort: 7000
+          name: http
+      resources:
+        requests:
+          memory: 8Ki                  # linear memory: 0.75 KiB stack, 4.2 KiB data, 3 KiB for request blocks
+          hardware.kube32.io/sd: "1"
+        limits:
+          memory: 8Ki
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: tessera-api
+  namespace: default
+  labels:
+    app: tessera
+    tier: api
+  annotations:
+    # Unmetered: the API's heaviest calls finish sooner without gas accounting
+    kube32.io/execution-budget: "off"
+    # Keypad input published by tessera-hud arrives in k32_event
+    kube32.io/event-topics: tessera.input
+spec:
+  nodeSelector:
+    node-role.kubernetes.io/control-plane: ""
   restartPolicy: Always
   containers:
-    - name: core
-      image: wasm://embedded/tessera-core:v1
+    - name: api
+      image: wasm://embedded/tessera-api:v1
       ports:
         - containerPort: 7000
           name: http
       env:
-        - name: SEED_ISSUES
-          value: "2400"
-        - name: SEED_COMMENTS
-          value: "4800"
+        - name: TESSERA_DB_URL
+          value: "http://tessera-db"
+        - name: MAX_ISSUES
+          value: "2900"
+        - name: MAX_COMMENTS
+          value: "5300"
         - name: EPOCH_BASE_MS
           value: "1793059200000"
       resources:
@@ -44,7 +95,31 @@ spec:
           esp32.io/psram: 1280Ki
       securityContext:
         capabilities:
-          add: ["CHANNEL_IPC"]
+          add: ["CHANNEL_IPC", "SERVICE_CALL"]
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: tessera-web
+  namespace: default
+  labels:
+    app: tessera
+    tier: web
+spec:
+  nodeSelector:
+    node-role.kubernetes.io/control-plane: ""
+  restartPolicy: Always
+  containers:
+    - name: web
+      image: wasm://embedded/tessera-web:v1
+      ports:
+        - containerPort: 7000
+          name: http
+      resources:
+        requests:
+          memory: 4Ki                  # linear memory: 0.5 KiB stack and data, the rest for request blocks
+        limits:
+          memory: 4Ki
 ---
 apiVersion: v1
 kind: Pod
@@ -54,9 +129,12 @@ metadata:
   labels:
     app: tessera
     tier: hud
+  annotations:
+    # Issue events and the ingress's stats lines arrive in k32_event
+    kube32.io/event-topics: tessera.events
 spec:
   nodeSelector:
-    kubernetes.io/hostname: esp32-node-02
+    kube32.io/board: cardputer
   restartPolicy: Always
   containers:
     - name: hud
@@ -64,36 +142,97 @@ spec:
       env:
         - name: HUD_TITLE
           value: "TESSERA"
+        # Silent by default. For beeps on new issues set HUD_SOUND to "1" and
+        # add hardware.kube32.io/speaker: "1" and the SPEAKER capability.
+        - name: HUD_SOUND
+          value: "0"
       resources:
         requests:
-          memory: 64Ki
+          memory: 1Ki                  # linear memory: 256-byte stack, 0.5 KiB data
           hardware.kube32.io/tft-display: "1"
           hardware.kube32.io/keyboard: "1"
-          hardware.kube32.io/speaker: "1"
           hardware.kube32.io/ipc: "1"
         limits:
-          memory: 64Ki
+          memory: 1Ki
       securityContext:
         capabilities:
-          add: ["CHANNEL_IPC", "DISPLAY", "KEYBOARD", "SPEAKER"]
+          add: ["CHANNEL_IPC", "DISPLAY", "KEYBOARD"]
 ---
-# The API server stores this Service so kubectl and k9s list it, but nothing
-# routes traffic through it: Kube32 has no ClusterIP or proxy. Browsers reach
-# the app through the ingress built into the control plane's firmware (port 80).
 apiVersion: v1
 kind: Service
 metadata:
-  name: tessera
+  name: tessera-db
   namespace: default
   labels:
     app: tessera
 spec:
-  type: ClusterIP
   selector:
     app: tessera
-    tier: core
+    tier: db
   ports:
     - name: http
       port: 80
-      targetPort: 7000
+      targetPort: http
       protocol: TCP
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: tessera-api
+  namespace: default
+  labels:
+    app: tessera
+spec:
+  selector:
+    app: tessera
+    tier: api
+  ports:
+    - name: http
+      port: 80
+      targetPort: http
+      protocol: TCP
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: tessera-web
+  namespace: default
+  labels:
+    app: tessera
+spec:
+  selector:
+    app: tessera
+    tier: web
+  ports:
+    - name: http
+      port: 80
+      targetPort: http
+      protocol: TCP
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: tessera
+  namespace: default
+  annotations:
+    kube32.io/event-stream: "/events=tessera.events,kube32.cluster,kube32.presence"
+    kube32.io/cluster-telemetry: "/api/cluster"
+    kube32.io/stats-topic: tessera.events
+spec:
+  rules:
+    - http:
+        paths:
+          - path: /api
+            pathType: Prefix
+            backend:
+              service:
+                name: tessera-api
+                port:
+                  name: http
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: tessera-web
+                port:
+                  name: http

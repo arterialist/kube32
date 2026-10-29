@@ -1,6 +1,7 @@
-# A pod no node can take: it requests 4000Ki of heap memory on esp32-node-01,
-# more than any ESP32-S3 has. The scheduler leaves it Pending and records a
-# FailedScheduling event:
+# A pod no node can take: it asks the control plane for 4000Ki of heap memory and
+# 4Mi of PSRAM, more than either board has (the simulator's PSRAM stand-in is
+# 1284Ki). The scheduler leaves it Pending and records a FailedScheduling
+# event that counts each node's reason:
 #
 #   kubectl apply -f examples/oversized-pod.yaml
 #   kubectl get events --field-selector involvedObject.name=oversized-pod
@@ -14,10 +15,11 @@ metadata:
   namespace: default
 spec:
   nodeSelector:
-    kubernetes.io/hostname: esp32-node-01
+    node-role.kubernetes.io/control-plane: ""
   containers:
     - name: greedy-worker
       image: wasm://embedded/echo:v1
       resources:
         requests:
           memory: 4000Ki
+          esp32.io/psram: 4Mi

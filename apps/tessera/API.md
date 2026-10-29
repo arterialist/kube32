@@ -1,32 +1,44 @@
 # Tessera HTTP API
 
-Tessera is an issue tracker (board, list, search, analytics, comments) that runs
-as two WebAssembly pods on a Kube32 cluster:
+Tessera is an issue tracker (board, list, search, analytics, comments) made of
+four WebAssembly pods on a Kube32 cluster:
 
-- `tessera-core` on `esp32-node-02` (PSRAM node). Owns all data and serves every
-  `/api/*` route below from inside its Wasm linear memory.
-- `tessera-hud` on `esp32-node-01` (display node). Renders live counters on the
-  LCD, reads the physical keyboard, beeps on new issues.
+| Pod | Node | Role |
+|---|---|---|
+| `tessera-web` | control plane | Serves the web client from its image bundle; client routes get `index.html` (`web/README.md`). |
+| `tessera-api` | control plane (PSRAM) | Serves every `/api/*` route below from its Wasm linear memory: the store and search index, loaded from `tessera-db` at startup (`api/README.md`). |
+| `tessera-db` | Cardputer | The store of record: an append-only log on the microSD card (`db/README.md`). |
+| `tessera-hud` | Cardputer | Live counters on the LCD and keyboard input (`hud/README.md`). |
 
-The ingress on `esp32-node-01` (port 80) serves the static frontend from flash,
-proxies `/api/*` to `tessera-core`, and serves `/events` (SSE) and
-`/api/cluster` natively.
+The Ingress `tessera` (`examples/tessera.yaml`) routes `/` to `tessera-web`
+and `/api` to `tessera-api`, and serves `/events` (SSE) and `/api/cluster`
+itself.
 
 All bodies are JSON. All timestamps are integer milliseconds in a synthetic
-epoch: the boards have no clock, so `now` is `EPOCH_BASE_MS + uptime`. Every
-response that carries timestamps also carries `"now"` so the client renders
-relative times without trusting its own clock.
+epoch: the boards have no clock, so `now` is `EPOCH_BASE_MS + uptime`, moved
+past the newest stored record when the API starts. Every response that
+carries timestamps also carries `"now"` so the client renders relative times
+without trusting its own clock.
 
 Error shape, any status >= 400:
 
 ```json
-{"error":"not_found","message":"issue TES-9999 does not exist"}
+{"error":"not_found","message":"issue WEB-9999 does not exist"}
+```
+
+Changes (`POST`, `PATCH`, `DELETE` below, and keypad comments) are stored in
+`tessera-db` before the API answers: a `2xx` means the change is on the card.
+While the API loads its data, and while `tessera-db` cannot be reached, they
+return `503` with `Retry-After: 2`; reads keep working:
+
+```json
+{"error":"unavailable","message":"loading data from tessera-db"}
 ```
 
 ## Auth
 
 Session cookie `tsid` (HttpOnly, Path=/). 32 concurrent sessions, 24 h idle
-expiry. Seeded users all share password `demo`.
+expiry, kept in the API's memory. All users share password `demo`.
 
 | Method | Path | Body | Response |
 |---|---|---|---|
@@ -44,7 +56,9 @@ User object: `{"id":1,"username":"mara","name":"Mara Okafor","initials":"MO","co
 {
   "now": 1793059200000,
   "users": [User...],
-  "projects": [{"id":1,"key":"TES","name":"Tessera Core","color":"#5b8def"}],
+  "projects": [{"id":1,"key":"WEB","name":"Web App","color":"#5b8def"},
+               {"id":2,"key":"IOS","name":"iOS App","color":"#3dbf8a"},
+               {"id":3,"key":"API","name":"Platform API","color":"#f0a05a"}],
   "labels": [{"id":0,"name":"bug","color":"#e5484d"}, ...],        // up to 16
   "statuses": ["backlog","todo","in_progress","review","done"],
   "priorities": ["none","low","medium","high","urgent"],
@@ -58,7 +72,7 @@ Issue object (full):
 
 ```json
 {
-  "id": 42, "key": "TES-42", "project": 1,
+  "id": 42, "key": "WEB-42", "project": 1,
   "title": "...", "description": "...",
   "status": "todo", "priority": 3,
   "assignee": 4, "reporter": 2,
@@ -81,7 +95,7 @@ Issue summary (lists, board, search) omits `description` and adds nothing else.
 
 Comment object: `{"id":7,"issue":42,"author":3,"body":"...","created":...}`
 
-Activity object: `{"id":n,"ts":...,"actor":userId,"issue":42,"key":"TES-42","op":"create|update|comment|delete","field":"status","from":"todo","to":"done"}`
+Activity object: `{"id":n,"ts":...,"actor":userId,"issue":42,"key":"WEB-42","op":"create|update|comment|delete","field":"status","from":"todo","to":"done"}`
 
 ## Board
 
@@ -99,7 +113,7 @@ Each column holds at most `limit` issues ordered by priority desc, updated desc.
 `GET /api/search?q=wifi+timeout&limit=20` -> 200
 
 ```json
-{"items":[{"key":"TES-12","title":"...","status":"todo","priority":2,"assignee":1,"updated":..,"score":17}],
+{"items":[{"key":"WEB-12","title":"...","status":"todo","priority":2,"assignee":1,"updated":..,"score":17}],
  "took_us":412,"scanned":38,"total":9,"now":..}
 ```
 
@@ -130,28 +144,34 @@ weighted by field (title x3) plus a recency boost.
 `GET /api/stats` -> 200
 
 ```json
-{"issues":3000,"comments":6000,"users":8,"sessions":2,
- "index":{"terms":4120,"postings":61000},
- "memory":{"used":1310720,"limit":1572864},
+{"issues":2400,"comments":4800,"users":8,"sessions":2,
+ "loading":{"done":4032,"total":9001},
+ "storage":{"state":"loading","reachable":true,"log":"9c96cb91","seq":4032,"writes":0,"write_errors":0,"conflicts":0,"load_ms":0},
+ "index":{"terms":306,"postings":54843},
+ "memory":{"used":1083120,"limit":1310720},
  "requests":{"total":n,"errors":n,"avg_us":n,"p99_us":n,"last_us":n},
  "uptime_ms":n,"now":n}
 ```
 
+`loading` is present until every record of `tessera-db` is loaded (`done` and
+`total` count records). `storage.state` is `connecting`, `loading`, `ready` or
+`failed` (a damaged record stopped the load; `storage.error` names it).
+
 ## Live events (SSE)
 
-`GET /events` served by the ingress on node 1. `text/event-stream`, retry 2000.
+`GET /events` served by the ingress on the control plane. `text/event-stream`, retry 2000.
 Event types:
 
-- `issue`: `{"op":"create|update|delete","key":"TES-42","status":"todo","actor":3,"title":"..."}`
-- `comment`: `{"key":"TES-42","author":3,"id":7}`
-- `hud`: `{"text":"typed on the keyboard so far"}` (from the keyboard pod on node 1)
+- `issue`: `{"op":"create|update|delete","key":"WEB-42","status":"todo","actor":3,"title":"..."}`
+- `comment`: `{"key":"WEB-42","author":3,"id":7}`
+- `hud`: `{"text":"typed on the keyboard so far"}` (from the keypad of `tessera-hud`)
 - `cluster`: node telemetry every 2 s, same shape as `GET /api/cluster`
 - `presence`: `{"viewers":n}`
 
 Clients should refetch the affected view on `issue`/`comment` rather than
 patching local state, except for the board which may move the card directly.
 
-## Cluster telemetry (native, node 1)
+## Cluster telemetry (served by the ingress)
 
 `GET /api/cluster` -> 200
 
@@ -165,9 +185,8 @@ patching local state, except for the board which may move the card directly.
 ## Keyboard input path
 
 `tessera-hud` emits `{"t":"key","c":"a"}` on channel `tessera.input` for every
-key press. `tessera-core` receives it through `k32_event`, appends it to the
-"live note" of the most recently viewed issue (or `TES-1`), and emits a `hud`
-event with the accumulated text. Enter commits the text as a comment by the
-`hud` system user (id 0). Backspace deletes one character. This is the
-demonstration that physical input on one chip reaches state on the other chip
-and every browser within a few milliseconds.
+key press. `tessera-api` receives it through `k32_event`, appends it to the
+"live note" of the most recently viewed issue (or issue id 1), and emits a `hud`
+event with the accumulated text. Enter stores the text as a comment by the
+`keypad` user (id 0) and clears the note; a note that cannot be stored yet
+(loading, `tessera-db` unreachable) is dropped. Backspace deletes one character.

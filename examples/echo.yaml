@@ -1,0 +1,77 @@
+# echo: a second app next to Tessera, routed by its own Ingress.
+#
+#   POST /echo/hello      the echo pod answers with the request it saw and
+#                         publishes {"type":"echo","n":N} on echo.events
+#   GET  /echo/events     Server-Sent Events of echo.events (and viewer counts)
+#   GET  /echo/ui/        a small page that sends requests and shows the event
+#                         stream: the pod sends it from its image's bundle
+#                         (images/web/echo/, embedded) with k32_resp_asset,
+#                         gzip-compressed to clients that accept it
+#
+# The pod also subscribes to its own topic (kube32.io/event-topics), so every
+# event shows up in `kubectl logs echo` as "echo got event on echo.events".
+#   kubectl --context kube32 apply -f examples/echo.yaml
+#   curl -s -X POST http://<control plane>/echo/hello
+apiVersion: v1
+kind: Pod
+metadata:
+  name: echo
+  namespace: default
+  labels:
+    app: echo
+  annotations:
+    kube32.io/event-topics: echo.events
+spec:
+  nodeSelector:
+    node-role.kubernetes.io/control-plane: ""
+  restartPolicy: Always
+  containers:
+    - name: echo
+      image: wasm://embedded/echo
+      ports:
+        - containerPort: 7000
+          name: http
+      env:
+        - name: GREETING
+          value: "hello from echo"
+      resources:
+        requests:
+          memory: 64Ki
+          hardware.kube32.io/ipc: "1"
+        limits:
+          memory: 64Ki                 # one Wasm page
+      securityContext:
+        capabilities:
+          add: ["CHANNEL_IPC"]
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: echo
+  namespace: default
+spec:
+  selector:
+    app: echo
+  ports:
+    - name: http
+      port: 80
+      targetPort: 7000
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: echo
+  namespace: default
+  annotations:
+    kube32.io/event-stream: "/echo/events=echo.events,kube32.presence"
+spec:
+  rules:
+    - http:
+        paths:
+          - path: /echo
+            pathType: Prefix
+            backend:
+              service:
+                name: echo
+                port:
+                  number: 80

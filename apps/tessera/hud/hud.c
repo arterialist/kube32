@@ -1,13 +1,18 @@
 /*
- * tessera-hud: the office keypad. Runs as an app_main loop (no HTTP), uses
- * the display, keypad and speaker imports, and talks to the rest of the app
- * through two channels:
+ * tessera-hud: the office keypad. A tick/event pod (no HTTP, no thread of
+ * its own): it uses the display, keypad and speaker imports and talks to the
+ * rest of the app through two channel topics:
  *
- *   tessera.events (subscribe): issue/comment events from tessera-core and the
- *                                "stats" lines the gateway publishes every second
- *   tessera.input  (publish):   one small JSON object per key press
+ *   tessera.events (k32_event):  issue/comment events from tessera-api and the
+ *                                "stats" lines the ingress publishes every second
+ *   tessera.input  (published):  one small JSON object per key press
  *
- * Memory: one 64 KiB page, no dynamic allocation.
+ * k32_tick polls the keypad and returns 1, so the node ticks it again after
+ * about 10 ms; the counters are redrawn once a second. Sound is off unless
+ * HUD_SOUND=1 (the pod then also needs the speaker grant).
+ *
+ * Memory: static only, under 1 KiB of linear memory; the pod's limit caps it
+ * at MEM_CAP (Makefile).
  */
 #include "../../../include/runtime/k32_app_abi.h"
 
@@ -22,15 +27,13 @@
 #define C_AMBER  0xFD20u
 #define C_RED    0xF800u
 
-static int ev_handle = -1;
-static int in_handle = -1;
-static unsigned char rx[256];
+static unsigned char g_block[232];   /* k32_alloc: topic + payload of one event (<= 200 bytes) */
+static int g_sound;
 static char line[48];      /* text typed on the keypad, mirrored to browsers */
 static unsigned line_len;
-static unsigned long issues_open, issues_total, created_here, events_seen;
+static unsigned long issues_open, created_here, events_seen;
 static unsigned rps, viewers;
-static unsigned long last_draw_ms, last_event_ms;
-static char last_key_text[32];
+static unsigned long last_draw_ms;
 
 static unsigned slen(const char* s) { unsigned n = 0; while (s[n]) n++; return n; }
 static void text(int x, int y, const char* s, unsigned fg, unsigned bg) { k32_display_text(x, y, s, slen(s), fg, bg); }
@@ -87,10 +90,10 @@ static int json_str(const unsigned char* s, unsigned len, const char* key, char*
 static void draw_frame(void) {
     k32_display_rect(0, 0, W, H, C_BG);
     k32_display_rect(0, 0, W, 18, C_PANEL);
-    char title[32];
+    char title[24];
     int n = k32_env_get("HUD_TITLE", 9, title, sizeof title - 1);
     if (n <= 0) { title[0] = 'T'; title[1] = 'E'; title[2] = 'S'; title[3] = 'S'; title[4] = 'E'; title[5] = 'R'; title[6] = 'A'; title[7] = 0; }
-    else title[n < 31 ? n : 31] = 0;
+    else title[n < 23 ? n : 23] = 0;
     text(6, 5, title, C_CYAN, C_PANEL);
     text(150, 5, "office keypad", C_DIM, C_PANEL);
     text(6, 24, "open", C_DIM, C_BG);
@@ -137,71 +140,75 @@ static void emit_key(char c) {
     k32_event_emit("tessera.input", 13, msg, o);
 }
 
+static void tone(unsigned hz, unsigned ms, unsigned vol) { if (g_sound) k32_tone(hz, ms, vol); }
+
 static void handle_event(const unsigned char* data, unsigned len) {
     char t[12];
     events_seen++;
     if (json_str(data, len, "t", t, sizeof t)) {
-        if (t[0] == 's' && t[1] == 't') {            /* "stats" from the gateway */
+        if (t[0] == 's' && t[1] == 't') {            /* "stats" from the ingress */
             unsigned long v;
             if (json_uint(data, len, "open", &v)) issues_open = v;
-            if (json_uint(data, len, "total", &v)) issues_total = v;
             if (json_uint(data, len, "rps", &v)) rps = (unsigned)v;
             if (json_uint(data, len, "viewers", &v)) viewers = (unsigned)v;
-            return;
-        }
-        if (t[0] == 'h' && t[1] == 'u') {            /* "hud": the issue service echoes the live note */
             return;
         }
     }
     char op[12];
     if (json_str(data, len, "op", op, sizeof op)) {
         if (op[0] == 'c' && op[1] == 'r') {
-            k32_tone(1320, 40, 35);
+            tone(1320, 40, 35);
             unsigned long v;
             if (json_uint(data, len, "actor", &v) && v == 0) created_here++;
             issues_open++;
         } else if (op[0] == 'd') {
-            k32_tone(440, 60, 25);
+            tone(440, 60, 25);
         } else {
-            k32_tone(880, 15, 15);
+            tone(880, 15, 15);
         }
     }
-    last_event_ms = (unsigned long)k32_time_ms();
 }
 
-K32_EXPORT("app_main") int app_main(void) {
-    ev_handle = kube32_channel_open("tessera.events", 0);
-    (void)in_handle;
+K32_EXPORT("k32_init") int32_t k32_init(void) {
+    char v[4];
+    g_sound = k32_env_get("HUD_SOUND", 9, v, sizeof v) == 1 && v[0] == '1';
     draw_frame();
     draw_stats();
     draw_line();
-    k32_tone(880, 30, 20);
-    k32_tone(1320, 50, 20);
-    for (;;) {
-        /* 1. Keyboard */
-        int k;
-        int typed = 0;
-        while ((k = k32_key_read()) >= 0) {
-            char c = (char)k;
-            typed = 1;
-            if (c == '\b') { if (line_len) line_len--; }
-            else if (c == '\n') { line_len = 0; }
-            else if (c >= 32 && c < 127 && line_len < sizeof line - 1) { line[line_len++] = c; }
-            emit_key(c);
-            k32_tone(2200, 6, 12);
-        }
-        if (typed) draw_line();
-
-        /* 2. App events (50 ms poll keeps the loop responsive to keys) */
-        int n = kube32_channel_recv(ev_handle, rx, sizeof rx, 50);
-        if (n > 0) handle_event(rx, (unsigned)n);
-
-        /* 3. Redraw counters once per second */
-        unsigned long now = (unsigned long)k32_time_ms();
-        if (now - last_draw_ms >= 1000) {
-            last_draw_ms = now;
-            draw_stats();
-        }
-    }
+    tone(880, 30, 20);
+    tone(1320, 50, 20);
     return 0;
+}
+
+/* The host copies an event's topic and payload here before k32_event. */
+K32_EXPORT("k32_alloc") uint32_t k32_alloc(uint32_t size) {
+    return size && size <= sizeof g_block ? (uint32_t)(uintptr_t)g_block : 0;
+}
+
+K32_EXPORT("k32_event") int32_t k32_event(uint32_t topic_ptr, uint32_t topic_len, uint32_t ptr, uint32_t len) {
+    const char* topic = (const char*)(uintptr_t)topic_ptr;
+    static const char want[] = "tessera.events";
+    if (topic_len != sizeof want - 1) return 0;
+    for (unsigned i = 0; i < topic_len; i++) if (topic[i] != want[i]) return 0;
+    handle_event((const unsigned char*)(uintptr_t)ptr, len);
+    return 0;
+}
+
+K32_EXPORT("k32_tick") int32_t k32_tick(uint32_t uptime_ms) {
+    int k, typed = 0;
+    while ((k = k32_key_read()) >= 0) {
+        char c = (char)k;
+        typed = 1;
+        if (c == '\b') { if (line_len) line_len--; }
+        else if (c == '\n') { line_len = 0; }
+        else if (c >= 32 && c < 127 && line_len < sizeof line - 1) { line[line_len++] = c; }
+        emit_key(c);
+        tone(2200, 6, 12);
+    }
+    if (typed) draw_line();
+    if (uptime_ms - last_draw_ms >= 1000) {
+        last_draw_ms = uptime_ms;
+        draw_stats();
+    }
+    return 1;   /* poll the keypad again soon */
 }
