@@ -37,21 +37,6 @@ const std::string* find_var(const EnvVars& vars, const std::string& name) {
     return nullptr;
 }
 
-std::string url_encode(const std::string& s) {
-    static const char* hex = "0123456789ABCDEF";
-    std::string out;
-    for (unsigned char c : s) {
-        if (std::isalnum(c) || c == '-' || c == '.' || c == '_' || c == '~') {
-            out.push_back(static_cast<char>(c));
-        } else {
-            out.push_back('%');
-            out.push_back(hex[c >> 4]);
-            out.push_back(hex[c & 15]);
-        }
-    }
-    return out;
-}
-
 std::string lower(std::string s) {
     for (auto& c : s) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
     return s;

@@ -30,10 +30,6 @@ namespace kube32::kubelet {
 
 // Pods whose image resolves to nothing fail with ErrImagePull, as on Kubernetes.
 
-static bool pod_phase_is_terminal(const models::KubePod& pod) {
-    return pod.phase == "Succeeded" || pod.phase == "Failed";
-}
-
 static std::string kib(size_t bytes) {
     return std::to_string((bytes + 1023) / 1024) + " KiB";
 }
