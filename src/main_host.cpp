@@ -272,8 +272,8 @@ int main(int argc, char* argv[]) {
         std::cout << "[SIM] PSRAM stand-in: " << (kube32_pool_block_size() / 1024) << " KiB of host memory (--psram)" << std::endl;
     } else if (opts.board_without_psram) {
         // A board without PSRAM, as main_esp32.cpp sets it up: the 80 KiB pod
-        // pool, the 28 KiB interpreter stack, pods admitted on the pool alone
-        // and held to the heap the board has (--heap-budget) less the system's 24 KiB
+        // pool, the 28 KiB interpreter stack, and pods limited to the heap the
+        // board has (--heap-budget) less the system's 24 KiB
         kube32_pool_reserve(80 * 1024);
         kube32_pool_reserve_stack(28672);
         const size_t interp = kube32_pool_stack_size();

@@ -297,9 +297,10 @@ size_t kube32_pool_system_reserve(void) { return system_reserve(); }
 size_t kube32_pool_pod_room(size_t memory_bytes, size_t* out_capacity) {
     size_t room = 0;
     if (s_heap_budget) {
-        // The simulator's --psram 0 admits as the board does, on the pool alone
+        // The simulator's --psram 0 also counts the modelled heap, unlike the
+        // board: its 64-bit wasm3 structures are larger than the board's
         const size_t used = s_general_bytes.load() + system_reserve();
-        if (!(s_block && !s_external)) room = s_heap_budget > used ? s_heap_budget - used : 0;
+        room = s_heap_budget > used ? s_heap_budget - used : 0;
     } else {
 #if defined(ESP_PLATFORM)
         // Without PSRAM a pod is admitted on the pool block alone: general

@@ -57,8 +57,9 @@ size_t kube32_pool_system_reserve(void);
 void  kube32_pool_set_heap_budget(size_t bytes);
 size_t kube32_pool_heap_budget(void);
 /* Bytes a pod whose linear memory is `memory_bytes` could be given now: the
- * pool block's free part, the general heap above the system reserve (not
- * counted with an internal pool block) and PSRAM above its stack reserve. *out_capacity (optional) adds what pods
+ * pool block's free part, the general heap above the system reserve (on
+ * the board, not with an internal pool block) and PSRAM above its stack
+ * reserve. *out_capacity (optional) adds what pods
  * hold already: what the pod could be given with no other pod running. */
 size_t kube32_pool_pod_room(size_t memory_bytes, size_t* out_capacity);
 /* General allocator for the interpreter: external RAM first when present,
