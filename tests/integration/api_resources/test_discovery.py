@@ -1,12 +1,12 @@
 """
-Tier 1 Feature Tests: Discovery Endpoints
+API Resource Tests: Discovery Endpoints
 Authoritative sources:
 - Kubernetes Discovery API Specification (meta/v1 APIResourceList, APIVersions, APIGroupList)
 - survey_spec_miner_1/report.md § 1.1 - 1.2
 - PROJECT.md § 2 (Feature 4: Kubernetes Discovery Endpoints)
 """
 
-from tests.framework import BaseTestCase
+from tests.integration.framework import BaseTestCase
 
 
 class TestDiscovery(BaseTestCase):

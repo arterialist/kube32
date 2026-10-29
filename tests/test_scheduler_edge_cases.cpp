@@ -14,14 +14,14 @@ using namespace kube32::scheduler;
 using namespace kube32::storage;
 
 // =============================================================================
-// Suite 1: Quantity Parser Adversarial Corner Cases
+// Suite 1: Quantity Parser Corner Cases
 // =============================================================================
-void test_quantity_parser_adversarial() {
-    std::cout << "[RUN] test_quantity_parser_adversarial" << std::endl;
+void test_quantity_parser_edge_cases() {
+    std::cout << "[RUN] test_quantity_parser_edge_cases" << std::endl;
 
     // Standard units
     assert(parse_quantity("240Ki") == 240 * 1024);
-    assert(parse_quantity("240ki") == 240 * 1024);
+    assert(parse_quantity("240ki") == 0);   // not a Kubernetes quantity
     assert(parse_quantity("4Mi") == 4 * 1024 * 1024);
     assert(parse_quantity("1Gi") == 1024ULL * 1024 * 1024);
 
@@ -41,7 +41,7 @@ void test_quantity_parser_adversarial() {
     assert(parse_quantity("14") == 14);
     assert(parse_quantity("245761") == 245761);
 
-    std::cout << "[PASS] test_quantity_parser_adversarial" << std::endl;
+    std::cout << "[PASS] test_quantity_parser_edge_cases" << std::endl;
 }
 
 // =============================================================================
@@ -212,7 +212,7 @@ void test_node_failure_and_reconciliation() {
                              "\"allocatable\":{\"memory\":\"240Ki\"}}}";
     store->put("/registry/nodes/esp32-node-01", node1_down, true);
 
-    // In M4: Pods remain on NotReady nodes until 30s eviction threshold triggers NodeLifecycleController eviction.
+    // Pods remain on NotReady nodes until 30s eviction threshold triggers NodeLifecycleController eviction.
     // Scheduler alone must NOT prematurely evict pods from living NotReady nodes.
     sched->reconcile_cluster();
     std::string check1;
@@ -259,16 +259,16 @@ void test_node_failure_and_reconciliation() {
 
 int main() {
     std::cout << "========================================================" << std::endl;
-    std::cout << "  Kube32 Adversarial Scheduler C++ Test Suite           " << std::endl;
+    std::cout << "  Kube32 Scheduler Edge Case Tests                    " << std::endl;
     std::cout << "========================================================" << std::endl;
 
-    test_quantity_parser_adversarial();
+    test_quantity_parser_edge_cases();
     test_capacity_exhaustion_boundary();
     test_occ_atomic_binding();
     test_node_failure_and_reconciliation();
 
     std::cout << "========================================================" << std::endl;
-    std::cout << "  Adversarial Scheduler Verification Completed          " << std::endl;
+    std::cout << "  Scheduler Edge Case Tests Completed                 " << std::endl;
     std::cout << "========================================================" << std::endl;
     return 0;
 }

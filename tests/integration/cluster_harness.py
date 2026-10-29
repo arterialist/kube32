@@ -1,5 +1,5 @@
 """
-Kube32 Milestone 4: Multi-Node Cluster Simulation Harness
+Kube32 Multi-Node Cluster Simulation Harness
 Manages multiple kube32-sim node instances (Control Plane + Worker Nodes)
 over loopback networking, mDNS, and UDP Virtual Channel IPC.
 """
@@ -17,10 +17,10 @@ import urllib.error
 import json
 from typing import Dict, List, Optional, Any, Tuple
 
-PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 BIN_PATH = os.path.join(PROJECT_ROOT, "build", "kube32-sim")
 
-logger = logging.getLogger("kube32_m4")
+logger = logging.getLogger("kube32_cluster")
 
 
 def crc16_ccitt(data: bytes) -> int:
@@ -105,7 +105,8 @@ class ClusterHarness:
         lease_interval_ms: int = 1000,
         not_ready_timeout_ms: int = 3000,
         eviction_timeout_ms: int = 6000,
-        reconcile_interval_ms: int = 500
+        reconcile_interval_ms: int = 500,
+        ingress_port: int = 0
     ) -> SimulatedNode:
         data_dir = f"/tmp/k32_cluster_test_{name}_{os.getpid()}_{int(time.time()*1000)%10000}"
         self.temp_dirs.append(data_dir)
@@ -128,6 +129,8 @@ class ClusterHarness:
             "--eviction-timeout", str(eviction_timeout_ms),
             "--reconcile-interval", str(reconcile_interval_ms)
         ]
+        if ingress_port:
+            cmd += ["--ingress-port", str(ingress_port)]
 
         proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         node = SimulatedNode("control-plane", name, 0, api_port, ipc_port, data_dir)
@@ -268,3 +271,37 @@ class ClusterHarness:
         full_packet = packet_no_crc + struct.pack("<H", crc)
         sock.sendto(full_packet, (dest_ip, dest_port))
         sock.close()
+
+
+def enable_link_stats(cp_node: SimulatedNode) -> None:
+    """Expose the control plane's channel counters on its Ingress port, GET /api/cluster (link.*),
+    through an Ingress with the kube32.io/cluster-telemetry annotation."""
+    import urllib.request
+    ingress = {
+        "apiVersion": "networking.k8s.io/v1", "kind": "Ingress",
+        "metadata": {"name": "link-stats", "namespace": "default",
+                     "annotations": {"kube32.io/cluster-telemetry": "/api/cluster"}},
+        "spec": {"rules": [{"http": {"paths": []}}]},
+    }
+    req = urllib.request.Request(
+        f"{cp_node.api_url}/apis/networking.k8s.io/v1/namespaces/default/ingresses",
+        data=json.dumps(ingress).encode(), headers={"Content-Type": "application/json"}, method="POST")
+    urllib.request.urlopen(req, timeout=2.0).read()
+
+
+def link_stats(ingress_port: int) -> Dict:
+    """The "link" counters (frames_rx, crc_errors, ...) the control plane's Ingress reports."""
+    import urllib.request
+    with urllib.request.urlopen(f"http://127.0.0.1:{ingress_port}/api/cluster", timeout=2.0) as resp:
+        return json.loads(resp.read().decode()).get("link", {})
+
+
+def node_ready_condition(api_url: str, name: str) -> Optional[Dict]:
+    """The Ready condition of a node, or None while the node is unknown or the API is unreachable."""
+    import urllib.request
+    try:
+        with urllib.request.urlopen(f"{api_url}/api/v1/nodes/{name}", timeout=2.0) as resp:
+            conds = json.loads(resp.read().decode()).get("status", {}).get("conditions", [])
+    except Exception:
+        return None
+    return next((c for c in conds if c.get("type") == "Ready"), None)

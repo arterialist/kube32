@@ -2,6 +2,7 @@
 #include "kubelet/node_status_reporter.hpp"
 #include "kubelet/kube_api_client.hpp"
 #include "runtime/wasm_runtime.hpp"
+#include "runtime/image_registry.hpp"
 #include "hal/capability_firewall.hpp"
 #include "osal/system.hpp"
 
@@ -15,9 +16,9 @@ using namespace kube32::kubelet;
 using namespace kube32::models;
 
 // =============================================================================
-// Mock Kube API Client for Deep Inspection
+// Mock Kube API Client
 // =============================================================================
-class DeepMockKubeClient : public KubeApiClient {
+class RecordingKubeClient : public KubeApiClient {
 public:
     bool registered{false};
     int register_count{0};
@@ -118,11 +119,11 @@ public:
 };
 
 // =============================================================================
-// CHALLENGE 1: Hardware Pin Admission Rejection Verification
+// Hardware Pin Admission Rejection Verification
 // =============================================================================
-void challenge_1_hardware_pin_admission_rejection() {
+void test_hardware_pin_admission_rejection() {
     std::cout << "\n==================================================================" << std::endl;
-    std::cout << " CHALLENGE 1: Hardware Pin Admission Rejection Stress Harness     " << std::endl;
+    std::cout << " Hardware Pin Admission Rejection                               " << std::endl;
     std::cout << "==================================================================" << std::endl;
 
     // The set of reserved pins that MUST be rejected:
@@ -149,8 +150,8 @@ void challenge_1_hardware_pin_admission_rejection() {
         kube32::hal::CapabilityFirewall::instance().reset();
 
         DeepControlledRuntime mock_rt;
-        auto mock_client = std::make_unique<DeepMockKubeClient>();
-        DeepMockKubeClient* client_ref = mock_client.get();
+        auto mock_client = std::make_unique<RecordingKubeClient>();
+        RecordingKubeClient* client_ref = mock_client.get();
 
         Kubelet kubelet(cfg, mock_rt, std::move(mock_client));
 
@@ -204,8 +205,8 @@ void challenge_1_hardware_pin_admission_rejection() {
         // Now test the exact same pin with "esp.io/gpio-<pin>" alias
         kube32::hal::CapabilityFirewall::instance().reset();
         DeepControlledRuntime mock_rt2;
-        auto mock_client2 = std::make_unique<DeepMockKubeClient>();
-        DeepMockKubeClient* client_ref2 = mock_client2.get();
+        auto mock_client2 = std::make_unique<RecordingKubeClient>();
+        RecordingKubeClient* client_ref2 = mock_client2.get();
 
         Kubelet kubelet2(cfg, mock_rt2, std::move(mock_client2));
         std::string pod_name_alias = "test-bad-pin-alias-" + std::to_string(pin);
@@ -246,8 +247,8 @@ void challenge_1_hardware_pin_admission_rejection() {
     {
         kube32::hal::CapabilityFirewall::instance().reset();
         DeepControlledRuntime mock_rt;
-        auto mock_client = std::make_unique<DeepMockKubeClient>();
-        DeepMockKubeClient* client_ref = mock_client.get();
+        auto mock_client = std::make_unique<RecordingKubeClient>();
+        RecordingKubeClient* client_ref = mock_client.get();
 
         Kubelet kubelet(cfg, mock_rt, std::move(mock_client));
         std::string pod_name = "test-bad-uart0";
@@ -285,8 +286,8 @@ void challenge_1_hardware_pin_admission_rejection() {
     {
         kube32::hal::CapabilityFirewall::instance().reset();
         DeepControlledRuntime mock_rt;
-        auto mock_client = std::make_unique<DeepMockKubeClient>();
-        DeepMockKubeClient* client_ref = mock_client.get();
+        auto mock_client = std::make_unique<RecordingKubeClient>();
+        RecordingKubeClient* client_ref = mock_client.get();
 
         Kubelet kubelet(cfg, mock_rt, std::move(mock_client));
         std::string pod_name = "test-bad-pin-out-of-range";
@@ -319,15 +320,15 @@ void challenge_1_hardware_pin_admission_rejection() {
         std::cout << "  [PASS] Out-of-range GPIO (GPIO 65) strictly rejected. Bytecode never deployed." << std::endl;
     }
 
-    std::cout << "[SUCCESS] CHALLENGE 1 FULLY VERIFIED (11 hardware pin scenarios passed)." << std::endl;
+    std::cout << "[PASS] (11 hardware pin scenarios passed)." << std::endl;
 }
 
 // =============================================================================
-// CHALLENGE 2: Dynamic Trap Exit Codes Verification
+// Dynamic Trap Exit Codes Verification
 // =============================================================================
-void challenge_2_dynamic_trap_exit_codes() {
+void test_dynamic_trap_exit_codes() {
     std::cout << "\n==================================================================" << std::endl;
-    std::cout << " CHALLENGE 2: Dynamic Trap Exit Codes Stress Harness              " << std::endl;
+    std::cout << " Dynamic Trap Exit Codes                                        " << std::endl;
     std::cout << "==================================================================" << std::endl;
 
     KubeletConfig cfg;
@@ -342,19 +343,21 @@ void challenge_2_dynamic_trap_exit_codes() {
     };
 
     std::vector<TrapTestCase> cases = {
-        {"div-zero-pod", 136, "IntegerDivisionByZero", "[trap] integer divide by zero"},
-        {"unreachable-pod", 134, "UnreachableExecuted", "[trap] unreachable executed"},
-        {"oom-pod", 137, "OOMKilled", "[trap] out of bounds memory access"},
-        {"timeout-pod", 137, "ExecutionTimeout", "ExecutionTimeout: Workload did not terminate"},
-        {"stack-pod", 137, "StackOverflow", "[trap] stack overflow"}
+        {"div-zero-pod", 136, "Error", "wasm trap: integer divide by zero"},
+        {"unreachable-pod", 134, "Error", "wasm trap: unreachable"},
+        {"segv-pod", 139, "Error", "wasm trap: out of bounds memory access"},
+        {"oom-pod", 137, "OOMKilled", "memory.grow refused at the pod memory limit of 64 KiB, then wasm trap: unreachable"},
+        {"stopped-pod", 137, "Error", "stopped by the kubelet (wasm trap: out of gas)"},
+        {"budget-pod", 152, "Error", "wasm trap: out of gas: a call used its whole execution budget of 4000000000 gas units (kube32.io/execution-budget)"},
+        {"stack-pod", 139, "Error", "wasm trap: stack overflow"}
     };
 
     for (const auto& tc : cases) {
         kube32::hal::CapabilityFirewall::instance().reset();
 
         DeepControlledRuntime mock_rt;
-        auto mock_client = std::make_unique<DeepMockKubeClient>();
-        DeepMockKubeClient* client_ref = mock_client.get();
+        auto mock_client = std::make_unique<RecordingKubeClient>();
+        RecordingKubeClient* client_ref = mock_client.get();
 
         KubePod pod;
         pod.name = tc.name;
@@ -366,6 +369,7 @@ void challenge_2_dynamic_trap_exit_codes() {
             "  \"metadata\": { \"name\": \"" + tc.name + "\", \"namespace\": \"default\" },\n"
             "  \"spec\": {\n"
             "    \"nodeName\": \"" + cfg.node_name + "\",\n"
+            "    \"restartPolicy\": \"Never\",\n"
             "    \"containers\": [{ \"name\": \"worker\", \"image\": \"wasm://" + tc.name + "\" }]\n"
             "  }\n"
             "}";
@@ -404,21 +408,21 @@ void challenge_2_dynamic_trap_exit_codes() {
         LocalPodRecord rec;
         assert(kubelet.get_pod_record("default/" + tc.name, rec));
         assert(rec.execution_phase == PodExecutionPhase::Failed);
-        assert(rec.restart_count == 1);
+        assert(rec.restart_count == 0);  // restartPolicy Never
 
         std::cout << "  [PASS] Trap: " << tc.name << " -> ExitCode=" << tc.exit_code
                   << " (" << tc.reason << ") correctly serialized into status patch." << std::endl;
     }
 
-    std::cout << "[SUCCESS] CHALLENGE 2 FULLY VERIFIED (All dynamic trap codes & reasons match specification)." << std::endl;
+    std::cout << "[PASS] (All dynamic trap codes & reasons match specification)." << std::endl;
 }
 
 // =============================================================================
-// CHALLENGE 3: Dynamic Node Telemetry Verification
+// Dynamic Node Telemetry Verification
 // =============================================================================
-void challenge_3_dynamic_node_telemetry() {
+void test_dynamic_node_telemetry() {
     std::cout << "\n==================================================================" << std::endl;
-    std::cout << " CHALLENGE 3: Dynamic Node Telemetry Stress Harness                " << std::endl;
+    std::cout << " Dynamic Node Telemetry                                          " << std::endl;
     std::cout << "==================================================================" << std::endl;
 
     kube32::hal::CapabilityFirewall::instance().reset();
@@ -429,12 +433,16 @@ void challenge_3_dynamic_node_telemetry() {
     NodeTelemetry t_base = reporter.collect_telemetry();
     std::cout << "  [INFO] Initial Allocatable GPIO: " << t_base.allocatable_gpio_count
               << ", Total GPIO: " << t_base.total_gpio_count << std::endl;
-    assert(t_base.allocatable_gpio_count == 14);
-    assert(t_base.total_gpio_count == 16);
+    const auto base = static_cast<uint32_t>(t_base.allocatable_gpio_count);
+    const auto claimed3 = base - 3;
+    assert(base > 3);
+    assert(t_base.total_gpio_count >= t_base.allocatable_gpio_count);
+    const std::string base_s = std::to_string(base);
+    const std::string claimed3_s = std::to_string(claimed3);
 
     std::string patch_base = reporter.build_heartbeat_patch_json(t_base, false);
-    assert(patch_base.find("\"esp32.io/gpio\":\"14\"") != std::string::npos);
-    assert(patch_base.find("\"esp.io/gpio\":\"14\"") != std::string::npos);
+    assert(patch_base.find("\"esp32.io/gpio\":\"" + base_s + "\"") != std::string::npos);
+    assert(patch_base.find("\"esp.io/gpio\":\"" + base_s + "\"") != std::string::npos);
 
     // Phase 2: Claim 3 generic GPIO pins via pod manifest
     std::string pod_manifest_3gpio = R"({
@@ -453,22 +461,22 @@ void challenge_3_dynamic_node_telemetry() {
 
     NodeTelemetry t_claimed = reporter.collect_telemetry();
     std::cout << "  [INFO] After claiming 3 GPIOs -> Allocatable GPIO: " << t_claimed.allocatable_gpio_count << std::endl;
-    assert(t_claimed.allocatable_gpio_count == 11);
+    assert(t_claimed.allocatable_gpio_count == claimed3);
 
     std::string patch_claimed = reporter.build_heartbeat_patch_json(t_claimed, false);
-    assert(patch_claimed.find("\"esp32.io/gpio\":\"11\"") != std::string::npos);
-    assert(patch_claimed.find("\"esp.io/gpio\":\"11\"") != std::string::npos);
+    assert(patch_claimed.find("\"esp32.io/gpio\":\"" + claimed3_s + "\"") != std::string::npos);
+    assert(patch_claimed.find("\"esp.io/gpio\":\"" + claimed3_s + "\"") != std::string::npos);
 
-    // Phase 3: Unregister pod and verify return to 14
+    // Phase 3: Unregister pod and verify the allocatable count is restored
     kube32::hal::CapabilityFirewall::instance().unregister_pod("default/sensor-reader");
 
     NodeTelemetry t_restored = reporter.collect_telemetry();
     std::cout << "  [INFO] After unregistering pod -> Allocatable GPIO: " << t_restored.allocatable_gpio_count << std::endl;
-    assert(t_restored.allocatable_gpio_count == 14);
+    assert(t_restored.allocatable_gpio_count == base);
 
     std::string patch_restored = reporter.build_heartbeat_patch_json(t_restored, false);
-    assert(patch_restored.find("\"esp32.io/gpio\":\"14\"") != std::string::npos);
-    assert(patch_restored.find("\"esp.io/gpio\":\"14\"") != std::string::npos);
+    assert(patch_restored.find("\"esp32.io/gpio\":\"" + base_s + "\"") != std::string::npos);
+    assert(patch_restored.find("\"esp.io/gpio\":\"" + base_s + "\"") != std::string::npos);
 
     // Phase 4: Full Kubelet instance heartbeat reporting cycle with client inspection
     {
@@ -477,19 +485,19 @@ void challenge_3_dynamic_node_telemetry() {
         cfg.node_ip = "192.168.4.100";
 
         DeepControlledRuntime mock_rt;
-        auto mock_client = std::make_unique<DeepMockKubeClient>();
-        DeepMockKubeClient* client_ref = mock_client.get();
+        auto mock_client = std::make_unique<RecordingKubeClient>();
+        RecordingKubeClient* client_ref = mock_client.get();
 
         Kubelet kubelet(cfg, mock_rt, std::move(mock_client));
 
         // Reconcile registration
         kubelet.reconcile_node_registration();
         assert(client_ref->registered);
-        assert(client_ref->last_node_registration_json.find("\"esp32.io/gpio\":\"14\"") != std::string::npos);
+        assert(client_ref->last_node_registration_json.find("\"esp32.io/gpio\":\"" + base_s + "\"") != std::string::npos);
 
         // Heartbeat with 0 claimed
         kubelet.report_heartbeat();
-        assert(client_ref->last_node_patch.find("\"esp32.io/gpio\":\"14\"") != std::string::npos);
+        assert(client_ref->last_node_patch.find("\"esp32.io/gpio\":\"" + base_s + "\"") != std::string::npos);
 
         // Claim 3 pins via firewall
         reg_ok = kube32::hal::CapabilityFirewall::instance().register_pod("default/sensor-reader", pod_manifest_3gpio, fw_err);
@@ -498,7 +506,7 @@ void challenge_3_dynamic_node_telemetry() {
         // Heartbeat with 3 claimed
         client_ref->reset_patches();
         kubelet.report_heartbeat();
-        assert(client_ref->last_node_patch.find("\"esp32.io/gpio\":\"11\"") != std::string::npos);
+        assert(client_ref->last_node_patch.find("\"esp32.io/gpio\":\"" + claimed3_s + "\"") != std::string::npos);
 
         // Unregister pod
         kube32::hal::CapabilityFirewall::instance().unregister_pod("default/sensor-reader");
@@ -506,20 +514,14 @@ void challenge_3_dynamic_node_telemetry() {
         // Heartbeat after unregister
         client_ref->reset_patches();
         kubelet.report_heartbeat();
-        assert(client_ref->last_node_patch.find("\"esp32.io/gpio\":\"14\"") != std::string::npos);
-        std::cout << "  [PASS] Kubelet heartbeat cycle verifies 14 -> 11 -> 14 allocatable GPIO dynamically." << std::endl;
+        assert(client_ref->last_node_patch.find("\"esp32.io/gpio\":\"" + base_s + "\"") != std::string::npos);
+        std::cout << "  [PASS] Kubelet heartbeat cycle tracks allocatable GPIO as pins are claimed and released." << std::endl;
     }
 
-    // Phase 5: Boundary stress: Claim ALL 14 allocatable pins
+    // Phase 5: Claim every allocatable pin
     {
-        std::string pod_manifest_14gpio = R"({
-            "spec": {
-                "containers": [{
-                    "name": "greedy-gpio",
-                    "resources": { "requests": { "esp32.io/gpio": "14" } }
-                }]
-            }
-        })";
+        std::string pod_manifest_14gpio = "{\"spec\": {\"containers\": [{\"name\": \"greedy-gpio\", "
+            "\"resources\": { \"requests\": { \"esp32.io/gpio\": \"" + base_s + "\" } }}]}}";
 
         reg_ok = kube32::hal::CapabilityFirewall::instance().register_pod("default/greedy-gpio", pod_manifest_14gpio, fw_err);
         assert(reg_ok);
@@ -530,7 +532,7 @@ void challenge_3_dynamic_node_telemetry() {
         assert(patch_zero.find("\"esp32.io/gpio\":\"0\"") != std::string::npos);
 
         // Claim remaining physical safe pins until firewall exhaustion
-        // Total safe pins in KUBE32_SAFE_GPIO_MASK in range 1..48 minus 11 reserved = 37 safe pins
+        // Count the safe pins in KUBE32_SAFE_GPIO_MASK
         uint32_t remaining_safe = 0;
         for (uint32_t p = 1; p < 64; ++p) {
             if ((kube32::hal::KUBE32_SAFE_GPIO_MASK & (1ULL << p)) != 0) remaining_safe++;
@@ -538,7 +540,7 @@ void challenge_3_dynamic_node_telemetry() {
         std::cout << "  [INFO] Total physical safe GPIO pins in firewall: " << remaining_safe << std::endl;
 
         // Claim all remaining safe pins
-        uint32_t to_claim = remaining_safe - 14;
+        uint32_t to_claim = remaining_safe - base;
         std::string pod_manifest_rest = "{\n"
             "  \"spec\": {\n"
             "    \"containers\": [{\n"
@@ -567,28 +569,34 @@ void challenge_3_dynamic_node_telemetry() {
         kube32::hal::CapabilityFirewall::instance().unregister_pod("default/greedy-gpio");
         kube32::hal::CapabilityFirewall::instance().unregister_pod("default/rest-gpio");
         NodeTelemetry t_restored_all = reporter.collect_telemetry();
-        assert(t_restored_all.allocatable_gpio_count == 14);
-        std::cout << "  [PASS] Boundary condition (0 allocatable clamp, full physical exhaustion rejected, restoration to 14) passed." << std::endl;
+        assert(t_restored_all.allocatable_gpio_count == base);
+        std::cout << "  [PASS] Boundary condition (0 allocatable clamp, full physical exhaustion rejected, restoration) passed." << std::endl;
     }
 
-    std::cout << "[SUCCESS] CHALLENGE 3 FULLY VERIFIED (Dynamic telemetry transitions 14 -> 11 -> 14 and boundaries verified)." << std::endl;
+    std::cout << "[PASS] (Dynamic telemetry transitions and boundaries verified)." << std::endl;
 }
 
 // =============================================================================
 // MAIN ENTRY POINT
 // =============================================================================
 int main() {
+    // Pods in these tests reference images that must exist in the local registry
+    static const uint8_t k_min_wasm[] = {0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00};
+    for (const char* key : {"sensor", "uart", "div-zero-pod", "unreachable-pod", "segv-pod", "oom-pod", "stopped-pod", "budget-pod", "stack-pod"}) {
+        kube32::runtime::ImageRegistry::instance().add({key, k_min_wasm, sizeof(k_min_wasm)});
+    }
+
     std::cout << "==================================================================" << std::endl;
-    std::cout << " Kube32 M3 Iteration 2 Challenger 3 Empirical Adversarial Suite   " << std::endl;
+    std::cout << " Kubelet Node Status Tests                                       " << std::endl;
     std::cout << " Testing: Hardware Admission, Dynamic Traps, Node Telemetry       " << std::endl;
     std::cout << "==================================================================" << std::endl;
 
-    challenge_1_hardware_pin_admission_rejection();
-    challenge_2_dynamic_trap_exit_codes();
-    challenge_3_dynamic_node_telemetry();
+    test_hardware_pin_admission_rejection();
+    test_dynamic_trap_exit_codes();
+    test_dynamic_node_telemetry();
 
     std::cout << "\n==================================================================" << std::endl;
-    std::cout << " ALL 3 EMPIRICAL CHALLENGES PASSED WITH ZERO FAILURES!            " << std::endl;
+    std::cout << " ALL KUBELET NODE STATUS TESTS PASSED                          " << std::endl;
     std::cout << "==================================================================" << std::endl;
     return 0;
 }

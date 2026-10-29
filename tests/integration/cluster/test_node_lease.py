@@ -1,5 +1,5 @@
 """
-Kube32 Milestone 4 Test Suite: Node Lease Heartbeat API & Lifecycle Transitions
+Kube32 Cluster Tests: Node Lease Heartbeat API & Lifecycle Transitions
 Verifies coordination.k8s.io/v1 Lease renewal, expiration, NotReady condition,
 and eviction thresholds without flash wear.
 """
@@ -7,11 +7,11 @@ and eviction thresholds without flash wear.
 import time
 import json
 import urllib.request
-from tests.framework import BaseTestCase, HTTPResponse
-from tests.m4_cluster_harness import ClusterHarness
+from tests.integration.framework import BaseTestCase, HTTPResponse
+from tests.integration.cluster_harness import ClusterHarness, node_ready_condition
 
 
-class TestM4NodeLease(BaseTestCase):
+class TestNodeLease(BaseTestCase):
     def setUp(self):
         super().setUp()
         self.harness = ClusterHarness(base_api_port=16543, base_ipc_port=17500)
@@ -59,25 +59,17 @@ class TestM4NodeLease(BaseTestCase):
         )
         worker = self.harness.start_worker("worker-lease-2", 1, cp, lease_interval_ms=500)
 
-        # Verify initially Ready = True
-        node_url = f"{cp.api_url}/api/v1/nodes/{worker.name}"
-        req = urllib.request.Request(node_url, method="GET")
-        with urllib.request.urlopen(req, timeout=2.0) as resp:
-            node_data = json.loads(resp.read().decode())
-            conds = {c.get("type"): c.get("status") for c in node_data.get("status", {}).get("conditions", [])}
-            self.assertEqual(conds.get("Ready"), "True")
+        # The kubelet reports Ready once it has registered
+        def ready(status):
+            cond = node_ready_condition(cp.api_url, worker.name)
+            return cond if cond and cond.get("status") == status else None
+        self.wait_for_condition(lambda: ready("True"), timeout=10.0, description="node Ready=True")
 
         # Kill worker to simulate abrupt hardware drop
         self.harness.kill_node(worker.name)
 
-        # Wait for not_ready_timeout (2000ms) + reconcile interval
-        time.sleep(2.6)
-
-        # Node condition should now be Ready = False, reason = NodeStatusUnknown
-        with urllib.request.urlopen(req, timeout=2.0) as resp:
-            node_data = json.loads(resp.read().decode())
-            conditions = node_data.get("status", {}).get("conditions", [])
-            ready_cond = next((c for c in conditions if c.get("type") == "Ready"), None)
-            self.assertIsNotNone(ready_cond)
-            self.assertEqual(ready_cond.get("status"), "False")
-            self.assertEqual(ready_cond.get("reason"), "NodeStatusUnknown")
+        # The lease lasts at least 15 s, so the lifecycle controller marks the node
+        # Ready=Unknown (reason NodeStatusUnknown), as Kubernetes does, after that
+        cond = self.wait_for_condition(lambda: ready("Unknown"), timeout=25.0, interval=0.5,
+                                       description="node Ready=Unknown")
+        self.assertEqual(cond.get("reason"), "NodeStatusUnknown")

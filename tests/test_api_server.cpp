@@ -2,8 +2,10 @@
 #include "api/route_handler.hpp"
 #include "api/table_serializer.hpp"
 #include "api/chunked_stream_writer.hpp"
+#include "api/http_server.hpp"
 #include "storage/store.hpp"
 #include "mem/monotonic_arena.hpp"
+#include "models/kube_models.hpp"
 
 #include <cassert>
 #include <iostream>
@@ -13,6 +15,7 @@
 using namespace kube32::api;
 using namespace kube32::storage;
 using namespace kube32::mem;
+namespace models = kube32::models;
 
 class TestBufferSink : public ISink {
 public:
@@ -114,6 +117,30 @@ void test_discovery_and_method_enforcement() {
     HttpResponse resp1 = handler.handle_request(r1, arena);
     assert(resp1.status_code == 200);
     assert(resp1.body.find("\"gitVersion\":\"v1.33.0-kube32\"") != std::string::npos);
+    {
+        // Build fields come from the build: an RFC 3339 UTC build time, a
+        // 40-hex commit (or "" outside a checkout), the compiler and the host
+        // platform. Nothing is built with Go, so goVersion is empty.
+        models::JsonValue v;
+        std::string err;
+        assert(models::parse_json(resp1.body, v, err));
+        const std::string date = v.get_string("buildDate", "");
+        uint64_t ms = 0;
+        assert(date.size() == 20 && date.back() == 'Z' && models::parse_rfc3339(date, ms) && ms > 0);
+        const std::string commit = v.get_string("gitCommit", "?");
+        assert(commit.empty() || commit.size() == 40);
+        const std::string tree = v.get_string("gitTreeState", "?");
+        assert(tree == "clean" || tree == "dirty" || (tree.empty() && commit.empty()));
+        assert(v.get("goVersion") && v.get_string("goVersion", "?").empty());
+        assert(!v.get_string("compiler", "").empty());
+        const std::string platform = v.get_string("platform", "");
+#if defined(__APPLE__)
+        assert(platform.rfind("darwin/", 0) == 0);
+#elif defined(__linux__)
+        assert(platform.rfind("linux/", 0) == 0);
+#endif
+        assert(platform.find("xtensa") == std::string::npos);
+    }
 
     // 2. POST /version -> 405 MethodNotAllowed
     HttpRequest r2;
@@ -297,8 +324,27 @@ void test_json_recursion_depth_limit() {
     std::cout << "[PASS] test_json_recursion_depth_limit" << std::endl;
 }
 
+// Status lines carry the RFC 9110 reason phrase for every code the server
+// and the ingress send.
+void test_status_reason_phrases() {
+    std::cout << "[RUN] test_status_reason_phrases" << std::endl;
+    const std::pair<int, const char*> expected[] = {
+        {200, "OK"}, {201, "Created"}, {400, "Bad Request"}, {404, "Not Found"}, {405, "Method Not Allowed"},
+        {406, "Not Acceptable"}, {409, "Conflict"}, {410, "Gone"}, {411, "Length Required"}, {413, "Content Too Large"},
+        {415, "Unsupported Media Type"}, {429, "Too Many Requests"}, {431, "Request Header Fields Too Large"},
+        {500, "Internal Server Error"}, {501, "Not Implemented"}, {502, "Bad Gateway"}, {503, "Service Unavailable"},
+    };
+    for (const auto& e : expected) {
+        assert(std::string(http_reason_phrase(e.first)) == e.second);
+        assert(std::string(HttpConnection::status_text(e.first)) == e.second);
+    }
+    assert(std::string(http_reason_phrase(599)).empty());
+    std::cout << "[PASS] test_status_reason_phrases" << std::endl;
+}
+
 int main() {
     std::cout << "=== Running Kube32 API Server & Router Unit Tests ===" << std::endl;
+    test_status_reason_phrases();
     test_uri_normalization();
     test_route_pattern_matching();
     test_discovery_and_method_enforcement();

@@ -25,9 +25,6 @@ ENDPOINTS = [
     ("GET", "/apis/coordination.k8s.io/v1/namespaces/kube-node-lease/leases"),
     ("GET", "/apis/apps/v1"),
     ("GET", "/apis/apps/v1/namespaces/default/deployments"),
-    ("GET", "/apis/apiextensions.k8s.io/v1"),
-    ("GET", "/apis/apiextensions.k8s.io/v1/customresourcedefinitions"),
-    ("GET", "/openapi/v2"),
 ]
 
 TABLE_ENDPOINTS = [

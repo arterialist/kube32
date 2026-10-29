@@ -1,5 +1,5 @@
 """
-Mock Upstream Kubernetes API Server for Milestone 5 Federation Testing
+Mock Upstream Kubernetes API Server for Federation Testing
 Implements Node registration, Lease heartbeats, and HTTP chunked Pod watch streams.
 Uses only Python standard library.
 """

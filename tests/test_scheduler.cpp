@@ -5,6 +5,7 @@
 #include <cassert>
 #include <iostream>
 #include <string>
+#include <vector>
 
 using namespace kube32::scheduler;
 using namespace kube32::storage;
@@ -21,6 +22,22 @@ void test_quantity_parser() {
     assert(parse_quantity("2") == 2);
     assert(parse_quantity("0") == 0);
     assert(parse_quantity("") == 0);
+
+    // Kubernetes suffixes: m is milli (memory "64m" rounds up to 1 byte, as
+    // Quantity.Value() does), k/M/G are decimal, exponents are allowed, and
+    // lower-case binary suffixes are not quantities.
+    assert(parse_quantity("64m") == 1);
+    assert(parse_quantity("1500m") == 2);
+    assert(parse_quantity("2000m") == 2);
+    assert(parse_quantity("1k") == 1000);
+    assert(parse_quantity("1M") == 1000000);
+    assert(parse_quantity("2G") == 2000000000ULL);
+    assert(parse_quantity("1e3") == 1000);
+    assert(parse_quantity("1.5Gi") == 1610612736ULL);
+    assert(parse_quantity("1.1k") == 1100);
+    assert(parse_quantity("64K") == 0);
+    assert(parse_quantity("240ki") == 0);
+    assert(parse_quantity("-1Ki") == 0);
 
     std::cout << "[PASS] test_quantity_parser" << std::endl;
 }
@@ -212,12 +229,85 @@ void test_deleted_node_reconciliation() {
     std::cout << "[PASS] test_deleted_node_reconciliation" << std::endl;
 }
 
+// Allocatable memory is the free heap the node measured. Pods its kubelet was
+// running when it reported are inside that figure and are not subtracted
+// again; bound pods it has not started are.
+void test_allocatable_accounting_and_failure_message() {
+    std::cout << "[RUN] test_allocatable_accounting_and_failure_message" << std::endl;
+    StoreOptions opts;
+    opts.enable_flash_persistence = false;
+    auto store = create_radix_store(opts);
+
+    const std::string running_pod =
+        "{\"kind\":\"Pod\",\"metadata\":{\"name\":\"hud\",\"namespace\":\"default\"},"
+        "\"spec\":{\"nodeName\":\"node-a\",\"containers\":[{\"name\":\"c\",\"resources\":{\"requests\":{\"memory\":\"64Ki\"}}}]},"
+        "\"status\":{\"phase\":\"Running\",\"containerStatuses\":[{\"name\":\"c\",\"state\":{\"running\":{}}}]}}";
+    store->put("/registry/pods/default/hud", running_pod, true);
+    // The node reports after the pod started: 100Ki free with the pod running
+    const std::string node_a = "{\"kind\":\"Node\",\"metadata\":{\"name\":\"node-a\",\"labels\":{\"board\":\"cardputer\"}},"
+                               "\"status\":{\"conditions\":[{\"type\":\"Ready\",\"status\":\"True\"}],"
+                               "\"allocatable\":{\"memory\":\"100Ki\"}}}";
+    store->put("/registry/nodes/node-a", node_a, true);
+
+    ResourceSpec used = calculate_node_allocated_resources(*store, "node-a");
+    assert(used.memory_bytes == 0);   // the running pod is inside the 100Ki
+
+    auto sched = create_scheduler(*store);
+    std::string fits = "{\"kind\":\"Pod\",\"metadata\":{\"name\":\"fits\",\"namespace\":\"default\"},"
+                       "\"spec\":{\"containers\":[{\"name\":\"c\",\"resources\":{\"requests\":{\"memory\":\"90Ki\"}}}]}}";
+    ScheduleResult r = sched->schedule_pod_manifest(fits);
+    assert(r.scheduled && r.target_node == "node-a");
+    store->put("/registry/pods/default/fits", fits, true);   // bound, not started
+
+    used = calculate_node_allocated_resources(*store, "node-a");
+    assert(used.memory_bytes == 90 * 1024);   // not in the node's figure yet
+
+    // A pod that changed after the node's last report is counted too
+    store->put("/registry/pods/default/hud", running_pod, true);
+    used = calculate_node_allocated_resources(*store, "node-a");
+    assert(used.memory_bytes == (90 + 64) * 1024);
+    // ... until the node reports again
+    store->put("/registry/nodes/node-a", node_a, true);
+    used = calculate_node_allocated_resources(*store, "node-a");
+    assert(used.memory_bytes == 90 * 1024);
+
+    // Nothing fits: the message counts each reason, kube-scheduler style
+    const std::string node_b = "{\"kind\":\"Node\",\"metadata\":{\"name\":\"node-b\",\"labels\":{\"board\":\"devkit\"}},"
+                               "\"status\":{\"conditions\":[{\"type\":\"Ready\",\"status\":\"True\"}],"
+                               "\"allocatable\":{\"memory\":\"4Mi\"}}}";
+    store->put("/registry/nodes/node-b", node_b, true);
+    std::string big = "{\"kind\":\"Pod\",\"metadata\":{\"name\":\"big\",\"namespace\":\"default\"},"
+                      "\"spec\":{\"nodeSelector\":{\"board\":\"cardputer\"},"
+                      "\"containers\":[{\"name\":\"c\",\"resources\":{\"requests\":{\"memory\":\"64Ki\"}}}]}}";
+    r = sched->schedule_pod_manifest(big);
+    assert(!r.scheduled);
+    const std::string expected = "0/2 nodes are available: 1 Insufficient memory, 1 node(s) didn't match Pod's node affinity/selector.";
+    assert(r.failure_reason == expected);
+    assert(big.find(expected) != std::string::npos);   // PodScheduled condition message
+    std::vector<std::string> events;
+    store->list("/registry/events/", events);
+    bool found = false;
+    for (const auto& e : events) {
+        if (e.find("FailedScheduling") != std::string::npos && e.find(expected) != std::string::npos) found = true;
+    }
+    assert(found);
+
+    // A node without the resource does not offer it
+    std::string psram_pod = "{\"kind\":\"Pod\",\"metadata\":{\"name\":\"p\",\"namespace\":\"default\"},"
+                            "\"spec\":{\"containers\":[{\"name\":\"c\",\"resources\":{\"requests\":{\"memory\":\"1Ki\",\"esp32.io/psram\":\"64Ki\"}}}]}}";
+    r = sched->schedule_pod_manifest(psram_pod);
+    assert(!r.scheduled);
+    assert(r.failure_reason == "0/2 nodes are available: 2 Insufficient esp32.io/psram.");
+    std::cout << "[PASS] test_allocatable_accounting_and_failure_message" << std::endl;
+}
+
 int main() {
     std::cout << "=== Running Kube32 Autonomous Scheduler Unit Tests ===" << std::endl;
     test_quantity_parser();
     test_predicates();
     test_scheduler_atomic_binding();
     test_deleted_node_reconciliation();
+    test_allocatable_accounting_and_failure_message();
     std::cout << "=== All Scheduler Tests Passed Successfully ===" << std::endl;
     return 0;
 }

@@ -139,14 +139,14 @@ void test_slab_concurrency() {
 
     constexpr int NUM_THREADS = 8;
     constexpr int OPS_PER_THREAD = 5000;
-    std::atomic<bool> start_gate{false};
+    std::atomic<bool> start_flag{false};
     std::atomic<int> successful_allocs{0};
     std::atomic<int> failed_allocs{0};
 
     std::vector<std::thread> workers;
     for (int t = 0; t < NUM_THREADS; ++t) {
         workers.emplace_back([&, t]() {
-            while (!start_gate.load(std::memory_order_relaxed)) {
+            while (!start_flag.load(std::memory_order_relaxed)) {
                 std::this_thread::yield();
             }
             std::mt19937 rng(100 + t);
@@ -177,7 +177,7 @@ void test_slab_concurrency() {
         });
     }
 
-    start_gate.store(true, std::memory_order_relaxed);
+    start_flag.store(true, std::memory_order_relaxed);
     for (auto& w : workers) {
         w.join();
     }
@@ -260,12 +260,12 @@ void test_memory_manager_concurrency() {
 
     constexpr int NUM_THREADS = 4;
     constexpr int ITERS = 1000;
-    std::atomic<bool> start_gate{false};
+    std::atomic<bool> start_flag{false};
     std::vector<std::thread> threads;
 
     for (int t = 0; t < NUM_THREADS; ++t) {
         threads.emplace_back([&]() {
-            while (!start_gate.load(std::memory_order_relaxed)) {
+            while (!start_flag.load(std::memory_order_relaxed)) {
                 std::this_thread::yield();
             }
             for (int i = 0; i < ITERS; ++i) {
@@ -283,7 +283,7 @@ void test_memory_manager_concurrency() {
         });
     }
 
-    start_gate.store(true, std::memory_order_relaxed);
+    start_flag.store(true, std::memory_order_relaxed);
     for (auto& th : threads) {
         th.join();
     }
@@ -297,7 +297,7 @@ void test_memory_manager_concurrency() {
 }
 
 // =============================================================================
-// PART 2: Adversarial Regression & Robustness Assertions
+// PART 2: Robustness Assertions
 // =============================================================================
 
 void test_arena_integer_overflow_defense() {
@@ -396,16 +396,19 @@ void test_slab_concurrent_telemetry() {
     SlabAllocator<int, CAP> pool;
     std::atomic<bool> running{true};
 
-    // Reader thread continuously calls const query methods
+    // Reader thread continuously calls const query methods. Each call takes
+    // the pool's lock on its own, so the mutator may run between two calls:
+    // only per-value bounds hold here, not sums across calls such as
+    // active + free == CAP.
     std::thread reader([&]() {
         while (running.load(std::memory_order_relaxed)) {
             size_t act = pool.active_count();
             size_t free_cnt = pool.free_count();
             size_t hwm = pool.high_water_mark();
-            bool full = pool.is_full();
-            assert(act + free_cnt == CAP);
+            (void)pool.is_full();
+            assert(act <= CAP);
+            assert(free_cnt <= CAP);
             assert(hwm <= CAP);
-            if (full) assert(act == CAP);
             std::this_thread::yield();
         }
     });
@@ -429,7 +432,7 @@ void test_slab_concurrent_telemetry() {
 // =============================================================================
 int main() {
     std::cout << "====================================================================" << std::endl;
-    std::cout << "     KUBE32 MEMORY ARCHITECTURE ADVERSARIAL STRESS & AUDIT SUITE    " << std::endl;
+    std::cout << "     KUBE32 MEMORY ARCHITECTURE EDGE CASE & CONCURRENCY TESTS        " << std::endl;
     std::cout << "====================================================================" << std::endl;
 
     std::cout << "\n>>> PART 1: SPECIFICATION & STRESS-TEST CONTRACT VERIFICATION <<<" << std::endl;
@@ -440,7 +443,7 @@ int main() {
     test_arena_reset_reusability();
     test_memory_manager_concurrency();
 
-    std::cout << "\n>>> PART 2: ADVERSARIAL ATTACK REGRESSION VERIFICATION <<<" << std::endl;
+    std::cout << "\n>>> PART 2: ROBUSTNESS ASSERTIONS <<<" << std::endl;
     test_arena_integer_overflow_defense();
     test_arena_unaligned_backing_defense();
     test_slab_constructor_exception_safety();
@@ -448,7 +451,7 @@ int main() {
     test_slab_concurrent_telemetry();
 
     std::cout << "\n====================================================================" << std::endl;
-    std::cout << "  ALL ADVERSARIAL MEMORY TESTS & REGRESSIONS PASSED CLEANLY!       " << std::endl;
+    std::cout << "  ALL MEMORY EDGE CASE TESTS PASSED                                " << std::endl;
     std::cout << "====================================================================" << std::endl;
 
     return 0;

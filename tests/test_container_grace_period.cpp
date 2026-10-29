@@ -66,7 +66,7 @@ void test_varying_grace_periods_sequential(uint32_t grace_period_ms, int cycles)
         ContainerStatus st = ctrl->get_status();
         assert(st.phase == ContainerPhase::Failed);
         assert(st.exit_code == 137);
-        assert(st.termination_reason == "ExecutionTimeout");
+        assert(st.termination_reason == "Error");
 
         // Immediate destruction — tests clean thread join and zero use-after-free
         ctrl.reset();
@@ -84,15 +84,15 @@ void test_varying_grace_periods_concurrent(const std::vector<uint32_t>& grace_pe
 
     std::vector<std::thread> workers;
     std::atomic<int> pass_count{0};
-    std::atomic<bool> start_gate{false};
+    std::atomic<bool> start_flag{false};
 
     int total_tasks = static_cast<int>(grace_periods.size()) * threads_per_grace;
 
     for (size_t g_idx = 0; g_idx < grace_periods.size(); ++g_idx) {
         uint32_t grace = grace_periods[g_idx];
         for (int t = 0; t < threads_per_grace; ++t) {
-            workers.emplace_back([grace, t, &pass_count, &start_gate]() {
-                while (!start_gate.load()) {
+            workers.emplace_back([grace, t, &pass_count, &start_flag]() {
+                while (!start_flag.load()) {
                     std::this_thread::yield();
                 }
 
@@ -117,7 +117,7 @@ void test_varying_grace_periods_concurrent(const std::vector<uint32_t>& grace_pe
                 if (elapsed_ms >= 600) return; // Must terminate within grace + 250ms trap + margin
 
                 ContainerStatus st = ctrl->get_status();
-                if (st.phase != ContainerPhase::Failed || st.exit_code != 137 || st.termination_reason != "ExecutionTimeout") {
+                if (st.phase != ContainerPhase::Failed || st.exit_code != 137 || st.termination_reason != "Error") {
                     return;
                 }
 
@@ -129,7 +129,7 @@ void test_varying_grace_periods_concurrent(const std::vector<uint32_t>& grace_pe
     }
 
     // Release all threads simultaneously
-    start_gate.store(true);
+    start_flag.store(true);
 
     for (auto& th : workers) {
         if (th.joinable()) th.join();
@@ -169,7 +169,7 @@ void test_direct_destruction_without_explicit_stop(int cycles) {
 }
 
 // =============================================================================
-// SECTION 2: GENERIC PIN ROLLBACK DEEP ADVERSARIAL STRESS
+// SECTION 2: GENERIC PIN ROLLBACK STRESS
 // =============================================================================
 
 void test_generic_pin_rollback_exhaustive() {
@@ -327,12 +327,12 @@ void test_generic_pin_concurrent_contention_stress(int thread_count, int ops_per
     fw.reset();
 
     std::vector<std::thread> workers;
-    std::atomic<bool> start_gate{false};
+    std::atomic<bool> start_flag{false};
     std::atomic<int> completed_threads{0};
 
     for (int t = 0; t < thread_count; ++t) {
-        workers.emplace_back([t, ops_per_thread, &fw, &start_gate, &completed_threads]() {
-            while (!start_gate.load()) std::this_thread::yield();
+        workers.emplace_back([t, ops_per_thread, &fw, &start_flag, &completed_threads]() {
+            while (!start_flag.load()) std::this_thread::yield();
 
             for (int op = 0; op < ops_per_thread; ++op) {
                 // Interleave doomed registrations (causing rollback) and valid registrations
@@ -382,7 +382,7 @@ void test_generic_pin_concurrent_contention_stress(int thread_count, int ops_per
         });
     }
 
-    start_gate.store(true);
+    start_flag.store(true);
     for (auto& th : workers) {
         if (th.joinable()) th.join();
     }
@@ -404,7 +404,7 @@ void test_generic_pin_concurrent_contention_stress(int thread_count, int ops_per
 // =============================================================================
 int main() {
     std::cout << "==================================================================" << std::endl;
-    std::cout << " Kube32 Milestone 3 Iteration 3 Challenger 6 Harness              " << std::endl;
+    std::cout << " Kube32 Container Grace Period & Pin Contention Tests         " << std::endl;
     std::cout << " Concurrency Stress, Thread Lifecycle & Generic Pin Rollback      " << std::endl;
     std::cout << "==================================================================" << std::endl;
 
@@ -424,7 +424,7 @@ int main() {
     test_generic_pin_concurrent_contention_stress(10, 20);
 
     std::cout << "\n==================================================================" << std::endl;
-    std::cout << " ALL CHALLENGER 6 EMPIRICAL STRESS TESTS PASSED! (100%)           " << std::endl;
+    std::cout << " ALL CONTAINER GRACE PERIOD TESTS PASSED                       " << std::endl;
     std::cout << "==================================================================" << std::endl;
 
     return 0;

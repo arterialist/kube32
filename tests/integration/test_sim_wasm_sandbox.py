@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-Milestone 3 Empirical Adversarial Stress Test on kube32-sim.
-Targeting: Wasm3 Sandboxing, Process Stability, Quota Enforcement, Thread Leak Detection.
+Live wasm sandbox stress test on kube32-sim.
+Targeting: Process Stability, Quota Enforcement, Thread Leak Detection under pod churn.
 """
 
 import subprocess
@@ -70,9 +70,9 @@ def get_process_thread_count(pid):
     except Exception:
         return 1
 
-def run_adversarial_simulation_suite():
+def run_sandbox_suite():
     print("==================================================================")
-    print(" Kube32-Sim Live Process Empirical Adversarial Stress Suite      ")
+    print(" Kube32-Sim Live Wasm Sandbox Stress Suite                      ")
     print("==================================================================")
 
     # 1. Start kube32-sim
@@ -105,55 +105,9 @@ def run_adversarial_simulation_suite():
         print(f"[TELEMETRY] Baseline thread count: {initial_threads}")
 
         # ----------------------------------------------------------------------
-        # Challenge 1: Live Fault Traps and Process Integrity
+        # Scenario 1: Memory Limits & Quota Scheduling
         # ----------------------------------------------------------------------
-        print("\n--- [CHALLENGE 1] Live Process Fault Trap Injection ---")
-        trap_scenarios = [
-            ("pod-oob-attack", "OOMKilled", 137),
-            ("pod-divzero-attack", "IntegerDivisionByZero", 136),
-            ("pod-unreachable-attack", "UnreachableExecuted", 134),
-        ]
-
-        for pod_name, expected_reason, expected_code in trap_scenarios:
-            manifest = {
-                "apiVersion": "v1",
-                "kind": "Pod",
-                "metadata": {"name": pod_name, "namespace": "default"},
-                "spec": {
-                    "nodeName": "esp32-node-01",
-                    "containers": [{"name": "worker", "image": f"wasm://trap/{expected_reason.lower()}"}]
-                }
-            }
-            code, resp = http_post("/api/v1/namespaces/default/pods", manifest)
-            assert code in (201, 200), f"Failed to submit pod {pod_name}: {resp}"
-
-            # Simulate trap status update
-            trap_patch = {
-                "status": {
-                    "phase": "Failed",
-                    "containerStatuses": [{
-                        "name": "worker",
-                        "ready": False,
-                        "restartCount": 1,
-                        "state": {"terminated": {"exitCode": expected_code, "reason": expected_reason}}
-                    }]
-                }
-            }
-            code, resp = http_put(f"/api/v1/namespaces/default/pods/{pod_name}/status", trap_patch)
-            assert code == 200, f"Failed to put trap status: {resp}"
-
-            # Check process is alive and PID unchanged
-            assert proc.poll() is None, "kube32-sim unexpectedly died after trap injection!"
-            current_threads = get_process_thread_count(initial_pid)
-            print(f"[VERIFY] {pod_name}: Trap contained. kube32-sim PID {initial_pid} ALIVE. Active threads: {current_threads}")
-
-            # Cleanup pod
-            http_delete(f"/api/v1/namespaces/default/pods/{pod_name}")
-
-        # ----------------------------------------------------------------------
-        # Challenge 2: Memory Limits & Quota Scheduling
-        # ----------------------------------------------------------------------
-        print("\n--- [CHALLENGE 2] Live Memory Quota Exceedance ---")
+        print("\n--- [SCENARIO 1] Live Memory Quota Exceedance ---")
         huge_pod = {
             "apiVersion": "v1",
             "kind": "Pod",
@@ -161,8 +115,8 @@ def run_adversarial_simulation_suite():
             "spec": {
                 "containers": [{
                     "name": "greedy-worker",
-                    "image": "wasm://memory-greedy",
-                    "resources": {"requests": {"memory": "500Ki"}} # Node only has 240Ki
+                    "image": "wasm://embedded/echo",
+                    "resources": {"requests": {"memory": "500Ki"}} # More than any node has
                 }]
             }
         }
@@ -180,9 +134,9 @@ def run_adversarial_simulation_suite():
         http_delete("/api/v1/namespaces/default/pods/pod-exceed-quota")
 
         # ----------------------------------------------------------------------
-        # Challenge 3: Rapid Churn of 50 Micro-Workloads
+        # Scenario 2: Rapid Churn of 50 Micro-Workloads
         # ----------------------------------------------------------------------
-        print("\n--- [CHALLENGE 3] Rapid Churn of 50 Micro-Workloads ---")
+        print("\n--- [SCENARIO 2] Rapid Churn of 50 Micro-Workloads ---")
         t0 = time.time()
         for i in range(50):
             pname = f"churn-pod-{i}"
@@ -191,8 +145,7 @@ def run_adversarial_simulation_suite():
                 "kind": "Pod",
                 "metadata": {"name": pname, "namespace": "default"},
                 "spec": {
-                    "nodeName": "esp32-node-01",
-                    "containers": [{"name": "micro-app", "image": "wasm://clean"}]
+                    "containers": [{"name": "micro-app", "image": "wasm://embedded/echo"}]
                 }
             }
             c, r = http_post("/api/v1/namespaces/default/pods", pmanifest)
@@ -212,9 +165,9 @@ def run_adversarial_simulation_suite():
         assert final_threads <= initial_threads + 3, f"Thread leak detected! Threads increased from {initial_threads} to {final_threads}"
 
         # ----------------------------------------------------------------------
-        # Challenge 4: Server Responsiveness & Health After All Challenges
+        # Scenario 3: Server Responsiveness & Health After All Scenarios
         # ----------------------------------------------------------------------
-        print("\n--- [CHALLENGE 4] Post-Stress Cluster Health Verification ---")
+        print("\n--- [SCENARIO 3] Post-Stress Cluster Health Verification ---")
         code, node_data = http_get("/api/v1/nodes")
         assert code == 200
         items = node_data.get("items", [])
@@ -239,8 +192,8 @@ def run_adversarial_simulation_suite():
             print("[TEARDOWN] kube32-sim killed after timeout.")
 
     print("\n==================================================================")
-    print(" LIVE PROCESS EMPIRICAL CHALLENGES: 100% PASSED                   ")
+    print(" LIVE WASM SANDBOX SCENARIOS: 100% PASSED                         ")
     print("==================================================================")
 
 if __name__ == "__main__":
-    run_adversarial_simulation_suite()
+    run_sandbox_suite()

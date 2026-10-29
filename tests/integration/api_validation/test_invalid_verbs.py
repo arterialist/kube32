@@ -1,12 +1,12 @@
 """
-Tier 2 Boundary Tests: 405 Method Not Allowed for Invalid HTTP Verbs
+API Validation Tests: 405 Method Not Allowed for Invalid HTTP Verbs
 Authoritative sources:
 - HTTP/1.1 Specification (RFC 7231 § 6.5.5)
 - Kubernetes REST API Convention
 - survey_spec_miner_1/report.md § 3.1
 """
 
-from tests.framework import BaseTestCase
+from tests.integration.framework import BaseTestCase
 
 
 class TestInvalidVerbs(BaseTestCase):

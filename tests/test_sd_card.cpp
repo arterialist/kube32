@@ -144,12 +144,21 @@ void test_firewall_sd_grant() {
     assert(!fw.register_pod("default/noclaim", no_claim, err));
     assert(err.find("claim") != std::string::npos);
 
-    // a claim without the resource request grants nothing
+    // a kube32.io/sd volume insists on the card, with or without the resource request
+    assert(fw.volume_needs_card("default/notes"));
     std::string no_request = R"({"spec": {"volumes": [{"name": "data", "kube32.io/sd": {"claim": "x"}}],
         "containers": [{"name": "c"}]}})";
     assert(fw.register_pod("default/norequest", no_request, err));
-    assert(!fw.check_permission("default/norequest", hal::PeripheralType::SdCard, 0, hal::AccessMode::Read));
-    assert(fw.sd_claim("default/norequest").empty());
+    assert(fw.check_permission("default/norequest", hal::PeripheralType::SdCard, 0, hal::AccessMode::Read));
+    assert(fw.sd_claim("default/norequest") == "x");
+    assert(fw.volume_needs_card("default/norequest"));
+    // a persistentVolumeClaim alone lives on whatever storage the node has
+    std::string pvc_only = R"({"spec": {"volumes": [{"name": "data", "persistentVolumeClaim": {"claimName": "local"}}],
+        "containers": [{"name": "c"}]}})";
+    assert(fw.register_pod("default/pvconly", pvc_only, err));
+    assert(fw.sd_claim("default/pvconly") == "local");
+    assert(!fw.volume_needs_card("default/pvconly"));
+    assert(fw.volume_needs_card("default/pvc"));   // it requests hardware.kube32.io/sd
 
     // claim names are directory names
     std::string bad = R"({"spec": {"volumes": [{"name": "data", "kube32.io/sd": {"claim": "../escape"}}],
@@ -273,11 +282,13 @@ void test_pod_fs_abi() {
     assert(fs.write("default/stranger", 0, buf, 1) == K32_ERR_PERM);
     assert(fs.close("default/stranger", 0) == K32_ERR_PERM);
     assert(fs.size("default/stranger", 0) == K32_ERR_PERM);
-    std::string no_request = R"({"spec": {"volumes": [{"name": "data", "kube32.io/sd": {"claim": "x"}}], "containers": [{"name": "c"}]}})";
+    // a volume claim alone is a grant: the volume lives on the node's storage
+    std::string no_request = R"({"spec": {"volumes": [{"name": "data", "persistentVolumeClaim": {"claimName": "x"}}], "containers": [{"name": "c"}]}})";
     assert(fw.register_pod("default/norequest", no_request, err));
-    assert(fs.open("default/norequest", "boot.log", K32_FS_O_RDONLY) == K32_ERR_PERM);
-    const hal::PodSecurityRecord* rec = fw.get_pod_security_record("default/norequest");
-    assert(rec && rec->violation_count == 1);
+    int32_t nfd = fs.open("default/norequest", "boot.log", K32_FS_O_WRONLY | K32_FS_O_CREAT);
+    assert(nfd >= 0);
+    assert(fs.close("default/norequest", nfd) == 0);
+    assert(file_exists(g_root + "/kube32/volumes/x/boot.log"));
 
     // no card: the grant is there but there is nothing to open
     hal::sd_unmount();
@@ -444,10 +455,11 @@ static int32_t call_pod(const std::string& pod, const char* method, const char* 
     return runtime::AppPodHost::instance().handle(pod, req, sink);
 }
 
+// The sdnote guest with its volume and hardware.kube32.io/sd, or with neither.
 static std::string sd_manifest(const std::string& name, bool with_request) {
     return "{\"metadata\":{\"name\":\"" + name + "\",\"namespace\":\"default\"},"
-           "\"spec\":{\"nodeName\":\"test-node-01\","
-           "\"volumes\":[{\"name\":\"data\",\"persistentVolumeClaim\":{\"claimName\":\"notes\"}}],"
+           "\"spec\":{\"nodeName\":\"test-node-01\"," +
+           std::string(with_request ? "\"volumes\":[{\"name\":\"data\",\"persistentVolumeClaim\":{\"claimName\":\"notes\"}}]," : "") +
            "\"containers\":[{\"name\":\"c\",\"image\":\"wasm://sd/sdnote\"" +
            std::string(with_request ? ",\"resources\":{\"requests\":{\"memory\":\"64Ki\",\"hardware.kube32.io/sd\":\"1\"}}" : "") + "}]}}";
 }
@@ -517,12 +529,13 @@ void test_sdnote_guest_end_to_end() {
     c->pods.clear();
     kl.sync_assigned_pods();
 
-    // without hardware.kube32.io/sd the same guest is denied inside k32_init
+    // without a volume the same guest is denied inside k32_init;
+    // a failed start under restartPolicy Always waits out a back-off
     c->events.clear();
     c->pods.emplace_back(make_pod("denied"), sd_manifest("denied", false));
     kl.sync_assigned_pods();
     assert(kl.get_pod_record("default/denied", rec));
-    assert(rec.execution_phase == kubelet::PodExecutionPhase::Failed);
+    assert(rec.execution_phase == kubelet::PodExecutionPhase::CrashLoopBackOff);
     assert(rec.last_error_message.find("k32_init returned " + std::to_string(K32_ERR_PERM)) != std::string::npos);
     assert(!file_exists(log_path));
     c->pods.clear();
@@ -534,7 +547,7 @@ void test_sdnote_guest_end_to_end() {
     c->pods.emplace_back(make_pod("nocard"), sd_manifest("nocard", true));
     kl.sync_assigned_pods();
     assert(kl.get_pod_record("default/nocard", rec) && rec.execution_phase == kubelet::PodExecutionPhase::Failed);
-    assert(rec.last_error_message.find("no sd card is mounted") != std::string::npos);
+    assert(rec.last_error_message.find("needs a microSD card") != std::string::npos);
     assert(c->last_status.find("CapabilityAdmissionFailed") != std::string::npos);
     mount_root();
     c->pods.clear();

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Kube32 E2E Test Runner & CLI Harness
-Executes Tiers 1-4 automated tests against simulated and physical Kube32 clusters
+Executes the API, validation, scheduling, workload, cluster and federation suites against simulated and physical Kube32 clusters
 using native kubectl commands and direct HTTP REST calls.
 """
 
@@ -16,49 +16,46 @@ from typing import List, Tuple, Type
 
 # Ensure project root is in sys.path
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-PROJECT_ROOT = os.path.dirname(SCRIPT_DIR)
+PROJECT_ROOT = os.path.dirname(os.path.dirname(SCRIPT_DIR))
 if PROJECT_ROOT not in sys.path:
     sys.path.insert(0, PROJECT_ROOT)
 
-from tests.framework import HTTPClient, KubectlClient, BaseTestCase, MockKube32Server
+from tests.integration.framework import HTTPClient, KubectlClient, BaseTestCase
 
 logger = logging.getLogger("kube32_test")
 
 
-TIER_MAPPING = {
-    "1": [
-        "tests.tier1_feature.test_discovery",
-        "tests.tier1_feature.test_nodes",
-        "tests.tier1_feature.test_pods",
-        "tests.tier1_feature.test_deployments",
-        "tests.tier1_feature.test_tables",
+SUITE_MAPPING = {
+    "api": [
+        "tests.integration.api_resources.test_discovery",
+        "tests.integration.api_resources.test_nodes",
+        "tests.integration.api_resources.test_pods",
+        "tests.integration.api_resources.test_deployments",
+        "tests.integration.api_resources.test_tables",
     ],
-    "2": [
-        "tests.tier2_boundary.test_empty_payloads",
-        "tests.tier2_boundary.test_malformed_json",
-        "tests.tier2_boundary.test_not_found",
-        "tests.tier2_boundary.test_conflict",
-        "tests.tier2_boundary.test_invalid_verbs",
+    "validation": [
+        "tests.integration.api_validation.test_empty_payloads",
+        "tests.integration.api_validation.test_malformed_json",
+        "tests.integration.api_validation.test_not_found",
+        "tests.integration.api_validation.test_conflict",
+        "tests.integration.api_validation.test_invalid_verbs",
     ],
-    "3": [
-        "tests.tier3_pairwise.test_memory_limits",
-        "tests.tier3_pairwise.test_peripherals",
-        "tests.tier3_pairwise.test_concurrency",
+    "resources": [
+        "tests.integration.scheduling_resources.test_memory_limits",
+        "tests.integration.scheduling_resources.test_peripherals",
+        "tests.integration.scheduling_resources.test_concurrency",
     ],
-    "4": [
-        "tests.tier4_application.test_microworkload",
-        "tests.tier4_application.test_rescheduling",
-        "tests.tier4_application.test_reboot",
-        "tests.tier4_application.test_federation",
+    "workloads": [
+        "tests.integration.workloads.test_microworkload",
     ],
-    "m4": [
-        "tests.test_m4_node_lease",
-        "tests.test_m4_self_healing",
-        "tests.test_m4_channel_ipc",
-        "tests.test_m4_reboot_recovery",
+    "cluster": [
+        "tests.integration.cluster.test_node_lease",
+        "tests.integration.cluster.test_self_healing",
+        "tests.integration.cluster.test_channel_ipc",
+        "tests.integration.cluster.test_reboot_recovery",
     ],
-    "m5": [
-        "tests.test_m5_federation_e2e",
+    "federation": [
+        "tests.integration.federation.test_upstream_federation",
     ]
 }
 
@@ -175,9 +172,9 @@ def main():
     )
     parser.add_argument(
         "--target",
-        choices=["sim", "hw", "mock"],
+        choices=["sim", "hw"],
         default="sim",
-        help="Test target environment: 'sim' (simulation cluster), 'hw' (physical ESP32), or 'mock' (reference server)"
+        help="Test target environment: 'sim' (simulation cluster) or 'hw' (physical ESP32)"
     )
     parser.add_argument(
         "--server",
@@ -185,10 +182,10 @@ def main():
         help="Base URL of the Kube32 API Server"
     )
     parser.add_argument(
-        "--tier",
-        choices=["1", "2", "3", "4", "m4", "m5", "all"],
+        "--suite",
+        choices=["api", "validation", "resources", "workloads", "cluster", "federation", "all"],
         default="all",
-        help="Test tier to execute ('1', '2', '3', '4', 'm4', 'm5', or 'all')"
+        help="Test suite to execute ('api', 'validation', 'resources', 'workloads', 'cluster', 'federation', or 'all')"
     )
     parser.add_argument(
         "-v", "--verbose", "--v",
@@ -201,11 +198,6 @@ def main():
         default="",
         help="Optional substring filter for test names"
     )
-    parser.add_argument(
-        "--self-test",
-        action="store_true",
-        help="Run self-test with built-in reference mock server"
-    )
 
     args = parser.parse_args()
 
@@ -215,17 +207,8 @@ def main():
         logging.basicConfig(level=logging.INFO, format="%(message)s")
 
     server_url = args.server
-    mock_server = None
-
-    # Handle self-test or mock target
-    if args.self_test or args.target == "mock":
-        print("[INIT] Starting built-in MockKube32 reference server for self-test...")
-        mock_server = MockKube32Server(host="127.0.0.1", port=0)
-        mock_server.start()
-        server_url = mock_server.url
-        print(f"[INIT] MockKube32 running on {server_url}")
-    elif args.tier in ("m4", "m5"):
-        # M4 and M5 tests manage their own multi-node simulated clusters
+    if args.suite in ("cluster", "federation"):
+        # Cluster and federation tests manage their own multi-node simulated clusters
         pass
     else:
         # Check if target server is reachable
@@ -239,24 +222,24 @@ def main():
                 print(f"[INIT] Connected to Kube32 API Server: gitVersion={test_resp.json().get('gitVersion', 'unknown')}")
         except ConnectionError as ce:
             print(f"[ERROR] Could not connect to Kube32 server at {server_url}: {ce}", file=sys.stderr)
-            print("[HINT] If Kube32 server is not running yet, use '--self-test' to verify test suites against reference mock.", file=sys.stderr)
+            print("[HINT] Start kube32-sim first, e.g. build/kube32-sim --role standalone --pod-port 17000", file=sys.stderr)
             sys.exit(3)
 
     # Determine modules to run
-    if args.tier == "all":
+    if args.suite == "all":
         modules_to_run = (
-            TIER_MAPPING["1"] +
-            TIER_MAPPING["2"] +
-            TIER_MAPPING["3"] +
-            TIER_MAPPING["4"] +
-            TIER_MAPPING["m4"] +
-            TIER_MAPPING["m5"]
+            SUITE_MAPPING["api"] +
+            SUITE_MAPPING["validation"] +
+            SUITE_MAPPING["resources"] +
+            SUITE_MAPPING["workloads"] +
+            SUITE_MAPPING["cluster"] +
+            SUITE_MAPPING["federation"]
         )
     else:
-        modules_to_run = TIER_MAPPING.get(args.tier, [])
+        modules_to_run = SUITE_MAPPING.get(args.suite, [])
 
     print("\n" + "=" * 70)
-    print(f" Running Kube32 E2E Test Suite (Tier: {args.tier.upper()}, Target: {args.target})")
+    print(f" Running Kube32 E2E Test Suite (Suite: {args.suite.upper()}, Target: {args.target})")
     print(f" Target Server : {server_url}")
     print(f" Modules Count : {len(modules_to_run)}")
     print("=" * 70 + "\n")
@@ -277,8 +260,6 @@ def main():
         )
     finally:
         total_time = time.time() - start_all
-        if mock_server:
-            mock_server.stop()
 
     print_summary(results, total_time)
 

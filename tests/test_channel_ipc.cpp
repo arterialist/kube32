@@ -63,7 +63,7 @@ void test_packet_wire_crc16() {
     std::cout << "[PASS] test_packet_wire_crc16" << std::endl;
 }
 
-void test_capability_firewall_ipc_gate() {
+void test_capability_firewall_ipc_access() {
     auto& fw = kube32::hal::CapabilityFirewall::instance();
     fw.reset();
 
@@ -96,7 +96,7 @@ void test_capability_firewall_ipc_gate() {
     assert(fw.check_permission("ipc-res-pod", kube32::hal::PeripheralType::IPC, 0, kube32::hal::AccessMode::ReadWrite));
 
     fw.reset();
-    std::cout << "[PASS] test_capability_firewall_ipc_gate" << std::endl;
+    std::cout << "[PASS] test_capability_firewall_ipc_access" << std::endl;
 }
 
 void test_intra_node_channel_loopback() {
@@ -188,7 +188,7 @@ int main() {
 
     test_ring_buffer_lock_free();
     test_packet_wire_crc16();
-    test_capability_firewall_ipc_gate();
+    test_capability_firewall_ipc_access();
     test_intra_node_channel_loopback();
     test_channel_high_level_object();
     test_channel_throughput_latency_benchmark();

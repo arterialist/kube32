@@ -1,5 +1,5 @@
 """
-Kube32 Milestone 4 Test Suite: Node Reboot and Rejoin Recovery
+Kube32 Cluster Tests: Node Reboot and Rejoin Recovery
 Verifies ephemeral lease re-establishment, state recovery, and cluster rejoin
 after an abrupt node reboot or power outage.
 """
@@ -7,11 +7,11 @@ after an abrupt node reboot or power outage.
 import time
 import json
 import urllib.request
-from tests.framework import BaseTestCase
-from tests.m4_cluster_harness import ClusterHarness
+from tests.integration.framework import BaseTestCase
+from tests.integration.cluster_harness import ClusterHarness, node_ready_condition
 
 
-class TestM4RebootRecovery(BaseTestCase):
+class TestRebootRecovery(BaseTestCase):
     def setUp(self):
         super().setUp()
         self.harness = ClusterHarness(base_api_port=16843, base_ipc_port=17800)
@@ -32,33 +32,21 @@ class TestM4RebootRecovery(BaseTestCase):
         worker = self.harness.start_worker("worker-reboot-1", 1, cp, lease_interval_ms=500)
 
         # Confirm initial Ready condition
-        node_url = f"{cp.api_url}/api/v1/nodes/{worker.name}"
-        with urllib.request.urlopen(node_url, timeout=2.0) as resp:
-            data = json.loads(resp.read().decode())
-            ready_cond = next((c for c in data.get("status", {}).get("conditions", []) if c.get("type") == "Ready"), None)
-            self.assertIsNotNone(ready_cond)
-            self.assertEqual(ready_cond.get("status"), "True")
+        def ready(status, reason=None):
+            cond = node_ready_condition(cp.api_url, worker.name)
+            ok = cond and cond.get("status") == status and (reason is None or cond.get("reason") == reason)
+            return cond if ok else None
+        self.wait_for_condition(lambda: ready("True"), timeout=10.0, description="node Ready=True")
 
         # Simulate abrupt reboot: kill worker
         self.harness.kill_node(worker.name)
 
-        # Wait for lease expiration (2000ms threshold)
-        time.sleep(2.4)
-
-        with urllib.request.urlopen(node_url, timeout=2.0) as resp:
-            data = json.loads(resp.read().decode())
-            ready_cond = next((c for c in data.get("status", {}).get("conditions", []) if c.get("type") == "Ready"), None)
-            self.assertEqual(ready_cond.get("status"), "False")
+        # Lease expiry (at least 15 s) turns the condition to Unknown
+        self.wait_for_condition(lambda: ready("Unknown"), timeout=25.0, interval=0.5, description="node Ready=Unknown")
 
         # Reboot / restart the worker
         rebooted = self.harness.restart_node(worker.name, cp, lease_interval_ms=500)
         self.assertTrue(rebooted.is_alive())
 
-        # Wait for kubelet heartbeat to renew lease and restore Ready=True
-        time.sleep(1.2)
-
-        with urllib.request.urlopen(node_url, timeout=2.0) as resp:
-            data = json.loads(resp.read().decode())
-            ready_cond = next((c for c in data.get("status", {}).get("conditions", []) if c.get("type") == "Ready"), None)
-            self.assertEqual(ready_cond.get("status"), "True")
-            self.assertEqual(ready_cond.get("reason"), "KubeletReady")
+        # The kubelet heartbeat renews the lease and restores Ready=True
+        self.wait_for_condition(lambda: ready("True", "KubeletReady"), timeout=15.0, description="node Ready=True after restart")

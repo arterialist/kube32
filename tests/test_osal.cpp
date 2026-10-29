@@ -1,5 +1,6 @@
 #include "osal/osal.hpp"
 #include <cassert>
+#include <thread>
 #include <iostream>
 #include <atomic>
 #include <vector>
@@ -186,12 +187,16 @@ void test_socket_loopback() {
 
 void test_system_telemetry() {
     std::cout << "[RUN] test_system_telemetry" << std::endl;
-    size_t sram = System::get_free_heap_bytes();
-    assert(sram > 0);
-    size_t psram = System::get_free_psram_bytes();
-    assert(psram > 0);
-    uint32_t freq = System::get_cpu_freq_mhz();
-    assert(freq > 0);
+    // Host figures are the machine's: physical and available memory, its core
+    // count, and no PSRAM. The CPU clock is not reported on the host.
+    size_t total = System::get_total_heap_bytes();
+    size_t avail = System::get_free_heap_bytes();
+    assert(total > 0);
+    assert(avail > 0 && avail <= total);
+    assert(System::get_free_psram_bytes() == 0);
+    assert(System::get_total_psram_bytes() == 0);
+    assert(System::get_cpu_cores() == std::thread::hardware_concurrency());
+    assert(System::get_cpu_freq_mhz() == 0);
     uint64_t uptime = System::get_uptime_ms();
     assert(uptime >= 0);
 
@@ -208,24 +213,24 @@ void test_condition_variable_lost_wakeup_guard() {
     constexpr int PULSES = 20;
 
     std::vector<Thread> consumers(NUM_CONSUMERS);
-    std::atomic<bool> start_gate{false};
+    std::atomic<bool> start_flag{false};
     int pulse_sequence = 0;
 
     struct ConsumerCtx {
         Mutex* mtx;
         ConditionVariable* cv;
         int* seq;
-        std::atomic<bool>* gate;
+        std::atomic<bool>* flag;
         std::atomic<int>* completed;
         int last_seen{0};
     };
 
     std::vector<ConsumerCtx> ctxs(NUM_CONSUMERS);
     for (int i = 0; i < NUM_CONSUMERS; ++i) {
-        ctxs[i] = {&mtx, &cv, &pulse_sequence, &start_gate, &completed_consumers, 0};
+        ctxs[i] = {&mtx, &cv, &pulse_sequence, &start_flag, &completed_consumers, 0};
         consumers[i].start([](void* arg) {
             auto* c = static_cast<ConsumerCtx*>(arg);
-            while (!c->gate->load()) {
+            while (!c->flag->load()) {
                 Thread::yield();
             }
             while (c->last_seen < PULSES) {
@@ -237,7 +242,7 @@ void test_condition_variable_lost_wakeup_guard() {
         }, &ctxs[i]);
     }
 
-    start_gate.store(true);
+    start_flag.store(true);
     for (int p = 1; p <= PULSES; ++p) {
         Thread::sleep_ms(2);
         {

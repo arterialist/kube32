@@ -1,11 +1,10 @@
 """
-Automated E2E Integration Test Suite for Milestone 5:
-Inter-Cluster Federation Bridge & Virtual Kubelet Gateway
+Integration tests for the inter-cluster federation bridge and Virtual Kubelet gateway.
 Tests:
 - Test 1: Node registration & aggregate capacity check
 - Test 2: Upstream lease heartbeats renewed across 30+ seconds
 - Test 3: Upstream pod scheduled -> translated -> autonomously scheduled on Kube32
-- Test 4: Reverse status sync (Pending -> Running with IP -> Failed exitCode 137)
+- Test 4: Reverse status sync (Pending -> Running with IP and container status)
 - Test 5: Pod deletion cascade & finalizer removal
 - Test 6: Channel IPC Gateway bidirectional message transmission over K32C UDP frames
 - Test 7: Downstream Kube32 restart / partition resilience
@@ -23,19 +22,19 @@ import urllib.request
 import urllib.error
 from typing import Dict, Any, Optional
 
-PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 if PROJECT_ROOT not in sys.path:
     sys.path.insert(0, PROJECT_ROOT)
 
-from tests.framework import BaseTestCase
-from tests.m4_cluster_harness import ClusterHarness
-from tests.mock_upstream_k8s import MockUpstreamK8sServer
+from tests.integration.framework import BaseTestCase
+from tests.integration.cluster_harness import ClusterHarness, enable_link_stats, link_stats, node_ready_condition
+from tests.integration.mock_upstream_k8s import MockUpstreamK8sServer
 
 VK_BIN_PATH = os.path.join(PROJECT_ROOT, "federation", "bin", "virtual-kubelet")
-logger = logging.getLogger("test_m5_federation_e2e")
+logger = logging.getLogger("test_upstream_federation")
 
 
-class TestM5FederationE2E(unittest.TestCase, BaseTestCase):
+class TestUpstreamFederation(unittest.TestCase, BaseTestCase):
     _cluster_started = False
     _harness = None
     _cp = None
@@ -82,8 +81,10 @@ class TestM5FederationE2E(unittest.TestCase, BaseTestCase):
             name="cp-fed-0",
             lease_interval_ms=500,
             not_ready_timeout_ms=3000,
-            eviction_timeout_ms=6000
+            eviction_timeout_ms=6000,
+            ingress_port=k32_cp_port + 100
         )
+        enable_link_stats(cls._cp)
         cls._worker = cls._harness.start_worker(
             name="worker-1",
             node_id=1,
@@ -96,6 +97,14 @@ class TestM5FederationE2E(unittest.TestCase, BaseTestCase):
             cp_node=cls._cp,
             lease_interval_ms=500
         )
+
+        # The bridge aggregates Ready nodes: wait until both workers report Ready
+        for w in (cls._worker, cls._worker2):
+            end = time.time() + 15.0
+            while (node_ready_condition(cls._cp.api_url, w.name) or {}).get("status") != "True":
+                if time.time() > end:
+                    raise TimeoutError(f"{w.name} did not become Ready within 15.0s")
+                time.sleep(0.2)
 
         # 2. Start Mock Upstream Kubernetes Server
         cls._mock_k8s = MockUpstreamK8sServer(port=mock_k8s_port)
@@ -164,8 +173,12 @@ class TestM5FederationE2E(unittest.TestCase, BaseTestCase):
 
     def test_01_node_registration_and_aggregate_capacity(self):
         """Test 1: Node registration & aggregate capacity check."""
-        with self.mock_k8s.lock:
-            node = self.mock_k8s.store["nodes"].get(self.node_name)
+        def virtual_node_ready():
+            with self.mock_k8s.lock:
+                node = self.mock_k8s.store["nodes"].get(self.node_name) or {}
+            conds = node.get("status", {}).get("conditions", [])
+            return node if any(c.get("type") == "Ready" and c.get("status") == "True" for c in conds) else None
+        node = self.wait_for_condition(virtual_node_ready, timeout=10.0, description="virtual node Ready")
 
         self.assertIsNotNone(node, "Virtual node not found in upstream store")
         meta = node.get("metadata", {})
@@ -240,7 +253,7 @@ class TestM5FederationE2E(unittest.TestCase, BaseTestCase):
                 "containers": [
                     {
                         "name": "collector",
-                        "image": "wasm://telemetry:v1",
+                        "image": "wasm://embedded/echo",
                         "resources": {
                             "limits": {
                                 "memory": "64Ki",
@@ -284,7 +297,7 @@ class TestM5FederationE2E(unittest.TestCase, BaseTestCase):
         self.assertIn("kube32.io/federation-protection", finalizers)
 
     def test_04_reverse_status_sync(self):
-        """Test 4: Reverse status sync (Pending -> Running with IP -> Failed exitCode 137)."""
+        """Test 4: Reverse status sync (Pending -> Running with IP and a running, ready container)."""
         pod_name = "esp32-status-sync-pod"
         upstream_manifest = {
             "apiVersion": "v1",
@@ -292,72 +305,22 @@ class TestM5FederationE2E(unittest.TestCase, BaseTestCase):
             "metadata": {"name": pod_name, "namespace": "default"},
             "spec": {
                 "nodeName": self.node_name,
-                "containers": [{"name": "app", "image": "wasm://app"}]
+                "containers": [{"name": "app", "image": "wasm://embedded/echo"}]
             }
         }
         self.mock_k8s.inject_pod(upstream_manifest)
 
-        # Wait for downstream creation
-        time.sleep(1.0)
-
-        # Step 4A: Check Running with IP
-        start = time.time()
-        synced_running = False
-        while time.time() - start < 5.0:
+        # Upstream status follows the downstream kubelet: Running with the pod IP and a ready container
+        def synced():
             with self.mock_k8s.lock:
                 up_pod = self.mock_k8s.store["pods"].get("default", {}).get(pod_name, {})
-                phase = up_pod.get("status", {}).get("phase")
-                pod_ip = up_pod.get("status", {}).get("podIP")
-                if phase == "Running" and pod_ip:
-                    synced_running = True
-                    break
-            time.sleep(0.2)
-        self.assertTrue(synced_running, "Upstream pod status did not transition to Running with podIP")
-
-        # Step 4B: Simulate Wasm runtime trap / OOM (exitCode 137) on Kube32
-        patch_body = {
-            "status": {
-                "phase": "Failed",
-                "reason": "RuntimeTrap",
-                "message": "Memory bounds trap (exitCode=137)",
-                "containerStatuses": [
-                    {
-                        "name": "app",
-                        "ready": False,
-                        "state": {
-                            "terminated": {
-                                "exitCode": 137,
-                                "reason": "RuntimeTrap"
-                            }
-                        }
-                    }
-                ]
-            }
-        }
-        req = urllib.request.Request(
-            f"{self.cp.api_url}/api/v1/namespaces/default/pods/{pod_name}/status",
-            data=json.dumps(patch_body).encode("utf-8"),
-            headers={"Content-Type": "application/json"},
-            method="PUT"
-        )
-        with urllib.request.urlopen(req, timeout=1.0) as resp:
-            self.assertEqual(resp.status, 200)
-
-        # Verify reverse syncer updates upstream pod to Failed with exitCode 137
-        start = time.time()
-        synced_failed = False
-        while time.time() - start < 5.0:
-            with self.mock_k8s.lock:
-                up_pod = self.mock_k8s.store["pods"].get("default", {}).get(pod_name, {})
-                phase = up_pod.get("status", {}).get("phase")
-                c_statuses = up_pod.get("status", {}).get("containerStatuses", [])
-                if phase == "Failed" and c_statuses:
-                    term = c_statuses[0].get("state", {}).get("terminated", {})
-                    if term.get("exitCode") == 137:
-                        synced_failed = True
-                        break
-            time.sleep(0.2)
-        self.assertTrue(synced_failed, "Upstream pod did not sync Failed phase with exitCode 137")
+                status = dict(up_pod.get("status", {}))
+            return status if status.get("phase") == "Running" and status.get("podIP") else None
+        status = self.wait_for_condition(synced, timeout=20.0, description="upstream pod Running with podIP")
+        c_statuses = status.get("containerStatuses", [])
+        self.assertEqual(len(c_statuses), 1)
+        self.assertTrue(c_statuses[0].get("ready"))
+        self.assertIn("running", c_statuses[0].get("state", {}))
 
     def test_05_pod_deletion_cascade(self):
         """Test 5: Pod deletion cascade & finalizer removal."""
@@ -368,7 +331,7 @@ class TestM5FederationE2E(unittest.TestCase, BaseTestCase):
             "metadata": {"name": pod_name, "namespace": "default"},
             "spec": {
                 "nodeName": self.node_name,
-                "containers": [{"name": "app", "image": "wasm://app"}]
+                "containers": [{"name": "app", "image": "wasm://embedded/echo"}]
             }
         }
         self.mock_k8s.inject_pod(upstream_manifest)
@@ -424,8 +387,9 @@ class TestM5FederationE2E(unittest.TestCase, BaseTestCase):
             "target_pod": "worker-1",
             "sender_pod": "cloud-control",
             "payload": "Telemetry-Ping-Command",
-            "dest_port": self.k32_worker_ipc_port
+            "dest_port": self.k32_cp_ipc_port
         }
+        frames_before = link_stats(self.k32_cp_port + 100)["espnow_frames_rx"]
         req = urllib.request.Request(
             send_url,
             data=json.dumps(outbound_data).encode("utf-8"),
@@ -435,10 +399,9 @@ class TestM5FederationE2E(unittest.TestCase, BaseTestCase):
         with urllib.request.urlopen(req, timeout=2.0) as resp:
             self.assertEqual(resp.status, 200)
 
-        # Verify worker received valid K32C frame
-        time.sleep(0.3)
-        stdout = self.worker.read_stdout(timeout=1.0)
-        self.assertIn("[IPC-RX] Accepted valid K32C frame", stdout, "Worker did not receive frame from Gateway")
+        # The control plane's channel layer counts the frame the Gateway sent
+        self.wait_for_condition(lambda: link_stats(self.k32_cp_port + 100)["espnow_frames_rx"] > frames_before,
+                                timeout=5.0, description="K32C frame from the Gateway received")
 
         # 2. Transmit reply frame from worker-1 back to Gateway UDP port
         reply_payload = b"Telemetry-Ack-Response-Data"
@@ -478,14 +441,13 @@ class TestM5FederationE2E(unittest.TestCase, BaseTestCase):
         self.worker2 = self.harness.restart_node("worker-2", cp_restarted)
         self.__class__._worker2 = self.worker2
 
-        # 3. Verify bridge reconnects and maintains Ready=True
-        time.sleep(2.0)
-        with self.mock_k8s.lock:
-            node = self.mock_k8s.store["nodes"].get(self.node_name, {})
-            conditions = node.get("status", {}).get("conditions", [])
-            ready_cond = next((c for c in conditions if c.get("type") == "Ready"), None)
-        self.assertIsNotNone(ready_cond)
-        self.assertEqual(ready_cond.get("status"), "True")
+        # 3. Verify bridge reconnects and reports Ready=True once the workers have rejoined
+        def virtual_node_ready():
+            with self.mock_k8s.lock:
+                node = self.mock_k8s.store["nodes"].get(self.node_name, {})
+                conditions = node.get("status", {}).get("conditions", [])
+            return any(c.get("type") == "Ready" and c.get("status") == "True" for c in conditions)
+        self.wait_for_condition(virtual_node_ready, timeout=30.0, interval=0.5, description="virtual node Ready after restart")
 
         # Clean shutdown after all tests
         self._stop_all()

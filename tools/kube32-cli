@@ -7,6 +7,8 @@ kube32-cli: build, check, deploy and ship WebAssembly pods for Kube32.
     kube32-cli deploy  <file.wasm>   create a Pod that carries the module inline (no reflash)
     kube32-cli embed   <file.wasm>   copy the module into images/ for the next firmware build
     kube32-cli sd-push <file.wasm>   copy the module onto a microSD card as kube32/images/<name>.wasm
+                                     (a mounted card with --to, or a node's card over the network with --node)
+    kube32-cli push    <file|dir>    upload a file or directory tree to a node's storage (kube32/<path>) through the API server
 
 The ABI it checks against is include/runtime/k32_app_abi.h; the import
 signatures are the m3_LinkRawFunction calls in src/runtime/app_pod.cpp and
@@ -68,6 +70,8 @@ APP_IMPORTS = {
     "k32_random": "i()",
     "k32_env_get": "i(iiii)",
     "k32_mem_stats": "i(ii)",
+    "k32_resp_asset": "i(iii)",
+    "k32_http_call": "i(iiiiiiiiiiii)",
     "k32_display_text": "i(iiiiii)",
     "k32_display_rect": "i(iiiii)",
     "k32_display_bar": "i(iiiiiii)",
@@ -134,6 +138,7 @@ HARDWARE_FOR_IMPORT = {
     "k32_fs_size": "sd",
     "k32_fs_list": "sd",
     "k32_fs_remove": "sd",
+    "k32_http_call": "service-call",
 }
 HARDWARE = {
     # name: (resource key, securityContext capability) as src/hal/capability_firewall.cpp reads them
@@ -142,9 +147,11 @@ HARDWARE = {
     "speaker": ("hardware.kube32.io/speaker", "SPEAKER"),
     "ipc": ("hardware.kube32.io/ipc", "CHANNEL_IPC"),
     "sd": ("hardware.kube32.io/sd", "SD"),
+    "service-call": (None, "SERVICE_CALL"),   # k32_http_call: a capability only, no resource
 }
-HARDWARE_ORDER = ("ipc", "display", "keyboard", "speaker", "sd")
-HARDWARE_ALIASES = {"tft-display": "display", "tft": "display", "channel_ipc": "ipc", "channels": "ipc", "sd-card": "sd"}
+HARDWARE_ORDER = ("ipc", "display", "keyboard", "speaker", "sd", "service-call")
+HARDWARE_ALIASES = {"tft-display": "display", "tft": "display", "channel_ipc": "ipc", "channels": "ipc", "sd-card": "sd",
+                    "service_call": "service-call", "http": "service-call"}
 
 # ---------------------------------------------------------------------------
 # Quantities
@@ -718,9 +725,15 @@ def check_module(path, data, memory_limit=None):
         res.memory_max_bytes = maximum * PAGE if maximum is not None else None
         if maximum is None:
             warn("memory has no maximum: memory.grow can run until the pod's limit traps it (link with --max-memory)")
-        if memory_limit is not None and res.memory_bytes > memory_limit:
+        # A limit under one page backs the module's single first page with
+        # the limit only (wasm3 memoryLimit): memory.grow then fails
+        sub_page = memory_limit is not None and memory_limit < PAGE and initial <= 1
+        if memory_limit is not None and res.memory_bytes > memory_limit and not sub_page:
             err("memory: the module declares %s (%d pages) of linear memory but the limit is %s"
                 % (format_quantity(res.memory_bytes), initial, format_quantity(memory_limit)))
+        if sub_page:
+            warn("memory: the page is backed by %s only; accesses past it trap and memory.grow fails"
+                             % format_quantity(memory_limit))
 
     # Exports
     ex = m.export_map()
@@ -770,7 +783,7 @@ def hardware_for_name(text):
     name = text.strip().lower()
     name = HARDWARE_ALIASES.get(name, name)
     if name not in HARDWARE:
-        raise ValueError("unknown hardware '%s' (expected display, keyboard, speaker, ipc, sd or none)" % text.strip())
+        raise ValueError("unknown hardware '%s' (expected display, keyboard, speaker, ipc, sd, service-call or none)" % text.strip())
     return name
 
 
@@ -812,7 +825,8 @@ def format_report(res):
         else:
             lines.append("features beyond MVP: none")
         if res.hardware:
-            lines.append("hardware: %s  (manifest resources: %s)" % (", ".join(res.hardware), ", ".join(HARDWARE[h][0] for h in res.hardware)))
+            resources = [HARDWARE[h][0] for h in res.hardware if HARDWARE[h][0]]
+            lines.append("hardware: %s  (manifest resources: %s)" % (", ".join(res.hardware), ", ".join(resources) or "none"))
         else:
             lines.append("hardware: none")
         if res.peripheral_imports:
@@ -1203,7 +1217,8 @@ def render_manifest(name, namespace, node, data, kind, memory_bytes, psram_bytes
     if psram_bytes:
         a("          esp32.io/psram: %s" % format_quantity(psram_bytes))
     for hw in hardware:
-        a("          %s: \"1\"" % HARDWARE[hw][0])
+        if HARDWARE[hw][0]:
+            a("          %s: \"1\"" % HARDWARE[hw][0])
     a("        limits:")
     a("          memory: %s" % format_quantity(memory_bytes))
     if psram_bytes:
@@ -1275,8 +1290,9 @@ def cmd_deploy(args):
     if args.image is not None and not args.image.startswith("wasm://"):
         return err_exit("--image must be a wasm:// reference such as wasm://sd/%s or wasm://embedded/%s:v1" % (name, name), EXIT_USAGE)
 
-    # kubelet.cpp: the sandbox is max(limits.memory, esp32.io/psram), at least one page
-    sandbox = max(memory_bytes, psram_bytes, PAGE)
+    # kubelet.cpp: the sandbox is max(limits.memory, esp32.io/psram); under one
+    # page it backs the first page partly
+    sandbox = max(memory_bytes, psram_bytes)
     res = check_module(args.file, data, memory_limit=sandbox)
     if not res.ok:
         print(format_report(res))
@@ -1380,6 +1396,86 @@ def cmd_embed(args):
 _SD_TOKEN_RE = re.compile(r"^[A-Za-z0-9_-][A-Za-z0-9._-]*$")   # image_registry.cpp valid_image_token
 
 
+# ---------------------------------------------------------------------------
+# push: node storage through the API server's node proxy
+# ---------------------------------------------------------------------------
+_STORAGE_PATH_RE = re.compile(r"^[A-Za-z0-9._-]+(/[A-Za-z0-9._-]+)*$")   # pod_fs.cpp validate_relative_path
+
+
+def push_file(args, data, path):
+    """PUT `data` to <node storage root>/kube32/<path> on args.node (kubectl replace --raw,
+    so kubeconfig credentials apply). Returns (exit code, bytes the node wrote)."""
+    if not _STORAGE_PATH_RE.match(path) or len(path) > 96 or any(c in (".", "..") for c in path.split("/")):
+        return err_exit("invalid --path '%s' (components of A-Z, a-z, 0-9, '.', '_', '-', no '.' or '..', at most 96 bytes)" % path, EXIT_USAGE), 0
+    base = kubectl_base(args)
+    if not shutil.which(base[0]):
+        return err_exit("%s not found in PATH" % base[0], EXIT_INPUT), 0
+    uri = "/api/v1/nodes/%s/proxy/storage/%s" % (args.node, path)
+    with tempfile.NamedTemporaryFile(prefix="kube32-push-", delete=False) as f:
+        f.write(data)
+        tmp = f.name
+    try:
+        t0 = time.time()
+        proc = subprocess.run(base + ["replace", "--raw", uri, "-f", tmp], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        took = time.time() - t0
+    finally:
+        os.unlink(tmp)
+    out = proc.stdout.decode("utf-8", "replace")
+    if proc.returncode != 0:
+        sys.stderr.write(proc.stderr.decode("utf-8", "replace") or out)
+        return err_exit("upload to node %s failed (kubectl exit %d)" % (args.node, proc.returncode), EXIT_KUBECTL), 0
+    try:
+        written = int(json.loads(out).get("bytes", -1))
+    except (ValueError, AttributeError):
+        written = -1
+    if written != len(data):
+        return err_exit("node %s answered %s" % (args.node, out.strip() or "nothing"), EXIT_KUBECTL), 0
+    print("pushed %s bytes to %s:kube32/%s in %.1f s" % (fmt_bytes(len(data)), args.node, path, took))
+    return EXIT_OK, written
+
+
+def cmd_push(args):
+    if os.path.isdir(args.file):
+        return push_dir(args)
+    try:
+        with open(args.file, "rb") as f:
+            data = f.read()
+    except OSError as e:
+        return err_exit("cannot read %s: %s" % (args.file, e.strerror or e), EXIT_INPUT)
+    path = args.path or "images/" + os.path.basename(args.file)
+    rc, _ = push_file(args, data, path)
+    return rc
+
+
+def push_dir(args):
+    """Upload every regular file below args.file to <--path>/<relative path>, stopping at the first error."""
+    root = os.path.normpath(args.file)
+    dest = (args.path or "images").strip("/")
+    files = []
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames.sort()
+        for name in sorted(filenames):
+            full = os.path.join(dirpath, name)
+            if os.path.isfile(full) and not os.path.islink(full):
+                files.append(full)
+    if not files:
+        return err_exit("%s contains no files" % args.file, EXIT_INPUT)
+    total = 0
+    for full in files:
+        rel = os.path.relpath(full, root).replace(os.sep, "/")
+        try:
+            with open(full, "rb") as f:
+                data = f.read()
+        except OSError as e:
+            return err_exit("cannot read %s: %s" % (full, e.strerror or e), EXIT_INPUT)
+        rc, written = push_file(args, data, dest + "/" + rel if dest else rel)
+        if rc != EXIT_OK:
+            return rc
+        total += written
+    print("pushed %d files, %s bytes to %s:kube32/%s" % (len(files), fmt_bytes(total), args.node, dest))
+    return EXIT_OK
+
+
 def cmd_sd_push(args):
     try:
         data = read_wasm(args.file)
@@ -1391,12 +1487,21 @@ def cmd_sd_push(args):
                         EXIT_USAGE)
     if args.tag is not None and (not _SD_TOKEN_RE.match(args.tag) or len(args.tag) > 24):
         return err_exit("invalid tag '%s' (1..24 characters of A-Z, a-z, 0-9, '.', '_', '-', not starting with '.')" % args.tag, EXIT_USAGE)
-    if not os.path.isdir(args.to):
+    if args.to is None and not args.node:
+        return err_exit("pass --to <card mount point> for a card in this machine, or --node <node> for the card in a node", EXIT_USAGE)
+    if args.to is not None and not os.path.isdir(args.to):
         return err_exit("%s is not a directory: mount the card and pass its mount point, e.g. --to /Volumes/CARD" % args.to, EXIT_INPUT)
     res = check_module(args.file, data)
     if not res.ok:
         print(format_report(res))
         return EXIT_CHECK
+    if args.to is None:
+        # The card is in a node: over the network
+        fname = name + ("-" + args.tag if args.tag else "") + ".wasm"     # sd_image_relative_path()
+        rc, _ = push_file(args, data, "images/" + fname)
+        if rc == EXIT_OK:
+            print("image: wasm://sd/%s%s" % (name, ":" + args.tag if args.tag else ""))
+        return rc
     images_dir = os.path.join(args.to, "kube32", "images")
     try:
         os.makedirs(images_dir, exist_ok=True)
@@ -1479,12 +1584,27 @@ def build_parser():
     e.add_argument("--images-dir", help="images directory (default: <repo>/images)")
     e.set_defaults(func=cmd_embed)
 
-    s = sub.add_parser("sd-push", help="copy a checked module onto a mounted microSD card as kube32/images/<name>.wasm")
+    def kubectl_flags(sp):
+        sp.add_argument("--context", help="kubectl context (default: the current context)")
+        sp.add_argument("--kubeconfig", help="kubectl kubeconfig path")
+        sp.add_argument("--server", help="kubectl API server URL")
+        sp.add_argument("--kubectl", help="kubectl binary (default: kubectl from PATH)")
+
+    s = sub.add_parser("sd-push", help="copy a checked module onto a microSD card as kube32/images/<name>.wasm")
     s.add_argument("file")
-    s.add_argument("--to", required=True, help="the card's mount point, e.g. /Volumes/CARD")
+    s.add_argument("--to", help="the card's mount point when it is in this machine, e.g. /Volumes/CARD")
+    s.add_argument("--node", help="the node whose card gets it, over the network (when --to is not given)")
     s.add_argument("--name", help="image name (default: file stem); pods reference wasm://sd/<name>")
     s.add_argument("--tag", help="image tag: written as <name>-<tag>.wasm, referenced as wasm://sd/<name>:<tag>")
+    kubectl_flags(s)
     s.set_defaults(func=cmd_sd_push)
+
+    u = sub.add_parser("push", help="upload a file, or every file below a directory, to a node's storage (<storage root>/kube32/<path>) through the API server")
+    u.add_argument("file", help="file or directory")
+    u.add_argument("--node", required=True, help="node name (kubectl get nodes)")
+    u.add_argument("--path", help="destination below kube32/ (default: images/<file name>; for a directory, images/ is the parent of its contents)")
+    kubectl_flags(u)
+    u.set_defaults(func=cmd_push)
     return p
 
 

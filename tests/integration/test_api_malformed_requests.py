@@ -1,9 +1,8 @@
 #!/usr/bin/env python3
 """
-Kube32 Milestone 2 Adversarial Security & Empirical Stress Testing Suite
-Author: m2_challenger_1 (Empirical Challenger)
+Kube32 API malformed-request and resource-exhaustion tests against kube32-sim.
 
-Attack Vectors:
+Vectors:
 1. Malformed JSON & Inbound Validation (Recursion depth limit, unquoted keys, trailing commas, null bytes)
 2. Query Parameter & Header Fuzzing (Extreme lengths, conflicting Accept headers, malformed HTTP syntax)
 3. Socket Streaming & Early Disconnects (EPIPE, ECONNRESET, SIGPIPE handling, TCP RST mid-transmission)
@@ -22,7 +21,7 @@ import subprocess
 SERVER_HOST = "127.0.0.1"
 SERVER_PORT = 6443
 BASE_URL = f"http://{SERVER_HOST}:{SERVER_PORT}"
-BINARY_PATH = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "build", "kube32-sim")
+BINARY_PATH = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), "build", "kube32-sim")
 
 sim_proc = None
 
@@ -108,7 +107,7 @@ def record(category, test_name, status, detail=""):
 
 def main():
     print("==================================================================")
-    print("   Kube32 Milestone 2 Adversarial Stress & Vulnerability Suite    ")
+    print("   Kube32 API Malformed Request Tests                          ")
     print("==================================================================")
 
     # --------------------------------------------------------------------------
@@ -299,7 +298,7 @@ def main():
     failed = sum(1 for r in results if r["status"] == "FAIL")
 
     print("\n==================================================================")
-    print(f"   ADVERSARIAL STRESS TEST SUMMARY: {passed}/{total} Passed, {failed} Failed")
+    print(f"   MALFORMED REQUEST TEST SUMMARY: {passed}/{total} Passed, {failed} Failed")
     print("==================================================================")
     for r in results:
         status_symbol = "✓" if r["status"] == "PASS" else "✗"

@@ -63,11 +63,11 @@ static const uint8_t s_wasm_ipc_probe[] = {
 };
 
 // =============================================================================
-// CHALLENGE 1: SPSC RingBuffer Concurrency, Thread Contention & Stress
+// SPSC RingBuffer Concurrency, Thread Contention & Stress
 // =============================================================================
 
-void challenge1_spsc_concurrent_stress() {
-    std::cout << "\n=== [CHALLENGE 1.1] SPSC RingBuffer High-Contention Concurrency Stress ===" << std::endl;
+void test_spsc_concurrent_stress() {
+    std::cout << "\n=== [spsc] SPSC RingBuffer High-Contention Concurrency Stress ===" << std::endl;
     const size_t RING_CAPACITY = 16;
     RingBuffer ring(RING_CAPACITY);
 
@@ -149,11 +149,11 @@ void challenge1_spsc_concurrent_stress() {
     assert(!payload_corrupted.load() && "SPSC RingBuffer experienced payload corruption!");
     assert(consumed_count.load() == TOTAL_MSGS && "SPSC RingBuffer lost messages under high contention!");
     assert(ring.is_empty() && "RingBuffer not empty after consuming all messages!");
-    std::cout << "[PASS] CHALLENGE 1.1: SPSC RingBuffer 50,000 message concurrency verified clean." << std::endl;
+    std::cout << "[PASS] SPSC RingBuffer 50,000 message concurrency verified clean." << std::endl;
 }
 
-void challenge1_multi_producer_channel_stress() {
-    std::cout << "\n=== [CHALLENGE 1.2] Multi-Producer ChannelManager Contention Stress ===" << std::endl;
+void test_multi_producer_channel_stress() {
+    std::cout << "\n=== [multi-producer] Multi-Producer ChannelManager Contention Stress ===" << std::endl;
     ChannelManager::instance().init(0, 7400);
 
     const std::string channel_uri = "pod://service-worker/work-queue";
@@ -162,7 +162,7 @@ void challenge1_multi_producer_channel_stress() {
 
     const int NUM_PRODUCERS = 4;
     const int MSGS_PER_PRODUCER = 2500;
-    std::atomic<bool> start_gate{false};
+    std::atomic<bool> start_flag{false};
     std::atomic<uint32_t> total_sent{0};
     std::atomic<uint32_t> total_dropped{0};
 
@@ -173,7 +173,7 @@ void challenge1_multi_producer_channel_stress() {
             int32_t tx_h = ChannelManager::instance().open(pod_name, channel_uri, 0);
             assert(tx_h > 0);
 
-            while (!start_gate.load()) {
+            while (!start_flag.load()) {
                 std::this_thread::yield();
             }
 
@@ -209,7 +209,7 @@ void challenge1_multi_producer_channel_stress() {
         }
     });
 
-    start_gate.store(true);
+    start_flag.store(true);
     for (auto& t : producers) {
         t.join();
     }
@@ -225,15 +225,15 @@ void challenge1_multi_producer_channel_stress() {
     ChannelManager::instance().close("service-worker", rx_handle);
     ChannelManager::instance().shutdown();
 
-    std::cout << "[PASS] CHALLENGE 1.2: Multi-producer ChannelManager completed without crash or ASan violation." << std::endl;
+    std::cout << "[PASS] Multi-producer ChannelManager completed without crash or ASan violation." << std::endl;
 }
 
 // =============================================================================
-// CHALLENGE 2: Malformed Wire Packets & Packet Corruption over UDP
+// Malformed Wire Packets & Packet Corruption over UDP
 // =============================================================================
 
-void challenge2_wire_packet_corruption_fuzzing() {
-    std::cout << "\n=== [CHALLENGE 2] Wire Packet Corruption & Boundary Attack ===" << std::endl;
+void test_wire_packet_corruption_fuzzing() {
+    std::cout << "\n=== [wire] Wire Packet Corruption & Boundary Checks ===" << std::endl;
 
     const uint16_t UDP_PORT = 7450;
     ChannelManager::instance().init(0, UDP_PORT);
@@ -456,15 +456,15 @@ void challenge2_wire_packet_corruption_fuzzing() {
     ChannelManager::instance().close("victim-pod", rx_handle);
     ChannelManager::instance().shutdown();
 
-    std::cout << "[PASS] CHALLENGE 2: Wire packet corruption fuzzing completed cleanly without server crash." << std::endl;
+    std::cout << "[PASS] Wire packet corruption fuzzing completed cleanly without server crash." << std::endl;
 }
 
 // =============================================================================
-// CHALLENGE 3: Wasm3 Sandbox Boundary Attack
+// Wasm3 Sandbox Boundary Checks
 // =============================================================================
 
-void challenge3_wasm3_sandbox_boundary_attacks() {
-    std::cout << "\n=== [CHALLENGE 3] Wasm3 Sandbox Boundary Attack ===" << std::endl;
+void test_wasm3_sandbox_boundary_attacks() {
+    std::cout << "\n=== [sandbox] Wasm3 Sandbox Boundary Checks ===" << std::endl;
 
     CapabilityFirewall& fw = CapabilityFirewall::instance();
     fw.reset();
@@ -607,21 +607,21 @@ void challenge3_wasm3_sandbox_boundary_attacks() {
         ChannelManager::instance().shutdown();
     }
 
-    std::cout << "[PASS] CHALLENGE 3: Wasm3 sandbox boundary and isolation attacks verified completely secure." << std::endl;
+    std::cout << "[PASS] Wasm3 sandbox boundary and isolation verified." << std::endl;
 }
 
 int main() {
     std::cout << "========================================================" << std::endl;
-    std::cout << "   Kube32 Adversarial IPC & Concurrency Verification    " << std::endl;
+    std::cout << "   Kube32 Channel IPC Stress Tests                      " << std::endl;
     std::cout << "========================================================" << std::endl;
 
-    challenge1_spsc_concurrent_stress();
-    challenge1_multi_producer_channel_stress();
-    challenge2_wire_packet_corruption_fuzzing();
-    challenge3_wasm3_sandbox_boundary_attacks();
+    test_spsc_concurrent_stress();
+    test_multi_producer_channel_stress();
+    test_wire_packet_corruption_fuzzing();
+    test_wasm3_sandbox_boundary_attacks();
 
     std::cout << "\n========================================================" << std::endl;
-    std::cout << " >>> ALL ADVERSARIAL CHALLENGES PASSED SUCCESSFULLY <<< " << std::endl;
+    std::cout << " >>> ALL CHANNEL IPC STRESS TESTS PASSED <<< " << std::endl;
     std::cout << "========================================================" << std::endl;
     return 0;
 }

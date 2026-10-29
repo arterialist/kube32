@@ -56,7 +56,7 @@ void test_distributed_pipeline_memory_boundaries() {
               << (cluster_pool / 1024) << "KiB Cluster Pool" << std::endl;
     assert(cluster_pool == 2560 * 1024);
 
-    // 2. Challenge: Stage 1 (audio-preprocessor) requiring 32KiB
+    // 2. Case: stage 1 (audio-preprocessor) requiring 32KiB
     // Pod manifest requesting 32KiB
     std::string stage1_pod = 
         "{\"kind\":\"Pod\",\"metadata\":{\"name\":\"audio-preprocessor\",\"namespace\":\"default\"},"
@@ -121,11 +121,11 @@ void test_distributed_pipeline_memory_boundaries() {
 }
 
 // =============================================================================
-// SUITE 2: K32C Wire Protocol Adversarial Fuzzing & Corruption Tests
+// SUITE 2: K32C Wire Protocol Fuzzing & Corruption Tests
 // =============================================================================
-void test_k32c_wire_protocol_adversarial_fuzzing() {
+void test_k32c_wire_protocol_fuzzing() {
     std::cout << "\n=================================================================\n";
-    std::cout << " [SUITE 2] K32C Wire Protocol Adversarial Fuzzing & Corruption\n";
+    std::cout << " [SUITE 2] K32C Wire Protocol Fuzzing & Corruption\n";
     std::cout << "=================================================================\n";
 
     auto& mgr = ChannelManager::instance();
@@ -282,7 +282,7 @@ void test_k32c_wire_protocol_adversarial_fuzzing() {
 
     mgr.close("keyword-classifier", handle);
     mgr.shutdown();
-    std::cout << "[PASS] SUITE 2: K32C Wire Protocol Adversarial Fuzzing passed completely.\n";
+    std::cout << "[PASS] SUITE 2: K32C Wire Protocol Fuzzing passed completely.\n";
 }
 
 // =============================================================================
@@ -331,15 +331,15 @@ void test_watchdog_and_yield_robustness() {
 
 int main() {
     std::cout << "*****************************************************************\n";
-    std::cout << "   Kube32 Milestone 6 Distributed Pipeline & Wire Fuzzing Suite\n";
+    std::cout << "   Kube32 Distributed Pipeline & Wire Fuzzing Tests\n";
     std::cout << "*****************************************************************\n";
 
     test_distributed_pipeline_memory_boundaries();
-    test_k32c_wire_protocol_adversarial_fuzzing();
+    test_k32c_wire_protocol_fuzzing();
     test_watchdog_and_yield_robustness();
 
     std::cout << "\n=================================================================\n";
-    std::cout << " >>> ALL EMPIRICAL ADVERSARIAL CHALLENGES PASSED (VERDICT: APPROVE) <<<\n";
+    std::cout << " >>> ALL PIPELINE IPC TESTS PASSED <<<\n";
     std::cout << "=================================================================\n";
     return 0;
 }

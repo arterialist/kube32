@@ -15,6 +15,9 @@
 #include <iostream>
 #include <string>
 #include <sys/socket.h>
+#include <sys/stat.h>
+#include <cstdio>
+#include <cstdlib>
 #include <unistd.h>
 
 using namespace kube32;
@@ -399,6 +402,10 @@ void test_router_watch_and_log_paths() {
     assert(handler.handle_request(req, arena, &client2).status_code == 429);  // cap reached
     ::close(sv[1]);
     ::close(sv2[1]);
+    // The hub notices the hang-up on its next pass (poll_interval_ms); the
+    // log follow below needs the slot back.
+    for (int i = 0; i < 200 && hub.active_streams() > 0; ++i) osal::Thread::sleep_ms(10);
+    assert(hub.active_streams() == 0);
 
     // Pod log: 404 unknown pod, 400 while waiting to start, text once lines are shipped
     req.query_string.clear();
@@ -441,6 +448,185 @@ void test_router_watch_and_log_paths() {
     std::cout << "[PASS] test_router_watch_and_log_paths" << std::endl;
 }
 
+// kubectl logs --previous: the kubelet tags each shipped line with the
+// container instance; a new instance moves the current log to "previous".
+void test_previous_container_log() {
+    std::cout << "[RUN] test_previous_container_log" << std::endl;
+    auto store = mem_store();
+    api::RouteHandler handler(*store);
+    mem::MonotonicArena arena;
+    runtime::PodLogStore::apiserver().clear();
+    store->put("/registry/pods/default/crash", "{\"kind\":\"Pod\",\"metadata\":{\"name\":\"crash\",\"namespace\":\"default\",\"uid\":\"u-1\"},"
+               "\"spec\":{\"containers\":[{\"name\":\"worker\"}]},\"status\":{\"phase\":\"Running\"}}", true);
+    api::HttpRequest ship;
+    ship.method = api::HttpMethod::Post;
+    ship.path = "/api/v1/namespaces/default/pods/crash/log";
+    api::HttpRequest get;
+    get.method = api::HttpMethod::Get;
+    get.path = ship.path;
+
+    ship.body = "{\"epoch\":9,\"seq\":1,\"t\":0,\"u\":1,\"r\":0,\"m\":\"first run\"}\n"
+                "{\"epoch\":9,\"seq\":2,\"t\":0,\"u\":2,\"r\":0,\"m\":\"[kube32] container trapped\"}\n";
+    assert(handler.handle_request(ship, arena).status_code == 200);
+    get.query_string = "previous=true";
+    api::HttpResponse r = handler.handle_request(get, arena);
+    assert(r.status_code == 400 && r.body.find("previous terminated container \\\"worker\\\" in pod \\\"crash\\\" not found") != std::string::npos);
+
+    // Restart: lines of instance 1 start a new current log
+    ship.body = "{\"epoch\":9,\"seq\":3,\"t\":0,\"u\":3,\"r\":1,\"m\":\"second run\"}\n";
+    assert(handler.handle_request(ship, arena).status_code == 200);
+    get.query_string.clear();
+    r = handler.handle_request(get, arena);
+    assert(r.status_code == 200 && r.body == "second run\n");
+    get.query_string = "previous=true";
+    r = handler.handle_request(get, arena);
+    assert(r.status_code == 200 && r.body == "first run\n[kube32] container trapped\n");
+    get.query_string = "previous=true&tailLines=1";
+    r = handler.handle_request(get, arena);
+    assert(r.body == "[kube32] container trapped\n");
+    // previous=true&follow=true returns the ended log instead of following
+    get.query_string = "previous=true&follow=true";
+    r = handler.handle_request(get, arena);
+    assert(r.status_code == 200 && !r.socket_taken && r.body.find("first run") != std::string::npos);
+
+    // A late line of the old instance goes to the previous log
+    ship.body = "{\"epoch\":9,\"seq\":4,\"t\":0,\"u\":4,\"r\":0,\"m\":\"late\"}\n";
+    handler.handle_request(ship, arena);
+    get.query_string = "previous=true";
+    assert(handler.handle_request(get, arena).body == "first run\n[kube32] container trapped\nlate\n");
+
+    // The previous log keeps only its tail within its byte budget
+    {
+        auto& m = runtime::PodLogStore::apiserver();
+        m.set_previous_capacity(256);
+        for (uint64_t i = 1; i <= 40; ++i) {
+            runtime::PodLogRecord rec;
+            rec.seq = i; rec.text = "line-" + std::to_string(i);
+            m.accept_shipped("default/budget", 3, rec, 0, "u-b");
+        }
+        runtime::PodLogRecord rec;
+        rec.seq = 41; rec.text = "restarted";
+        m.accept_shipped("default/budget", 3, rec, 1, "u-b");
+        std::vector<runtime::PodLogRecord> prev;
+        assert(m.tail_previous("default/budget", 0, prev));
+        assert(!prev.empty() && prev.size() < 40 && prev.back().text == "line-40");
+        m.set_previous_capacity(1024);
+    }
+
+    // The pod is deleted and created again under the same name: a new uid,
+    // nothing of the old pod's log is served, and its seq numbers start over
+    store->put("/registry/pods/default/crash", "{\"kind\":\"Pod\",\"metadata\":{\"name\":\"crash\",\"namespace\":\"default\",\"uid\":\"u-2\"},"
+               "\"spec\":{\"containers\":[{\"name\":\"worker\"}]},\"status\":{\"phase\":\"Running\"}}", true);
+    ship.body = "{\"epoch\":9,\"seq\":1,\"t\":0,\"u\":9,\"r\":0,\"m\":\"new pod\"}\n";
+    r = handler.handle_request(ship, arena);
+    assert(r.body.find("\"accepted\":1") != std::string::npos);
+    get.query_string.clear();
+    assert(handler.handle_request(get, arena).body == "new pod\n");
+    get.query_string = "previous=true";
+    assert(handler.handle_request(get, arena).status_code == 400);
+
+    // A kubelet restart (new epoch) for the same pod: its container restarted too
+    ship.body = "{\"epoch\":10,\"seq\":1,\"t\":0,\"u\":1,\"r\":0,\"m\":\"after node reboot\"}\n";
+    handler.handle_request(ship, arena);
+    get.query_string.clear();
+    assert(handler.handle_request(get, arena).body == "after node reboot\n");
+    get.query_string = "previous=true";
+    assert(handler.handle_request(get, arena).body == "new pod\n");
+
+    runtime::PodLogStore::apiserver().clear();
+    std::cout << "[PASS] test_previous_container_log" << std::endl;
+}
+
+static std::string read_file(const std::string& path) {
+    FILE* f = std::fopen(path.c_str(), "rb");
+    if (!f) return "<missing>";
+    std::string out;
+    char buf[512];
+    size_t n;
+    while ((n = std::fread(buf, 1, sizeof(buf), f)) > 0) out.append(buf, n);
+    std::fclose(f);
+    return out;
+}
+
+// Container logs on the storage root: <root>/kube32/logs/<ns>_<pod>/<container>.log,
+// rotated to .log.1 when a new container instance starts, capped in size,
+// served for ?previous=true and after the RAM ring is gone, removed with the pod.
+void test_persisted_container_logs() {
+    std::cout << "[RUN] test_persisted_container_logs" << std::endl;
+    char tmpl[] = "/tmp/k32-logs-XXXXXX";
+    const std::string root = mkdtemp(tmpl);
+    auto& mirror = runtime::PodLogStore::apiserver();
+    mirror.clear();
+    mirror.enable_persistence([root]() { return root; }, 2048);
+    mirror.set_previous_capacity(256);
+    auto store = mem_store();
+    api::RouteHandler handler(*store);
+    mem::MonotonicArena arena;
+    store->put("/registry/pods/default/disk", "{\"kind\":\"Pod\",\"metadata\":{\"name\":\"disk\",\"namespace\":\"default\",\"uid\":\"d-1\"},"
+               "\"spec\":{\"containers\":[{\"name\":\"worker\"}]},\"status\":{\"phase\":\"Running\"}}", true);
+    api::HttpRequest ship;
+    ship.method = api::HttpMethod::Post;
+    ship.path = "/api/v1/namespaces/default/pods/disk/log";
+    auto ship_lines = [&](uint64_t first_seq, int count, int instance, const std::string& prefix) {
+        ship.body.clear();
+        for (int i = 0; i < count; ++i) {
+            ship.body += "{\"epoch\":4,\"seq\":" + std::to_string(first_seq + i) + ",\"t\":1700000000000,\"u\":5,\"r\":" +
+                         std::to_string(instance) + ",\"m\":\"" + prefix + std::to_string(i) + "\"}\n";
+        }
+        assert(handler.handle_request(ship, arena).status_code == 200);
+    };
+    const std::string dir = root + "/kube32/logs/default_disk";
+    ship_lines(1, 20, 0, "first-run line ");
+    mirror.flush_persisted();
+    std::string current = read_file(dir + "/worker.log");
+    assert(current.rfind("2023-11-14T22:13:20.000Z first-run line 0\n", 0) == 0);
+    assert(current.find("first-run line 19\n") != std::string::npos);
+
+    // A restart rotates the file; ?previous=true reads it whole, beyond the RAM tail
+    ship_lines(21, 3, 1, "second-run line ");
+    mirror.flush_persisted();
+    assert(read_file(dir + "/worker.log.1").find("first-run line 0\n") != std::string::npos);
+    assert(read_file(dir + "/worker.log").rfind("2023-11-14T22:13:20.000Z second-run line 0", 0) == 0);
+    api::HttpRequest get;
+    get.method = api::HttpMethod::Get;
+    get.path = ship.path;
+    get.query_string = "previous=true";
+    api::HttpResponse r = handler.handle_request(get, arena);
+    assert(r.status_code == 200 && r.body.rfind("first-run line 0\n", 0) == 0 && r.body.find("first-run line 19\n") != std::string::npos);
+    get.query_string = "previous=true&timestamps=true&tailLines=1";
+    assert(handler.handle_request(get, arena).body == "2023-11-14T22:13:20.000Z first-run line 19\n");
+
+    // The file stays under its cap, keeping the newest lines
+    ship_lines(24, 200, 1, "bulk line ");
+    mirror.flush_persisted();
+    current = read_file(dir + "/worker.log");
+    assert(current.size() <= 2048 && current.find("bulk line 199\n") != std::string::npos);
+    assert(current.find("second-run line 0") == std::string::npos);
+
+    // Without the RAM ring (the API server restarted) the file still answers
+    mirror.clear();
+    get.query_string = "tailLines=2";
+    r = handler.handle_request(get, arena);
+    assert(r.status_code == 200 && r.body == "bulk line 198\nbulk line 199\n");
+
+    // Deleting the pod deletes its log directory
+    api::HttpRequest del;
+    del.method = api::HttpMethod::Delete;
+    del.path = "/api/v1/namespaces/default/pods/disk";
+    assert(handler.handle_request(del, arena).status_code == 200);
+    mirror.flush_persisted();
+    struct stat st;
+    assert(::stat(dir.c_str(), &st) != 0);
+
+    mirror.enable_persistence(runtime::pod_log_storage_root);
+    mirror.set_previous_capacity(1024);
+    mirror.clear();
+    ::rmdir((root + "/kube32/logs").c_str());
+    ::rmdir((root + "/kube32").c_str());
+    ::rmdir(root.c_str());
+    std::cout << "[PASS] test_persisted_container_logs" << std::endl;
+}
+
 int main() {
     std::cout << "=== Kube32 API streams: watch, logs, events, metrics ===" << std::endl;
     test_inject_resource_version();
@@ -450,6 +636,8 @@ int main() {
     test_metrics_registry();
     test_watch_hub_framing();
     test_router_watch_and_log_paths();
+    test_previous_container_log();
+    test_persisted_container_logs();
     std::cout << "=== All API stream tests passed ===" << std::endl;
     return 0;
 }

@@ -1,12 +1,12 @@
 """
-Tier 1 Feature Tests: Pod Creation, Retrieval, Listing & Deletion
+API Resource Tests: Pod Creation, Retrieval, Listing & Deletion
 Authoritative sources:
 - Kubernetes Pod v1 API Specification (io.k8s.api.core.v1.Pod)
 - survey_spec_miner_1/report.md § 2.2
 - PROJECT.md § 2 (Feature 5: Core Resource HTTP REST Endpoints)
 """
 
-from tests.framework import BaseTestCase
+from tests.integration.framework import BaseTestCase
 
 
 class TestPods(BaseTestCase):
@@ -59,7 +59,7 @@ class TestPods(BaseTestCase):
             "kind": "Pod",
             "metadata": {"name": pod_name, "namespace": "default"},
             "spec": {
-                "containers": [{"name": "c1", "image": "wasm://app"}]
+                "containers": [{"name": "c1", "image": "wasm://embedded/echo"}]
             }
         }
         self.register_cleanup("pod", "default", pod_name)
@@ -81,7 +81,7 @@ class TestPods(BaseTestCase):
             "apiVersion": "v1",
             "kind": "Pod",
             "metadata": {"name": pod_name, "namespace": "default"},
-            "spec": {"containers": [{"name": "c1", "image": "wasm://app"}]}
+            "spec": {"containers": [{"name": "c1", "image": "wasm://embedded/echo"}]}
         }
         self.register_cleanup("pod", "default", pod_name)
         self.http.post("/api/v1/namespaces/default/pods", body=manifest)
@@ -102,7 +102,7 @@ class TestPods(BaseTestCase):
             "apiVersion": "v1",
             "kind": "Pod",
             "metadata": {"name": pod_name, "namespace": "default"},
-            "spec": {"containers": [{"name": "c1", "image": "wasm://app"}]}
+            "spec": {"containers": [{"name": "c1", "image": "wasm://embedded/echo"}]}
         }
         self.register_cleanup("pod", "default", pod_name)
         self.http.post("/api/v1/namespaces/default/pods", body=manifest)
@@ -117,26 +117,31 @@ class TestPods(BaseTestCase):
     def test_delete_pod_happy_path(self):
         """
         Verify DELETE /api/v1/namespaces/{ns}/pods/{name} deletes the pod
-        and returns 200 OK with Status Success.
+        and returns 200 OK: the Pod for graceful deletion of a bound pod, a Status
+        for immediate deletion of a pod that is not bound yet.
         """
         pod_name = self.unique_name("pod-delete")
         manifest = {
             "apiVersion": "v1",
             "kind": "Pod",
             "metadata": {"name": pod_name, "namespace": "default"},
-            "spec": {"containers": [{"name": "c1", "image": "wasm://app"}]}
+            "spec": {"containers": [{"name": "c1", "image": "wasm://embedded/echo"}]}
         }
         self.http.post("/api/v1/namespaces/default/pods", body=manifest)
 
         del_resp = self.http.delete(f"/api/v1/namespaces/default/pods/{pod_name}")
         self.assertEqual(del_resp.status_code, 200)
         body = del_resp.json()
-        self.assertEqual(body.get("kind"), "Status")
-        self.assertEqual(body.get("status"), "Success")
+        self.assertIn(body.get("kind"), ("Pod", "Status"))
+        if body["kind"] == "Pod":
+            self.assertEqual(body["metadata"]["name"], pod_name)
+        else:
+            self.assertEqual(body.get("status"), "Success")
 
-        # Verify pod is no longer returned
-        get_resp = self.http.get(f"/api/v1/namespaces/default/pods/{pod_name}")
-        self.assertEqual(get_resp.status_code, 404)
+        # Graceful deletion: the pod goes away once its containers have stopped
+        self.wait_for_condition(
+            lambda: self.http.get(f"/api/v1/namespaces/default/pods/{pod_name}").status_code == 404,
+            timeout=10.0, description=f"pod {pod_name} to disappear")
 
     def test_kubectl_get_pods_cli(self):
         """
@@ -147,7 +152,7 @@ class TestPods(BaseTestCase):
             "apiVersion": "v1",
             "kind": "Pod",
             "metadata": {"name": pod_name, "namespace": "default"},
-            "spec": {"containers": [{"name": "c1", "image": "wasm://app"}]}
+            "spec": {"containers": [{"name": "c1", "image": "wasm://embedded/echo"}]}
         }
         self.register_cleanup("pod", "default", pod_name)
         self.http.post("/api/v1/namespaces/default/pods", body=manifest)

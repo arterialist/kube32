@@ -1,11 +1,11 @@
 """
-Tier 2 Boundary Tests: 409 Conflict on Duplicate Creation
+API Validation Tests: 409 Conflict on Duplicate Creation
 Authoritative sources:
 - Kubernetes Status Schema (code: 409, reason: "AlreadyExists")
 - survey_spec_miner_1/report.md § 4.1 - 4.2
 """
 
-from tests.framework import BaseTestCase
+from tests.integration.framework import BaseTestCase
 
 
 class TestConflict(BaseTestCase):

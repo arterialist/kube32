@@ -4,8 +4,11 @@
 #include "kubelet/kube_api_client.hpp"
 #include "runtime/wasm_runtime.hpp"
 #include "hal/capability_firewall.hpp"
+#include "runtime/pod_log.hpp"
 #include <iostream>
 #include <cassert>
+#include "osal/system.hpp"
+#include <thread>
 
 using namespace kube32::kubelet;
 using namespace kube32::models;
@@ -52,11 +55,28 @@ public:
         last_pod_status_patch = status_patch_json;
         return true;
     }
+
+    std::string shipped_logs;
+    bool push_pod_logs(const std::string&, const std::string&, const std::string& ndjson) override {
+        shipped_logs += ndjson;
+        return true;
+    }
 };
 
 void test_node_status_reporter() {
     NodeStatusReporter reporter("esp32-node-test", "192.168.4.2");
     NodeTelemetry t = reporter.collect_telemetry();
+    // Host figures: the machine's memory and cores, no PSRAM
+    assert(t.total_heap_bytes > 0 && t.free_heap_bytes > 0);
+    assert(t.cpu_cores == std::thread::hardware_concurrency());
+    assert(t.total_psram_bytes == 0);
+    {
+        std::string host_reg = reporter.build_registration_json(t);
+        assert(host_reg.find("psram") == std::string::npos);   // no PSRAM: not advertised
+        assert(host_reg.find("\"cpu\":\"" + std::to_string(t.cpu_cores) + "\"") != std::string::npos);
+        assert(host_reg.find("\"kubernetes.io/arch\":\"xtensa\"") == std::string::npos);
+    }
+    t.total_heap_bytes = 320 * 1024;
 
     std::string reg = reporter.build_registration_json(t);
     assert(reg.find("\"kind\":\"Node\"") != std::string::npos);
@@ -89,10 +109,15 @@ void test_node_status_reporter() {
     assert(patch_dyn.find("\"memory\":\"180Ki\"") != std::string::npos);
     assert(patch_dyn.find("\"esp32.io/i2c\":\"1\"") != std::string::npos);
 
-    // CapabilityFirewall live integration with collect_telemetry()
+    // CapabilityFirewall live integration with collect_telemetry(): capacity
+    // is what the board profile lets pods claim
     kube32::hal::CapabilityFirewall::instance().reset();
     NodeTelemetry t_fresh = reporter.collect_telemetry();
-    assert(t_fresh.allocatable_gpio_count == 14);
+    const uint32_t safe_pins = static_cast<uint32_t>(__builtin_popcountll(kube32::hal::KUBE32_SAFE_GPIO_MASK));
+    assert(safe_pins == 33);   // 45 ESP32-S3 pads minus 12 reserved on every board
+    assert(t_fresh.total_gpio_count == safe_pins);
+    assert(t_fresh.allocatable_gpio_count == safe_pins);
+    assert(t_fresh.total_adc_count == 10 && t_fresh.total_i2c_count == 2);
 
     // Register pod requesting 3 GPIOs
     std::string pod_manifest = R"({
@@ -107,14 +132,30 @@ void test_node_status_reporter() {
     assert(kube32::hal::CapabilityFirewall::instance().register_pod("test-gpio-pod", pod_manifest, fw_err));
 
     NodeTelemetry t_allocated = reporter.collect_telemetry();
-    assert(t_allocated.allocatable_gpio_count == 11);
+    assert(t_allocated.allocatable_gpio_count == safe_pins - 3);
 
     std::string patch_allocated = reporter.build_heartbeat_patch_json(t_allocated, false);
-    assert(patch_allocated.find("\"esp32.io/gpio\":\"11\"") != std::string::npos);
+    assert(patch_allocated.find("\"esp32.io/gpio\":\"" + std::to_string(safe_pins - 3) + "\"") != std::string::npos);
 
     kube32::hal::CapabilityFirewall::instance().unregister_pod("test-gpio-pod");
     NodeTelemetry t_cleared = reporter.collect_telemetry();
-    assert(t_cleared.allocatable_gpio_count == 14);
+    assert(t_cleared.allocatable_gpio_count == safe_pins);
+
+    // A Cardputer-style profile: on-board pins and buses without a driver
+    // leave the node's capacity. GPIO 2-9 also take ADC1 channels 1-8.
+    kube32::hal::BoardProfile prof;
+    prof.name = "test-board";
+    prof.reserved_gpio_mask = 0x3FCULL | (1ULL << 35);   // GPIO 2-9 and 35
+    prof.i2c_bus_mask = 0;
+    kube32::hal::CapabilityFirewall::instance().set_board_profile(prof);
+    NodeTelemetry t_board = reporter.collect_telemetry();
+    assert(t_board.total_gpio_count == safe_pins - 9);
+    assert(t_board.total_adc_count == 2);       // channels 0 (GPIO 1) and 9 (GPIO 10)
+    assert(t_board.total_i2c_count == 0);
+    std::string reg_board = reporter.build_registration_json(t_board);
+    assert(reg_board.find("esp32.io/i2c") == std::string::npos);   // no driver: not advertised
+    assert(reg_board.find("\"esp32.io/adc\":\"2\"") != std::string::npos);
+    kube32::hal::CapabilityFirewall::instance().reset();
 
     std::cout << "[PASS] test_node_status_reporter" << std::endl;
 }
@@ -134,9 +175,13 @@ void test_kubelet_mock_registration_and_heartbeat() {
     assert(client_ref->registered);
     assert(client_ref->register_count == 1);
 
+    // Ready follows the pod sync loop: NotReady until a pass completes
     kubelet.report_heartbeat();
     assert(client_ref->node_patched);
-    assert(client_ref->last_node_patch.find("KubeletReady") != std::string::npos);
+    assert(client_ref->last_node_patch.find("{\"type\":\"Ready\",\"status\":\"False\",\"reason\":\"KubeletNotReady\"") != std::string::npos);
+    kubelet.sync_assigned_pods();
+    kubelet.report_heartbeat();
+    assert(client_ref->last_node_patch.find("{\"type\":\"Ready\",\"status\":\"True\",\"reason\":\"KubeletReady\"") != std::string::npos);
 
     std::cout << "[PASS] test_kubelet_mock_registration_and_heartbeat" << std::endl;
 }
@@ -215,10 +260,15 @@ public:
     kube32::runtime::ContainerStatus mock_status;
     std::string deployed_pod_id;
     bool was_started{false};
+    int deploy_count{0};
+    int terminate_count{0};
 
     bool deploy_workload(const std::string& pod_id, const uint8_t* wasm_bytes, size_t len, uint32_t memory_limit_bytes) override {
         (void)wasm_bytes; (void)len; (void)memory_limit_bytes;
         deployed_pod_id = pod_id;
+        deploy_count++;
+        mock_status = kube32::runtime::ContainerStatus{};
+        mock_status.phase = kube32::runtime::ContainerPhase::Running;
         return true;
     }
     bool start(const std::string& pod_id) override {
@@ -227,7 +277,7 @@ public:
         return true;
     }
     bool pause(const std::string& pod_id) override { (void)pod_id; return true; }
-    bool terminate(const std::string& pod_id) override { (void)pod_id; return true; }
+    bool terminate(const std::string& pod_id) override { (void)pod_id; terminate_count++; return true; }
     kube32::runtime::ContainerStatus get_status(const std::string& pod_id) override {
         (void)pod_id;
         return mock_status;
@@ -316,12 +366,13 @@ void test_kubelet_dynamic_trap_status_reporting() {
     // 1. Division by Zero (exitCode 136)
     mock_rt.mock_status.phase = kube32::runtime::ContainerPhase::Failed;
     mock_rt.mock_status.exit_code = 136;
-    mock_rt.mock_status.termination_reason = "IntegerDivisionByZero";
-    mock_rt.mock_status.exit_message = "[trap] integer divide by zero";
+    mock_rt.mock_status.termination_reason = "Error";
+    mock_rt.mock_status.exit_message = "wasm trap: integer divide by zero";
 
     kubelet.monitor_and_report_pod_statuses();
     assert(client_ref->last_pod_status_patch.find("\"exitCode\":136") != std::string::npos);
-    assert(client_ref->last_pod_status_patch.find("\"reason\":\"IntegerDivisionByZero\"") != std::string::npos);
+    assert(client_ref->last_pod_status_patch.find("\"reason\":\"Error\"") != std::string::npos);
+    assert(client_ref->last_pod_status_patch.find("wasm trap: integer divide by zero") != std::string::npos);
 
     // 2. Unreachable Executed (exitCode 134)
     KubePod pod2;
@@ -342,15 +393,148 @@ void test_kubelet_dynamic_trap_status_reporting() {
     client_ref->mock_pods.emplace_back(pod2, manifest2);
     kubelet.sync_assigned_pods();
 
+    mock_rt.mock_status.phase = kube32::runtime::ContainerPhase::Failed;
     mock_rt.mock_status.exit_code = 134;
-    mock_rt.mock_status.termination_reason = "UnreachableExecuted";
-    mock_rt.mock_status.exit_message = "[trap] unreachable executed";
+    mock_rt.mock_status.termination_reason = "Error";
+    mock_rt.mock_status.exit_message = "wasm trap: unreachable";
 
     kubelet.monitor_and_report_pod_statuses();
     assert(client_ref->last_pod_status_patch.find("\"exitCode\":134") != std::string::npos);
-    assert(client_ref->last_pod_status_patch.find("\"reason\":\"UnreachableExecuted\"") != std::string::npos);
+    assert(client_ref->last_pod_status_patch.find("\"reason\":\"Error\"") != std::string::npos);
 
     std::cout << "[PASS] test_kubelet_dynamic_trap_status_reporting" << std::endl;
+}
+
+// restartPolicy: Never reports the exit code and stops; OnFailure restarts
+// failures after a doubling back-off and completes on exit 0; Always
+// restarts whatever the exit code. Containers are released when they end.
+static std::string pod_manifest_with_policy(const std::string& name, const std::string& policy) {
+    return "{\"metadata\":{\"name\":\"" + name + "\",\"namespace\":\"default\",\"uid\":\"u-" + name + "\"},"
+           "\"spec\":{\"nodeName\":\"test-node-01\",\"restartPolicy\":\"" + policy + "\","
+           "\"containers\":[{\"name\":\"main\",\"image\":\"wasm://app\"}]}}";
+}
+
+void test_kubelet_restart_policy() {
+    std::cout << "[RUN] test_kubelet_restart_policy" << std::endl;
+    using kube32::runtime::ContainerPhase;
+    auto exited = [](MockControlledRuntime& rt, int32_t code) {
+        rt.mock_status.phase = ContainerPhase::Terminated;
+        rt.mock_status.exit_code = code;
+        rt.mock_status.termination_reason = code == 0 ? "Completed" : "Error";
+        rt.mock_status.exit_message = "entry point returned " + std::to_string(code);
+    };
+
+    // Never: app_main returned 3 -> Failed with exit code 3, no restart
+    {
+        KubeletConfig cfg;
+        cfg.node_name = "test-node-01";
+        MockControlledRuntime rt;
+        auto client = std::make_unique<MockKubeClient>();
+        MockKubeClient* c = client.get();
+        KubePod pod; pod.name = "job-never"; pod.namespace_name = "default"; pod.node_name = "test-node-01";
+        c->mock_pods.emplace_back(pod, pod_manifest_with_policy("job-never", "Never"));
+        Kubelet k(cfg, rt, std::move(client));
+        k.sync_assigned_pods();
+        exited(rt, 3);
+        k.monitor_and_report_pod_statuses();
+        const std::string& p = c->last_pod_status_patch;
+        assert(p.find("\"phase\":\"Failed\"") != std::string::npos);
+        assert(p.find("\"exitCode\":3") != std::string::npos);
+        assert(p.find("\"reason\":\"Error\"") != std::string::npos);
+        assert(p.find("\"restartCount\":0") != std::string::npos);
+        assert(rt.terminate_count == 1);   // container released
+        k.sync_assigned_pods();
+        assert(rt.deploy_count == 1);      // never restarted
+    }
+
+    // OnFailure: exit 0 completes the pod
+    {
+        KubeletConfig cfg;
+        cfg.node_name = "test-node-01";
+        MockControlledRuntime rt;
+        auto client = std::make_unique<MockKubeClient>();
+        MockKubeClient* c = client.get();
+        KubePod pod; pod.name = "job-ok"; pod.namespace_name = "default"; pod.node_name = "test-node-01";
+        c->mock_pods.emplace_back(pod, pod_manifest_with_policy("job-ok", "OnFailure"));
+        Kubelet k(cfg, rt, std::move(client));
+        k.sync_assigned_pods();
+        exited(rt, 0);
+        k.monitor_and_report_pod_statuses();
+        assert(c->last_pod_status_patch.find("\"phase\":\"Succeeded\"") != std::string::npos);
+        assert(c->last_pod_status_patch.find("\"exitCode\":0") != std::string::npos);
+    }
+
+    // OnFailure: a trap is restarted after the back-off, which doubles
+    {
+        KubeletConfig cfg;
+        cfg.node_name = "test-node-01";
+        cfg.restart_backoff_initial_ms = 300;
+        cfg.restart_backoff_max_ms = 1000;
+        MockControlledRuntime rt;
+        auto client = std::make_unique<MockKubeClient>();
+        MockKubeClient* c = client.get();
+        KubePod pod; pod.name = "crasher"; pod.namespace_name = "default"; pod.node_name = "test-node-01";
+        c->mock_pods.emplace_back(pod, pod_manifest_with_policy("crasher", "OnFailure"));
+        Kubelet k(cfg, rt, std::move(client));
+        k.sync_assigned_pods();
+        rt.mock_status.phase = ContainerPhase::Failed;
+        rt.mock_status.exit_code = 136;
+        rt.mock_status.termination_reason = "Error";
+        rt.mock_status.exit_message = "wasm trap: integer divide by zero";
+        k.monitor_and_report_pod_statuses();
+        std::string p = c->last_pod_status_patch;
+        assert(p.find("\"phase\":\"Running\"") != std::string::npos);
+        assert(p.find("\"waiting\":{\"reason\":\"CrashLoopBackOff\"") != std::string::npos);
+        assert(p.find("\"lastState\":{\"terminated\":{\"exitCode\":136,\"reason\":\"Error\"") != std::string::npos);
+        assert(p.find("\"restartCount\":0") != std::string::npos);
+        LocalPodRecord rec;
+        assert(k.get_pod_record("default/crasher", rec));
+        assert(rec.execution_phase == PodExecutionPhase::CrashLoopBackOff);
+        uint64_t now = kube32::osal::System::get_uptime_ms();
+        assert(rec.next_restart_allowed_ms > now && rec.next_restart_allowed_ms - now <= 300);
+        k.sync_assigned_pods();
+        assert(rt.deploy_count == 1);       // still backing off
+        // A line of the stopped container not yet shipped when the restart comes
+        kube32::runtime::PodLogStore::runtime().append("default/crasher", "old container's last line");
+        kube32::osal::Thread::sleep_ms(350);
+        k.sync_assigned_pods();
+        assert(rt.deploy_count == 2);       // restarted
+        // Shipped lines name the container instance that wrote them
+        kube32::runtime::PodLogStore::runtime().append("default/crasher", "new container");
+        k.ship_pod_logs();
+        assert(c->shipped_logs.find("\"r\":0,\"m\":\"old container's last line\"") != std::string::npos);
+        assert(c->shipped_logs.find("\"r\":1,\"m\":\"new container\"") != std::string::npos);
+        p = c->last_pod_status_patch;
+        assert(p.find("\"phase\":\"Running\"") != std::string::npos);
+        assert(p.find("\"restartCount\":1") != std::string::npos);
+        assert(p.find("\"lastState\":{\"terminated\":{\"exitCode\":136") != std::string::npos);
+        rt.mock_status.phase = ContainerPhase::Failed;
+        rt.mock_status.exit_code = 137;
+        rt.mock_status.termination_reason = "OOMKilled";
+        k.monitor_and_report_pod_statuses();
+        assert(k.get_pod_record("default/crasher", rec));
+        now = kube32::osal::System::get_uptime_ms();
+        assert(rec.next_restart_allowed_ms - now > 300 && rec.next_restart_allowed_ms - now <= 600);   // doubled
+        assert(rec.restart_count == 1);
+    }
+
+    // Always: even exit 0 is restarted
+    {
+        KubeletConfig cfg;
+        cfg.node_name = "test-node-01";
+        MockControlledRuntime rt;
+        auto client = std::make_unique<MockKubeClient>();
+        MockKubeClient* c = client.get();
+        KubePod pod; pod.name = "server"; pod.namespace_name = "default"; pod.node_name = "test-node-01";
+        c->mock_pods.emplace_back(pod, pod_manifest_with_policy("server", "Always"));
+        Kubelet k(cfg, rt, std::move(client));
+        k.sync_assigned_pods();
+        exited(rt, 0);
+        k.monitor_and_report_pod_statuses();
+        assert(c->last_pod_status_patch.find("CrashLoopBackOff") != std::string::npos);
+        assert(c->last_pod_status_patch.find("back-off 10s restarting failed container=main pod=server_default(u-server)") != std::string::npos);
+    }
+    std::cout << "[PASS] test_kubelet_restart_policy" << std::endl;
 }
 
 void test_http_chunked_response_decoding() {
@@ -418,6 +602,7 @@ int main() {
     test_kubelet_thread_lifecycle();
     test_kubelet_capability_admission_rejection();
     test_kubelet_dynamic_trap_status_reporting();
+    test_kubelet_restart_policy();
     test_http_chunked_response_decoding();
 
     std::cout << "All Kubelet tests passed successfully!" << std::endl;

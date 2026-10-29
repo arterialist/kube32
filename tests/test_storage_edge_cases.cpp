@@ -24,7 +24,7 @@ using namespace kube32::osal;
 // ============================================================================
 // TEST 1: Complex Key Mutations & Recursive Compaction Stress
 // ============================================================================
-void test_adversarial_key_mutations_and_compaction() {
+void test_key_mutations_and_compaction() {
     std::cout << "\n[TEST 1] Complex Key Mutations & Recursive Compaction Stress" << std::endl;
     RadixTree tree;
     std::map<std::string, std::string> oracle;
@@ -195,7 +195,7 @@ void test_adversarial_key_mutations_and_compaction() {
 // ============================================================================
 // TEST 2: Subtree Prefix Queries Across Namespaces
 // ============================================================================
-void test_adversarial_subtree_prefix_queries() {
+void test_subtree_prefix_queries() {
     std::cout << "\n[TEST 2] Subtree Prefix Queries Across Namespaces" << std::endl;
     RadixTree tree;
 
@@ -321,7 +321,7 @@ void test_adversarial_subtree_prefix_queries() {
 // ============================================================================
 // TEST 3: OCC CAS Conflict Stress & Rejection
 // ============================================================================
-void test_adversarial_occ_cas_conflicts() {
+void test_occ_cas_conflicts() {
     std::cout << "\n[TEST 3] OCC CAS Conflict Stress & Version Rejection" << std::endl;
     std::string test_dir = "/tmp/kube32_adv_occ_" + std::to_string(Thread::get_time_us());
     StoreOptions opts;
@@ -451,7 +451,10 @@ void test_adversarial_occ_cas_conflicts() {
               << final_conflicts << " version conflicts handled." << std::endl;
 
     assert(final_successes == NUM_THREADS * INCREMENTS_PER_THREAD);
-    assert(final_conflicts > 0); // Must have encountered true contention
+    // How many writes collide depends on how the OS interleaves the threads
+    // (none when they happen to run one after another), so the conflict count
+    // is reported, not asserted. No lost update is what is checked below.
+    (void)final_conflicts;
 
     // Verify counter value exactly matches total completed increments (+1 from initial valid test)
     std::string final_json;
@@ -468,7 +471,7 @@ void test_adversarial_occ_cas_conflicts() {
 // ============================================================================
 // TEST 4: Power-Failure Crash Simulation & LittleFS Journal Recovery
 // ============================================================================
-void test_adversarial_power_failure_crash_simulation() {
+void test_power_failure_crash_simulation() {
     std::cout << "\n[TEST 4] Power-Failure Crash Simulation & LittleFS Recovery" << std::endl;
     std::string crash_dir = "/tmp/kube32_adv_crash_" + std::to_string(Thread::get_time_us());
     StoreOptions opts;
@@ -618,10 +621,10 @@ void test_adversarial_power_failure_crash_simulation() {
 }
 
 // ============================================================================
-// TEST 5: Adversarial Vulnerabilities & Boundary Probing
+// TEST 5: Boundary Conditions
 // ============================================================================
-void test_adversarial_vulnerabilities_and_edge_cases() {
-    std::cout << "\n[TEST 5] Adversarial Vulnerabilities & Boundary Probing" << std::endl;
+void test_vulnerabilities_and_edge_cases() {
+    std::cout << "\n[TEST 5] Boundary Conditions" << std::endl;
     std::string test_dir = "/tmp/kube32_adv_vuln_" + std::to_string(Thread::get_time_us());
     StoreOptions opts;
     opts.base_path = test_dir;
@@ -683,7 +686,7 @@ void test_adversarial_vulnerabilities_and_edge_cases() {
     store->unwatch(wid);
     std::cout << "     [PASS] Watcher re-entrancy executed without deadlock." << std::endl;
 
-    std::cout << "  [COMPLETED] Adversarial Vulnerabilities & Boundary Probing Completed." << std::endl;
+    std::cout << "  [COMPLETED] Boundary Conditions Completed." << std::endl;
 }
 
 // ============================================================================
@@ -691,17 +694,17 @@ void test_adversarial_vulnerabilities_and_edge_cases() {
 // ============================================================================
 int main() {
     std::cout << "==================================================================" << std::endl;
-    std::cout << "  KUBE32 ADVERSARIAL STRESS TEST HARNESS (Radix Store & LittleFS) " << std::endl;
+    std::cout << "  KUBE32 STORAGE EDGE CASE TESTS (Radix Store & LittleFS)     " << std::endl;
     std::cout << "==================================================================" << std::endl;
 
-    test_adversarial_key_mutations_and_compaction();
-    test_adversarial_subtree_prefix_queries();
-    test_adversarial_occ_cas_conflicts();
-    test_adversarial_power_failure_crash_simulation();
-    test_adversarial_vulnerabilities_and_edge_cases();
+    test_key_mutations_and_compaction();
+    test_subtree_prefix_queries();
+    test_occ_cas_conflicts();
+    test_power_failure_crash_simulation();
+    test_vulnerabilities_and_edge_cases();
 
     std::cout << "\n==================================================================" << std::endl;
-    std::cout << "  >>> ALL ADVERSARIAL CHALLENGES COMPLETED <<<                    " << std::endl;
+    std::cout << "  >>> ALL STORAGE EDGE CASE TESTS COMPLETED <<<                   " << std::endl;
     std::cout << "==================================================================" << std::endl;
     return 0;
 }

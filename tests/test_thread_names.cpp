@@ -51,7 +51,7 @@ void test_osal_thread_name_lengths() {
 
         // Long > 64 chars
         {"Long (65 chars)",
-         "long_thread_name_that_exceeds_sixty_four_chars_boundary_adversarial65", 31},
+         "long_thread_name_that_exceeds_sixty_four_chars_boundary_name65", 31},
         {"Long (100 chars)",
          "extremely_long_thread_name_designed_to_heavily_overflow_any_32_byte_internal_buffer_up_to_100_chars!", 31},
         {"Extreme (256 chars)",
@@ -94,12 +94,17 @@ void test_osal_thread_name_lengths() {
                   << (tc.input_name.length() > 40 ? "..." : "") << "\"" << std::endl;
         std::cout << "   -> Captured: \"" << captured_name << "\" [len=" << captured_name.length() << "]" << std::endl;
 
-        // Truncation verification
+        // Truncation verification. The OSAL keeps 31 characters; Linux
+        // threads carry at most 15 of them.
+        size_t expected_len = tc.expected_max_len;
+#if defined(__linux__)
+        if (expected_len > 15) expected_len = 15;
+#endif
         assert(captured_name.length() <= 31);
         if (!tc.input_name.empty()) {
             // Must prefix-match the input name up to captured length
             assert(tc.input_name.compare(0, captured_name.length(), captured_name) == 0);
-            assert(captured_name.length() == tc.expected_max_len);
+            assert(captured_name.length() == expected_len);
         }
     }
 
@@ -151,7 +156,7 @@ void test_container_lifecycle_thread_name_lengths() {
 
         // Long > 64 chars
         {"Long (>64 chars)",
-         "pod-identifier-created-specifically-to-exceed-sixty-four-characters-total-length-adversarial-test",
+         "pod-identifier-created-specifically-to-exceed-sixty-four-characters-total-length-test",
          97},
         {"Extreme (>128 chars)",
          "extremely-long-pod-id-" + std::string(120, 'z'),
@@ -213,7 +218,7 @@ void test_concurrent_varying_name_stress() {
         "exact_thirty_one_chars_padding",            // 30 chars
         "exact_thirty_one_chars_padding!",           // 31 chars
         "exact_thirty_two_chars_paddings!",          // 32 chars
-        "this_thread_name_is_definitely_greater_than_sixty_four_characters_long_for_adversarial_testing_123456", // 101 chars
+        "this_thread_name_is_definitely_greater_than_sixty_four_characters_long_for_truncation_testing_123456", // 101 chars
         std::string(150, 'A'),                       // 150 chars
         std::string(300, 'B')                        // 300 chars
     };
@@ -260,7 +265,7 @@ void test_concurrent_varying_name_stress() {
 // =============================================================================
 int main() {
     std::cout << "==================================================================" << std::endl;
-    std::cout << " Kube32 Milestone 3 Challenger 7: Thread Name Length Adversarial  " << std::endl;
+    std::cout << " Kube32 Thread Name Length Tests                            " << std::endl;
     std::cout << " Verifying Short (<15), Medium (=22), Long (>64), and Truncation " << std::endl;
     std::cout << "==================================================================" << std::endl;
 
@@ -269,7 +274,7 @@ int main() {
     test_concurrent_varying_name_stress();
 
     std::cout << "\n==================================================================" << std::endl;
-    std::cout << " ALL THREAD NAME ADVERSARIAL TESTS PASSED (100%)                  " << std::endl;
+    std::cout << " ALL THREAD NAME TESTS PASSED                                  " << std::endl;
     std::cout << "==================================================================" << std::endl;
     return 0;
 }

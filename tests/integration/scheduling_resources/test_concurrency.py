@@ -1,5 +1,5 @@
 """
-Tier 3 Pairwise Tests: Concurrent API Operations & Thread Safety
+Scheduling and Resource Tests: Concurrent API Operations & Thread Safety
 Authoritative sources:
 - Kube32 Concurrency & State Store Thread-Safety Contract (PROJECT.md § 4.1)
 - In-Memory Radix State Store with Thread-Safe Locking (PROJECT.md § 1)
@@ -7,7 +7,7 @@ Authoritative sources:
 
 import threading
 import queue
-from tests.framework import BaseTestCase
+from tests.integration.framework import BaseTestCase
 
 
 class TestConcurrency(BaseTestCase):
@@ -27,7 +27,7 @@ class TestConcurrency(BaseTestCase):
                 "metadata": {"name": pod_name, "namespace": "default"},
                 "spec": {
                     "containers": [
-                        {"name": "worker", "image": "wasm://app", "resources": {"requests": {"memory": "16Ki"}}}
+                        {"name": "worker", "image": "wasm://embedded/echo", "resources": {"requests": {"memory": "16Ki"}}}
                     ]
                 }
             }
@@ -84,7 +84,7 @@ class TestConcurrency(BaseTestCase):
                 "apiVersion": "v1",
                 "kind": "Pod",
                 "metadata": {"name": pname, "namespace": "default"},
-                "spec": {"containers": [{"name": "app", "image": "wasm://app"}]}
+                "spec": {"containers": [{"name": "app", "image": "wasm://embedded/echo"}]}
             }
             resp = self.http.post("/api/v1/namespaces/default/pods", body=manifest)
             self.assertEqual(resp.status_code, 201)
@@ -98,11 +98,12 @@ class TestConcurrency(BaseTestCase):
         Verify simultaneous DELETE and GET on the same pod handles atomic transition cleanly.
         """
         pod_name = self.unique_name("conc-del-get")
+        self.register_cleanup("pod", "default", pod_name)
         manifest = {
             "apiVersion": "v1",
             "kind": "Pod",
             "metadata": {"name": pod_name, "namespace": "default"},
-            "spec": {"containers": [{"name": "app", "image": "wasm://app"}]}
+            "spec": {"containers": [{"name": "app", "image": "wasm://embedded/echo"}]}
         }
         resp = self.http.post("/api/v1/namespaces/default/pods", body=manifest)
         self.assertEqual(resp.status_code, 201)
@@ -141,7 +142,7 @@ class TestConcurrency(BaseTestCase):
                 "apiVersion": "v1",
                 "kind": "Pod",
                 "metadata": {"name": pname, "namespace": "default"},
-                "spec": {"containers": [{"name": "app", "image": "wasm://app"}]}
+                "spec": {"containers": [{"name": "app", "image": "wasm://embedded/echo"}]}
             }
             self.http.post("/api/v1/namespaces/default/pods", body=manifest)
 
@@ -174,11 +175,12 @@ class TestConcurrency(BaseTestCase):
         iterations = 5
         for i in range(iterations):
             pname = self.unique_name(f"churn-pod-{i}")
+            self.register_cleanup("pod", "default", pname)   # teardown waits until the pod is gone
             manifest = {
                 "apiVersion": "v1",
                 "kind": "Pod",
                 "metadata": {"name": pname, "namespace": "default"},
-                "spec": {"containers": [{"name": "app", "image": "wasm://app"}]}
+                "spec": {"containers": [{"name": "app", "image": "wasm://embedded/echo"}]}
             }
             # Create
             c_resp = self.http.post("/api/v1/namespaces/default/pods", body=manifest)

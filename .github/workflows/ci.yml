@@ -34,15 +34,15 @@ jobs:
         # A per-test timeout turns a hang into a failure instead of a stalled job.
         run: ctest --test-dir build --output-on-failure --timeout 300 --parallel 4
 
-  tessera-core:
-    name: Tessera core native tests
+  tessera:
+    name: Tessera native tests (db, api, web)
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Install clang
         run: sudo apt-get update && sudo apt-get install -y --no-install-recommends clang
       - name: make test
-        run: make -C apps/tessera/core test
+        run: make -C apps/tessera test
 
   kube32-cli:
     name: kube32-cli tests
@@ -62,6 +62,50 @@ jobs:
           rustup default "$RUST_TOOLCHAIN"
       - name: unittest
         run: python3 -m unittest discover -s tools/tests -v
+
+  integration:
+    name: Integration suites (kube32-sim)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+      - name: Build the simulator
+        run: |
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+          cmake --build build --parallel 4 --target kube32-sim
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: federation/go.mod
+          cache-dependency-path: federation/go.sum
+      - name: Build the Virtual Kubelet
+        run: make -C federation build
+      - name: Suites against one running simulator (api, validation, resources, workloads)
+        run: |
+          rm -rf "$RUNNER_TEMP/sim"
+          mkdir -p "$RUNNER_TEMP/sim"
+          build/kube32-sim --role control-plane --node-name cp-0 --node-id 0 --port 6443 --ipc-port 17100 \
+            --pod-port 17000 --psram 8Mi --data-dir "$RUNNER_TEMP/sim" > "$RUNNER_TEMP/sim.log" 2>&1 &
+          sim=$!
+          trap 'kill $sim; wait $sim' EXIT
+          for _ in $(seq 60); do
+            curl -sf http://127.0.0.1:6443/api/v1/nodes | python3 -c 'import json,sys; sys.exit(0 if any(c["type"] == "Ready" and c["status"] == "True" for n in json.load(sys.stdin)["items"] for c in n["status"]["conditions"]) else 1)' && break
+            sleep 0.5
+          done
+          for suite in api validation resources workloads; do
+            python3 tests/integration/runner.py --suite "$suite"
+          done
+          python3 tests/integration/test_api_client_compat.py
+      - name: Suites that start their own clusters (cluster, federation)
+        run: |
+          python3 tests/integration/runner.py --suite cluster
+          python3 tests/integration/runner.py --suite federation
+      - name: Stress scripts (each starts its own simulator)
+        run: |
+          for script in test_api_chunked_stream_stress test_api_malformed_requests test_api_socket_disconnect test_sim_wasm_sandbox; do
+            python3 "tests/integration/$script.py"
+          done
 
   rust-sdk:
     name: Rust SDK (wasm32-unknown-unknown)

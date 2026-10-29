@@ -1,12 +1,12 @@
 """
-Tier 1 Feature Tests: Server-Side Table Serialization
+API Resource Tests: Server-Side Table Serialization
 Authoritative sources:
 - Kubernetes meta.k8s.io/v1 Table Schema (io.k8s.apimachinery.pkg.apis.meta.v1.Table)
 - survey_spec_miner_1/report.md § 2.1, 2.2, 2.3
 - PROJECT.md § 2 (Feature 6: Server-Side Table Serializer)
 """
 
-from tests.framework import BaseTestCase
+from tests.integration.framework import BaseTestCase
 
 TABLE_ACCEPT_HEADER = {
     "Accept": "application/json;as=Table;v=v1;g=meta.k8s.io, application/json;q=0.9"
@@ -63,7 +63,7 @@ class TestTables(BaseTestCase):
             "apiVersion": "v1",
             "kind": "Pod",
             "metadata": {"name": pod_name, "namespace": "default"},
-            "spec": {"containers": [{"name": "c1", "image": "wasm://app"}]}
+            "spec": {"containers": [{"name": "c1", "image": "wasm://embedded/echo"}]}
         }
         self.register_cleanup("pod", "default", pod_name)
         self.http.post("/api/v1/namespaces/default/pods", body=manifest)
@@ -98,7 +98,7 @@ class TestTables(BaseTestCase):
                 "selector": {"matchLabels": {"app": "test"}},
                 "template": {
                     "metadata": {"labels": {"app": "test"}},
-                    "spec": {"containers": [{"name": "app", "image": "wasm://app"}]}
+                    "spec": {"containers": [{"name": "app", "image": "wasm://embedded/echo"}]}
                 }
             }
         }

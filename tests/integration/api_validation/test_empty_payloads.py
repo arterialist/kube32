@@ -1,11 +1,11 @@
 """
-Tier 2 Boundary Tests: Empty Payloads
+API Validation Tests: Empty Payloads
 Authoritative sources:
 - Kubernetes API Server Validation Protocol (io.k8s.apimachinery.pkg.apis.meta.v1.Status)
 - survey_spec_miner_1/report.md § 4.1 - 4.2
 """
 
-from tests.framework import BaseTestCase
+from tests.integration.framework import BaseTestCase
 
 
 class TestEmptyPayloads(BaseTestCase):

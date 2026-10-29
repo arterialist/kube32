@@ -1,11 +1,11 @@
 """
-Tier 2 Boundary Tests: 404 Not Found on Missing Resources
+API Validation Tests: 404 Not Found on Missing Resources
 Authoritative sources:
 - Kubernetes Status Schema (code: 404, reason: "NotFound")
 - survey_spec_miner_1/report.md § 4.1 - 4.2
 """
 
-from tests.framework import BaseTestCase
+from tests.integration.framework import BaseTestCase
 
 
 class TestNotFound(BaseTestCase):

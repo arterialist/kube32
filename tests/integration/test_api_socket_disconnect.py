@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 """
-Dedicated Empirical Adversarial Stress Test: Socket Disconnect Mid-Chunk & Concurrency Resilience
-Tester: m2_challenger_3
+Stress test: socket disconnect mid-chunk and concurrency resilience.
 
 Stress Scenarios:
 1. High-frequency disconnects during Table chunked streaming (50+ pods seeded).
@@ -30,7 +29,7 @@ import subprocess
 SERVER_HOST = "127.0.0.1"
 SERVER_PORT = 6443
 BASE_URL = f"http://{SERVER_HOST}:{SERVER_PORT}"
-PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 BINARY_PATH = os.path.join(PROJECT_ROOT, "build", "kube32-sim")
 
 sim_proc = None

@@ -1,12 +1,12 @@
 """
-Tier 1 Feature Tests: Node Management & Listing
+API Resource Tests: Node Management & Listing
 Authoritative sources:
 - Kubernetes Node v1 API Specification (io.k8s.api.core.v1.Node)
 - survey_spec_miner_1/report.md § 2.1
 - PROJECT.md § 2 (Feature 5: Core Resource HTTP REST Endpoints)
 """
 
-from tests.framework import BaseTestCase
+from tests.integration.framework import BaseTestCase
 
 
 class TestNodes(BaseTestCase):

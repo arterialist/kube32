@@ -214,12 +214,16 @@ void test_generic_resource_pools() {
     uint64_t gpio_mask = fw.get_allocated_gpio_mask();
     uint8_t i2c_mask = fw.get_allocated_i2c_mask();
 
-    // Verify 2 GPIOs and 1 I2C bus were allocated
+    // 2 GPIOs and 1 I2C bus were allocated; the bus took its pins (SDA 8,
+    // SCL 9) as well, which the pod cannot drive as GPIOs
     int count = 0;
     for (int i = 0; i < 64; ++i) {
         if ((gpio_mask & (1ULL << i)) != 0) count++;
     }
-    assert(count == 2);
+    assert(count == 4);
+    assert((gpio_mask & ((1ULL << 8) | (1ULL << 9))) == ((1ULL << 8) | (1ULL << 9)));
+    const PodSecurityRecord* rec = fw.get_pod_security_record("generic-pod");
+    assert(rec && __builtin_popcountll(rec->grant.gpio_write_mask) == 2 && (rec->grant.gpio_write_mask & (1ULL << 8)) == 0);
     assert(i2c_mask != 0);
 
     fw.unregister_pod("generic-pod");

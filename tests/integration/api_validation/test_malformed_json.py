@@ -1,11 +1,11 @@
 """
-Tier 2 Boundary Tests: Malformed & Syntactically Invalid JSON
+API Validation Tests: Malformed & Syntactically Invalid JSON
 Authoritative sources:
 - Kubernetes API Server Serialization Protocol
 - survey_spec_miner_1/report.md § 4.1 - 4.2
 """
 
-from tests.framework import BaseTestCase
+from tests.integration.framework import BaseTestCase
 
 
 class TestMalformedJSON(BaseTestCase):

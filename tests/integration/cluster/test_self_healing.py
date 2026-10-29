@@ -1,5 +1,5 @@
 """
-Kube32 Milestone 4 Test Suite: Autonomous Self-Healing and Multi-Node Failover
+Kube32 Cluster Tests: Autonomous Self-Healing and Multi-Node Failover
 Verifies node lease eviction, DisruptionTarget tagging, and rescheduling
 of orphaned workloads to surviving healthy cluster nodes.
 """
@@ -7,11 +7,11 @@ of orphaned workloads to surviving healthy cluster nodes.
 import time
 import json
 import urllib.request
-from tests.framework import BaseTestCase
-from tests.m4_cluster_harness import ClusterHarness
+from tests.integration.framework import BaseTestCase
+from tests.integration.cluster_harness import ClusterHarness, node_ready_condition
 
 
-class TestM4SelfHealing(BaseTestCase):
+class TestSelfHealing(BaseTestCase):
     def setUp(self):
         super().setUp()
         self.harness = ClusterHarness(base_api_port=16643, base_ipc_port=17600)
@@ -32,6 +32,12 @@ class TestM4SelfHealing(BaseTestCase):
         worker1 = self.harness.start_worker("worker-heal-1", 1, cp, lease_interval_ms=400)
         worker2 = self.harness.start_worker("worker-heal-2", 2, cp, lease_interval_ms=400)
 
+        # Both workers must be Ready before pods can be bound to them
+        for w in (worker1, worker2):
+            self.wait_for_condition(
+                lambda w=w: (node_ready_condition(cp.api_url, w.name) or {}).get("status") == "True",
+                timeout=10.0, description=f"{w.name} Ready")
+
         # Deploy a regular workload pod explicitly scheduled on worker-1
         pod_manifest = {
             "apiVersion": "v1",
@@ -44,7 +50,7 @@ class TestM4SelfHealing(BaseTestCase):
                 "nodeName": worker1.name,
                 "containers": [{
                     "name": "sensor",
-                    "image": "wasm://sensor-firmware",
+                    "image": "wasm://embedded/echo",
                     "resources": {
                         "requests": {
                             "memory": "32Ki"
@@ -78,7 +84,7 @@ class TestM4SelfHealing(BaseTestCase):
                 "nodeName": worker1.name,
                 "containers": [{
                     "name": "daemon",
-                    "image": "wasm://telemetry"
+                    "image": "wasm://embedded/echo"
                 }]
             }
         }
@@ -94,15 +100,14 @@ class TestM4SelfHealing(BaseTestCase):
         # Kill worker-1
         self.harness.kill_node(worker1.name)
 
-        # Wait for eviction timeout (3000ms) + controller reconcile (500ms) + scheduler cycle
-        time.sleep(4.0)
-
-        # Query resilient pod: should be evicted and rescheduled to worker-2
+        # The lease lasts at least 15 s; after it expires and the eviction delay passes, the
+        # pod is unbound, then the scheduler rebinds it to the surviving worker
         pod_url = f"{cp.api_url}/api/v1/namespaces/default/pods/resilient-sensor-app"
-        with urllib.request.urlopen(pod_url, timeout=2.0) as resp:
-            pod_data = json.loads(resp.read().decode())
-            # Self-healing should reassign to surviving healthy worker-2
-            self.assertEqual(pod_data.get("spec", {}).get("nodeName"), worker2.name)
+        def node_of():
+            with urllib.request.urlopen(pod_url, timeout=2.0) as resp:
+                return json.loads(resp.read().decode()).get("spec", {}).get("nodeName")
+        self.wait_for_condition(lambda: node_of() == worker2.name, timeout=40.0, interval=0.5,
+                                description="evicted pod rebound to the surviving worker")
 
         # Query daemon pod: should NOT be evicted because of daemonset exemption
         daemon_url = f"{cp.api_url}/api/v1/namespaces/default/pods/node-telemetry-daemon"

@@ -30,8 +30,10 @@ TESTS_DIR = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.dirname(os.path.dirname(TESTS_DIR))
 CLI = os.path.join(REPO, "tools", "kube32-cli")
 ECHO = os.path.join(REPO, "images", "echo.wasm")
-TESSERA_CORE = os.path.join(REPO, "images", "tessera-core.wasm")
+ECHO_SIZE = "{:,}".format(os.path.getsize(ECHO))
+TESSERA_API = os.path.join(REPO, "images", "tessera-api.wasm")
 TESSERA_HUD = os.path.join(REPO, "images", "tessera-hud.wasm")
+I2CSCAN = os.path.join(REPO, "images", "i2cscan.wasm")
 SDNOTE = os.path.join(REPO, "images", "sd", "sdnote.wasm")
 
 
@@ -201,20 +203,26 @@ class TestCheckFixtures(unittest.TestCase):
     def test_echo_report(self):
         rc, out, _ = run_cli("check", "images/echo.wasm")
         self.assertEqual(rc, 0)
-        self.assertIn("images/echo.wasm: 2,035 bytes", out)
+        self.assertIn("images/echo.wasm: %s bytes" % ECHO_SIZE, out)
         self.assertIn("kind: request pod (k32_handle)", out)
         self.assertIn("exports (5): k32_alloc, k32_event, k32_handle, k32_init, memory [memory]", out)
-        self.assertIn("imports (8): k32_env_get, k32_event_emit, k32_log, k32_resp_begin, k32_resp_end, k32_resp_header, "
+        self.assertIn("imports (9): k32_env_get, k32_event_emit, k32_log, k32_resp_asset, k32_resp_begin, k32_resp_end, k32_resp_header, "
                       "k32_resp_write, k32_time_ms", out)
         self.assertIn("memory: 1 page = 65,536 bytes (64Ki), max 1 page", out)
         self.assertIn("features beyond MVP: none", out)
         self.assertIn("hardware: ipc  (manifest resources: hardware.kube32.io/ipc)", out)
 
-    @unittest.skipUnless(os.path.isfile(TESSERA_HUD), "images/tessera-hud.wasm not built")
+    @unittest.skipUnless(os.path.isfile(I2CSCAN), "images/i2cscan.wasm not built")
     def test_app_main_pod(self):
-        rc, out, _ = run_cli("check", TESSERA_HUD)
+        rc, out, _ = run_cli("check", I2CSCAN)
         self.assertEqual(rc, 0)
         self.assertIn("kind: app_main pod (app_main runs on the pod thread)", out)
+
+    @unittest.skipUnless(os.path.isfile(TESSERA_HUD), "images/tessera-hud.wasm not built")
+    def test_event_pod(self):
+        rc, out, _ = run_cli("check", TESSERA_HUD)
+        self.assertEqual(rc, 0)
+        self.assertIn("kind: event pod (no k32_handle; k32_init/k32_tick/k32_event)", out)
         self.assertIn("hardware: ipc, display, keyboard, speaker", out)
 
     @unittest.skipUnless(os.path.isfile(SDNOTE), "images/sd/sdnote.wasm not built")
@@ -223,16 +231,16 @@ class TestCheckFixtures(unittest.TestCase):
         self.assertEqual(rc, 0)
         self.assertIn("hardware: sd  (manifest resources: hardware.kube32.io/sd)", out)
 
-    @unittest.skipUnless(os.path.isfile(TESSERA_CORE), "images/tessera-core.wasm not built")
+    @unittest.skipUnless(os.path.isfile(TESSERA_API), "images/tessera-api.wasm not built")
     def test_memory_limit(self):
-        with open(TESSERA_CORE, "rb") as f:
+        with open(TESSERA_API, "rb") as f:
             initial = cli.parse_module(f.read()).memories[0][0]
         need = cli.format_quantity(initial * 65536)
-        rc, out, _ = run_cli("check", TESSERA_CORE, "--memory", "64Ki")
+        rc, out, _ = run_cli("check", TESSERA_API, "--memory", "64Ki")
         self.assertEqual(rc, 3)
         self.assertIn("error: memory: the module declares %s (%d pages) of linear memory but the limit is 64Ki" % (need, initial), out)
         self.assertEqual(out.strip().splitlines()[-1], "FAILED (1 error)")
-        rc, _, _ = run_cli("check", TESSERA_CORE, "--memory", need)
+        rc, _, _ = run_cli("check", TESSERA_API, "--memory", need)
         self.assertEqual(rc, 0)
 
 
@@ -402,7 +410,7 @@ FAKE_KUBECTL = textwrap.dedent('''\
     stdin = sys.stdin.read() if "-f" in args else ""
     with open(log, "a") as f:
         f.write(json.dumps({"args": args, "stdin": stdin}) + "\\n")
-    verbs = [a for a in args if a in ("get", "create", "delete")]
+    verbs = [a for a in args if a in ("get", "create", "delete", "replace")]
     verb = verbs[0] if verbs else ""
     if state == "down":
         sys.stderr.write("The connection to the server 127.0.0.1:6443 was refused - did you specify the right host or port?\\n")
@@ -415,6 +423,15 @@ FAKE_KUBECTL = textwrap.dedent('''\
         sys.exit(1)
     if verb == "delete":
         print('pod "x" deleted')
+        sys.exit(0)
+    if verb == "replace":
+        body = open(args[args.index("-f") + 1], "rb").read()
+        with open(log, "a") as f:
+            f.write(json.dumps({"put": args[args.index("--raw") + 1], "size": len(body)}) + "\\n")
+        if state == "pushfail":
+            sys.stderr.write('Error from server (ServiceUnavailable): node w1 reports no kubelet endpoint\\n')
+            sys.exit(1)
+        print(json.dumps({"path": "x", "bytes": len(body), "ms": 3}))
         sys.exit(0)
     if verb == "create":
         if state == "createfail":
@@ -490,7 +507,7 @@ class TestDeploy(TempDirCase):
             (("--name", "Bad_Name"), "error: invalid pod name 'Bad_Name' (lowercase letters, digits and '-', at most 63 characters; pass --name)\n"),
             (("--name", "x", "--env", "NOEQUALS"), "error: --env expects KEY=VALUE, got 'NOEQUALS'\n"),
             (("--name", "x", "--env", "1BAD=v"), "error: invalid environment variable name '1BAD'\n"),
-            (("--name", "x", "--hardware", "lasers"), "error: unknown hardware 'lasers' (expected display, keyboard, speaker, ipc, sd or none)\n"),
+            (("--name", "x", "--hardware", "lasers"), "error: unknown hardware 'lasers' (expected display, keyboard, speaker, ipc, sd, service-call or none)\n"),
             (("--name", "x", "--memory", "lots"), "error: invalid quantity 'lots' (expected e.g. 64Ki, 1280Ki, 2Mi, 65536)\n"),
             (("--name", "x", "--image", "docker.io/nginx"), "error: --image must be a wasm:// reference such as wasm://sd/x or wasm://embedded/x:v1\n"),
             (("--name", "x", "--sd-claim", "data"), "error: --sd-claim needs the sd hardware (--hardware ...,sd, or a module that imports k32_fs_*)\n"),
@@ -539,22 +556,22 @@ class TestDeploy(TempDirCase):
         self.assertIsNotNone(self.annotation(out, "kube32.io/wasm-sha256"))
         self.assertIn('      image: "wasm://sd/sdnote"\n', out)
 
-    @unittest.skipUnless(os.path.isfile(TESSERA_CORE), "images/tessera-core.wasm not built")
+    @unittest.skipUnless(os.path.isfile(TESSERA_API), "images/tessera-api.wasm not built")
     def test_memory_too_small_and_psram(self):
-        with open(TESSERA_CORE, "rb") as f:
+        with open(TESSERA_API, "rb") as f:
             need = cli.format_quantity(cli.parse_module(f.read()).memories[0][0] * 65536)
-        rc, out, err = run_cli("deploy", TESSERA_CORE, "--name", "core", "--dry-run")
+        rc, out, err = run_cli("deploy", TESSERA_API, "--name", "api", "--dry-run")
         self.assertEqual(rc, 3)
         self.assertIn("but the limit is 64Ki", out)
         self.assertIn("hint: pass --memory %s, or --psram %s on a node with PSRAM" % (need, need), err)
-        rc, out, _ = run_cli("deploy", TESSERA_CORE, "--name", "core", "--memory", "48Ki", "--psram", need, "--dry-run")
+        rc, out, _ = run_cli("deploy", TESSERA_API, "--name", "api", "--memory", "48Ki", "--psram", need, "--dry-run")
         self.assertEqual(rc, 0)
         self.assertIn("          memory: 48Ki\n          esp32.io/psram: %s\n" % need, out)
 
     def test_create_when_absent(self):
         rc, out, err = self.deploy("absent", ECHO, "--name", "echo-x", "--context", "sim", "--kubeconfig", "/tmp/kc")
         self.assertEqual(rc, 0, err)
-        self.assertEqual(out, "pod/x created\ndeployed default/echo-x: 2,035 bytes inline, 64Ki linear memory, hardware: ipc\n")
+        self.assertEqual(out, "pod/x created\ndeployed default/echo-x: %s bytes inline, 64Ki linear memory, hardware: ipc\n" % ECHO_SIZE)
         calls = self.calls()
         self.assertEqual([c["args"] for c in calls], [
             ["--kubeconfig", "/tmp/kc", "--context", "sim", "get", "pod", "echo-x", "-n", "default", "-o",
@@ -614,7 +631,7 @@ class TestEmbed(TempDirCase):
         dest = os.path.join(images, "echo-copy.wasm")
         with open(ECHO, "rb") as a, open(dest, "rb") as b:
             self.assertEqual(a.read(), b.read())
-        self.assertEqual(out.splitlines()[:2], ["embedded %s (2,035 bytes)" % dest, "image: wasm://embedded/echo-copy:v1"])
+        self.assertEqual(out.splitlines()[:2], ["embedded %s (%s bytes)" % (dest, ECHO_SIZE), "image: wasm://embedded/echo-copy:v1"])
         rc, out, err = run_cli("embed", ECHO, "--name", "echo-copy", "--images-dir", images)
         self.assertEqual((rc, out, err), (1, "", "error: %s exists; pass --force to replace it\n" % dest))
         rc, _, _ = run_cli("embed", ECHO, "--name", "echo-copy", "--images-dir", images, "--force")
@@ -640,11 +657,11 @@ class TestSdPush(TempDirCase):
         rc, out, err = run_cli("sd-push", ECHO, "--to", card)
         self.assertEqual(rc, 0, err)
         dest = os.path.join(card, "kube32", "images", "echo.wasm")
-        self.assertEqual(out, "copied %s (2,035 bytes)\nimage: wasm://sd/echo\n" % dest)
+        self.assertEqual(out, "copied %s (%s bytes)\nimage: wasm://sd/echo\n" % (dest, ECHO_SIZE))
         with open(ECHO, "rb") as a, open(dest, "rb") as b:
             self.assertEqual(a.read(), b.read())
         rc, out, _ = run_cli("sd-push", ECHO, "--to", card)
-        self.assertEqual(out, "replaced %s (2,035 bytes, was 2,035)\nimage: wasm://sd/echo\n" % dest)
+        self.assertEqual(out, "replaced %s (%s bytes, was %s)\nimage: wasm://sd/echo\n" % (dest, ECHO_SIZE, ECHO_SIZE))
         rc, out, _ = run_cli("sd-push", ECHO, "--to", card, "--name", "Echo_2", "--tag", "v2")
         self.assertEqual(rc, 0)
         self.assertIn("image: wasm://sd/Echo_2:v2\n", out)
@@ -680,7 +697,7 @@ class TestSdPush(TempDirCase):
         self.assertIn("error: invalid tag 'a/b'", err)
         rc, _, err = run_cli("sd-push", ECHO)
         self.assertEqual(rc, 2)
-        self.assertIn("the following arguments are required: --to", err)
+        self.assertIn("pass --to <card mount point> for a card in this machine, or --node <node>", err)
         bad = self.write("bad.wasm", request_pod(memory=None))
         rc, out, _ = run_cli("sd-push", bad, "--to", self.tmp)
         self.assertEqual(rc, 3)
@@ -819,6 +836,76 @@ class TestBuild(TempDirCase):
             res = cli.check_module(out_path, f.read())
         self.assertTrue(res.ok)
         self.assertLess(res.module.size, 8192)
+
+
+class TestPush(TempDirCase):
+    def setUp(self):
+        super().setUp()
+        self.kubectl = self.write("kubectl", FAKE_KUBECTL)
+        os.chmod(self.kubectl, os.stat(self.kubectl).st_mode | stat.S_IXUSR)
+        self.log = os.path.join(self.tmp, "calls.jsonl")
+
+    def run_with(self, state, *args):
+        env = dict(os.environ, FAKE_KUBECTL_STATE=state, FAKE_KUBECTL_LOG=self.log)
+        return run_cli(*args, "--kubectl", self.kubectl, "--context", "c1", env=env)
+
+    def puts(self):
+        with open(self.log) as f:
+            return [json.loads(line) for line in f if '"put"' in line]
+
+    def test_push(self):
+        data = self.write("site.css", b"body{}")
+        rc, out, err = self.run_with("ok", "push", data, "--node", "w1", "--path", "images/web/site.css")
+        self.assertEqual(rc, 0, err)
+        self.assertRegex(out, r"^pushed 6 bytes to w1:kube32/images/web/site.css in \d+\.\d s\n$")
+        self.assertEqual(self.puts(), [{"put": "/api/v1/nodes/w1/proxy/storage/images/web/site.css", "size": 6}])
+
+    def test_push_default_path_and_errors(self):
+        rc, out, _ = self.run_with("ok", "push", ECHO, "--node", "w1")
+        self.assertEqual(rc, 0)
+        self.assertEqual(self.puts()[-1]["put"], "/api/v1/nodes/w1/proxy/storage/images/echo.wasm")
+        rc, _, err = self.run_with("ok", "push", ECHO, "--node", "w1", "--path", "../etc/x")
+        self.assertEqual(rc, 2)
+        self.assertIn("invalid --path", err)
+        rc, _, err = self.run_with("pushfail", "push", ECHO, "--node", "w1")
+        self.assertEqual(rc, 4)
+        self.assertIn("reports no kubelet endpoint", err)
+
+    def test_push_directory(self):
+        d = os.path.join(self.tmp, "db")
+        self.write("db/a.bin", b"123")
+        self.write("db/sub/deep/b.bin", b"12345")
+        rc, out, err = self.run_with("ok", "push", d, "--node", "w1", "--path", "volumes/db")
+        self.assertEqual(rc, 0, err)
+        self.assertEqual([p["put"] for p in self.puts()], [
+            "/api/v1/nodes/w1/proxy/storage/volumes/db/a.bin",
+            "/api/v1/nodes/w1/proxy/storage/volumes/db/sub/deep/b.bin"])
+        lines = out.splitlines()
+        self.assertEqual(len(lines), 3)
+        self.assertIn("w1:kube32/volumes/db/sub/deep/b.bin", lines[1])
+        self.assertEqual(lines[2], "pushed 2 files, 8 bytes to w1:kube32/volumes/db")
+
+    def test_push_directory_default_path_and_errors(self):
+        self.write("db/a.bin", b"1")
+        d = os.path.join(self.tmp, "db") + "/"
+        rc, _, err = self.run_with("ok", "push", d, "--node", "w1")
+        self.assertEqual(rc, 0, err)
+        self.assertEqual(self.puts()[-1]["put"], "/api/v1/nodes/w1/proxy/storage/images/a.bin")
+        os.makedirs(os.path.join(self.tmp, "empty"))
+        rc, _, err = self.run_with("ok", "push", os.path.join(self.tmp, "empty"), "--node", "w1")
+        self.assertEqual(rc, 1)
+        self.assertIn("contains no files", err)
+        self.write("db/b.bin", b"2")
+        rc, out, err = self.run_with("pushfail", "push", d, "--node", "w1")
+        self.assertEqual(rc, 4)
+        self.assertEqual(len(self.puts()), 2)          # the first failure ends the run
+        self.assertNotIn("pushed 2 files", out)
+
+    def test_sd_push_over_the_network(self):
+        rc, out, err = self.run_with("ok", "sd-push", ECHO, "--node", "w1", "--tag", "v2")
+        self.assertEqual(rc, 0, err)
+        self.assertTrue(out.endswith("image: wasm://sd/echo:v2\n"))
+        self.assertEqual(self.puts(), [{"put": "/api/v1/nodes/w1/proxy/storage/images/echo-v2.wasm", "size": os.path.getsize(ECHO)}])
 
 
 if __name__ == "__main__":

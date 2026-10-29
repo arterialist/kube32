@@ -1,12 +1,12 @@
 """
-Tier 1 Feature Tests: Deployment Lifecycle & Scale Subresource
+API Resource Tests: Deployment Lifecycle & Scale Subresource
 Authoritative sources:
 - Kubernetes Deployment apps/v1 API Specification (io.k8s.api.apps.v1.Deployment)
 - survey_spec_miner_1/report.md § 2.3
 - PROJECT.md § 2 (Feature 5: Core Resource HTTP REST Endpoints)
 """
 
-from tests.framework import BaseTestCase
+from tests.integration.framework import BaseTestCase
 
 
 class TestDeployments(BaseTestCase):
@@ -66,7 +66,7 @@ class TestDeployments(BaseTestCase):
                 "selector": {"matchLabels": {"app": "test"}},
                 "template": {
                     "metadata": {"labels": {"app": "test"}},
-                    "spec": {"containers": [{"name": "app", "image": "wasm://app"}]}
+                    "spec": {"containers": [{"name": "app", "image": "wasm://embedded/echo"}]}
                 }
             }
         }
@@ -94,7 +94,7 @@ class TestDeployments(BaseTestCase):
                 "selector": {"matchLabels": {"app": "test"}},
                 "template": {
                     "metadata": {"labels": {"app": "test"}},
-                    "spec": {"containers": [{"name": "app", "image": "wasm://app"}]}
+                    "spec": {"containers": [{"name": "app", "image": "wasm://embedded/echo"}]}
                 }
             }
         }
@@ -121,7 +121,7 @@ class TestDeployments(BaseTestCase):
                 "selector": {"matchLabels": {"app": "test"}},
                 "template": {
                     "metadata": {"labels": {"app": "test"}},
-                    "spec": {"containers": [{"name": "app", "image": "wasm://app"}]}
+                    "spec": {"containers": [{"name": "app", "image": "wasm://embedded/echo"}]}
                 }
             }
         }
@@ -148,7 +148,7 @@ class TestDeployments(BaseTestCase):
                 "selector": {"matchLabels": {"app": "test"}},
                 "template": {
                     "metadata": {"labels": {"app": "test"}},
-                    "spec": {"containers": [{"name": "app", "image": "wasm://app"}]}
+                    "spec": {"containers": [{"name": "app", "image": "wasm://embedded/echo"}]}
                 }
             }
         }
@@ -177,7 +177,7 @@ class TestDeployments(BaseTestCase):
                 "selector": {"matchLabels": {"app": "test"}},
                 "template": {
                     "metadata": {"labels": {"app": "test"}},
-                    "spec": {"containers": [{"name": "app", "image": "wasm://app"}]}
+                    "spec": {"containers": [{"name": "app", "image": "wasm://embedded/echo"}]}
                 }
             }
         }

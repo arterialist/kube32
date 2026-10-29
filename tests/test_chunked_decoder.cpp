@@ -143,7 +143,7 @@ void test_header_detection_edge_cases() {
 
 int main() {
     std::cout << "==========================================================" << std::endl;
-    std::cout << " Kube32 HTTP Chunked Decoding Adversarial Stress Test     " << std::endl;
+    std::cout << " Kube32 HTTP Chunked Decoding Fuzz Test                   " << std::endl;
     std::cout << "==========================================================" << std::endl;
 
     test_truncated_chunks();

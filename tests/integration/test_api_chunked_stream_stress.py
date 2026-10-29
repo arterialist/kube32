@@ -1,8 +1,7 @@
 #!/usr/bin/env python3
 """
-Live Adversarial Stress Test: HTTP Chunked Stream Malformations & Socket Resilience
+Live stress test: HTTP chunked stream malformations and socket resilience.
 Target: ./build/kube32-sim
-Author: m3_challenger_5
 """
 
 import socket

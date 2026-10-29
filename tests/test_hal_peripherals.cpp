@@ -64,13 +64,13 @@ static const uint8_t s_wasm_hal_probe[] = {
 };
 
 // =============================================================================
-// Challenge 1: Unauthorized Peripheral Access
+// Unauthorized Peripheral Access
 // - Deploy pod granting only GPIO 2
 // - Attempt writing/reading GPIO 4, GPIO 15, and ADC1 channel 3
 // - Assert: strictly returns -EPERM (-1), zero state changes in MockHAL
 // =============================================================================
-void test_challenge1_unauthorized_peripheral_access() {
-    std::cout << "[RUN] Challenge 1: Unauthorized Peripheral Access..." << std::endl;
+void test_unauthorized_peripheral_access() {
+    std::cout << "[RUN] Unauthorized Peripheral Access..." << std::endl;
 
     CapabilityFirewall& fw = CapabilityFirewall::instance();
     MockHal& mock = MockHal::instance();
@@ -122,7 +122,7 @@ void test_challenge1_unauthorized_peripheral_access() {
     // 2. Unauthorized Access: GPIO 4 Write & Read
     int32_t wr4_res = runtime->execute_function(pod_id, "probe_gpio_write", {4, 1});
     assert(wr4_res == HAL_ERR_PERM); // -1 (-EPERM)
-    // EMPIRICAL ASSERTION: Zero state changes in MockHAL!
+    // zero state changes in MockHAL
     assert(mock.get_gpio_write_count(4) == 0);
     assert(mock.gpio_read(4) == 0);
 
@@ -132,7 +132,7 @@ void test_challenge1_unauthorized_peripheral_access() {
     // 3. Unauthorized Access: GPIO 15 Write & Read
     int32_t wr15_res = runtime->execute_function(pod_id, "probe_gpio_write", {15, 1});
     assert(wr15_res == HAL_ERR_PERM); // -1 (-EPERM)
-    // EMPIRICAL ASSERTION: Zero state changes in MockHAL!
+    // zero state changes in MockHAL
     assert(mock.get_gpio_write_count(15) == 0);
     assert(mock.gpio_read(15) == 0);
 
@@ -160,16 +160,16 @@ void test_challenge1_unauthorized_peripheral_access() {
     fw.unregister_pod(pod_id);
     assert(fw.get_allocated_gpio_mask() == 0);
 
-    std::cout << "[PASS] Challenge 1: Unauthorized Peripheral Access strictly denied (-EPERM, 0 state changes)" << std::endl;
+    std::cout << "[PASS] Unauthorized Peripheral Access strictly denied (-EPERM, 0 state changes)" << std::endl;
 }
 
 // =============================================================================
-// Challenge 2: Hardware Safety Mask / Reserved Pins
+// Hardware Safety Mask / Reserved Pins
 // - Submit pod manifests claiming Octal Flash/PSRAM pins (26-32), console UART0 (43, 44), USB (19, 20)
 // - Assert: Registration is rejected immediately with Security Violation
 // =============================================================================
-void test_challenge2_hardware_safety_mask_reserved_pins() {
-    std::cout << "[RUN] Challenge 2: Hardware Safety Mask / Reserved Pins..." << std::endl;
+void test_hardware_safety_mask_reserved_pins() {
+    std::cout << "[RUN] Hardware Safety Mask / Reserved Pins..." << std::endl;
 
     CapabilityFirewall& fw = CapabilityFirewall::instance();
     fw.reset();
@@ -288,16 +288,16 @@ void test_challenge2_hardware_safety_mask_reserved_pins() {
         assert(err.find("Security Violation") != std::string::npos);
     }
 
-    std::cout << "[PASS] Challenge 2: Hardware Safety Mask strictly enforced on all reserved pins (26-32, 43, 44, 19, 20)" << std::endl;
+    std::cout << "[PASS] Hardware Safety Mask strictly enforced on all reserved pins (26-32, 43, 44, 19, 20)" << std::endl;
 }
 
 // =============================================================================
-// Challenge 3: Peripheral Collision Prevention
+// Peripheral Collision Prevention
 // - Pod A claims GPIO 2. Pod B attempts claiming GPIO 2 -> rejected with collision error
 // - Terminate Pod A: verify GPIO 2 released back to pool and Pod B can claim it
 // =============================================================================
-void test_challenge3_peripheral_collision_prevention() {
-    std::cout << "[RUN] Challenge 3: Peripheral Collision Prevention..." << std::endl;
+void test_peripheral_collision_prevention() {
+    std::cout << "[RUN] Peripheral Collision Prevention..." << std::endl;
 
     CapabilityFirewall& fw = CapabilityFirewall::instance();
     fw.reset();
@@ -389,16 +389,16 @@ void test_challenge3_peripheral_collision_prevention() {
     fw.unregister_pod("pod-b");
     assert(fw.get_allocated_gpio_mask() == 0);
 
-    std::cout << "[PASS] Challenge 3: Peripheral Collision Prevention verified with lifecycle re-claim" << std::endl;
+    std::cout << "[PASS] Peripheral Collision Prevention verified with lifecycle re-claim" << std::endl;
 }
 
 // =============================================================================
-// Challenge 4: Linear Memory Buffer Overrun Protection
+// Linear Memory Buffer Overrun Protection
 // - Pass guest buffer offsets and lengths such that offset + len > memory_size
 // - Assert: Host functions trap bad pointer and return -EFAULT (-14)
 // =============================================================================
-void test_challenge4_linear_memory_buffer_overrun_protection() {
-    std::cout << "[RUN] Challenge 4: Linear Memory Buffer Overrun Protection..." << std::endl;
+void test_linear_memory_buffer_overrun_protection() {
+    std::cout << "[RUN] Linear Memory Buffer Overrun Protection..." << std::endl;
 
     CapabilityFirewall& fw = CapabilityFirewall::instance();
     MockHal& mock = MockHal::instance();
@@ -483,11 +483,11 @@ void test_challenge4_linear_memory_buffer_overrun_protection() {
     runtime->terminate(pod_id);
     fw.unregister_pod(pod_id);
 
-    std::cout << "[PASS] Challenge 4: Linear Memory Buffer Overrun strictly trapped with -EFAULT (-14)" << std::endl;
+    std::cout << "[PASS] Linear Memory Buffer Overrun strictly trapped with -EFAULT (-14)" << std::endl;
 }
 
 // =============================================================================
-// Challenge 5: Virtual BMP280 Sensor Emulation
+// Virtual BMP280 Sensor Emulation
 // - Execute I2C transactions to address 0x76:
 //   - read register 0xD0 (assert 0x58)
 //   - write configuration registers
@@ -495,8 +495,8 @@ void test_challenge4_linear_memory_buffer_overrun_protection() {
 //   - verify chip ID read-only protection
 //   - verify non-existent device returns -ENODEV (-19)
 // =============================================================================
-void test_challenge5_virtual_bmp280_sensor_emulation() {
-    std::cout << "[RUN] Challenge 5: Virtual BMP280 Sensor Emulation..." << std::endl;
+void test_virtual_bmp280_sensor_emulation() {
+    std::cout << "[RUN] Virtual BMP280 Sensor Emulation..." << std::endl;
 
     CapabilityFirewall& fw = CapabilityFirewall::instance();
     MockHal& mock = MockHal::instance();
@@ -603,12 +603,12 @@ void test_challenge5_virtual_bmp280_sensor_emulation() {
     runtime->terminate(pod_id);
     fw.unregister_pod(pod_id);
 
-    std::cout << "[PASS] Challenge 5: Virtual BMP280 Sensor Emulation verified (ID 0x58, config, data, read-only 0xD0)" << std::endl;
+    std::cout << "[PASS] Virtual BMP280 Sensor Emulation verified (ID 0x58, config, data, read-only 0xD0)" << std::endl;
 }
 
 // =============================================================================
 // Concurrency Stress Test
-// - Stress-test lockless gatekeeper and collision registry under 8 concurrent threads
+// - Stress-test lockless admission check and collision registry under 8 concurrent threads
 // =============================================================================
 void test_firewall_concurrency_stress() {
     std::cout << "[RUN] Concurrency Stress Test: 8 threads x 1000 operations..." << std::endl;
@@ -666,12 +666,12 @@ void test_firewall_concurrency_stress() {
 }
 
 // =============================================================================
-// Challenge 6: Generic Pin Cleanup on Allocation Failure
+// Generic Pin Cleanup on Allocation Failure
 // - Request 3 generic GPIOs and 5 generic I2C buses (ESP32-S3 only has 2 buses)
 // - Assert: Registration fails, and exactly 0 GPIO/I2C pins leak in the firewall
 // =============================================================================
-void test_challenge6_generic_pin_cleanup_on_allocation_failure() {
-    std::cout << "[RUN] Challenge 6: Generic Pin Cleanup on Allocation Failure..." << std::endl;
+void test_generic_pin_cleanup_on_allocation_failure() {
+    std::cout << "[RUN] Generic Pin Cleanup on Allocation Failure..." << std::endl;
 
     CapabilityFirewall& fw = CapabilityFirewall::instance();
     fw.reset();
@@ -699,7 +699,7 @@ void test_challenge6_generic_pin_cleanup_on_allocation_failure() {
     assert(!ok);
     assert(err.find("Insufficient allocatable I2C buses") != std::string::npos);
 
-    // CRITICAL EMPIRICAL ASSERTION: 0 pins leaked!
+    // CRITICAL 0 pins leaked
     assert(fw.get_allocated_gpio_mask() == 0);
     assert(fw.get_allocated_i2c_mask() == 0);
 
@@ -724,25 +724,25 @@ void test_challenge6_generic_pin_cleanup_on_allocation_failure() {
     fw.unregister_pod("valid-pod");
     assert(fw.get_allocated_gpio_mask() == 0);
 
-    std::cout << "[PASS] Challenge 6: Generic Pin Cleanup on Allocation Failure completely rolled back (0 leaked pins)" << std::endl;
+    std::cout << "[PASS] Generic Pin Cleanup on Allocation Failure completely rolled back (0 leaked pins)" << std::endl;
 }
 
 int main() {
     std::cout << "==========================================================" << std::endl;
     std::cout << " Kube32 HAL Capability Firewall & Peripheral Collision    " << std::endl;
-    std::cout << " Empirical Adversarial Challenge Suite (Milestone 3)      " << std::endl;
+    std::cout << " Wasm Peripheral Access Tests                           " << std::endl;
     std::cout << "==========================================================" << std::endl;
 
-    test_challenge1_unauthorized_peripheral_access();
-    test_challenge2_hardware_safety_mask_reserved_pins();
-    test_challenge3_peripheral_collision_prevention();
-    test_challenge4_linear_memory_buffer_overrun_protection();
-    test_challenge5_virtual_bmp280_sensor_emulation();
-    test_challenge6_generic_pin_cleanup_on_allocation_failure();
+    test_unauthorized_peripheral_access();
+    test_hardware_safety_mask_reserved_pins();
+    test_peripheral_collision_prevention();
+    test_linear_memory_buffer_overrun_protection();
+    test_virtual_bmp280_sensor_emulation();
+    test_generic_pin_cleanup_on_allocation_failure();
     test_firewall_concurrency_stress();
 
     std::cout << "==========================================================" << std::endl;
-    std::cout << " ALL 6 EMPIRICAL ADVERSARIAL CHALLENGES PASSED (100%)     " << std::endl;
+    std::cout << " ALL HAL PERIPHERAL TESTS PASSED                        " << std::endl;
     std::cout << "==========================================================" << std::endl;
 
     return 0;
