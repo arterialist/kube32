@@ -73,10 +73,13 @@ void* sub_alloc_locked(size_t bytes) {
         s_sub_allocs = 0;
     }
     const size_t need = align8(bytes) + sizeof(SubChunk);
-    // The highest free chunk that fits, allocated from its top
+    // The smallest free chunk that fits (the highest of equal ones),
+    // allocated from its top: large holes stay whole for large allocations,
+    // so a pod that replaces another fits where that one was, and the bottom
+    // of the block stays free for a large linear memory
     SubChunk* fit = nullptr;
     for (SubChunk* c = sub_first(); reinterpret_cast<uint8_t*>(c) < sub_end(); c = sub_next(c)) {
-        if (!c->used && c->size >= need) fit = c;
+        if (!c->used && c->size >= need && (!fit || c->size <= fit->size)) fit = c;
     }
     if (!fit) return nullptr;
     SubChunk* out = fit;

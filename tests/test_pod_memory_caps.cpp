@@ -205,6 +205,26 @@ int main() {
         assert(kube32_pool_available(nullptr) == block);
         void* again = kube32_pool_alloc(65 * 1024);
         assert(again && kube32_pool_free(again) == 1);
+
+        // A pod replaced between two others: its successor's small
+        // allocations take the small hole, so its large one still fits where
+        // the old pod was (a first-fit from the top split that hole)
+        void* top = kube32_pool_sub_alloc(40000);
+        void* old_pod[5] = {kube32_pool_sub_alloc(6000), kube32_pool_sub_alloc(1000), kube32_pool_sub_alloc(1000),
+                            kube32_pool_sub_alloc(1000), kube32_pool_sub_alloc(1000)};
+        void* neighbour = kube32_pool_sub_alloc(3000);
+        void* filler = kube32_pool_sub_alloc(block - 40008 - 10040 - 3008 - 5600 - 8);   // 5600 bytes stay free below
+        assert(top && neighbour && filler);
+        for (void* p : old_pod) { assert(p); kube32_rt_free(p); }
+        void* new_pod[6];
+        for (int i = 0; i < 5; ++i) new_pod[i] = kube32_pool_sub_alloc(1000);
+        new_pod[5] = kube32_pool_sub_alloc(6000);
+        for (void* p : new_pod) { assert(p); kube32_rt_free(p); }
+        kube32_rt_free(top);
+        kube32_rt_free(neighbour);
+        kube32_rt_free(filler);
+        assert(kube32_pool_available(nullptr) == block);
+        std::cout << "[pool] a replaced pod's large allocation fits where the old pod was" << std::endl;
     }
 
     // A module exhausting its operand stack traps with a message naming it
