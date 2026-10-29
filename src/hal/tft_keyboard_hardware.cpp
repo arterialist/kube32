@@ -25,6 +25,7 @@ namespace kube32::hal {
 static esp_lcd_panel_io_handle_t s_io_handle = nullptr;
 static esp_lcd_panel_handle_t s_panel_handle = nullptr;
 static SemaphoreHandle_t s_lcd_mutex = nullptr;
+static SemaphoreHandle_t s_lcd_flushed = nullptr;   // given when a line buffer transfer ends
 static i2s_chan_handle_t s_tx_chan = nullptr;
 static bool s_display_ok = false;
 
@@ -70,10 +71,24 @@ struct LcdLock {
     ~LcdLock() { if (s_lcd_mutex) xSemaphoreGive(s_lcd_mutex); }
 };
 
-// Pushes the line buffer rows [0, rows) to panel rows [y, y+rows) at columns [x, x+w)
+static bool IRAM_ATTR on_flushed(esp_lcd_panel_io_handle_t, esp_lcd_panel_io_event_data_t*, void*) {
+    BaseType_t woken = pdFALSE;
+    xSemaphoreGiveFromISR(s_lcd_flushed, &woken);
+    return woken == pdTRUE;
+}
+
+// Pushes the line buffer rows [0, rows) to panel rows [y, y+rows) at columns
+// [x, x+w) and waits until the transfer has read the buffer, so the next
+// draw can reuse it. Callers run pods (a HUD draws from its tick): a transfer
+// that does not end turns the display off instead of blocking them, and the
+// next draw would wait for the SPI bus forever.
 static void flush_rows(int x, int y, int w, int rows) {
-    if (!s_panel_handle || rows <= 0 || w <= 0) return;
-    esp_lcd_panel_draw_bitmap(s_panel_handle, x, y, x + w, y + rows, s_linebuf);
+    if (!s_panel_handle || !s_display_ok || rows <= 0 || w <= 0) return;
+    if (esp_lcd_panel_draw_bitmap(s_panel_handle, x, y, x + w, y + rows, s_linebuf) != ESP_OK) return;
+    if (xSemaphoreTake(s_lcd_flushed, pdMS_TO_TICKS(200)) != pdTRUE) {
+        s_display_ok = false;
+        ESP_LOGE(TAG, "LCD transfer did not end within 200 ms: display off");
+    }
 }
 
 bool init_display_and_backlight() {
@@ -83,6 +98,7 @@ bool init_display_and_backlight() {
     gpio_set_level((gpio_num_t)PIN_LCD_BACKLIGHT, 1);
 
     if (!s_lcd_mutex) s_lcd_mutex = xSemaphoreCreateMutex();
+    if (!s_lcd_flushed) s_lcd_flushed = xSemaphoreCreateBinary();
     if (!s_linebuf) {
         s_linebuf = static_cast<uint16_t*>(heap_caps_malloc(LCD_WIDTH * LINEBUF_ROWS * sizeof(uint16_t), MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL));
         if (!s_linebuf) {
@@ -110,6 +126,7 @@ bool init_display_and_backlight() {
     io_config.spi_mode = 0;
     io_config.pclk_hz = 40 * 1000 * 1000;
     io_config.trans_queue_depth = 4;
+    io_config.on_color_trans_done = on_flushed;
     io_config.lcd_cmd_bits = 8;
     io_config.lcd_param_bits = 8;
     ret = esp_lcd_new_panel_io_spi((esp_lcd_spi_bus_handle_t)SPI2_HOST, &io_config, &s_io_handle);
