@@ -435,6 +435,8 @@ void Kubelet::sync_assigned_pods() {
 
     osal::LockGuard guard(state_mutex_);
 
+    repack_pool(now_ms);
+
     // 0. Graceful deletions: stop the container, flush its log, then finalize
     for (const auto& tp : terminating) {
         std::string key = tp.first + "/" + tp.second;
@@ -505,12 +507,59 @@ void Kubelet::start_pod_guarded(const models::KubePod& pod, const std::string& m
     }
 }
 
+// A pod whose module failed to load twice for memory, on a node without
+// PSRAM, where pods share one pool block: the pods already loaded hold
+// pieces of it, and a module only fits whole into a block they leave in one
+// piece. Pods with a smaller memory limit than the waiting one are stopped,
+// once for that pod, so it loads first; they start again after it. A bigger
+// pod is never stopped for a smaller one.
+void Kubelet::repack_pool(uint64_t now_ms) {
+    if (osal::System::get_total_psram_bytes() > 0) return;
+    for (auto& kv : active_pods_) {
+        LocalPodRecord& waiting = kv.second;
+        if (waiting.execution_phase != PodExecutionPhase::InsufficientMemory || waiting.load_failures < 2 || waiting.repacked) continue;
+        waiting.repacked = true;
+        std::vector<std::string> smaller;
+        for (const auto& other : active_pods_) {
+            if (other.first != kv.first && other.second.execution_phase == PodExecutionPhase::Running &&
+                other.second.memory_limit_bytes < waiting.memory_limit_bytes) {
+                smaller.push_back(other.first);
+            }
+        }
+        if (smaller.empty()) continue;
+        std::cout << "[KUBELET] " << kv.first << ": its module does not fit beside the pods loaded before it; stopping "
+                  << smaller.size() << " smaller pod(s) so it loads first" << std::endl;
+        for (const auto& key : smaller) {
+            LocalPodRecord& rec = active_pods_[key];
+            runtime_.terminate(key);
+            hal::CapabilityFirewall::instance().unregister_pod(key);
+            rec.restart_due = true;
+            wait_for_memory(key, rec, "stopped so that " + kv.first + " loads first", nullptr);
+            // Back once the waiting pod had its turn
+            rec.next_restart_allowed_ms = now_ms + config_.memory_retry_ms * 4;
+        }
+        waiting.next_restart_allowed_ms = now_ms;
+        return;   // one pod per pass
+    }
+}
+
 bool Kubelet::wait_for_memory(const std::string& pod_key, LocalPodRecord& rec, const std::string& why, const LocalPodRecord* previous) {
     rec.execution_phase = PodExecutionPhase::InsufficientMemory;
     rec.last_error_message = why;
     rec.next_restart_allowed_ms = osal::System::get_uptime_ms() + config_.memory_retry_ms;
+    if (previous && previous->execution_phase == PodExecutionPhase::InsufficientMemory) {
+        // Still no room: the status already says so; the log repeats why once a minute
+        const uint64_t now = osal::System::get_uptime_ms();
+        rec.last_wait_log_ms = previous->last_wait_log_ms;
+        if (now - rec.last_wait_log_ms >= 60000) {
+            rec.last_wait_log_ms = now;
+            std::cout << "[KUBELET] " << pod_key << ": still waiting: " << why << std::endl;
+        }
+        active_pods_[pod_key] = rec;
+        return false;
+    }
+    rec.last_wait_log_ms = osal::System::get_uptime_ms();
     active_pods_[pod_key] = rec;
-    if (previous && previous->execution_phase == PodExecutionPhase::InsufficientMemory) return false;
     std::cout << "[KUBELET] " << pod_key << ": " << why << "; waiting" << std::endl;
     const std::string message = why + "; retrying every " + std::to_string(config_.memory_retry_ms / 1000) + " s";
     std::string status_patch = "{\"status\":{\"phase\":\"Pending\","
@@ -882,7 +931,10 @@ bool Kubelet::deploy_and_start_pod(const models::KubePod& pod_in, const std::str
         if (previous) {
             rec.restart_count = previous->restart_count;
             rec.restart_due = previous->restart_due || restarting;
+            rec.repacked = previous->repacked;
         }
+        const uint8_t failures = previous ? previous->load_failures : 0;
+        rec.load_failures = failures < 255 ? failures + 1 : failures;
         return wait_for_memory(pod_key, rec, "not enough memory to load the module: " + deploy_err, previous);
     }
     if (!deployed) {

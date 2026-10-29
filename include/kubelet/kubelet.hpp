@@ -52,6 +52,11 @@ struct LocalPodRecord {
     // What admission estimated the container needs, when it waits for memory:
     // a retry is only attempted once that much room exists
     uint32_t memory_need_bytes{0};
+    uint64_t last_wait_log_ms{0};            // when a retry that still had no room was last logged
+    // Module loads that failed for memory in a row, and whether smaller pods
+    // were already stopped once to let this one load (repack_pool)
+    uint8_t load_failures{0};
+    bool repacked{false};
     uint64_t requested_gpio_mask{0};
     uint32_t listed_pass{0};                 // the last pod sync pass whose list held this pod
     // Log shipping and metrics rate state
@@ -163,6 +168,7 @@ private:
     // reason in its container status and is admitted again after
     // memory_retry_ms. Status and Event go out when it starts waiting.
     bool wait_for_memory(const std::string& pod_key, LocalPodRecord& rec, const std::string& why, const LocalPodRecord* previous);
+    void repack_pool(uint64_t now_ms);
     void ship_pod_logs_locked(const std::string& pod_key, LocalPodRecord& rec);
 
     KubeletConfig config_;

@@ -40,6 +40,8 @@ The firmware reserves contiguous pod memory at boot before Wi-Fi initializes:
 
 Without PSRAM, network buffers come from internal RAM. The Wi-Fi station uses a 576-byte MTU, ~650 bytes per frame, with 12 dynamic RX and 12 dynamic TX buffers. Each socket holds up to 4 unread and 2 out-of-order segments. The pod HTTP server queues one connection, keeps two idle, and returns 503 when free internal heap is under 10 KB.
 
+A pod's module loads only into pieces of the pool block left free by earlier pods. When a module fails to load twice for memory, the kubelet stops pods with a smaller memory limit once so the module loads first, then restarts them; a pod never stops for a smaller one.
+
 Check free internal RAM and PSRAM on the serial console with `K32_CMD:STATUS`.
 
 ## Partition table
