@@ -50,7 +50,7 @@ public:
     std::string last_pod_status_patch;
     std::vector<std::pair<std::string, std::string>> pod_status_history; // (pod, patch)
 
-    bool register_node(const std::string& node_json, bool& out_conflict) override {
+    bool register_node(std::string_view node_json, bool& out_conflict) override {
         register_count++;
         registered = true;
         last_node_registration_json = node_json;

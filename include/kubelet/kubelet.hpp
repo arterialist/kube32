@@ -185,6 +185,10 @@ private:
     uint64_t last_sync_ms_{0};
     uint64_t last_status_report_ms_{0};
     uint32_t heartbeat_failures_{0};
+    // The Node object is written here, allocated at start while the heap is
+    // whole: re-registering must work when the heap is fragmented
+    static constexpr size_t kRegistrationBufBytes = 2048;
+    std::unique_ptr<char[]> registration_buf_;
     std::atomic<uint64_t> last_sync_ok_ms_{0};     // end of the last pod sync pass that listed pods
     std::atomic<bool> heartbeat_due_{false};       // send the next heartbeat without waiting
 

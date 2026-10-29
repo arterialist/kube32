@@ -28,7 +28,7 @@ class KubeApiClient {
 public:
     virtual ~KubeApiClient() = default;
 
-    virtual bool register_node(const std::string& node_json, bool& out_conflict) = 0;
+    virtual bool register_node(std::string_view node_json, bool& out_conflict) = 0;
     virtual bool patch_node_status(const std::string& node_name, std::string_view patch_json) = 0;
     virtual bool renew_node_lease(const std::string& /*node_name*/, uint32_t /*duration_sec*/, std::string_view /*renew_time_iso8601*/) { return true; }
     virtual bool list_pods(std::vector<models::KubePod>& out_pods) = 0;
@@ -69,7 +69,7 @@ public:
     HttpKubeClient(std::string host, uint16_t port);
     ~HttpKubeClient() override = default;
 
-    bool register_node(const std::string& node_json, bool& out_conflict) override;
+    bool register_node(std::string_view node_json, bool& out_conflict) override;
     bool patch_node_status(const std::string& node_name, std::string_view patch_json) override;
     bool renew_node_lease(const std::string& node_name, uint32_t duration_sec, std::string_view renew_time_iso8601) override;
     bool list_pods(std::vector<models::KubePod>& out_pods) override;

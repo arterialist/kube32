@@ -22,7 +22,7 @@ public:
     std::string last_pod_status_patch;
     int register_count{0};
 
-    bool register_node(const std::string& node_json, bool& out_conflict) override {
+    bool register_node(std::string_view node_json, bool& out_conflict) override {
         (void)node_json;
         register_count++;
         registered = true;

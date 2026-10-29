@@ -1,5 +1,6 @@
 #include "kubelet/kube_api_client.hpp"
 #include "osal/socket.hpp"
+#include "osal/system.hpp"
 #include "models/kube_models.hpp"
 
 #include <algorithm>
@@ -315,7 +316,7 @@ int HttpKubeClient::exchange(const char* method, std::string_view path, std::str
     });
 }
 
-bool HttpKubeClient::register_node(const std::string& node_json, bool& out_conflict) {
+bool HttpKubeClient::register_node(std::string_view node_json, bool& out_conflict) {
     out_conflict = false;
     const int status = exchange("POST", "/api/v1/nodes", node_json);
     if (status == 201) {
@@ -324,6 +325,13 @@ bool HttpKubeClient::register_node(const std::string& node_json, bool& out_confl
     if (status == 409) {
         out_conflict = true;
         return true;
+    }
+    // The kubelet retries every loop: one line per 10 s
+    static uint64_t last_log_ms = 0;
+    const uint64_t now = osal::System::get_uptime_ms();
+    if (last_log_ms == 0 || now - last_log_ms >= 10000) {
+        last_log_ms = now;
+        std::cout << "[KUBELET] node registration failed: http " << status << std::endl;
     }
     return false;
 }

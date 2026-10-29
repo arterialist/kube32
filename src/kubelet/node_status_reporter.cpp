@@ -162,31 +162,64 @@ static void append_ready_condition(Out& json, const NodeTelemetry& t) {
     json += "\"}";
 }
 
-std::string NodeStatusReporter::build_registration_json(const NodeTelemetry& telemetry) const {
-    std::string json;
-    json.reserve(1024);
-
+template <typename Out>
+void NodeStatusReporter::append_registration(Out& json, const NodeTelemetry& telemetry) const {
     json += "{\"kind\":\"Node\",\"apiVersion\":\"v1\",";
-    json += "\"metadata\":{\"name\":\"" + node_name_ + "\",\"labels\":{";
-    json += "\"kubernetes.io/hostname\":\"" + node_name_ + "\",";
-    json += "\"kubernetes.io/arch\":\"" + std::string(api::build_info().arch) + "\",";
-    for (const auto& kv : labels_) json += "\"" + kv.first + "\":\"" + kv.second + "\",";
+    json += "\"metadata\":{\"name\":\"";
+    json += node_name_;
+    json += "\",\"labels\":{\"kubernetes.io/hostname\":\"";
+    json += node_name_;
+    json += "\",\"kubernetes.io/arch\":\"";
+    json += api::build_info().arch;
+    json += "\",";
+    for (const auto& kv : labels_) {
+        json += "\"";
+        json += kv.first;
+        json += "\":\"";
+        json += kv.second;
+        json += "\",";
+    }
     json += control_plane_ ? "\"node-role.kubernetes.io/control-plane\":\"\"}}," : "\"node-role.kubernetes.io/worker\":\"\"}},";
     json += "\"spec\":{\"unschedulable\":false},";
     json += "\"status\":{";
     json += "\"conditions\":[";
     append_ready_condition(json, telemetry);
     json += "],";
-    json += "\"addresses\":[{\"type\":\"InternalIP\",\"address\":\"" + node_ip_ + "\"}],";
-    if (kubelet_port_) json += "\"daemonEndpoints\":{\"kubeletEndpoint\":{\"Port\":" + std::to_string(kubelet_port_) + "}},";
-    json += "\"nodeInfo\":{\"kubeletVersion\":\"" + std::string(api::KUBE32_GIT_VERSION) + "\",\"osImage\":\"" + osal::System::get_os_image() + "\",";
-    json += "\"kernelVersion\":\"" + osal::System::get_kernel_version() + "\",\"containerRuntimeVersion\":\"wasm3://" + std::string(M3_VERSION) + "\"},";
+    json += "\"addresses\":[{\"type\":\"InternalIP\",\"address\":\"";
+    json += node_ip_;
+    json += "\"}],";
+    if (kubelet_port_) {
+        json += "\"daemonEndpoints\":{\"kubeletEndpoint\":{\"Port\":";
+        append_uint(json, kubelet_port_);
+        json += "}},";
+    }
+    json += "\"nodeInfo\":{\"kubeletVersion\":\"";
+    json += api::KUBE32_GIT_VERSION;
+    json += "\",\"osImage\":\"";
+    json += osal::System::get_os_image();
+    json += "\",\"kernelVersion\":\"";
+    json += osal::System::get_kernel_version();
+    json += "\",\"containerRuntimeVersion\":\"wasm3://";
+    json += M3_VERSION;
+    json += "\"},";
     json += "\"capacity\":{";
     append_resources(json, telemetry, true);
     json += "},\"allocatable\":{";
     append_resources(json, telemetry, false);
     json += "}}}";
+}
+
+std::string NodeStatusReporter::build_registration_json(const NodeTelemetry& telemetry) const {
+    std::string json;
+    json.reserve(1024);
+    append_registration(json, telemetry);
     return json;
+}
+
+bool NodeStatusReporter::write_registration_json(mem::FixedText& out, const NodeTelemetry& telemetry) const {
+    out.clear();
+    append_registration(out, telemetry);
+    return !out.overflowed();
 }
 
 template <typename Out>

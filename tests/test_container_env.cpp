@@ -237,7 +237,7 @@ public:
     std::vector<std::pair<models::KubePod, std::string>> pods;
     std::string last_patch;
     std::vector<std::string> events;
-    bool register_node(const std::string&, bool& c) override { c = false; return true; }
+    bool register_node(std::string_view, bool& c) override { c = false; return true; }
     bool patch_node_status(const std::string&, std::string_view) override { return true; }
     bool list_pods(std::vector<models::KubePod>& out) override { for (auto& p : pods) out.push_back(p.first); return true; }
     bool list_pods_raw(std::vector<std::pair<models::KubePod, std::string>>& out) override { out = pods; return true; }

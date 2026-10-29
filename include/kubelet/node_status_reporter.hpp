@@ -51,9 +51,11 @@ public:
     // JSON builders
     std::string build_registration_json(const NodeTelemetry& telemetry) const;
     std::string build_heartbeat_patch_json(const NodeTelemetry& telemetry, bool memory_pressure) const;
-    // The heartbeat patch written into `out` (cleared first), storage the
-    // caller owns: nothing is taken from the heap. False when it did not fit.
+    // The heartbeat patch or the Node object written into `out` (cleared
+    // first), storage the caller owns: nothing is taken from the heap.
+    // False when it did not fit.
     bool write_heartbeat_patch_json(mem::FixedText& out, const NodeTelemetry& telemetry, bool memory_pressure) const;
+    bool write_registration_json(mem::FixedText& out, const NodeTelemetry& telemetry) const;
 
     // Extra labels for the Node object (board profile and the like).
     void set_labels(const std::map<std::string, std::string>& labels) { labels_ = labels; }
@@ -65,6 +67,9 @@ public:
     void set_node_ip(const std::string& ip) { node_ip_ = ip; }
 
 private:
+    template <typename Out>
+    void append_registration(Out& json, const NodeTelemetry& telemetry) const;
+
     std::string node_name_;
     std::string node_ip_;
     bool control_plane_{false};

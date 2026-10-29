@@ -1,6 +1,7 @@
 #include "kubelet/kubelet.hpp"
 #include "kubelet/pod_env.hpp"
 #include <cstdlib>
+#include <new>
 #include "hal/capability_firewall.hpp"
 #include "hal/sd_card.hpp"
 #include "hal/node_storage.hpp"
@@ -168,6 +169,7 @@ bool Kubelet::start() {
     if (running_.load()) return true;
 
     running_.store(true);
+    if (!registration_buf_) registration_buf_.reset(new (std::nothrow) char[kRegistrationBufBytes]);
     osal::Thread::Config t_cfg;
     t_cfg.name = "k32_kubelet";
     t_cfg.stack_size = config_.task_stack_size;
@@ -267,7 +269,15 @@ void Kubelet::reconcile_node_registration() {
 
     NodeTelemetry t = status_reporter_->collect_telemetry();
     fill_ready_condition(t);
-    std::string reg_json = status_reporter_->build_registration_json(t);
+    std::string reg_heap;
+    std::string_view reg_json;
+    mem::FixedText reg(registration_buf_.get(), registration_buf_ ? kRegistrationBufBytes : 0);
+    if (registration_buf_ && status_reporter_->write_registration_json(reg, t)) {
+        reg_json = reg.view();
+    } else {
+        reg_heap = status_reporter_->build_registration_json(t);
+        reg_json = reg_heap;
+    }
 
     bool conflict = false;
     bool ok = api_client_->register_node(reg_json, conflict);
