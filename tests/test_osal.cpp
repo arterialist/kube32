@@ -127,15 +127,22 @@ void test_timer_oneshot_and_periodic() {
     cfg.arg = &callbacks;
 
     timer.init(cfg);
+    // Shared CI runners can delay a timer by tens of milliseconds: wait for
+    // the expected count with a deadline instead of a fixed sleep
+    auto wait_for_count = [&callbacks](int want, uint32_t limit_ms) {
+        for (uint32_t waited = 0; callbacks.load() < want && waited < limit_ms; waited += 5) Thread::sleep_ms(5);
+    };
+
     timer.start(25, false); // 25ms one-shot
-    Thread::sleep_ms(70);
+    wait_for_count(1, 2000);
+    Thread::sleep_ms(100);  // a one-shot timer must not fire again
     timer.stop();
     assert(callbacks.load() == 1);
 
     // Periodic
     callbacks.store(0);
     timer.start(20, true); // 20ms periodic
-    Thread::sleep_ms(75);
+    wait_for_count(2, 2000);
     timer.stop();
     assert(callbacks.load() >= 2);
     std::cout << "[PASS] test_timer_oneshot_and_periodic" << std::endl;
