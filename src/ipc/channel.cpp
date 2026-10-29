@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <cstdio>
 #include <iostream>
+#include <new>
 
 #if defined(KUBE32_TARGET_ESP32)
 #include "esp_now.h"
@@ -571,38 +572,44 @@ void ChannelManager::enqueue_raw_frame(const uint8_t* src_mac, const uint8_t* fr
 void ChannelManager::dispatch_loop() {
     uint8_t buf[264];
     while (background_running_.load()) {
-        uint32_t sender = 0;
-        uint64_t now = osal::System::get_uptime_ms();
-        if (hello_interval_ms_ > 0 && now - last_hello_ms_ >= hello_interval_ms_) {
-            last_hello_ms_ = now;
-            send_hello();
-        }
-        // Raw frames from the ESP-NOW callback
-        if (rx_ring_) {
-            int32_t rn;
-            while ((rn = rx_ring_->pop(buf, sizeof(buf), 0, &sender)) > 6) {
-                NodeEndpoint src;
-                src.is_espnow = true;
-                std::memcpy(src.mac_address, buf, 6);
-                on_frame_received(buf + 6, static_cast<size_t>(rn - 6), &src);
+        // Out of memory a frame or a hello is dropped; the dispatcher (and
+        // with it every channel subscription on this node) keeps running
+        try {
+            uint32_t sender = 0;
+            uint64_t now = osal::System::get_uptime_ms();
+            if (hello_interval_ms_ > 0 && now - last_hello_ms_ >= hello_interval_ms_) {
+                last_hello_ms_ = now;
+                send_hello();
             }
-        }
-        int32_t n = dispatch_ring_ ? dispatch_ring_->pop(buf, sizeof(buf), 20, &sender) : IPC_ERR_TIMEDOUT;
-        if (n < 4) {
+            // Raw frames from the ESP-NOW callback
+            if (rx_ring_) {
+                int32_t rn;
+                while ((rn = rx_ring_->pop(buf, sizeof(buf), 0, &sender)) > 6) {
+                    NodeEndpoint src;
+                    src.is_espnow = true;
+                    std::memcpy(src.mac_address, buf, 6);
+                    on_frame_received(buf + 6, static_cast<size_t>(rn - 6), &src);
+                }
+            }
+            int32_t n = dispatch_ring_ ? dispatch_ring_->pop(buf, sizeof(buf), 20, &sender) : IPC_ERR_TIMEDOUT;
+            if (n < 4) {
+                osal::System::feed_watchdog();
+                continue;
+            }
+            uint32_t hash = 0;
+            std::memcpy(&hash, buf, 4);
+            std::vector<Subscription> matched;
+            {
+                osal::LockGuard guard(sub_mutex_);
+                for (const auto& sub : subs_) if (sub.topic_hash == hash) matched.push_back(sub);
+            }
+            for (const auto& sub : matched) {
+                if (sub.cb) sub.cb(sub.topic, sender, buf + 4, static_cast<size_t>(n - 4));
+            }
             osal::System::feed_watchdog();
-            continue;
+        } catch (const std::bad_alloc&) {
+            osal::System::feed_watchdog();
         }
-        uint32_t hash = 0;
-        std::memcpy(&hash, buf, 4);
-        std::vector<Subscription> matched;
-        {
-            osal::LockGuard guard(sub_mutex_);
-            for (const auto& sub : subs_) if (sub.topic_hash == hash) matched.push_back(sub);
-        }
-        for (const auto& sub : matched) {
-            if (sub.cb) sub.cb(sub.topic, sender, buf + 4, static_cast<size_t>(n - 4));
-        }
-        osal::System::feed_watchdog();
     }
 }
 
