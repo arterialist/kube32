@@ -392,6 +392,8 @@ else()
     )
     target_link_libraries(test_lease_controller PRIVATE kube32_core)
     add_test(NAME test_lease_controller COMMAND test_lease_controller)
+    # macOS libc fills freed blocks, so reads through stale JSON pointers fail
+    set_tests_properties(test_lease_controller PROPERTIES ENVIRONMENT "MallocScribble=1")
 
     # 20. mDNS service discovery
     add_executable(test_mdns_discovery

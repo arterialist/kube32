@@ -1477,6 +1477,10 @@ HttpResponse RouteHandler::handle_pods(const HttpRequest& req, const RouteMatch&
                 return make_status(409, "AlreadyExists", "pods \"" + pod_name + "\" already exists", pod_name, "pods");
             }
 
+            // Read before stamping: adding top-level fields can move doc's
+            // members and leave meta, spec and containers dangling
+            const std::string explicit_node = spec->get_string("nodeName", "");
+
             // Namespace, uid and creationTimestamp are the API server's to set
             ResourceInfo pinfo;
             resource_info(RouteCategory::PodsNsCollection, pinfo);
@@ -1492,7 +1496,6 @@ HttpResponse RouteHandler::handle_pods(const HttpRequest& req, const RouteMatch&
 
             // Run autonomous scheduler if pod does not already have an assigned node
             if (scheduler_ && !dry_run()) {
-                std::string explicit_node = spec ? spec->get_string("nodeName", "") : "";
                 if (explicit_node.empty() || explicit_node == "<none>") {
                     scheduler_->schedule_pod_manifest(pod_json);
                 }

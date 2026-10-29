@@ -557,6 +557,41 @@ void test_job_controller() {
     std::cout << "[PASS] test_job_controller" << std::endl;
 }
 
+// A kubectl manifest has exactly four top-level keys, so adding "status"
+// on create grows doc's member vector. Fields read after that must not come
+// through pointers taken before it (run under ASan to catch a regression).
+void test_pod_create_four_key_manifest() {
+    std::cout << "[RUN] test_pod_create_four_key_manifest" << std::endl;
+    StoreOptions opts;
+    opts.enable_flash_persistence = false;
+    auto store = create_radix_store(opts);
+    store->put("/registry/nodes/node-a", ready_node_json("node-a", "cardputer"), true);
+    store->put("/registry/nodes/node-b", ready_node_json("node-b", "devkit"), true);
+    auto sched = kube32::scheduler::create_scheduler(*store);
+    RouteHandler api(*store, sched.get());
+
+    auto pod = [](const std::string& name, const std::string& node_name) {
+        return "{\"apiVersion\":\"v1\",\"kind\":\"Pod\",\"metadata\":{\"name\":\"" + name + "\",\"labels\":{\"app\":\"x\"}},"
+               "\"spec\":{" + (node_name.empty() ? std::string() : "\"nodeName\":\"" + node_name + "\",") +
+               "\"nodeSelector\":{\"board\":\"cardputer\"},\"containers\":[{\"name\":\"c\",\"image\":\"wasm://embedded/echo:v1\","
+               "\"resources\":{\"requests\":{\"memory\":\"4Ki\"}}}]}}";
+    };
+    HttpResponse scheduled = api_call(api, HttpMethod::Post, "/api/v1/namespaces/default/pods", pod("sched", ""));
+    assert(scheduled.status_code == 201);
+    HttpResponse pinned = api_call(api, HttpMethod::Post, "/api/v1/namespaces/default/pods", pod("pinned", "node-b"));
+    assert(pinned.status_code == 201);
+
+    std::string json;
+    JsonValue doc;
+    std::string err;
+    assert(store->get("/registry/pods/default/sched", json).ok() && parse_json(json, doc, err));
+    assert(doc.get("spec")->get_string("nodeName", "") == "node-a");
+    assert(doc.get("status")->get_string("phase", "") == "Pending");
+    assert(store->get("/registry/pods/default/pinned", json).ok() && parse_json(json, doc, err));
+    assert(doc.get("spec")->get_string("nodeName", "") == "node-b");   // an explicit binding is kept
+    std::cout << "[PASS] test_pod_create_four_key_manifest" << std::endl;
+}
+
 int main() {
     std::cout << "========================================" << std::endl;
     std::cout << " Running Node Lease & Controller Tests  " << std::endl;
@@ -570,6 +605,7 @@ int main() {
     test_daemonset_controller();
     test_daemonset_rolling_update();
     test_job_controller();
+    test_pod_create_four_key_manifest();
 
     std::cout << "All Node Lease & Controller tests passed successfully!" << std::endl;
     return 0;
