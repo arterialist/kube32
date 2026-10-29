@@ -49,8 +49,10 @@ public:
             // driver must never find the heap empty, or it stops sending.
             // A socket with unread data holds up to 7 RX buffers (receive
             // mailbox 4, one refused segment, 2 out of order): 12 leave the
-            // rest of the node able to receive.
-            cfg.dynamic_tx_buf_num = 4;
+            // rest of the node able to receive. A TCP send buffer of 5760
+            // bytes is 11 segments of 536: fewer TX buffers make a burst
+            // overflow, and the connection waits 250 ms to send again.
+            cfg.dynamic_tx_buf_num = 12;
             cfg.dynamic_rx_buf_num = 12;
         }
         if (esp_wifi_init(&cfg) != ESP_OK) {
