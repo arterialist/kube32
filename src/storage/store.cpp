@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <cctype>
 #include <chrono>
+#include <condition_variable>
 #include <cstdio>
 #include <map>
 
@@ -184,6 +185,7 @@ public:
     }
 
     Status recover() override {
+        std::lock_guard<std::mutex> serial(flush_mutex_);
         std::lock_guard<std::recursive_mutex> lock(rw_mutex_);
         tree_.clear();
 
@@ -200,6 +202,7 @@ public:
                     tree_.remove(key);
                 }
             }, max_rev);
+            journal_unreadable_ = !ok;
             if (!ok) return Status::InternalError("flash journal could not be read");
             durable_bytes_ = 0;
             tree_.iterate_all([this](const std::string& key, const std::string& value, uint64_t, bool) {
@@ -208,6 +211,8 @@ public:
             });
             current_version_ = max_rev + 1;
             revision_reserved_ = max_rev;
+            std::lock_guard<std::mutex> commit_lock(commit_mutex_);
+            committed_version_ = current_version_;
             return Status::Ok();
         }
 
@@ -275,8 +280,13 @@ public:
             uint64_t new_ver = current_version_ + 1;
             const std::string stored = inject_resource_version(json, new_ver);
 
+            // A key in the journal stays there: a write that skips persistence
+            // would leave the key RAM-only, and the next flush would write it
+            // to the journal as deleted
+            const bool persist = persist_to_flash || (log_ && exists && !existing_ephemeral);
+
             size_t old_record = 0, new_record = 0;
-            if (options_.enable_flash_persistence && persist_to_flash) {
+            if (options_.enable_flash_persistence && persist) {
                 if (log_) {
                     // A write that would grow the persisted state past the
                     // journal's capacity is refused here, before anything
@@ -297,22 +307,27 @@ public:
             }
 
             bool is_new = false;
-            if (!tree_.put(key, stored, new_ver, !persist_to_flash, overwrite, &is_new)) {
+            if (!tree_.put(key, stored, new_ver, !persist, overwrite, &is_new)) {
                 return Status::InternalError("Failed inserting key into state store index");
             }
             current_version_ = new_ver;
 
-            if (log_ && options_.enable_flash_persistence && persist_to_flash) {
+            if (log_ && options_.enable_flash_persistence && persist) {
                 durable_bytes_ = durable_bytes_ - old_record + new_record;
                 uint32_t delay = options_.flush_delay_ms;
+                bool deferred = false;
                 if (persist_class(key) == PersistClass::Deferred) {
-                    // Heartbeat churn waits; a change that matters does not
+                    // Heartbeat churn waits, commit() included; a change that matters does not
                     const uint64_t fp = durable_fingerprint(key, stored);
                     auto it = deferred_fp_.find(key);
-                    if (it != deferred_fp_.end() && it->second == fp) delay = options_.deferred_flush_delay_ms;
-                    else deferred_fp_[key] = fp;
+                    if (it != deferred_fp_.end() && it->second == fp) {
+                        delay = options_.deferred_flush_delay_ms;
+                        deferred = true;
+                    } else {
+                        deferred_fp_[key] = fp;
+                    }
                 }
-                schedule_flush_locked(key, delay);
+                schedule_flush_locked(key, delay, deferred);
             }
 
             if (out_version) *out_version = new_ver;
@@ -358,15 +373,140 @@ public:
     }
 
     Status flush(bool all) override {
+        return write_pending(all ? Batch::All : Batch::Due);
+    }
+
+    Status commit() override {
         if (!log_) return Status::Ok();
+        uint64_t target = 0;
+        {
+            std::lock_guard<std::recursive_mutex> lock(rw_mutex_);
+            target = current_version_;
+        }
+        std::unique_lock<std::mutex> lock(commit_mutex_);
+        while (committed_version_ < target) {
+            // One caller writes; the others wait for it, and its batch, or
+            // the next one, carries their changes too (group commit)
+            if (committing_) {
+                commit_cv_.wait(lock);
+                continue;
+            }
+            committing_ = true;
+            lock.unlock();
+            Status s = write_pending(Batch::Urgent);
+            lock.lock();
+            committing_ = false;
+            commit_cv_.notify_all();
+            if (!s.ok()) return s;
+        }
+        return Status::Ok();
+    }
+
+    bool persistence_stats(PersistenceStats& out) const override {
+        if (!log_) return false;
+        FlashLogStats ls = log_->stats();
+        out.flash_log = true;
+        out.region_bytes = ls.region_bytes;
+        out.capacity_bytes = log_->capacity_bytes();
+        out.live_bytes = ls.live_bytes;
+        out.live_keys = ls.live_keys;
+        out.used_sectors = ls.used_sectors;
+        out.sector_count = ls.sector_count;
+        out.records_written = ls.records_written;
+        out.bytes_written = ls.bytes_written;
+        out.records_moved = ls.records_moved;
+        out.sectors_erased = ls.sectors_erased;
+        out.unchanged_skipped = unchanged_skipped_;
+        out.write_errors = write_errors_;
+        std::lock_guard<std::recursive_mutex> lock(rw_mutex_);
+        out.pending_keys = pending_.size();
+        return true;
+    }
+
+private:
+    struct Watcher {
+        uint32_t id;
+        std::string prefix;
+        WatchCallback callback;
+    };
+    struct Pending {
+        uint64_t due;     // steady_ms() by which the change is written
+        bool deferred;    // Node heartbeat churn only: commit() leaves it
+    };
+    // The pending changes a journal write takes: the due ones (the periodic
+    // flush), every one but deferred heartbeats (commit), or all
+    enum class Batch { Due, Urgent, All };
+
+    StoreOptions options_;
+    mutable std::recursive_mutex rw_mutex_;
+    RadixTree tree_;
+    LittleFSJournal journal_;
+    std::unique_ptr<FlashLog> log_;
+    std::map<std::string, Pending> pending_;        // key -> its change not yet on flash
+    std::map<std::string, uint64_t> deferred_fp_;   // Deferred keys: durable fingerprint last scheduled
+    std::mutex flush_mutex_;                        // one batch reaches the journal at a time, in order
+    std::mutex commit_mutex_;
+    std::condition_variable commit_cv_;
+    bool committing_{false};                        // a commit() caller is writing a batch
+    bool journal_unreadable_{false};                // recover() could not read the journal
+    uint64_t committed_version_{0};                 // every change up to this revision is durable
+    uint64_t revision_reserved_{0};
+    size_t durable_bytes_{0};   // journal bytes the durable keys take once flushed
+    uint64_t unchanged_skipped_{0};
+    uint64_t write_errors_{0};
+    uint64_t current_version_{0};
+    uint32_t next_watch_id_{0};
+    std::vector<Watcher> watchers_;
+
+    // Bytes a put record of this key and value takes in the journal
+    static size_t journal_record_bytes(const std::string& key, const std::string& value) {
+        return (24 + key.size() + value.size() + 3) & ~static_cast<size_t>(3);
+    }
+
+    static bool is_key_ephemeral(const std::string& key) {
+        return persist_class(key) == PersistClass::Ephemeral;
+    }
+
+    void schedule_flush_locked(const std::string& key, uint32_t delay_ms, bool deferred = false) {
+        const uint64_t due = steady_ms() + delay_ms;
+        auto it = pending_.find(key);
+        if (it == pending_.end()) {
+            pending_.emplace(key, Pending{due, deferred});
+            return;
+        }
+        if (due < it->second.due) it->second.due = due;
+        if (!deferred) it->second.deferred = false;
+    }
+
+    Status write_pending(Batch batch) {
+        if (!log_) return Status::Ok();
+        Status result = Status::InternalError("flash journal write did not run");
+        auto run = [&]() { result = write_batch(batch); };
+        if (options_.io_call) options_.io_call(run);
+        else run();
+        return result;
+    }
+
+    Status write_batch(Batch batch) {
+        std::lock_guard<std::mutex> serial(flush_mutex_);
+        // The changes stay pending: a log started now would go over what
+        // the journal holds
+        if (journal_unreadable_) return Status::InternalError("the flash journal could not be read at boot; nothing is written to it");
         struct Item { std::string key; bool present; std::string value; uint64_t rev; };
         std::vector<Item> items;
         uint64_t mark = 0;
+        uint64_t covered = 0;   // when the batch takes every urgent change: the revision they reach
         {
             std::lock_guard<std::recursive_mutex> lock(rw_mutex_);
             const uint64_t now = steady_ms();
+            bool urgent_left = false;
             for (auto it = pending_.begin(); it != pending_.end();) {
-                if (!all && it->second > now) { ++it; continue; }
+                const bool take = batch == Batch::All || it->second.due <= now || (batch == Batch::Urgent && !it->second.deferred);
+                if (!take) {
+                    if (!it->second.deferred) urgent_left = true;
+                    ++it;
+                    continue;
+                }
                 Item item;
                 item.key = it->first;
                 bool ephemeral = false;
@@ -375,6 +515,10 @@ public:
                 items.push_back(std::move(item));
                 it = pending_.erase(it);
             }
+            // Deletes first: the space they free is counted already when a
+            // put in the same batch is checked against the journal's capacity
+            std::stable_partition(items.begin(), items.end(), [](const Item& i) { return !i.present; });
+            if (!urgent_left) covered = current_version_;
             if (current_version_ + kRevisionBlock / 2 > revision_reserved_) mark = current_version_ + kRevisionBlock;
         }
         Status result = Status::Ok();
@@ -411,66 +555,14 @@ public:
             write_errors_++;
             result = Status::InternalError("flash journal sync failed");
         }
+        if (result.ok() && covered) {
+            {
+                std::lock_guard<std::mutex> lock(commit_mutex_);
+                if (covered > committed_version_) committed_version_ = covered;
+            }
+            commit_cv_.notify_all();
+        }
         return result;
-    }
-
-    bool persistence_stats(PersistenceStats& out) const override {
-        if (!log_) return false;
-        FlashLogStats ls = log_->stats();
-        out.flash_log = true;
-        out.region_bytes = ls.region_bytes;
-        out.capacity_bytes = log_->capacity_bytes();
-        out.live_bytes = ls.live_bytes;
-        out.live_keys = ls.live_keys;
-        out.used_sectors = ls.used_sectors;
-        out.sector_count = ls.sector_count;
-        out.records_written = ls.records_written;
-        out.bytes_written = ls.bytes_written;
-        out.records_moved = ls.records_moved;
-        out.sectors_erased = ls.sectors_erased;
-        out.unchanged_skipped = unchanged_skipped_;
-        out.write_errors = write_errors_;
-        std::lock_guard<std::recursive_mutex> lock(rw_mutex_);
-        out.pending_keys = pending_.size();
-        return true;
-    }
-
-private:
-    struct Watcher {
-        uint32_t id;
-        std::string prefix;
-        WatchCallback callback;
-    };
-
-    StoreOptions options_;
-    mutable std::recursive_mutex rw_mutex_;
-    RadixTree tree_;
-    LittleFSJournal journal_;
-    std::unique_ptr<FlashLog> log_;
-    std::map<std::string, uint64_t> pending_;       // key -> time its change is due on flash
-    std::map<std::string, uint64_t> deferred_fp_;   // Deferred keys: durable fingerprint last scheduled
-    uint64_t revision_reserved_{0};
-    size_t durable_bytes_{0};   // journal bytes the durable keys take once flushed
-    uint64_t unchanged_skipped_{0};
-    uint64_t write_errors_{0};
-    uint64_t current_version_{0};
-    uint32_t next_watch_id_{0};
-    std::vector<Watcher> watchers_;
-
-    // Bytes a put record of this key and value takes in the journal
-    static size_t journal_record_bytes(const std::string& key, const std::string& value) {
-        return (24 + key.size() + value.size() + 3) & ~static_cast<size_t>(3);
-    }
-
-    static bool is_key_ephemeral(const std::string& key) {
-        return persist_class(key) == PersistClass::Ephemeral;
-    }
-
-    void schedule_flush_locked(const std::string& key, uint32_t delay_ms) {
-        const uint64_t due = steady_ms() + delay_ms;
-        auto it = pending_.find(key);
-        if (it == pending_.end()) pending_.emplace(key, due);
-        else if (due < it->second) it->second = due;
     }
 
     static uint64_t extract_resource_version(const std::string& json) {

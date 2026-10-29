@@ -69,11 +69,15 @@ struct StoreOptions {
     size_t max_value_size_bytes{64 * 1024}; // 64KB max per JSON manifest
     // Raw flash for the log-structured journal (storage/flash_log.hpp). When
     // set, it replaces the file-per-key journal under base_path: changes are
-    // written by flush(), coalesced per key, and Leases, Events and Node
-    // heartbeats are kept off flash (storage/persist_policy.hpp).
+    // written by flush() and commit(), coalesced per key, and Leases, Events
+    // and Node heartbeats are kept off flash (storage/persist_policy.hpp).
     FlashRegion* flash_region{nullptr};
     uint32_t flush_delay_ms{1000};            // longest a change to a durable key waits for flush()
     uint32_t deferred_flush_delay_ms{600000}; // the same for Node status heartbeats
+    // Runs the journal writes of flush() and commit(). On the ESP32 the node
+    // sets hal::node_storage_call, which moves them onto a stack in internal
+    // RAM; unset, they run on the calling thread.
+    std::function<void(const std::function<void()>&)> io_call{};
 };
 
 struct PersistenceStats {
@@ -119,9 +123,13 @@ public:
     virtual uint64_t current_version() const = 0;
 
     // Writes the changes that are due (all of them with `all`) to the flash
-    // journal. Runs on the caller's thread; on the ESP32 that thread's stack
-    // must be in internal RAM. A no-op for the file journal and RAM-only stores.
+    // journal. A no-op for the file journal and RAM-only stores.
     virtual Status flush(bool all = false) { (void)all; return Status::Ok(); }
+    // Returns once every change made before the call is durable in the flash
+    // journal, Node heartbeat status (deferred) and RAM-only keys aside.
+    // Callers that overlap share one journal write and one sync. Not OK when
+    // a change could not be written; it stays pending and is retried.
+    virtual Status commit() { return Status::Ok(); }
     // False when the store has no flash journal.
     virtual bool persistence_stats(PersistenceStats& out) const { (void)out; return false; }
 };

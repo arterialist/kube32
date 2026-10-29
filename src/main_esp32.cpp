@@ -59,10 +59,12 @@
 #include <cstdio>
 #include <cstring>
 #include <cstdlib>
+#include <functional>
 #include <memory>
 #include <string>
 #include <dirent.h>
 #include <sys/stat.h>
+#include <unistd.h>
 
 #include "esp_system.h"
 #include "esp_wifi.h"
@@ -249,6 +251,7 @@ struct Console {
 static std::string s_forward_host = "127.0.0.1";
 static kube32::api::HttpServer* s_api_server = nullptr;       // for console toggles
 static kube32::storage::Store* s_store = nullptr;             // control plane: journal figures for the console
+static std::string s_journal_location;                         // control plane: where the store's journal is
 static bool s_api_token_set = false;
 static kube32::osal::TlsServer* s_tls = nullptr;               // control plane: the API server's certificate
 static kube32::api::HttpServer* s_ingress_server = nullptr;
@@ -380,7 +383,7 @@ void console_task(void* arg) {
                 if (s_store && s_store->persistence_stats(ps)) {
                     l = snprintf(buf, sizeof(buf),
                         "K32_STORE journal=%s keys=%u live_bytes=%u capacity_bytes=%u sectors=%u/%u pending=%u records=%llu bytes=%llu moved=%llu unchanged=%llu errors=%llu revision=%llu\n",
-                        kube32::hal::node_storage_path("store/journal.img").c_str(), (unsigned)ps.live_keys, (unsigned)ps.live_bytes,
+                        s_journal_location.c_str(), (unsigned)ps.live_keys, (unsigned)ps.live_bytes,
                         (unsigned)ps.capacity_bytes, (unsigned)ps.used_sectors, (unsigned)ps.sector_count, (unsigned)ps.pending_keys,
                         (unsigned long long)ps.records_written, (unsigned long long)ps.bytes_written, (unsigned long long)ps.records_moved,
                         (unsigned long long)ps.unchanged_skipped, (unsigned long long)ps.write_errors,
@@ -880,19 +883,59 @@ void cluster_task(void* pv) {
     kubelet_cfg.node_labels["kube32.io/board"] = ident.has_display ? "cardputer" : "generic";
 
     if (ident.is_control_plane) {
-        // The object store's journal lives on the node storage root; without
-        // one the cluster state is kept in RAM only
+        // The object store's journal: the raw `journal` partition on a board
+        // whose storage root is internal flash, a file on a card; without
+        // either the cluster state is kept in RAM only
         kube32::storage::StoreOptions store_opts;
         store_opts.enable_flash_persistence = false;
+        // Journal writes made for API requests (commit) run on the API
+        // workers, whose stacks may be in PSRAM
+        store_opts.io_call = [](const std::function<void()>& fn) { kube32::hal::node_storage_call(fn); };
         static std::unique_ptr<kube32::storage::FlashRegion> journal;
         const kube32::hal::NodeStorageInfo storage_info = kube32::hal::node_storage_info();
         const std::string journal_dir = kube32::hal::node_storage_path("store");
-        if (!journal_dir.empty() && kube32::hal::node_storage_make_dirs(journal_dir)) {
-            // 1 MiB on internal flash (the rest is for volumes and logs), 4 MiB on a card
+        const std::string journal_file = journal_dir + "/journal.img";
+        if (storage_info.medium == kube32::hal::StorageMedium::InternalFlash) {
+            // Not a file on the FAT volume: FATFS rewrites a file's directory
+            // entry on every sync and wear levelling rewrites a sector by
+            // erasing it first, so a reset between the two loses the whole
+            // file. A journal.img left on the FAT volume is moved over once.
+            kube32::hal::node_storage_call([&]() { journal = kube32::storage::create_partition_flash_region("journal", 1u << 20); });
+            bool found = false, moved = false, copied = false;
+            if (journal && !journal_dir.empty()) {
+                kube32::hal::node_storage_call([&]() {
+                    struct stat st;
+                    found = ::stat(journal_file.c_str(), &st) == 0;
+                    if (!found) return;
+                    auto file = kube32::storage::create_file_flash_region(journal_file, journal->size());
+                    moved = file && kube32::storage::FlashLog::copy_log(*file, *journal, copied);
+                    if (moved) {
+                        file.reset();
+                        ::unlink(journal_file.c_str());
+                    } else {
+                        // Retried at the next boot; this one keeps using the file
+                        journal = std::move(file);
+                    }
+                });
+            }
+            if (found && !moved) {
+                printf("[STORE] %s could not be moved to the journal partition\n", journal_file.c_str());
+                if (journal) s_journal_location = journal_file;
+            } else if (journal) {
+                if (copied) printf("[STORE] %s moved to the journal partition\n", journal_file.c_str());
+                s_journal_location = "partition:journal";
+            }
+        }
+        if (!journal && !journal_dir.empty() && kube32::hal::node_storage_make_dirs(journal_dir)) {
+            // 1 MiB on internal flash without a journal partition (an older
+            // partition table), 4 MiB on a card
             const size_t journal_bytes = storage_info.medium == kube32::hal::StorageMedium::SdCard ? 4u << 20 : 1u << 20;
-            kube32::hal::node_storage_call([&]() {
-                journal = kube32::storage::create_file_flash_region(journal_dir + "/journal.img", journal_bytes);
-            });
+            kube32::hal::node_storage_call([&]() { journal = kube32::storage::create_file_flash_region(journal_file, journal_bytes); });
+            if (journal) s_journal_location = journal_file;
+            if (journal && storage_info.medium == kube32::hal::StorageMedium::InternalFlash) {
+                printf("[STORE] no journal partition in the partition table: the journal is a file on the FAT volume, "
+                       "which a reset during a write can lose (flash the current partitions.csv)\n");
+            }
         }
         if (journal) {
             store_opts.enable_flash_persistence = true;
@@ -908,7 +951,7 @@ void cluster_task(void* pv) {
             kube32::hal::node_storage_call([&]() { rs = store->recover(); });
             std::vector<std::string> keys;
             store->list("/registry/", keys);
-            printf("[STORE] journal %s/journal.img: %u object(s) recovered in %llu ms, revision %llu%s\n", journal_dir.c_str(),
+            printf("[STORE] journal %s: %u object(s) recovered in %llu ms, revision %llu%s\n", s_journal_location.c_str(),
                    (unsigned)keys.size(), (unsigned long long)(kube32::osal::System::get_uptime_ms() - t0),
                    (unsigned long long)store->current_version(), rs.ok() ? "" : (" (" + rs.message + ")").c_str());
         }
@@ -1120,8 +1163,9 @@ void cluster_task(void* pv) {
         iter++;
         if (ingress) ingress->tick();
         if (store) {
-            // Changes reach the journal here, on this task's internal-RAM stack
-            kube32::hal::node_storage_call([&]() { store->flush(false); });
+            // Changes no API request waited for (controllers, Node
+            // heartbeats) reach the journal here
+            store->flush(false);
             // Objects made before the clock was set get their timestamps once it is
             static int backfills = 0;
             if (backfills < 2 && kube32::osal::System::get_unix_time_ms() != 0 && (backfills == 0 || iter % 60 == 0)) {

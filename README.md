@@ -12,7 +12,7 @@ kube32 is a Kubernetes-compatible control plane and WebAssembly pod runtime for 
 - Kubernetes API serving Pod, Node, Namespace, Service, Endpoints, EndpointSlice, Ingress, Deployment, DaemonSet, Job, ConfigMap, Secret, Lease, Event, and metrics for `kubectl` and k9s, including watch streams, Table output, OpenAPI v3 validation, and log tailing.
 - WebAssembly pods in [wasm3](https://github.com/wasm3/wasm3) with SDKs and templates for Rust, C, and AssemblyScript, using either a request-handler ABI with `k32_handle` or an entry-point ABI with `app_main`, plus configurable memory limits and per-call gas budgets.
 - Service routing, HTTP Ingress with host and prefix rules, Server-Sent Events streams, embedded static asset bundles via `k32_resp_asset` and `StaticBundle`, and synchronous pod-to-pod HTTP calls via `k32_http_call`.
-- Persistent object store backed by a CRC-checked journal on the microSD card or internal FAT flash partition, plus `persistentVolumeClaim` pod volumes via `k32_fs_*` and rotated container logs for `kubectl logs --previous`.
+- Persistent object store backed by a CRC-checked journal on a raw flash partition or the microSD card, plus `persistentVolumeClaim` pod volumes via `k32_fs_*` and rotated container logs for `kubectl logs --previous`.
 - Peripheral access gated per pod by a capability firewall covering GPIO pins, ADC channels, I2C and UART buses, ST7789 display, key matrix, I2S speaker, and microSD storage.
 - Container lifecycle management with `restartPolicy` set to `Always`, `OnFailure`, or `Never`, exponential CrashLoopBackOff, and distinct exit codes for Wasm traps, gas exhaustion, and `OOMKilled`.
 - Optional bearer-token authentication and automatic self-signed ECDSA P-256 TLS on port 6443.

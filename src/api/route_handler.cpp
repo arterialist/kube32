@@ -127,6 +127,7 @@ public:
     void unwatch(uint32_t id) override { real_.unwatch(id); }
     uint64_t current_version() const override { return real_.current_version(); }
     storage::Status flush(bool all) override { return real_.flush(all); }
+    storage::Status commit() override { return real_.commit(); }
     bool persistence_stats(storage::PersistenceStats& out) const override { return real_.persistence_stats(out); }
 
 private:
@@ -761,6 +762,18 @@ HttpResponse RouteHandler::handle_request(const HttpRequest& req, mem::Monotonic
     }
 
     HttpResponse resp = dispatch(*effective, match, arena, client_sock);
+
+    // A change is in the journal before the client hears it was made, so a
+    // crash right after the answer keeps it. Requests that end at the same
+    // time share one journal write.
+    const bool mutation = req.method == HttpMethod::Post || req.method == HttpMethod::Put ||
+                          req.method == HttpMethod::Patch || req.method == HttpMethod::Delete;
+    if (mutation && !scope.state.dry_run && resp.status_code >= 200 && resp.status_code < 300) {
+        storage::Status durable = store_.commit();
+        if (!durable.ok()) {
+            return make_status(500, "InternalError", "the change could not be written to the object store journal: " + durable.message);
+        }
+    }
 
     // A list cut short by ?limit carries the token for the next page
     if (!scope.state.continue_token.empty() && resp.status_code == 200 && !resp.is_chunked && !resp.socket_taken) {

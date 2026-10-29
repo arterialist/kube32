@@ -50,7 +50,8 @@ Layout in `partitions.csv` for 8 MB flash:
 | `phy_init` | `0x11000` | 4 KB | Radio calibration |
 | `factory` | `0x20000` | 3 MB | Application image |
 | `storage` | `0x320000` | 3.5 MB | FAT filesystem with wear levelling at `/data`, used when no microSD card is mounted |
-| `reserved` | `0x6A0000` | 1.375 MB | Unused |
+| `journal` | `0x6A0000` | 1 MB | Raw object store journal (`data`, subtype `0x40`), used when no microSD card is mounted |
+| `reserved` | `0x7A0000` | 384 KB | Unused |
 
 ## Configuration notes
 

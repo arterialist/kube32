@@ -52,7 +52,8 @@ public:
 // Memory-backed region for tests, NOR flash (`nor`) or a plain overwritable
 // image. A write budget simulates a power cut: once `budget` bytes have been
 // written, further writes and erases are dropped (partially for the write
-// that crosses the limit). -1 means no limit.
+// that crosses the limit). -1 means no limit. Reads can be made to fail, and
+// syncs are counted.
 class RamFlashRegion : public FlashRegion {
 public:
     explicit RamFlashRegion(size_t size, size_t sector = 4096, bool nor = true);
@@ -62,21 +63,35 @@ public:
     bool read(size_t offset, void* dst, size_t len) override;
     bool write(size_t offset, const void* src, size_t len) override;
     bool erase_sector(size_t index) override;
+    bool sync() override { ++syncs_; return true; }
     void set_write_budget(long long bytes) { budget_ = bytes; }
+    // Bytes left before the cut; 0 once it happened
+    long long write_budget() const { return budget_; }
+    void set_read_error(bool fail) { read_error_ = fail; }
     std::vector<uint8_t>& bytes() { return data_; }
     uint64_t erase_count() const { return erases_; }
+    uint64_t sync_count() const { return syncs_; }
 
 private:
     std::vector<uint8_t> data_;
     size_t sector_;
     bool nor_;
     long long budget_{-1};
+    bool read_error_{false};
     uint64_t erases_{0};
+    uint64_t syncs_{0};
 };
 
 // A preallocated file (on the node's storage root, or a host directory). The
-// file is extended to `size` without writing it; nothing is erased.
+// file is extended to `size` without writing it; nothing is erased. On a FAT
+// volume every sync also rewrites the file's directory entry.
 std::unique_ptr<FlashRegion> create_file_flash_region(const std::string& path, size_t size);
+
+// The data partition named `label` on the board's own flash, written raw: at
+// most `size` bytes, NOR semantics, no filesystem between the log and the
+// flash, so a reset in the middle of a write can only cut that write. nullptr
+// when the partition table has no such partition, and always on the host.
+std::unique_ptr<FlashRegion> create_partition_flash_region(const std::string& label, size_t size);
 
 struct FlashLogStats {
     size_t region_bytes{0};
@@ -103,9 +118,19 @@ public:
     // Scans the region and calls `apply` for every key's latest record, put
     // or delete, in log order. Records torn by a power cut are skipped.
     // Afterwards appends go to a fresh sector. `max_revision` receives the
-    // largest revision seen in any record, revision marks included.
+    // largest revision seen in any record, revision marks included. False
+    // when the region could not be read: appends are then refused, since a
+    // log started over unreadable sectors would replace what they hold.
     using ApplyFn = std::function<void(RecordType type, const std::string& key, std::string& value, uint64_t revision)>;
     bool recover(const ApplyFn& apply, uint64_t& max_revision);
+
+    // Copies the log in `from` into `to` sector by sector and reads the copy
+    // back: moves a journal kept in a file onto a raw partition. Nothing is
+    // copied (`copied` false) when `from` holds no log or `to` a newer one; a
+    // copy cut short is made again by the next call, since `to` then holds
+    // nothing newer. False on a read or write error, or when the two regions
+    // differ in size or sector size.
+    static bool copy_log(FlashRegion& from, FlashRegion& to, bool& copied);
 
     // Appends one record. False when the region is full or the flash fails.
     bool append_put(const std::string& key, const std::string& value, uint64_t revision, uint64_t fingerprint);
@@ -157,6 +182,8 @@ private:
     size_t head_off_{0};       // next free byte within it
     uint32_t tail_seq_{0};     // oldest sector holding records
     bool reclaiming_{false};
+    bool read_error_{false};   // a region read failed since it was last cleared
+    bool unreadable_{false};   // recover() could not read the region
     std::vector<IndexEntry> index_;   // sorted by key_hash
     size_t live_bytes_{0};
     uint64_t revision_mark_{0};
@@ -164,7 +191,9 @@ private:
 
     size_t phys(uint32_t seq) const { return static_cast<size_t>(seq % sectors_); }
     uint64_t pos_of(uint32_t seq, size_t off) const { return static_cast<uint64_t>(seq) * sector_ + off; }
+    bool read_region(size_t offset, void* dst, size_t len);
     bool read_header(size_t index, SectorHeader& out);
+    bool newest_sector(uint32_t& head);
     bool open_sector(uint32_t seq, size_t first);
     bool ensure_space(size_t record_bytes);
     bool reclaim_tail();

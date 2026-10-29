@@ -7,6 +7,9 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+#if defined(KUBE32_TARGET_ESP32)
+#include "esp_partition.h"
+#endif
 
 namespace kube32::storage {
 
@@ -80,7 +83,7 @@ uint64_t FlashLog::hash_key(const std::string& key) {
 RamFlashRegion::RamFlashRegion(size_t size, size_t sector, bool nor) : data_(size, 0xFF), sector_(sector), nor_(nor) {}
 
 bool RamFlashRegion::read(size_t offset, void* dst, size_t len) {
-    if (offset + len > data_.size()) return false;
+    if (read_error_ || offset + len > data_.size()) return false;
     std::memcpy(dst, data_.data() + offset, len);
     return true;
 }
@@ -150,6 +153,49 @@ std::unique_ptr<FlashRegion> create_file_flash_region(const std::string& path, s
     return std::make_unique<FileFlashRegion>(fd, size);
 }
 
+#if defined(KUBE32_TARGET_ESP32)
+
+namespace {
+
+class PartitionFlashRegion : public FlashRegion {
+public:
+    PartitionFlashRegion(const esp_partition_t* part, size_t size) : part_(part), size_(size) {}
+    size_t size() const override { return size_; }
+    bool read(size_t offset, void* dst, size_t len) override {
+        return offset + len <= size_ && esp_partition_read(part_, offset, dst, len) == ESP_OK;
+    }
+    bool write(size_t offset, const void* src, size_t len) override {
+        return offset + len <= size_ && esp_partition_write(part_, offset, src, len) == ESP_OK;
+    }
+    bool erase_sector(size_t index) override {
+        const size_t sector = sector_size();
+        return (index + 1) * sector <= size_ && esp_partition_erase_range(part_, index * sector, sector) == ESP_OK;
+    }
+
+private:
+    const esp_partition_t* part_;
+    size_t size_;
+};
+
+} // namespace
+
+#endif
+
+std::unique_ptr<FlashRegion> create_partition_flash_region(const std::string& label, size_t size) {
+#if defined(KUBE32_TARGET_ESP32)
+    const esp_partition_t* part = esp_partition_find_first(ESP_PARTITION_TYPE_DATA, ESP_PARTITION_SUBTYPE_ANY, label.c_str());
+    // An encrypted partition takes 16-byte aligned writes only
+    if (!part || part->encrypted || part->erase_size != 4096) return nullptr;
+    const size_t bytes = std::min<size_t>(size, part->size) / 4096 * 4096;
+    if (bytes == 0) return nullptr;
+    return std::make_unique<PartitionFlashRegion>(part, bytes);
+#else
+    (void)label;
+    (void)size;
+    return nullptr;
+#endif
+}
+
 
 // ---------------------------------------------------------------------------
 // Log
@@ -209,9 +255,15 @@ size_t FlashLog::capacity_bytes() const {
     return usable * payload_ / 2;
 }
 
+bool FlashLog::read_region(size_t offset, void* dst, size_t len) {
+    if (region_.read(offset, dst, len)) return true;
+    read_error_ = true;
+    return false;
+}
+
 bool FlashLog::read_header(size_t index, SectorHeader& out) {
     uint8_t b[kSectorHeader];
-    if (!region_.read(index * sector_, b, sizeof(b))) return false;
+    if (!read_region(index * sector_, b, sizeof(b))) return false;
     out.magic = get32(b);
     out.seq = get32(b + 4);
     out.first = get16(b + 8);
@@ -272,7 +324,7 @@ bool FlashLog::stream_read(uint32_t& seq, size_t& off, void* dst, size_t len) {
             off = kSectorHeader;
         }
         size_t n = std::min(len, sector_ - off);
-        if (!region_.read(phys(seq) * sector_ + off, d, n)) return false;
+        if (!read_region(phys(seq) * sector_ + off, d, n)) return false;
         d += n;
         off += n;
         len -= n;
@@ -300,7 +352,7 @@ bool FlashLog::stream_write(const void* src, size_t len, size_t record_remaining
 
 bool FlashLog::append_record(RecordType type, const std::string& key, const std::string& value, uint64_t revision,
                              uint64_t fingerprint, bool moving) {
-    if (key.size() > kMaxKey || key.size() + value.size() > max_record_) return false;
+    if (unreadable_ || key.size() > kMaxKey || key.size() + value.size() > max_record_) return false;
     const size_t body = kRecordHeader + key.size() + value.size();
     const size_t total = align4(body);
     if (!moving && type == RecordType::Put) {
@@ -395,7 +447,9 @@ bool FlashLog::read_record_at(uint32_t seq, size_t off, RecordType& type, std::s
 bool FlashLog::reclaim_tail() {
     if (!have_head_ || tail_seq_ >= head_seq_) return false;
     reclaiming_ = true;
+    read_error_ = false;
     const uint32_t seq = tail_seq_;
+    bool moved = false;
     SectorHeader hdr;
     if (read_header(phys(seq), hdr) && hdr.seq == seq && hdr.first != kNoRecordStart) {
         size_t off = hdr.first;
@@ -416,12 +470,19 @@ bool FlashLog::reclaim_tail() {
                 } else if (!append_record(type, key, value, revision, e->fingerprint, true)) {
                     reclaiming_ = false;
                     return false;
+                } else {
+                    moved = true;
                 }
             }
             if (end_seq != seq) break;   // the record ran into the next sector
             off = end_off;
         }
     }
+    // A record that could not be read was not moved: the sector stays
+    if (read_error_) { reclaiming_ = false; return false; }
+    // The copies are durable before the sector they replace can be erased or
+    // written over (a file may reach the disk out of order)
+    if (moved && !region_.sync()) { reclaiming_ = false; return false; }
     // On NOR flash a reclaimed sector is erased at once, so recovery never
     // finds it; elsewhere its stale records are older than every copy made
     if (region_.erase_required()) {
@@ -443,6 +504,18 @@ bool FlashLog::reclaim_tail() {
     return true;
 }
 
+bool FlashLog::newest_sector(uint32_t& head) {
+    bool found = false;
+    head = 0;
+    for (size_t i = 0; i < sectors_; ++i) {
+        SectorHeader h;
+        if (!read_header(i, h)) continue;
+        if (!found || h.seq > head) head = h.seq;
+        found = true;
+    }
+    return found;
+}
+
 bool FlashLog::recover(const ApplyFn& apply, uint64_t& max_revision) {
     std::lock_guard<std::recursive_mutex> lock(mutex_);
     index_.clear();
@@ -450,18 +523,15 @@ bool FlashLog::recover(const ApplyFn& apply, uint64_t& max_revision) {
     have_head_ = false;
     max_revision = 0;
     revision_mark_ = 0;
+    read_error_ = false;
+    unreadable_ = false;
 
     // The newest valid sector and the run of consecutive sequence numbers
     // that ends there are the log; any other valid sector is left over from a
     // broken run and gets erased when its slot is reused.
-    bool found = false;
     uint32_t head = 0;
-    for (size_t i = 0; i < sectors_; ++i) {
-        SectorHeader h;
-        if (!read_header(i, h)) continue;
-        if (!found || h.seq > head) head = h.seq;
-        found = true;
-    }
+    const bool found = newest_sector(head);
+    if (read_error_) { unreadable_ = true; return false; }
     if (!found) return true;
     uint32_t tail = head;
     while (tail > 0 && head - tail + 1 < sectors_) {
@@ -515,9 +585,43 @@ bool FlashLog::recover(const ApplyFn& apply, uint64_t& max_revision) {
         off = end_off;
         if (end_off >= sector_) { ++seq; positioned = false; }
     }
+    if (read_error_) {
+        index_.clear();
+        live_bytes_ = 0;
+        unreadable_ = true;
+        return false;
+    }
     // Appends continue in a fresh sector: the tail end of the newest one may
     // hold a torn record that must not be extended
     head_off_ = sector_;
+    return true;
+}
+
+bool FlashLog::copy_log(FlashRegion& from, FlashRegion& to, bool& copied) {
+    copied = false;
+    if (from.size() != to.size() || from.sector_size() != to.sector_size()) return false;
+    FlashLog src(from, 0);
+    FlashLog dst(to, 0);
+    uint32_t src_head = 0, dst_head = 0;
+    const bool src_log = src.newest_sector(src_head);
+    const bool dst_log = dst.newest_sector(dst_head);
+    if (src.read_error_ || dst.read_error_) return false;
+    if (!src_log || (dst_log && dst_head > src_head)) return true;
+    auto erased = [](const std::vector<uint8_t>& b) {
+        return std::all_of(b.begin(), b.end(), [](uint8_t c) { return c == 0xFF; });
+    };
+    std::vector<uint8_t> buf(from.sector_size()), back(from.sector_size());
+    for (size_t i = 0; i < src.sectors_; ++i) {
+        const size_t at = i * buf.size();
+        if (!from.read(at, buf.data(), buf.size()) || !to.read(at, back.data(), back.size())) return false;
+        if (back == buf) continue;   // copied by an earlier call, or both erased
+        if (to.erase_required() && !erased(back) && !to.erase_sector(i)) return false;
+        if (to.erase_required() && erased(buf)) continue;
+        if (!to.write(at, buf.data(), buf.size())) return false;
+        if (!to.read(at, back.data(), back.size()) || back != buf) return false;
+    }
+    if (!to.sync()) return false;
+    copied = true;
     return true;
 }
 

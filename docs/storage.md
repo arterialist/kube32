@@ -10,7 +10,7 @@ On the host simulator, `KUBE32_SD_ROOT=/some/directory` mounts a directory as `/
 
 ```
 <root>/kube32/
-  store/journal.img             object store journal (control plane)
+  store/journal.img             object store journal (microSD card and simulator)
   volumes/<claim>/              one directory per volume claim
   logs/<ns>_<pod>/<container>.log
   images/<name>.wasm            wasm://sd/<name> (card only)
@@ -26,7 +26,8 @@ On the host simulator, `KUBE32_SD_ROOT=/some/directory` mounts a directory as `/
 | `phy_init` | `data` | `phy` | `0x11000` | 4 KB (`0x1000`) |
 | `factory` | `app` | `factory` | `0x20000` | 3 MB (`0x300000`) |
 | `storage` | `data` | `fat` | `0x320000` | 3.5 MB (`0x380000`) |
-| `reserved` | `data` | `0xff` | `0x6A0000` | 1.375 MB (`0x160000`) |
+| `journal` | `data` | `0x40` | `0x6A0000` | 1 MB (`0x100000`) |
+| `reserved` | `data` | `0xff` | `0x7A0000` | 384 KB (`0x60000`) |
 
 ### microSD hardware and mount
 
@@ -60,13 +61,15 @@ kubectl --context kube32 get node esp32-node-02 -o jsonpath='{.status.capacity.h
 
 ## Control plane object store
 
-The control plane persists cluster objects in a single log-structured journal file at `<root>/kube32/store/journal.img` (enabled on the simulator with `--enable-flash`). Records are CRC-checked and power-cut safe.
+The control plane persists cluster objects in a log-structured journal. When the storage root is internal flash, the journal is written raw to the 1 MiB `journal` flash partition (`0x6A0000`, subtype `0x40`) with no filesystem layer. On a board with a microSD card (and on the simulator with `--enable-flash`), the journal is a 4 MiB file at `<root>/kube32/store/journal.img`. Records are CRC-checked and power-cut safe.
 
 * Journal size is 1 MiB on internal flash (~480 KB of live objects) and 4 MiB on a microSD card.
+* At boot, an existing `/data/kube32/store/journal.img` is copied into the `journal` partition, verified by readback, and deleted; an interrupted copy is redone on the next boot without overwriting a newer log in the partition.
+* If the journal cannot be read at boot, recovery fails and nothing is written to it.
+* API writes (`POST`, `PUT`, `PATCH`, and `DELETE` that are not dry-run) commit to the journal before the API server responds, or return `500` if the write fails. Concurrent writers share one journal write and sync (group commit).
 * When the journal is full, any persisted create or update that cannot fit returns `500 InternalError` (`object store is full: X of Y bytes in use, N more needed`). Shrinking updates and deletes continue to work.
 * Leases and Events stay in RAM.
-* Node heartbeat status writes at most every 10 minutes. Changes to Node labels, annotations, spec, or the `Ready` condition write within 1 s.
-* All other objects write within 1 s. Unchanged content is skipped.
+* Node heartbeat status writes at most every 10 minutes. Controller writes batch and flush within 1 s. Unchanged content is skipped.
 * `resourceVersion` never goes backwards across restarts. Watch streams opened before a restart receive `410 Gone` and relist. Pods already in `Succeeded` or `Failed` phase do not restart after boot.
 * Send `K32_CMD:STORE` over the serial console to inspect journal usage and counters.
 

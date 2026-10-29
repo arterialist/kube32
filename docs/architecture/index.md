@@ -56,7 +56,7 @@ See the detailed pages for each subsystem:
 5. Start [event channels](espnow-ipc.md) over ESP-NOW and UDP port 7400, with peer discovery every 3 s.
 6. Register embedded Wasm images compiled from `images/*.wasm`.
 7. Start role services. The control plane recovers the [object store](radix-store.md), starts the node lifecycle, [scheduler, Deployment, DaemonSet, and Job controllers](scheduler.md), starts the API server on port 6443 (serving HTTP and TLS on the same port), starts a local kubelet pointing to `127.0.0.1:6443`, and starts the Ingress controller on port 80. A worker starts its kubelet pointing to `K32_CMD:API:<host>` (default `192.168.4.1`) and, if the board has PSRAM, starts a pod HTTP server on port 7000.
-8. Start the serial console task, the pod tick thread (calling `k32_tick` at 1 Hz, or every 10 ms while a pod returns pending work), and the 1 s housekeeping loop (flushing the store journal, ticking the Ingress controller, and seeding UDP peers from node `InternalIP` addresses every 10 s).
+8. Start the serial console task, the pod tick thread (calling `k32_tick` at 1 Hz, or every 10 ms while a pod returns pending work), and the 1 s housekeeping loop (flushing batched controller and deferred node heartbeat store writes, ticking the Ingress controller, and seeding UDP peers from node `InternalIP` addresses every 10 s).
 
 Run `K32_CMD:TASKS` on the serial console to inspect the live task table and stack high-water marks.
 
@@ -83,7 +83,7 @@ Each board mounts one node storage root: `/sd` when a microSD card is inserted, 
 
 | Path under `<root>/kube32/` | Contents |
 | --- | --- |
-| `store/journal.img` | Control-plane [object store](radix-store.md) log-structured journal with CRC-checked records (1 MiB on internal flash, 4 MiB on microSD). Leases and Events stay in RAM. Node heartbeats flush at most every 10 min, and other changes flush within 1 s. |
+| `store/journal.img` (microSD) or raw `journal` partition (internal flash) | Control-plane [object store](radix-store.md) log-structured journal with CRC-checked records (1 MiB in the `journal` partition at `0x6A0000` on internal flash, 4 MiB on microSD). API writes commit before the server responds; controller writes flush within 1 s, node heartbeats flush at most every 10 min, and Leases and Events stay in RAM. |
 | `volumes/<claim>` | Pod directories mounted from a `persistentVolumeClaim` (`claimName: <claim>`) and accessed via the `k32_fs_*` ABI. |
 | `logs/<ns>_<pod>/<container>.log` | Container logs (capped at 32 KiB, rotated to `.log.1` on restart, and served by `kubectl logs --previous`). Deleted when the pod is deleted. |
 | `images/<name>.wasm` | Wasm binaries loaded via `wasm://sd/<name>` (microSD only) and optional static assets under `images/<name>/` served by `k32_resp_asset`. |

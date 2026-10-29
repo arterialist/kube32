@@ -4,10 +4,14 @@
 # Sector Alignment: 4KB (0x1000). MMU App Alignment: 64KB (0x10000).
 # ==============================================================================
 # storage: the node's storage root when no microSD card is present (FAT with
-# wear levelling: object store journal, pod volumes, container logs)
+# wear levelling: pod volumes, container logs)
+# journal: the control plane's object store journal on a board without a
+# card, written raw (no filesystem) so a reset in the middle of a write can
+# only cut that write
 # Name,      Type, SubType, Offset,   Size,     Flags
 nvs,         data, nvs,     0x9000,   0x8000,
 phy_init,    data, phy,     0x11000,  0x1000,
 factory,     app,  factory, 0x20000,  0x300000,
 storage,     data, fat,     0x320000, 0x380000,
-reserved,    data, 0xff,    0x6A0000, 0x160000,
+journal,     data, 0x40,    0x6A0000, 0x100000,
+reserved,    data, 0xff,    0x7A0000, 0x60000,
