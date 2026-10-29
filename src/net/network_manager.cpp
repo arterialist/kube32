@@ -7,13 +7,23 @@
 #include "esp_heap_caps.h"
 #include "esp_event.h"
 #include "esp_netif.h"
+#include "esp_netif_net_stack.h"
+#include "lwip/netif.h"
 #include "esp_mac.h"
 #include "esp_log.h"
+#include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include <cstring>
 
 static const char* TAG = "Kube32Net";
+static constexpr uint16_t k_small_heap_mtu = 576;
+// Below this signal the station looks for a stronger AP of the same network,
+// and moves when one is at least k_roam_margin_db better; a scan that finds
+// none waits k_roam_retry_us before the next one.
+static constexpr int8_t k_roam_rssi = -70;
+static constexpr int8_t k_roam_margin_db = 10;
+static constexpr uint64_t k_roam_retry_us = 60ULL * 1000 * 1000;
 #endif
 
 namespace kube32::net {
@@ -33,11 +43,15 @@ public:
 
         wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
         if (heap_caps_get_total_size(MALLOC_CAP_SPIRAM) == 0) {
-            // Frames wait in these buffers (~1.6 KB of internal RAM each)
-            // until the radio sends them or lwIP is done with them; a pod
-            // streaming a large response filled all eight
+            // Frames wait in these buffers until the radio sends them or
+            // lwIP is done with them. Without PSRAM the station runs a 576
+            // byte MTU (see ip_event), so each holds at most ~650 bytes; the
+            // driver must never find the heap empty, or it stops sending.
+            // A socket with unread data holds up to 7 RX buffers (receive
+            // mailbox 4, one refused segment, 2 out of order): 12 leave the
+            // rest of the node able to receive.
             cfg.dynamic_tx_buf_num = 4;
-            cfg.dynamic_rx_buf_num = 6;
+            cfg.dynamic_rx_buf_num = 12;
         }
         if (esp_wifi_init(&cfg) != ESP_OK) {
             ESP_LOGE(TAG, "esp_wifi_init failed");
@@ -61,6 +75,13 @@ public:
             esp_wifi_connect();
         } else if (id == WIFI_EVENT_STA_START && self->mode_ != NetworkMode::SoftAP) {
             esp_wifi_connect();
+        } else if (id == WIFI_EVENT_STA_CONNECTED) {
+            esp_wifi_set_rssi_threshold(k_roam_rssi);
+        } else if (id == WIFI_EVENT_STA_BSS_RSSI_LOW) {
+            self->start_roam_scan();
+        } else if (id == WIFI_EVENT_SCAN_DONE && self->roam_scan_) {
+            self->roam_scan_ = false;
+            self->finish_roam_scan();
         } else if (id == WIFI_EVENT_AP_STACONNECTED || id == WIFI_EVENT_AP_STADISCONNECTED) {
             // A client joining the cluster AP must not steal the default route
             if (self->mode_ == NetworkMode::StationAndSoftAP && self->sta_netif_ && self->sta_has_ip_) {
@@ -73,18 +94,84 @@ public:
         auto* self = static_cast<EspNetworkManager*>(arg);
         auto* ev = static_cast<ip_event_got_ip_t*>(data);
         self->sta_has_ip_ = true;
+        if (heap_caps_get_total_size(MALLOC_CAP_SPIRAM) == 0 && self->sta_netif_) {
+            // Without PSRAM the heap soon holds no 1.6 KB block, and a full
+            // size Wi-Fi frame can then be neither sent nor received: TCP
+            // stalls with its queued segments still holding memory. A 576
+            // byte MTU keeps every segment, ours and the MSS peers are told
+            // to use, under 600 bytes.
+            esp_netif_tcpip_exec([](void* ctx) -> esp_err_t {
+                auto* nif = static_cast<struct netif*>(esp_netif_get_netif_impl(static_cast<esp_netif_t*>(ctx)));
+                if (nif) nif->mtu = k_small_heap_mtu;
+                return ESP_OK;
+            }, self->sta_netif_);
+        }
         // With both an AP and a station interface, lwIP must route everything
         // that is not on the AP subnet through the uplink, whatever joined last.
         if (self->sta_netif_) esp_netif_set_default_netif(self->sta_netif_);
         ESP_LOGI(TAG, "station got ip " IPSTR " (default route)", IP2STR(&ev->ip_info.ip));
     }
 
+    // Networks with several APs under one name: the station joins the
+    // strongest, not the first one a scan finds
+    void fill_station_config(wifi_config_t& cfg) const {
+        std::strncpy(reinterpret_cast<char*>(cfg.sta.ssid), config_.ssid.c_str(), sizeof(cfg.sta.ssid));
+        std::strncpy(reinterpret_cast<char*>(cfg.sta.password), config_.password.c_str(), sizeof(cfg.sta.password));
+        cfg.sta.scan_method = WIFI_ALL_CHANNEL_SCAN;
+        cfg.sta.sort_method = WIFI_CONNECT_AP_BY_SIGNAL;
+        cfg.sta.failure_retry_cnt = 2;
+    }
+
+    void start_roam_scan() {
+        wifi_scan_config_t sc = {};
+        sc.ssid = reinterpret_cast<uint8_t*>(const_cast<char*>(config_.ssid.c_str()));
+        roam_scan_ = true;
+        if (esp_wifi_scan_start(&sc, false) != ESP_OK) {
+            roam_scan_ = false;
+            rearm_roam_later();
+        }
+    }
+
+    // Leaving the AP makes the station rejoin the strongest one
+    void finish_roam_scan() {
+        wifi_ap_record_t current = {};
+        if (esp_wifi_sta_get_ap_info(&current) != ESP_OK) {
+            esp_wifi_clear_ap_list();
+            return;
+        }
+        wifi_ap_record_t rec = {};
+        wifi_ap_record_t best = {};
+        bool found = false;
+        while (esp_wifi_scan_get_ap_record(&rec) == ESP_OK) {
+            if (std::memcmp(rec.bssid, current.bssid, sizeof(rec.bssid)) == 0) continue;
+            if (!found || rec.rssi > best.rssi) { best = rec; found = true; }
+        }
+        esp_wifi_clear_ap_list();
+        if (found && best.rssi >= current.rssi + k_roam_margin_db) {
+            ESP_LOGI(TAG, "roaming: AP on channel %u at %d dBm, this one on channel %u at %d dBm",
+                     best.primary, best.rssi, current.primary, current.rssi);
+            esp_wifi_disconnect();
+            return;
+        }
+        rearm_roam_later();
+    }
+
+    void rearm_roam_later() {
+        if (!roam_timer_) {
+            esp_timer_create_args_t args = {};
+            args.callback = [](void*) { esp_wifi_set_rssi_threshold(k_roam_rssi); };
+            args.name = "k32_roam";
+            if (esp_timer_create(&args, &roam_timer_) != ESP_OK) return;
+        }
+        esp_timer_stop(roam_timer_);
+        esp_timer_start_once(roam_timer_, k_roam_retry_us);
+    }
+
     bool start_station() override {
         if (!sta_netif_) return false;
 
         wifi_config_t wifi_cfg = {};
-        std::strncpy(reinterpret_cast<char*>(wifi_cfg.sta.ssid), config_.ssid.c_str(), sizeof(wifi_cfg.sta.ssid));
-        std::strncpy(reinterpret_cast<char*>(wifi_cfg.sta.password), config_.password.c_str(), sizeof(wifi_cfg.sta.password));
+        fill_station_config(wifi_cfg);
 
         esp_wifi_set_mode(WIFI_MODE_STA);
         esp_wifi_set_config(WIFI_IF_STA, &wifi_cfg);
@@ -144,8 +231,7 @@ public:
         ap_cfg.ap.max_connection = 4;
         ap_cfg.ap.authmode = WIFI_AUTH_WPA2_PSK;
         wifi_config_t sta_cfg = {};
-        std::strncpy(reinterpret_cast<char*>(sta_cfg.sta.ssid), config_.ssid.c_str(), sizeof(sta_cfg.sta.ssid));
-        std::strncpy(reinterpret_cast<char*>(sta_cfg.sta.password), config_.password.c_str(), sizeof(sta_cfg.sta.password));
+        fill_station_config(sta_cfg);
         esp_wifi_set_mode(WIFI_MODE_APSTA);
         esp_wifi_set_config(WIFI_IF_AP, &ap_cfg);
         esp_wifi_set_config(WIFI_IF_STA, &sta_cfg);
@@ -196,6 +282,8 @@ private:
     NetworkMode mode_{NetworkMode::Disconnected};
     bool connected_{false};
     volatile bool sta_has_ip_{false};
+    volatile bool roam_scan_{false};
+    esp_timer_handle_t roam_timer_{nullptr};
 };
 
 #else // Host Simulation (POSIX)

@@ -26,6 +26,13 @@ CONFIG_ESP_WIFI_MGMT_SBUF_NUM=8
 # CONFIG_ESP_WIFI_AMPDU_RX_ENABLED is not set
 CONFIG_LWIP_TCP_SND_BUF_DEFAULT=5760
 CONFIG_LWIP_TCP_WND_DEFAULT=5760
+# Out-of-order segments hold Wi-Fi RX buffers until the gap is filled; few per
+# connection, released soon, so they cannot take every buffer and stall RX
+CONFIG_LWIP_TCP_OOSEQ_MAX_PBUFS=2
+CONFIG_LWIP_TCP_OOSEQ_TIMEOUT=3
+# Received segments a socket holds before its application reads them; each
+# keeps a Wi-Fi RX buffer. Four full size segments are a whole TCP window.
+CONFIG_LWIP_TCP_RECVMBOX_SIZE=4
 CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ_240=y
 CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ=240
 # CONFIG_ESP_TASK_WDT_CHECK_IDLE_TASK_CPU1 is not set

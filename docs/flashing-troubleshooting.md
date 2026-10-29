@@ -30,7 +30,7 @@ Profile commands write to the `k32` NVS namespace, return `K32_OK ..., rebooting
 
 | Command | Effect |
 | --- | --- |
-| `K32_CMD:WIFI:<ssid>:<password>` | Join a 2.4 GHz network as a station. The SSID cannot contain `:`. `K32_CMD:WIFI:` erases credentials. |
+| `K32_CMD:WIFI:<ssid>:<password>` | Join a 2.4 GHz network as a station. The station picks the strongest access point with that name and roams to one at least 10 dB stronger when signal drops below -70 dBm. The SSID cannot contain `:`. `K32_CMD:WIFI:` erases credentials. |
 | `K32_CMD:API:<host>` | Set the control plane address for a worker, default `192.168.4.1`. `auto` erases it. |
 | `K32_CMD:AP:off` | Disable the `Kube32-Cluster` access point on the control plane. `on` erases the setting. |
 | `K32_CMD:BOARD:cardputer` | Enable the Cardputer display, keypad, speaker, and microSD. `display` is an alias. `generic` erases it. |
