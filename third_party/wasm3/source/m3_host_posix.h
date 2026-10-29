@@ -25,6 +25,8 @@
 #include <sys/stat.h>
 #include <unistd.h>
 #include <signal.h>
+#include <pthread.h>        // the per-thread signal stack is released by a key destructor
+#include <stdlib.h>
 #include <errno.h>
 #include <time.h>
 
@@ -475,14 +477,38 @@ bool install_guard_handlers (void)
 // A stack for the handler to run on, so that a fault which happens because the
 // thread's own stack ran out still has somewhere to be handled. One per thread, and
 // only where the thread has not already been given one.
+//
+// It comes from the heap rather than a thread-local array: glibc carves static TLS
+// out of every thread's stack, so 64KiB of it made pthread_create fail with EINVAL
+// for any thread whose stack was not much larger. A key destructor disables and
+// frees it when the thread exits.
+static pthread_key_t  g_altStackKey;
+static pthread_once_t g_altStackOnce = PTHREAD_ONCE_INIT;
+
+static
+void release_alt_stack (void* i_stack)
+{
+    stack_t off;
+    off.ss_sp = NULL;
+    off.ss_size = 0;
+    off.ss_flags = SS_DISABLE;
+    sigaltstack(&off, NULL);
+    free(i_stack);
+}
+
+static
+void create_alt_stack_key (void)
+{
+    pthread_key_create(&g_altStackKey, release_alt_stack);
+}
+
 static
 void install_alt_stack (void)
 {
-    // A fixed size rather than SIGSTKSZ, which recent glibc made a call to sysconf
-    // and so no longer something an array can be declared with. 64KiB is well over
-    // what any of these handlers need - the claimed path is a siglongjmp, and the
-    // unclaimed one is a call to whatever was there before.
-    static M3_THREAD_LOCAL u8   stack[64 * 1024];
+    // A fixed size rather than SIGSTKSZ, which recent glibc made a call to sysconf.
+    // 64KiB is well over what any of these handlers need - the claimed path is a
+    // siglongjmp, and the unclaimed one is a call to whatever was there before.
+    const size_t size = 64 * 1024;
     static M3_THREAD_LOCAL bool installed;
 
     if (installed) {
@@ -495,12 +521,22 @@ void install_alt_stack (void)
         return;                          // this thread already has one
     }
 
+    u8* stack = (u8*) malloc(size);
+    if (not stack) {
+        return;
+    }
+
     stack_t alt;
     alt.ss_sp = stack;
-    alt.ss_size = sizeof(stack);
+    alt.ss_size = size;
     alt.ss_flags = 0;
 
-    sigaltstack(&alt, NULL);
+    if (sigaltstack(&alt, NULL) != 0) {
+        free(stack);
+        return;
+    }
+    pthread_once(&g_altStackOnce, create_alt_stack_key);
+    pthread_setspecific(g_altStackKey, stack);
 }
 
 bool m3_HostGuardsActive (void)
