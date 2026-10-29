@@ -20,12 +20,15 @@
 # telemetry and publishes its traffic once a second on tessera.events for
 # the HUD.
 #
+# Each pod runs under a single-replica Deployment that replaces deleted or
+# evicted pods. Recreate stops the old pod before starting the new one.
+#
 # An empty card is an empty tracker. For the sample data run
 # `make -C apps/tessera dataset` and copy apps/tessera/build/card/kube32 to
 # the root of the card. Deploy with:
 #   kubectl --context kube32 apply -f examples/tessera.yaml
-apiVersion: v1
-kind: Pod
+apiVersion: apps/v1
+kind: Deployment
 metadata:
   name: tessera-db
   namespace: default
@@ -33,72 +36,98 @@ metadata:
     app: tessera
     tier: db
 spec:
-  nodeSelector:
-    kube32.io/board: cardputer
-  restartPolicy: Always
-  volumes:
-    - name: data
-      persistentVolumeClaim:
-        claimName: tessera-db          # -> /sd/kube32/volumes/tessera-db/
-  containers:
-    - name: db
-      image: wasm://embedded/tessera-db:v1
-      ports:
-        - containerPort: 7000
-          name: http
-      resources:
-        requests:
-          memory: 8Ki                  # linear memory: 0.75 KiB stack, 4.2 KiB data, 3 KiB for request blocks
-          hardware.kube32.io/sd: "1"
-        limits:
-          memory: 8Ki
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: tessera
+      tier: db
+  template:
+    metadata:
+      labels:
+        app: tessera
+        tier: db
+    spec:
+      nodeSelector:
+        kube32.io/board: cardputer
+      restartPolicy: Always
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: tessera-db          # -> /sd/kube32/volumes/tessera-db/
+      containers:
+        - name: db
+          image: wasm://embedded/tessera-db:v1
+          ports:
+            - containerPort: 7000
+              name: http
+          resources:
+            requests:
+              memory: 8Ki                  # linear memory: 0.75 KiB stack, 4.2 KiB data, 3 KiB for request blocks
+              hardware.kube32.io/sd: "1"
+            limits:
+              memory: 8Ki
 ---
-apiVersion: v1
-kind: Pod
+apiVersion: apps/v1
+kind: Deployment
 metadata:
   name: tessera-api
   namespace: default
   labels:
     app: tessera
     tier: api
-  annotations:
-    # Unmetered: the API's heaviest calls finish sooner without gas accounting
-    kube32.io/execution-budget: "off"
-    # Keypad input published by tessera-hud arrives in k32_event
-    kube32.io/event-topics: tessera.input
 spec:
-  nodeSelector:
-    node-role.kubernetes.io/control-plane: ""
-  restartPolicy: Always
-  containers:
-    - name: api
-      image: wasm://embedded/tessera-api:v1
-      ports:
-        - containerPort: 7000
-          name: http
-      env:
-        - name: TESSERA_DB_URL
-          value: "http://tessera-db"
-        - name: MAX_ISSUES
-          value: "2900"
-        - name: MAX_COMMENTS
-          value: "5300"
-        - name: EPOCH_BASE_MS
-          value: "1793059200000"
-      resources:
-        requests:
-          memory: 48Ki                 # internal SRAM for the interpreter and stacks
-          esp32.io/psram: 1280Ki       # Wasm linear memory lives in external PSRAM
-          hardware.kube32.io/ipc: "1"
-        limits:
-          memory: 48Ki
-          esp32.io/psram: 1280Ki
-      securityContext:
-        capabilities:
-          add: ["CHANNEL_IPC", "SERVICE_CALL"]
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: tessera
+      tier: api
+  template:
+    metadata:
+      labels:
+        app: tessera
+        tier: api
+      annotations:
+        # Unmetered: the API's heaviest calls finish sooner without gas accounting
+        kube32.io/execution-budget: "off"
+        # Keypad input published by tessera-hud arrives in k32_event
+        kube32.io/event-topics: tessera.input
+    spec:
+      nodeSelector:
+        node-role.kubernetes.io/control-plane: ""
+      restartPolicy: Always
+      containers:
+        - name: api
+          image: wasm://embedded/tessera-api:v1
+          ports:
+            - containerPort: 7000
+              name: http
+          env:
+            - name: TESSERA_DB_URL
+              value: "http://tessera-db"
+            - name: MAX_ISSUES
+              value: "2900"
+            - name: MAX_COMMENTS
+              value: "5300"
+            - name: EPOCH_BASE_MS
+              value: "1793059200000"
+          resources:
+            requests:
+              memory: 16Ki                 # internal SRAM for the pod's own structures (about 4 KiB)
+              esp32.io/psram: 1280Ki       # Wasm linear memory lives in external PSRAM
+              hardware.kube32.io/ipc: "1"
+            limits:
+              memory: 16Ki
+              esp32.io/psram: 1280Ki
+          securityContext:
+            capabilities:
+              add: ["CHANNEL_IPC", "SERVICE_CALL"]
 ---
-apiVersion: v1
-kind: Pod
+apiVersion: apps/v1
+kind: Deployment
 metadata:
   name: tessera-web
   namespace: default
@@ -106,57 +135,83 @@ metadata:
     app: tessera
     tier: web
 spec:
-  nodeSelector:
-    node-role.kubernetes.io/control-plane: ""
-  restartPolicy: Always
-  containers:
-    - name: web
-      image: wasm://embedded/tessera-web:v1
-      ports:
-        - containerPort: 7000
-          name: http
-      resources:
-        requests:
-          memory: 4Ki                  # linear memory: 0.5 KiB stack and data, the rest for request blocks
-        limits:
-          memory: 4Ki
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: tessera
+      tier: web
+  template:
+    metadata:
+      labels:
+        app: tessera
+        tier: web
+    spec:
+      nodeSelector:
+        node-role.kubernetes.io/control-plane: ""
+      restartPolicy: Always
+      containers:
+        - name: web
+          image: wasm://embedded/tessera-web:v1
+          ports:
+            - containerPort: 7000
+              name: http
+          resources:
+            requests:
+              memory: 4Ki                  # linear memory: 0.5 KiB stack and data, the rest for request blocks
+            limits:
+              memory: 4Ki
 ---
-apiVersion: v1
-kind: Pod
+apiVersion: apps/v1
+kind: Deployment
 metadata:
   name: tessera-hud
   namespace: default
   labels:
     app: tessera
     tier: hud
-  annotations:
-    # Issue events and the ingress's stats lines arrive in k32_event
-    kube32.io/event-topics: tessera.events
 spec:
-  nodeSelector:
-    kube32.io/board: cardputer
-  restartPolicy: Always
-  containers:
-    - name: hud
-      image: wasm://embedded/tessera-hud:v1
-      env:
-        - name: HUD_TITLE
-          value: "TESSERA"
-        # Silent by default. For beeps on new issues set HUD_SOUND to "1" and
-        # add hardware.kube32.io/speaker: "1" and the SPEAKER capability.
-        - name: HUD_SOUND
-          value: "0"
-      resources:
-        requests:
-          memory: 1Ki                  # linear memory: 256-byte stack, 0.5 KiB data
-          hardware.kube32.io/tft-display: "1"
-          hardware.kube32.io/keyboard: "1"
-          hardware.kube32.io/ipc: "1"
-        limits:
-          memory: 1Ki
-      securityContext:
-        capabilities:
-          add: ["CHANNEL_IPC", "DISPLAY", "KEYBOARD"]
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: tessera
+      tier: hud
+  template:
+    metadata:
+      labels:
+        app: tessera
+        tier: hud
+      annotations:
+        # Issue events and the ingress's stats lines arrive in k32_event
+        kube32.io/event-topics: tessera.events
+    spec:
+      nodeSelector:
+        kube32.io/board: cardputer
+      restartPolicy: Always
+      containers:
+        - name: hud
+          image: wasm://embedded/tessera-hud:v1
+          env:
+            - name: HUD_TITLE
+              value: "TESSERA"
+            # Silent by default. For beeps on new issues set HUD_SOUND to "1" and
+            # add hardware.kube32.io/speaker: "1" and the SPEAKER capability.
+            - name: HUD_SOUND
+              value: "0"
+          resources:
+            requests:
+              memory: 1Ki                  # linear memory: 256-byte stack, 0.5 KiB data
+              hardware.kube32.io/tft-display: "1"
+              hardware.kube32.io/keyboard: "1"
+              hardware.kube32.io/ipc: "1"
+            limits:
+              memory: 1Ki
+          securityContext:
+            capabilities:
+              add: ["CHANNEL_IPC", "DISPLAY", "KEYBOARD"]
 ---
 apiVersion: v1
 kind: Service

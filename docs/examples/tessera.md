@@ -4,7 +4,7 @@ Tessera is a multi-pod issue tracker with a kanban board, filterable issue list,
 
 ## Architecture
 
-Four WebAssembly pods, three Services, and an Ingress make up the application (`examples/tessera.yaml`):
+The application (`examples/tessera.yaml`) consists of four WebAssembly pods (each under a single-replica Deployment), three Services, and an Ingress. The Deployment replaces deleted or evicted pods, and its `Recreate` strategy stops the old pod before starting the new one so a node never holds two copies:
 
 ```mermaid
 flowchart LR
@@ -28,7 +28,7 @@ flowchart LR
 | Pod | Node | Memory limit | Role |
 | --- | --- | --- | --- |
 | `tessera-web` | Control plane | `4Ki` | Serves the single-page web client from `images/web/tessera-web/` via `k32_resp_asset` (`apps/tessera/web`). |
-| `tessera-api` | Control plane | `48Ki` SRAM, `1280Ki` PSRAM | Holds the in-memory store and search index. Answers `/api/*` requests (`apps/tessera/api`). Runs with `kube32.io/execution-budget: "off"`. |
+| `tessera-api` | Control plane | `16Ki` SRAM, `1280Ki` PSRAM | Holds the in-memory store and search index. Answers `/api/*` requests (`apps/tessera/api`). Runs with `kube32.io/execution-budget: "off"`. |
 | `tessera-db` | Cardputer | `8Ki` | Store of record (`apps/tessera/db`). Appends and reads records on the microSD volume claim `tessera-db` (`/sd/kube32/volumes/tessera-db/`). |
 | `tessera-hud` | Cardputer | `1Ki` | `k32_tick`/`k32_event` pod (`apps/tessera/hud`). Subscribes to `tessera.events` via `kube32.io/event-topics`, draws open issues, request rate, and viewer count on the LCD, and reads the keypad. |
 
