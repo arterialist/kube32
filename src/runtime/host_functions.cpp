@@ -1,4 +1,5 @@
 #include "runtime/host_functions.hpp"
+#include "runtime/container_lifecycle.hpp"
 #include "hal/capability_firewall.hpp"
 #include "hal/mock_hal.hpp"
 #include "osal/system.hpp"
@@ -13,11 +14,11 @@
 #include <iostream>
 #include <cstring>
 
+#include "hal/pod_buses.hpp"
+
 #if defined(KUBE32_TARGET_ESP32)
 #include "driver/gpio.h"
 #include "esp_adc/adc_oneshot.h"
-#include "driver/i2c.h"
-#include "driver/uart.h"
 #endif
 
 namespace kube32::runtime {
@@ -141,6 +142,8 @@ static const void* raw_esp32_adc_read(IM3Runtime runtime, IM3ImportContext _ctx,
 }
 
 // esp32_i2c_write: signature "i(iiii)" -> returns int32_t, args: (bus, addr, data_offset, len)
+// Bytes written, or a negative error. len 0 probes the address: 0 when a
+// device acknowledges, -19 (ENODEV) when none does.
 static const void* raw_esp32_i2c_write(IM3Runtime runtime, IM3ImportContext _ctx, uint64_t* _sp, void* _mem) {
     uint32_t bus         = static_cast<uint32_t>(_sp[1]);
     uint32_t addr        = static_cast<uint32_t>(_sp[2]);
@@ -160,15 +163,7 @@ static const void* raw_esp32_i2c_write(IM3Runtime runtime, IM3ImportContext _ctx
     }
 
     const uint8_t* host_data = static_cast<const uint8_t*>(_mem) + data_offset;
-
-#if defined(KUBE32_TARGET_ESP32)
-    esp_err_t err = i2c_master_write_to_device(static_cast<i2c_port_t>(bus), static_cast<uint8_t>(addr), host_data, len, pdMS_TO_TICKS(100));
-    *reinterpret_cast<int32_t*>(_sp) = (err == ESP_OK) ? static_cast<int32_t>(len) : hal::HAL_ERR_IO;
-#else
-    int32_t res = hal::MockHal::instance().i2c_write(bus, static_cast<uint8_t>(addr), host_data, len);
-    *reinterpret_cast<int32_t*>(_sp) = res;
-#endif
-
+    *reinterpret_cast<int32_t*>(_sp) = (addr > 0x7f) ? hal::HAL_ERR_INVAL : hal::i2c_bus_write(bus, static_cast<uint8_t>(addr), host_data, len);
     return m3Err_none;
 }
 
@@ -192,15 +187,7 @@ static const void* raw_esp32_i2c_read(IM3Runtime runtime, IM3ImportContext _ctx,
     }
 
     uint8_t* host_buf = static_cast<uint8_t*>(_mem) + buf_offset;
-
-#if defined(KUBE32_TARGET_ESP32)
-    esp_err_t err = i2c_master_read_from_device(static_cast<i2c_port_t>(bus), static_cast<uint8_t>(addr), host_buf, len, pdMS_TO_TICKS(100));
-    *reinterpret_cast<int32_t*>(_sp) = (err == ESP_OK) ? static_cast<int32_t>(len) : hal::HAL_ERR_IO;
-#else
-    int32_t res = hal::MockHal::instance().i2c_read(bus, static_cast<uint8_t>(addr), host_buf, len);
-    *reinterpret_cast<int32_t*>(_sp) = res;
-#endif
-
+    *reinterpret_cast<int32_t*>(_sp) = (addr > 0x7f) ? hal::HAL_ERR_INVAL : hal::i2c_bus_read(bus, static_cast<uint8_t>(addr), host_buf, len);
     return m3Err_none;
 }
 
@@ -223,15 +210,7 @@ static const void* raw_esp32_uart_write(IM3Runtime runtime, IM3ImportContext _ct
     }
 
     const uint8_t* host_data = static_cast<const uint8_t*>(_mem) + data_offset;
-
-#if defined(KUBE32_TARGET_ESP32)
-    int bytes = uart_write_bytes(static_cast<uart_port_t>(port), host_data, len);
-    *reinterpret_cast<int32_t*>(_sp) = (bytes >= 0) ? bytes : hal::HAL_ERR_IO;
-#else
-    int32_t res = hal::MockHal::instance().uart_write(port, host_data, len);
-    *reinterpret_cast<int32_t*>(_sp) = res;
-#endif
-
+    *reinterpret_cast<int32_t*>(_sp) = hal::uart_port_write(port, host_data, len);
     return m3Err_none;
 }
 
@@ -254,15 +233,7 @@ static const void* raw_esp32_uart_read(IM3Runtime runtime, IM3ImportContext _ctx
     }
 
     uint8_t* host_buf = static_cast<uint8_t*>(_mem) + buf_offset;
-
-#if defined(KUBE32_TARGET_ESP32)
-    int bytes = uart_read_bytes(static_cast<uart_port_t>(port), host_buf, max_len, pdMS_TO_TICKS(50));
-    *reinterpret_cast<int32_t*>(_sp) = (bytes >= 0) ? bytes : hal::HAL_ERR_IO;
-#else
-    int32_t res = hal::MockHal::instance().uart_read(port, host_buf, max_len);
-    *reinterpret_cast<int32_t*>(_sp) = res;
-#endif
-
+    *reinterpret_cast<int32_t*>(_sp) = hal::uart_port_read(port, host_buf, max_len, 50);
     return m3Err_none;
 }
 
@@ -276,13 +247,22 @@ static const void* raw_esp32_get_time_us(IM3Runtime runtime, IM3ImportContext _c
     return m3Err_none;
 }
 
+// Waits are cut into slices. A container being stopped leaves the call
+// within one slice with the same trap the stop raises in guest code, so its
+// thread ends instead of waiting out the call.
+static constexpr uint32_t kWaitSliceMs = 20;
+
 // esp32_delay_ms: signature "v(i)" -> returns void, args: (ms)
 static const void* raw_esp32_delay_ms(IM3Runtime runtime, IM3ImportContext _ctx, uint64_t* _sp, void* _mem) {
-    (void)runtime;
     (void)_ctx;
     (void)_mem;
     uint32_t ms = static_cast<uint32_t>(_sp[0]);
-    osal::Thread::sleep_ms(ms);
+    while (ms > 0) {
+        if (runtime_stop_requested(runtime)) return m3Err_trapOutOfGas;
+        uint32_t slice = ms < kWaitSliceMs ? ms : kWaitSliceMs;
+        osal::Thread::sleep_ms(slice);
+        ms -= slice;
+    }
     osal::System::feed_watchdog();
     return m3Err_none;
 }
@@ -354,7 +334,14 @@ static const void* raw_kube32_channel_recv(IM3Runtime runtime, IM3ImportContext 
     }
 
     uint8_t* buf = static_cast<uint8_t*>(_mem) + buf_offset;
-    int32_t recvd = ipc::ChannelManager::instance().recv(pod_id, handle, buf, max_len, timeout_ms);
+    int32_t recvd = ipc::ChannelManager::instance().recv(pod_id, handle, buf, max_len, timeout_ms < kWaitSliceMs ? timeout_ms : kWaitSliceMs);
+    uint32_t waited = kWaitSliceMs;
+    while (recvd == ipc::IPC_ERR_TIMEDOUT && waited < timeout_ms) {
+        if (runtime_stop_requested(runtime)) return m3Err_trapOutOfGas;
+        uint32_t slice = (timeout_ms - waited) < kWaitSliceMs ? (timeout_ms - waited) : kWaitSliceMs;
+        recvd = ipc::ChannelManager::instance().recv(pod_id, handle, buf, max_len, slice);
+        waited += slice;
+    }
     *reinterpret_cast<int32_t*>(_sp) = recvd;
     return m3Err_none;
 }
@@ -478,39 +465,19 @@ int32_t esp32_adc_read(uint32_t channel) {
 }
 
 int32_t esp32_i2c_write(uint32_t bus, uint8_t addr, const uint8_t* data, uint32_t len) {
-#if defined(KUBE32_TARGET_ESP32)
-    esp_err_t err = i2c_master_write_to_device(static_cast<i2c_port_t>(bus), addr, data, len, pdMS_TO_TICKS(100));
-    return (err == ESP_OK) ? static_cast<int32_t>(len) : hal::HAL_ERR_IO;
-#else
-    return hal::MockHal::instance().i2c_write(bus, addr, data, len);
-#endif
+    return hal::i2c_bus_write(bus, addr, data, len);
 }
 
 int32_t esp32_i2c_read(uint32_t bus, uint8_t addr, uint8_t* buf, uint32_t len) {
-#if defined(KUBE32_TARGET_ESP32)
-    esp_err_t err = i2c_master_read_from_device(static_cast<i2c_port_t>(bus), addr, buf, len, pdMS_TO_TICKS(100));
-    return (err == ESP_OK) ? static_cast<int32_t>(len) : hal::HAL_ERR_IO;
-#else
-    return hal::MockHal::instance().i2c_read(bus, addr, buf, len);
-#endif
+    return hal::i2c_bus_read(bus, addr, buf, len);
 }
 
 int32_t esp32_uart_write(uint32_t port, const uint8_t* data, uint32_t len) {
-#if defined(KUBE32_TARGET_ESP32)
-    int bytes = uart_write_bytes(static_cast<uart_port_t>(port), data, len);
-    return (bytes >= 0) ? bytes : hal::HAL_ERR_IO;
-#else
-    return hal::MockHal::instance().uart_write(port, data, len);
-#endif
+    return hal::uart_port_write(port, data, len);
 }
 
 int32_t esp32_uart_read(uint32_t port, uint8_t* buf, uint32_t max_len) {
-#if defined(KUBE32_TARGET_ESP32)
-    int bytes = uart_read_bytes(static_cast<uart_port_t>(port), buf, max_len, pdMS_TO_TICKS(50));
-    return (bytes >= 0) ? bytes : hal::HAL_ERR_IO;
-#else
-    return hal::MockHal::instance().uart_read(port, buf, max_len);
-#endif
+    return hal::uart_port_read(port, buf, max_len, 50);
 }
 
 int64_t esp32_get_time_us() {

@@ -1315,6 +1315,7 @@ d_m3Op(MemGrow)
             M3Result r = ResizeMemory(runtime, memory, requiredPages);
             if (r) {
                 _r0 = -1;
+                runtime->lastMemoryGrowError = r;
             }
 
             _mem = memory->mallocated;
@@ -1344,11 +1345,14 @@ d_m3Op(MemGrow64)
     if (M3_LIKELY(numPagesToGrow)) {
         // maxPages is never below the current size, so the difference cannot
         // wrap; asking for more than it is a request nothing could satisfy
-        if (numPagesToGrow <= memory->maxPages - numPages and
-            not ResizeMemory(runtime, memory, numPages + numPagesToGrow)) {
+        M3Result r = (numPagesToGrow <= memory->maxPages - numPages)
+                       ? ResizeMemory(runtime, memory, numPages + numPagesToGrow)
+                       : m3Err_wasmMemoryOverflow;
+        if (not r) {
             _r0 = (m3reg_t)numPages;
         } else {
             _r0 = -1;
+            runtime->lastMemoryGrowError = r;
         }
 
         _mem = memory->mallocated;
@@ -1945,7 +1949,7 @@ d_m3Op(Entry)
         forwardTrap(r);
 #endif // d_m3EntryKeepsFrame
     } else {
-        newTrap(m3Err_trapStackOverflow);
+        newTrap(m3Err_trapWasmStackOverflow);
     }
 }
 
@@ -3610,7 +3614,7 @@ d_m3Op(Entry_Suspendable)
 
         nextOpDirect();
     } else {
-        newTrap(m3Err_trapStackOverflow);
+        newTrap(m3Err_trapWasmStackOverflow);
     }
 }
 #  endif

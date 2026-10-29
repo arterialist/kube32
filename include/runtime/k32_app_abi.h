@@ -22,8 +22,15 @@
  * k32_resp_header() zero or more times, then k32_resp_write() any number
  * of times, then k32_resp_end(). The host streams the body with HTTP
  * chunked transfer encoding, so the guest never needs a buffer for the
- * whole response. If k32_handle() returns without calling
- * k32_resp_begin() the host replies 500.
+ * whole response. Headers set before k32_resp_begin() (or before
+ * k32_resp_asset()) are kept and sent with the response; setting a name to
+ * an empty value before the response starts withdraws the headers of that
+ * name set so far (names compare without case). If k32_handle() returns
+ * without a response the host replies 500.
+ *
+ * Pod annotation kube32.io/wasm-stack (e.g. "2Ki", 512 bytes to 64Ki) sets
+ * the module's operand stack, by default 4 KiB for pods of at most one page;
+ * a pod that exhausts it traps with exit code 139 and a message naming it.
  */
 #ifndef KUBE32_APP_ABI_H
 #define KUBE32_APP_ABI_H
@@ -41,6 +48,15 @@ extern "C" {
 #define K32_EXPORT_TICK    "k32_tick"    /* int32 k32_tick(uint32 uptime_ms)  optional  */
 #define K32_EXPORT_EVENT   "k32_event"   /* int32 k32_event(uint32 topic_ptr, uint32 topic_len, uint32 ptr, uint32 len) optional */
 
+/* k32_event receives every message published on the channel topics listed in
+ * the pod's annotation kube32.io/event-topics (comma separated), from any
+ * node:
+ *
+ *   metadata:
+ *     annotations:
+ *       kube32.io/event-topics: myapp.input,myapp.events
+ */
+
 /* Return codes for k32_handle: an HTTP status (100..599) after a complete
  * response was produced, or a negative error. */
 #define K32_HANDLE_ERR_NO_RESPONSE   (-1)
@@ -50,7 +66,8 @@ extern "C" {
 #define K32_OK               0
 #define K32_ERR_PERM        (-1)    /* capability not granted to this pod            */
 #define K32_ERR_NOENT       (-2)    /* no such file or directory                     */
-#define K32_ERR_IO          (-5)    /* card I/O error                                 */
+#define K32_ERR_IO          (-5)    /* I/O error: the card, or the connection to a remote pod */
+#define K32_ERR_TOOBIG      (-7)    /* response body larger than the buffer (E2BIG)   */
 #define K32_ERR_BADF        (-9)    /* fd not open, or opened for the other direction */
 #define K32_ERR_AGAIN       (-11)
 #define K32_ERR_NOMEM       (-12)
@@ -62,6 +79,8 @@ extern "C" {
 #define K32_ERR_MFILE       (-24)   /* 4 files already open (per pod or node-wide)    */
 #define K32_ERR_NOSPC       (-28)   /* card full                                      */
 #define K32_ERR_NAMETOOLONG (-36)   /* path longer than K32_FS_MAX_PATH               */
+#define K32_ERR_LOOP        (-40)   /* the call would re-enter a pod already serving it (ELOOP) */
+#define K32_ERR_TIMEOUT     (-110)  /* no answer within the timeout (ETIMEDOUT)       */
 
 /* ---- Pod storage (microSD volume) -------------------------------------
  * A pod gets a directory of its own on the node's microSD card when its
@@ -70,7 +89,7 @@ extern "C" {
  *   spec:
  *     volumes:
  *       - name: data
- *         kube32.io/sd: { claim: tessera }      # -> /sd/kube32/volumes/tessera/
+ *         kube32.io/sd: { claim: notes }        # -> /sd/kube32/volumes/notes/
  *     containers:
  *       - resources:
  *           requests: { hardware.kube32.io/sd: "1" }
@@ -111,7 +130,7 @@ K32_IMPORT("k32_resp_write")  int32_t k32_resp_write(const void* data, uint32_t 
 K32_IMPORT("k32_resp_end")    void    k32_resp_end(void);
 
 /* Publish an event on a cluster virtual channel (ESP-NOW on hardware).
- * topic is the channel name, e.g. "tessera.events". Requires the
+ * topic is the channel name, e.g. "myapp.events". Requires the
  * CHANNEL_IPC capability. Returns bytes sent or a negative error. */
 K32_IMPORT("k32_event_emit")  int32_t k32_event_emit(const char* topic, uint32_t topic_len, const void* data, uint32_t len);
 
@@ -120,6 +139,44 @@ K32_IMPORT("k32_log")         void    k32_log(const char* msg, uint32_t len);
 K32_IMPORT("k32_random")      uint32_t k32_random(void);      /* hardware RNG on ESP32 */
 K32_IMPORT("k32_env_get")     int32_t k32_env_get(const char* key, uint32_t key_len, char* out, uint32_t out_cap); /* value length, or -1 */
 K32_IMPORT("k32_mem_stats")   int32_t k32_mem_stats(uint32_t* out_used, uint32_t* out_limit);
+
+/* Sends a file from this pod's image bundle as the response to the current
+ * request. path is relative to the bundle root ("index.html", "js/app.js").
+ * The host prefers the .gz variant when the client accepts gzip, sets
+ * Content-Type from the extension, streams the file from flash (or the card)
+ * without copying it into linear memory, and keeps headers set earlier with
+ * k32_resp_header. status 0 means 200. Returns 0 once the response is sent,
+ * or K32_ERR_NOENT (no such file): then nothing was sent and the headers set
+ * earlier are still pending, so the guest can answer itself (a 404, say).
+ *
+ * The bundle of an embedded image <name> is images/web/<name>/ in the
+ * firmware; the bundle of wasm://sd/<name> is the directory
+ * kube32/images/<name>/ on the card. A file stored only gzip-compressed is
+ * answered 406 to a client that does not accept gzip. */
+K32_IMPORT("k32_resp_asset")  int32_t k32_resp_asset(const char* path, uint32_t path_len, uint32_t status);
+
+/* Synchronous HTTP request to a Service in the cluster.
+ * url: "http://<service>[.<namespace>][:<port>]<path>"; the namespace
+ * defaults to the caller's and the port to the Service's first port.
+ * headers: optional "Name: value\r\n" lines. The response body is copied
+ * into resp up to resp_cap; *resp_len receives the number of bytes copied.
+ * Returns the HTTP status, or a negative error:
+ *   K32_ERR_NOENT    no such Service, or no ready pod behind it
+ *   K32_ERR_TIMEOUT  no complete answer within timeout_ms (0: 5000 ms)
+ *   K32_ERR_TOOBIG   the body is larger than resp_cap (the first resp_cap
+ *                    bytes are copied)
+ *   K32_ERR_LOOP     the target pod is already serving this call chain
+ *                    (a pod calling itself, or a cycle across pods)
+ *   K32_ERR_IO       the pod's node could not be reached
+ *   K32_ERR_PERM     the pod lacks the SERVICE_CALL capability:
+ *                      securityContext: { capabilities: { add: [SERVICE_CALL] } }
+ * A pod on the same node is called in-process; others are reached through
+ * their node's pod HTTP server. The calling pod is suspended (its thread
+ * blocks) until the answer arrives. Request headers the target sees:
+ * Content-Type, Cookie, X-Request-Id and Accept-Encoding. */
+K32_IMPORT("k32_http_call")   int32_t k32_http_call(const char* method, uint32_t method_len, const char* url, uint32_t url_len,
+                                                    const char* headers, uint32_t headers_len, const uint8_t* body, uint32_t body_len,
+                                                    uint8_t* resp, uint32_t resp_cap, uint32_t* resp_len, uint32_t timeout_ms);
 
 /* ---- Hardware imports, gated by the capability firewall ---------------
  * The pod manifest must request the matching resource:
@@ -141,6 +198,26 @@ K32_IMPORT("k32_fs_close")  int32_t k32_fs_close(int32_t fd);                   
 K32_IMPORT("k32_fs_size")   int32_t k32_fs_size(int32_t fd);                                            /* file size in bytes or error */
 K32_IMPORT("k32_fs_list")   int32_t k32_fs_list(const char* dir, uint32_t dir_len, char* out, uint32_t out_cap); /* bytes written: "name\n" per entry, directories end in "/" */
 K32_IMPORT("k32_fs_remove") int32_t k32_fs_remove(const char* path, uint32_t path_len);                 /* 0 or error; removes a file or an empty directory */
+
+/* ---- I2C and UART, gated by the capability firewall --------------------
+ * The pod claims a bus as a resource and may name its pins in an annotation
+ * (the board's default pins otherwise):
+ *
+ *   metadata:
+ *     annotations:
+ *       kube32.io/i2c-bus-0: "sda=8,scl=9,hz=100000"
+ *       kube32.io/uart-1: "tx=17,rx=18,baud=115200"
+ *   spec:
+ *     containers:
+ *       - resources:
+ *           requests: { esp32.io/i2c-bus-0: "1", esp32.io/uart-1: "1" }
+ *
+ * The node installs the driver on those pins while the pod runs. Calls on a
+ * bus the pod did not claim return K32_ERR_PERM. */
+K32_IMPORT("esp32_i2c_write")  int32_t esp32_i2c_write(uint32_t bus, uint32_t addr, const void* data, uint32_t len); /* bytes written; len 0 probes the address: 0 = a device answered, K32_ERR_NODEV = none */
+K32_IMPORT("esp32_i2c_read")   int32_t esp32_i2c_read(uint32_t bus, uint32_t addr, void* buf, uint32_t len);         /* bytes read or error */
+K32_IMPORT("esp32_uart_write") int32_t esp32_uart_write(uint32_t port, const void* data, uint32_t len);              /* bytes queued or error */
+K32_IMPORT("esp32_uart_read")  int32_t esp32_uart_read(uint32_t port, void* buf, uint32_t max_len);                  /* bytes received within 50 ms, or error */
 
 /* Existing low-level imports (see host_functions.cpp) remain available:
  * esp32_gpio_set_mode, esp32_gpio_write, esp32_gpio_read, esp32_adc_read,

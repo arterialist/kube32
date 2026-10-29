@@ -35,7 +35,14 @@ struct ContainerStatus {
 struct DeploySpec {
     uint32_t memory_limit_bytes{64 * 1024};
     uint32_t stack_size_bytes{16 * 1024};
+    bool stack_size_set{false};                     // stack_size_bytes given by the pod (kube32.io/wasm-stack): used as is
     std::vector<std::pair<std::string, std::string>> env;
+    uint64_t gas_budget_per_call{4000000000ULL};   // 0: no metering (see ContainerConfig)
+    std::vector<std::string> event_topics;          // channel topics delivered to k32_event
+    // Bundle files the pod may send with k32_resp_asset: an embedded bundle
+    // (images/web/<name>/) or a directory on node storage
+    std::string asset_bundle;
+    std::string asset_directory;
 };
 
 // Abstract Runtime Interface conforming to PROJECT.md § 4.3
@@ -60,6 +67,9 @@ public:
     virtual bool pause(const std::string& pod_id) = 0;
     virtual bool terminate(const std::string& pod_id) = 0;
     virtual ContainerStatus get_status(const std::string& pod_id) = 0;
+    // Frees containers whose stop had to wait for a host call to return, once
+    // it has (called periodically by the kubelet).
+    virtual void reap_stopped() {}
 };
 
 class WasmRuntime : public Runtime {
@@ -73,6 +83,9 @@ public:
     bool pause(const std::string& pod_id) override;
     bool terminate(const std::string& pod_id) override;
     ContainerStatus get_status(const std::string& pod_id) override;
+    void reap_stopped() override;
+    // Stopped containers whose thread has not ended yet
+    size_t lingering_count() const;
 
     // Extended runtime management operations
     bool resume(const std::string& pod_id);

@@ -646,7 +646,13 @@ M3Result EvaluateExpression (IM3Module i_module, void* o_expressed, m3type_t i_t
     IM3Runtime savedRuntime = i_module->runtime;
     i_module->runtime       = &runtime;
 
-    IM3Compilation o   = &runtime.compilation;
+    IM3Compilation o   = m3_AllocStruct(M3Compilation);
+    if (not o) {
+        i_module->runtime = savedRuntime;
+        runtime.originStack = NULL;
+        Runtime_Release(&runtime);
+        return m3Err_mallocFailed;
+    }
     o->runtime         = &runtime;
     o->module          = i_module;
     o->wasm            = *io_bytes;
@@ -716,6 +722,7 @@ M3Result EvaluateExpression (IM3Module i_module, void* o_expressed, m3type_t i_t
     i_module->runtime = savedRuntime;
 
     *io_bytes = o->wasm;
+    m3_Free(o);
 
     return result;
 }
@@ -1085,12 +1092,16 @@ M3Result ResizeMemory (IM3Runtime io_runtime, IM3Memory memory, u64 i_numPages)
                  numPageBytes > (u64)d_m3MaxLinearMemoryPages * d_m3DefaultMemPageSize);
 #endif
 
-        // Limit the amount of memory that gets actually allocated
-        if (io_runtime->memoryLimit) {
-            numPageBytes = M3_MIN(numPageBytes, (u64)io_runtime->memoryLimit);
+        u64 oldLength = memory->mallocated ? memory->mallocated->length : 0;
+
+        // Limit the amount of memory that gets actually allocated. A memory
+        // already holding the whole limit cannot grow: memory.grow past it
+        // fails (-1) instead of reporting pages that have nothing behind them.
+        if (io_runtime->memoryLimit and numPageBytes > (u64)io_runtime->memoryLimit) {
+            _throwif(m3Err_memoryLimitExceeded, oldLength >= (u64)io_runtime->memoryLimit);
+            numPageBytes = (u64)io_runtime->memoryLimit;
         }
 
-        u64 oldLength = memory->mallocated ? memory->mallocated->length : 0;
         u64 otherUsed = io_runtime->memoryBytesUsed - oldLength;
         _throwif(m3Err_memoryLimitExceeded, io_runtime->memoryBytesLimit and
                                               (numPageBytes > io_runtime->memoryBytesLimit or
@@ -1139,7 +1150,7 @@ M3Result ResizeMemory (IM3Runtime io_runtime, IM3Memory memory, u64 i_numPages)
         // whole limit again on every grow past it.
         size_t numPreviousBytes = memory->mallocated ? memory->mallocated->length + sizeof(M3MemoryHeader) : 0;
 
-        void* newMem = m3_Realloc("Wasm Linear Memory", memory->mallocated, numBytes, numPreviousBytes);
+        void* newMem = m3_ReallocLinear_Impl(memory->mallocated, numBytes, numPreviousBytes);
         _throwifnull(newMem);
 
         memory->mallocated = (M3MemoryHeader*)newMem;

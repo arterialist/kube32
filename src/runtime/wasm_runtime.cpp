@@ -8,6 +8,7 @@
 #include "runtime/k32_app_abi.h"
 #include "osal/mutex.hpp"
 
+#include <iostream>
 #include <map>
 #include <vector>
 
@@ -16,6 +17,18 @@ namespace kube32::runtime {
 struct WasmRuntime::Impl {
     mutable osal::Mutex mutex;
     std::map<std::string, std::unique_ptr<ContainerLifecycleController>> containers;
+    // Stopped while the guest was inside a host call: kept until the thread
+    // ends, then destroyed, which frees its stack and the module's memory.
+    std::vector<std::unique_ptr<ContainerLifecycleController>> lingering;
+
+    void reap_locked() {
+        for (auto it = lingering.begin(); it != lingering.end();) {
+            if ((*it)->lingering()) { ++it; continue; }
+            const std::string pod_id = (*it)->config().pod_id;
+            it = lingering.erase(it);
+            std::cout << "[RUNTIME] " << pod_id << ": thread ended, memory released" << std::endl;
+        }
+    }
 };
 
 WasmRuntime::WasmRuntime() : impl_(std::make_unique<Impl>()) {}
@@ -53,19 +66,23 @@ bool WasmRuntime::deploy_workload_owned(const std::string& pod_id, std::vector<u
 bool WasmRuntime::deploy_impl(const std::string& pod_id, const uint8_t* wasm_bytes, size_t len, std::vector<uint8_t>* owned, const DeploySpec& spec, std::string& out_error) {
     out_error.clear();
     osal::LockGuard guard(impl_->mutex);
+    impl_->reap_locked();   // memory a stopped container held may be free now
 
     ContainerConfig config;
     config.pod_id = pod_id;
     config.container_name = pod_id;
     config.memory_limit_bytes = (spec.memory_limit_bytes > 0) ? spec.memory_limit_bytes : (64 * 1024);
     config.stack_size_bytes = (spec.stack_size_bytes > 0) ? spec.stack_size_bytes : (8 * 1024);
-    if (config.memory_limit_bytes <= 64 * 1024 && config.stack_size_bytes > 4 * 1024) {
+    if (!spec.stack_size_set && config.memory_limit_bytes <= 64 * 1024 && config.stack_size_bytes > 4 * 1024) {
         config.stack_size_bytes = 4 * 1024; // one-page pods are small programs
     }
     config.restart_policy = RestartPolicy::Always;
     config.env = spec.env;
+    config.gas_budget_per_call = spec.gas_budget_per_call;
 
     AppPodHost::instance().set_env(pod_id, spec.env);
+    AppPodHost::instance().set_event_topics(pod_id, spec.event_topics);
+    AppPodHost::instance().set_assets(pod_id, AppAssetSource{spec.asset_bundle, spec.asset_directory});
 
     const uint64_t t_load = osal::Thread::get_time_us();
 #if defined(ESP_PLATFORM)
@@ -143,6 +160,13 @@ bool WasmRuntime::restart(const std::string& pod_id) {
 
 bool WasmRuntime::terminate(const std::string& pod_id) {
     std::unique_ptr<ContainerLifecycleController> target;
+    {
+        // Host calls the pod is blocked in return early from here on, also
+        // the in-flight call unregister_pod waits for
+        osal::LockGuard guard(impl_->mutex);
+        auto it = impl_->containers.find(pod_id);
+        if (it != impl_->containers.end()) it->second->request_stop();
+    }
     AppPodHost::instance().unregister_pod(pod_id);
     PodFs::instance().release_pod(pod_id);
     {
@@ -152,7 +176,21 @@ bool WasmRuntime::terminate(const std::string& pod_id) {
         target = std::move(it->second);
         impl_->containers.erase(it);
     }
-    return target->stop(1000);
+    bool ok = target->stop(1000);
+    osal::LockGuard guard(impl_->mutex);
+    if (target->lingering()) impl_->lingering.push_back(std::move(target));
+    impl_->reap_locked();
+    return ok;
+}
+
+void WasmRuntime::reap_stopped() {
+    osal::LockGuard guard(impl_->mutex);
+    impl_->reap_locked();
+}
+
+size_t WasmRuntime::lingering_count() const {
+    osal::LockGuard guard(impl_->mutex);
+    return impl_->lingering.size();
 }
 
 ContainerStatus WasmRuntime::get_status(const std::string& pod_id) {

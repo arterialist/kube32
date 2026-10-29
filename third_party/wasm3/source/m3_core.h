@@ -320,6 +320,8 @@ uint64_t m3_GetTimestamp ();
 void  m3_Abort (const char* message);
 void* m3_Malloc_Impl (size_t i_size);
 void* m3_Realloc_Impl (void* i_ptr, size_t i_newSize, size_t i_oldSize);
+// Kube32: linear memory, which may come from the pod pool (pod_memory_pool.h)
+void* m3_ReallocLinear_Impl (void* i_ptr, size_t i_newSize, size_t i_oldSize);
 void  m3_Free_Impl (void* i_ptr);
 void* m3_CopyMem (const void* i_from, size_t i_size);
 

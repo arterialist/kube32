@@ -140,6 +140,11 @@ void* m3_Realloc_Impl (void* i_ptr, size_t i_newSize, size_t i_oldSize)
     return newPtr;
 }
 
+void* m3_ReallocLinear_Impl (void* i_ptr, size_t i_newSize, size_t i_oldSize)
+{
+    return m3_Realloc_Impl(i_ptr, i_newSize, i_oldSize);
+}
+
 #else
 
 // Kube32: large allocations (linear memory) may come from a block reserved at
@@ -148,15 +153,26 @@ extern void*  kube32_pool_alloc(size_t bytes);
 extern int    kube32_pool_owns(const void* ptr);
 extern int    kube32_pool_free(void* ptr);
 extern size_t kube32_pool_block_size(void);
+extern size_t kube32_pool_whole_capacity(void);
 extern void*  kube32_rt_calloc(size_t bytes);
+extern void*  kube32_pool_sub_alloc(size_t bytes);
 extern void*  kube32_rt_realloc(void* ptr, size_t bytes);
 extern void   kube32_rt_free(void* ptr);
 
 void* m3_Malloc_Impl (size_t i_size)
 {
-    void* pooled = kube32_pool_alloc(i_size);
-    if (pooled) return pooled;
     return kube32_rt_calloc(i_size);
+}
+
+// Linear memory: its first allocation may take the pool's block; nothing
+// else does (a runtime structure as large as a pod's memory must not)
+void* m3_ReallocLinear_Impl (void* i_ptr, size_t i_newSize, size_t i_oldSize)
+{
+    if (!i_ptr) {
+        void* pooled = kube32_pool_alloc(i_newSize);
+        if (pooled) return pooled;
+    }
+    return m3_Realloc_Impl(i_ptr, i_newSize, i_oldSize);
 }
 
 void m3_Free_Impl (void* io_ptr)
@@ -172,10 +188,10 @@ void* m3_Realloc_Impl (void* i_ptr, size_t i_newSize, size_t i_oldSize)
     }
 
     if (!i_ptr) {
-        return m3_Malloc_Impl(i_newSize);   // first allocation of a linear memory: try the pool
+        return m3_Malloc_Impl(i_newSize);
     }
     if (kube32_pool_owns(i_ptr)) {
-        if (i_newSize <= kube32_pool_block_size()) {
+        if (i_newSize <= kube32_pool_whole_capacity()) {
             if (i_newSize > i_oldSize) memset((u8*)i_ptr + i_oldSize, 0x0, i_newSize - i_oldSize);
             return i_ptr;
         }
@@ -187,6 +203,15 @@ void* m3_Realloc_Impl (void* i_ptr, size_t i_newSize, size_t i_oldSize)
     }
 
     void* newPtr = kube32_rt_realloc(i_ptr, i_newSize);
+
+    if (M3_UNLIKELY(!newPtr)) {
+        // No block of that size in the general heap: the pod pool's shared part
+        newPtr = kube32_pool_sub_alloc(i_newSize);
+        if (newPtr) {
+            memcpy(newPtr, i_ptr, i_oldSize < i_newSize ? i_oldSize : i_newSize);
+            kube32_rt_free(i_ptr);
+        }
+    }
 
     if (M3_LIKELY(newPtr)) {
         if (i_newSize > i_oldSize) {
@@ -345,12 +370,13 @@ void* m3_NativeStackLimit (void* i_stackPtr, size_t i_budget)
 {
     u8* sp = (u8*)i_stackPtr;
 
-#  if M3_HAS_THREAD_LOCAL
+#  if M3_HAS_THREAD_LOCAL && !defined(ESP_PLATFORM)
     static M3_THREAD_LOCAL u8* base = NULL;
     if (base == NULL) {
         base = (u8*)m3_HostStackBase();
     }
 #  else
+    // Kube32 (ESP32): asked every time, a call may run on a borrowed stack
     u8* base = (u8*)m3_HostStackBase();
 #  endif
 

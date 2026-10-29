@@ -2,11 +2,12 @@
 
 // Pod storage: the host side of the k32_fs_* imports (see k32_app_abi.h).
 //
-// A pod granted hardware.kube32.io/sd owns one directory on the card,
-// <sd root>/kube32/volumes/<claim>/, named by its spec.volumes claim. Every
-// call checks the CapabilityFirewall, then runs plain POSIX file operations
-// through the VFS (FATFS on the board, the KUBE32_SD_ROOT directory on the
-// host), so firmware and simulator share this code.
+// A pod with a volume claim (spec.volumes: persistentVolumeClaim, or
+// kube32.io/sd for one that must be on the microSD card) owns one directory
+// on the node's storage root, <root>/kube32/volumes/<claim>/ (see
+// hal/node_storage.hpp). Every call checks the CapabilityFirewall, then runs
+// plain POSIX file operations through the VFS (FATFS on the board, host
+// directories in the simulator), so firmware and simulator share this code.
 
 #include <cstdint>
 #include <cstddef>
@@ -39,7 +40,8 @@ public:
     // success `out` is the cleaned path ("" allowed only when allow_empty).
     static bool validate_relative_path(std::string_view path, bool allow_empty, std::string& out);
 
-    // Absolute directory of a pod's volume, or "" without a grant / card.
+    // Absolute directory of a pod's volume, or "" without a claim, a storage
+    // root, or the card a kube32.io/sd volume needs.
     std::string volume_root(const std::string& pod_id) const;
 
 private:

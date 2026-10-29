@@ -1027,21 +1027,32 @@ M3Result Parse_InitExprTyped (M3Module* io_module, bytes_t* io_bytes, cbytes_t i
 
     // this doesn't generate code pages. just walks the wasm bytecode to find the end
 
+    // Kube32: the scratch state is on the heap; on a task stack of a few KB
+    // it would not fit at any useful function stack height
 #if defined(d_m3PreferStaticAlloc)
-    static M3Compilation compilation;
+    static M3Compilation compilation_storage;
+    IM3Compilation compilation = &compilation_storage;
+    memset(compilation, 0, sizeof(M3Compilation));
 #else
-    M3Compilation compilation;
+    IM3Compilation compilation = m3_AllocStruct(M3Compilation);
+    if (not compilation) return m3Err_mallocFailed;
 #endif
-    compilation = (M3Compilation){ .runtime = NULL, .module = io_module, .wasm = *io_bytes, .wasmEnd = i_end, .isInitExpr = true };
+    compilation->module     = io_module;
+    compilation->wasm       = *io_bytes;
+    compilation->wasmEnd    = i_end;
+    compilation->isInitExpr = true;
 
-    result = CompileBlockStatements(&compilation);
+    result = CompileBlockStatements(compilation);
 
-    *io_bytes = compilation.wasm;
+    *io_bytes = compilation->wasm;
 
     if (o_type) {
-        *o_type = compilation.stackIndex ? compilation.typeStack[compilation.stackIndex - 1]
-                                         : (m3type_t)c_m3Type_none;
+        *o_type = compilation->stackIndex ? compilation->typeStack[compilation->stackIndex - 1]
+                                          : (m3type_t)c_m3Type_none;
     }
+#if !defined(d_m3PreferStaticAlloc)
+    m3_Free(compilation);
+#endif
 
     return result;
 }

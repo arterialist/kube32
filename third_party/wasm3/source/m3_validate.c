@@ -1677,21 +1677,23 @@ static M3Result v_validate_body (ValCtx * v)
 
 // ---------- Public entry point ----------
 
+static M3Result  ValidateFunctionWith  (ValCtx* v, IM3Function i_function);
+
+// Kube32: the context is scratch for one function, not kept in the runtime
 M3Result  ValidateFunction  (IM3Function i_function)
 {
     if (!i_function->wasm) return m3Err_none;
+    ValCtx* v = m3_AllocStruct (ValCtx);
+    if (!v) return m3Err_mallocFailed;
+    M3Result r = ValidateFunctionWith(v, i_function);
+    m3_Free(v);
+    return r;
+}
 
+static M3Result  ValidateFunctionWith  (ValCtx* v, IM3Function i_function)
+{
     IM3FuncType funcType = i_function->funcType;
     IM3Module   module   = i_function->module;
-
-    IM3Runtime runtime = module->runtime;
-
-    ValCtx* v = runtime->validator;
-    if (!v) {
-        v = m3_AllocStruct (ValCtx);
-        if (!v) return m3Err_mallocFailed;
-        runtime->validator = v;
-    }
 
     memset(v, 0, sizeof(*v));
     v->module   = module;

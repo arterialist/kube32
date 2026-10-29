@@ -19,7 +19,7 @@
 namespace kube32::runtime {
 
 struct EmbeddedImage {
-    const char* name;      // registry key, e.g. "tessera-core"
+    const char* name;      // registry key, e.g. "my-app"
     const uint8_t* data;
     size_t len;
 };

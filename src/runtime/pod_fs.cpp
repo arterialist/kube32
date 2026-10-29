@@ -1,7 +1,7 @@
 #include "runtime/pod_fs.hpp"
 #include "runtime/k32_app_abi.h"
 #include "hal/capability_firewall.hpp"
-#include "hal/sd_card.hpp"
+#include "hal/node_storage.hpp"
 
 #include <cerrno>
 #include <cstring>
@@ -57,32 +57,34 @@ bool PodFs::validate_relative_path(std::string_view path, bool allow_empty, std:
     return true;
 }
 
-std::string PodFs::volume_root(const std::string& pod_id) const {
-    std::string claim = hal::CapabilityFirewall::instance().sd_claim(pod_id);
+// The volume's directory on the node storage root, "" without a claim, a
+// root, or the card the claim insists on.
+static std::string claim_root(const std::string& pod_id) {
+    const hal::CapabilityFirewall& fw = hal::CapabilityFirewall::instance();
+    std::string claim = fw.sd_claim(pod_id);
     if (claim.empty()) return std::string();
-    std::string root = hal::sd_root_path();
-    if (root.empty()) return std::string();
-    return root + "/kube32/volumes/" + claim;
+    hal::NodeStorageInfo si = hal::node_storage_info();
+    if (si.root.empty()) return std::string();
+    if (fw.volume_needs_card(pod_id) && si.medium != hal::StorageMedium::SdCard) return std::string();
+    return si.root + "/kube32/volumes/" + claim;
+}
+
+std::string PodFs::volume_root(const std::string& pod_id) const {
+    return claim_root(pod_id);
 }
 
 int32_t PodFs::resolve_root(const std::string& pod_id, std::string& out_root) {
     if (!hal::CapabilityFirewall::instance().check_permission(pod_id, hal::PeripheralType::SdCard, 0, hal::AccessMode::ReadWrite)) {
         return K32_ERR_PERM;
     }
-    std::string root = hal::sd_root_path();
-    if (root.empty()) return K32_ERR_NODEV;
-    std::string claim = hal::CapabilityFirewall::instance().sd_claim(pod_id);
-    if (claim.empty()) return K32_ERR_PERM;
-    out_root = root + "/kube32/volumes/" + claim;
+    if (hal::CapabilityFirewall::instance().sd_claim(pod_id).empty()) return K32_ERR_PERM;
+    out_root = claim_root(pod_id);
+    if (out_root.empty()) return K32_ERR_NODEV;
 
     std::lock_guard<std::mutex> lock(mutex_);
     Table& t = tables_[pod_id];
     if (!t.dir_ready) {
-        // mkdir -p <root>/kube32/volumes/<claim>; EEXIST is the normal case
-        const std::string steps[] = {root + "/kube32", root + "/kube32/volumes", out_root};
-        for (const auto& dir : steps) {
-            if (::mkdir(dir.c_str(), 0777) != 0 && errno != EEXIST) return errno_to_k32(errno);
-        }
+        if (!hal::node_storage_make_dirs(out_root)) return K32_ERR_IO;
         t.dir_ready = true;
     }
     return 0;
@@ -116,8 +118,9 @@ int32_t PodFs::open(const std::string& pod_id, std::string_view path, uint32_t f
     if (slot < 0) return K32_ERR_MFILE;
 
     std::string full = root + "/" + rel;
-    int fd = ::open(full.c_str(), oflags, 0666);
-    if (fd < 0) return errno_to_k32(errno);
+    int fd = -1, err = 0;
+    hal::node_storage_call([&]() { fd = ::open(full.c_str(), oflags, 0666); err = errno; });
+    if (fd < 0) return errno_to_k32(err);
     t.slots[slot].host_fd = fd;
     t.slots[slot].readable = (acc != K32_FS_O_WRONLY);
     t.slots[slot].writable = (acc != K32_FS_O_RDONLY);
@@ -134,8 +137,10 @@ int32_t PodFs::read(const std::string& pod_id, int32_t fd, uint8_t* buf, uint32_
     Slot& s = it->second.slots[fd];
     if (s.host_fd < 0 || !s.readable) return K32_ERR_BADF;
     if (len == 0) return 0;
-    ssize_t n = ::read(s.host_fd, buf, len);
-    if (n < 0) return errno_to_k32(errno);
+    ssize_t n = -1;
+    int err = 0;
+    hal::node_storage_call([&]() { n = ::read(s.host_fd, buf, len); err = errno; });
+    if (n < 0) return errno_to_k32(err);
     return static_cast<int32_t>(n);
 }
 
@@ -149,8 +154,10 @@ int32_t PodFs::write(const std::string& pod_id, int32_t fd, const uint8_t* buf, 
     Slot& s = it->second.slots[fd];
     if (s.host_fd < 0 || !s.writable) return K32_ERR_BADF;
     if (len == 0) return 0;
-    ssize_t n = ::write(s.host_fd, buf, len);
-    if (n < 0) return errno_to_k32(errno);
+    ssize_t n = -1;
+    int err = 0;
+    hal::node_storage_call([&]() { n = ::write(s.host_fd, buf, len); err = errno; });
+    if (n < 0) return errno_to_k32(err);
     return static_cast<int32_t>(n);
 }
 
@@ -162,9 +169,10 @@ int32_t PodFs::close(const std::string& pod_id, int32_t fd) {
     if (it == tables_.end()) return K32_ERR_BADF;
     Slot& s = it->second.slots[fd];
     if (s.host_fd < 0) return K32_ERR_BADF;
-    int rc = ::close(s.host_fd);
+    int rc = -1, err = 0;
+    hal::node_storage_call([&]() { rc = ::close(s.host_fd); err = errno; });
     s = Slot{};
-    return rc == 0 ? 0 : errno_to_k32(errno);
+    return rc == 0 ? 0 : errno_to_k32(err);
 }
 
 int32_t PodFs::size(const std::string& pod_id, int32_t fd) {
@@ -176,7 +184,9 @@ int32_t PodFs::size(const std::string& pod_id, int32_t fd) {
     Slot& s = it->second.slots[fd];
     if (s.host_fd < 0) return K32_ERR_BADF;
     struct stat st;
-    if (::fstat(s.host_fd, &st) != 0) return errno_to_k32(errno);
+    int rc = -1, err = 0;
+    hal::node_storage_call([&]() { rc = ::fstat(s.host_fd, &st); err = errno; });
+    if (rc != 0) return errno_to_k32(err);
     if (st.st_size > 0x7FFFFFFF) return 0x7FFFFFFF;
     return static_cast<int32_t>(st.st_size);
 }
@@ -190,8 +200,10 @@ int32_t PodFs::list(const std::string& pod_id, std::string_view dir, char* out, 
     if (cap > K32_FS_MAX_IO) cap = K32_FS_MAX_IO;
 
     std::string full = rel.empty() ? root : root + "/" + rel;
+    int32_t result = 0;
+    hal::node_storage_call([&]() {
     DIR* d = ::opendir(full.c_str());
-    if (!d) return errno_to_k32(errno);
+    if (!d) { result = errno_to_k32(errno); return; }
     uint32_t written = 0;
     while (struct dirent* e = ::readdir(d)) {
         const char* name = e->d_name;
@@ -215,7 +227,9 @@ int32_t PodFs::list(const std::string& pod_id, std::string_view dir, char* out, 
         out[written++] = '\n';
     }
     ::closedir(d);
-    return static_cast<int32_t>(written);
+    result = static_cast<int32_t>(written);
+    });
+    return result;
 }
 
 int32_t PodFs::remove(const std::string& pod_id, std::string_view path) {
@@ -225,10 +239,14 @@ int32_t PodFs::remove(const std::string& pod_id, std::string_view path) {
     int32_t rc = resolve_root(pod_id, root);
     if (rc != 0) return rc;
     std::string full = root + "/" + rel;
-    struct stat st;
-    if (::stat(full.c_str(), &st) != 0) return errno_to_k32(errno);
-    int r = S_ISDIR(st.st_mode) ? ::rmdir(full.c_str()) : ::unlink(full.c_str());
-    return r == 0 ? 0 : errno_to_k32(errno);
+    int r = -1, err = 0;
+    hal::node_storage_call([&]() {
+        struct stat st;
+        if (::stat(full.c_str(), &st) != 0) { err = errno; return; }
+        r = S_ISDIR(st.st_mode) ? ::rmdir(full.c_str()) : ::unlink(full.c_str());
+        err = errno;
+    });
+    return r == 0 ? 0 : errno_to_k32(err);
 }
 
 void PodFs::release_pod(const std::string& pod_id) {
@@ -236,7 +254,10 @@ void PodFs::release_pod(const std::string& pod_id) {
     auto it = tables_.find(pod_id);
     if (it == tables_.end()) return;
     for (auto& s : it->second.slots) {
-        if (s.host_fd >= 0) ::close(s.host_fd);
+        if (s.host_fd >= 0) {
+            int fd = s.host_fd;
+            hal::node_storage_call([fd]() { ::close(fd); });
+        }
         s = Slot{};
     }
     tables_.erase(it);

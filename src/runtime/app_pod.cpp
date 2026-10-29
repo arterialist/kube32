@@ -1,16 +1,23 @@
 #include "runtime/app_pod.hpp"
+#include "runtime/container_lifecycle.hpp"
 #include "runtime/pod_log.hpp"
 #include "runtime/pod_fs.hpp"
 #include "runtime/k32_app_abi.h"
 #include "hal/capability_firewall.hpp"
+#include "ipc/channel.hpp"
 #include "osal/system.hpp"
+#include "osal/thread.hpp"
 
 #include "wasm3.h"
 #include "m3_env.h"
+#include "m3_host.h"
 
+#include <algorithm>
+#include <cctype>
 #include <cstring>
 #include <cstdio>
 #include <mutex>
+#include <map>
 
 
 namespace kube32::runtime {
@@ -41,6 +48,28 @@ std::string encode_app_request(const AppRequest& req) {
     return out;
 }
 
+bool BufferResponseSink::write(const uint8_t* data, size_t len) {
+    if (len_ < cap_) {
+        size_t take = (cap_ - len_ < len) ? cap_ - len_ : len;
+        std::memcpy(buf_ + len_, data, take);
+        len_ += take;
+    }
+    total_ += len;
+    return true;   // the rest is counted (overflow), the guest goes on writing
+}
+
+// True when `pod` is one of the comma separated entries of `chain`
+static bool chain_contains(std::string_view chain, std::string_view pod) {
+    size_t start = 0;
+    while (start <= chain.size()) {
+        size_t end = chain.find(',', start);
+        if (end == std::string_view::npos) end = chain.size();
+        if (chain.substr(start, end - start) == pod) return true;
+        start = end + 1;
+    }
+    return false;
+}
+
 // -----------------------------------------------------------------------------
 // Platform hooks
 // -----------------------------------------------------------------------------
@@ -49,10 +78,45 @@ static bool s_verbose_requests = false;
 static std::mutex s_inflight_mutex;
 static std::string s_inflight;
 static uint64_t s_inflight_since = 0;
-static uint64_t s_gas_budget_per_call = 400ull * 1000ull * 1000ull;
 
 void set_app_request_logging(bool verbose) { s_verbose_requests = verbose; }
-void set_app_gas_budget(uint64_t units) { s_gas_budget_per_call = units; }
+
+// Every host-initiated entry (k32_init, k32_alloc, k32_handle, k32_tick,
+// k32_event) gets a fresh budget: a runaway call traps instead of pinning the
+// pod, and no call runs on what an earlier call left over.
+// wasm3 charges 45-120 units per ordinary instruction and 10,000 per
+// indirect call; the budget is per pod (ContainerConfig::gas_budget_per_call).
+static void arm_call_budget(ContainerLifecycleController* ctrl) {
+#if d_m3HasGasMetering
+    IM3Runtime rt = ctrl ? static_cast<IM3Runtime>(ctrl->m3_runtime_handle()) : nullptr;
+    if (!rt || ctrl->config().gas_budget_per_call == 0) return;   // unmetered pod
+    uint64_t budget = ctrl->config().gas_budget_per_call;
+    m3_SetResourceLimit(rt, c_m3Limit_GasUnits, budget);
+#else
+    (void)ctrl;
+#endif
+}
+
+// Gas spent by the call that just returned; logs new per-pod peaks so the
+// budget can be sized from measurements (bounded output).
+static void note_call_cost(ContainerLifecycleController* ctrl, const char* fn) {
+#if d_m3HasGasMetering
+    IM3Runtime rt = ctrl ? static_cast<IM3Runtime>(ctrl->m3_runtime_handle()) : nullptr;
+    if (!rt || ctrl->config().gas_budget_per_call == 0) return;
+    uint64_t used = m3_GetResourceUsage(rt, c_m3Limit_GasUnits);
+    static std::map<std::string, uint64_t> s_peak;
+    static int s_logged = 0;
+    uint64_t& peak = s_peak[ctrl->config().pod_id];
+    if (used > peak + peak / 4 && s_logged < 24) {
+        s_logged++;
+        printf("[POD] %s: new peak call cost %llu gas units in %s (budget %llu)\n", ctrl->config().pod_id.c_str(),
+               (unsigned long long)used, fn, (unsigned long long)m3_GetResourceLimit(rt, c_m3Limit_GasUnits));
+    }
+    if (used > peak) peak = used;
+#else
+    (void)ctrl; (void)fn;
+#endif
+}
 
 void set_app_platform_hooks(AppPlatformHooks hooks) {
     s_hooks = std::move(hooks);
@@ -72,7 +136,21 @@ struct CallContext {
     bool ended{false};
     int status{0};
     bool write_failed{false};
+    bool accepts_gzip{false};
+    std::string chain;    // pods serving this request, this one last (service calls)
+    std::vector<std::pair<std::string, std::string>> pending_headers;   // set before the response began
 };
+
+static constexpr size_t kMaxPendingHeaders = 8;
+
+// Starts the response: status line, then the headers the guest set earlier
+static void begin_response(CallContext* c, int status, std::string_view ctype) {
+    c->began = true;
+    c->status = status;
+    c->sink->begin(status, ctype);
+    for (const auto& h : c->pending_headers) c->sink->header(h.first, h.second);
+    c->pending_headers.clear();
+}
 
 static std::mutex s_ctx_mutex;
 static std::map<const void*, CallContext*> s_ctx_by_runtime;
@@ -110,9 +188,7 @@ static const void* raw_resp_begin(IM3Runtime rt, IM3ImportContext, uint64_t* sp,
     if (len > 0 && len < 128 && guest_range_ok(mem, off, len)) {
         ctype = std::string_view(static_cast<const char*>(mem) + off, len);
     }
-    c->began = true;
-    c->status = status;
-    c->sink->begin(status, ctype);
+    begin_response(c, status, ctype);
     return m3Err_none;
 }
 
@@ -122,11 +198,32 @@ static const void* raw_resp_header(IM3Runtime rt, IM3ImportContext, uint64_t* sp
     uint32_t voff = static_cast<uint32_t>(sp[2]);
     uint32_t vlen = static_cast<uint32_t>(sp[3]);
     CallContext* c = ctx_for(rt);
-    if (!c || !c->sink || !c->began) return m3Err_none;
+    if (!c || !c->sink || c->ended) return m3Err_none;
     if (nlen == 0 || nlen > 64 || vlen > K32_MAX_HEADER_BYTES) return m3Err_none;
     if (!guest_range_ok(mem, noff, nlen) || !guest_range_ok(mem, voff, vlen)) return m3Err_none;
-    c->sink->header(std::string_view(static_cast<const char*>(mem) + noff, nlen),
-                    std::string_view(static_cast<const char*>(mem) + voff, vlen));
+    std::string_view name(static_cast<const char*>(mem) + noff, nlen);
+    std::string_view value(static_cast<const char*>(mem) + voff, vlen);
+    if (name.find_first_of("\r\n:") != std::string_view::npos || value.find_first_of("\r\n") != std::string_view::npos) return m3Err_none;
+    if (c->began) {
+        if (!value.empty()) c->sink->header(name, value);
+        return m3Err_none;
+    }
+    // Kept for k32_resp_begin or k32_resp_asset; an empty value withdraws
+    // the headers of that name set earlier (names compare without case)
+    auto same = [&](const std::string& n) {
+        if (n.size() != name.size()) return false;
+        for (size_t i = 0; i < n.size(); ++i) {
+            if (std::tolower(static_cast<unsigned char>(n[i])) != std::tolower(static_cast<unsigned char>(name[i]))) return false;
+        }
+        return true;
+    };
+    if (value.empty()) {
+        c->pending_headers.erase(std::remove_if(c->pending_headers.begin(), c->pending_headers.end(),
+                                                [&](const std::pair<std::string, std::string>& h) { return same(h.first); }),
+                                 c->pending_headers.end());
+    } else if (c->pending_headers.size() < kMaxPendingHeaders) {
+        c->pending_headers.emplace_back(std::string(name), std::string(value));
+    }
     return m3Err_none;
 }
 
@@ -246,6 +343,77 @@ static const void* raw_mem_stats(IM3Runtime rt, IM3ImportContext, uint64_t* sp, 
     return m3Err_none;
 }
 
+// k32_resp_asset(path, path_len, status) -> 0 or K32_ERR_*
+static const void* raw_resp_asset(IM3Runtime rt, IM3ImportContext ictx, uint64_t* sp, void* mem) {
+    uint32_t off = static_cast<uint32_t>(sp[1]);
+    uint32_t len = static_cast<uint32_t>(sp[2]);
+    uint32_t status = static_cast<uint32_t>(sp[3]);
+    int32_t& ret = *reinterpret_cast<int32_t*>(sp);
+    CallContext* c = ctx_for(rt);
+    if (!c || !c->sink || c->began) { ret = K32_ERR_INVAL; return m3Err_none; }   // only as the whole response
+    if (len == 0 || len > K32_FS_MAX_PATH || !guest_range_ok(mem, off, len)) {
+        ret = (len > K32_FS_MAX_PATH) ? K32_ERR_NAMETOOLONG : K32_ERR_INVAL;
+        return m3Err_none;
+    }
+    if (status == 0) status = 200;
+    if (status < 100 || status > 599) { ret = K32_ERR_INVAL; return m3Err_none; }
+    AppAssetSource src = AppPodHost::instance().assets(pod_for(rt, ictx));
+    if (src.empty()) { ret = K32_ERR_NOENT; return m3Err_none; }
+    // The sink is driven directly: the CallContext only records that the
+    // response is complete
+    ret = send_bundle_file(src, std::string_view(static_cast<const char*>(mem) + off, len), static_cast<int>(status), c->accepts_gzip,
+                           c->pending_headers, *c->sink);
+    if (ret == 0) {
+        c->pending_headers.clear();
+        c->began = true;
+        c->ended = true;
+        c->status = static_cast<int>(status);
+    }
+    return m3Err_none;
+}
+
+// k32_http_call(method, method_len, url, url_len, headers, headers_len, body,
+//               body_len, resp, resp_cap, resp_len_ptr, timeout_ms) -> status or K32_ERR_*
+static const void* raw_http_call(IM3Runtime rt, IM3ImportContext ictx, uint64_t* sp, void* mem) {
+    uint32_t a[12];
+    for (int i = 0; i < 12; ++i) a[i] = static_cast<uint32_t>(sp[i + 1]);
+    int32_t& ret = *reinterpret_cast<int32_t*>(sp);
+    std::string pod_id = pod_for(rt, ictx);
+    if (!hal::CapabilityFirewall::instance().check_permission(pod_id, hal::PeripheralType::ServiceCall, 0, hal::AccessMode::ReadWrite)) {
+        ret = K32_ERR_PERM;
+        return m3Err_none;
+    }
+    const uint32_t mlen = a[1], ulen = a[3], hlen = a[5], blen = a[7], rcap = a[9];
+    if (mlen == 0 || mlen > 16 || ulen == 0 || ulen > 512 || hlen > 2048 || blen > K32_MAX_REQUEST_BYTES ||
+        !guest_range_ok(mem, a[0], mlen) || !guest_range_ok(mem, a[2], ulen) || !guest_range_ok(mem, a[4], hlen) ||
+        !guest_range_ok(mem, a[6], blen) || !guest_range_ok(mem, a[8], rcap) || !guest_range_ok(mem, a[10], 4)) {
+        ret = K32_ERR_FAULT;
+        return m3Err_none;
+    }
+    if (!s_hooks.service_call) { ret = K32_ERR_IO; return m3Err_none; }
+    const char* base = static_cast<const char*>(mem);
+    CallContext* c = ctx_for(rt);
+    std::string chain = c ? c->chain : pod_id;   // k32_init / k32_tick: the pod alone
+    ServiceCallRequest req;
+    req.caller_pod = pod_id;
+    req.method = std::string_view(base + a[0], mlen);
+    req.url = std::string_view(base + a[2], ulen);
+    req.headers = std::string_view(base + a[4], hlen);
+    req.body = std::string_view(base + a[6], blen);
+    req.call_chain = chain;
+    req.timeout_ms = a[11] ? (a[11] > 60000 ? 60000 : a[11]) : 5000;
+    req.caller_runtime = rt;
+    // The caller is suspended in this call, so its memory cannot move or grow
+    BufferResponseSink sink(static_cast<uint8_t*>(mem) + a[8], rcap);
+    int32_t rc = s_hooks.service_call(req, sink);
+    if (rc >= 0 && sink.overflow()) rc = K32_ERR_TOOBIG;
+    uint32_t copied = static_cast<uint32_t>(sink.copied());
+    std::memcpy(static_cast<uint8_t*>(mem) + a[10], &copied, 4);
+    ret = rc;
+    if (runtime_stop_requested(rt)) return m3Err_trapOutOfGas;   // being stopped: end the guest here
+    return m3Err_none;
+}
+
 // Hardware imports -------------------------------------------------------------
 static const void* raw_display_text(IM3Runtime rt, IM3ImportContext ictx, uint64_t* sp, void* mem) {
     int32_t x = static_cast<int32_t>(sp[1]);
@@ -315,6 +483,7 @@ static const void* raw_tone(IM3Runtime rt, IM3ImportContext ictx, uint64_t* sp, 
     uint32_t freq = static_cast<uint32_t>(sp[1]);
     uint32_t ms = static_cast<uint32_t>(sp[2]);
     uint32_t vol = static_cast<uint32_t>(sp[3]);
+    if (runtime_stop_requested(rt)) return m3Err_trapOutOfGas;   // being stopped: end here, no new sound
     if (ms > 2000) ms = 2000;
     if (vol > 100) vol = 100;
     *reinterpret_cast<int32_t*>(sp) = s_hooks.tone ? s_hooks.tone(freq, ms, vol) : hal::HAL_ERR_NODEV;
@@ -424,6 +593,8 @@ void link_app_host_functions(IM3Module module, const std::string& pod_id) {
     m3_LinkRawFunction(module, "env", "k32_random",       "i()",        &raw_random);
     m3_LinkRawFunction(module, "env", "k32_env_get",      "i(iiii)",    &raw_env_get);
     m3_LinkRawFunction(module, "env", "k32_mem_stats",    "i(ii)",      &raw_mem_stats);
+    m3_LinkRawFunction(module, "env", "k32_resp_asset",   "i(iii)",     &raw_resp_asset);
+    m3_LinkRawFunction(module, "env", "k32_http_call",    "i(iiiiiiiiiiii)", &raw_http_call);
     m3_LinkRawFunction(module, "env", "k32_display_text", "i(iiiiii)",  &raw_display_text);
     m3_LinkRawFunction(module, "env", "k32_display_rect", "i(iiiii)",   &raw_display_rect);
     m3_LinkRawFunction(module, "env", "k32_display_bar",  "i(iiiiiii)", &raw_display_bar);
@@ -464,6 +635,133 @@ int32_t AppPodHost::env_get(const std::string& pod_id, std::string_view key, std
     return -1;
 }
 
+void AppPodHost::set_event_topics(const std::string& pod_id, const std::vector<std::string>& topics) {
+    osal::LockGuard guard(mutex_);
+    if (topics.empty()) event_topics_.erase(pod_id);
+    else event_topics_[pod_id] = topics;
+    sync_topic_subscriptions_locked();
+}
+
+void AppPodHost::sync_topic_subscriptions_locked() {
+    std::vector<std::string> wanted;
+    for (const auto& kv : event_topics_) {
+        auto pod = pods_.find(kv.first);
+        if (pod == pods_.end() || !pod->second.has_event) continue;
+        for (const auto& t : kv.second) {
+            if (std::find(wanted.begin(), wanted.end(), t) == wanted.end()) wanted.push_back(t);
+        }
+    }
+    for (auto it = topic_subs_.begin(); it != topic_subs_.end();) {
+        if (std::find(wanted.begin(), wanted.end(), it->first) == wanted.end()) {
+            ipc::ChannelManager::instance().unsubscribe(it->second);
+            it = topic_subs_.erase(it);
+        } else {
+            ++it;
+        }
+    }
+    for (const auto& t : wanted) {
+        if (topic_subs_.count(t)) continue;
+        // Runs on the channel dispatcher thread
+        topic_subs_[t] = ipc::ChannelManager::instance().subscribe(t, [this](std::string_view topic, uint32_t, const uint8_t* data, size_t len) {
+            deliver_topic(topic, data, len);
+        });
+    }
+    {
+        osal::LockGuard guard(event_mutex_);
+        event_thread_wanted_ = !wanted.empty();
+    }
+    if (wanted.empty()) event_cv_.notify_all();
+    else start_event_thread();
+}
+
+// Runs on the channel dispatcher thread, whose stack is too small for the
+// interpreter: the message is queued for the event thread.
+void AppPodHost::deliver_topic(std::string_view topic, const uint8_t* data, size_t len) {
+    std::vector<std::string> targets;
+    {
+        osal::LockGuard guard(mutex_);
+        for (const auto& kv : event_topics_) {
+            auto pod = pods_.find(kv.first);
+            if (pod == pods_.end() || !pod->second.has_event) continue;
+            for (const auto& t : kv.second) {
+                if (t == topic) { targets.push_back(kv.first); break; }
+            }
+        }
+    }
+    if (targets.empty() || len > K32_MAX_EVENT_BYTES) return;
+    {
+        osal::LockGuard guard(event_mutex_);
+        for (auto& id : targets) {
+            if (event_queue_.size() >= kMaxQueuedEvents) {
+                event_queue_.pop_front();   // a slow handler loses the oldest message, not the newest
+                if (events_dropped_++ < 4) printf("[POD] event queue full, dropping the oldest message\n");
+            }
+            event_queue_.push_back(PendingEvent{std::move(id), std::string(topic), std::string(reinterpret_cast<const char*>(data), len)});
+        }
+    }
+    start_event_thread();   // normally running already; retried here if it could not start
+    event_cv_.notify_one();
+}
+
+// The event thread runs while some pod subscribes to a topic: it is started
+// with the first subscription (so a pod that cannot get one fails visibly at
+// start, not message by message) and ends when the last one goes.
+void AppPodHost::start_event_thread() {
+    {
+        osal::LockGuard guard(event_mutex_);
+        if (event_thread_running_ || !event_thread_wanted_) return;
+        event_thread_running_ = true;
+    }
+    osal::Thread::Config cfg;
+    cfg.name = "k32_events";
+#if defined(ESP_PLATFORM)
+    const bool psram = osal::System::get_total_psram_bytes() > 0;
+    cfg.stack_size = event_stack_bytes_ ? event_stack_bytes_ : (psram ? 32768 : 16384);
+    cfg.stack_in_psram = event_stack_bytes_ ? event_stack_in_psram_ : psram;
+#else
+    cfg.stack_size = event_stack_bytes_ ? event_stack_bytes_ : 262144;
+#endif
+    cfg.priority = 4;
+    cfg.core_affinity = 1;
+    if (!osal::Thread::create([](void* self) { static_cast<AppPodHost*>(self)->event_thread_main(); }, this, cfg)) {
+        printf("[POD] cannot start the event thread (%u byte stack); queued messages wait for the next attempt\n", (unsigned)cfg.stack_size);
+        osal::LockGuard guard(event_mutex_);
+        event_thread_running_ = false;
+    }
+}
+
+void AppPodHost::event_thread_main() {
+    for (;;) {
+        PendingEvent ev;
+        {
+            osal::UniqueLock<osal::Mutex> lock(event_mutex_);
+            event_cv_.wait_for(lock, 1000, [this]() { return !event_queue_.empty() || !event_thread_wanted_; });
+            if (event_queue_.empty()) {
+                if (!event_thread_wanted_) {
+                    event_thread_running_ = false;
+                    return;
+                }
+                continue;
+            }
+            ev = std::move(event_queue_.front());
+            event_queue_.pop_front();
+        }
+        event(ev.pod_id, ev.topic, reinterpret_cast<const uint8_t*>(ev.data.data()), ev.data.size());
+        osal::System::feed_watchdog();
+    }
+}
+
+void AppPodHost::set_event_thread_stack(size_t bytes, bool in_psram) {
+    osal::LockGuard guard(event_mutex_);
+    event_stack_bytes_ = bytes;
+    event_stack_in_psram_ = in_psram;
+}
+
+uint64_t AppPodHost::events_dropped() const {
+    osal::LockGuard guard(event_mutex_);
+    return events_dropped_;
+}
+
 bool AppPodHost::register_pod(const std::string& pod_id, ContainerLifecycleController* ctrl) {
     if (!ctrl) return false;
     Entry e;
@@ -477,7 +775,20 @@ bool AppPodHost::register_pod(const std::string& pod_id, ContainerLifecycleContr
     e.call_mutex = std::make_unique<osal::Mutex>();
     osal::LockGuard guard(mutex_);
     pods_[pod_id] = std::move(e);
+    sync_topic_subscriptions_locked();
     return true;
+}
+
+void AppPodHost::set_assets(const std::string& pod_id, AppAssetSource src) {
+    osal::LockGuard guard(mutex_);
+    if (src.empty()) assets_.erase(pod_id);
+    else assets_[pod_id] = std::move(src);
+}
+
+AppAssetSource AppPodHost::assets(const std::string& pod_id) const {
+    osal::LockGuard guard(mutex_);
+    auto it = assets_.find(pod_id);
+    return it == assets_.end() ? AppAssetSource{} : it->second;
 }
 
 void AppPodHost::unregister_pod(const std::string& pod_id) {
@@ -490,6 +801,9 @@ void AppPodHost::unregister_pod(const std::string& pod_id) {
             pods_.erase(it);
         }
         env_.erase(pod_id);
+        assets_.erase(pod_id);
+        event_topics_.erase(pod_id);
+        sync_topic_subscriptions_locked();
     }
     if (hold) {
         // Wait for any in-flight call on this pod to finish before the mutex dies
@@ -555,18 +869,23 @@ int32_t AppPodHost::init_pod(const std::string& pod_id) {
     }
     if (!has_init) return 0;
     osal::LockGuard call_guard(*cm);
-    return ctrl->call_function(K32_EXPORT_INIT);
+    arm_call_budget(ctrl);
+    int32_t init_rc = ctrl->call_function(K32_EXPORT_INIT);
+    note_call_cost(ctrl, K32_EXPORT_INIT);
+    return init_rc;
 }
 
 // Copies a block into guest memory via k32_alloc and calls `fn(ptr,len)` or
 // `fn(topic_ptr, topic_len, ptr, len)` for events.
 int32_t AppPodHost::call_with_block(Entry& e, const std::string& pod_id, const char* fn, std::string_view topic,
-                                    const uint8_t* data, size_t len, AppResponseSink* sink) {
+                                    const uint8_t* data, size_t len, AppResponseSink* sink, const AppRequest* req) {
     ContainerLifecycleController* ctrl = e.ctrl;
     if (!e.has_alloc) return -1;
 
     uint32_t total = static_cast<uint32_t>(len + topic.size());
+    arm_call_budget(ctrl);
     int32_t ptr = ctrl->call_function(K32_EXPORT_ALLOC, {static_cast<int32_t>(total + 1)});
+    arm_call_budget(ctrl);   // the entry point itself gets a full budget too
     if (ptr <= 0) return -1;
 
     size_t mem_size = 0;
@@ -581,19 +900,25 @@ int32_t AppPodHost::call_with_block(Entry& e, const std::string& pod_id, const c
     CallContext ctx;
     ctx.pod_id = pod_id;
     ctx.sink = sink;
+    if (req) {
+        ctx.accepts_gzip = req->accepts_gzip;
+        ctx.chain.reserve(req->call_chain.size() + pod_id.size() + 1);
+        ctx.chain.assign(req->call_chain.data(), req->call_chain.size());
+        if (!ctx.chain.empty()) ctx.chain.push_back(',');
+    }
+    ctx.chain.append(pod_id);
     IM3Runtime rt = static_cast<IM3Runtime>(ctrl->m3_runtime_handle());
     {
         std::lock_guard<std::mutex> lock(s_ctx_mutex);
         s_ctx_by_runtime[rt] = &ctx;
     }
-#if d_m3HasGasMetering
-    // A runaway handler must not pin the pod forever: budget one call's work.
-    // 400M gas units is roughly 2-4 s of interpretation on a 240 MHz core.
-    if (rt) m3_SetResourceLimit(rt, c_m3Limit_GasUnits, s_gas_budget_per_call);
-#endif
     uint64_t t_call = osal::Thread::get_time_us();
+    std::string outer_inflight;   // a nested call (service call) restores its caller's entry
+    uint64_t outer_since = 0;
     {
         std::lock_guard<std::mutex> lk(s_inflight_mutex);
+        outer_inflight.swap(s_inflight);
+        outer_since = s_inflight_since;
         s_inflight.assign(fn);
         s_inflight.append(" ");
         s_inflight.append(reinterpret_cast<const char*>(data), len > 48 ? 48 : len);
@@ -610,6 +935,7 @@ int32_t AppPodHost::call_with_block(Entry& e, const std::string& pod_id, const c
         result = ctrl->call_function(fn, {ptr, static_cast<int32_t>(topic.size()),
                                           ptr + static_cast<int32_t>(topic.size()), static_cast<int32_t>(len)});
     }
+    note_call_cost(ctrl, fn);
 
     {
         std::lock_guard<std::mutex> lock(s_ctx_mutex);
@@ -618,7 +944,8 @@ int32_t AppPodHost::call_with_block(Entry& e, const std::string& pod_id, const c
     uint32_t call_us = static_cast<uint32_t>(osal::Thread::get_time_us() - t_call);
     {
         std::lock_guard<std::mutex> lk(s_inflight_mutex);
-        s_inflight.clear();
+        s_inflight.swap(outer_inflight);
+        s_inflight_since = outer_since;
     }
     if (s_verbose_requests || call_us > 2000000u) {
         printf("[APP] < %s %s rc=%d %u us\n", pod_id.c_str(), fn, (int)result, (unsigned)call_us);
@@ -640,35 +967,68 @@ int32_t AppPodHost::call_with_block(Entry& e, const std::string& pod_id, const c
 }
 
 int32_t AppPodHost::handle(const std::string& pod_id, const AppRequest& req, AppResponseSink& sink) {
+    return dispatch(pod_id, req, sink, 0, false);
+}
+
+int32_t AppPodHost::call_nested(const std::string& pod_id, const AppRequest& req, AppResponseSink& sink, uint32_t timeout_ms) {
+    return dispatch(pod_id, req, sink, timeout_ms ? timeout_ms : 1, true);
+}
+
+static void send_error(AppResponseSink& sink, int status, const char* body) {
+    sink.begin(status, "application/json");
+    sink.write(reinterpret_cast<const uint8_t*>(body), std::strlen(body));
+    sink.end();
+}
+
+int32_t AppPodHost::dispatch(const std::string& pod_id, const AppRequest& req, AppResponseSink& sink, uint32_t wait_ms, bool nested) {
     Entry* e = nullptr;
     osal::Mutex* cm = nullptr;
     {
         osal::LockGuard guard(mutex_);
         e = find_locked(pod_id);
-        if (!e || !e->has_handle) return -2;
+        if (!e || !e->has_handle) return nested ? K32_ERR_NOENT : -2;
         cm = e->call_mutex.get();
+    }
+    if (chain_contains(req.call_chain, pod_id)) {
+        // The pod is already serving this request further up the chain:
+        // entering it again would wait on itself
+        if (nested) return K32_ERR_LOOP;
+        send_error(sink, 508, "{\"error\":\"loop_detected\",\"message\":\"the pod is already serving this call chain\"}");
+        return 508;
+    }
+    if (nested) {
+        // The callee interprets on this thread's stack, below the caller
+        const uint8_t* base = static_cast<const uint8_t*>(m3_HostStackBase());
+        const uint8_t* here = static_cast<const uint8_t*>(__builtin_frame_address(0));
+        if (base && base < here && static_cast<size_t>(here - base) < nested_stack_reserve_) {
+            printf("[APP] %s: in-process call refused, %u bytes of stack left (%u needed)\n", pod_id.c_str(),
+                   (unsigned)(here - base), (unsigned)nested_stack_reserve_);
+            return K32_ERR_NOMEM;
+        }
     }
     std::string block = encode_app_request(req);
     if (block.size() > K32_MAX_REQUEST_BYTES) {
-        sink.begin(413, "application/json");
-        const char* body = "{\"error\":\"too_large\",\"message\":\"request exceeds 16 KiB\"}";
-        sink.write(reinterpret_cast<const uint8_t*>(body), std::strlen(body));
-        sink.end();
+        send_error(sink, 413, "{\"error\":\"too_large\",\"message\":\"request exceeds 16 KiB\"}");
         return 413;
     }
 
     uint64_t t0 = osal::Thread::get_time_us();
     int32_t status;
     {
-        osal::LockGuard call_guard(*cm);
+        // A nested call waits for a busy pod at most its timeout: two pods
+        // calling each other from two threads time out instead of deadlocking
+        if (wait_ms == 0) cm->lock();
+        else if (!cm->try_lock(wait_ms)) return K32_ERR_TIMEOUT;
+        struct Unlock { osal::Mutex* m; ~Unlock() { m->unlock(); } } call_guard{cm};
         // Entry may have been unregistered while we waited
         {
             osal::LockGuard guard(mutex_);
             e = find_locked(pod_id);
-            if (!e) return -2;
+            if (!e) return nested ? K32_ERR_NOENT : -2;
         }
-        status = call_with_block(*e, pod_id, K32_EXPORT_HANDLE, std::string_view(), reinterpret_cast<const uint8_t*>(block.data()), block.size(), &sink);
+        status = call_with_block(*e, pod_id, K32_EXPORT_HANDLE, std::string_view(), reinterpret_cast<const uint8_t*>(block.data()), block.size(), &sink, &req);
     }
+    if (nested && status < 0) status = 500;   // the callee trapped or gave no response
     uint32_t us = static_cast<uint32_t>(osal::Thread::get_time_us() - t0);
     if (status < 0 || status >= 500) {
         printf("[APP] %s %.*s %.*s -> %d (%u us)\n", pod_id.c_str(), (int)req.method.size(), req.method.data(),
@@ -702,7 +1062,9 @@ int32_t AppPodHost::tick(const std::string& pod_id, uint32_t uptime_ms) {
     int32_t rc;
     {
         osal::LockGuard call_guard(*cm);
+        arm_call_budget(ctrl);
         rc = ctrl->call_function(K32_EXPORT_TICK, {static_cast<int32_t>(uptime_ms)});
+        note_call_cost(ctrl, K32_EXPORT_TICK);
     }
     uint32_t us = static_cast<uint32_t>(osal::Thread::get_time_us() - t0);
     {
@@ -741,19 +1103,6 @@ int32_t AppPodHost::event(const std::string& pod_id, std::string_view topic, con
         if (e2) e2->stats.total_us += us;
     }
     return rc;
-}
-
-void AppPodHost::broadcast_event(std::string_view topic, const uint8_t* data, size_t len) {
-    std::vector<std::string> targets;
-    {
-        osal::LockGuard guard(mutex_);
-        for (const auto& kv : pods_) {
-            if (kv.second.has_event) targets.push_back(kv.first);
-        }
-    }
-    for (const auto& id : targets) {
-        event(id, topic, data, len);
-    }
 }
 
 } // namespace kube32::runtime

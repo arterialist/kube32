@@ -579,8 +579,9 @@ M3Result ParseValueType (IM3Module i_module, m3type_t* o_type, bytes_t* io_bytes
 
 
 typedef struct M3Runtime {
-    M3Compilation  compilation;
-
+    // Kube32: the compiler's scratch state (M3Compilation, tens of KB at the
+    // default function stack height) is allocated while a function compiles
+    // instead of living in every runtime.
     IM3Environment environment;
 
     M3CodePage*    pagesOpen;      // linked list of code pages with writable space on them
@@ -605,6 +606,10 @@ typedef struct M3Runtime {
     u32            memoryLimit;
     u64            memoryBytesLimit;
     u64            memoryBytesUsed;
+    // Why the last memory.grow that failed was refused (m3Err_none until one
+    // fails); the embedder clears it to scope it to a call. Lets the host tell
+    // a program that aborted after hitting the memory limit from other traps.
+    M3Result       lastMemoryGrowError;
     u64            tableElementsLimit;
     u64            tableElementsUsed;
 

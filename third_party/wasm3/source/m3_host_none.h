@@ -29,9 +29,16 @@
 // Kube32: on FreeRTOS the current task's stack bounds are known, which lets the
 // interpreter trap on deep recursion (m3Err_trapStackOverflow) instead of
 // corrupting memory. Other bare systems keep answering NULL (no probe).
+#if defined(ESP_PLATFORM)
+// The shared interpreter stack a call may be running on (pod_memory_pool.h)
+extern void* kube32_interp_stack_base_for(const void* sp);
+#endif
+
 void* m3_HostStackBase (void)
 {
 #if defined(ESP_PLATFORM)
+    void* shared = kube32_interp_stack_base_for(__builtin_frame_address(0));
+    if (shared) return shared;
     return (void*) pxTaskGetStackStart(NULL);
 #else
     return NULL;

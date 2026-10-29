@@ -268,6 +268,9 @@ d_m3ErrorConst(trapAbort,                      "[trap] program called abort")
 d_m3ErrorConst(trapUnreachable,                "[trap] unreachable")
 d_m3ErrorConst(trapUnsupportedInstruction,     "[trap] unsupported instruction")
 d_m3ErrorConst(trapStackOverflow,              "[trap] stack overflow")
+// Kube32: the module's own operand stack (m3_NewRuntime's stack size) is full,
+// as opposed to the native stack the interpreter runs on
+d_m3ErrorConst(trapWasmStackOverflow,          "[trap] wasm stack exhausted")
 d_m3ErrorConst(trapOutOfGas,                   "[trap] out of gas")
 d_m3ErrorConst(trapUncaughtException,          "[trap] uncaught exception")
 d_m3ErrorConst(trapContinuationConsumed,       "[trap] continuation already consumed")

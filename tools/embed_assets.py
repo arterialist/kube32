@@ -1,11 +1,15 @@
 #!/usr/bin/env python3
 """
-Generates the embedded blob tables for the local image registry and the web
-asset store.
+Generates the embedded blob tables for the local image registry and the
+static bundles served by the ingress controller.
 
 Inputs (relative to the repository root):
-  images/*.wasm                 -> EmbeddedImage entries, key = file stem
-  images/web/<app>/<file>.gz    -> EmbeddedAsset entries, path = /<file> (index.html -> /)
+  images/*.wasm                     -> EmbeddedImage entries, key = file stem
+  images/web/<bundle>/<path>[.gz]   -> EmbeddedAsset entries for bundle <bundle>,
+                                       path = /<path> without ".gz"; a ".gz" file
+                                       is served with Content-Encoding: gzip. A
+                                       file may exist both plain and as .gz: the
+                                       server picks by the client's Accept-Encoding.
 
 Outputs:
   <out_dir>/embedded_blobs.cpp  host build: byte arrays generated inline
@@ -33,6 +37,15 @@ CONTENT_TYPES = {
     ".png": "image/png",
     ".ico": "image/x-icon",
     ".txt": "text/plain; charset=utf-8",
+    ".mjs": "application/javascript; charset=utf-8",
+    ".map": "application/json",
+    ".webmanifest": "application/manifest+json",
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".webp": "image/webp",
+    ".gif": "image/gif",
+    ".wasm": "application/wasm",
+    ".woff": "font/woff",
     ".woff2": "font/woff2",
 }
 
@@ -45,20 +58,29 @@ def collect():
             if name.endswith(".wasm"):
                 images.append((name[:-5], os.path.join(IMAGES_DIR, name)))
     if os.path.isdir(WEB_DIR):
-        for app in sorted(os.listdir(WEB_DIR)):
-            app_dir = os.path.join(WEB_DIR, app)
-            if not os.path.isdir(app_dir):
+        for bundle in sorted(os.listdir(WEB_DIR)):
+            bundle_dir = os.path.join(WEB_DIR, bundle)
+            if not os.path.isdir(bundle_dir):
                 continue
-            for name in sorted(os.listdir(app_dir)):
-                full = os.path.join(app_dir, name)
-                if not os.path.isfile(full):
-                    continue
-                gz = name.endswith(".gz")
-                plain = name[:-3] if gz else name
-                ext = os.path.splitext(plain)[1]
-                ctype = CONTENT_TYPES.get(ext, "application/octet-stream")
-                path = "/" if plain == "index.html" else "/" + plain
-                assets.append((app, path, full, ctype, gz))
+            seen = {}
+            for dirpath, dirnames, filenames in os.walk(bundle_dir):
+                dirnames[:] = sorted(d for d in dirnames if not d.startswith("."))
+                for name in sorted(filenames):
+                    if name.startswith("."):
+                        continue
+                    full = os.path.join(dirpath, name)
+                    rel = os.path.relpath(full, bundle_dir).replace(os.sep, "/")
+                    gz = rel.endswith(".gz")
+                    plain = rel[:-3] if gz else rel
+                    ext = os.path.splitext(plain)[1].lower()
+                    ctype = CONTENT_TYPES.get(ext, "application/octet-stream")
+                    path = "/" + plain
+                    if '"' in path or "\\" in path:
+                        sys.exit(f"[embed] {bundle}: unsupported character in {rel}")
+                    if (path, gz) in seen:
+                        sys.exit(f"[embed] {bundle}: both {seen[(path, gz)]} and {rel} map to {path}")
+                    seen[(path, gz)] = rel
+                    assets.append((bundle, path, full, ctype, gz))
     return images, assets
 
 
@@ -80,7 +102,7 @@ def write_host(out_dir, images, assets):
             f.write(f"static const uint8_t img_{i}[] = {{")
             f.write(",".join(str(b) for b in data))
             f.write("};\n")
-        for i, (app, path, full, ctype, gz) in enumerate(assets):
+        for i, (bundle, path, full, ctype, gz) in enumerate(assets):
             data = open(full, "rb").read()
             f.write(f"static const uint8_t asset_{i}[] = {{")
             f.write(",".join(str(b) for b in data) if data else "0")
@@ -90,9 +112,9 @@ def write_host(out_dir, images, assets):
             f.write(f"    {{\"{key}\", img_{i}, sizeof(img_{i})}},\n")
         f.write("    {nullptr, nullptr, 0}\n};\n")
         f.write("static const EmbeddedAsset s_assets[] = {\n")
-        for i, (app, path, full, ctype, gz) in enumerate(assets):
+        for i, (bundle, path, full, ctype, gz) in enumerate(assets):
             size = os.path.getsize(full)
-            f.write(f"    {{\"{app}\", \"{path}\", asset_{i}, {size}, \"{ctype}\", {'true' if gz else 'false'}}},\n")
+            f.write(f"    {{\"{bundle}\", \"{path}\", asset_{i}, {size}, \"{ctype}\", {'true' if gz else 'false'}}},\n")
         f.write("    {nullptr, nullptr, nullptr, 0, nullptr, false}\n};\n\n")
         f.write("const kube32::runtime::EmbeddedImage* images(size_t& count) { count = %d; return s_images; }\n" % len(images))
         f.write("const EmbeddedAsset* assets(size_t& count) { count = %d; return s_assets; }\n" % len(assets))
