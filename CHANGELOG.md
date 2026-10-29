@@ -1,150 +1,24 @@
 # Changelog
 
-All notable changes to this project are recorded here. The format follows
-[Keep a Changelog](https://keepachangelog.com/en/1.1.0/). The project has no
-tagged release yet, so everything is under Unreleased. This section covers
-the work since commit `2e3bbd1` ("Deploy 3 enterprise workloads"), the point
-after which the demo code was replaced by things that run on the boards.
-Commit hashes are given so each entry can be checked.
+All notable changes to this project will be documented in this file. The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
 ### Added
 
-- **Tessera**, an issue tracker that runs as Wasm pods: a freestanding C core
-  with its own index and arena allocator, a display and keypad HUD pod, and a
-  gzipped web client served from flash (`55bb012`, `6b29a7c`, `4a8ca5b`).
-- **The app ABI** (`include/runtime/k32_app_abi.h`): request pods with
-  `k32_handle`, `k32_init`, `k32_tick` and `k32_event`, imports for
-  responses, events, environment, display, keypad and tone, per-pod
-  serialization and a gas budget per call (`55bb012`).
-- **The ingress on port 80**: static assets, `/api/*` forwarding to the
-  app's core pod, and server-sent events. Also an embedded image registry
-  generated at build time (`55bb012`).
-- **Watch streams with bookmarks and the WatchList protocol**, pod logs,
-  core and `events.k8s.io` events, `metrics.k8s.io` node and pod metrics,
-  and Deployments with a controller (`bf12ce9`, `022d910`).
-- **k9s works**: protobuf-encoded access reviews are accepted (`83a323b`),
-  and watches honour `sendInitialEvents` (`022d910`).
-- **A UDP channel transport beside ESP-NOW**, with peers seeded from node
-  addresses, so events cross access points (`464c402`).
-- **Console commands**:
-  - `K32_CMD:TASKS` (`766a7c9`), `K32_CMD:KEY` (`bf12ce9`) and
-    `K32_CMD:KEYPOP` (`022d910`).
-  - `K32_CMD:ACCESSLOG`, `K32_CMD:BOOTLOADER`, `K32_CMD:TASKBT` and
-    `K32_CMD:TONE` (`464c402`).
-  - `K32_CMD:SD` (`0565b3f`).
-- **The microSD card on the Cardputer**: mount, images pulled with
-  `wasm://sd/<name>`, pod volumes through `k32_fs_*`, and the `sdnote`
-  example pod (`0565b3f`).
-- **Tooling**: the Rust SDK (`sdk/rust`), `tools/kube32-cli` (build, check,
-  deploy, embed, `sd-push`) and `docs/app-development.md` (`f03617a`).
-- **Validation for `kubectl apply` and `create`.** A minimal OpenAPI v3 index
-  lets them work without `--validate=false`, and `fieldValidation=Strict` is
-  enforced for top-level and `metadata` fields (`f737ab6`).
-- **Completed pods**: a pod whose entry point returns is reported
-  `Succeeded`. A single-object `kubectl get` of a pod, node or deployment
-  returns a Table (`ff03c3b`).
-- **Project files**: CI (`.github/workflows/ci.yml`), `CONTRIBUTING.md`, this
-  changelog, and the docs pages `docs/tessera.md` and
-  `docs/workloads/gpio-blinker.md`, now about peripherals in general.
-
-### Changed
-
-- **Roles and board settings**: the role comes from PSRAM presence and the
-  board profile from NVS, set over the console. Both used to come from
-  hard-coded MAC addresses (`55bb012`).
-- **Wi-Fi**: boards join an existing network as stations, and the cluster
-  access point can be turned off (`55bb012`).
-- **Node figures are measured**: heap, PSRAM, versions, CPU from FreeRTOS
-  run-time statistics. The pod IP is now the node IP; the `10.244.0.x`
-  addresses were made up (`bf12ce9`). Some constants remain; see
-  `docs/api-reference.md`.
-- **PodMetrics memory** now counts internal RAM governed by the pod's request.
-  PSRAM is reported separately as `esp32.io/psram` (`022d910`).
-- **`tools/kube32_serial_gateway.py`** is now a transparent HTTP-over-USB
-  relay. It used to serve an in-memory imitation of the Kubernetes API
-  (`55bb012`).
-- **`scripts/flash.sh`**:
-  - It paces writes only on CH340 bridges. A native USB flash takes 26 s
-    instead of 192 s (`022d910`).
-  - It resets native USB boards through the watchdog (`f54968a`).
-- **Socket limits**: lwIP sockets and active TCP connections raised from 16
-  to 32 (`8eaf359`).
-- **Tessera copy and seed data** no longer mention the boards, the runtime or
-  Kubernetes (`4a8ca5b`, `e9e80f7`).
-- **Documentation rewritten to match the code.** README, quick start,
-  hardware, flashing and console, architecture, API coverage and tools were
-  rewritten. Statements the code does not support were removed; the
-  "Removed" list below names them.
-
-### Fixed
-
-- **USB console stops answering**: console output now goes through the
-  USB-Serial-JTAG driver. Before, `printf` raced the driver and the port went
-  silent until a power cycle (`f54968a`).
-- **SD mount cost**: FatFs sector buffers are sized for 512-byte sectors. The
-  mount had cost 28 KB of internal RAM on the Cardputer (`f54968a`).
-- **Control-plane reboot on allocation failure**: telemetry parses pods once,
-  and the housekeeping loop survives a failed allocation (`f54968a`).
-- **Chunked responses stalled on Nagle's algorithm**: the board view (50 KB)
-  took 1.1 s (`766a7c9`).
-- **Native stack guard trips** while seeding (`766a7c9`).
-- **A worker that registered before DHCP** advertised `0.0.0.0` (`8eaf359`).
-- **New connections dropped without a reset** once 16 sockets were in use
-  (`8eaf359`).
-- **HUD shown `Running` without a thread.** It now gets a stack reserved at
-  boot, and a pod whose thread cannot start is reported `Failed` (`83a323b`).
-- **k9s showed "No resources found"** without the WatchList bookmark, and
-  2700 % pod memory (`022d910`).
-- **The I2S speaker hummed endlessly** after a tone (`55bb012`).
-
-### Removed
-
-- **The scripted "enterprise workloads" (`55bb012`).** These were "Vortex DAW
-  Synth", "Aether Workspace" and "Aegis Fleet Operations",
-  `tools/kube32_workbench_app.py`, and the `web/` dashboards. They ran in
-  Python on the developer's machine behind an imitation API, not on the
-  boards.
-- **Fakes in the firmware and tools (`55bb012`).** The kubelet deployed an
-  8-byte Wasm header instead of a module, and the firmware printed scripted
-  "pipeline" and "inference" lines. Also removed: the MAC-keyed workbench
-  manifests, `tools/kube32_mesh_controller.py`,
-  `tools/rpi_edge_telemetry.py` and `tools/autoflash_node.py`.
-- **Bounded diagnostic probes** (`[STACK]`, `[TRACE]`, `[DIAG]`) once the
-  keypad path was verified (`c7f0139`).
-- **Example manifests that named images which were never built** (this
-  change):
-  - `examples/workloads/` (ten "mission-critical industrial" pods);
-  - `examples/gpio-blinker.yaml`;
-  - `examples/distributed-pipeline.yaml`.
-
-  `examples/oversized-pod.yaml` now uses the embedded echo image.
-- **Docs pages describing behaviour the code does not have** (this change):
-  `docs/workloads/distributed-pipeline.md` (a "TinyML wake word" pipeline
-  with invented log output and MAC address) and
-  `docs/workloads/resource-limits.md`. Removed claims from other pages:
-  - "47 KB RAM", "1.59 MB firmware", "under 15 ms cold start" and "0 heap
-    allocations" metrics;
-  - an ESP-NOW latency under 3 ms;
-  - CRC32 journaling to LittleFS on the boards;
-  - `GPIO_WRITE`/`ADC_READ` capabilities;
-  - pin admission failures reported as `CrashLoopBackOff` (they are
-    `CapabilityAdmissionFailed`);
-  - CLI output from a CLI that no longer worked.
-- **Dead tools and scripts** (this change):
-  - `cli/kube32-cli`: it spoke a `K32_REQ` console protocol the firmware no
-    longer has.
-  - `tools/kube32_port_forward.py`: it imported the deleted workbench module.
-  - `tools/openapi_*.json` and `tools/spdy_dict.bin`: data for the old
-    imitation gateway.
-  - `scripts/benchmark_suite.py`: it measured a `/pipeline/transmit`
-    endpoint that no longer exists.
-  - `scripts/run_live_stress_suite.py`: it "migrated" pods by rewriting
-    `nodeName` and made-up pod IPs.
-  - `scripts/deploy_all_workloads.py`, `scripts/visual_review.py`,
-    `scripts/flash_dual_boards.py`, `scripts/flash_hardware.sh` and
-    `scripts/wait_for_boards.py`.
-  - `tests/test_hw_serial_empirical_challenge.py`: it asserted log lines the
-    firmware never prints, among them a "WAKE_WORD_DETECTED (confidence:
-    99.1%)" result.
+- Kubernetes API server on port 6443 serving Pod, Node, Namespace, Service, Endpoints, EndpointSlice, ConfigMap, Secret, Event, Deployment, DaemonSet, Job, Lease, Ingress, NodeMetrics, PodMetrics, and subject access reviews.
+- Watch streams with bookmarks and `sendInitialEvents`, Table output, OpenAPI v3 index, `fieldValidation=Strict`, `dryRun=All`, pagination, merge and strategic-merge patches, and protobuf request bodies for ConfigMap, Secret, and Namespace.
+- Pod scheduler filtering by node state, `nodeName`, `nodeSelector`, memory, `esp32.io/psram`, and peripheral counts (`esp32.io/gpio`, `esp32.io/i2c`, `esp32.io/adc`, `esp32.io/uart`).
+- Deployment, DaemonSet, and Job controllers, plus node Lease tracking with automatic tainting and pod eviction.
+- wasm3 container runtime supporting request pods (`k32_alloc`, `k32_handle`, `k32_init`, `k32_tick`, `k32_event`), static asset serving with gzip negotiation (`k32_resp_asset`), and entry-point pods (`_start`, `app_main`, `main`).
+- Per-pod linear memory limits across internal RAM and PSRAM (including sub-page limits below 64 KiB), configurable wasm3 value stacks (`kube32.io/wasm-stack`) and gas execution budgets (`kube32.io/execution-budget`), pool-first allocation and a shared interpreter stack on boards without PSRAM, trap-specific exit codes, and `Always`, `OnFailure`, and `Never` restart policies with exponential back-off.
+- Pod environment variable injection from ConfigMaps, Secrets, `fieldRef`, and service links, with `$(VAR)` expansion.
+- Port 80 Ingress controller with host and path matching, Service backend routing across nodes, `StaticBundle` asset serving, and Server-Sent Events streaming (`kube32.io/event-stream`).
+- Inter-pod event pub/sub (`k32_event_emit`, `kube32.io/event-topics`) over ESP-NOW and UDP port 7400, plus synchronous pod-to-pod HTTP calls (`k32_http_call`) gated by the `SERVICE_CALL` capability.
+- Single firmware image with automatic control-plane and worker role detection from PSRAM presence, configurable over the serial console (`K32_CMD:*`) and persisted in NVS.
+- Log-structured, CRC-checked object store journal on internal FAT flash or microSD with pre-write capacity checks and object-store-full errors, persistent volume claims via the `k32_fs_*` ABI, rotated container logs, and network storage access (`GET`, `PUT`, `DELETE`) via the node proxy subresource (`/api/v1/nodes/<node>/proxy/storage/<path>`).
+- Optional bearer token authentication (`K32_CMD:TOKEN`) and self-signed ECDSA P-256 TLS (`K32_CMD:CERT`) with HTTP/1.1 keep-alive multiplexed with plain HTTP on port 6443.
+- Capability firewall and `generic` and `cardputer` board profiles governing GPIO, ADC, I2C, UART, display, keypad, speaker, IPC, and microSD resources.
+- Rust guest SDK (`sdk/rust`), `tools/kube32-cli` (`build`, `check`, `deploy`, `embed`, `sd-push`, and recursive file/directory `push`), USB serial HTTP gateway (`tools/kube32_serial_gateway.py`), flashing script (`scripts/flash.sh`), and host simulator (`kube32-sim`, supporting `--psram 0` for boards without PSRAM, `--tls`, and `--help`).
+- Example workloads and manifests including the four-pod Tessera issue tracker (`apps/tessera`), `echo`, and `i2cscan`.
+- Python integration test suites (`tests/integration/runner.py`) for API, validation, resources, workloads, cluster, and federation in CI.

@@ -1,0 +1,66 @@
+name: Bug report
+description: Report a defect in kube32 firmware, control plane, or host tools
+title: "bug: "
+labels: ["bug"]
+body:
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened
+      description: Describe the failure or unexpected behaviour.
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behaviour
+      description: Describe what should happen instead.
+    validations:
+      required: true
+
+  - type: textarea
+    id: repro
+    attributes:
+      label: Steps to reproduce
+      description: Provide commands, manifests, or steps that trigger the issue.
+    validations:
+      required: true
+
+  - type: dropdown
+    id: boards
+    attributes:
+      label: Board(s)
+      multiple: true
+      options:
+        - ESP32-S3 devkit with PSRAM
+        - M5Stack Cardputer
+        - other ESP32-S3
+        - host simulator
+    validations:
+      required: true
+
+  - type: input
+    id: version
+    attributes:
+      label: kube32 commit or /version output
+      placeholder: "git rev-parse --short HEAD or curl http://<ip>:6443/version"
+    validations:
+      required: true
+
+  - type: input
+    id: kubectl
+    attributes:
+      label: kubectl version
+      placeholder: "kubectl version --client"
+    validations:
+      required: false
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs
+      description: Serial output, simulator output, or kubectl output.
+      render: shell
+    validations:
+      required: false

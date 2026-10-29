@@ -1,38 +1,29 @@
 # Kube32
 
-Kube32 is a small Kubernetes-compatible control plane and node agent for the
-ESP32-S3, written in C++17. One firmware image runs on every board. The board
-with PSRAM becomes the control plane: an HTTP API server that `kubectl` and
-k9s talk to, a scheduler, a node lifecycle controller, a Deployment controller
-and an in-memory object store. Every board runs a kubelet that executes pods
-as WebAssembly modules in the wasm3 interpreter, with access to the display,
-keypad, speaker and microSD card granted per pod.
+Kube32 is a Kubernetes-compatible control plane and WebAssembly pod runtime for ESP32-S3 microcontrollers, written in C++17. One firmware image runs on every board, and the same sources build `kube32-sim`, a host simulator for macOS and Linux. A board with PSRAM runs the control plane, including the API server, scheduler, controllers, journaled object store, and Ingress controller. Every board runs a kubelet that executes pods as WebAssembly modules in the wasm3 interpreter, with access to storage and hardware peripherals granted per pod.
 
-The same sources build `kube32-sim`, a host simulator for macOS and Linux.
-The repository includes Tessera, a demo issue tracker whose backend and
-device front end run as Wasm pods on the cluster.
-
-Kube32 is an experiment, not a production orchestrator. The API server has no
-authentication, the boards keep cluster state in RAM, and pods are never
-restarted. The README's
-[What is not done](https://github.com/arterialist/kube32#what-is-not-done)
-section has the full list.
+```mermaid
+flowchart LR
+    kubectl["kubectl / k9s"] -->|":6443"| cp["Control plane board<br/>API server, scheduler, controllers,<br/>object store, Ingress, kubelet"]
+    browser["Browser"] -->|":80 Ingress"| cp
+    cp <-->|"HTTP / ESP-NOW / UDP"| w1["Worker board<br/>kubelet + wasm3 pods"]
+    cp <-->|"HTTP / ESP-NOW / UDP"| w2["Worker board<br/>kubelet + wasm3 pods"]
+```
 
 ## Where to start
 
-| If you want to | Read |
+| Topic | Page |
 | --- | --- |
-| run it on your laptop, or on two boards | [Quick start](quickstart.md) |
-| write a pod in Rust, C or AssemblyScript | [Writing app pods](app-development.md) |
-| understand how it fits together | [Architecture overview](architecture/index.md) |
-| know which kubectl features work | [Kubernetes API coverage](api-reference.md) |
-| flash a board or use its console | [Flashing and the serial console](flashing-troubleshooting.md) |
-| see the demo app | [Tessera demo](tessera.md) |
+| Run the simulator or boot a two-board cluster | [Quick start](quickstart.md) |
+| Supported boards, memory layout, and pin capacities | [Hardware specification](hardware-spec.md) |
+| Flash firmware and configure nodes over USB serial | [Flashing and the serial console](flashing-troubleshooting.md) |
+| Configure `kubectl`, k9s, TLS, and bearer tokens | [Cluster access](cluster-access.md) |
+| Build and package WebAssembly pods in C, Rust, or AssemblyScript | [Writing app pods](app-development.md) |
+| Services, Ingress routing, pod-to-pod HTTP, and event topics | [Networking and Ingress](networking.md) |
+| Control plane journal, persistent volumes, and node storage | [Storage and persistence](storage.md) |
+| Claim GPIO, I2C, UART, ADC, display, keypad, and speaker resources | [Peripherals and capabilities](peripherals.md) |
+| Four-pod issue tracker running across a devkit and Cardputer | [Tessera example](examples/tessera.md) |
+| Control plane, kubelet, and runtime internals | [Architecture overview](architecture/index.md) |
+| Supported Kubernetes API resources, subresources, and semantics | [Kubernetes API reference](api-reference.md) |
+| `kube32-cli`, `kube32-sim`, and serial console commands | [CLI and serial reference](cli-reference.md) |
 
-## What has been verified where
-
-The [README](https://github.com/arterialist/kube32#what-runs-today) lists
-what was measured on the two development boards: an ESP32-S3 devkit with
-2 MB of PSRAM and an M5Stack Cardputer. Each page here says whether its
-examples ran on a board or on the simulator. When a page says nothing, the
-statement comes from reading the code and has not been measured.

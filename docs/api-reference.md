@@ -1,175 +1,104 @@
 # Kubernetes API coverage
 
-The API server (`src/api/`) listens on port 6443 with plain HTTP/1.1. It
-speaks JSON only: a request body encoded as protobuf gets
-`415 UnsupportedMediaType`, and kubectl then retries in JSON. When kubectl
-asks for `as=Table;v=v1;g=meta.k8s.io`, list responses come back in
-`meta.k8s.io/v1` Table form. Large responses are streamed with chunked
-transfer encoding.
+The API server (`src/api/`) listens on port 6443. It serves TLS and plain HTTP/1.1 on the same port, detected from the first bytes of each connection. Large responses stream with chunked transfer encoding.
 
-This page describes the code at the time of writing. Where a figure is a
-default, the file that sets it is named.
+## Authentication and TLS
 
-!!! warning "No authentication"
-    The server reads no credentials and serves no TLS. Every request is
-    accepted, and `SelfSubjectAccessReview` and `SelfSubjectRulesReview` always
-    answer "allowed". Anyone who can reach port 6443 controls the cluster.
+Bearer token authentication is optional and off by default. Set or disable a token, 16 to 128 characters, over the serial console with `K32_CMD:TOKEN:<token>` or `K32_CMD:TOKEN:off`.
+
+- Unauthenticated requests receive `401 Unauthorized` with a Status body.
+- `/healthz`, `/livez`, `/readyz` and `/version` do not require authentication.
+- Worker kubelets read the same NVS `token` key and send it over plain HTTP on the LAN.
+- `SelfSubjectAccessReview` and `SelfSubjectRulesReview` always return allowed for authenticated callers, or for all callers when authentication is off.
+
+On first boot, the control plane generates an ECDSA P-256 key and self-signed certificate in NVS for `kube32-apiserver`, `localhost`, the node name and the node IP. Run `K32_CMD:CERT` on the console to print the PEM certificate.
+
+`kubectl` only sends bearer tokens over HTTPS. Configure `kubeconfig` with TLS:
+
+```
+kubectl config set-cluster kube32 --server=https://<control-plane-ip>:6443 --tls-server-name=kube32-apiserver --certificate-authority=<pem file> --embed-certs
+kubectl config set-credentials kube32 --token=<token>
+```
+
+Without authentication, use `http://<control-plane-ip>:6443` and no credentials.
+
+## Discovery
+
+Discovery endpoints accept `GET` and `HEAD`.
+
+| Path | Answer |
+| --- | --- |
+| `/version` | `gitVersion` `v1.33.0-kube32`, git commit, tree state, UTC build time, compiler and platform: `darwin/arm64`, `linux/amd64` or `freertos/xtensa`. `goVersion` is empty |
+| `/healthz`, `/livez`, `/readyz` | `200 OK` with body `ok` |
+| `/api`, `/api/v1` | core `v1` |
+| `/apis`, `/apis/<group>`, `/apis/<group>/<version>` | `apps/v1`, `batch/v1`, `coordination.k8s.io/v1`, `discovery.k8s.io/v1`, `events.k8s.io/v1`, `networking.k8s.io/v1`, `authorization.k8s.io/v1`, `metrics.k8s.io/v1beta1` |
+| `/openapi/v3`, `/openapi/v3/<group version>` | OpenAPI v3 index and per-group documents listing the `fieldValidation` parameter without schemas. `/openapi/v2` and unknown groups return 404 |
+
+## Resources
+
+| Group | Kind | Short | Verbs and subresources | Notes |
+| --- | --- | --- | --- | --- |
+| core `v1` | Pod | `po` | get, list, watch, create, update, patch, delete; `status`, `log`, `binding` | Graceful deletion when bound to a node, 30 s by default or `gracePeriodSeconds`. `DELETE` returns the `Pod` for bound pods and a `Status` for unbound pods |
+| core `v1` | Node | `no` | get, list, watch, create, update, patch, delete; `status`, `proxy` | Registered by kubelets. `/api/v1/nodes/<node>/proxy/storage/<path>` supports `GET`, `PUT` and `DELETE`; `PUT` accepts chunked or `Content-Length` bodies up to 8 MiB by default, writes `<path>.part` and renames it into place |
+| core `v1` | Namespace | `ns` | get, list, watch, create, update, patch, delete | Seeded at boot: `default`, `kube-system`, `kube-public`, `kube-node-lease`, `kube32-cluster` |
+| core `v1` | Service | `svc` | get, list, watch, create, update, patch, delete | Selects Running pods for Ingress, `k32_http_call` and environment variables |
+| core `v1` | Endpoints | `ep` | get, list | Read-only. Computed on read from Services and their pods |
+| core `v1` | ConfigMap | `cm` | get, list, watch, create, update, patch, delete | Stored in the object store |
+| core `v1` | Secret | | get, list, watch, create, update, patch, delete | Stored in the object store |
+| core `v1`, `events.k8s.io/v1` | Event | `ev` | get, list, watch, create, update, patch, delete | Kept in RAM, up to 64 events, and projected to both API groups |
+| `apps/v1` | Deployment | `deploy` | get, list, watch, create, update, patch, delete; `status`, `scale` | Manages pods directly using `pod-template-hash` |
+| `apps/v1` | DaemonSet | `ds` | get, list, watch, create, update, patch, delete | Template `restartPolicy` must be `Always` or unset, 422 otherwise |
+| `batch/v1` | Job | `job` | get, list, watch, create, update, patch, delete | Template `restartPolicy` must be `Never` or `OnFailure`, 422 otherwise |
+| `coordination.k8s.io/v1` | Lease | | get, list, watch, create, update, patch, delete | Kept in RAM for node heartbeats with duration `max(15 s, 3 * heartbeat)`. `POST` and `PUT` upsert. When a lease expires, the node is marked `Ready=Unknown` (`NodeStatusUnknown`) and evicted pods are unbound and rescheduled |
+| `networking.k8s.io/v1` | Ingress | `ing` | get, list, watch, create, update, patch, delete | Routes HTTP traffic on port 80 |
+| `discovery.k8s.io/v1` | EndpointSlice | | get, list | Read-only. Computed on read from Services and their pods |
+| `metrics.k8s.io/v1beta1` | NodeMetrics, PodMetrics | | get, list | Kubelet samples, up to 32 pods with a 30 s TTL |
+| `authorization.k8s.io/v1` | SelfSubjectAccessReview, SelfSubjectRulesReview | | create | Always returns allowed |
 
 ## kubectl and k9s
 
-On the boards, `kubectl get`, `describe`, `logs`, `top` and `get events`
-have been used, and so has k9s. For this page the simulator was also driven
-with `apply`, `create`, `delete`, `scale deployment`, `get -w` and `logs -f`;
-all of them worked.
+`kubectl` and `k9s` work without extra flags. Supported commands include `get`, `describe`, `apply`, `create`, `delete`, `patch`, `scale`, `logs`, `top`, `events` and `auth can-i`.
 
-`kubectl apply` and `create` need no extra flags. This was verified on the
-simulator. The server publishes a
-minimal OpenAPI v3 index (`/openapi/v3`) with one document per group
-version. Each document lists the `fieldValidation` parameter for the kinds
-it stores, and there are no schemas. kubectl therefore leaves validation to
-the server, which then checks only top-level and `metadata` fields:
+When the client sends `Accept: as=Table;v=v1;g=meta.k8s.io`, list and single-object `GET` requests return `meta.k8s.io/v1` Table responses for Pod, Node, Deployment, Event, Namespace, Service, ConfigMap, Secret, Lease, Ingress, Endpoints and EndpointSlice. DaemonSets, Jobs and metrics return plain objects for client-side printing.
+
+OpenAPI v3 documents advertise `fieldValidation`. When `kubectl` sends `fieldValidation=Strict`, the server rejects unknown top-level and `metadata` fields with `400 BadRequest`:
 
 ```
 $ kubectl apply -f typo.yaml        # metadata.lables instead of metadata.labels
 Error from server (BadRequest): error when creating "typo.yaml": strict decoding error: unknown field "metadata.lables"
 ```
 
-A misspelt field deeper in the object, for example
-`spec.containers[0].imagePulPolicy`, is accepted and stored. `/openapi/v2`
-returns 404.
+Write requests honour `dryRun=All` in the query string or in a `DeleteOptions` request body. The server validates the request and checks preconditions without writing to the store or firing watch events.
 
-## Discovery
+`application/merge-patch+json` and `application/strategic-merge-patch+json` apply a recursive JSON merge where objects merge and arrays or scalars replace. `PUT` and `PATCH` preserve `uid`, `creationTimestamp` and `status`, and increment `metadata.generation` when `spec` changes.
 
-| Path | Answer |
-| --- | --- |
-| `/version` | Fixed values, see [Known inaccuracies](#known-inaccuracies) |
-| `/api`, `/api/v1` | core `v1` |
-| `/apis` | `apps`, `batch`, `coordination.k8s.io`, `events.k8s.io`, `authorization.k8s.io`, `metrics.k8s.io` |
-| `/apis/<group>/<version>` | resource list for each group above |
-| `/openapi/v3`, `/openapi/v3/<group version>` | index and per-group documents (no schemas); unknown groups get 404 |
+`fieldSelector` supports `=`, `==` and `!=` on any dotted path. `labelSelector` supports `=`, `==`, `!=`, `in`, `notin`, `key` and `!key`. List endpoints honour `limit` and `continue` and set `remainingItemCount` in the list metadata. Pod list endpoints accept `?inlineImages=omit` (used by the kubelet) to omit `kube32.io/wasm-base64` annotation payloads.
 
-Discovery accepts only `GET` and `HEAD`.
+`GET /api/v1/namespaces/{ns}/pods/{name}/log` supports `follow`, `previous`, `timestamps`, `tailLines`, `sinceSeconds`, `limitBytes` and `container`. Logs live in a 2 KiB RAM ring per pod on the board, 1 KiB for the previous instance and 16 KiB on the simulator. Nodes with storage also write `<root>/kube32/logs/<ns>_<pod>/<container>.log`, capped at 32 KiB and rotated to `.log.1` on restart.
 
-## Resources
+## Watches
 
-| Kind | Collection paths | Verbs | What acts on it |
-| --- | --- | --- | --- |
-| Pod | `/api/v1/pods`, `/api/v1/namespaces/{ns}/pods` | list, get, create, update, patch, delete; `status` and `log` subresources | scheduler binds it; the kubelet on that node runs it and reports status |
-| Node | `/api/v1/nodes` | list, get, create, update, patch, delete; `status` | kubelets register and heartbeat; node lifecycle controller |
-| Deployment | `/apis/apps/v1/deployments`, `.../namespaces/{ns}/deployments` | list, get, create, update, patch, delete; `status`, `scale` | Deployment controller creates and replaces pods directly (no ReplicaSets) |
-| Event (core/v1 and events.k8s.io/v1) | `/api/v1/events`, `/apis/events.k8s.io/v1/...` | list, get, create, update, patch, delete | written by the scheduler, kubelets and node lifecycle controller; at most 64 kept |
-| Lease | `/apis/coordination.k8s.io/v1/...` | list, get, create, update, patch, delete | node heartbeats |
-| Namespace, ConfigMap, Secret | core `v1` | list, get, create, update, patch, delete | stored only |
-| Service | core `v1` | list, get, create, delete | stored only: no ClusterIP, endpoints or proxy |
-| DaemonSet | `apps/v1` | list, get, create, delete | no controller (see [Known inaccuracies](#known-inaccuracies)) |
-| Job | `batch/v1` | list, get, create, delete | no controller (see [Known inaccuracies](#known-inaccuracies)) |
-
-No other kinds are served. That includes ReplicaSets, StatefulSets,
-Endpoints, ServiceAccounts, RBAC and CRDs. There is no `exec`, `attach`,
-`portforward`, `eviction` or `binding` subresource, and `deletecollection`
-answers 405.
-
-Five namespaces exist from the start: `default`, `kube-system`, `kube-public`,
-`kube-node-lease` and `kube32-cluster`. Objects can be created in a namespace
-that does not exist, and deleting a namespace deletes nothing else.
-
-### Writes
-
-- **PATCH** applies a recursive JSON merge whatever the `Content-Type`: objects
-  merge, arrays and scalars replace. A `null` is stored as null instead of
-  deleting the key. There is no strategic list merge and no JSON Patch.
-- **PUT** does not check `resourceVersion`.
-- **Not supported:** server-side apply, `dryRun` (a dry-run request is
-  executed) and `limit`/`continue` (lists always return everything).
-- **Duplicate names:** creating a Pod, Node, Deployment, Namespace, ConfigMap
-  or Secret that already exists returns 409. Creating a Service, DaemonSet,
-  Job or Lease that exists overwrites it.
-- **Pod deletion** is graceful when the pod is bound to a node (30 s by
-  default, or `gracePeriodSeconds`).
-- **Size limits:** a request body may be up to 2 MiB. Chunked request bodies
-  get 411. Headers larger than the receive buffer get 431; the buffer is
-  4 KiB on the boards.
-
-### Lists and watches
-
-- **Table output** is available for every list except DaemonSets, Jobs and
-  metrics. Pods, Nodes and Deployments have their own columns, and a
-  single-object `get` of those three kinds also returns a Table.
-- **Selectors:** `fieldSelector` supports `=`, `==` and `!=` on any dotted
-  path. `labelSelector` supports `=`, `==`, `!=`, `in`, `notin`, `key` and
-  `!key`.
-- **Watches:** `?watch=true` works on every stored kind. One hub thread owns
-  the streams; its defaults are in `include/api/watch_hub.hpp`:
+`?watch=true` works on every stored resource collection. One hub thread in `include/api/watch_hub.hpp` owns all watch and log-follow streams:
 
 | Setting | Value |
 | --- | --- |
-| Concurrent streams (watches and log follows together) | 8 on a board with PSRAM, 4 without, 16 on the simulator; 429 past the limit |
+| Concurrent streams | 8 on a board with PSRAM, 4 without, 16 on the simulator; `429 TooManyRequests` past the limit |
 | Queue per stream | 16 events; overflow sends `410 Expired` and closes the stream |
 | Replay ring for `resourceVersion=N` | 32 events; older versions get `410 Expired` |
 | Bookmarks | every 30 s with `allowWatchBookmarks=true` |
-| `sendInitialEvents=true` | initial `ADDED` events, then a BOOKMARK annotated `k8s.io/initial-events-end` (the WatchList protocol k9s uses) |
+| `sendInitialEvents=true` | initial `ADDED` events followed by a `BOOKMARK` annotated `k8s.io/initial-events-end` |
 | Stream lifetime | 1800 s, or `timeoutSeconds` |
 
-A watch on an item path, such as `pods/{name}`, streams the whole collection.
+## Limitations
 
-### Pod logs
-
-`GET .../pods/{name}/log` supports `follow`, `timestamps`, `tailLines`,
-`sinceSeconds` and `limitBytes`; `previous` and `sinceTime` are ignored. The
-log is a ring buffer per pod:
-
-- 1 KiB on a board without PSRAM, 2 KiB on a board with PSRAM, 16 KiB on the
-  simulator.
-- Fed by the pod's `k32_log` calls and by the runtime's own lines (container
-  started, trapped, entry point returned).
-- The kubelet ships it to the API server.
-
-### Metrics
-
-`metrics.k8s.io/v1beta1` serves NodeMetrics and PodMetrics from samples that
-the kubelet sends with its heartbeat:
-
-| Metric | Source |
-| --- | --- |
-| Node CPU | FreeRTOS run-time statistics: non-idle task time over wall time |
-| Node memory | heap in use |
-| Pod memory | linear memory, bytecode and interpreter stack |
-| Pod `esp32.io/psram` | the part of a pod that lives in PSRAM, as a separate key |
-| Pod CPU | interpreter time |
-
-Samples older than 30 s are dropped, and at most 32 pod samples are kept. On
-the simulator, "node memory" is the heap of the whole simulator process
-compared with a declared 240 KiB, so `kubectl top nodes` shows more than
-100 %.
-
-## Known inaccuracies
-
-These are places where the server reports something it did not measure or do.
-They are bugs, listed here so nobody relies on them:
-
-- **`/version`** returns fixed strings: `v1.33.0-kube32`, a build date of
-  `2026-10-26`, `go1.22.0` and `gcc-xtensa`. `/api` reports
-  `serverAddressByClientCIDRs` as `127.0.0.1:6443`.
-- **DaemonSet create** writes one pod per node immediately, with phase
-  `Running` and pod IPs `192.168.4.1`/`192.168.4.2`, before any kubelet has
-  run it. Pod names are `<ds>-01` or `<ds>-02`.
-- **Job create** writes one pod already in phase `Succeeded` on
-  `esp32-node-01`.
-- **Node heartbeats.** When a board measures 0 bytes of free PSRAM (a board
-  without PSRAM), its heartbeat advertises 3840Ki of allocatable PSRAM
-  anyway. GPIO, I2C and ADC counts and `cpu: 2` are constants, and `Ready`
-  is always `True`.
-- **Missing node fields** are filled in by the node table with `ESP-IDF v5.2`,
-  `FreeRTOS-v10.4` and `127.0.0.1`. The standalone simulator seeds its two
-  nodes with those values.
-- **Deployments** report `NewReplicaSetAvailable` and `ReplicaSetUpdated`
-  condition reasons, though no ReplicaSets exist.
-- **Pod reasons.** Pods that fail to start are given the reason
-  `CrashLoopBackOff`, and `restartCount` goes up after a trap, but nothing is
-  ever restarted. An out-of-bounds memory access is reported as `OOMKilled`.
-- **Completion codes.** A pod whose entry point returns is reported as
-  "exited with code 0", whatever value it returned.
-- **Discovery** lists `update` and `patch` for Services, DaemonSets and Jobs,
-  which answer 405.
-- **Strict validation of events.k8s.io/v1.** The field list holds core/v1
-  Event fields only, so `regarding` and `note` are rejected.
+- Server-side apply and JSON Patch return `415 UnsupportedMediaType`; use `kubectl apply` without `--server-side`.
+- Request bodies must be JSON, except `ConfigMap`, `Secret`, `Namespace`, `SelfSubjectAccessReview` and `SelfSubjectRulesReview`, which also accept protobuf (`kubectl create configmap|secret|namespace` works); other kinds in protobuf return `415 UnsupportedMediaType` with the reason.
+- A persisted create or update that exceeds the object store capacity returns `500 InternalError` (`object store is full: X of Y bytes in use, N more needed`), checked before writing; shrinking writes always pass, and a lost create race returns `409 AlreadyExists`.
+- There is no RBAC; authenticated callers have full access to all resources.
+- `Endpoints` and `EndpointSlice` are read-only and do not support `watch`.
+- Deployments manage Pods directly without `ReplicaSet` objects.
+- `deletecollection`, `exec`, `attach`, `portforward` and `eviction` are not supported.
+- `fieldValidation=Strict` checks top-level and `metadata` fields only, so unknown fields nested inside `spec` are accepted.
+- Paginated lists with `limit` and `continue` read from the current store state without a snapshot.
+- Request bodies are capped at 2 MiB, chunked request bodies return `411` (except node proxy storage uploads), and headers larger than the 4 KiB board receive buffer return `431`.
+- Creating an object in a non-existent namespace succeeds, and deleting a namespace does not delete the objects in it.

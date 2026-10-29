@@ -1,87 +1,62 @@
 # Events between nodes
 
-Pods on different boards exchange small messages through a publish and
-subscribe layer in `src/ipc/channel.cpp`. On the boards it runs over two
-transports at once: ESP-NOW and UDP on port 7400. Each frame is sent on the
-transport through which the peer was discovered. This is the path the
-Tessera keypad uses: a key pressed on the Cardputer travels as an event to
-the core pod on the control plane, and from there to browsers as a
-server-sent event.
+Pods exchange messages across `src/ipc/channel.cpp` over ESP-NOW and UDP port 7400. Each frame uses the transport that discovered the peer. The simulator uses UDP on port 7400 plus the node ID.
 
-## What a pod uses
+## Host API
 
-| Call | Effect | Needs |
+| Call | Effect | Requirement |
 | --- | --- | --- |
-| `k32_event_emit(topic, payload)` | publishes to local subscribers and to every known peer | `hardware.kube32.io/ipc` |
-| `kube32_channel_open(name, flags)` | opens a receive queue for frames published under `name` | `hardware.kube32.io/ipc` |
-| `kube32_channel_recv(handle, buf, cap, timeout_ms)` | reads one frame from that queue | an open handle |
-| `kube32_channel_send(handle, data, len)` | delivers to the queue on the same node only | an open handle |
-| `k32_event` export | the node calls it for each frame on `<app>.events` and `<app>.input` | exporting `k32_event` and `k32_alloc` |
+| `k32_event_emit(topic, payload)` | Publishes to local subscribers and known peers | `hardware.kube32.io/ipc` |
+| `kube32_channel_open(name, flags)` | Opens a receive queue for `name` | `hardware.kube32.io/ipc` |
+| `kube32_channel_recv(handle, buf, cap, timeout_ms)` | Reads one frame from the queue | Open handle |
+| `kube32_channel_send(handle, data, len)` | Delivers to the local queue only | Open handle |
+| `k32_event(topic_ptr, topic_len, ptr, len)` | Receives topics listed in `kube32.io/event-topics` | `k32_event` and `k32_alloc` exports |
 
-`kube32_channel_send` does not cross nodes. The code has a remote-route
-table, but nothing fills it. To reach another board, use `k32_event_emit`.
-
-On the boards the app name is `tessera`, so the topics delivered to
-`k32_event` are `tessera.events` and `tessera.input`. The Tessera HUD pod:
-
-- publishes key presses with `k32_event_emit("tessera.input", ...)`;
-- reads `tessera.events` through `kube32_channel_open` and
-  `kube32_channel_recv`.
-
-The core pod publishes on `tessera.events`, and the ingress turns those
-events into SSE for browsers.
+Set the pod annotation `kube32.io/event-topics: a,b` to deliver channel topics from any node to the pod's `k32_event` export. Messages queue up to 16 entries and run on the `k32_events` thread, which uses a 16 KiB internal RAM stack or a 32 KiB PSRAM stack. In the `tessera` app, `tessera-hud` publishes keystrokes with `k32_event_emit("tessera.input", ...)` and reads `tessera.events` with `kube32_channel_open` and `kube32_channel_recv`. `tessera-api` subscribes to `tessera.input` via `kube32.io/event-topics` and publishes updates on `tessera.events`, which the Ingress streams as Server-Sent Events via `kube32.io/event-stream`.
 
 ## Limits
 
 | Item | Limit |
 | --- | --- |
 | `k32_event_emit` payload | 200 bytes; topic 1 to 64 bytes |
-| Published message | 1024 bytes, split into frames of up to 224 bytes of payload |
-| Reassembly | up to 32 fragments, 500 ms timeout, 8 messages in flight |
-| Receive queue per channel | 8 slots of 512 bytes on a board; 16 slots of 1024 bytes on the simulator |
-| Delivery | best effort: no acknowledgement, no retransmission |
+| `k32_events` queue | 16 messages; stack 16 KiB internal RAM or 32 KiB PSRAM, 256 KiB on the simulator |
+| Published message | 1024 bytes, split into 224-byte payload frames |
+| Reassembly | 32 fragments, 500 ms timeout, 8 messages in flight |
+| Receive queue per channel | 8 slots of 512 bytes on hardware; 16 slots of 1024 bytes on the simulator |
+| Maximum frame size | 250 bytes |
+| Delivery | Best effort, no acknowledgement or retransmission |
 
 ## Peer discovery
 
-Every node sends a HELLO frame every 3 s (every 2 s on the simulator). The
-frame carries the node's ID and name, and goes out:
+Nodes send a HELLO frame carrying the node ID and name on topic `k32.hello` every 3 s on hardware, or every 2 s on the simulator, to:
 
-- to the ESP-NOW broadcast address (boards only);
-- to every known peer;
-- to UDP seed addresses.
+- The ESP-NOW broadcast address on hardware.
+- Every known peer.
+- UDP seed addresses on port 7400.
 
-Workers seed the control plane's address. Every 10 s the control plane seeds
-the `InternalIP` of every registered node. Seeding is what makes events flow
-when the two boards sit on different access points of the same network: they
-may then be on different Wi-Fi channels, and ESP-NOW frames never arrive. On
-such a network the keypad events used to stop at the worker; that is why the
-UDP transport exists (commit `464c402`). Peers never expire.
-
-ESP-NOW runs unencrypted at a fixed 24 Mbps rate. The simulator uses UDP
-only, on port 7400 plus the node ID.
+Workers seed the control plane address at boot. Every 10 s, the control plane reads node objects and seeds the `InternalIP` of each registered node on UDP port 7400. UDP seeding routes traffic when boards sit on different access points or Wi-Fi channels and cannot receive ESP-NOW broadcast frames. On the simulator, pass `--peer name:id:port` to add static UDP peers. Peers never expire. ESP-NOW runs unencrypted at 24 Mbps.
 
 ## Frame format
 
-Little-endian, packed, defined in `include/ipc/channel.hpp`:
+Defined as a packed little-endian struct in `include/ipc/channel.hpp`:
 
 | Offset | Size | Field |
 | --- | --- | --- |
-| 0 | 4 | magic, the bytes `K32C` (`0x4332334B` read as a little-endian `u32`) |
-| 4 | 1 | version, `1` |
-| 5 | 1 | flags: `0x01` fragment, `0x02` first, `0x04` last, `0x10` HELLO; `0x08` (ack requested) is defined but unused |
-| 6 | 2 | sequence number |
-| 8 | 4 | FNV-1a hash of the channel or topic name |
-| 12 | 4 | FNV-1a hash of the sending pod |
-| 16 | 4 | FNV-1a hash of the target pod (ignored on receive) |
-| 20 | 1 | fragment index |
-| 21 | 1 | fragment count |
-| 22 | 2 | payload length, 0 to 224 |
-| 24 | n | payload |
-| 24 + n | 2 | CRC-16/CCITT-FALSE (polynomial `0x1021`, initial `0xFFFF`) over header and payload |
+| 0 | 4 | Magic `K32C` (`0x4332334B` as little-endian `u32`) |
+| 4 | 1 | Version `1` |
+| 5 | 1 | Flags: `0x01` fragment, `0x02` first, `0x04` last, `0x08` ack unused, `0x10` HELLO |
+| 6 | 2 | Sequence number |
+| 8 | 4 | FNV-1a hash of channel or topic name |
+| 12 | 4 | FNV-1a hash of sending pod |
+| 16 | 4 | FNV-1a hash of target pod, ignored on receive |
+| 20 | 1 | Fragment index |
+| 21 | 1 | Fragment count |
+| 22 | 2 | Payload length, 0 to 224 |
+| 24 | n | Payload |
+| 24 + n | 2 | CRC-16/CCITT-FALSE, polynomial `0x1021`, initial `0xFFFF`, over header and payload |
 
-A frame is at most 250 bytes, the ESP-NOW maximum. Frames with a bad magic,
-version, length or CRC are dropped.
+Frames with an invalid magic, version, length, or CRC are dropped.
 
-Latency and throughput of this path have not been measured in isolation. The
-end-to-end keypad path (key, HUD, transport, core pod, browser) works on the
-boards; no timing for it has been recorded.
+## Limitations
+
+`kube32_channel_send` delivers only to the local node; use `k32_event_emit` to reach other boards.

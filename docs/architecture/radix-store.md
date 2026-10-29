@@ -1,55 +1,45 @@
 # Object store
 
-The control plane keeps every API object in an in-memory radix tree
-(`src/storage/radix_tree.cpp`, behind the `Store` interface in
-`include/storage/store.hpp`). It plays the role etcd plays in Kubernetes, at
-a much smaller scale: one process, no replication, no consensus.
+The control plane stores API objects as JSON strings in a single-process, in-memory radix tree in `src/storage/radix_tree.cpp` and `include/storage/store.hpp`. A single recursive mutex guards the tree and watch list. The API server copies data out of the store and releases the lock before it serializes and streams responses. Watch callbacks also run after the lock is released.
 
 ## Keys
 
-Objects are stored as JSON strings under etcd-style keys. The kinds that have
-their own handlers use these keys:
+`resource_info` in `src/api/route_handler.cpp` defines the etcd-style key paths for stored resources:
 
 | Kind | Key |
 | --- | --- |
 | Node | `/registry/nodes/<name>` |
+| Namespace | `/registry/namespaces/<name>` |
 | Pod | `/registry/pods/<namespace>/<name>` |
+| Service | `/registry/services/<namespace>/<name>` |
+| ConfigMap | `/registry/configmaps/<namespace>/<name>` |
+| Secret | `/registry/secrets/<namespace>/<name>` |
+| Event | `/registry/events/<namespace>/<name>` |
 | Deployment | `/registry/deployments/<namespace>/<name>` |
+| DaemonSet | `/registry/daemonsets/<namespace>/<name>` |
+| Job | `/registry/jobs/<namespace>/<name>` |
 | Lease | `/registry/leases/<namespace>/<name>` |
+| Ingress | `/registry/ingresses/<namespace>/<name>` |
 
-Namespaces, Services, ConfigMaps, Secrets, DaemonSets, Jobs and Events
-follow the same pattern; `resource_info` in `src/api/route_handler.cpp` lists
-them. A list request is a prefix scan, for example `/registry/pods/default/`.
-Prefix scans walk only the matching branch of the tree.
+List requests run a prefix scan on the matching branch of the tree, such as `/registry/pods/default/`. `Endpoints` and `EndpointSlice` objects are computed from Services and Pods on read and are not stored in the tree.
 
-## Versions
+## Versions and watches
 
-Each write increments a store-wide revision. The object's `resourceVersion`
-carries it, and watches use it to replay recent events. `put` can take an
-expected version and fail on a mismatch. The API server's PUT path does not
-pass one, so concurrent updates through the API are last-writer-wins.
+Each write or delete increments a store-wide revision counter and injects the value into `metadata.resourceVersion`. `put_extended` accepts an `expected_version` for compare-and-swap writes, but the HTTP PUT and PATCH handlers omit it, making concurrent API updates last-writer-wins.
 
-## Persistence
+`WatchHub` in `include/api/watch_hub.hpp` subscribes to `/registry/` and manages up to 8 concurrent watch or log streams on PSRAM boards, 4 without PSRAM, and 16 on the simulator:
 
-| Target | Behaviour |
-| --- | --- |
-| Boards | Not persisted. `src/main_esp32.cpp` sets `enable_flash_persistence = false`. Nothing mounts the `storage` partition in `partitions.csv`. |
-| Simulator | Persisted with `--enable-flash --data-dir <dir>`: one `<key>.json` file per object, written to a temporary file, fsynced and renamed. `recover()` reloads the directory at start. Leases and events are not written. |
+- Watches with `resourceVersion=0` or unset stream `ADDED` events for current objects, followed by a `k8s.io/initial-events-end: "true"` bookmark when `sendInitialEvents=true`.
+- Watches with `resourceVersion=N` replay events from a 32-event ring buffer. If `N` was evicted or exceeds the current revision, the server sends an `ERROR` frame with code `410` and reason `Expired`, then closes the stream.
+- Each stream buffers up to 16 pending events and sends `BOOKMARK` frames every 30 seconds when `allowWatchBookmarks=true`.
 
-The class that writes those files is called `LittleFSJournal`, but it uses
-plain POSIX file calls. It is not LittleFS, and there is no checksum,
-snapshot or append-only log.
+## Persistence journal
 
-What a control-plane reboot on a board does, as the code stands:
+When node storage is mounted, or when you pass `--enable-flash` to the simulator, `FlashLog` in `include/storage/flash_log.hpp` persists objects to `<root>/kube32/store/journal.img`:
 
-1. Every object is lost, including the Tessera pods.
-2. The workers fail two heartbeats and register again.
-3. On their next sync they see no pods bound to them, and they stop the pods
-   they were running.
-4. Nothing recreates the workloads; apply the manifests again.
+- The journal is a preallocated ring of 4 KiB sectors with `K32L` magic and a sequence number. Each `Put`, `Delete`, or `RevisionMark` record is 4-byte aligned and carries a CRC32 over the sector sequence number, header, key, and value. The journal reclaims space from the oldest sector by re-appending live records to the head.
+- Leases and Events stay in RAM, as defined in `include/storage/persist_policy.hpp`. Node heartbeat status flushes at most every 10 minutes, while Node labels, annotations, `spec`, or `Ready` status flush within 1 second. All other objects flush within 1 second. Pending updates to the same key coalesce, and the journal skips writes when the content outside `resourceVersion` is unchanged.
+- The journal file is 1 MiB on internal flash at `/data`, with ~480 KB of live object capacity, and 4 MiB on a microSD card at `/sd` or in the simulator, with ~1.9 MB of live capacity. The maximum value size is 64 KiB. When live bytes reach capacity, the store refuses new object creations with HTTP 500 `StorageFull`, while updates and deletes continue to work.
+- At boot, `recover` scans the consecutive sector run, skips torn records with invalid CRCs, and replays the latest record per key. The store reserves revisions on flash in blocks of 10,000 via `RevisionMark` records so `resourceVersion` never goes backwards across restarts. Watches opened before a restart receive `410` and relist. Pods already in `Succeeded` or `Failed` phase are not restarted after boot.
+- Send `K32_CMD:STORE` on the serial console to print live keys, byte usage, sector usage, and revision counters.
 
-## Concurrency
-
-One mutex guards the tree. The API server copies what it needs out of the
-store and releases the lock before it serializes and streams a response, so
-a slow client does not hold up the scheduler or the controllers.

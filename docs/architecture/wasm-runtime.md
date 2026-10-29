@@ -1,113 +1,89 @@
 # Wasm runtime
 
-Pods are WebAssembly modules executed by [wasm3](https://github.com/wasm3/wasm3),
-an interpreter vendored in `third_party/wasm3`. The vendored copy carries
-Kube32 changes, for example the allocator hooks in `m3_core.c`. It is built
-with exception
-handling, typed function references, stack switching, snapshots and
-backtraces compiled out; see the `-Dd_m3*` flags in `platformio.ini` and
-`CMakeLists.txt`. The interpreter gives each pod its own linear memory. A
-guest can read and write only that memory, and it reaches the node only
-through the host functions linked into the `env` module.
+[wasm3](https://github.com/wasm3/wasm3), an interpreter in `third_party/wasm3`, executes pods as WebAssembly modules. Each pod gets isolated linear memory and reaches the node through host functions in the `env` module. The ABI is in `include/runtime/k32_app_abi.h`. See [Writing app pods](../app-development.md) for guest examples.
 
-The contract between host and guest is `include/runtime/k32_app_abi.h`.
-[Writing app pods](../app-development.md) covers it from the guest's side,
-with examples in Rust, C and AssemblyScript.
+The build disables exception handling, typed function references, stack switching, snapshots, and backtraces via `-Dd_m3*` flags in `platformio.ini` and `CMakeLists.txt`.
 
-## Two kinds of pod
+## Pod kinds
 
-| Kind | Exports | How it runs |
+| Kind | Exports | Execution |
 | --- | --- | --- |
-| Request pod | `k32_alloc`, `k32_handle`; optionally `k32_init`, `k32_tick`, `k32_event` | Has no thread of its own. The ingress or pod HTTP server calls `k32_handle` once per request, on its own thread, serialized per pod. The tick thread calls `k32_tick`. Events arrive through `k32_event`. |
-| Entry-point pod | `_start`, `app_main` or `main` | Runs on a thread of its own. The pod completes when the function returns. |
-
-`k32_init` runs once when the container is created. A non-zero return fails
-the pod.
+| Request pod | `k32_alloc`, `k32_handle`, and optionally `k32_init`, `k32_tick`, `k32_event` | Runs on the caller thread, or on the shared 40 KiB interpreter stack on boards without PSRAM. Calls are serialized per pod. `k32_init` runs once at creation, and a non-zero return fails the pod. |
+| Entry-point pod | `_start`, `app_main`, or `main` | Runs on a dedicated pod thread until the function returns. Requires a board with PSRAM. |
 
 ## Images
 
-The kubelet resolves `spec.containers[0].image` in this order:
+The kubelet resolves `spec.containers[0].image` in order:
 
-1. **microSD card.** `wasm://sd/<name>[:<tag>]` is read from the card (see
-   [microSD card](../sd-card.md)). If that fails, the pod fails with
-   `ErrImagePull`; there is no fallback.
-2. **Embedded registry.** The firmware's registry, built from `images/*.wasm`
-   at compile time and looked up by the last path component before `:`.
-   Modules there are parsed in place from flash.
-3. **Inline annotation.** The `kube32.io/wasm-base64` annotation on the pod,
-   which `tools/kube32-cli deploy` writes.
+1. `wasm://sd/<name>[:<tag>]` reads `<card>/kube32/images/<name>[-<tag>].wasm` from the [storage](../storage.md).
+2. `wasm://embedded/<name>` or any other reference matches `images/*.wasm` in the embedded firmware registry by the last path component before `:` and parses modules in place from flash.
+3. The `kube32.io/wasm-base64` pod annotation, written by `tools/kube32-cli deploy`.
+
+Unresolved images or images too large for node memory fail the pod with `ErrImagePull`.
 
 ## Memory
 
-- **Linear memory** is what the module declares, capped by the pod's memory
-  limit. The limit is `limits.memory`, else `requests.memory`, raised to
-  `esp32.io/psram` when that is larger, and at least 64 KiB. A module that
-  declares more than its limit does not load. `memory.grow` past the limit
-  returns -1 to the guest.
-- **The large block.** Allocations of 48 KiB or more are served first from
-  a single block reserved at boot: 67 KiB of internal RAM on a board without
-  PSRAM, 1,340 KiB of PSRAM on a board with it. The block serves one pod at a
-  time. A second large allocation goes to the general heap. On the
-  Cardputer, once Wi-Fi was up, that heap was observed to have no contiguous
-  48 KB block left.
-- **Value stack.** wasm3's value stack is 16 KiB, or 4 KiB for pods whose
-  limit is 64 KiB or less.
-- **Shadow stack.** C and Rust locals live in linear memory, in a shadow
-  stack the module's own linker sets up.
+- Linear memory is capped by `limits.memory` or `requests.memory`, raised to `esp32.io/psram` if larger, with a 64 KiB default. Limits below `64Ki` cap the backing of the first Wasm page to that byte limit; `memory.grow` past the limit returns -1 and accesses past it trap.
+- At boot, PSRAM nodes reserve one 1,284 KiB PSRAM block (`20 * 64 KiB + 4 KiB` header). Nodes without PSRAM reserve one 67 KiB internal RAM block and one shared 40 KiB interpreter stack.
+- On boards without PSRAM, the 67 KiB pool block holds one large linear memory (>= 48 KiB and at least half the block) from its start and places smaller pod allocations (wasm3 runtime, compiled code, small linear memories) from its end. Every pod allocation comes from the pool block first and falls back to the general heap only when the block is full, except while a pod whose linear memory needs >= 48 KiB loads, when its runtime structures go to the general heap so the block stays whole. The general heap stays for the kubelet, Wi-Fi, and lwIP, with 16 KiB reserved for the system.
+- The per-pod wasm3 value stack defaults to 4 KiB when the pod memory limit is 64 KiB or less and 16 KiB above. The pod annotation `kube32.io/wasm-stack` sets it between `512` and `64Ki`. C and Rust locals use a shadow stack in linear memory.
 
-## Work limits
+## Threads
 
-- **Per call.** Each `k32_handle` and `k32_event` call gets a budget of 400
-  million wasm3 gas units. A call that runs out traps.
-- **Other calls.** `k32_init`, `k32_tick` and entry points get no fresh
-  budget.
-- **Stopping a pod** forces the remaining gas negative, which ends a guest
-  stuck in a loop at its next metered instruction.
+| Thread | Stack, with PSRAM / without PSRAM | Role |
+| --- | --- | --- |
+| `pod_<ns>/<name>` | 64 KiB PSRAM / not supported | Dedicated thread per entry-point pod (PSRAM boards only). |
+| `k32_tick` | 64 KiB PSRAM / 4 KiB internal | Calls `k32_tick(uptime_ms)` at 1 Hz, or every 10 ms while a pod returns > 0. |
+| `k32_events` | 32 KiB PSRAM / 6 KiB internal | Runs while any pod subscribes via `kube32.io/event-topics` and dispatches messages to `k32_event`. |
 
-## Faults
+On boards without PSRAM, all host-initiated pod calls (`k32_init`, `k32_alloc`, `k32_handle`, `k32_tick`, `k32_event`) switch onto the shared 40 KiB interpreter stack and run serialized across the node. `k32_init` runs from `k32_kubelet` (64 KiB PSRAM stack or 12 KiB internal stack), and `k32_handle` runs from the ingress worker or pod server thread. Run `K32_CMD:TASKS` to inspect native stack sizes and high-water marks.
 
-wasm3 checks every memory access and every trap condition, so a guest fault
-ends that guest and leaves the node running.
+## Execution budget
 
-| Trap | Reason reported |
-| --- | --- |
-| out-of-bounds memory access | `OOMKilled` (the name is misleading: it is an access fault, not memory exhaustion) |
-| integer division by zero | exit code 136 |
-| `unreachable` | exit code 134 |
-| stack overflow | `StackOverflow` |
-| out of gas (entry-point pods) | `ExecutionTimeout` |
-| anything else | `RuntimeTrap` |
+Every call into a pod (`k32_init`, `k32_alloc`, `k32_handle`, `k32_tick`, `k32_event`) starts with a fresh wasm3 gas budget, default 4,000,000,000 units. The pod annotation `kube32.io/execution-budget` sets the unit count, or `"off"` or `"0"` to disable metering. Unmetered pods run 25 to 60 percent faster, but their calls cannot be interrupted mid-call. Stopping a pod interrupts metered guest loops and wakes blocking host calls (`esp32_delay_ms`, `kube32_channel_recv`, `k32_tone`, `k32_http_call`).
 
-After a trap the kubelet reports the pod `Failed`. Nothing restarts it:
-`restartPolicy` is not read, whatever the reason text says. A request pod
-that trapped stays registered and is still called for later requests.
+## Traps and exit codes
 
-When an entry point returns normally, the kubelet reports the pod
-`Succeeded` and `kubectl` shows `Completed`. The return value is not read.
-On the simulator, a C `app_main` that returned 3 was reported as "exited with
-code 0".
+Guest faults terminate the container and leave the node running. Container status messages include the wasm3 trap text.
 
-## Native stacks
+| Condition or trap | Exit code | Reason |
+| --- | --- | --- |
+| `_start` returns, or `app_main` / `main` returns 0 | 0 | `Completed` |
+| `app_main` / `main` returns non-zero `N` | `N` | `Error` |
+| Module parse/load failure, `k32_init` non-zero, or no pod thread | 128 | `StartError` |
+| Unsupported instruction | 132 | `Error` |
+| `unreachable`, abort, or uncaught trap | 134 | `Error` |
+| Unaligned atomic | 135 | `Error` |
+| Integer division by zero, integer overflow, or bad conversion | 136 | `Error` |
+| Allocation failure, `memory.grow` refused at the limit, or abort after refused `memory.grow` | 137 | `OOMKilled` |
+| Stopped by the kubelet | 137 | `Error` |
+| Out-of-bounds memory/table access, stack overflow, bad indirect call, or null reference | 139 | `Error` |
+| Wasm value stack exhausted (`the module's stack of N bytes is exhausted (raise it with the annotation kube32.io/wasm-stack)`) | 139 | `Error` |
+| Execution budget exhausted via `kube32.io/execution-budget` | 152 | `Error` |
 
-Request pods run on the caller's thread, so the kubelet, tick, ingress and
-event-dispatch threads are sized for interpreter recursion. On the Xtensa
-build, wasm3's operation chain is not fully tail-call optimised. An entry-point
-pod gets its own thread; on a board without PSRAM it runs on a 40 KiB stack
-reserved at boot. `K32_CMD:TASKS` shows the current sizes and high-water
-marks.
+## Restarts
+
+When a container exits, the kubelet releases its memory, thread, open files, and firewall claims, then applies `restartPolicy`:
+
+| `restartPolicy` | Exit code 0 | Non-zero exit or trap |
+| --- | --- | --- |
+| `Always`, default | restart | restart |
+| `OnFailure` | pod `Succeeded` | restart |
+| `Never` | pod `Succeeded` | pod `Failed` |
+
+Restarts back off for 10 s, doubling up to 5 minutes, and reset to 10 s after 10 minutes of running. While waiting, the pod stays `Running` with the container in `CrashLoopBackOff`, `lastState` holding the exit code and reason, and a `BackOff` event. Each restart loads a fresh instance, increments `restartCount`, and rotates the container log so `kubectl logs --previous` serves the prior instance.
 
 ## Host functions
 
-Two groups are linked into every module:
+Every module links two function groups in the `env` module:
 
-- `src/runtime/app_pod.cpp`: responses (`k32_resp_*`), `k32_log`, time,
-  random, environment, memory statistics, `k32_event_emit`, display, keypad,
-  tone, and the `k32_fs_*` file calls.
-- `src/runtime/host_functions.cpp`: `esp32_gpio_*`, `esp32_adc_read`,
-  `esp32_i2c_*`, `esp32_uart_*`, `esp32_delay_ms`, `esp32_get_time_us`, and
-  `kube32_channel_*`.
+- `src/runtime/app_pod.cpp` links `k32_resp_begin`, `k32_resp_header`, `k32_resp_write`, `k32_resp_end`, `k32_resp_asset`, `k32_http_call`, `k32_event_emit`, `k32_time_ms`, `k32_log`, `k32_random`, `k32_env_get`, `k32_mem_stats`, `k32_display_text`, `k32_display_rect`, `k32_display_bar`, `k32_key_read`, `k32_tone`, and `k32_fs_open`/`read`/`write`/`close`/`size`/`list`/`remove`.
+- `src/runtime/host_functions.cpp` links `esp32_gpio_set_mode`, `esp32_gpio_write`, `esp32_gpio_read`, `esp32_adc_read`, `esp32_i2c_write`, `esp32_i2c_read`, `esp32_uart_write`, `esp32_uart_read`, `esp32_get_time_us`, `esp32_delay_ms`, and `kube32_channel_open`/`send`/`recv`/`close`.
 
-The calls that touch hardware or other nodes are checked by the
-[capability firewall](capability-firewall.md). `tools/kube32-cli check` holds
-the full list of names and signatures. It rejects a module that imports
-anything else.
+The [capability firewall](capability-firewall.md) gates hardware, storage, IPC, and `SERVICE_CALL` requests. Run `tools/kube32-cli check` to validate module imports and memory against the ABI.
+
+## Limitations
+
+- Liveness and readiness probes are not run by the kubelet.
+- Without PSRAM, only one 67 KiB pool block and one shared 40 KiB interpreter stack are reserved at boot. Entry-point (`app_main`) pods are not supported without PSRAM, and allocations beyond the pool block may fail once Wi-Fi fragments the internal heap.
+

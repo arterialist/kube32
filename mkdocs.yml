@@ -52,11 +52,13 @@ nav:
       - Quick start: quickstart.md
       - Hardware: hardware-spec.md
       - Flashing and the serial console: flashing-troubleshooting.md
+      - Cluster access: cluster-access.md
   - Building apps:
-      - Writing app pods: app-development.md
-      - microSD card: sd-card.md
-      - GPIO and other peripherals: workloads/gpio-blinker.md
-      - Tessera demo: tessera.md
+      - Writing pods: app-development.md
+      - Services, Ingress and pod-to-pod calls: networking.md
+      - Storage and volumes: storage.md
+      - Peripherals: peripherals.md
+      - "Example: Tessera": examples/tessera.md
   - Architecture:
       - Overview: architecture/index.md
       - Object store: architecture/radix-store.md

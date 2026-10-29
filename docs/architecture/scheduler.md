@@ -1,60 +1,40 @@
 # Scheduler and controllers
 
-Three control loops run on the control plane next to the API server:
+Four control loops run on the control plane next to the API server:
 
-- the scheduler, `src/scheduler/scheduler.cpp`;
-- the node lifecycle controller, `src/controller/node_lifecycle_controller.cpp`;
-- the Deployment controller, `src/controller/deployment_controller.cpp`.
+- `src/scheduler/scheduler.cpp`
+- `src/controller/node_lifecycle_controller.cpp`
+- `src/controller/deployment_controller.cpp`
+- `src/controller/workload_controller.cpp`
 
 ## Scheduler
 
-A pod created without `spec.nodeName` is scheduled during the create
-request. A reconcile loop then retries anything still unbound: every 3 s on
-the boards, and every second on the simulator (`--reconcile-interval`). A pod
-created with `nodeName` already set skips the scheduler.
+The scheduler binds pods created without `spec.nodeName` during the create request. A reconcile loop retries unbound pods every 3 s on hardware and every 1 s on the simulator via `--reconcile-interval`. Pods created with `nodeName` set skip the scheduler.
 
 ### Filters
 
-Each candidate node must pass every filter, in this order:
+Candidate nodes must pass each filter in order:
 
-1. **Schedulable.** `spec.unschedulable` is not set, the node has a status,
-   and its `Ready` condition is `True`.
-2. **Memory.** `requests.memory`, or `limits.memory` when the pod has no
-   requests, must fit the node's allocatable `memory`. A pod that declares
-   none counts as 16 KiB.
-3. **PSRAM**, only when the pod requests `esp32.io/psram` (or `esp.io/psram`).
-4. **Peripheral counts:** `esp32.io/gpio`, `esp32.io/i2c` and `esp32.io/adc`.
-5. **Node selector:** exact matches on the node's labels.
-6. **Node name.**
+1. `spec.unschedulable` is unset, status is present, and `Ready` is `True`.
+2. `nodeName` matches if specified.
+3. `nodeSelector` labels match the node labels.
+4. `requests.memory`, or `limits.memory` if requests are omitted, fits within allocatable `memory`. Pods without a memory declaration default to 16 KiB.
+5. `esp32.io/psram` or `esp.io/psram` fits within allocatable PSRAM.
+6. `esp32.io/gpio`, `esp32.io/i2c`, `esp32.io/uart`, and `esp32.io/adc` counts fit within allocatable limits. Named buses such as `esp32.io/i2c-bus-0` or `esp32.io/uart-1` each consume one bus from the node's count.
 
-"Allocatable" comes from the node's `status.allocatable`, or `capacity`.
-Pods already bound to the node (`Running` or `Pending`) are subtracted from
-it.
+Quantities follow Kubernetes: `Ki`, `Mi`, `Gi` are binary, `k`, `M`, `G` decimal, and `m` is milli. Unrecognized suffixes count as 0.
 
-The scheduler does not look at:
+Allocatable resources come from `status.allocatable` or `capacity`. The kubelet measures free heap, free PSRAM, and unclaimed pins, so running pods are already included in the reported figures. The scheduler subtracts requests only for bound pods the report does not include yet: `Pending` pods, containers waiting to restart, and pods modified after the node's last status write.
 
-- `hardware.kube32.io/*` resources;
-- specific pin claims (`esp32.io/gpio-<N>`);
-- UART;
-- taints, affinity or topology.
-
-Those are checked later by the kubelet's
-[capability firewall](capability-firewall.md), which fails the pod at
-admission if a grant cannot be given.
+The scheduler ignores `hardware.kube32.io/*` resources, `esp32.io/gpio-<N>` pin claims, taints, affinity, and topology. The kubelet [capability firewall](capability-firewall.md) validates hardware and pin claims at admission.
 
 ### Scoring
 
-When several nodes pass, each gets a "least allocated" score. The score is
-the mean of two percentages: free memory after this pod, and free GPIO count
-after this pod. The highest score wins, and ties go to the
-alphabetically first node name. PSRAM, I2C and ADC are not scored.
+Passing nodes receive a score equal to the mean of two percentages: free memory after binding the pod and free GPIO count after binding the pod. The highest score wins. Ties break by alphabetically first node name.
 
-### When nothing fits
+### Unschedulable pods
 
-The pod stays `Pending`, its `PodScheduled` condition is `False` with reason
-`Unschedulable`, and a `FailedScheduling` warning is recorded on every pass.
-`examples/oversized-pod.yaml` requests 4000 KiB of memory on a node; on the
-simulator:
+When no node passes filtering, the pod remains `Pending` with `PodScheduled` set to `False`, reason `Unschedulable`, and a `FailedScheduling` event in kube-scheduler format:
 
 ```
 $ kubectl apply -f examples/oversized-pod.yaml
@@ -64,63 +44,59 @@ NAME            READY   STATUS    RESTARTS   AGE
 oversized-pod   0/1     Pending   0          4s
 $ kubectl get events --field-selector involvedObject.name=oversized-pod
 LAST SEEN   TYPE      REASON             OBJECT              MESSAGE
-1s          Warning   FailedScheduling   pod/oversized-pod   0/2 nodes are available: insufficient heap memory or peripheral resources
+0s          Warning   FailedScheduling   pod/oversized-pod   0/2 nodes are available: 1 Insufficient esp32.io/psram, 1 node(s) didn't match Pod's node affinity/selector.
 ```
-
-The message does not say which filter failed. The scheduler computes the
-reason and then discards it.
-
-### Known limits
-
-- **Memory is counted twice.** On a board, a node's allocatable memory is the
-  free heap it measured at its last heartbeat. That figure already excludes
-  running pods, and the scheduler subtracts their requests again.
-- **Quantity suffixes are not standard.** `m` is read as Mi, and `K`, `M` and
-  `G` are read as binary units.
-- **A missing field gets a default.** When a node's status lacks a key, the
-  scheduler assumes 240Ki memory, 14 GPIO, 2 I2C, 2 ADC or 3840Ki PSRAM, and
-  so does the kubelet's heartbeat (see
-  [Known inaccuracies](../api-reference.md#known-inaccuracies)).
 
 ## Node lifecycle controller
 
-Each kubelet sends a heartbeat every 5 s: a Lease update and a Node status
-patch. The controller remembers when it last saw one for each node and checks
-every second (every 500 ms on the simulator):
+Each kubelet renews a Lease in `kube-node-lease` with `leaseDurationSeconds: 15` every 5 s. The controller checks renewals every 1 s on hardware and every 500 ms on the simulator:
 
-| Time without a heartbeat | Action |
+| Time without renewal | Action |
 | --- | --- |
-| 15 s | Node `Ready` set to `False` (reason `NodeStatusUnknown`), `NodeNotReady` event |
-| 30 s | `Unreachable` condition added; every pod on the node is evicted |
+| 15 s, or `leaseDurationSeconds` | Sets Node `Ready` to `Unknown` with reason `NodeStatusUnknown`, adds a `node.kubernetes.io/unreachable:NoSchedule` taint, and emits `NodeNotReady` |
+| +15 s, or 30 s total | Adds a `node.kubernetes.io/unreachable:NoExecute` taint and evicts non-DaemonSet pods |
 
-Eviction does not delete the pod. It clears `spec.nodeName`, sets phase
-`Pending` with reason `Evicted`, adds a `DisruptionTarget` condition and
-records an event. The scheduler can then bind the pod to another node. When
-the old node returns, its kubelet stops its copy, because the pod is no longer
-bound to it.
+Simulator timeouts are configurable with `--not-ready-timeout` and `--eviction-timeout`. A lease renewal clears both taints and emits `NodeReady`. After a control-plane restart, a previously `Ready` node gets a full lease duration before timing out.
 
-The thresholds are set in `src/main_esp32.cpp`; on the simulator they come
-from `--not-ready-timeout` and `--eviction-timeout`. The code has unit tests
-(`test_lease_controller`). Nobody has yet measured eviction on the two boards
-by unplugging one.
-
-Two caveats:
-
-- **Only arrival times count.** The controller tracks when it received a
-  heartbeat. It ignores the Lease's `renewTime` and `leaseDurationSeconds`.
-- **A restarted controller trusts every node.** After a control-plane
-  restart, every node starts with a fresh "last seen" time.
+Eviction clears `spec.nodeName`, sets phase to `Pending` with reason `Evicted`, adds a `DisruptionTarget` condition, and records an `Evicted` event so the scheduler can rebind the pod. The controller removes terminating pods from the store, and leaves `Succeeded`, `Failed`, and DaemonSet pods on the node.
 
 ## Deployment controller
 
-Once a second the controller compares each Deployment with the pods that
-carry its owner reference:
+The controller reconciles each Deployment every 1 s against pods carrying its owner reference:
 
-- It creates pods from the template, labelled with a `pod-template-hash`.
-- It deletes surplus pods.
-- When the template changes, it replaces one stale pod per pass. It does not
-  read `strategy`.
-- It writes `status` from the real pod phases.
+- Creates missing pods from the template with a `pod-template-hash` label.
+- Deletes surplus pods, removing not-ready and stale pods first, and deletes pods whose owner Deployment is deleted.
+- Replaces one stale pod per pass on template changes.
+- Tracks spec changes in `metadata.generation`, updates `status` and `Available` / `Progressing` conditions with `maxUnavailable` defaulting to 25%, and serves the `scale` subresource for `kubectl scale deployment`.
 
-There are no ReplicaSet objects. Pods whose owner Deployment is gone are
-deleted. `kubectl scale deployment` works through the `scale` subresource.
+kube32 does not create ReplicaSet objects.
+
+## DaemonSet and Job controller
+
+One loop in `src/controller/workload_controller.cpp` reconciles DaemonSets and Jobs every 1 s. Pods carry an owner reference to their DaemonSet or Job and are deleted when the owner is deleted.
+
+### DaemonSet
+
+- Places one pod per node matching the template's `nodeSelector` by setting a `kubernetes.io/hostname` node selector and `controller-revision-hash` label.
+- Deletes pods on nodes that leave or no longer match. DaemonSet pods stay on unreachable nodes.
+- Performs node-by-node rolling updates on template changes under `RollingUpdate`, with `maxUnavailable` defaulting to 1. The controller replaces not-ready pods first and waits for terminating pods to leave the node before creating replacements. `OnDelete` leaves updates to the user.
+- Rejects DaemonSets whose pod template sets `restartPolicy` to anything other than `Always`.
+
+### Job
+
+- Starts pods from the template until `completions`, defaulting to 1, reach `Succeeded`, running at most `parallelism`, defaulting to 1, active pods at a time, then sets the `Complete` condition.
+- Counts `Failed` pods against `backoffLimit`, which defaults to 6. When exceeded, the controller deletes active pods and sets the `Failed` condition with reason `BackoffLimitExceeded`.
+- Rejects Jobs whose pod template `restartPolicy` is not `Never` or `OnFailure`. Containers restarted in place under `OnFailure` do not count as pod failures.
+
+## Endpoints and EndpointSlices
+
+The API server computes read-only `core/v1` Endpoints and `discovery.k8s.io/v1` EndpointSlices on every read from Services and their selected pods:
+
+- Services with a non-empty `spec.selector` match non-terminating pods in the same namespace that have a `podIP`.
+- Named `targetPort` values resolve against container `ports` on each pod. The API server groups pods whose ports resolve to different numbers into separate subsets or slices.
+- Ready `Running` pods populate `addresses`, or `ready` and `serving` in EndpointSlices. Other non-terminating pods populate `notReadyAddresses`.
+
+## Limitations
+
+- Any write to a Node object advances its `resourceVersion`, so the scheduler stops subtracting a pod started right before a label or taint update until the kubelet's next status report.
+
