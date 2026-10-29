@@ -4,11 +4,13 @@
 #include "osal/thread.hpp"
 #include "osal/mutex.hpp"
 #include "osal/timer.hpp"
+#include "mem/function_ref.hpp"
 
 #include <string>
 #include <memory>
 #include <vector>
 #include <functional>
+#include <initializer_list>
 #include <atomic>
 
 namespace kube32::runtime {
@@ -81,8 +83,9 @@ TrapReport describe_trap(const char* trap, const TrapContext& ctx);
 
 // Runs `fn` on the shared interpreter stack when one is set (boards without
 // PSRAM, kube32_interp_stack_set) and the caller is not on it already;
-// otherwise on the caller's stack.
-void run_on_interpreter_stack(const std::function<void()>& fn);
+// otherwise on the caller's stack. `fn` is invoked in place: nothing is taken
+// from the heap.
+void run_on_interpreter_stack(mem::FunctionRef<void()> fn);
 
 // True once the container owning this wasm3 runtime is being stopped. Host
 // calls that wait (sleeps, channel receives, tones) check it and return early,
@@ -125,8 +128,15 @@ public:
     // Internal trap callback (invoked by worker thread on interpreter trap)
     void on_trap_caught(const std::string& trap_message, int32_t exit_code, const std::string& reason);
 
-    // Synchronous function invocation helper
-    int32_t call_function(const std::string& fn_name, const std::vector<int32_t>& args = {});
+    // Synchronous function invocation helper. Arguments are passed as an
+    // array (a braced list or a vector): a call takes nothing from the heap.
+    int32_t call_function(const std::string& fn_name, std::initializer_list<int32_t> args = {}) {
+        return call_function(fn_name, args.begin(), args.size());
+    }
+    int32_t call_function(const std::string& fn_name, const std::vector<int32_t>& args) {
+        return call_function(fn_name, args.data(), args.size());
+    }
+    int32_t call_function(const std::string& fn_name, const int32_t* args, size_t argc);
 
     // Introspection used by the application ABI host
     bool has_export(const char* fn_name) const;

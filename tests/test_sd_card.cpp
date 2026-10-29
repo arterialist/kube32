@@ -208,6 +208,24 @@ void test_pod_fs_abi() {
     assert(fs.read(pod, fd, buf, sizeof(buf)) == 0);    // end of file
     assert(fs.write(pod, fd, buf, 1) == K32_ERR_BADF);  // read-only descriptor
     assert(fs.close(pod, fd) == 0);
+
+    // Reads and writes larger than the staging buffer, at addresses that are
+    // not word aligned (guest memory at any offset), move every byte
+    {
+        std::vector<uint8_t> src(3001), dst(4800);
+        for (size_t i = 0; i < src.size(); ++i) src[i] = static_cast<uint8_t>(i * 7 + 3);
+        int32_t big = fs.open(pod, "big.bin", K32_FS_O_WRONLY | K32_FS_O_CREAT | K32_FS_O_TRUNC);
+        assert(big >= 0);
+        assert(fs.write(pod, big, src.data() + 1, 3000) == 3000);
+        assert(fs.close(pod, big) == 0);
+        big = fs.open(pod, "big.bin", K32_FS_O_RDONLY);
+        assert(fs.read(pod, big, dst.data() + 3, 700) == 700);
+        assert(fs.read(pod, big, dst.data() + 703, 4000) == 2300);   // short at the end of the file
+        assert(fs.read(pod, big, dst.data(), 10) == 0);
+        assert(std::memcmp(dst.data() + 3, src.data() + 1, 3000) == 0);
+        assert(fs.close(pod, big) == 0);
+        assert(fs.remove(pod, "big.bin") == 0);
+    }
     assert(fs.close(pod, fd) == K32_ERR_BADF);          // already closed
     assert(fs.close(pod, -1) == K32_ERR_BADF);
     assert(fs.close(pod, 9) == K32_ERR_BADF);

@@ -15,6 +15,7 @@
 #include <mutex>
 #include <string>
 #include <string_view>
+#include <sys/types.h>
 
 namespace kube32::runtime {
 
@@ -59,9 +60,19 @@ private:
     // Returns 0 and the volume root, or K32_ERR_PERM / K32_ERR_NODEV.
     int32_t resolve_root(const std::string& pod_id, std::string& out_root);
     static int32_t errno_to_k32(int err);
+    // read()/write() of up to `len` bytes through stage_, a chunk at a time;
+    // -1 with errno set when nothing moved and the call failed.
+    ssize_t staged_read(int host_fd, uint8_t* buf, uint32_t len);
+    ssize_t staged_write(int host_fd, const uint8_t* buf, uint32_t len);
 
     mutable std::mutex mutex_;
     std::map<std::string, Table> tables_;
+    // Data moves between the file and guest memory through this word-aligned
+    // buffer (used under mutex_). The SD card driver transfers sectors
+    // straight into a word-aligned buffer; for any other address (guest
+    // memory at an arbitrary offset) it allocates a sector bounce buffer on
+    // every call.
+    alignas(4) uint8_t stage_[512];
 };
 
 } // namespace kube32::runtime

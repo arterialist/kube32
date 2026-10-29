@@ -24,6 +24,7 @@
 #include <vector>
 
 typedef struct M3Module* IM3Module;
+typedef struct M3Runtime* IM3Runtime;
 
 namespace kube32::runtime {
 
@@ -134,6 +135,8 @@ const AppPlatformHooks& app_platform_hooks();
 // lifecycle controller for every module so that missing imports never fail
 // instantiation; permission is enforced at call time.
 void link_app_host_functions(IM3Module module, const std::string& pod_id);
+// Forgets the pod link_app_host_functions recorded for a runtime about to be freed.
+void unlink_app_host_functions(IM3Runtime runtime);
 
 struct AppPodStats {
     uint64_t requests{0};
@@ -167,6 +170,10 @@ public:
     bool has_pod(const std::string& pod_id) const;
     bool pod_handles_requests(const std::string& pod_id) const;
     std::vector<std::string> list_pods() const;
+    // The same into `out`, reusing its strings: a caller that lists pods
+    // over and over (the tick loop) keeps one vector and allocates nothing
+    // once it has held every pod id.
+    void list_pods(std::vector<std::string>& out) const;
     // Returns the first registered request-handling pod id, or empty.
     std::string default_request_pod() const;
 

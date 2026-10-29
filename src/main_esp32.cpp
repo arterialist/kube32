@@ -1149,10 +1149,12 @@ void cluster_task(void* pv) {
         t_cfg.priority = 4;
         t_cfg.core_affinity = 1;
         kube32::osal::Thread::create([](void*) {
+            std::vector<std::string> ids;   // reused: a tick round allocates nothing
             while (true) {
                 bool busy = false;
                 uint32_t now = static_cast<uint32_t>(kube32::osal::System::get_uptime_ms());
-                for (const auto& id : kube32::runtime::AppPodHost::instance().list_pods()) {
+                kube32::runtime::AppPodHost::instance().list_pods(ids);
+                for (const auto& id : ids) {
                     if (kube32::runtime::AppPodHost::instance().tick(id, now) > 0) busy = true;
                 }
                 vTaskDelay(pdMS_TO_TICKS(busy ? 10 : 1000));

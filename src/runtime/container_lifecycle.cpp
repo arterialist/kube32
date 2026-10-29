@@ -34,11 +34,11 @@ namespace kube32::runtime {
 #if defined(ESP_PLATFORM)
 static std::mutex s_interp_mutex;
 static SemaphoreHandle_t s_interp_lock = nullptr;
-static const std::function<void()>* s_interp_fn = nullptr;
+static const mem::FunctionRef<void()>* s_interp_fn = nullptr;
 static void interp_trampoline() { if (s_interp_fn) (*s_interp_fn)(); }
 #endif
 
-void run_on_interpreter_stack(const std::function<void()>& fn) {
+void run_on_interpreter_stack(mem::FunctionRef<void()> fn) {
 #if defined(ESP_PLATFORM)
     if (kube32_interp_stack_active() && !kube32_interp_stack_base_for(__builtin_frame_address(0))) {
         size_t size = 0;
@@ -177,6 +177,7 @@ void ContainerLifecycleController::cleanup_runtime() {
     }
     if (m3_runtime_) {
         set_stopping(m3_runtime_, false);
+        unlink_app_host_functions(reinterpret_cast<IM3Runtime>(m3_runtime_));
         m3_FreeRuntime(reinterpret_cast<IM3Runtime>(m3_runtime_));
         m3_runtime_ = nullptr;
         m3_module_ = nullptr; // Freed by m3_FreeRuntime
@@ -622,7 +623,7 @@ bool ContainerLifecycleController::is_running() const {
     return status_.phase == ContainerPhase::Running;
 }
 
-int32_t ContainerLifecycleController::call_function(const std::string& fn_name, const std::vector<int32_t>& args) {
+int32_t ContainerLifecycleController::call_function(const std::string& fn_name, const int32_t* args, size_t argc) {
 #if defined(ESP_PLATFORM)
     // The shared interpreter stack is taken before this pod's call lock, as
     // in a nested in-process call (pod A on the stack calling pod B): taking
@@ -630,7 +631,7 @@ int32_t ContainerLifecycleController::call_function(const std::string& fn_name, 
     // B's caller waits for the stack.
     if (kube32_interp_stack_active() && !kube32_interp_stack_base_for(__builtin_frame_address(0))) {
         int32_t rc = -1;
-        run_on_interpreter_stack([&]() { rc = call_function(fn_name, args); });
+        run_on_interpreter_stack([&]() { rc = call_function(fn_name, args, argc); });
         return rc;
     }
 #endif
@@ -654,13 +655,13 @@ int32_t ContainerLifecycleController::call_function(const std::string& fn_name, 
     rt->lastMemoryGrowError = m3Err_none;
     M3Result call_r = m3Err_none;
     run_on_interpreter_stack([&]() {
-        if (args.empty()) {
+        if (argc == 0) {
             call_r = m3_CallV(fn);
-        } else if (args.size() == 1) {
+        } else if (argc == 1) {
             call_r = m3_CallV(fn, args[0]);
-        } else if (args.size() == 2) {
+        } else if (argc == 2) {
             call_r = m3_CallV(fn, args[0], args[1]);
-        } else if (args.size() == 3) {
+        } else if (argc == 3) {
             call_r = m3_CallV(fn, args[0], args[1], args[2]);
         } else {
             call_r = m3_CallV(fn, args[0], args[1], args[2], args[3]);

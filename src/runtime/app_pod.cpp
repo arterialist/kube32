@@ -163,12 +163,13 @@ static CallContext* ctx_for(IM3Runtime rt) {
     return (it == s_ctx_by_runtime.end()) ? nullptr : it->second;
 }
 
-static std::string pod_for(IM3Runtime rt, IM3ImportContext ctx) {
-    if (ctx && ctx->userdata) return static_cast<const char*>(ctx->userdata);
+// The pod a host call comes from, by reference: the entry lives as long as
+// the pod's runtime, so a host call copies no string.
+static const std::string& pod_for(IM3Runtime rt, IM3ImportContext) {
+    static const std::string kUnknown("default-pod");
     std::lock_guard<std::mutex> lock(s_ctx_mutex);
     auto it = s_pod_by_runtime.find(rt);
-    if (it != s_pod_by_runtime.end()) return it->second;
-    return "default-pod";
+    return it != s_pod_by_runtime.end() ? it->second : kUnknown;
 }
 
 static bool guest_range_ok(void* mem, uint32_t off, uint32_t len) {
@@ -263,7 +264,7 @@ static const void* raw_event_emit(IM3Runtime rt, IM3ImportContext ictx, uint64_t
     uint32_t tlen = static_cast<uint32_t>(sp[2]);
     uint32_t doff = static_cast<uint32_t>(sp[3]);
     uint32_t dlen = static_cast<uint32_t>(sp[4]);
-    std::string pod_id = pod_for(rt, ictx);
+    const std::string& pod_id = pod_for(rt, ictx);
     if (!hal::CapabilityFirewall::instance().check_permission(pod_id, hal::PeripheralType::IPC, 0, hal::AccessMode::Write)) {
         *reinterpret_cast<int32_t*>(sp) = hal::HAL_ERR_PERM;
         return m3Err_none;
@@ -290,7 +291,7 @@ static const void* raw_log(IM3Runtime rt, IM3ImportContext ictx, uint64_t* sp, v
     uint32_t off = static_cast<uint32_t>(sp[0]);
     uint32_t len = static_cast<uint32_t>(sp[1]);
     if (len > 512 || !guest_range_ok(mem, off, len)) return m3Err_none;
-    std::string pod_id = pod_for(rt, ictx);
+    const std::string& pod_id = pod_for(rt, ictx);
     std::string_view text(static_cast<const char*>(mem) + off, len);
     while (!text.empty() && (text.back() == '\n' || text.back() == '\r')) text.remove_suffix(1);
     printf("[POD %s] %.*s\n", pod_id.c_str(), static_cast<int>(text.size()), text.data());
@@ -314,7 +315,7 @@ static const void* raw_env_get(IM3Runtime rt, IM3ImportContext ictx, uint64_t* s
         *reinterpret_cast<int32_t*>(sp) = hal::HAL_ERR_FAULT;
         return m3Err_none;
     }
-    std::string pod_id = pod_for(rt, ictx);
+    const std::string& pod_id = pod_for(rt, ictx);
     std::string value;
     int32_t n = AppPodHost::instance().env_get(pod_id, std::string_view(static_cast<const char*>(mem) + koff, klen), value);
     if (n < 0) {
@@ -379,7 +380,7 @@ static const void* raw_http_call(IM3Runtime rt, IM3ImportContext ictx, uint64_t*
     uint32_t a[12];
     for (int i = 0; i < 12; ++i) a[i] = static_cast<uint32_t>(sp[i + 1]);
     int32_t& ret = *reinterpret_cast<int32_t*>(sp);
-    std::string pod_id = pod_for(rt, ictx);
+    const std::string& pod_id = pod_for(rt, ictx);
     if (!hal::CapabilityFirewall::instance().check_permission(pod_id, hal::PeripheralType::ServiceCall, 0, hal::AccessMode::ReadWrite)) {
         ret = K32_ERR_PERM;
         return m3Err_none;
@@ -423,7 +424,7 @@ static const void* raw_display_text(IM3Runtime rt, IM3ImportContext ictx, uint64
     uint32_t len = static_cast<uint32_t>(sp[4]);
     uint32_t fg = static_cast<uint32_t>(sp[5]);
     uint32_t bg = static_cast<uint32_t>(sp[6]);
-    std::string pod_id = pod_for(rt, ictx);
+    const std::string& pod_id = pod_for(rt, ictx);
     if (!hal::CapabilityFirewall::instance().check_permission(pod_id, hal::PeripheralType::Display, 0, hal::AccessMode::Write)) {
         *reinterpret_cast<int32_t*>(sp) = hal::HAL_ERR_PERM;
         return m3Err_none;
@@ -438,7 +439,7 @@ static const void* raw_display_text(IM3Runtime rt, IM3ImportContext ictx, uint64
 }
 
 static const void* raw_display_rect(IM3Runtime rt, IM3ImportContext ictx, uint64_t* sp, void*) {
-    std::string pod_id = pod_for(rt, ictx);
+    const std::string& pod_id = pod_for(rt, ictx);
     if (!hal::CapabilityFirewall::instance().check_permission(pod_id, hal::PeripheralType::Display, 0, hal::AccessMode::Write)) {
         *reinterpret_cast<int32_t*>(sp) = hal::HAL_ERR_PERM;
         return m3Err_none;
@@ -451,7 +452,7 @@ static const void* raw_display_rect(IM3Runtime rt, IM3ImportContext ictx, uint64
 }
 
 static const void* raw_display_bar(IM3Runtime rt, IM3ImportContext ictx, uint64_t* sp, void*) {
-    std::string pod_id = pod_for(rt, ictx);
+    const std::string& pod_id = pod_for(rt, ictx);
     if (!hal::CapabilityFirewall::instance().check_permission(pod_id, hal::PeripheralType::Display, 0, hal::AccessMode::Write)) {
         *reinterpret_cast<int32_t*>(sp) = hal::HAL_ERR_PERM;
         return m3Err_none;
@@ -465,7 +466,7 @@ static const void* raw_display_bar(IM3Runtime rt, IM3ImportContext ictx, uint64_
 }
 
 static const void* raw_key_read(IM3Runtime rt, IM3ImportContext ictx, uint64_t* sp, void*) {
-    std::string pod_id = pod_for(rt, ictx);
+    const std::string& pod_id = pod_for(rt, ictx);
     if (!hal::CapabilityFirewall::instance().check_permission(pod_id, hal::PeripheralType::Keyboard, 0, hal::AccessMode::Read)) {
         *reinterpret_cast<int32_t*>(sp) = hal::HAL_ERR_PERM;
         return m3Err_none;
@@ -476,7 +477,7 @@ static const void* raw_key_read(IM3Runtime rt, IM3ImportContext ictx, uint64_t* 
 }
 
 static const void* raw_tone(IM3Runtime rt, IM3ImportContext ictx, uint64_t* sp, void*) {
-    std::string pod_id = pod_for(rt, ictx);
+    const std::string& pod_id = pod_for(rt, ictx);
     if (!hal::CapabilityFirewall::instance().check_permission(pod_id, hal::PeripheralType::Speaker, 0, hal::AccessMode::Write)) {
         *reinterpret_cast<int32_t*>(sp) = hal::HAL_ERR_PERM;
         return m3Err_none;
@@ -502,7 +503,7 @@ static const void* raw_fs_open(IM3Runtime rt, IM3ImportContext ictx, uint64_t* s
         *reinterpret_cast<int32_t*>(sp) = (len > K32_FS_MAX_PATH) ? K32_ERR_NAMETOOLONG : K32_ERR_FAULT;
         return m3Err_none;
     }
-    std::string pod_id = pod_for(rt, ictx);
+    const std::string& pod_id = pod_for(rt, ictx);
     *reinterpret_cast<int32_t*>(sp) = PodFs::instance().open(pod_id, std::string_view(static_cast<const char*>(mem) + off, len), flags);
     return m3Err_none;
 }
@@ -516,7 +517,7 @@ static const void* raw_fs_read(IM3Runtime rt, IM3ImportContext ictx, uint64_t* s
         *reinterpret_cast<int32_t*>(sp) = K32_ERR_FAULT;
         return m3Err_none;
     }
-    std::string pod_id = pod_for(rt, ictx);
+    const std::string& pod_id = pod_for(rt, ictx);
     *reinterpret_cast<int32_t*>(sp) = PodFs::instance().read(pod_id, fd, static_cast<uint8_t*>(mem) + off, len);
     return m3Err_none;
 }
@@ -530,21 +531,21 @@ static const void* raw_fs_write(IM3Runtime rt, IM3ImportContext ictx, uint64_t* 
         *reinterpret_cast<int32_t*>(sp) = K32_ERR_FAULT;
         return m3Err_none;
     }
-    std::string pod_id = pod_for(rt, ictx);
+    const std::string& pod_id = pod_for(rt, ictx);
     *reinterpret_cast<int32_t*>(sp) = PodFs::instance().write(pod_id, fd, static_cast<const uint8_t*>(mem) + off, len);
     return m3Err_none;
 }
 
 static const void* raw_fs_close(IM3Runtime rt, IM3ImportContext ictx, uint64_t* sp, void*) {
     int32_t fd = static_cast<int32_t>(sp[1]);
-    std::string pod_id = pod_for(rt, ictx);
+    const std::string& pod_id = pod_for(rt, ictx);
     *reinterpret_cast<int32_t*>(sp) = PodFs::instance().close(pod_id, fd);
     return m3Err_none;
 }
 
 static const void* raw_fs_size(IM3Runtime rt, IM3ImportContext ictx, uint64_t* sp, void*) {
     int32_t fd = static_cast<int32_t>(sp[1]);
-    std::string pod_id = pod_for(rt, ictx);
+    const std::string& pod_id = pod_for(rt, ictx);
     *reinterpret_cast<int32_t*>(sp) = PodFs::instance().size(pod_id, fd);
     return m3Err_none;
 }
@@ -559,7 +560,7 @@ static const void* raw_fs_list(IM3Runtime rt, IM3ImportContext ictx, uint64_t* s
         *reinterpret_cast<int32_t*>(sp) = (dlen > K32_FS_MAX_PATH) ? K32_ERR_NAMETOOLONG : K32_ERR_FAULT;
         return m3Err_none;
     }
-    std::string pod_id = pod_for(rt, ictx);
+    const std::string& pod_id = pod_for(rt, ictx);
     *reinterpret_cast<int32_t*>(sp) = PodFs::instance().list(pod_id, std::string_view(static_cast<const char*>(mem) + doff, dlen),
                                                              static_cast<char*>(mem) + ooff, ocap);
     return m3Err_none;
@@ -572,9 +573,14 @@ static const void* raw_fs_remove(IM3Runtime rt, IM3ImportContext ictx, uint64_t*
         *reinterpret_cast<int32_t*>(sp) = (len > K32_FS_MAX_PATH) ? K32_ERR_NAMETOOLONG : K32_ERR_FAULT;
         return m3Err_none;
     }
-    std::string pod_id = pod_for(rt, ictx);
+    const std::string& pod_id = pod_for(rt, ictx);
     *reinterpret_cast<int32_t*>(sp) = PodFs::instance().remove(pod_id, std::string_view(static_cast<const char*>(mem) + off, len));
     return m3Err_none;
+}
+
+void unlink_app_host_functions(IM3Runtime runtime) {
+    std::lock_guard<std::mutex> lock(s_ctx_mutex);
+    s_pod_by_runtime.erase(runtime);
 }
 
 void link_app_host_functions(IM3Module module, const std::string& pod_id) {
@@ -825,10 +831,21 @@ bool AppPodHost::pod_handles_requests(const std::string& pod_id) const {
 }
 
 std::vector<std::string> AppPodHost::list_pods() const {
-    osal::LockGuard guard(mutex_);
     std::vector<std::string> out;
-    for (const auto& kv : pods_) out.push_back(kv.first);
+    list_pods(out);
     return out;
+}
+
+void AppPodHost::list_pods(std::vector<std::string>& out) const {
+    osal::LockGuard guard(mutex_);
+    // Strings past the current count keep their buffers for later lists
+    size_t n = 0;
+    for (const auto& kv : pods_) {
+        if (n < out.size()) out[n].assign(kv.first);
+        else out.push_back(kv.first);
+        ++n;
+    }
+    out.resize(n);
 }
 
 std::string AppPodHost::default_request_pod() const {

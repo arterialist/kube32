@@ -139,9 +139,35 @@ int32_t PodFs::read(const std::string& pod_id, int32_t fd, uint8_t* buf, uint32_
     if (len == 0) return 0;
     ssize_t n = -1;
     int err = 0;
-    hal::node_storage_call([&]() { n = ::read(s.host_fd, buf, len); err = errno; });
+    hal::node_storage_call([&]() { n = staged_read(s.host_fd, buf, len); err = errno; });
     if (n < 0) return errno_to_k32(err);
     return static_cast<int32_t>(n);
+}
+
+ssize_t PodFs::staged_read(int host_fd, uint8_t* buf, uint32_t len) {
+    uint32_t done = 0;
+    while (done < len) {
+        const uint32_t want = (len - done) < sizeof(stage_) ? (len - done) : static_cast<uint32_t>(sizeof(stage_));
+        const ssize_t n = ::read(host_fd, stage_, want);
+        if (n < 0) return done > 0 ? static_cast<ssize_t>(done) : -1;
+        std::memcpy(buf + done, stage_, static_cast<size_t>(n));
+        done += static_cast<uint32_t>(n);
+        if (static_cast<uint32_t>(n) < want) break;   // end of file
+    }
+    return static_cast<ssize_t>(done);
+}
+
+ssize_t PodFs::staged_write(int host_fd, const uint8_t* buf, uint32_t len) {
+    uint32_t done = 0;
+    while (done < len) {
+        const uint32_t want = (len - done) < sizeof(stage_) ? (len - done) : static_cast<uint32_t>(sizeof(stage_));
+        std::memcpy(stage_, buf + done, want);
+        const ssize_t n = ::write(host_fd, stage_, want);
+        if (n < 0) return done > 0 ? static_cast<ssize_t>(done) : -1;
+        done += static_cast<uint32_t>(n);
+        if (static_cast<uint32_t>(n) < want) break;   // volume full
+    }
+    return static_cast<ssize_t>(done);
 }
 
 int32_t PodFs::write(const std::string& pod_id, int32_t fd, const uint8_t* buf, uint32_t len) {
@@ -156,7 +182,7 @@ int32_t PodFs::write(const std::string& pod_id, int32_t fd, const uint8_t* buf, 
     if (len == 0) return 0;
     ssize_t n = -1;
     int err = 0;
-    hal::node_storage_call([&]() { n = ::write(s.host_fd, buf, len); err = errno; });
+    hal::node_storage_call([&]() { n = staged_write(s.host_fd, buf, len); err = errno; });
     if (n < 0) return errno_to_k32(err);
     return static_cast<int32_t>(n);
 }
