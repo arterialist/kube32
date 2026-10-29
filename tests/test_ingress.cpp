@@ -13,6 +13,7 @@
 #include "api/table_serializer.hpp"
 #include "embedded/embedded_blobs.hpp"
 #include "ipc/channel.hpp"
+#include "storage/flash_log.hpp"
 #include "mem/monotonic_arena.hpp"
 #include "osal/socket.hpp"
 #include "osal/system.hpp"
@@ -525,6 +526,36 @@ static void test_controller_end_to_end() {
     std::cout << "[PASS] test_controller_end_to_end" << std::endl;
 }
 
+// The address the controller writes into status.loadBalancer must not take
+// the Ingress off the journal: after a restart the Ingress is still there
+static void test_status_survives_restart() {
+    std::cout << "[RUN] test_status_survives_restart" << std::endl;
+    storage::RamFlashRegion region(256 * 1024);
+    storage::StoreOptions opts{"/tmp/kube32_test_ingress_journal", true};
+    opts.flash_region = &region;
+    const std::string key = "/registry/ingresses/default/site";
+    {
+        auto store = storage::create_radix_store(opts);
+        assert(store->recover().ok());
+        put(*store, key, ingress_json("site", "", "{\"rules\":[{\"http\":{\"paths\":[" + path_rule("/", "Prefix", backend_bundle("tessera-web")) + "]}}]}"));
+        app::IngressControllerOptions io;
+        io.store = store.get();
+        io.address = []() { return std::string("127.0.0.1"); };
+        app::IngressController ingress(io);
+        ingress.refresh_routes();
+        ingress.tick();
+        std::string stored;
+        assert(store->get(key, stored).ok() && stored.find("\"loadBalancer\"") != std::string::npos);
+        assert(store->flush(true).ok());
+    }
+    auto store = storage::create_radix_store(opts);
+    assert(store->recover().ok());
+    std::string stored;
+    assert(store->get(key, stored).ok());
+    assert(stored.find("\"loadBalancer\":{\"ingress\":[{\"ip\":\"127.0.0.1\"}]}") != std::string::npos);
+    std::cout << "[PASS] test_status_survives_restart" << std::endl;
+}
+
 int main() {
     std::cout << "=== Ingress controller tests ===" << std::endl;
     osal::Socket::init_networking();
@@ -534,6 +565,7 @@ int main() {
     test_bundle_paths();
     test_ingress_api();
     test_controller_end_to_end();
+    test_status_survives_restart();
     std::cout << "=== All ingress tests passed ===" << std::endl;
     return 0;
 }

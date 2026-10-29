@@ -356,8 +356,10 @@ void IngressController::sync_status() {
         status.type = models::JsonType::Object;
         status.set("loadBalancer", std::move(lb));
         doc.set("status", std::move(status));
-        // A concurrent update wins; the next tick retries
-        opts_.store->put_extended(key, doc.to_string(), true, false, version, nullptr);
+        // A concurrent update wins; the next tick retries. Written to the
+        // journal like any change: a write kept off flash would leave the
+        // Ingress itself out of it, and a restart would lose the object.
+        opts_.store->put_extended(key, doc.to_string(), true, true, version, nullptr);
     }
 }
 
