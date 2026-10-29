@@ -8,6 +8,9 @@
 
 #define WRITE_TIMEOUT_MS 2000u
 #define READ_TIMEOUT_MS  5000u
+/* A page of records takes tessera-db seconds to read from its card; a caller
+   that gives up first leaves it serving an answer nobody reads */
+#define PAGE_TIMEOUT_MS  30000u
 #define RETRY_MS         2000
 #define FAILED_CHECK_MS  10000
 #define LOAD_CHUNK_DEFAULT 32u
@@ -128,7 +131,7 @@ static int load_stats(void) {
 static int load_page(void) {
     char url[128]; u32 rl = 0;
     u32 n = build_url(url, sizeof url, "/records?after=", g.stg.seq, "&max=", STG_PAGE_BYTES);
-    int32_t rc = call("GET", url, n, 0, 0, g.stg.page, STG_PAGE_BYTES, &rl, READ_TIMEOUT_MS);
+    int32_t rc = call("GET", url, n, 0, 0, g.stg.page, STG_PAGE_BYTES, &rl, PAGE_TIMEOUT_MS);
     if (rc != 200) {
         set_error("tessera-db unreachable while loading, status ", rc);
         g.stg.retry_at = k32_time_ms() + RETRY_MS;
