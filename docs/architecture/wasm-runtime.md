@@ -8,7 +8,7 @@ The build disables exception handling, typed function references, stack switchin
 
 | Kind | Exports | Execution |
 | --- | --- | --- |
-| Request pod | `k32_alloc`, `k32_handle`, and optionally `k32_init`, `k32_tick`, `k32_event` | Runs on the node's shared interpreter stack (64 KiB in PSRAM, or 40 KiB of internal RAM on boards without PSRAM). Calls are serialized across the node. `k32_init` runs once at creation, and a non-zero return fails the pod. |
+| Request pod | `k32_alloc`, `k32_handle`, and optionally `k32_init`, `k32_tick`, `k32_event` | Runs on the node's shared interpreter stack (64 KiB in PSRAM, or 28 KiB of internal RAM on boards without PSRAM). Calls are serialized across the node. `k32_init` runs once at creation, and a non-zero return fails the pod. |
 | Entry-point pod | `_start`, `app_main`, or `main` | Runs on a dedicated pod thread until the function returns. Requires a board with PSRAM. |
 
 ## Images
@@ -24,15 +24,15 @@ Unresolved images or images too large for node memory fail the pod with `ErrImag
 ## Memory
 
 - Linear memory is capped by `limits.memory` or `requests.memory`, raised to `esp32.io/psram` if larger, with a 64 KiB default. Limits below `64Ki` cap the backing of the first Wasm page to that byte limit; `memory.grow` past the limit returns -1 and accesses past it trap.
-- At boot, PSRAM nodes reserve one 1,284 KiB PSRAM block (`20 * 64 KiB + 4 KiB` header) and one shared 64 KiB interpreter stack in PSRAM. Nodes without PSRAM reserve one 67 KiB internal RAM block and one shared 40 KiB interpreter stack.
-- On boards without PSRAM, the 67 KiB pool block holds one large linear memory (>= 48 KiB and at least half the block) from its start and places smaller pod allocations (wasm3 runtime, compiled code, small linear memories) from its end. Every pod allocation comes from the pool block first and falls back to the general heap only when the block is full, except while a pod whose linear memory needs >= 48 KiB loads, when its runtime structures go to the general heap so the block stays whole. The general heap stays for the kubelet, Wi-Fi, and lwIP, with 16 KiB reserved for the system.
+- At boot, PSRAM nodes reserve one 1,284 KiB PSRAM block (`20 * 64 KiB + 4 KiB` header) and one shared 64 KiB interpreter stack in PSRAM. Nodes without PSRAM reserve one 80 KiB internal RAM block, which holds the shared 28 KiB interpreter stack.
+- On boards without PSRAM, the pool block holds one large linear memory (>= 48 KiB and at least half the block) from its start and places smaller pod allocations (wasm3 runtime, compiled code, small linear memories) from its end. Every pod allocation comes from the pool block first and falls back to the general heap only when the block is full, except while a pod whose linear memory needs >= 48 KiB loads, when its runtime structures go to the general heap so the block stays whole. The general heap stays for the kubelet, Wi-Fi, and lwIP, with 24 KiB reserved for the system (16 KiB on boards with PSRAM).
 - The per-pod wasm3 value stack defaults to 4 KiB when the pod memory limit is 64 KiB or less and 16 KiB above. The pod annotation `kube32.io/wasm-stack` sets it between `512` and `64Ki`. C and Rust locals use a shadow stack in linear memory.
 - Every function is compiled when the pod loads, and the unused end of the last 4 KiB code page goes back to the pool block. A module that runs out of memory while it loads or compiles fails to load instead of failing in a later call.
-- Pod allocations never take the last 16 KiB of the internal heap. A pod that needs more fails to load, or traps with `OOMKilled` when `memory.grow` or a later allocation is refused.
+- Pod allocations never take the system reserve of the internal heap. A pod that needs more fails to load, or traps with `OOMKilled` when `memory.grow` or a later allocation is refused.
 
 ## Memory admission
 
-Before a pod starts, the kubelet estimates the memory it needs to load: value stack, linear memory, compiled code (about 3.2 times the code section on a 32-bit board), module structures, host-side state and the compiler's scratch. It compares the estimate with what pods can still be given: the free part of the pool block, the general heap above the 16 KiB reserve, and PSRAM above a 16 KiB stack reserve.
+Before a pod starts, the kubelet estimates the memory it needs to load: value stack, linear memory, compiled code (about 3.2 times the code section on a 32-bit board), module structures, host-side state and the compiler's scratch. It compares the estimate with what pods can still be given: the free part of the pool block, the general heap above the system reserve, and PSRAM above a 16 KiB stack reserve. On a board without PSRAM only the pool block counts: free general heap is what Wi-Fi and lwIP need in a burst.
 
 | Outcome | Pod status | Event |
 | --- | --- | --- |
@@ -50,7 +50,7 @@ A pod that passes admission but runs out of memory while it loads also waits wit
 | `k32_tick` | 8 KiB PSRAM / 4 KiB internal | Calls `k32_tick(uptime_ms)` at 1 Hz, or every 10 ms while a pod returns > 0. |
 | `k32_events` | 8 KiB PSRAM / 4 KiB internal | Runs while any pod subscribes via `kube32.io/event-topics` and dispatches messages to `k32_event`. |
 
-All host-initiated pod calls (`k32_init`, `k32_alloc`, `k32_handle`, `k32_tick`, `k32_event`) switch onto the shared interpreter stack (64 KiB in PSRAM, or 40 KiB of internal RAM without PSRAM) and run serialized across the node. `k32_init` runs from `k32_kubelet` (24 KiB PSRAM stack or 12 KiB internal stack), and `k32_handle` runs from the ingress worker or pod server thread. Run `K32_CMD:TASKS` to inspect native stack sizes and high-water marks.
+All host-initiated pod calls (`k32_init`, `k32_alloc`, `k32_handle`, `k32_tick`, `k32_event`) switch onto the shared interpreter stack (64 KiB in PSRAM, or 28 KiB of internal RAM without PSRAM) and run serialized across the node. `k32_init` runs from `k32_kubelet` (24 KiB PSRAM stack or 12 KiB internal stack), and `k32_handle` runs from the ingress worker or pod server thread. Run `K32_CMD:TASKS` to inspect native stack sizes and high-water marks.
 
 ## Execution budget
 
@@ -99,5 +99,5 @@ The [capability firewall](capability-firewall.md) gates hardware, storage, IPC, 
 ## Limitations
 
 - Liveness and readiness probes are not run by the kubelet.
-- Without PSRAM, only one 67 KiB pool block and one shared 40 KiB interpreter stack are reserved at boot. Entry-point (`app_main`) pods are not supported without PSRAM, and allocations beyond the pool block may fail once Wi-Fi fragments the internal heap.
+- Without PSRAM, only one 80 KiB pool block, holding the shared 28 KiB interpreter stack, is reserved at boot. Entry-point (`app_main`) pods are not supported without PSRAM, and allocations beyond the pool block may fail once Wi-Fi fragments the internal heap.
 

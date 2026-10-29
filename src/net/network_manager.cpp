@@ -4,6 +4,7 @@
 
 #if defined(KUBE32_TARGET_ESP32)
 #include "esp_wifi.h"
+#include "esp_heap_caps.h"
 #include "esp_event.h"
 #include "esp_netif.h"
 #include "esp_mac.h"
@@ -31,6 +32,13 @@ public:
         sta_netif_ = esp_netif_create_default_wifi_sta();
 
         wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
+        if (heap_caps_get_total_size(MALLOC_CAP_SPIRAM) == 0) {
+            // Frames wait in these buffers (~1.6 KB of internal RAM each)
+            // until the radio sends them or lwIP is done with them; a pod
+            // streaming a large response filled all eight
+            cfg.dynamic_tx_buf_num = 4;
+            cfg.dynamic_rx_buf_num = 6;
+        }
         if (esp_wifi_init(&cfg) != ESP_OK) {
             ESP_LOGE(TAG, "esp_wifi_init failed");
             return false;

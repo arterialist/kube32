@@ -205,7 +205,10 @@ struct Console {
     bool last_from_usb{true};
     void init(bool usb_only) {
         if (!usb_serial_jtag_is_driver_installed()) {
-            usb_serial_jtag_driver_config_t cfg = { .tx_buffer_size = 4096, .rx_buffer_size = 4096 };
+            // Console lines are short and writes wait for room: small rings
+            // on a board without PSRAM, whose internal RAM pods need
+            const bool psram = heap_caps_get_total_size(MALLOC_CAP_SPIRAM) > 0;
+            usb_serial_jtag_driver_config_t cfg = { .tx_buffer_size = psram ? 4096u : 2048u, .rx_buffer_size = psram ? 4096u : 1024u };
             usb_serial_jtag_driver_install(&cfg);
         }
         // Once the driver owns the USB-JTAG FIFO, printf/ESP_LOG must go through
@@ -679,14 +682,14 @@ void cluster_task(void* pv) {
     // Without PSRAM, reserve one Wasm page (+ interpreter headroom) now, before
     // Wi-Fi and lwIP fragment the heap, so a 64 KiB pod can still be placed.
     if (!ident.has_psram) {
-        kube32_pool_reserve(67 * 1024);
+        kube32_pool_reserve(80 * 1024);
         // One stack for the interpreter, while a contiguous block still
         // exists: every call into a pod (k32_init, k32_handle, k32_tick,
         // k32_event) runs on it, so the threads that make those calls need
         // no large stacks of their own. Xtensa has no tail calls, so the
         // interpreter holds a native frame per instruction until a function
         // returns: a request handler needs 20-40 KB.
-        kube32_pool_reserve_stack(40960);
+        kube32_pool_reserve_stack(28672);
         size_t interp_size = kube32_pool_stack_size();
         kube32_interp_stack_set(kube32_pool_stack_alloc(interp_size), interp_size);
         // Events reach k32_event the way ticks reach k32_tick, on the shared
@@ -1093,7 +1096,7 @@ void cluster_task(void* pv) {
         po.workers = ident.has_psram ? 2 : 1;
         // Without PSRAM pods are interpreted on the shared interpreter stack;
         // the worker's own stack only serves HTTP and node storage
-        po.worker_stack = ident.has_psram ? 24576 : 12288;   // FATFS over SPI for node storage needs about 10 KB
+        po.worker_stack = ident.has_psram ? 24576 : 10240;   // FATFS over SPI for node storage needs about 10 KB
         po.rx_buffer = ident.has_psram ? 4096 : 2048;
         po.core_affinity = 1;
         po.stacks_in_psram = ident.has_psram;

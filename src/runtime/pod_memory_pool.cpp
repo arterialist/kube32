@@ -244,7 +244,7 @@ static std::atomic<int> s_prefer_general{0};
 static std::atomic<size_t> s_general_bytes{0};
 static std::atomic<size_t> s_psram_bytes{0};
 static size_t s_heap_budget = 0;                    // 0: not modelled
-static const size_t k_system_reserve = 16 * 1024;
+static const size_t k_system_reserve_default = 16 * 1024;
 static const size_t k_psram_stack_reserve = 16 * 1024;   // PSRAM kept for thread stacks made later
 
 static size_t general_size(void* p) {
@@ -257,11 +257,21 @@ static size_t general_size(void* p) {
 #endif
 }
 
+// Internal RAM pods leave to the system. A board without PSRAM keeps more:
+// its general heap also absorbs the network's bursts (lwIP send buffers and
+// Wi-Fi frames, measured near 25 KB while a pod streams a large response)
+static size_t system_reserve() {
+#if defined(ESP_PLATFORM)
+    if (s_block && !s_external) return 24 * 1024;
+#endif
+    return k_system_reserve_default;
+}
+
 // Whether `bytes` more of the general heap leave the system reserve free
 static bool general_has_room(size_t bytes) {
-    if (s_heap_budget) return s_general_bytes.load() + bytes + k_system_reserve <= s_heap_budget;
+    if (s_heap_budget) return s_general_bytes.load() + bytes + system_reserve() <= s_heap_budget;
 #if defined(ESP_PLATFORM)
-    return heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT) >= bytes + k_system_reserve;
+    return heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT) >= bytes + system_reserve();
 #else
     return true;
 #endif
@@ -284,17 +294,19 @@ void kube32_pool_prefer_general(int on) { s_prefer_general.fetch_add(on ? 1 : -1
 void kube32_pool_set_heap_budget(size_t bytes) { s_heap_budget = bytes; }
 size_t kube32_pool_heap_budget(void) { return s_heap_budget; }
 size_t kube32_pool_general_bytes(void) { return s_general_bytes.load(); }
-size_t kube32_pool_system_reserve(void) { return k_system_reserve; }
+size_t kube32_pool_system_reserve(void) { return system_reserve(); }
 
 size_t kube32_pool_pod_room(size_t memory_bytes, size_t* out_capacity) {
     size_t room = 0;
     if (s_heap_budget) {
-        const size_t used = s_general_bytes.load() + k_system_reserve;
+        const size_t used = s_general_bytes.load() + system_reserve();
         room = s_heap_budget > used ? s_heap_budget - used : 0;
     } else {
 #if defined(ESP_PLATFORM)
+        // Without PSRAM a pod is admitted on the pool block alone: general
+        // heap that looks free now is what the network needs in a burst
         const size_t internal = heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
-        room = internal > k_system_reserve ? internal - k_system_reserve : 0;
+        if (!(s_block && !s_external)) room = internal > system_reserve() ? internal - system_reserve() : 0;
         const size_t psram = heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
         if (psram > k_psram_stack_reserve) room += psram - k_psram_stack_reserve;
 #else

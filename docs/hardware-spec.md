@@ -36,7 +36,7 @@ The firmware reserves contiguous pod memory at boot before Wi-Fi initializes:
 | Board type | Boot reservation | Pod allocation |
 | --- | --- | --- |
 | With PSRAM | One 1,284 KiB PSRAM block, 64 KiB shared interpreter stack in PSRAM | Serves one large pod requesting at least half the block, up to 1,280 KiB of linear memory. Allocations over 4 KB and interpreter structures use remaining PSRAM. Serializes all pod calls on the 64 KiB stack |
-| Without PSRAM | 67 KiB internal RAM pool block, 40 KiB shared interpreter stack, 16 KiB system heap reserve, 1 KiB log ring per pod | Serves all pod allocations from the 67 KiB pool block first, falling back to the general heap when full. The kubelet admits a pod only when its estimated footprint fits with the reserve kept. Serializes all pod calls on the 40 KiB stack (`app_main` pods require PSRAM). The kubelet refuses API responses over 16 KB |
+| Without PSRAM | 80 KiB internal RAM pool block holding the 28 KiB shared interpreter stack, 24 KiB system heap reserve, 1 KiB log ring per pod | Serves all pod allocations from the pool block first, falling back to the general heap when full. The kubelet admits a pod only when its estimated footprint fits in the pool block. Serializes all pod calls on the 28 KiB stack (`app_main` pods require PSRAM). The kubelet refuses API responses over 16 KB |
 
 Check free internal RAM and PSRAM on the serial console with `K32_CMD:STATUS`.
 
