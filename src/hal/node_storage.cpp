@@ -45,7 +45,7 @@ TaskHandle_t s_storage_task = nullptr;
 SemaphoreHandle_t s_call_ready = nullptr;
 SemaphoreHandle_t s_call_done = nullptr;
 std::mutex s_call_mutex;
-const std::function<void()>* s_call = nullptr;
+const mem::FunctionRef<void()>* s_call = nullptr;
 std::exception_ptr s_call_error;
 
 void storage_task(void*) {
@@ -214,7 +214,7 @@ std::string node_storage_path(const std::string& relative) {
     return root + "/kube32" + (relative.empty() || relative[0] == '/' ? relative : "/" + relative);
 }
 
-void node_storage_call(const std::function<void()>& fn) {
+void node_storage_call(mem::FunctionRef<void()> fn) {
 #if defined(KUBE32_TARGET_ESP32)
     if (s_storage_task && xTaskGetCurrentTaskHandle() != s_storage_task &&
         esp_ptr_external_ram(reinterpret_cast<void*>(esp_cpu_get_sp()))) {

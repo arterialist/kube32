@@ -22,8 +22,9 @@
 // goes through node_storage_call(), which moves it onto a stack in internal
 // RAM when it has to.
 
+#include "mem/function_ref.hpp"
+
 #include <cstdint>
-#include <functional>
 #include <string>
 
 namespace kube32::hal {
@@ -54,8 +55,9 @@ std::string node_storage_path(const std::string& relative);
 
 // Runs `fn` where file operations on the root are safe (see above) and
 // returns when it has finished. Calls are serialized only when they must
-// switch stacks. `fn` must not throw.
-void node_storage_call(const std::function<void()>& fn);
+// switch stacks. `fn` must not throw. It is invoked in place, so a call
+// takes nothing from the heap.
+void node_storage_call(mem::FunctionRef<void()> fn);
 
 // mkdir -p, inside node_storage_call.
 bool node_storage_make_dirs(const std::string& path);
