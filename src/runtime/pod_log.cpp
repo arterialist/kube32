@@ -61,6 +61,14 @@ class PodLogDisk {
 public:
     PodLogDisk(std::function<std::string()> root, size_t limit, std::function<void()> collect)
         : root_(std::move(root)), limit_(limit < 1024 ? 1024 : limit), collect_(std::move(collect)) {}
+    // The writer thread is detached and uses this object: finish the queued
+    // operations and wait for it to exit before the members go away
+    ~PodLogDisk() {
+        osal::UniqueLock<osal::Mutex> lock(mutex_);
+        stopping_ = true;
+        cv_.notify_all();
+        cv_.wait_for(lock, 10000, [this]() { return !running_; });
+    }
 
     void append(const std::string& dir, const std::string& file, std::string text) { push(Op{Op::Append, dir, file, std::move(text), nullptr}); }
     void rotate(const std::string& dir, const std::string& file) { push(Op{Op::Rotate, dir, file, {}, nullptr}); }
@@ -115,7 +123,7 @@ private:
         bool start = false;
         {
             osal::LockGuard guard(mutex_);
-            if (!running_) { running_ = true; start = true; }
+            if (!running_ && !stopping_) { running_ = true; start = true; }
         }
         if (!start) return;
         osal::Thread::Config cfg;
@@ -140,7 +148,12 @@ private:
             Op op;
             {
                 osal::UniqueLock<osal::Mutex> lock(mutex_);
-                cv_.wait_for(lock, 2000, [this]() { return !ops_.empty(); });
+                cv_.wait_for(lock, 2000, [this]() { return !ops_.empty() || stopping_; });
+                if (ops_.empty() && stopping_) {
+                    running_ = false;
+                    cv_.notify_all();
+                    return;
+                }
                 if (ops_.empty()) {
                     lock.unlock();
                     // Lines of quiet pods reach the disk after 10 s
@@ -273,6 +286,7 @@ private:
     std::deque<Op> ops_;
     bool running_{false};
     bool busy_{false};
+    bool stopping_{false};
 };
 
 static std::string log_dir_name(const std::string& pod_key) {
@@ -308,8 +322,14 @@ PodLogStore& PodLogStore::apiserver() {
 }
 
 void PodLogStore::enable_persistence(std::function<std::string()> root, size_t file_limit_bytes) {
-    osal::LockGuard guard(mutex_);
-    disk_ = std::make_unique<PodLogDisk>(std::move(root), file_limit_bytes, [this]() { collect_pending(10000); });
+    std::unique_ptr<PodLogDisk> previous;
+    {
+        osal::LockGuard guard(mutex_);
+        previous = std::move(disk_);
+        disk_ = std::make_unique<PodLogDisk>(std::move(root), file_limit_bytes, [this]() { collect_pending(10000); });
+    }
+    // Destroyed unlocked: its writer may be collecting lines, which takes mutex_
+    previous.reset();
 }
 
 bool PodLogStore::persistence_enabled() const {
