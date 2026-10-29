@@ -1,6 +1,7 @@
 #pragma once
 
 #include "models/kube_models.hpp"
+#include "mem/fixed_text.hpp"
 #include <map>
 #include <string>
 #include <cstdint>
@@ -32,10 +33,11 @@ struct NodeTelemetry {
     bool sd_present{false};
     uint64_t sd_total_bytes{0};
     uint64_t sd_free_bytes{0};
-    // Ready condition, from the kubelet's own health (Kubelet::fill_ready_condition)
+    // Ready condition, from the kubelet's own health (Kubelet::fill_ready_condition).
+    // Fixed storage: telemetry is collected every heartbeat.
     bool ready{false};
-    std::string ready_reason{"KubeletNotReady"};
-    std::string ready_message{"kubelet has not completed a pod sync yet"};
+    const char* ready_reason{"KubeletNotReady"};
+    char ready_message[72]{"kubelet has not completed a pod sync yet"};
 };
 
 class NodeStatusReporter {
@@ -49,6 +51,9 @@ public:
     // JSON builders
     std::string build_registration_json(const NodeTelemetry& telemetry) const;
     std::string build_heartbeat_patch_json(const NodeTelemetry& telemetry, bool memory_pressure) const;
+    // The heartbeat patch written into `out` (cleared first), storage the
+    // caller owns: nothing is taken from the heap. False when it did not fit.
+    bool write_heartbeat_patch_json(mem::FixedText& out, const NodeTelemetry& telemetry, bool memory_pressure) const;
 
     // Extra labels for the Node object (board profile and the like).
     void set_labels(const std::map<std::string, std::string>& labels) { labels_ = labels; }

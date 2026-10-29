@@ -130,6 +130,8 @@ struct KubeDeployment {
 
 // RFC 3339 UTC timestamp ("2026-10-28T09:12:33Z") from Unix milliseconds.
 std::string format_rfc3339(uint64_t unix_ms);
+// The same into `out` (21 bytes with the terminator); returns the length.
+size_t format_rfc3339(uint64_t unix_ms, char* out, size_t cap);
 // Current wall-clock time as RFC 3339, or "" while the platform clock is unset.
 std::string now_rfc3339();
 // Parses "YYYY-MM-DDTHH:MM:SS[.fff]Z" (and +00:00). Returns false on malformed input.

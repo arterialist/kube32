@@ -49,7 +49,11 @@ struct LocalPodRecord {
     std::string last_error_message;
     std::string pod_ip;
     uint32_t memory_limit_bytes{64 * 1024};
+    // What admission estimated the container needs, when it waits for memory:
+    // a retry is only attempted once that much room exists
+    uint32_t memory_need_bytes{0};
     uint64_t requested_gpio_mask{0};
+    uint32_t listed_pass{0};                 // the last pod sync pass whose list held this pod
     // Log shipping and metrics rate state
     uint64_t shipped_log_seq{0};
     uint64_t log_instance_start_seq{0};      // runtime log lines up to this seq were written before the last (re)start
@@ -89,6 +93,7 @@ struct KubeletConfig {
     // A pod the node has no memory for yet waits (Pending, InsufficientMemory)
     // and is admitted again after this long
     uint32_t memory_retry_ms{5000};
+
 
     // Task & concurrency configuration
     size_t task_stack_size{65536};
@@ -183,8 +188,9 @@ private:
     std::atomic<uint64_t> last_sync_ok_ms_{0};     // end of the last pod sync pass that listed pods
     std::atomic<bool> heartbeat_due_{false};       // send the next heartbeat without waiting
 
-    // Local state map: key = namespace/name
-    std::map<std::string, LocalPodRecord> active_pods_;
+    // Local state map: key = namespace/name (looked up by view)
+    std::map<std::string, LocalPodRecord, std::less<>> active_pods_;
+    uint32_t sync_pass_{0};
 };
 
 } // namespace kube32::kubelet

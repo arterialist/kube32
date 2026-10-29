@@ -877,17 +877,21 @@ static int64_t days_from_civil(int y, unsigned m, unsigned d) {
     return era * 146097 + static_cast<int64_t>(doe) - 719468;
 }
 
-std::string format_rfc3339(uint64_t unix_ms) {
+size_t format_rfc3339(uint64_t unix_ms, char* out, size_t cap) {
     int64_t secs = static_cast<int64_t>(unix_ms / 1000ULL);
     int64_t days = secs / 86400;
     int64_t rem = secs % 86400;
     int y; unsigned m, d;
     civil_from_days(days, y, m, d);
+    int n = snprintf(out, cap, "%04d-%02u-%02uT%02lld:%02lld:%02lldZ", y, m, d,
+                     static_cast<long long>(rem / 3600), static_cast<long long>((rem % 3600) / 60),
+                     static_cast<long long>(rem % 60));
+    return (n < 0 || static_cast<size_t>(n) >= cap) ? 0 : static_cast<size_t>(n);
+}
+
+std::string format_rfc3339(uint64_t unix_ms) {
     char buf[32];
-    snprintf(buf, sizeof(buf), "%04d-%02u-%02uT%02lld:%02lld:%02lldZ", y, m, d,
-             static_cast<long long>(rem / 3600), static_cast<long long>((rem % 3600) / 60),
-             static_cast<long long>(rem % 60));
-    return buf;
+    return std::string(buf, format_rfc3339(unix_ms, buf, sizeof(buf)));
 }
 
 std::string now_rfc3339() {

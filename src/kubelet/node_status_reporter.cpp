@@ -6,13 +6,30 @@
 #include "hal/sd_card.hpp"
 #include "api/version_info.hpp"
 
+#include <charconv>
+
 namespace kube32::kubelet {
 
+// The JSON writers take std::string (registration, tests) or mem::FixedText
+// (the heartbeat, on the kubelet's stack).
+template <typename Out>
+static void append_uint(Out& out, uint64_t v) {
+    char buf[24];
+    out.append(buf, static_cast<size_t>(std::to_chars(buf, buf + sizeof(buf), v).ptr - buf));
+}
+
 // Exact byte count as a Kubernetes quantity: "30Mi"/"512Ki" when it divides, else plain bytes.
-static std::string bytes_quantity(uint64_t bytes) {
-    if (bytes > 0 && bytes % (1024ULL * 1024ULL) == 0) return std::to_string(bytes / (1024ULL * 1024ULL)) + "Mi";
-    if (bytes > 0 && bytes % 1024ULL == 0) return std::to_string(bytes / 1024ULL) + "Ki";
-    return std::to_string(bytes);
+template <typename Out>
+static void append_bytes_quantity(Out& out, uint64_t bytes) {
+    if (bytes > 0 && bytes % (1024ULL * 1024ULL) == 0) {
+        append_uint(out, bytes / (1024ULL * 1024ULL));
+        out += "Mi";
+    } else if (bytes > 0 && bytes % 1024ULL == 0) {
+        append_uint(out, bytes / 1024ULL);
+        out += "Ki";
+    } else {
+        append_uint(out, bytes);
+    }
 }
 
 static uint32_t count_bits(uint64_t v) {
@@ -76,52 +93,73 @@ NodeTelemetry NodeStatusReporter::collect_telemetry() const {
 }
 
 // One resource list (capacity or allocatable). Resources the node does not
-// have are left out.
-static void append_resources(std::string& json, const NodeTelemetry& t, bool capacity) {
+// have are left out. Written piece by piece: no temporary strings.
+template <typename Out>
+static void append_resources(Out& json, const NodeTelemetry& t, bool capacity) {
     bool first = true;
-    auto add = [&](const char* key, const std::string& value) {
+    auto key = [&](const char* name) {
         if (!first) json += ",";
         first = false;
         json += "\"";
-        json += key;
-        json += "\":\"" + value + "\"";
+        json += name;
+        json += "\":\"";
     };
-    if (t.total_heap_bytes > 0) {
-        add("memory", std::to_string((capacity ? t.total_heap_bytes : t.free_heap_bytes) / 1024) + "Ki");
-    }
-    if (t.cpu_cores > 0) add("cpu", std::to_string(t.cpu_cores));
+    auto count = [&](const char* name, uint64_t v) {
+        key(name);
+        append_uint(json, v);
+        json += "\"";
+    };
+    auto kib = [&](const char* name, uint64_t bytes) {
+        key(name);
+        append_uint(json, bytes / 1024);
+        json += "Ki\"";
+    };
+    auto quantity = [&](const char* name, uint64_t bytes) {
+        key(name);
+        append_bytes_quantity(json, bytes);
+        json += "\"";
+    };
+    if (t.total_heap_bytes > 0) kib("memory", capacity ? t.total_heap_bytes : t.free_heap_bytes);
+    if (t.cpu_cores > 0) count("cpu", t.cpu_cores);
     if (t.total_gpio_count > 0) {
-        std::string v = std::to_string(capacity ? t.total_gpio_count : t.allocatable_gpio_count);
-        add("esp.io/gpio", v);
-        add("esp32.io/gpio", v);
+        const uint64_t v = capacity ? t.total_gpio_count : t.allocatable_gpio_count;
+        count("esp.io/gpio", v);
+        count("esp32.io/gpio", v);
     }
     if (t.total_i2c_count > 0) {
-        std::string v = std::to_string(capacity ? t.total_i2c_count : t.allocatable_i2c_count);
-        add("esp.io/i2c", v);
-        add("esp32.io/i2c", v);
+        const uint64_t v = capacity ? t.total_i2c_count : t.allocatable_i2c_count;
+        count("esp.io/i2c", v);
+        count("esp32.io/i2c", v);
     }
     if (t.total_uart_count > 0) {
-        std::string v = std::to_string(capacity ? t.total_uart_count : t.allocatable_uart_count);
-        add("esp.io/uart", v);
-        add("esp32.io/uart", v);
+        const uint64_t v = capacity ? t.total_uart_count : t.allocatable_uart_count;
+        count("esp.io/uart", v);
+        count("esp32.io/uart", v);
     }
     if (t.total_adc_count > 0) {
-        std::string v = std::to_string(capacity ? t.total_adc_count : t.allocatable_adc_count);
-        add("esp.io/adc", v);
-        add("esp32.io/adc", v);
+        const uint64_t v = capacity ? t.total_adc_count : t.allocatable_adc_count;
+        count("esp.io/adc", v);
+        count("esp32.io/adc", v);
     }
     if (t.total_psram_bytes > 0) {
-        std::string v = capacity ? bytes_quantity(t.total_psram_bytes) : std::to_string(t.free_psram_bytes / 1024) + "Ki";
-        add("esp.io/psram", v);
-        add("esp32.io/psram", v);
+        for (const char* name : {"esp.io/psram", "esp32.io/psram"}) {
+            if (capacity) quantity(name, t.total_psram_bytes);
+            else kib(name, t.free_psram_bytes);
+        }
     }
     // The card: capacity is its size, allocatable the free space, both measured
-    if (t.sd_present) add("hardware.kube32.io/sd", bytes_quantity(capacity ? t.sd_total_bytes : t.sd_free_bytes));
+    if (t.sd_present) quantity("hardware.kube32.io/sd", capacity ? t.sd_total_bytes : t.sd_free_bytes);
 }
 
-static std::string ready_condition_json(const NodeTelemetry& t) {
-    return "{\"type\":\"Ready\",\"status\":\"" + std::string(t.ready ? "True" : "False") + "\",\"reason\":\"" + t.ready_reason +
-           "\",\"message\":\"" + t.ready_message + "\"}";
+template <typename Out>
+static void append_ready_condition(Out& json, const NodeTelemetry& t) {
+    json += "{\"type\":\"Ready\",\"status\":\"";
+    json += t.ready ? "True" : "False";
+    json += "\",\"reason\":\"";
+    json += t.ready_reason;
+    json += "\",\"message\":\"";
+    json += t.ready_message;
+    json += "\"}";
 }
 
 std::string NodeStatusReporter::build_registration_json(const NodeTelemetry& telemetry) const {
@@ -136,7 +174,9 @@ std::string NodeStatusReporter::build_registration_json(const NodeTelemetry& tel
     json += control_plane_ ? "\"node-role.kubernetes.io/control-plane\":\"\"}}," : "\"node-role.kubernetes.io/worker\":\"\"}},";
     json += "\"spec\":{\"unschedulable\":false},";
     json += "\"status\":{";
-    json += "\"conditions\":[" + ready_condition_json(telemetry) + "],";
+    json += "\"conditions\":[";
+    append_ready_condition(json, telemetry);
+    json += "],";
     json += "\"addresses\":[{\"type\":\"InternalIP\",\"address\":\"" + node_ip_ + "\"}],";
     if (kubelet_port_) json += "\"daemonEndpoints\":{\"kubeletEndpoint\":{\"Port\":" + std::to_string(kubelet_port_) + "}},";
     json += "\"nodeInfo\":{\"kubeletVersion\":\"" + std::string(api::KUBE32_GIT_VERSION) + "\",\"osImage\":\"" + osal::System::get_os_image() + "\",";
@@ -149,21 +189,33 @@ std::string NodeStatusReporter::build_registration_json(const NodeTelemetry& tel
     return json;
 }
 
-std::string NodeStatusReporter::build_heartbeat_patch_json(const NodeTelemetry& telemetry, bool memory_pressure) const {
-    std::string json;
-    json.reserve(512);
-
-    std::string mem_status = memory_pressure ? "True" : "False";
-    std::string mem_reason = memory_pressure ? "KubeletHasMemoryPressure" : "KubeletHasSufficientMemory";
-
+template <typename Out>
+static void append_heartbeat_patch(Out& json, const NodeTelemetry& telemetry, bool memory_pressure) {
     json += "{\"status\":{";
-    json += "\"conditions\":[" + ready_condition_json(telemetry) + ",";
-    json += "{\"type\":\"MemoryPressure\",\"status\":\"" + mem_status + "\",\"reason\":\"" + mem_reason + "\"}";
+    json += "\"conditions\":[";
+    append_ready_condition(json, telemetry);
+    json += ",{\"type\":\"MemoryPressure\",\"status\":\"";
+    json += memory_pressure ? "True" : "False";
+    json += "\",\"reason\":\"";
+    json += memory_pressure ? "KubeletHasMemoryPressure" : "KubeletHasSufficientMemory";
+    json += "\"}";
     json += "],";
     json += "\"allocatable\":{";
     append_resources(json, telemetry, false);
     json += "}}}";
+}
+
+std::string NodeStatusReporter::build_heartbeat_patch_json(const NodeTelemetry& telemetry, bool memory_pressure) const {
+    std::string json;
+    json.reserve(512);
+    append_heartbeat_patch(json, telemetry, memory_pressure);
     return json;
+}
+
+bool NodeStatusReporter::write_heartbeat_patch_json(mem::FixedText& out, const NodeTelemetry& telemetry, bool memory_pressure) const {
+    out.clear();
+    append_heartbeat_patch(out, telemetry, memory_pressure);
+    return !out.overflowed();
 }
 
 } // namespace kube32::kubelet

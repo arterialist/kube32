@@ -818,23 +818,18 @@ void cluster_task(void* pv) {
         if (kube32::osal::System::get_unix_time_ms() == 0) printf("[CLOCK] not synchronized yet, continuing\n");
     }
 
-    // Node CPU utilisation for metrics.k8s.io: cumulative run time of every
-    // non-idle task (both cores, esp_timer microseconds) against wall time.
+    // Node CPU utilisation for metrics.k8s.io: the time both cores spent
+    // outside their idle tasks (esp_timer microseconds) against wall time.
+    // Read from the idle tasks' counters: no task list, nothing allocated.
     kube32::kubelet::set_platform_cpu_sampler([](uint64_t& busy_us, uint64_t& wall_us) -> bool {
-        UBaseType_t n = uxTaskGetNumberOfTasks();
-        auto* states = static_cast<TaskStatus_t*>(heap_caps_malloc((n + 4) * sizeof(TaskStatus_t), MALLOC_CAP_8BIT));
-        if (!states) return false;
-        configRUN_TIME_COUNTER_TYPE total = 0;
-        UBaseType_t got = uxTaskGetSystemState(states, n + 4, &total);
-        uint64_t busy = 0;
-        for (UBaseType_t i = 0; i < got; ++i) {
-            if (states[i].pcTaskName && std::strncmp(states[i].pcTaskName, "IDLE", 4) == 0) continue;
-            busy += static_cast<uint64_t>(states[i].ulRunTimeCounter);
+        const uint64_t wall = static_cast<uint64_t>(esp_timer_get_time());
+        uint64_t idle = 0;
+        for (BaseType_t core = 0; core < portNUM_PROCESSORS; ++core) {
+            idle += static_cast<uint64_t>(ulTaskGetIdleRunTimeCounterForCore(core));
         }
-        heap_caps_free(states);
-        if (got == 0) return false;
-        busy_us = busy;
-        wall_us = static_cast<uint64_t>(esp_timer_get_time());
+        const uint64_t total = wall * portNUM_PROCESSORS;
+        busy_us = total > idle ? total - idle : 0;
+        wall_us = wall;
         return true;
     });
 

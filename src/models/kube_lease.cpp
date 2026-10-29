@@ -61,14 +61,19 @@ KubeLease KubeLease::from_json(const std::string& json_str) {
     return lease;
 }
 
+size_t now_micro_time(char* out, size_t cap) {
+    const uint64_t ms = osal::System::get_unix_time_ms();
+    if (ms == 0 || cap < 28) return 0;
+    size_t n = format_rfc3339(ms, out, cap);
+    if (n == 0 || out[n - 1] != 'Z') return 0;
+    // "...:SSZ" becomes "...:SS.mmm000Z"
+    snprintf(out + n - 1, cap - (n - 1), ".%03u000Z", static_cast<unsigned>(ms % 1000));
+    return n - 1 + 8;
+}
+
 std::string now_micro_time() {
-    uint64_t ms = osal::System::get_unix_time_ms();
-    if (ms == 0) return std::string();
-    std::string t = format_rfc3339(ms);
-    char frac[16];
-    snprintf(frac, sizeof(frac), ".%03u000Z", static_cast<unsigned>(ms % 1000));
-    if (!t.empty() && t.back() == 'Z') t.pop_back();
-    return t + frac;
+    char buf[32];
+    return std::string(buf, now_micro_time(buf, sizeof(buf)));
 }
 
 } // namespace kube32::models

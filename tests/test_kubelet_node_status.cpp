@@ -7,10 +7,29 @@
 #include "osal/system.hpp"
 
 #include <iostream>
+#include <atomic>
 #include <cassert>
+#include <cstdio>
+#include <cstdlib>
+#include <new>
 #include <vector>
 #include <string>
 #include <sstream>
+
+// Allocations made by the test's own thread while counting is on
+static thread_local bool g_count_allocs = false;
+static std::atomic<size_t> g_allocs{0};
+void* operator new(size_t n) {
+    if (g_count_allocs) g_allocs.fetch_add(1);
+    void* p = std::malloc(n ? n : 1);
+    if (!p) throw std::bad_alloc();
+    return p;
+}
+void* operator new[](size_t n) { return operator new(n); }
+void operator delete(void* p) noexcept { std::free(p); }
+void operator delete[](void* p) noexcept { std::free(p); }
+void operator delete(void* p, size_t) noexcept { std::free(p); }
+void operator delete[](void* p, size_t) noexcept { std::free(p); }
 
 using namespace kube32::kubelet;
 using namespace kube32::models;
@@ -39,11 +58,11 @@ public:
         return true;
     }
 
-    bool patch_node_status(const std::string& node_name, const std::string& patch_json) override {
+    bool patch_node_status(const std::string& node_name, std::string_view patch_json) override {
         (void)node_name;
         node_patched = true;
         last_node_patch = patch_json;
-        all_node_patches.push_back(patch_json);
+        all_node_patches.emplace_back(patch_json);
         return true;
     }
 
@@ -576,6 +595,41 @@ void test_dynamic_node_telemetry() {
     std::cout << "[PASS] (Dynamic telemetry transitions and boundaries verified)." << std::endl;
 }
 
+// The heartbeat patch is written into storage on the kubelet's stack: a
+// heartbeat takes nothing from the heap, and the patch reads as
+// build_heartbeat_patch_json's. One that does not fit is reported.
+void test_heartbeat_patch_in_fixed_buffer() {
+    std::cout << "\n[TEST] Heartbeat patch in a fixed buffer..." << std::endl;
+    NodeStatusReporter reporter("test-node-01", "192.168.4.2");
+    NodeTelemetry t = reporter.collect_telemetry();
+    t.total_psram_bytes = 2u << 20;
+    t.free_psram_bytes = 1536u << 10;
+    t.sd_present = true;
+    t.sd_total_bytes = 31154688ull << 10;
+    t.sd_free_bytes = 29786912ull << 10;
+    t.ready = true;
+    t.ready_reason = "KubeletReady";
+    snprintf(t.ready_message, sizeof(t.ready_message), "kubelet is posting ready status");
+
+    char storage[1024];
+    kube32::mem::FixedText patch(storage);
+    g_allocs = 0;
+    g_count_allocs = true;
+    const bool fits = reporter.write_heartbeat_patch_json(patch, t, true) && reporter.write_heartbeat_patch_json(patch, t, false);
+    g_count_allocs = false;
+    assert(fits && g_allocs.load() == 0);
+    const std::string buf(patch.view());
+    assert(buf == reporter.build_heartbeat_patch_json(t, false));
+    assert(buf.find("{\"type\":\"Ready\",\"status\":\"True\",\"reason\":\"KubeletReady\",\"message\":\"kubelet is posting ready status\"}") != std::string::npos);
+    assert(buf.find("\"reason\":\"KubeletHasSufficientMemory\"") != std::string::npos);
+    assert(buf.find("\"esp32.io/psram\":\"1536Ki\"") != std::string::npos);
+    assert(buf.find("\"hardware.kube32.io/sd\":\"29786912Ki\"") != std::string::npos);
+    char small[64];
+    kube32::mem::FixedText cut(small);
+    assert(!reporter.write_heartbeat_patch_json(cut, t, false) && cut.overflowed() && cut.size() <= sizeof(small));
+    std::cout << "[PASS] (" << buf.size() << " bytes, no allocation)" << std::endl;
+}
+
 // =============================================================================
 // MAIN ENTRY POINT
 // =============================================================================
@@ -594,6 +648,7 @@ int main() {
     test_hardware_pin_admission_rejection();
     test_dynamic_trap_exit_codes();
     test_dynamic_node_telemetry();
+    test_heartbeat_patch_in_fixed_buffer();
 
     std::cout << "\n==================================================================" << std::endl;
     std::cout << " ALL KUBELET NODE STATUS TESTS PASSED                          " << std::endl;

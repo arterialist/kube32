@@ -1,6 +1,7 @@
 #pragma once
 
 #include <string>
+#include <cstddef>
 #include <cstdint>
 
 namespace kube32::models {
@@ -20,5 +21,8 @@ struct KubeLease {
 // The wall clock as a metav1.MicroTime ("2026-10-28T12:00:00.123000Z"), empty
 // while the clock is not set.
 std::string now_micro_time();
+// The same into `out` (28 bytes with the terminator); returns the length, 0
+// while the clock is not set.
+size_t now_micro_time(char* out, size_t cap);
 
 } // namespace kube32::models

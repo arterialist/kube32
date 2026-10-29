@@ -11,6 +11,7 @@
 
 #include <atomic>
 #include <cassert>
+#include <cstdio>
 #include <cstdlib>
 #include <iostream>
 #include <new>
@@ -18,14 +19,16 @@
 #include <thread>
 #include <vector>
 
-// Largest single allocation of the tracking thread (the client's, not the
-// API server's threads in the same process)
+// Largest single allocation and number of allocations of the tracking
+// thread (the client's, not the API server's threads in the same process)
 static thread_local bool g_track = false;
 static std::atomic<size_t> g_max_alloc{0};
+static std::atomic<size_t> g_allocs{0};
 void* operator new(size_t n) {
     if (g_track) {
         size_t m = g_max_alloc.load();
         while (n > m && !g_max_alloc.compare_exchange_weak(m, n)) {}
+        g_allocs.fetch_add(1);
     }
     void* p = std::malloc(n ? n : 1);
     if (!p) throw std::bad_alloc();
@@ -61,6 +64,20 @@ static std::string pod_json(const std::string& name, const std::string& node, co
            "\"annotations\":{\"kube32.io/wasm-base64\":\"" + image_b64 + "\",\"kube32.io/wasm-size\":\"1\"}},"
            "\"spec\":{\"nodeName\":\"" + node + "\",\"containers\":[{\"name\":\"c\",\"image\":\"wasm://inline/" + name + "\","
            "\"resources\":{\"requests\":{\"memory\":\"16Ki\"}}}]},\"status\":{\"phase\":\"Pending\"}}";
+}
+
+// Answers one request on `port` with `response`, then closes
+static std::thread serve_once(osal::Socket& listener, uint16_t port, std::string response) {
+    assert(listener.create(osal::SocketType::Tcp));
+    listener.set_reuse_addr(true);
+    assert(listener.bind("127.0.0.1", port) && listener.listen(1));
+    return std::thread([&listener, response]() {
+        osal::Socket c = listener.accept();
+        char b[1024];
+        c.recv(b, sizeof b);
+        c.send_all(response.data(), response.size());
+        c.close();
+    });
 }
 
 // One raw request to the API server
@@ -135,6 +152,26 @@ int main() {
     // No buffer anywhere near an image (96 KiB, 128 KiB as base64), nor the list
     assert(g_max_alloc.load() < 4096);
 
+    // The pod sync's pass: each pod is collected on the stack and read in
+    // place, so a pass over the node's pods takes nothing from the heap
+    {
+        int visits = 0;
+        bool fields_ok = true;
+        auto check = [&](const kubelet::PodListEntry& e) {
+            ++visits;
+            fields_ok = fields_ok && e.node_name == "n1" && e.namespace_name == "default" && e.phase == "Pending" && !e.deleting &&
+                        e.uid.size() == 4 && e.uid.substr(0, 2) == "u-" && e.uid.substr(2) == e.name && e.pod == nullptr &&
+                        e.manifest.find("\"kube32.io/wasm-base64\":\"\"") != std::string_view::npos;
+        };
+        g_allocs = 0;
+        g_track = true;
+        const bool ok = client.for_each_node_pod(check);
+        g_track = false;
+        std::cout << "[sync pass] " << visits << " pods, " << g_allocs.load() << " allocations" << std::endl;
+        assert(ok && visits == 3 && fields_ok);
+        assert(g_allocs.load() == 0);
+    }
+
     // The image comes with its pod, decoded as it streams
     std::vector<uint8_t> got;
     std::string why;
@@ -168,6 +205,50 @@ int main() {
         assert(!cut.list_pods_raw(partial) && partial.empty());
         srv.join();
         l.close();
+    }
+    {
+        // The same for the pod sync's pass: no visit counts as the whole list
+        const std::string r = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n"
+                              "{\"kind\":\"PodList\",\"items\":[{\"metadata\":{\"name\":\"a\"},\"spec\":{\"nodeName\":\"n1\"}},{\"metadata\":{\"na";
+        osal::Socket l;
+        std::thread srv = serve_once(l, 18696, r);
+        kubelet::HttpKubeClient cut("127.0.0.1", 18696);
+        int visits = 0;
+        assert(!cut.for_each_node_pod([&](const kubelet::PodListEntry&) { ++visits; }));
+        assert(visits == 1);
+        srv.join();
+        l.close();
+    }
+    {
+        // Fields are found whatever surrounds them: brackets and quotes in
+        // strings, nested arrays, numbers, null, a deletionTimestamp
+        const std::string r = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n";
+        const std::string body =
+            "{\"kind\":\"PodList\",\"metadata\":{\"resourceVersion\":\"9\"},\"items\":["
+            "{\"metadata\":{\"labels\":{\"x\":\"[}{\"},\"name\":\"a\",\"namespace\":\"ns1\",\"uid\":\"u1\",\"deletionTimestamp\":\"2026-10-29T00:00:00Z\"},"
+            "\"spec\":{\"containers\":[{\"name\":\"c\",\"args\":[\"}\",\"\\\"]\"]}],\"nodeName\":\"n1\"},\"status\":{\"phase\":\"Running\"}},"
+            " { \"metadata\" : { \"name\" : \"b\", \"namespace\":\"ns1\", \"uid\":\"u2\", \"deletionTimestamp\":null,"
+            "\"annotations\":{\"k\":\"v\\\"q\"}}, \"spec\":{\"priority\":-1.5e3,\"hostNetwork\":true,\"nodeName\":\"n2\"},"
+            "\"status\":{\"conditions\":[{\"a\":[[1],[2,{\"b\":\"}\"}]]}],\"phase\":\"Succeeded\"}},"
+            // larger than the stack buffer: carried on in the heap
+            "{\"metadata\":{\"annotations\":{\"big\":\"" + std::string(5000, 'x') + "\"},\"name\":\"c\",\"namespace\":\"ns1\",\"uid\":\"u3\"},"
+            "\"spec\":{\"nodeName\":\"n1\"},\"status\":{\"phase\":\"Pending\"}}]}";
+        char size_line[16];
+        snprintf(size_line, sizeof size_line, "%zx\r\n", body.size());
+        osal::Socket l;
+        std::thread srv = serve_once(l, 18697, r + size_line + body + "\r\n0\r\n\r\n");
+        kubelet::HttpKubeClient lister("127.0.0.1", 18697);
+        std::vector<std::string> seen;
+        assert(lister.for_each_node_pod([&](const kubelet::PodListEntry& e) {
+            seen.push_back(std::string(e.namespace_name) + "/" + std::string(e.name) + " " + std::string(e.uid) + " " +
+                           std::string(e.node_name) + " " + std::string(e.phase) + (e.deleting ? " deleting" : ""));
+        }));
+        srv.join();
+        l.close();
+        assert(seen.size() == 3);
+        assert(seen[0] == "ns1/a u1 n1 Running deleting");
+        assert(seen[1] == "ns1/b u2 n2 Succeeded");
+        assert(seen[2] == "ns1/c u3 n1 Pending");
     }
 
     // A full list (kubectl) keeps the annotation

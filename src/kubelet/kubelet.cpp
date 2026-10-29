@@ -11,12 +11,16 @@
 #include "models/kube_models.hpp"
 #include "models/kube_lease.hpp"
 #include "osal/system.hpp"
+#include "mem/fixed_text.hpp"
 
 #include <algorithm>
+#include <charconv>
 #include <functional>
 #include <iostream>
 #include <new>
+#include <tuple>
 #include <cerrno>
+#include <cstdio>
 #include <cstring>
 #include <fcntl.h>
 #include <sys/stat.h>
@@ -182,7 +186,7 @@ bool Kubelet::start() {
     // initialises Wasm modules (seconds on a 240 MHz core).
     osal::Thread::Config h_cfg;
     h_cfg.name = "k32_kubelet_hb";
-    h_cfg.stack_size = config_.task_stack_in_psram ? 12288 : 8192;   // JSON for lease + status patch: 3.4 KB high-water on the worker
+    h_cfg.stack_size = config_.task_stack_in_psram ? 12288 : 8192;   // status patch and metrics sample are written here: 6.1 KB high-water on the worker
     h_cfg.priority = config_.task_priority;
     h_cfg.core_affinity = config_.core_affinity;
     h_cfg.stack_in_psram = config_.task_stack_in_psram;
@@ -297,13 +301,21 @@ void Kubelet::report_heartbeat() {
     // The lease outlives three missed heartbeats: the control plane marks the
     // node NotReady once it expires (NodeLifecycleController)
     const uint32_t lease_s = std::max<uint32_t>(15, (3 * config_.heartbeat_interval_ms + 999) / 1000);
-    api_client_->renew_node_lease(config_.node_name, lease_s, models::now_micro_time());
+    char renew_time[32];
+    const size_t renew_len = models::now_micro_time(renew_time, sizeof(renew_time));
+    api_client_->renew_node_lease(config_.node_name, lease_s, std::string_view(renew_time, renew_len));
 
     NodeTelemetry t = status_reporter_->collect_telemetry();
     fill_ready_condition(t);
     bool memory_pressure = (t.free_heap_bytes < config_.memory_pressure_threshold_bytes);
-    std::string patch = status_reporter_->build_heartbeat_patch_json(t, memory_pressure);
-    if (!api_client_->patch_node_status(config_.node_name, patch)) {
+    // Written on this thread's stack; a patch that does not fit (a board
+    // with an unusual set of resources) is built on the heap instead
+    char patch_buf[768];
+    mem::FixedText patch(patch_buf);
+    const bool patched = status_reporter_->write_heartbeat_patch_json(patch, t, memory_pressure)
+        ? api_client_->patch_node_status(config_.node_name, patch.view())
+        : api_client_->patch_node_status(config_.node_name, status_reporter_->build_heartbeat_patch_json(t, memory_pressure));
+    if (!patched) {
         // Two rejected heartbeats in a row: the control plane restarted or
         // lost this node (a control plane without storage keeps its state in
         // RAM), so register again; a Node that survived answers 409 and is
@@ -328,45 +340,92 @@ void Kubelet::fill_ready_condition(NodeTelemetry& t) const {
     if (last == 0) {
         t.ready = false;
         t.ready_reason = "KubeletNotReady";
-        t.ready_message = "kubelet has not completed a pod sync yet";
+        snprintf(t.ready_message, sizeof(t.ready_message), "kubelet has not completed a pod sync yet");
     } else if (now > last && now - last > config_.sync_stall_threshold_ms) {
         t.ready = false;
         t.ready_reason = "KubeletNotReady";
-        t.ready_message = "pod sync loop last completed " + std::to_string((now - last) / 1000) + "s ago";
+        snprintf(t.ready_message, sizeof(t.ready_message), "pod sync loop last completed %llus ago",
+                 static_cast<unsigned long long>((now - last) / 1000));
     } else {
         t.ready = true;
         t.ready_reason = "KubeletReady";
-        t.ready_message = "kubelet is posting ready status";
+        snprintf(t.ready_message, sizeof(t.ready_message), "kubelet is posting ready status");
     }
+}
+
+// The pod key "namespace/name" in `buf`
+static std::string_view pod_key_view(std::string_view ns, std::string_view name, char* buf, size_t cap) {
+    if (ns.size() + 1 + name.size() > cap) return std::string_view();
+    std::memcpy(buf, ns.data(), ns.size());
+    buf[ns.size()] = '/';
+    std::memcpy(buf + ns.size() + 1, name.data(), name.size());
+    return std::string_view(buf, ns.size() + 1 + name.size());
 }
 
 void Kubelet::sync_assigned_pods() {
     last_sync_ms_ = osal::System::get_uptime_ms();
+    const uint32_t pass = ++sync_pass_;
+    const uint64_t now_ms = last_sync_ms_;
 
-    std::vector<std::pair<models::KubePod, std::string>> all_pods;
-    if (!api_client_->list_pods_raw(all_pods)) {
+    // The list is read through first and acted on once it arrived whole. Only
+    // the pods to stop or to start are copied out of it (a start parses the
+    // pod); a pass over pods that keep running takes nothing from the heap.
+    struct PodStart {
+        models::KubePod pod;
+        std::string manifest;
+    };
+    std::vector<PodStart> starts;
+    std::vector<std::pair<std::string, std::string>> terminating;   // (ns, name), deletionTimestamp set
+    char key_buf[320];
+    const bool listed = api_client_->for_each_node_pod([&](const PodListEntry& e) {
+        if (e.node_name != config_.node_name) return;
+        // Pods carrying a deletionTimestamp are to be stopped and then
+        // finalized by us
+        if (e.deleting) {
+            terminating.emplace_back(std::string(e.namespace_name), std::string(e.name));
+            return;
+        }
+        const std::string_view key = pod_key_view(e.namespace_name, e.name, key_buf, sizeof(key_buf));
+        bool start = false;
+        {
+            osal::LockGuard guard(state_mutex_);
+            auto it = active_pods_.find(key);
+            if (it == active_pods_.end()) {
+                // A pod that already Succeeded or Failed is never started
+                // again, also not after this node or the control plane restarted
+                start = !(e.phase == "Succeeded" || e.phase == "Failed");
+            } else {
+                LocalPodRecord& rec = it->second;
+                rec.listed_pass = pass;
+                const PodExecutionPhase phase = rec.execution_phase;
+                if (!rec.uid.empty() && !e.uid.empty() && rec.uid != e.uid) {
+                    start = true;   // deleted and created again under the same name
+                } else if ((phase == PodExecutionPhase::CrashLoopBackOff || phase == PodExecutionPhase::CreateContainerConfigError ||
+                            phase == PodExecutionPhase::InsufficientMemory) && now_ms >= rec.next_restart_allowed_ms) {
+                    // A pod waiting for memory is tried again once the room
+                    // admission asked for exists; until then the wait goes on
+                    // without parsing the pod
+                    if (phase == PodExecutionPhase::InsufficientMemory && rec.memory_need_bytes > 0 &&
+                        kube32_pool_pod_room(rec.memory_limit_bytes, nullptr) < rec.memory_need_bytes) {
+                        rec.next_restart_allowed_ms = now_ms + config_.memory_retry_ms;
+                    } else {
+                        start = true;
+                    }
+                }
+            }
+        }
+        if (start) {
+            starts.push_back(PodStart{e.pod ? *e.pod : models::parse_pod_manifest(std::string(e.manifest)), std::string(e.manifest)});
+        }
+    });
+    if (!listed) {
         return;
     }
 
-    // Filter desired pods assigned to this node; pods carrying a
-    // deletionTimestamp are to be stopped and then finalized by us
-    std::map<std::string, std::pair<models::KubePod, std::string>> desired;
-    std::vector<std::pair<std::string, std::string>> terminating; // (ns, name)
-    for (auto& item : all_pods) {
-        const auto& pod = item.first;
-        if (pod.node_name == config_.node_name) {
-            std::string key = pod.namespace_name + "/" + pod.name;
-            if (!pod.deletion_timestamp.empty()) {
-                terminating.emplace_back(pod.namespace_name, pod.name);
-                continue;
-            }
-            // A pod that already Succeeded or Failed is never started again,
-            // also not after this node or the control plane restarted
-            if (active_pods_.find(key) == active_pods_.end() && pod_phase_is_terminal(pod)) continue;
-            desired[key] = std::move(item);
-        }
-    }
-    std::vector<std::pair<models::KubePod, std::string>>().swap(all_pods);
+    // Started in key order, as the API server lists them
+    std::sort(starts.begin(), starts.end(), [](const PodStart& a, const PodStart& b) {
+        return std::tie(a.pod.namespace_name, a.pod.name) < std::tie(b.pod.namespace_name, b.pod.name);
+    });
 
     osal::LockGuard guard(state_mutex_);
 
@@ -377,45 +436,37 @@ void Kubelet::sync_assigned_pods() {
         api_client_->delete_pod(tp.first, tp.second);
     }
 
-    // 1. Detect additions, and restart containers whose back-off has passed
-    const uint64_t now_ms = osal::System::get_uptime_ms();
-    for (const auto& kv : desired) {
-        const std::string& key = kv.first;
+    // 1. Additions, and restarts of containers whose back-off has passed
+    for (const auto& st : starts) {
+        const std::string key = st.pod.namespace_name + "/" + st.pod.name;
         auto it = active_pods_.find(key);
-        if (it != active_pods_.end() && !it->second.uid.empty() && !kv.second.first.uid.empty() && it->second.uid != kv.second.first.uid) {
+        if (it != active_pods_.end() && !it->second.uid.empty() && !st.pod.uid.empty() && it->second.uid != st.pod.uid) {
             // Deleted and created again under the same name while this node
             // still had the old pod: the old one stops, the new one starts
             terminate_pod(key);
             it = active_pods_.end();
         }
         if (it == active_pods_.end()) {
-            start_pod_guarded(kv.second.first, kv.second.second, nullptr);
-            continue;
-        }
-        // Tried again once due: a crashed container after its back-off, a
-        // container whose ConfigMap or Secret may exist by now, a pod the
-        // node may have the memory for by now
-        const PodExecutionPhase phase = it->second.execution_phase;
-        if ((phase == PodExecutionPhase::CrashLoopBackOff || phase == PodExecutionPhase::CreateContainerConfigError ||
-             phase == PodExecutionPhase::InsufficientMemory) && now_ms >= it->second.next_restart_allowed_ms) {
+            start_pod_guarded(st.pod, st.manifest, nullptr);
+        } else {
+            // Tried again once due: a crashed container after its back-off, a
+            // container whose ConfigMap or Secret may exist by now, a pod the
+            // node may have the memory for by now
             LocalPodRecord previous = it->second;
             active_pods_.erase(it);
-            if (phase == PodExecutionPhase::CrashLoopBackOff) {
+            if (previous.execution_phase == PodExecutionPhase::CrashLoopBackOff) {
                 std::cout << "[KUBELET] " << key << ": restarting container (restart " << (previous.restart_count + 1) << ")" << std::endl;
             }
-            start_pod_guarded(kv.second.first, kv.second.second, &previous);
+            start_pod_guarded(st.pod, st.manifest, &previous);
         }
+        if (auto started = active_pods_.find(key); started != active_pods_.end()) started->second.listed_pass = pass;
     }
 
-    // 2. Detect Deletions
+    // 2. Deletions: local pods the list no longer holds
     std::vector<std::string> to_remove;
     for (const auto& kv : active_pods_) {
-        const std::string& key = kv.first;
-        if (desired.find(key) == desired.end()) {
-            to_remove.push_back(key);
-        }
+        if (kv.second.listed_pass != pass) to_remove.push_back(kv.first);
     }
-
     for (const auto& key : to_remove) {
         terminate_pod(key);
     }
@@ -583,6 +634,7 @@ bool Kubelet::deploy_and_start_pod(const models::KubePod& pod_in, const std::str
                 rec.restart_count = previous->restart_count;
                 rec.restart_due = previous->restart_due || restarting;
             }
+            rec.memory_need_bytes = static_cast<uint32_t>(need);
             return wait_for_memory(pod_key, rec, "not enough memory to start the container: it needs about " + kib(need) +
                                                  ", pods can be given " + kib(room) + " now (" + reserve + " kept for the system)", previous);
         }
@@ -890,15 +942,19 @@ bool Kubelet::deploy_and_start_pod(const models::KubePod& pod_in, const std::str
 
 bool Kubelet::terminate_pod(const std::string& pod_key) {
     std::cout << "[KUBELET] " << pod_key << ": terminating" << std::endl;
-    auto it = active_pods_.find(pod_key);
-    if (it != active_pods_.end()) {
-        record_pod_event(it->second, "Killing", "Stopping container " + it->second.container_name, false);
-    }
+    // The container's memory is given back before anything is reported: on
+    // a node out of memory the report may fail, the stop must not
     runtime_.terminate(pod_key);
     hal::CapabilityFirewall::instance().unregister_pod(pod_key);
+    auto it = active_pods_.find(pod_key);
     if (it != active_pods_.end()) {
-        // The "container stopped" line is the ring's last record; flush it
-        ship_pod_logs_locked(pod_key, it->second);
+        try {
+            record_pod_event(it->second, "Killing", "Stopping container " + it->second.container_name, false);
+            // The "container stopped" line is the ring's last record; flush it
+            ship_pod_logs_locked(pod_key, it->second);
+        } catch (const std::bad_alloc&) {
+            std::cout << "[KUBELET] " << pod_key << ": stopped, not reported (out of memory)" << std::endl;
+        }
         active_pods_.erase(it);
     }
     runtime::PodLogStore::runtime().remove(pod_key);
@@ -1079,35 +1135,61 @@ void Kubelet::ship_pod_logs_locked(const std::string& pod_key, LocalPodRecord& r
     }
 }
 
+static void append_uint(mem::FixedText& out, uint64_t v) {
+    char buf[24];
+    out.append(buf, static_cast<size_t>(std::to_chars(buf, buf + sizeof(buf), v).ptr - buf));
+}
+
+// The sample is written on this thread's stack: nothing is taken from the
+// heap. Room for about ten pods; a larger sample is not sent.
 void Kubelet::push_metrics_sample() {
     if (!metrics_) return;
     NodeResourceSample node;
     bool have_node = metrics_->sample_node(node);
     const uint64_t wall_now_us = osal::Thread::get_time_us();
 
-    std::string body = "{\"node\":\"" + config_.node_name + "\"";
+    char body_buf[1536];
+    mem::FixedText body(body_buf);
+    body += "{\"node\":\"";
+    body += config_.node_name;
+    body += "\"";
+    char ts[32];
+    const uint64_t unix_ms = osal::System::get_unix_time_ms();
+    const size_t ts_len = unix_ms ? models::format_rfc3339(unix_ms, ts, sizeof(ts)) : 0;
+    if (ts_len) {
+        body += ",\"timestamp\":\"";
+        body.append(ts, ts_len);
+        body += "\"";
+    }
+    // usage and window_ms follow; the window is known once the CPU sample is
     uint64_t window_ms = 0;
-    std::string usage;
+    bool have_cpu = false;
+    uint64_t nanocores = 0;
     if (have_node) {
         if (node.has_cpu && has_node_sample_ && last_node_sample_.has_cpu && node.cpu_wall_us > last_node_sample_.cpu_wall_us) {
             uint64_t dbusy = node.cpu_busy_us - last_node_sample_.cpu_busy_us;
             uint64_t dwall = node.cpu_wall_us - last_node_sample_.cpu_wall_us;
-            uint64_t nanocores = (dbusy * 1000000000ULL) / dwall;
-            usage += "\"cpu_nanocores\":" + std::to_string(nanocores);
+            nanocores = (dbusy * 1000000000ULL) / dwall;
+            have_cpu = true;
             window_ms = dwall / 1000ULL;
-        }
-        if (node.has_memory) {
-            if (!usage.empty()) usage += ",";
-            usage += "\"memory_bytes\":" + std::to_string(node.memory_used_bytes);
         }
         last_node_sample_ = node;
         has_node_sample_ = true;
     }
     if (window_ms == 0) window_ms = (last_heartbeat_ms_ > 0) ? (osal::System::get_uptime_ms() - last_heartbeat_ms_) : 0;
-    std::string ts = models::now_rfc3339();
-    if (!ts.empty()) body += ",\"timestamp\":\"" + ts + "\"";
-    body += ",\"window_ms\":" + std::to_string(window_ms);
-    body += ",\"usage\":{" + usage + "}";
+    body += ",\"window_ms\":";
+    append_uint(body, window_ms);
+    body += ",\"usage\":{";
+    if (have_cpu) {
+        body += "\"cpu_nanocores\":";
+        append_uint(body, nanocores);
+    }
+    if (have_node && node.has_memory) {
+        if (have_cpu) body += ",";
+        body += "\"memory_bytes\":";
+        append_uint(body, node.memory_used_bytes);
+    }
+    body += "}";
 
     body += ",\"pods\":[";
     bool first = true;
@@ -1117,11 +1199,20 @@ void Kubelet::push_metrics_sample() {
             LocalPodRecord& rec = kv.second;
             PodResourceSample ps;
             if (!metrics_->sample_pod(kv.first, runtime_, ps)) continue;
-            std::string cu;
+            if (!first) body += ",";
+            first = false;
+            body += "{\"namespace\":\"";
+            body += rec.namespace_name;
+            body += "\",\"name\":\"";
+            body += rec.name;
+            body += "\",\"containers\":[{\"name\":\"";
+            body += rec.container_name.empty() ? rec.name : rec.container_name;
+            body += "\"";
             if (ps.has_cpu && rec.has_cpu_sample && wall_now_us > rec.last_cpu_wall_us) {
                 uint64_t dbusy = ps.cpu_busy_us >= rec.last_cpu_busy_us ? ps.cpu_busy_us - rec.last_cpu_busy_us : 0;
                 uint64_t dwall = wall_now_us - rec.last_cpu_wall_us;
-                cu += "\"cpu_nanocores\":" + std::to_string((dbusy * 1000000000ULL) / dwall);
+                body += ",\"cpu_nanocores\":";
+                append_uint(body, (dbusy * 1000000000ULL) / dwall);
             }
             if (ps.has_cpu) {
                 rec.has_cpu_sample = true;
@@ -1129,18 +1220,24 @@ void Kubelet::push_metrics_sample() {
                 rec.last_cpu_wall_us = wall_now_us;
             }
             if (ps.has_memory) {
-                if (!cu.empty()) cu += ",";
-                cu += "\"memory_bytes\":" + std::to_string(ps.memory_bytes);
-                if (ps.has_psram) cu += ",\"psram_bytes\":" + std::to_string(ps.psram_bytes);
+                body += ",\"memory_bytes\":";
+                append_uint(body, ps.memory_bytes);
+                if (ps.has_psram) {
+                    body += ",\"psram_bytes\":";
+                    append_uint(body, ps.psram_bytes);
+                }
             }
-            if (!first) body += ",";
-            first = false;
-            body += "{\"namespace\":\"" + rec.namespace_name + "\",\"name\":\"" + rec.name + "\",\"containers\":[{\"name\":\"" +
-                    (rec.container_name.empty() ? rec.name : rec.container_name) + "\"" + (cu.empty() ? std::string() : "," + cu) + "}]}";
+            body += "}]}";
         }
     }
     body += "]}";
-    api_client_->push_metrics(config_.node_name, body);
+    if (body.overflowed()) {
+        static bool logged = false;
+        if (!logged) std::cout << "[KUBELET] metrics sample over " << sizeof(body_buf) << " bytes, not sent" << std::endl;
+        logged = true;
+        return;
+    }
+    api_client_->push_metrics(config_.node_name, body.view());
 }
 
 std::vector<std::string> Kubelet::get_active_pod_keys() const {

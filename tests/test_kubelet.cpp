@@ -30,7 +30,7 @@ public:
         return true;
     }
 
-    bool patch_node_status(const std::string& node_name, const std::string& patch_json) override {
+    bool patch_node_status(const std::string& node_name, std::string_view patch_json) override {
         (void)node_name;
         node_patched = true;
         last_node_patch = patch_json;
