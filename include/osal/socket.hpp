@@ -61,6 +61,10 @@ public:
     bool set_timeout(uint32_t recv_timeout_ms, uint32_t send_timeout_ms);
     bool set_reuse_addr(bool reuse);
     bool set_tcp_nodelay(bool nodelay);
+    // The peer closed its side and nothing is left to read: a request that
+    // was read in full but whose client has gone. Does not block. Always
+    // false on TLS sessions (the descriptor carries ciphertext).
+    bool peer_closed() const;
     // Port the socket is bound to (0 when unknown)
     uint16_t local_port() const;
 

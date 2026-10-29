@@ -228,6 +228,14 @@ bool Socket::set_tcp_nodelay(bool nodelay) {
     return (setsockopt(fd_, IPPROTO_TCP, TCP_NODELAY, &opt, sizeof(opt)) == 0);
 }
 
+bool Socket::peer_closed() const {
+    if (fd_ < 0) return true;
+    if (tls_) return false;
+    char c;
+    const ssize_t n = ::recv(fd_, &c, 1, MSG_PEEK | MSG_DONTWAIT);
+    return n == 0 || (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK);
+}
+
 void Socket::shutdown(ShutdownMode mode) {
     if (fd_ < 0) return;
     int how = SHUT_RDWR;

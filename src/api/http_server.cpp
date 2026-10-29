@@ -713,6 +713,14 @@ size_t HttpServer::serve_one(Worker& w, osal::Socket& sock, const std::string& c
     }
     req.client_ip = client_ip;
 
+    // The client gave up while the request waited in the queue: answering it
+    // would only hold the worker while more callers time out behind it
+    if (!stream_body && sock.peer_closed()) {
+        metrics_.errors.fetch_add(1, std::memory_order_relaxed);
+        if (options_.access_log) printf("[HTTP] %s %s %s: client closed the connection before it was served\n", client_ip.c_str(), http_method_str(req.method), req.raw_uri.c_str());
+        return static_cast<size_t>(-1);
+    }
+
     HttpConnection conn(sock, req, buf, cap);
     if (stream_body) {
         conn.set_body_stream(take, req.content_length, req.chunked_body);
