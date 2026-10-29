@@ -2,12 +2,16 @@
 #include "app/node_storage_api.hpp"
 #include "ipc/channel.hpp"
 #include "osal/thread.hpp"
+#include "osal/system.hpp"
 
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <iostream>
 
 namespace kube32::app {
+
+static constexpr size_t kMinFreeHeapToServe = 10 * 1024;
 
 // =============================================================================
 // HttpAppSink
@@ -120,9 +124,22 @@ bool PodServerHandler::handle(api::HttpConnection& conn) {
     if (pod.empty() || !runtime::AppPodHost::instance().pod_handles_requests(pod)) {
         return conn.send_simple(503, "application/json", "{\"error\":\"unavailable\",\"message\":\"no request-handling pod on this node\"}", "Retry-After: 2\r\n");
     }
+    // Without PSRAM a response in flight takes several KB of the internal
+    // heap in TCP and Wi-Fi buffers, and the Wi-Fi driver stops sending for
+    // good once an allocation of its own fails: start none on a low heap
+    if (osal::System::get_total_psram_bytes() == 0 && osal::System::get_free_heap_bytes() < kMinFreeHeapToServe) {
+        return conn.send_simple(503, "application/json", "{\"error\":\"unavailable\",\"message\":\"node memory is low\"}", "Retry-After: 1\r\n");
+    }
     runtime::AppRequest areq = app_request_from(req);
     HttpAppSink sink(conn);
+    const uint64_t t0 = osal::Thread::get_time_us();
     int32_t rc = runtime::AppPodHost::instance().handle(pod, areq, sink);
+    const uint32_t total_ms = static_cast<uint32_t>((osal::Thread::get_time_us() - t0) / 1000);
+    if (total_ms >= 2000) {
+        // Slow calls, and how much of the time went to writing the response
+        printf("[POD-HTTP] %s %s: %u ms, %u ms writing %u bytes in %u writes\n", pod.c_str(), req.raw_uri.c_str(), (unsigned)total_ms,
+               (unsigned)(sink.socket_us() / 1000), (unsigned)sink.bytes(), (unsigned)sink.flushes());
+    }
     if (rc < 0 && !conn.responded()) {
         return conn.send_simple(502, "application/json", "{\"error\":\"pod_failure\"}");
     }
@@ -136,7 +153,9 @@ bool PodServer::start() {
     api::HttpServerOptions o;
     o.host = "0.0.0.0";
     o.port = opts_.port;
-    o.backlog = 4;
+    o.backlog = opts_.backlog;
+    o.accept_queue_depth = opts_.accept_queue_depth;
+    o.max_idle_connections = opts_.max_idle_connections;
     o.rx_buffer_size = opts_.rx_buffer;
     o.max_body_size = 16 * 1024;
     o.workers = opts_.workers;

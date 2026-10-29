@@ -75,6 +75,12 @@ struct PodServerOptions {
     uint32_t workers{2};
     size_t worker_stack{16384};
     size_t rx_buffer{4096};
+    // Connections accepted and not yet served, and idle keep-alive ones.
+    // Each socket holding unread bytes pins Wi-Fi RX buffers; a board
+    // without PSRAM has few.
+    uint32_t accept_queue_depth{8};
+    uint32_t max_idle_connections{16};
+    int backlog{4};
     int core_affinity{-1};
     bool stacks_in_psram{false};
     void* stack_buffer{nullptr};             // the (first) worker's stack, owned by the caller (worker_stack bytes)

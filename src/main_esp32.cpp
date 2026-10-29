@@ -1093,6 +1093,14 @@ void cluster_task(void* pv) {
         // the worker's own stack only serves HTTP and node storage
         po.worker_stack = ident.has_psram ? 24576 : 10240;   // FATFS over SPI for node storage needs about 10 KB
         po.rx_buffer = ident.has_psram ? 4096 : 2048;
+        if (!ident.has_psram) {
+            // A request waiting here keeps its bytes in Wi-Fi RX buffers
+            // until it is read; with one worker and a slow pod, a deep queue
+            // took every buffer and the node stopped receiving
+            po.backlog = 2;
+            po.accept_queue_depth = 1;
+            po.max_idle_connections = 2;
+        }
         po.core_affinity = 1;
         po.stacks_in_psram = ident.has_psram;
         if (s_api_token_set) po.token = api_token;
