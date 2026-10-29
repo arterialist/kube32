@@ -75,6 +75,9 @@
 #include "esp_mac.h"
 #include "esp_log.h"
 #include "esp_heap_caps.h"
+#include "esp_debug_helpers.h"
+#include "lwip/priv/tcp_priv.h"
+#include "lwip/priv/tcpip_priv.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "driver/usb_serial_jtag.h"
@@ -300,6 +303,77 @@ static void console_list_sd(Console& con, const std::string& path, int depth, in
     closedir(d);
 }
 
+// "K32_HEAP used|free <bucket> <blocks> <bytes>" lines: internal heap blocks
+// grouped by size. The walk holds the heap lock, so the counts live in statics.
+struct HeapBuckets { uint32_t count[2][7]; uint32_t bytes[2][7]; };
+static HeapBuckets s_heap_buckets;
+static const size_t k_heap_bucket_max[] = {32, 128, 512, 1024, 1700, 4096, SIZE_MAX};
+
+static void console_heap_histogram(Console& con) {
+    std::memset(&s_heap_buckets, 0, sizeof(s_heap_buckets));
+    heap_caps_walk(MALLOC_CAP_INTERNAL, [](walker_heap_into_t, walker_block_info_t b, void*) {
+        size_t i = 0;
+        while (b.size > k_heap_bucket_max[i]) ++i;
+        s_heap_buckets.count[b.used ? 0 : 1][i]++;
+        s_heap_buckets.bytes[b.used ? 0 : 1][i] += static_cast<uint32_t>(b.size);
+        return true;
+    }, nullptr);
+    for (int u = 0; u < 2; ++u) {
+        for (size_t i = 0; i < 7; ++i) {
+            char l[80];
+            int ll = snprintf(l, sizeof(l), "K32_HEAP %s <=%u %u %u\n", u == 0 ? "used" : "free",
+                              i == 6 ? 99999u : (unsigned)k_heap_bucket_max[i],
+                              (unsigned)s_heap_buckets.count[u][i], (unsigned)s_heap_buckets.bytes[u][i]);
+            con.write(l, static_cast<size_t>(ll));
+        }
+    }
+}
+
+// lwIP's TCP connections, copied in the TCP/IP thread: state, ports, the
+// bytes queued to send or waiting for an ACK, and data the application has
+// not taken yet.
+struct TcpPcbRow { uint8_t state; uint8_t peer; uint16_t local_port, remote_port, queuelen; uint32_t unsent, unacked, refused, ooseq; uint16_t nrtx; };
+static TcpPcbRow s_tcp_rows[24];
+static size_t s_tcp_count;
+
+static void console_tcp_pcbs(Console& con) {
+    s_tcp_count = 0;
+    struct tcpip_api_call_data call = {};
+    tcpip_api_call([](struct tcpip_api_call_data*) -> err_t {
+        auto seg_bytes = [](const struct tcp_seg* seg) {
+            uint32_t n = 0;
+            for (; seg; seg = seg->next) n += seg->p ? seg->p->tot_len : 0;
+            return n;
+        };
+        for (struct tcp_pcb* const* list : {&tcp_active_pcbs, &tcp_tw_pcbs}) {
+            for (const struct tcp_pcb* pcb = *list; pcb && s_tcp_count < 24; pcb = pcb->next) {
+                TcpPcbRow& r = s_tcp_rows[s_tcp_count++];
+                r.state = static_cast<uint8_t>(pcb->state);
+                r.peer = static_cast<uint8_t>(ntohl(ip4_addr_get_u32(ip_2_ip4(&pcb->remote_ip))) & 0xff);
+                r.local_port = pcb->local_port;
+                r.remote_port = pcb->remote_port;
+                r.queuelen = pcb->snd_queuelen;
+                r.unsent = seg_bytes(pcb->unsent);
+                r.unacked = seg_bytes(pcb->unacked);
+                r.refused = pcb->refused_data ? pcb->refused_data->tot_len : 0;
+                r.ooseq = seg_bytes(pcb->ooseq);
+                r.nrtx = pcb->nrtx;
+            }
+        }
+        return ERR_OK;
+    }, &call);
+    static const char* const states[] = {"CLOSED", "LISTEN", "SYN_SENT", "SYN_RCVD", "ESTABLISHED", "FIN_WAIT_1",
+                                         "FIN_WAIT_2", "CLOSE_WAIT", "CLOSING", "LAST_ACK", "TIME_WAIT"};
+    for (size_t i = 0; i < s_tcp_count; ++i) {
+        const TcpPcbRow& r = s_tcp_rows[i];
+        char l[160];
+        int ll = snprintf(l, sizeof(l), "K32_TCP %-11s local=%u peer=.%u:%u queuelen=%u unsent=%u unacked=%u refused=%u ooseq=%u nrtx=%u\n",
+                          r.state <= 10 ? states[r.state] : "?", r.local_port, r.peer, r.remote_port, r.queuelen,
+                          (unsigned)r.unsent, (unsigned)r.unacked, (unsigned)r.refused, (unsigned)r.ooseq, r.nrtx);
+        con.write(l, static_cast<size_t>(ll));
+    }
+}
+
 static uint32_t crc32_bytes(const uint8_t* p, size_t n) {
     uint32_t c = 0xFFFFFFFFu;
     for (size_t i = 0; i < n; ++i) {
@@ -475,8 +549,13 @@ void console_task(void* arg) {
                 bool found = false;
                 if (st) {
                     UBaseType_t got = uxTaskGetSystemState(st, n + 4, nullptr);
-                    for (UBaseType_t i = 0; i < got && !found; ++i) {
+                    // An exact name wins over a prefix ("k32_kubelet" vs "k32_kubelet_hb")
+                    UBaseType_t pick = got;
+                    for (UBaseType_t i = 0; i < got; ++i) {
                         if (std::strncmp(st[i].pcTaskName, want.c_str(), want.size()) != 0) continue;
+                        if (pick == got || st[i].pcTaskName[want.size()] == '\0') pick = i;
+                    }
+                    for (UBaseType_t i = pick; i < got && !found; ++i) {
                         found = true;
                         // pxTopOfStack is the first member of the TCB
                         const uint32_t* sp = *reinterpret_cast<uint32_t* const*>(st[i].xHandle);
@@ -538,6 +617,19 @@ void console_task(void* arg) {
                 char l[48];
                 int ll = snprintf(l, sizeof(l), "K32_OK keypop=%d\n", k);
                 con.write(l, static_cast<size_t>(ll));
+            } else if (line == "K32_CMD:HEAP") {
+                // Internal heap blocks by size, used and free: what holds the
+                // memory on a board without PSRAM
+                console_heap_histogram(con);
+                con.write("K32_OK heap\n", 12);
+            } else if (line == "K32_CMD:TCP") {
+                // lwIP's TCP connections and the bytes each one holds
+                console_tcp_pcbs(con);
+                con.write("K32_OK tcp\n", 11);
+            } else if (line == "K32_CMD:BTALL") {
+                // Backtrace of every task, for a host to addr2line: where each one waits
+                esp_backtrace_print_all_tasks(24);
+                con.write("K32_OK btall\n", 13);
             } else if (line == "K32_CMD:TASKS") {
                 // FreeRTOS task table: state, priority, core, stack high-water mark,
                 // cumulative run time (run-time statistics are enabled in sdkconfig).

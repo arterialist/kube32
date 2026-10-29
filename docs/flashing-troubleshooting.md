@@ -49,7 +49,10 @@ Profile commands write to the `k32` NVS namespace, return `K32_OK ..., rebooting
 | `K32_CMD:CERT` | The API server's self-signed TLS certificate in PEM format as `K32_CERT <line>` lines followed by `K32_OK cert`. |
 | `K32_CMD:SCAN` | Up to 20 `K32_AP ssid="..." rssi=... ch=... auth=...` lines for 2.4 GHz networks. |
 | `K32_CMD:TASKS` | One `K32_TASK` line per FreeRTOS task with state, priority, core, free stack high-water mark, and run time. |
-| `K32_CMD:TASKBT:<task name prefix>` | First 48 words of a blocked task's saved stack for `addr2line`. |
+| `K32_CMD:TASKBT:<task name prefix>` | First 48 words of a blocked task's saved stack for `addr2line`. Exact name matches take precedence over prefix matches. |
+| `K32_CMD:BTALL` | Every task's backtrace for `addr2line`. |
+| `K32_CMD:HEAP` | `K32_HEAP used\|free <=<size> <blocks> <bytes>` lines: internal heap blocks grouped by size. |
+| `K32_CMD:TCP` | One `K32_TCP` line per lwIP TCP connection with its state, local port, peer, and bytes unsent, unacknowledged, unread by the application, or out of order. |
 | `K32_CMD:ACCESSLOG:on` / `off` | Log HTTP requests on the API server and ingress. |
 | `K32_CMD:SD` | microSD mount state, capacity, and files under `/sd/kube32`. See [storage](storage.md). |
 | `K32_CMD:KEY:<text>` | Queue keystrokes `\n`, `\b`, `\t`, and characters. |
