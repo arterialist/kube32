@@ -337,6 +337,33 @@ static bool in_psram(const void* p) {
 #endif
 }
 
+// The size of the last allocation a pod was refused, for load errors
+static std::atomic<size_t> s_last_refused{0};
+
+size_t kube32_pool_last_refused(void) { return s_last_refused.load(); }
+
+size_t kube32_pool_chunks(void (*each)(size_t offset, size_t size, int used, void* ctx), void* ctx) {
+    if (!s_block) return 0;
+    std::lock_guard<std::mutex> lock(s_sub_mutex);
+    if (!s_sub_active) return 0;
+    size_t n = 0;
+    for (SubChunk* c = sub_first(); reinterpret_cast<uint8_t*>(c) < sub_end(); c = sub_next(c), ++n) {
+        each(static_cast<size_t>(reinterpret_cast<uint8_t*>(c) - static_cast<uint8_t*>(s_block)), c->size, c->used ? 1 : 0, ctx);
+    }
+    return n;
+}
+
+size_t kube32_pool_largest_free(void) {
+    if (!s_block) return 0;
+    std::lock_guard<std::mutex> lock(s_sub_mutex);
+    if (!s_sub_active) return s_in_use.load() ? s_block_size - align8(s_whole_bytes) : s_block_size;
+    size_t largest = 0;
+    for (SubChunk* c = sub_first(); reinterpret_cast<uint8_t*>(c) < sub_end(); c = sub_next(c)) {
+        if (!c->used && c->size - sizeof(SubChunk) > largest) largest = c->size - sizeof(SubChunk);
+    }
+    return largest;
+}
+
 void* kube32_rt_calloc(size_t bytes) {
 #if defined(ESP_PLATFORM)
     // Keep a small PSRAM reserve for stacks allocated later; everything else
@@ -354,7 +381,9 @@ void* kube32_rt_calloc(size_t bytes) {
         if (shared) return shared;
     }
     void* p = general_calloc(bytes);
-    return p ? p : kube32_pool_sub_alloc(bytes);
+    if (!p) p = kube32_pool_sub_alloc(bytes);
+    if (!p) s_last_refused.store(bytes);
+    return p;
 }
 
 void* kube32_rt_realloc(void* ptr, size_t bytes) {

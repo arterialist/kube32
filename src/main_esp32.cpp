@@ -622,6 +622,14 @@ void console_task(void* arg) {
                 // memory on a board without PSRAM
                 console_heap_histogram(con);
                 con.write("K32_OK heap\n", 12);
+            } else if (line == "K32_CMD:POOL") {
+                // The pod pool's small heap, chunk by chunk: where pods' memory lies
+                kube32_pool_chunks([](size_t off, size_t size, int used, void* ctx) {
+                    char l[64];
+                    int ll = snprintf(l, sizeof(l), "K32_POOL %6u %6u %s\n", (unsigned)off, (unsigned)size, used ? "used" : "free");
+                    static_cast<Console*>(ctx)->write(l, static_cast<size_t>(ll));
+                }, &con);
+                con.write("K32_OK pool\n", 12);
             } else if (line == "K32_CMD:TCP") {
                 // lwIP's TCP connections and the bytes each one holds
                 console_tcp_pcbs(con);

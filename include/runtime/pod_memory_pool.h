@@ -38,6 +38,13 @@ size_t kube32_pool_threshold(void);
 /* Bytes the pool could still hand to pods (0 when one holds it whole, the
  * free part while small pods share it), and whether it is external RAM. */
 size_t kube32_pool_available(int* out_external);
+// The largest free piece of the pool block, and the size of the last
+// allocation a pod was refused (both for load errors)
+size_t kube32_pool_largest_free(void);
+// Calls `each` for every chunk of the block's small heap, in address order
+// (offset from the block, size with header, in use); returns the count
+size_t kube32_pool_chunks(void (*each)(size_t offset, size_t size, int used, void* ctx), void* ctx);
+size_t kube32_pool_last_refused(void);
 /* The block as a heap for small allocations (NULL when a pod holds it whole
  * or nothing fits); zero-filled. kube32_pool_sub_free returns 1 when the
  * pointer was one of these. */

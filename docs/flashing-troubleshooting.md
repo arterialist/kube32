@@ -52,6 +52,7 @@ Profile commands write to the `k32` NVS namespace, return `K32_OK ..., rebooting
 | `K32_CMD:TASKBT:<task name prefix>` | First 48 words of a blocked task's saved stack for `addr2line`. Exact name matches take precedence over prefix matches. |
 | `K32_CMD:BTALL` | Every task's backtrace for `addr2line`. |
 | `K32_CMD:HEAP` | `K32_HEAP used\|free <=<size> <blocks> <bytes>` lines: internal heap blocks grouped by size. |
+| `K32_CMD:POOL` | `K32_POOL <offset> <size> used\|free` lines list the chunks of the pod pool block's small heap in address order. |
 | `K32_CMD:TCP` | One `K32_TCP` line per lwIP TCP connection with its state, local port, peer, and bytes unsent, unacknowledged, unread by the application, or out of order. |
 | `K32_CMD:ACCESSLOG:on` / `off` | Log HTTP requests on the API server and ingress. |
 | `K32_CMD:SD` | microSD mount state, capacity, and files under `/sd/kube32`. See [storage](storage.md). |

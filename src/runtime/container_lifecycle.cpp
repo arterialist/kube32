@@ -309,7 +309,9 @@ bool ContainerLifecycleController::deploy(const uint8_t* wasm_bytes, size_t len)
 #if defined(ESP_PLATFORM)
         status_.exit_message += " (free heap " + std::to_string(heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT)) +
                                 ", largest block " + std::to_string(heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT)) +
-                                ", pod pool " + std::to_string(kube32_pool_available(nullptr)) + ")";
+                                ", pod pool " + std::to_string(kube32_pool_available(nullptr)) +
+                                " in pieces of at most " + std::to_string(kube32_pool_largest_free()) +
+                                ", refused " + std::to_string(kube32_pool_last_refused()) + " bytes)";
 #endif
         cleanup_runtime();
         return false;
