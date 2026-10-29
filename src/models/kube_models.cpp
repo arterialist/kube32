@@ -7,6 +7,8 @@
 #endif
 
 #include <cctype>
+#include <cmath>
+#include <cstdint>
 #include <cstdlib>
 #include <sstream>
 #include <iomanip>
@@ -16,17 +18,63 @@
 namespace kube32::models {
 
 uint64_t parse_quantity(const std::string& val) {
-    if (val.empty()) return 0;
-    size_t idx = 0;
-    while (idx < val.size() && (std::isdigit(static_cast<unsigned char>(val[idx])) || val[idx] == '.')) idx++;
-    if (idx == 0) return 0;
+    // <number><suffix> as k8s.io/apimachinery/pkg/api/resource parses it. The
+    // number is digits with an optional fraction (a leading '+' is allowed,
+    // negatives are not resources). Suffixes: binary Ki Mi Gi Ti Pi Ei, decimal
+    // n u m k M G T P E, or an exponent e<int>/E<int>. Like Quantity.Value(),
+    // the result is rounded up to a whole unit, so "500m" of memory is 1
+    // byte. Anything else is not a quantity and yields 0.
+    size_t i = 0;
+    if (i < val.size() && val[i] == '+') ++i;
+    const size_t num_start = i;
+    bool digits = false;
+    while (i < val.size() && std::isdigit(static_cast<unsigned char>(val[i]))) { ++i; digits = true; }
+    if (i < val.size() && val[i] == '.') {
+        ++i;
+        while (i < val.size() && std::isdigit(static_cast<unsigned char>(val[i]))) { ++i; digits = true; }
+    }
+    if (!digits) return 0;
     double num = 0.0;
-    try { num = std::stod(val.substr(0, idx)); } catch (...) { return 0; }
-    std::string unit = val.substr(idx);
-    if (unit == "Ki" || unit == "ki" || unit == "K" || unit == "k") return static_cast<uint64_t>(num * 1024.0);
-    if (unit == "Mi" || unit == "mi" || unit == "M" || unit == "m") return static_cast<uint64_t>(num * 1024.0 * 1024.0);
-    if (unit == "Gi" || unit == "gi" || unit == "G" || unit == "g") return static_cast<uint64_t>(num * 1024.0 * 1024.0 * 1024.0);
-    return static_cast<uint64_t>(num);
+    try { num = std::stod(val.substr(num_start, i - num_start)); } catch (...) { return 0; }
+    const std::string unit = val.substr(i);
+    double scale = 1.0;
+    if (unit.empty()) scale = 1.0;
+    else if (unit == "Ki") scale = 1024.0;
+    else if (unit == "Mi") scale = 1024.0 * 1024.0;
+    else if (unit == "Gi") scale = 1024.0 * 1024.0 * 1024.0;
+    else if (unit == "Ti") scale = 1024.0 * 1024.0 * 1024.0 * 1024.0;
+    else if (unit == "Pi") scale = 1024.0 * 1024.0 * 1024.0 * 1024.0 * 1024.0;
+    else if (unit == "Ei") scale = 1024.0 * 1024.0 * 1024.0 * 1024.0 * 1024.0 * 1024.0;
+    else if (unit == "n") scale = 1e-9;
+    else if (unit == "u") scale = 1e-6;
+    else if (unit == "m") scale = 1e-3;
+    else if (unit == "k") scale = 1e3;
+    else if (unit == "M") scale = 1e6;
+    else if (unit == "G") scale = 1e9;
+    else if (unit == "T") scale = 1e12;
+    else if (unit == "P") scale = 1e15;
+    else if (unit == "E") scale = 1e18;
+    else if ((unit[0] == 'e' || unit[0] == 'E') && unit.size() > 1) {
+        size_t j = 1;
+        bool neg = false;
+        if (unit[j] == '+' || unit[j] == '-') { neg = (unit[j] == '-'); ++j; }
+        if (j >= unit.size() || j + 3 < unit.size()) return 0;
+        int exp = 0;
+        for (; j < unit.size(); ++j) {
+            if (!std::isdigit(static_cast<unsigned char>(unit[j]))) return 0;
+            exp = exp * 10 + (unit[j] - '0');
+        }
+        scale = std::pow(10.0, neg ? -exp : exp);
+    } else {
+        return 0;
+    }
+    const double v = num * scale;
+    if (v >= 1.8e19) return UINT64_MAX;
+    // Round up, but let a product that lands a hair above an integer through
+    // floating point (1.1 * 1000) stay that integer.
+    const double whole = std::floor(v);
+    if (v - whole < 1e-9 * (whole > 1.0 ? whole : 1.0)) return static_cast<uint64_t>(whole);
+    return static_cast<uint64_t>(whole) + 1;
 }
 
 // =============================================================================
@@ -594,14 +642,24 @@ KubeNode parse_node_manifest(const std::string& json_str) {
 
         const JsonValue* ninfo = status->get("nodeInfo");
         if (ninfo && ninfo->is_object()) {
-            node.version = ninfo->get_string("kubeletVersion", "v1.33.0-kube32");
-            node.os_image = ninfo->get_string("osImage", "ESP-IDF v5.2");
-            node.kernel_version = ninfo->get_string("kernelVersion", "FreeRTOS-v10.4");
-            node.container_runtime = ninfo->get_string("containerRuntimeVersion", "kube32-runtime://0.1.0");
+            node.version = ninfo->get_string("kubeletVersion", "");
+            node.os_image = ninfo->get_string("osImage", "");
+            node.kernel_version = ninfo->get_string("kernelVersion", "");
+            node.container_runtime = ninfo->get_string("containerRuntimeVersion", "");
         }
     }
 
     return node;
+}
+
+bool has_owner(const JsonValue& obj, const std::string& kind, const std::string& uid) {
+    const JsonValue* meta = obj.get("metadata");
+    const JsonValue* refs = meta ? meta->get("ownerReferences") : nullptr;
+    if (!refs || !refs->is_array()) return false;
+    for (const auto& r : refs->arr_val) {
+        if (r.get_string("kind", "") == kind && (uid.empty() || r.get_string("uid", "") == uid)) return true;
+    }
+    return false;
 }
 
 KubePod parse_pod_manifest(const std::string& json_str) {
@@ -639,6 +697,7 @@ KubePod parse_pod_manifest(const std::string& json_str) {
     const JsonValue* spec = doc.get("spec");
     if (spec && spec->is_object()) {
         pod.node_name = spec->get_string("nodeName", "<none>");
+        pod.restart_policy = spec->get_string("restartPolicy", "Always");
         const JsonValue* sel = spec->get("nodeSelector");
         if (sel && sel->is_object()) {
             for (const auto& kv : sel->obj_val) {
@@ -686,7 +745,10 @@ KubePod parse_pod_manifest(const std::string& json_str) {
                     total_lim += parse_quantity(lim->get_string("memory", ""));
                 }
             }
-            if (total_req > 0) pod.memory_request_bytes = total_req;
+            if (total_req > 0) {
+                pod.memory_request_bytes = total_req;
+                pod.memory_request_set = true;
+            }
             pod.memory_limit_bytes = total_lim;
             if (pod.memory_request_bytes == 16 * 1024 && total_req == 0 && total_lim > 0) {
                 pod.memory_request_bytes = total_lim;

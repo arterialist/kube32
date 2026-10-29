@@ -11,6 +11,7 @@
 
 #include "storage/store.hpp"
 #include "osal/mutex.hpp"
+#include "models/kube_models.hpp"
 
 #include <deque>
 #include <map>
@@ -33,6 +34,9 @@ struct EventSpec {
     bool warning{false};        // type: Warning vs Normal
     std::string component;      // "default-scheduler", "kubelet", "node-controller"
     std::string host;           // node name that observed it (source.host)
+    // Fields a client sent that the recorder keeps as they are: action,
+    // related, eventTime, series (an object, or null when there are none)
+    models::JsonValue passthrough;
 };
 
 class EventRecorder {

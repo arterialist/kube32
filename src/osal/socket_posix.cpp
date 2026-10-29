@@ -1,4 +1,6 @@
 #include "osal/socket.hpp"
+#include "osal/tls.hpp"
+#include <cerrno>
 #include <cstring>
 
 #if defined(ESP_PLATFORM)
@@ -27,15 +29,18 @@ Socket::~Socket() {
     close();
 }
 
-Socket::Socket(Socket&& other) noexcept : fd_(other.fd_) {
+Socket::Socket(Socket&& other) noexcept : fd_(other.fd_), tls_(other.tls_) {
     other.fd_ = -1;
+    other.tls_ = nullptr;
 }
 
 Socket& Socket::operator=(Socket&& other) noexcept {
     if (this != &other) {
         close();
         fd_ = other.fd_;
+        tls_ = other.tls_;
         other.fd_ = -1;
+        other.tls_ = nullptr;
     }
     return *this;
 }
@@ -115,6 +120,7 @@ bool Socket::connect(const char* host_or_ip, uint16_t port, uint32_t timeout_ms)
 
 ssize_t Socket::send(const void* buf, size_t len, int flags) {
     if (fd_ < 0 || !buf) return -1;
+    if (tls_) return detail::tls_send(tls_, buf, len);
 #if defined(MSG_NOSIGNAL)
     flags |= MSG_NOSIGNAL;
 #endif
@@ -123,6 +129,7 @@ ssize_t Socket::send(const void* buf, size_t len, int flags) {
 
 ssize_t Socket::recv(void* buf, size_t len, int flags) {
     if (fd_ < 0 || !buf) return -1;
+    if (tls_) return detail::tls_recv(tls_, buf, len);
     return ::recv(fd_, static_cast<char*>(buf), len, flags);
 }
 
@@ -136,7 +143,7 @@ bool Socket::send_all(const void* buf, size_t len) {
 #else
         int send_flags = 0;
 #endif
-        ssize_t sent = ::send(fd_, ptr, remaining, send_flags);
+        ssize_t sent = tls_ ? detail::tls_send(tls_, ptr, remaining) : ::send(fd_, ptr, remaining, send_flags);
         if (sent <= 0) return false;
         ptr += sent;
         remaining -= static_cast<size_t>(sent);
@@ -202,6 +209,14 @@ bool Socket::set_reuse_addr(bool reuse) {
     return (setsockopt(fd_, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt)) == 0);
 }
 
+uint16_t Socket::local_port() const {
+    if (fd_ < 0) return 0;
+    struct sockaddr_in addr;
+    socklen_t len = sizeof(addr);
+    if (::getsockname(fd_, reinterpret_cast<struct sockaddr*>(&addr), &len) != 0) return 0;
+    return ntohs(addr.sin_port);
+}
+
 bool Socket::set_tcp_nodelay(bool nodelay) {
     if (fd_ < 0) return false;
     int opt = nodelay ? 1 : 0;
@@ -217,10 +232,25 @@ void Socket::shutdown(ShutdownMode mode) {
 }
 
 void Socket::close() {
+    if (tls_) {
+        detail::tls_free(tls_);
+        tls_ = nullptr;
+    }
     if (fd_ >= 0) {
         KUBE32_CLOSE_SOCKET(fd_);
         fd_ = -1;
     }
+}
+
+bool Socket::tls_pending() const {
+    return tls_ && detail::tls_pending(tls_);
+}
+
+bool Socket::tls_accept(TlsServer& server) {
+    if (fd_ < 0 || tls_) return false;
+    tls_ = detail::tls_handshake(server, fd_);
+    if (!tls_) close();
+    return tls_ != nullptr;
 }
 
 bool Socket::init_networking() { return true; }

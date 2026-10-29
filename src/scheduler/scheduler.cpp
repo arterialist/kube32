@@ -7,35 +7,14 @@
 #include <cctype>
 #include <cmath>
 #include <iostream>
+#include <map>
 #include <set>
+#include <cstdlib>
 
 namespace kube32::scheduler {
 
 uint64_t parse_quantity(const std::string& val) {
-    if (val.empty()) return 0;
-
-    size_t idx = 0;
-    while (idx < val.size() && (std::isdigit(static_cast<unsigned char>(val[idx])) || val[idx] == '.')) {
-        idx++;
-    }
-    if (idx == 0) return 0;
-
-    double num = 0.0;
-    try {
-        num = std::stod(val.substr(0, idx));
-    } catch (...) {
-        return 0;
-    }
-
-    std::string unit = val.substr(idx);
-    if (unit == "Ki" || unit == "ki" || unit == "K" || unit == "k") {
-        return static_cast<uint64_t>(num * 1024);
-    } else if (unit == "Mi" || unit == "mi" || unit == "M" || unit == "m") {
-        return static_cast<uint64_t>(num * 1024 * 1024);
-    } else if (unit == "Gi" || unit == "gi" || unit == "G" || unit == "g") {
-        return static_cast<uint64_t>(num * 1024 * 1024 * 1024);
-    }
-    return static_cast<uint64_t>(num);
+    return models::parse_quantity(val);
 }
 
 ResourceSpec extract_pod_resource_requests(const std::string& pod_json) {
@@ -63,6 +42,7 @@ ResourceSpec extract_pod_resource_requests(const std::string& pod_json) {
     uint64_t total_psram = 0;
     uint32_t total_gpio = 0;
     uint32_t total_i2c = 0;
+    uint32_t total_uart = 0;
     uint32_t total_adc = 0;
 
     for (const auto& c : containers->arr_val) {
@@ -105,12 +85,25 @@ ResourceSpec extract_pod_resource_requests(const std::string& pod_json) {
         if (!adc_str.empty()) {
             total_adc += static_cast<uint32_t>(parse_quantity(adc_str));
         }
+
+        // UART: esp.io/uart or esp32.io/uart; a named bus (esp32.io/i2c-bus-N,
+        // esp32.io/uart-N) needs one of the node's buses as well
+        std::string uart_str = req->get_string("esp.io/uart", req->get_string("esp32.io/uart", ""));
+        if (!uart_str.empty()) {
+            total_uart += static_cast<uint32_t>(parse_quantity(uart_str));
+        }
+        for (const auto& kv : req->obj_val) {
+            const std::string& k = kv.first;
+            if (k.rfind("esp32.io/i2c-bus-", 0) == 0 || k.rfind("esp.io/i2c-bus-", 0) == 0) total_i2c += 1;
+            else if (k.rfind("esp32.io/uart-", 0) == 0 || k.rfind("esp.io/uart-", 0) == 0) total_uart += 1;
+        }
     }
 
     spec.memory_bytes = (total_mem > 0) ? total_mem : (16 * 1024);
     spec.psram_bytes = total_psram;
     spec.gpio_pins = total_gpio;
     spec.i2c_buses = total_i2c;
+    spec.uart_ports = total_uart;
     spec.adc_channels = total_adc;
     return spec;
 }
@@ -142,26 +135,52 @@ ResourceSpec extract_node_allocatable(const std::string& node_json) {
         return spec;
     }
 
-    std::string mem_str = alloc->get_string("memory", "240Ki");
-    spec.memory_bytes = parse_quantity(mem_str);
-
-    std::string gpio_str = alloc->get_string("esp.io/gpio", alloc->get_string("esp32.io/gpio", "14"));
-    spec.gpio_pins = static_cast<uint32_t>(parse_quantity(gpio_str));
-
-    std::string i2c_str = alloc->get_string("esp.io/i2c", alloc->get_string("esp32.io/i2c", "2"));
-    spec.i2c_buses = static_cast<uint32_t>(parse_quantity(i2c_str));
-
-    std::string adc_str = alloc->get_string("esp.io/adc", alloc->get_string("esp32.io/adc", "2"));
-    spec.adc_channels = static_cast<uint32_t>(parse_quantity(adc_str));
-
-    std::string psram_str = alloc->get_string("esp.io/psram", alloc->get_string("esp32.io/psram", "3840Ki"));
-    spec.psram_bytes = parse_quantity(psram_str);
+    // A resource the node does not list is a resource it does not have.
+    spec.memory_bytes = parse_quantity(alloc->get_string("memory", ""));
+    spec.gpio_pins = static_cast<uint32_t>(parse_quantity(alloc->get_string("esp.io/gpio", alloc->get_string("esp32.io/gpio", ""))));
+    spec.i2c_buses = static_cast<uint32_t>(parse_quantity(alloc->get_string("esp.io/i2c", alloc->get_string("esp32.io/i2c", ""))));
+    spec.uart_ports = static_cast<uint32_t>(parse_quantity(alloc->get_string("esp.io/uart", alloc->get_string("esp32.io/uart", ""))));
+    spec.adc_channels = static_cast<uint32_t>(parse_quantity(alloc->get_string("esp.io/adc", alloc->get_string("esp32.io/adc", ""))));
+    spec.psram_bytes = parse_quantity(alloc->get_string("esp.io/psram", alloc->get_string("esp32.io/psram", "")));
 
     return spec;
 }
 
+static uint64_t resource_version_of(const models::JsonValue& doc) {
+    const models::JsonValue* meta = doc.get("metadata");
+    std::string rv = meta ? meta->get_string("resourceVersion", "") : "";
+    return rv.empty() ? 0 : std::strtoull(rv.c_str(), nullptr, 10);
+}
+
+static bool container_running(const models::JsonValue* status) {
+    const models::JsonValue* css = status ? status->get("containerStatuses") : nullptr;
+    if (!css || !css->is_array() || css->arr_val.empty()) return false;
+    for (const auto& cs : css->arr_val) {
+        const models::JsonValue* state = cs.get("state");
+        if (!state || !state->get("running")) return false;
+    }
+    return true;
+}
+
+// The node's allocatable figures are measured by its kubelet (free heap,
+// free PSRAM, unclaimed pins), so pods it was already running when it last
+// reported are inside them. What the scheduler still has to subtract are the
+// requests of pods bound to the node that the report cannot include yet:
+// pods its kubelet has not started (Pending), containers waiting to restart,
+// and pods that started after the node's last status write (the store's
+// resourceVersion is one global counter, so a pod written after the node
+// is newer than its report).
 ResourceSpec calculate_node_allocated_resources(storage::Store& store, const std::string& node_name, const std::string& exclude_pod_key) {
     ResourceSpec allocated;
+    uint64_t node_rv = 0;
+    {
+        std::string node_json;
+        models::JsonValue node_doc;
+        std::string err;
+        if (store.get("/registry/nodes/" + node_name, node_json).ok() && models::parse_json(node_json, node_doc, err)) {
+            node_rv = resource_version_of(node_doc);
+        }
+    }
     std::vector<std::string> pod_jsons;
     std::vector<std::string> pod_keys;
     store.list_extended("/registry/pods/", pod_jsons, &pod_keys);
@@ -184,11 +203,14 @@ ResourceSpec calculate_node_allocated_resources(storage::Store& store, const std
         const models::JsonValue* status = doc.get("status");
         std::string phase = status ? status->get_string("phase", "") : "";
         if (phase != "Running" && phase != "Pending") continue;
+        const bool reflected = phase == "Running" && container_running(status) && node_rv > 0 && resource_version_of(doc) < node_rv;
+        if (reflected) continue;
 
         ResourceSpec req = extract_pod_resource_requests(pod_jsons[i]);
         allocated.memory_bytes += req.memory_bytes;
         allocated.gpio_pins += req.gpio_pins;
         allocated.i2c_buses += req.i2c_buses;
+        allocated.uart_ports += req.uart_ports;
         allocated.adc_channels += req.adc_channels;
         allocated.psram_bytes += req.psram_bytes;
     }
@@ -209,25 +231,25 @@ bool NodeSchedulablePredicate::evaluate(const std::string&,
     models::JsonValue doc;
     std::string err;
     if (!models::parse_json(node_json, doc, err) || !doc.is_object()) {
-        failure_reason = "Malformed node JSON";
+        failure_reason = "node(s) could not be read";
         return false;
     }
 
     const models::JsonValue* spec = doc.get("spec");
     if (spec && spec->is_object() && spec->get_bool("unschedulable", false)) {
-        failure_reason = "Node is marked unschedulable";
+        failure_reason = "node(s) were unschedulable";
         return false;
     }
 
     const models::JsonValue* status = doc.get("status");
     if (!status || !status->is_object()) {
-        failure_reason = "Node has no status";
+        failure_reason = "node(s) were not ready";
         return false;
     }
 
     const models::JsonValue* conds = status->get("conditions");
     if (!conds || !conds->is_array()) {
-        failure_reason = "Node has no conditions";
+        failure_reason = "node(s) were not ready";
         return false;
     }
 
@@ -242,7 +264,7 @@ bool NodeSchedulablePredicate::evaluate(const std::string&,
     }
 
     if (!is_ready) {
-        failure_reason = "Node is NotReady";
+        failure_reason = "node(s) were not ready";
         return false;
     }
     return true;
@@ -257,8 +279,7 @@ bool NodeMemoryPredicate::evaluate(const std::string&,
     uint64_t available = (node_allocatable.memory_bytes >= node_allocated.memory_bytes) 
         ? (node_allocatable.memory_bytes - node_allocated.memory_bytes) : 0;
     if (available < pod_req.memory_bytes) {
-        failure_reason = "InsufficientMemory (available: " + std::to_string(available) + 
-                         " bytes, requested: " + std::to_string(pod_req.memory_bytes) + " bytes)";
+        failure_reason = "Insufficient memory";
         return false;
     }
     return true;
@@ -274,7 +295,7 @@ bool NodePSRAMPredicate::evaluate(const std::string&,
     uint64_t available = (node_allocatable.psram_bytes >= node_allocated.psram_bytes)
         ? (node_allocatable.psram_bytes - node_allocated.psram_bytes) : 0;
     if (available < pod_req.psram_bytes) {
-        failure_reason = "InsufficientPSRAM";
+        failure_reason = "Insufficient esp32.io/psram";
         return false;
     }
     return true;
@@ -289,22 +310,28 @@ bool NodePeripheralPredicate::evaluate(const std::string&,
     uint32_t avail_gpio = (node_allocatable.gpio_pins >= node_allocated.gpio_pins)
         ? (node_allocatable.gpio_pins - node_allocated.gpio_pins) : 0;
     if (avail_gpio < pod_req.gpio_pins) {
-        failure_reason = "InsufficientGPIO (available: " + std::to_string(avail_gpio) + 
-                         ", requested: " + std::to_string(pod_req.gpio_pins) + ")";
+        failure_reason = "Insufficient esp32.io/gpio";
         return false;
     }
 
     uint32_t avail_i2c = (node_allocatable.i2c_buses >= node_allocated.i2c_buses)
         ? (node_allocatable.i2c_buses - node_allocated.i2c_buses) : 0;
     if (avail_i2c < pod_req.i2c_buses) {
-        failure_reason = "InsufficientI2C";
+        failure_reason = "Insufficient esp32.io/i2c";
+        return false;
+    }
+
+    uint32_t avail_uart = (node_allocatable.uart_ports >= node_allocated.uart_ports)
+        ? (node_allocatable.uart_ports - node_allocated.uart_ports) : 0;
+    if (avail_uart < pod_req.uart_ports) {
+        failure_reason = "Insufficient esp32.io/uart";
         return false;
     }
 
     uint32_t avail_adc = (node_allocatable.adc_channels >= node_allocated.adc_channels)
         ? (node_allocatable.adc_channels - node_allocated.adc_channels) : 0;
     if (avail_adc < pod_req.adc_channels) {
-        failure_reason = "InsufficientADC";
+        failure_reason = "Insufficient esp32.io/adc";
         return false;
     }
 
@@ -329,7 +356,7 @@ bool NodeSelectorPredicate::evaluate(const std::string& pod_json,
 
     models::JsonValue node_doc;
     if (!models::parse_json(node_json, node_doc, err) || !node_doc.is_object()) {
-        failure_reason = "Node selector check failed (invalid node JSON)";
+        failure_reason = "node(s) could not be read";
         return false;
     }
 
@@ -338,9 +365,12 @@ bool NodeSelectorPredicate::evaluate(const std::string& pod_json,
 
     for (const auto& kv : sel->obj_val) {
         std::string req_val = kv.second.is_string() ? kv.second.str_val : "";
-        std::string node_val = labels ? labels->get_string(kv.first, "") : "";
-        if (node_val != req_val) {
-            failure_reason = "Node label mismatch: " + kv.first + "=" + req_val;
+        // The label must exist: "node-role.kubernetes.io/control-plane: ''"
+        // selects nodes that carry it with an empty value, not every node
+        const bool present = labels && labels->get(kv.first);
+        std::string node_val = present ? labels->get_string(kv.first, "") : "";
+        if (!present || node_val != req_val) {
+            failure_reason = "node(s) didn't match Pod's node affinity/selector";
             return false;
         }
     }
@@ -364,13 +394,16 @@ bool NodeNamePredicate::evaluate(const std::string& pod_json,
     if (node_name_pin.empty() || node_name_pin == "<none>") return true;
 
     models::JsonValue node_doc;
-    if (!models::parse_json(node_json, node_doc, err) || !node_doc.is_object()) return false;
+    if (!models::parse_json(node_json, node_doc, err) || !node_doc.is_object()) {
+        failure_reason = "node(s) could not be read";
+        return false;
+    }
 
     const models::JsonValue* meta = node_doc.get("metadata");
     std::string nname = meta ? meta->get_string("name", "") : "";
 
     if (nname != node_name_pin) {
-        failure_reason = "Node name mismatch (pinned to " + node_name_pin + ")";
+        failure_reason = "node(s) didn't match the requested node name";
         return false;
     }
     return true;
@@ -422,13 +455,15 @@ class SchedulerImpl : public Scheduler {
 public:
     SchedulerImpl(storage::Store& store, SchedulerConfig config)
         : store_(store), config_(config) {
-        // Register default predicates
+        // Default filters, in kube-scheduler's order: node state, placement
+        // (name, selector), then resources. The first one a node fails is
+        // its reason in the FailedScheduling message.
         add_predicate(std::make_shared<NodeSchedulablePredicate>());
+        add_predicate(std::make_shared<NodeNamePredicate>());
+        add_predicate(std::make_shared<NodeSelectorPredicate>());
         add_predicate(std::make_shared<NodeMemoryPredicate>());
         add_predicate(std::make_shared<NodePSRAMPredicate>());
         add_predicate(std::make_shared<NodePeripheralPredicate>());
-        add_predicate(std::make_shared<NodeSelectorPredicate>());
-        add_predicate(std::make_shared<NodeNamePredicate>());
 
         // Register default scorer
         if (config_.strategy == ScoringStrategy::BestFit) {
@@ -575,8 +610,10 @@ public:
             std::string pod_ns = meta ? meta->get_string("namespace", "default") : "default";
 
             const models::JsonValue* labels = meta ? meta->get("labels") : nullptr;
-            bool is_daemon = labels && labels->get_string("kube32.io/daemonset", "") == "true";
-            if (is_daemon) continue;
+            // DaemonSet pods belong to their node; the DaemonSet controller
+            // removes them when the node goes away
+            bool is_daemon = models::has_owner(doc, "DaemonSet") || (labels && labels->get_string("kube32.io/daemonset", "") == "true");
+            if (is_daemon && !assigned_node.empty() && assigned_node != "<none>") continue;
             if (meta && !meta->get_string("deletionTimestamp", "").empty()) continue; // being torn down
 
             // Only consider a node "missing" if it was deleted from /registry/nodes/
@@ -630,13 +667,14 @@ private:
         };
 
         std::vector<Candidate> qualified;
+        std::map<std::string, size_t> reasons;   // why nodes were filtered out, with counts
 
         for (const auto& n_json : node_jsons) {
             models::JsonValue n_doc;
-            if (!models::parse_json(n_json, n_doc, err) || !n_doc.is_object()) continue;
+            if (!models::parse_json(n_json, n_doc, err) || !n_doc.is_object()) { reasons["node(s) could not be read"]++; continue; }
             const models::JsonValue* meta = n_doc.get("metadata");
             std::string nname = meta ? meta->get_string("name", "") : "";
-            if (nname.empty()) continue;
+            if (nname.empty()) { reasons["node(s) could not be read"]++; continue; }
 
             ResourceSpec node_alloc = extract_node_allocatable(n_json);
             ResourceSpec node_used = calculate_node_allocated_resources(store_, nname, exclude_pod_key);
@@ -646,6 +684,7 @@ private:
             for (const auto& pred : predicates_) {
                 if (!pred->evaluate(in_out_pod_json, n_json, pod_req, node_alloc, node_used, reason)) {
                     passes = false;
+                    reasons[reason.empty() ? std::string(pred->name()) : reason]++;
                     break;
                 }
             }
@@ -674,7 +713,20 @@ private:
         }
 
         if (qualified.empty()) {
-            // Unschedulable
+            // Unschedulable. The message has kube-scheduler's shape: one count
+            // per reason, sorted ("0/2 nodes are available: 1 Insufficient
+            // memory, 1 node(s) didn't match Pod's node affinity/selector.").
+            std::string message;
+            if (node_jsons.empty()) {
+                message = "no nodes available to schedule pods";
+            } else {
+                std::vector<std::string> parts;
+                for (const auto& r : reasons) parts.push_back(std::to_string(r.second) + " " + r.first);
+                std::sort(parts.begin(), parts.end());
+                message = "0/" + std::to_string(node_jsons.size()) + " nodes are available: ";
+                for (size_t k = 0; k < parts.size(); ++k) message += (k ? ", " : "") + parts[k];
+                message += ".";
+            }
             models::JsonValue* spec = pod_doc.get_mut("spec");
             if (spec) spec->set("nodeName", models::JsonValue{models::JsonType::String, false, 0, "", {}, {}});
 
@@ -701,8 +753,7 @@ private:
             cond_item.set("type", models::JsonValue{models::JsonType::String, false, 0, "PodScheduled", {}, {}});
             cond_item.set("status", models::JsonValue{models::JsonType::String, false, 0, "False", {}, {}});
             cond_item.set("reason", models::JsonValue{models::JsonType::String, false, 0, "Unschedulable", {}, {}});
-            cond_item.set("message", models::JsonValue{models::JsonType::String, false, 0, 
-                "0/" + std::to_string(node_jsons.size()) + " nodes are available: insufficient heap memory or peripheral resources", {}, {}});
+            cond_item.set("message", models::JsonValue{models::JsonType::String, false, 0, message, {}, {}});
 
             bool found_sched = false;
             for (auto& c : conds_arr->arr_val) {
@@ -725,13 +776,12 @@ private:
                 ev.involved.namespace_name = pmeta ? pmeta->get_string("namespace", "default") : "default";
                 ev.involved.uid = pmeta ? pmeta->get_string("uid", "") : "";
                 ev.reason = "FailedScheduling";
-                ev.message = "0/" + std::to_string(node_jsons.size()) +
-                             " nodes are available: insufficient heap memory or peripheral resources";
+                ev.message = message;
                 ev.warning = true;
                 ev.component = "default-scheduler";
                 events_.record(ev);
             }
-            return {false, "", "0/" + std::to_string(node_jsons.size()) + " nodes available"};
+            return {false, "", message};
         }
 
         // Sort candidates: highest score first, lexicographical tie-break

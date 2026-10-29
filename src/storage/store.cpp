@@ -1,11 +1,15 @@
 #include "storage/store.hpp"
 #include "storage/radix_tree.hpp"
 #include "storage/littlefs_journal.hpp"
+#include "storage/flash_log.hpp"
+#include "storage/persist_policy.hpp"
 
-#include <mutex>
 #include <mutex>
 #include <algorithm>
 #include <cctype>
+#include <chrono>
+#include <cstdio>
+#include <map>
 
 namespace kube32::storage {
 
@@ -78,11 +82,25 @@ std::string inject_resource_version(const std::string& json, uint64_t version) {
     return out;
 }
 
+// Revisions are reserved on flash in blocks so the counter never goes back
+// after a restart, even though Leases and Events (which also take revisions)
+// are not persisted.
+static constexpr uint64_t kRevisionBlock = 10000;
+
+static uint64_t steady_ms() {
+    return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count());
+}
+
 class RadixStore : public Store {
 public:
     explicit RadixStore(StoreOptions options = {})
         : options_(std::move(options)),
-          journal_(options_.base_path) {}
+          journal_(options_.base_path) {
+        if (options_.enable_flash_persistence && options_.flash_region) {
+            log_ = std::make_unique<FlashLog>(*options_.flash_region, options_.max_value_size_bytes + 1024);
+        }
+    }
 
     Status get(const std::string& key, std::string& out_json) override {
         return get_extended(key, out_json, nullptr);
@@ -111,7 +129,14 @@ public:
             }
 
             if (options_.enable_flash_persistence && !is_key_ephemeral(key)) {
-                journal_.remove_file(key);
+                if (log_) {
+                    deferred_fp_.erase(key);
+                    const size_t rec = journal_record_bytes(key, deleted_val);
+                    durable_bytes_ = durable_bytes_ > rec ? durable_bytes_ - rec : 0;
+                    schedule_flush_locked(key, options_.flush_delay_ms);
+                } else {
+                    journal_.remove_file(key);
+                }
             }
 
             uint64_t new_version = ++current_version_;
@@ -136,6 +161,15 @@ public:
 
     Status persist() override {
         if (!options_.enable_flash_persistence) return Status::Ok();
+        if (log_) {
+            {
+                std::lock_guard<std::recursive_mutex> lock(rw_mutex_);
+                tree_.iterate_all([this](const std::string& key, const std::string&, uint64_t, bool ephemeral) {
+                    if (!ephemeral) schedule_flush_locked(key, 0);
+                });
+            }
+            return flush(true);
+        }
         std::lock_guard<std::recursive_mutex> lock(rw_mutex_);
         Status result = Status::Ok();
         tree_.iterate_all([this, &result](const std::string& key, const std::string& value, 
@@ -154,6 +188,28 @@ public:
         tree_.clear();
 
         if (!options_.enable_flash_persistence) return Status::Ok();
+
+        if (log_) {
+            pending_.clear();
+            deferred_fp_.clear();
+            uint64_t max_rev = 0;
+            bool ok = log_->recover([this](FlashLog::RecordType type, const std::string& key, std::string& value, uint64_t rev) {
+                if (type == FlashLog::RecordType::Put) {
+                    tree_.put(key, value, rev, false, true);
+                } else {
+                    tree_.remove(key);
+                }
+            }, max_rev);
+            if (!ok) return Status::InternalError("flash journal could not be read");
+            durable_bytes_ = 0;
+            tree_.iterate_all([this](const std::string& key, const std::string& value, uint64_t, bool) {
+                if (persist_class(key) == PersistClass::Deferred) deferred_fp_[key] = durable_fingerprint(key, value);
+                durable_bytes_ += journal_record_bytes(key, value);
+            });
+            current_version_ = max_rev + 1;
+            revision_reserved_ = max_rev;
+            return Status::Ok();
+        }
 
         std::vector<std::pair<std::string, std::string>> recovered;
         journal_.scan_and_recover(recovered);
@@ -197,7 +253,8 @@ public:
             // OCC CAS check
             std::string existing_val;
             uint64_t existing_ver = 0;
-            bool exists = tree_.get(key, existing_val, &existing_ver);
+            bool existing_ephemeral = false;
+            bool exists = tree_.get(key, existing_val, &existing_ver, &existing_ephemeral);
 
             if (expected_version > 0) {
                 if (!exists) {
@@ -218,9 +275,23 @@ public:
             uint64_t new_ver = current_version_ + 1;
             const std::string stored = inject_resource_version(json, new_ver);
 
-            // Two-phase atomic write to LittleFS
+            size_t old_record = 0, new_record = 0;
             if (options_.enable_flash_persistence && persist_to_flash) {
-                if (!journal_.atomic_write(key, stored)) {
+                if (log_) {
+                    // A write that would grow the persisted state past the
+                    // journal's capacity is refused here, before anything
+                    // changes; writes that keep or shrink it always pass.
+                    // (Reclamation inside the journal frees space taken by
+                    // old versions, not by live objects, so it cannot help.)
+                    old_record = (exists && !existing_ephemeral) ? journal_record_bytes(key, existing_val) : 0;
+                    new_record = journal_record_bytes(key, stored);
+                    if (new_record > old_record && durable_bytes_ - old_record + new_record > log_->capacity_bytes()) {
+                        return Status::StorageFull("object store is full: " + std::to_string(durable_bytes_) + " of " +
+                                                   std::to_string(log_->capacity_bytes()) + " bytes in use, " +
+                                                   std::to_string(new_record - old_record) + " more needed");
+                    }
+                } else if (!journal_.atomic_write(key, stored)) {
+                    // Two-phase atomic write to the file journal
                     return Status::StorageFull("Failed writing to persistent flash journal");
                 }
             }
@@ -230,6 +301,19 @@ public:
                 return Status::InternalError("Failed inserting key into state store index");
             }
             current_version_ = new_ver;
+
+            if (log_ && options_.enable_flash_persistence && persist_to_flash) {
+                durable_bytes_ = durable_bytes_ - old_record + new_record;
+                uint32_t delay = options_.flush_delay_ms;
+                if (persist_class(key) == PersistClass::Deferred) {
+                    // Heartbeat churn waits; a change that matters does not
+                    const uint64_t fp = durable_fingerprint(key, stored);
+                    auto it = deferred_fp_.find(key);
+                    if (it != deferred_fp_.end() && it->second == fp) delay = options_.deferred_flush_delay_ms;
+                    else deferred_fp_[key] = fp;
+                }
+                schedule_flush_locked(key, delay);
+            }
 
             if (out_version) *out_version = new_ver;
 
@@ -273,6 +357,84 @@ public:
         return current_version_;
     }
 
+    Status flush(bool all) override {
+        if (!log_) return Status::Ok();
+        struct Item { std::string key; bool present; std::string value; uint64_t rev; };
+        std::vector<Item> items;
+        uint64_t mark = 0;
+        {
+            std::lock_guard<std::recursive_mutex> lock(rw_mutex_);
+            const uint64_t now = steady_ms();
+            for (auto it = pending_.begin(); it != pending_.end();) {
+                if (!all && it->second > now) { ++it; continue; }
+                Item item;
+                item.key = it->first;
+                bool ephemeral = false;
+                item.present = tree_.get(item.key, item.value, &item.rev, &ephemeral) && !ephemeral;
+                if (!item.present) item.rev = current_version_;
+                items.push_back(std::move(item));
+                it = pending_.erase(it);
+            }
+            if (current_version_ + kRevisionBlock / 2 > revision_reserved_) mark = current_version_ + kRevisionBlock;
+        }
+        Status result = Status::Ok();
+        bool wrote = false;
+        if (mark) {
+            if (log_->append_revision_mark(mark)) {
+                wrote = true;
+                std::lock_guard<std::recursive_mutex> lock(rw_mutex_);
+                revision_reserved_ = mark;
+            } else {
+                write_errors_++;
+                result = Status::StorageFull("flash journal refused the revision mark");
+            }
+        }
+        for (auto& item : items) {
+            bool ok = true;
+            if (item.present) {
+                const uint64_t fp = value_fingerprint(item.value);
+                if (log_->has_value(item.key, fp)) { unchanged_skipped_++; continue; }
+                ok = log_->append_put(item.key, item.value, item.rev, fp);
+            } else {
+                ok = log_->append_delete(item.key, item.rev);
+            }
+            if (!ok) {
+                write_errors_++;
+                result = Status::StorageFull("flash journal refused " + item.key);
+                std::lock_guard<std::recursive_mutex> lock(rw_mutex_);
+                schedule_flush_locked(item.key, 5000);
+            } else {
+                wrote = true;
+            }
+        }
+        if (wrote && !log_->sync()) {
+            write_errors_++;
+            result = Status::InternalError("flash journal sync failed");
+        }
+        return result;
+    }
+
+    bool persistence_stats(PersistenceStats& out) const override {
+        if (!log_) return false;
+        FlashLogStats ls = log_->stats();
+        out.flash_log = true;
+        out.region_bytes = ls.region_bytes;
+        out.capacity_bytes = log_->capacity_bytes();
+        out.live_bytes = ls.live_bytes;
+        out.live_keys = ls.live_keys;
+        out.used_sectors = ls.used_sectors;
+        out.sector_count = ls.sector_count;
+        out.records_written = ls.records_written;
+        out.bytes_written = ls.bytes_written;
+        out.records_moved = ls.records_moved;
+        out.sectors_erased = ls.sectors_erased;
+        out.unchanged_skipped = unchanged_skipped_;
+        out.write_errors = write_errors_;
+        std::lock_guard<std::recursive_mutex> lock(rw_mutex_);
+        out.pending_keys = pending_.size();
+        return true;
+    }
+
 private:
     struct Watcher {
         uint32_t id;
@@ -284,15 +446,31 @@ private:
     mutable std::recursive_mutex rw_mutex_;
     RadixTree tree_;
     LittleFSJournal journal_;
+    std::unique_ptr<FlashLog> log_;
+    std::map<std::string, uint64_t> pending_;       // key -> time its change is due on flash
+    std::map<std::string, uint64_t> deferred_fp_;   // Deferred keys: durable fingerprint last scheduled
+    uint64_t revision_reserved_{0};
+    size_t durable_bytes_{0};   // journal bytes the durable keys take once flushed
+    uint64_t unchanged_skipped_{0};
+    uint64_t write_errors_{0};
     uint64_t current_version_{0};
     uint32_t next_watch_id_{0};
     std::vector<Watcher> watchers_;
 
+    // Bytes a put record of this key and value takes in the journal
+    static size_t journal_record_bytes(const std::string& key, const std::string& value) {
+        return (24 + key.size() + value.size() + 3) & ~static_cast<size_t>(3);
+    }
+
     static bool is_key_ephemeral(const std::string& key) {
-        return key.find("/registry/leases/") != std::string::npos || 
-               key.find("/registry/events/") != std::string::npos ||
-               key.find("/heartbeat") != std::string::npos ||
-               key.find("/telemetry") != std::string::npos;
+        return persist_class(key) == PersistClass::Ephemeral;
+    }
+
+    void schedule_flush_locked(const std::string& key, uint32_t delay_ms) {
+        const uint64_t due = steady_ms() + delay_ms;
+        auto it = pending_.find(key);
+        if (it == pending_.end()) pending_.emplace(key, due);
+        else if (due < it->second) it->second = due;
     }
 
     static uint64_t extract_resource_version(const std::string& json) {

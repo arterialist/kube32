@@ -12,6 +12,9 @@
 
 namespace kube32::osal {
 
+class TlsServer;
+namespace detail { struct TlsSession; }
+
 enum class SocketType {
     Tcp,
     Udp
@@ -58,13 +61,25 @@ public:
     bool set_timeout(uint32_t recv_timeout_ms, uint32_t send_timeout_ms);
     bool set_reuse_addr(bool reuse);
     bool set_tcp_nodelay(bool nodelay);
+    // Port the socket is bound to (0 when unknown)
+    uint16_t local_port() const;
 
     void shutdown(ShutdownMode mode);
     void close();
 
+    // Server side of a TLS handshake on this connected socket (osal/tls.hpp):
+    // afterwards send, recv and close go through the session. On failure
+    // the socket is closed.
+    bool tls_accept(TlsServer& server);
+    bool is_tls() const { return tls_ != nullptr; }
+    // TLS data already read from the descriptor and not yet handed out: the
+    // descriptor may not turn readable for it.
+    bool tls_pending() const;
+
     bool is_valid() const { return fd_ >= 0; }
     int native_handle() const { return fd_; }
-    // Gives up ownership of the descriptor without closing it.
+    // Gives up ownership of the descriptor without closing it (plain
+    // sockets only: a TLS session cannot outlive its Socket).
     int release() { int fd = fd_; fd_ = -1; return fd; }
 
     // Platform networking initialization
@@ -73,6 +88,7 @@ public:
 
 private:
     int fd_{-1};
+    detail::TlsSession* tls_{nullptr};
 };
 
 } // namespace kube32::osal

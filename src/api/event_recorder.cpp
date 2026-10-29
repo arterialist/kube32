@@ -132,6 +132,9 @@ std::string EventRecorder::record(const EventSpec& spec) {
     doc.set("type", jstr(spec.warning ? "Warning" : "Normal"));
     doc.set("reportingComponent", jstr(spec.component));
     if (!spec.host.empty()) doc.set("reportingInstance", jstr(spec.host));
+    if (spec.passthrough.is_object()) {
+        for (const auto& kv : spec.passthrough.obj_val) doc.set(kv.first, kv.second);
+    }
 
     std::string json = doc.to_string();
     store_.put_extended(key, json, true, false);
@@ -158,6 +161,10 @@ bool EventRecorder::admit(const std::string& event_json, std::string& out_stored
     const models::JsonValue* src = doc.get("source");
     spec.component = doc.get_string("reportingComponent", src ? src->get_string("component", "") : "");
     spec.host = doc.get_string("reportingInstance", src ? src->get_string("host", "") : "");
+    spec.passthrough.type = models::JsonType::Object;
+    for (const char* field : {"action", "related", "eventTime", "series"}) {
+        if (const models::JsonValue* v = doc.get(field)) spec.passthrough.set(field, *v);
+    }
     std::string ns = meta ? meta->get_string("namespace", "") : "";
     if (ns.empty()) ns = spec.involved.namespace_name;
     if (!ns.empty()) spec.involved.namespace_name = ns;
@@ -175,6 +182,8 @@ std::string EventRecorder::to_events_v1(const std::string& core_json) {
     out.set("apiVersion", jstr("events.k8s.io/v1"));
     if (const auto* m = doc.get("metadata")) out.set("metadata", *m);
     if (const auto* inv = doc.get("involvedObject")) out.set("regarding", *inv);
+    if (const auto* rel = doc.get("related")) out.set("related", *rel);
+    if (!doc.get_string("action", "").empty()) out.set("action", jstr(doc.get_string("action", "")));
     out.set("reason", jstr(doc.get_string("reason", "")));
     out.set("note", jstr(doc.get_string("message", "")));
     out.set("type", jstr(doc.get_string("type", "Normal")));
@@ -183,7 +192,8 @@ std::string EventRecorder::to_events_v1(const std::string& core_json) {
     std::string first = doc.get_string("firstTimestamp", "");
     std::string last = doc.get_string("lastTimestamp", "");
     int64_t count = doc.get_int("count", 1);
-    if (!first.empty()) out.set("eventTime", jstr(first));
+    const std::string event_time = doc.get_string("eventTime", first);
+    if (!event_time.empty()) out.set("eventTime", jstr(event_time));
     if (count > 1) {
         models::JsonValue series;
         series.type = models::JsonType::Object;

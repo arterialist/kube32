@@ -1,5 +1,6 @@
 #pragma once
 
+#include "api/http_types.hpp"
 #include "osal/socket.hpp"
 #include "osal/thread.hpp"
 
@@ -67,7 +68,7 @@ public:
     bool send_headers(const char* content_type = "application/json", int status_code = 200) {
         if (has_error_) return false;
         char header_buf[256];
-        const char* status_text = (status_code == 200) ? "OK" : ((status_code == 201) ? "Created" : "Status");
+        const char* status_text = http_reason_phrase(status_code);
         int len = snprintf(header_buf, sizeof(header_buf),
                            "HTTP/1.1 %d %s\r\n"
                            "Content-Type: %s\r\n"

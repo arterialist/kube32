@@ -71,6 +71,19 @@ enum class RouteCategory {
     MetricsNodeItem,
     MetricsPods,
     MetricsPodItem,
+    DiscoveryApisNetworkingGroup,
+    DiscoveryApisNetworkingV1,
+    IngressesCollection,
+    IngressItem,
+    // Computed from Services and their pods on every read (read-only)
+    EndpointsCollection,
+    EndpointsItem,
+    DiscoveryApisDiscoveryGroup,
+    DiscoveryApisDiscoveryV1,
+    EndpointSlicesCollection,
+    EndpointSliceItem,
+    // /healthz, /livez, /readyz
+    Health,
     NotFound
 };
 
@@ -99,7 +112,13 @@ public:
     ~RouteHandler() = default;
 
     void set_scheduler(scheduler::Scheduler* scheduler) { scheduler_ = scheduler; }
-    void set_lease_callback(std::function<void(const std::string&)> cb) { on_lease_renewed_ = std::move(cb); }
+    // Bearer token every request must present (Authorization: Bearer <token>),
+    // except /healthz, /livez, /readyz and /version. Empty: authentication off.
+    // Set before the server starts serving.
+    void set_bearer_token(std::string token) { bearer_token_ = std::move(token); }
+    bool authentication_enabled() const { return !bearer_token_.empty(); }
+    // The request carries the bearer token (always true with authentication off)
+    bool authenticated(const HttpRequest& req) const;
     // Streams (?watch=true, pod log follow) are handed to this hub; without one
     // the endpoints answer 501.
     void set_watch_hub(WatchHub* hub) { watch_hub_ = hub; }
@@ -124,15 +143,21 @@ public:
                                     std::string_view kind = "");
 
 private:
+    // Every handler reads and writes through this view of the store: under
+    // ?dryRun=All its writes are validated and dropped (see route_handler.cpp).
+    std::unique_ptr<storage::Store> dry_run_view_;
     storage::Store& store_;
     scheduler::Scheduler* scheduler_{nullptr};
-    std::function<void(const std::string&)> on_lease_renewed_;
+    std::string bearer_token_;
     WatchHub* watch_hub_{nullptr};
     EventRecorder events_;
     MetricsRegistry metrics_;
 
     std::string openapi_v3_document(const std::string& path) const;
-    bool strict_fields_ok(RouteCategory category, const std::string& body, std::string& out_unknown) const;
+    bool strict_fields_ok(RouteCategory category, std::string_view api_group, const std::string& body, std::string& out_unknown) const;
+    HttpResponse dispatch(const HttpRequest& req, const RouteMatch& match, mem::MonotonicArena& arena, osal::Socket* client_sock);
+    HttpResponse handle_endpoints(const HttpRequest& req, const RouteMatch& match);
+    bool workload_template_ok(RouteCategory category, const std::string& body, std::string& out_why) const;
     void seed_namespaces();
     // Shared helpers
     std::string list_json(const ResourceInfo& info, const std::vector<std::string>& jsons) const;
@@ -150,9 +175,6 @@ private:
     HttpResponse handle_pods(const HttpRequest& req, const RouteMatch& match, mem::MonotonicArena& arena, osal::Socket* client_sock = nullptr);
     HttpResponse handle_deployments(const HttpRequest& req, const RouteMatch& match, mem::MonotonicArena& arena, osal::Socket* client_sock = nullptr);
     HttpResponse handle_leases(const HttpRequest& req, const RouteMatch& match, mem::MonotonicArena& arena, osal::Socket* client_sock = nullptr);
-    HttpResponse handle_services(const HttpRequest& req, const RouteMatch& match, mem::MonotonicArena& arena);
-    HttpResponse handle_daemonsets(const HttpRequest& req, const RouteMatch& match, mem::MonotonicArena& arena);
-    HttpResponse handle_jobs(const HttpRequest& req, const RouteMatch& match, mem::MonotonicArena& arena);
 };
 
 } // namespace kube32::api

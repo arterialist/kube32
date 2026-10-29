@@ -3,11 +3,17 @@
 #include "api/table_serializer.hpp"
 #include "api/selectors.hpp"
 #include "api/watch_hub.hpp"
+#include "api/version_info.hpp"
 #include "models/kube_models.hpp"
+#include "models/kube_lease.hpp"
 #include "runtime/pod_log.hpp"
+#include "api/protobuf_body.hpp"
 #include "osal/socket.hpp"
 #include "osal/system.hpp"
 
+#include <algorithm>
+#include <cctype>
+#include <cstring>
 #include <sstream>
 
 namespace kube32::api {
@@ -15,13 +21,195 @@ namespace kube32::api {
 static models::JsonValue jstr(const std::string& v) { return models::JsonValue{models::JsonType::String, false, 0, v, {}, {}}; }
 static models::JsonValue jnum(double v) { return models::JsonValue{models::JsonType::Number, false, v, "", {}, {}}; }
 
+namespace {
+
+// Per-request state shared by the handlers of one request on one worker
+// thread: the dry-run switch and the continue token a paginated list sets.
+struct RequestState {
+    bool dry_run{false};
+    std::string continue_token;
+    uint64_t remaining{0};
+};
+thread_local RequestState* t_request = nullptr;
+
+struct RequestScope {
+    RequestState state;
+    RequestState* previous;
+    RequestScope() : previous(t_request) { t_request = &state; }
+    ~RequestScope() { t_request = previous; }
+};
+
+bool dry_run() { return t_request && t_request->dry_run; }
+
+// A store write that did not happen, as kube-apiserver reports it: a full
+// object store is a 500 with the reason, a lost race on create a 409.
+HttpResponse store_failure(const storage::Status& s, const std::string& plural, const std::string& name) {
+    if (s.code == storage::StatusCode::AlreadyExists) {
+        return RouteHandler::make_status(409, "AlreadyExists", plural + " \"" + name + "\" already exists", name, plural);
+    }
+    if (s.code == storage::StatusCode::VersionConflict) {
+        return RouteHandler::make_status(409, "Conflict", "Operation cannot be fulfilled on " + plural + " \"" + name +
+                                         "\": the object has been modified; please apply your changes to the latest version and try again",
+                                         name, plural);
+    }
+    return RouteHandler::make_status(500, "InternalError", s.message.empty() ? "the object store refused the write" : s.message, name, plural);
+}
+
+// Server-owned fields across an update, as kube-apiserver keeps them: uid
+// and creationTimestamp stay, metadata.generation counts spec changes, and
+// a main-resource PUT that leaves out status keeps the stored one.
+void carry_server_fields(const models::JsonValue& old_doc, models::JsonValue& doc, bool keep_status) {
+    const models::JsonValue* om = old_doc.get("metadata");
+    models::JsonValue* nm = doc.get_mut("metadata");
+    if (!nm || !nm->is_object()) {
+        models::JsonValue m;
+        m.type = models::JsonType::Object;
+        doc.set("metadata", std::move(m));
+        nm = doc.get_mut("metadata");
+    }
+    if (om) {
+        if (nm->get_string("uid", "").empty() && !om->get_string("uid", "").empty()) nm->set("uid", jstr(om->get_string("uid", "")));
+        if (nm->get_string("creationTimestamp", "").empty() && !om->get_string("creationTimestamp", "").empty())
+            nm->set("creationTimestamp", jstr(om->get_string("creationTimestamp", "")));
+    }
+    const models::JsonValue* os = old_doc.get("spec");
+    const models::JsonValue* ns = doc.get("spec");
+    if (os || ns) {
+        int64_t gen = om ? om->get_int("generation", 1) : 1;
+        if (gen < 1) gen = 1;
+        if ((os ? os->to_string() : std::string()) != (ns ? ns->to_string() : std::string())) ++gen;
+        nm->set("generation", jnum(static_cast<double>(gen)));
+    }
+    if (keep_status && !doc.get("status")) {
+        if (const models::JsonValue* st = old_doc.get("status")) doc.set("status", *st);
+    }
+}
+bool page_truncated() { return t_request && !t_request->continue_token.empty(); }
+
+// Lists are streamed straight to the socket (no full copy in RAM) on plain
+// connections when the page is complete. A TLS connection is kept alive
+// between requests, so it gets a Content-Length response instead.
+bool stream_list(osal::Socket* sock) { return sock && !sock->is_tls() && !page_truncated(); }
+
+// The store as the handlers see it. With ?dryRun=All a write is checked
+// (existence, resourceVersion preconditions) and then dropped: nothing is
+// stored, no watch event fires, nothing reaches flash.
+class DryRunView : public storage::Store {
+public:
+    explicit DryRunView(storage::Store& real) : real_(real) {}
+    storage::Status get(const std::string& key, std::string& out) override { return real_.get(key, out); }
+    storage::Status put(const std::string& key, const std::string& json, bool overwrite) override {
+        if (dry_run()) return check_put(key, overwrite, 0, nullptr);
+        return real_.put(key, json, overwrite);
+    }
+    storage::Status remove(const std::string& key) override {
+        if (dry_run()) {
+            std::string existing;
+            return real_.get(key, existing).ok() ? storage::Status::Ok() : storage::Status::NotFound();
+        }
+        return real_.remove(key);
+    }
+    storage::Status list(const std::string& prefix, std::vector<std::string>& out) override { return real_.list(prefix, out); }
+    storage::Status persist() override { return real_.persist(); }
+    storage::Status recover() override { return real_.recover(); }
+    storage::Status get_extended(const std::string& key, std::string& out, uint64_t* version) override {
+        return real_.get_extended(key, out, version);
+    }
+    storage::Status put_extended(const std::string& key, const std::string& json, bool overwrite, bool persist_to_flash,
+                                 uint64_t expected_version, uint64_t* out_version) override {
+        if (dry_run()) return check_put(key, overwrite, expected_version, out_version);
+        return real_.put_extended(key, json, overwrite, persist_to_flash, expected_version, out_version);
+    }
+    storage::Status list_extended(const std::string& prefix, std::vector<std::string>& out, std::vector<std::string>* keys) override {
+        return real_.list_extended(prefix, out, keys);
+    }
+    uint32_t watch(const std::string& prefix, storage::WatchCallback cb) override { return real_.watch(prefix, std::move(cb)); }
+    void unwatch(uint32_t id) override { real_.unwatch(id); }
+    uint64_t current_version() const override { return real_.current_version(); }
+    storage::Status flush(bool all) override { return real_.flush(all); }
+    bool persistence_stats(storage::PersistenceStats& out) const override { return real_.persistence_stats(out); }
+
+private:
+    storage::Store& real_;
+    storage::Status check_put(const std::string& key, bool overwrite, uint64_t expected, uint64_t* out_version) {
+        std::string existing;
+        uint64_t version = 0;
+        bool exists = real_.get_extended(key, existing, &version).ok();
+        if (expected && (!exists || version != expected)) return storage::Status::VersionConflict();
+        if (exists && !overwrite) return storage::Status::AlreadyExists();
+        if (out_version) *out_version = real_.current_version() + 1;
+        return storage::Status::Ok();
+    }
+};
+
+// Continue tokens are opaque to clients: base64url (no padding) of
+// {"rv":<list resourceVersion>,"start":"<namespace>/<name>"}. A continued list
+// starts after `start` in the current state of the store.
+const char kB64[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+
+std::string base64url_encode(const std::string& in) {
+    std::string out;
+    size_t i = 0;
+    while (i + 2 < in.size()) {
+        uint32_t v = (static_cast<uint8_t>(in[i]) << 16) | (static_cast<uint8_t>(in[i + 1]) << 8) | static_cast<uint8_t>(in[i + 2]);
+        out += kB64[(v >> 18) & 63]; out += kB64[(v >> 12) & 63]; out += kB64[(v >> 6) & 63]; out += kB64[v & 63];
+        i += 3;
+    }
+    if (i + 1 == in.size()) {
+        uint32_t v = static_cast<uint8_t>(in[i]) << 16;
+        out += kB64[(v >> 18) & 63]; out += kB64[(v >> 12) & 63];
+    } else if (i + 2 == in.size()) {
+        uint32_t v = (static_cast<uint8_t>(in[i]) << 16) | (static_cast<uint8_t>(in[i + 1]) << 8);
+        out += kB64[(v >> 18) & 63]; out += kB64[(v >> 12) & 63]; out += kB64[(v >> 6) & 63];
+    }
+    return out;
+}
+
+bool base64url_decode(const std::string& in, std::string& out) {
+    out.clear();
+    uint32_t acc = 0;
+    int bits = 0;
+    for (char c : in) {
+        if (c == '=') break;
+        const char* p = std::strchr(kB64, c == '+' ? '-' : (c == '/' ? '_' : c));
+        if (!p || !*p) return false;
+        acc = (acc << 6) | static_cast<uint32_t>(p - kB64);
+        bits += 6;
+        if (bits >= 8) {
+            bits -= 8;
+            out += static_cast<char>((acc >> bits) & 0xFF);
+        }
+    }
+    return true;
+}
+
+// Sort key of a listed object: "<namespace>/<name>", the order of the keys
+// under one store prefix.
+std::string list_order_key(const std::string& json) {
+    models::JsonValue doc;
+    std::string err;
+    if (!models::parse_json(json, doc, err) || !doc.is_object()) return std::string();
+    const models::JsonValue* meta = doc.get("metadata");
+    if (!meta) return std::string();
+    return meta->get_string("namespace", "") + "/" + meta->get_string("name", "");
+}
+
+} // namespace
+
 RouteHandler::RouteHandler(storage::Store& store, scheduler::Scheduler* scheduler)
-    : store_(store), scheduler_(scheduler), events_(store, 64), metrics_(30000, 32) {
+    : dry_run_view_(std::make_unique<DryRunView>(store)), store_(*dry_run_view_), scheduler_(scheduler),
+      events_(*dry_run_view_, 64), metrics_(30000, 32) {
     seed_namespaces();
 }
 
 RouteMatch RouteHandler::match_route(std::string_view path) {
     RouteMatch match;
+
+    if (path == "/healthz" || path == "/livez" || path == "/readyz" || path.rfind("/healthz/", 0) == 0 ||
+        path.rfind("/livez/", 0) == 0 || path.rfind("/readyz/", 0) == 0) {
+        match.category = RouteCategory::Health;
+        return match;
+    }
 
     // 1. Discovery Endpoints
     if (path == "/version") {
@@ -156,6 +344,41 @@ RouteMatch RouteHandler::match_route(std::string_view path) {
         return match;
     }
 
+    // Endpoints (core/v1) and EndpointSlices (discovery.k8s.io/v1)
+    if (path == "/api/v1/endpoints") {
+        match.category = RouteCategory::EndpointsCollection;
+        return match;
+    }
+    if (path == "/apis/discovery.k8s.io") {
+        match.category = RouteCategory::DiscoveryApisDiscoveryGroup;
+        return match;
+    }
+    if (path == "/apis/discovery.k8s.io/v1") {
+        match.category = RouteCategory::DiscoveryApisDiscoveryV1;
+        return match;
+    }
+    if (path == "/apis/discovery.k8s.io/v1/endpointslices") {
+        match.category = RouteCategory::EndpointSlicesCollection;
+        match.api_group = "discovery.k8s.io";
+        return match;
+    }
+    static constexpr std::string_view kSlicesNsPrefix = "/apis/discovery.k8s.io/v1/namespaces/";
+    if (path.rfind(kSlicesNsPrefix, 0) == 0) {
+        std::string_view sub = path.substr(kSlicesNsPrefix.size());
+        size_t sl = sub.find('/');
+        if (sl != std::string_view::npos) {
+            match.namespace_name = sub.substr(0, sl);
+            match.api_group = "discovery.k8s.io";
+            std::string_view rest = sub.substr(sl + 1);
+            if (rest == "endpointslices") { match.category = RouteCategory::EndpointSlicesCollection; return match; }
+            if (rest.rfind("endpointslices/", 0) == 0 && rest.size() > 15 && rest.find('/', 15) == std::string_view::npos) {
+                match.category = RouteCategory::EndpointSliceItem;
+                match.resource_name = rest.substr(15);
+                return match;
+            }
+        }
+    }
+
     // 2. Nodes Endpoints: /api/v1/nodes, /api/v1/nodes/{name}, /api/v1/nodes/{name}/status
     if (path == "/api/v1/nodes") {
         match.category = RouteCategory::NodesCollection;
@@ -221,6 +444,13 @@ RouteMatch RouteHandler::match_route(std::string_view path) {
             } else if (rest.rfind("secrets/", 0) == 0) {
                 match.category = RouteCategory::SecretItem;
                 match.resource_name = rest.substr(8);
+                return match;
+            } else if (rest == "endpoints") {
+                match.category = RouteCategory::EndpointsCollection;
+                return match;
+            } else if (rest.rfind("endpoints/", 0) == 0 && rest.size() > 10 && rest.find('/', 10) == std::string_view::npos) {
+                match.category = RouteCategory::EndpointsItem;
+                match.resource_name = rest.substr(10);
                 return match;
             } else if (rest == "services") {
                 match.category = RouteCategory::ServicesNsCollection;
@@ -367,6 +597,37 @@ RouteMatch RouteHandler::match_route(std::string_view path) {
         return match;
     }
 
+    // 7. networking.k8s.io Ingresses
+    if (path == "/apis/networking.k8s.io") {
+        match.category = RouteCategory::DiscoveryApisNetworkingGroup;
+        return match;
+    }
+    if (path == "/apis/networking.k8s.io/v1") {
+        match.category = RouteCategory::DiscoveryApisNetworkingV1;
+        return match;
+    }
+    if (path == "/apis/networking.k8s.io/v1/ingresses") {
+        match.category = RouteCategory::IngressesCollection;
+        match.api_group = "networking.k8s.io";
+        return match;
+    }
+    static constexpr std::string_view kNetNsPrefix = "/apis/networking.k8s.io/v1/namespaces/";
+    if (path.rfind(kNetNsPrefix, 0) == 0) {
+        std::string_view sub = path.substr(kNetNsPrefix.size());
+        size_t sl = sub.find('/');
+        if (sl != std::string_view::npos) {
+            match.namespace_name = sub.substr(0, sl);
+            match.api_group = "networking.k8s.io";
+            std::string_view rest = sub.substr(sl + 1);
+            if (rest == "ingresses") { match.category = RouteCategory::IngressesCollection; return match; }
+            if (rest.rfind("ingresses/", 0) == 0 && rest.find('/', 10) == std::string_view::npos && rest.size() > 10) {
+                match.category = RouteCategory::IngressItem;
+                match.resource_name = rest.substr(10);
+                return match;
+            }
+        }
+    }
+
     match.category = RouteCategory::NotFound;
     return match;
 }
@@ -424,7 +685,97 @@ HttpResponse RouteHandler::make_status(int status_code,
     return resp;
 }
 
+bool RouteHandler::authenticated(const HttpRequest& req) const {
+    if (bearer_token_.empty()) return true;
+    std::string_view h = req.authorization;
+    while (!h.empty() && h.front() == ' ') h.remove_prefix(1);
+    if (h.size() < 7) return false;
+    static const char kScheme[] = "bearer ";
+    for (size_t i = 0; i < 7; ++i) {
+        if (std::tolower(static_cast<unsigned char>(h[i])) != kScheme[i]) return false;
+    }
+    h.remove_prefix(7);
+    while (!h.empty() && (h.front() == ' ' || h.back() == ' ')) {
+        if (h.front() == ' ') h.remove_prefix(1); else h.remove_suffix(1);
+    }
+    // Constant time in the token's length
+    unsigned diff = static_cast<unsigned>(h.size() ^ bearer_token_.size());
+    for (size_t i = 0; i < bearer_token_.size(); ++i) {
+        diff |= static_cast<unsigned>(static_cast<unsigned char>(bearer_token_[i]) ^ (i < h.size() ? static_cast<unsigned char>(h[i]) : 0));
+    }
+    return diff == 0;
+}
+
 HttpResponse RouteHandler::handle_request(const HttpRequest& req, mem::MonotonicArena& arena, osal::Socket* client_sock) {
+    RouteMatch match = match_route(req.path);
+
+    // Probes answer without credentials, as kube-apiserver's do
+    if (match.category == RouteCategory::Health) {
+        HttpResponse resp;
+        resp.status_code = 200;
+        resp.content_type = "text/plain";
+        resp.body = (req.method == HttpMethod::Head) ? "" : "ok";
+        return resp;
+    }
+    if (!authenticated(req) && match.category != RouteCategory::DiscoveryVersion) {
+        return make_status(401, "Unauthorized", "Unauthorized");
+    }
+
+    RequestScope scope;
+    std::string dry;
+    if (query_param(req.query_string, "dryRun", dry)) {
+        if (dry != "All") {
+            return make_status(400, "BadRequest", "dryRun: Unsupported value: \"" + dry + "\": supported values: \"All\"");
+        }
+        scope.state.dry_run = (req.method == HttpMethod::Post || req.method == HttpMethod::Put ||
+                               req.method == HttpMethod::Patch || req.method == HttpMethod::Delete);
+    } else if (req.method == HttpMethod::Delete && !req.body.empty()) {
+        // kubectl delete --dry-run=server sends DeleteOptions {"dryRun":["All"]}
+        models::JsonValue opts;
+        std::string err;
+        if (models::parse_json(req.body, opts, err) && opts.is_object()) {
+            if (const models::JsonValue* d = opts.get("dryRun"); d && d->is_array()) {
+                for (const auto& v : d->arr_val) {
+                    if (!v.is_string() || v.str_val != "All") {
+                        return make_status(400, "BadRequest", "dryRun: Unsupported value: supported values: \"All\"");
+                    }
+                    scope.state.dry_run = true;
+                }
+            }
+        }
+    }
+
+    // Typed clients send ConfigMaps, Secrets and Namespaces as protobuf
+    // (kubectl create configmap|secret|namespace) and do not retry as JSON
+    HttpRequest converted;
+    const HttpRequest* effective = &req;
+    if (!req.body.empty() && req.content_type.rfind("application/vnd.kubernetes.protobuf", 0) == 0) {
+        std::string json, why;
+        if (protobuf_body_to_json(req.body, json, why)) {
+            converted = req;
+            converted.body = std::move(json);
+            converted.content_type = "application/json";
+            effective = &converted;
+        }
+    }
+
+    HttpResponse resp = dispatch(*effective, match, arena, client_sock);
+
+    // A list cut short by ?limit carries the token for the next page
+    if (!scope.state.continue_token.empty() && resp.status_code == 200 && !resp.is_chunked && !resp.socket_taken) {
+        size_t meta = resp.body.find("\"metadata\":{");
+        if (meta != std::string::npos) {
+            size_t at = meta + 12;
+            std::string field = "\"continue\":\"" + scope.state.continue_token + "\",\"remainingItemCount\":" +
+                                std::to_string(scope.state.remaining);
+            if (at < resp.body.size() && resp.body[at] != '}') field += ",";
+            resp.body.insert(at, field);
+        }
+    }
+    return resp;
+}
+
+HttpResponse RouteHandler::dispatch(const HttpRequest& req, const RouteMatch& match, mem::MonotonicArena& arena, osal::Socket* client_sock) {
     // Arena Scratchpad Allocation 1: Normalized URI & Path Tokens
     size_t uri_len = req.raw_uri.empty() ? req.path.size() : req.raw_uri.size();
     char* uri_scratch = static_cast<char*>(arena.allocate(uri_len + 16, 4));
@@ -457,18 +808,33 @@ HttpResponse RouteHandler::handle_request(const HttpRequest& req, mem::Monotonic
         }
     }
 
-    RouteMatch match = match_route(req.path);
-
-    // This server speaks JSON only. Typed kubectl clients may send protobuf
-    // first; 415 makes client-go retry the request as JSON. Access reviews
-    // are the exception: k9s posts them as protobuf on every view and does
-    // not retry, and the answer does not depend on the body (always allowed).
+    // Bodies are JSON; protobuf ones of the kinds handle_request converts
+    // arrive here as JSON already. Access reviews are the exception: k9s posts
+    // them as protobuf on every view and does not retry, and the answer does
+    // not depend on the body (always allowed).
     bool protobuf_body = !req.body.empty() && req.content_type.rfind("application/vnd.kubernetes.protobuf", 0) == 0;
     bool body_free_review = (match.category == RouteCategory::SelfSubjectAccessReviews || match.category == RouteCategory::SelfSubjectRulesReviews);
     if (protobuf_body && !body_free_review) {
-        HttpResponse resp = make_status(415, "UnsupportedMediaType",
-                                        "the body could not be decoded: application/vnd.kubernetes.protobuf is not supported, send application/json");
+        std::string json, why;
+        protobuf_body_to_json(req.body, json, why);
+        HttpResponse resp = make_status(415, "UnsupportedMediaType", "the body could not be decoded: " + why);
         return resp;
+    }
+
+    // Patches are applied as JSON merge patches (strategic merge patches the
+    // same way). Server-side apply needs field ownership tracking and JSON
+    // patch an RFC 6902 engine; both are refused with the media types that
+    // are accepted, as kube-apiserver answers an unknown patch type.
+    if (req.method == HttpMethod::Patch) {
+        const std::string& ct = req.content_type;
+        if (ct.rfind("application/apply-patch", 0) == 0 || ct.rfind("application/json-patch+json", 0) == 0) {
+            const bool apply = ct.rfind("application/apply-patch", 0) == 0;
+            return make_status(415, "UnsupportedMediaType",
+                               std::string(apply ? "server-side apply is not supported, use client-side apply (kubectl apply without --server-side)"
+                                                 : "JSON patch is not supported") +
+                               ": the body of the request was in an unknown format - accepted media types include: "
+                               "application/merge-patch+json, application/strategic-merge-patch+json");
+        }
     }
 
     // fieldValidation=Strict (what kubectl apply/create send by default, see
@@ -478,7 +844,7 @@ HttpResponse RouteHandler::handle_request(const HttpRequest& req, mem::Monotonic
         std::string fv;
         if (query_param(req.query_string, "fieldValidation", fv) && fv == "Strict") {
             std::string unknown;
-            if (!strict_fields_ok(match.category, req.body, unknown)) {
+            if (!strict_fields_ok(match.category, match.api_group, req.body, unknown)) {
                 return make_status(400, "BadRequest", "strict decoding error: unknown field \"" + unknown + "\"");
             }
         }
@@ -506,6 +872,10 @@ HttpResponse RouteHandler::handle_request(const HttpRequest& req, mem::Monotonic
         case RouteCategory::DiscoveryApisCoordinationV1:
         case RouteCategory::DiscoveryApisAuthorizationV1:
         case RouteCategory::DiscoveryApisBatchV1:
+        case RouteCategory::DiscoveryApisNetworkingGroup:
+        case RouteCategory::DiscoveryApisNetworkingV1:
+        case RouteCategory::DiscoveryApisDiscoveryGroup:
+        case RouteCategory::DiscoveryApisDiscoveryV1:
         case RouteCategory::SelfSubjectAccessReviews:
         case RouteCategory::SelfSubjectRulesReviews:
         case RouteCategory::DiscoveryOpenApiV3:
@@ -516,7 +886,11 @@ HttpResponse RouteHandler::handle_request(const HttpRequest& req, mem::Monotonic
         case RouteCategory::ConfigMapsCollection:
         case RouteCategory::ConfigMapItem:
         case RouteCategory::SecretsCollection:
-        case RouteCategory::SecretItem: {
+        case RouteCategory::SecretItem:
+        case RouteCategory::ServicesNsCollection:
+        case RouteCategory::ServiceItem:
+        case RouteCategory::IngressesCollection:
+        case RouteCategory::IngressItem: {
             ResourceInfo info;
             resource_info(match.category, info);
             return handle_generic(req, match, info);
@@ -535,17 +909,21 @@ HttpResponse RouteHandler::handle_request(const HttpRequest& req, mem::Monotonic
         case RouteCategory::MetricsPodItem:
             return handle_metrics(req, match);
 
-        case RouteCategory::ServicesNsCollection:
-        case RouteCategory::ServiceItem:
-            return handle_services(req, match, arena);
-
+        // Stored like any object; the workload controller creates their pods
         case RouteCategory::DaemonSetsNsCollection:
         case RouteCategory::DaemonSetItem:
-            return handle_daemonsets(req, match, arena);
-
         case RouteCategory::JobsNsCollection:
-        case RouteCategory::JobItem:
-            return handle_jobs(req, match, arena);
+        case RouteCategory::JobItem: {
+            ResourceInfo info;
+            resource_info(match.category, info);
+            if ((req.method == HttpMethod::Post || req.method == HttpMethod::Put) && !req.body.empty()) {
+                std::string why;
+                if (!workload_template_ok(match.category, req.body, why)) {
+                    return make_status(422, "Invalid", why);
+                }
+            }
+            return handle_generic(req, match, info);
+        }
 
         case RouteCategory::NodesCollection:
         case RouteCategory::NodeItem:
@@ -567,6 +945,12 @@ HttpResponse RouteHandler::handle_request(const HttpRequest& req, mem::Monotonic
         case RouteCategory::LeasesNsCollection:
         case RouteCategory::LeaseItem:
             return handle_leases(req, match, arena, client_sock);
+
+        case RouteCategory::EndpointsCollection:
+        case RouteCategory::EndpointsItem:
+        case RouteCategory::EndpointSlicesCollection:
+        case RouteCategory::EndpointSliceItem:
+            return handle_endpoints(req, match);
 
         case RouteCategory::NotFound:
         default:
@@ -591,10 +975,7 @@ HttpResponse RouteHandler::handle_discovery(const HttpRequest& req, RouteCategor
 
     switch (category) {
         case RouteCategory::DiscoveryVersion:
-            resp.body = "{\"major\":\"1\",\"minor\":\"33\",\"gitVersion\":\"v1.33.0-kube32\","
-                        "\"gitCommit\":\"esp32-kube32-idf\",\"gitTreeState\":\"clean\","
-                        "\"buildDate\":\"2026-10-26T00:00:00Z\",\"goVersion\":\"go1.22.0\","
-                        "\"compiler\":\"gcc-xtensa\",\"platform\":\"freertos/xtensa-esp32\"}";
+            resp.body = version_json();
             break;
 
         case RouteCategory::DiscoveryApi:
@@ -614,6 +995,10 @@ HttpResponse RouteHandler::handle_discovery(const HttpRequest& req, RouteCategor
                         "\"preferredVersion\":{\"groupVersion\":\"events.k8s.io/v1\",\"version\":\"v1\"}},"
                         "{\"name\":\"coordination.k8s.io\",\"versions\":[{\"groupVersion\":\"coordination.k8s.io/v1\",\"version\":\"v1\"}],"
                         "\"preferredVersion\":{\"groupVersion\":\"coordination.k8s.io/v1\",\"version\":\"v1\"}},"
+                        "{\"name\":\"networking.k8s.io\",\"versions\":[{\"groupVersion\":\"networking.k8s.io/v1\",\"version\":\"v1\"}],"
+                        "\"preferredVersion\":{\"groupVersion\":\"networking.k8s.io/v1\",\"version\":\"v1\"}},"
+                        "{\"name\":\"discovery.k8s.io\",\"versions\":[{\"groupVersion\":\"discovery.k8s.io/v1\",\"version\":\"v1\"}],"
+                        "\"preferredVersion\":{\"groupVersion\":\"discovery.k8s.io/v1\",\"version\":\"v1\"}},"
                         "{\"name\":\"metrics.k8s.io\",\"versions\":[{\"groupVersion\":\"metrics.k8s.io/v1beta1\",\"version\":\"v1beta1\"}],"
                         "\"preferredVersion\":{\"groupVersion\":\"metrics.k8s.io/v1beta1\",\"version\":\"v1beta1\"}}"
                         "]}";
@@ -665,7 +1050,9 @@ HttpResponse RouteHandler::handle_discovery(const HttpRequest& req, RouteCategor
                         "{\"name\":\"configmaps\",\"singularName\":\"configmap\",\"namespaced\":true,\"kind\":\"ConfigMap\","
                         "\"verbs\":[\"get\",\"list\",\"watch\",\"create\",\"update\",\"patch\",\"delete\"],\"shortNames\":[\"cm\"]},"
                         "{\"name\":\"secrets\",\"singularName\":\"secret\",\"namespaced\":true,\"kind\":\"Secret\","
-                        "\"verbs\":[\"get\",\"list\",\"watch\",\"create\",\"update\",\"patch\",\"delete\"]}"
+                        "\"verbs\":[\"get\",\"list\",\"watch\",\"create\",\"update\",\"patch\",\"delete\"]},"
+                        "{\"name\":\"endpoints\",\"singularName\":\"endpoints\",\"namespaced\":true,\"kind\":\"Endpoints\","
+                        "\"verbs\":[\"get\",\"list\"],\"shortNames\":[\"ep\"]}"
                         "]}";
             break;
 
@@ -679,6 +1066,32 @@ HttpResponse RouteHandler::handle_discovery(const HttpRequest& req, RouteCategor
                         "\"verbs\":[\"get\",\"patch\",\"update\"]},"
                         "{\"name\":\"deployments/scale\",\"singularName\":\"deployment\",\"namespaced\":true,\"group\":\"autoscaling\",\"version\":\"v1\",\"kind\":\"Scale\","
                         "\"verbs\":[\"get\",\"patch\",\"update\"]}"
+                        "]}";
+            break;
+
+        case RouteCategory::DiscoveryApisNetworkingGroup:
+            resp.body = "{\"kind\":\"APIGroup\",\"apiVersion\":\"v1\",\"name\":\"networking.k8s.io\","
+                        "\"versions\":[{\"groupVersion\":\"networking.k8s.io/v1\",\"version\":\"v1\"}],"
+                        "\"preferredVersion\":{\"groupVersion\":\"networking.k8s.io/v1\",\"version\":\"v1\"}}";
+            break;
+
+        case RouteCategory::DiscoveryApisNetworkingV1:
+            resp.body = "{\"kind\":\"APIResourceList\",\"apiVersion\":\"v1\",\"groupVersion\":\"networking.k8s.io/v1\",\"resources\":["
+                        "{\"name\":\"ingresses\",\"singularName\":\"ingress\",\"namespaced\":true,\"kind\":\"Ingress\","
+                        "\"verbs\":[\"get\",\"list\",\"watch\",\"create\",\"update\",\"patch\",\"delete\"],\"shortNames\":[\"ing\"]}"
+                        "]}";
+            break;
+
+        case RouteCategory::DiscoveryApisDiscoveryGroup:
+            resp.body = "{\"kind\":\"APIGroup\",\"apiVersion\":\"v1\",\"name\":\"discovery.k8s.io\","
+                        "\"versions\":[{\"groupVersion\":\"discovery.k8s.io/v1\",\"version\":\"v1\"}],"
+                        "\"preferredVersion\":{\"groupVersion\":\"discovery.k8s.io/v1\",\"version\":\"v1\"}}";
+            break;
+
+        case RouteCategory::DiscoveryApisDiscoveryV1:
+            resp.body = "{\"kind\":\"APIResourceList\",\"apiVersion\":\"v1\",\"groupVersion\":\"discovery.k8s.io/v1\",\"resources\":["
+                        "{\"name\":\"endpointslices\",\"singularName\":\"endpointslice\",\"namespaced\":true,\"kind\":\"EndpointSlice\","
+                        "\"verbs\":[\"get\",\"list\"]}"
                         "]}";
             break;
 
@@ -712,7 +1125,11 @@ HttpResponse RouteHandler::handle_discovery(const HttpRequest& req, RouteCategor
 
         case RouteCategory::SelfSubjectAccessReviews:
             resp.status_code = 201;
-            resp.body = "{\"kind\":\"SelfSubjectAccessReview\",\"apiVersion\":\"authorization.k8s.io/v1\",\"status\":{\"allowed\":true,\"reason\":\"Kube32 cluster authorization is open\"}}";
+            // Callers that reach this point are authenticated (or authentication
+            // is off); kube32 has one role, which may do everything
+            resp.body = std::string("{\"kind\":\"SelfSubjectAccessReview\",\"apiVersion\":\"authorization.k8s.io/v1\",\"status\":{\"allowed\":true,\"reason\":\"") +
+                        (bearer_token_.empty() ? "authentication is off: every caller may do everything"
+                                               : "the bearer token grants full access") + "\"}}";
             break;
 
         case RouteCategory::SelfSubjectRulesReviews:
@@ -753,7 +1170,7 @@ HttpResponse RouteHandler::handle_nodes(const HttpRequest& req, const RouteMatch
             HttpResponse sel_err;
             if (!filter_list(req, node_jsons, sel_err)) return sel_err;
             const uint64_t rv = store_.current_version();
-            if (client_sock != nullptr) {
+            if (stream_list(client_sock)) {
                 ChunkedStreamWriter writer(*client_sock);
                 if (req.as_table) {
                     TableSerializer::serialize_nodes_table_from_json(writer, node_jsons, rv);
@@ -805,10 +1222,7 @@ HttpResponse RouteHandler::handle_nodes(const HttpRequest& req, const RouteMatch
             resource_info(RouteCategory::NodesCollection, ninfo);
             stamp_new_object(doc, "", ninfo);
             std::string node_json = doc.to_string();
-            store_.put(key, node_json, false);
-            if (on_lease_renewed_) {
-                on_lease_renewed_(node_name);
-            }
+            if (storage::Status ps = store_.put(key, node_json, false); !ps.ok()) return store_failure(ps, "nodes", node_name);
             {
                 EventSpec ev;
                 ev.involved.kind = "Node";
@@ -853,14 +1267,14 @@ HttpResponse RouteHandler::handle_nodes(const HttpRequest& req, const RouteMatch
         if (!store_.get(key, existing_json).ok()) {
             return make_status(404, "NotFound", "nodes \"" + name + "\" not found", name, "nodes");
         }
-        store_.put(key, req.body, true);
-        if (on_lease_renewed_) {
-            on_lease_renewed_(name);
-        }
+        models::JsonValue old_doc;
+        if (models::parse_json(existing_json, old_doc, err)) carry_server_fields(old_doc, doc, true);
+        const std::string updated = doc.to_string();
+        if (storage::Status ps = store_.put(key, updated, true); !ps.ok()) return store_failure(ps, "nodes", name);
         HttpResponse resp;
         resp.status_code = 200;
         resp.content_type = "application/json";
-        resp.body = req.body;
+        resp.body = updated;
         return resp;
     } else if (req.method == HttpMethod::Patch) {
         if (req.body.empty()) {
@@ -881,10 +1295,7 @@ HttpResponse RouteHandler::handle_nodes(const HttpRequest& req, const RouteMatch
         }
         models::merge_json(target_doc, patch_doc);
         std::string updated_json = target_doc.to_string();
-        store_.put(key, updated_json, true);
-        if (on_lease_renewed_) {
-            on_lease_renewed_(name);
-        }
+        if (storage::Status ps = store_.put(key, updated_json, true); !ps.ok()) return store_failure(ps, "nodes", name);
 
         HttpResponse resp;
         resp.status_code = 200;
@@ -926,6 +1337,23 @@ HttpResponse RouteHandler::handle_nodes(const HttpRequest& req, const RouteMatch
     return make_status(405, "MethodNotAllowed", std::string(http_method_str(req.method)) + " not allowed on " + req.path);
 }
 
+// ?inlineImages=omit (kubelets): the value of each kube32.io/wasm-base64
+// annotation is left empty, so a list stays small on nodes with little RAM;
+// the kubelet reads the module with the pod when it starts it.
+static void omit_inline_images(const HttpRequest& req, std::vector<std::string>& pod_jsons) {
+    std::string v;
+    if (!query_param(req.query_string, "inlineImages", v) || v != "omit") return;
+    static const std::string kKey = "\"kube32.io/wasm-base64\":\"";
+    for (auto& j : pod_jsons) {
+        size_t at = j.find(kKey);
+        if (at == std::string::npos) continue;
+        size_t start = at + kKey.size();
+        size_t end = start;
+        while (end < j.size() && j[end] != '"') end += (j[end] == '\\') ? 2 : 1;
+        if (end < j.size()) j.erase(start, end - start);
+    }
+}
+
 HttpResponse RouteHandler::handle_pods(const HttpRequest& req, const RouteMatch& match, mem::MonotonicArena& arena, osal::Socket* client_sock) {
     if (match.category == RouteCategory::PodsClusterCollection) {
         if (req.method == HttpMethod::Head) {
@@ -941,8 +1369,9 @@ HttpResponse RouteHandler::handle_pods(const HttpRequest& req, const RouteMatch&
             // fieldSelector (kubelets: spec.nodeName=<node>) and labelSelector
             HttpResponse sel_err;
             if (!filter_list(req, pod_jsons, sel_err)) return sel_err;
+            omit_inline_images(req, pod_jsons);
             const uint64_t rv = store_.current_version();
-            if (client_sock != nullptr) {
+            if (stream_list(client_sock)) {
                 ChunkedStreamWriter writer(*client_sock);
                 if (req.as_table) {
                     TableSerializer::serialize_pods_table_from_json(writer, pod_jsons, rv);
@@ -986,8 +1415,9 @@ HttpResponse RouteHandler::handle_pods(const HttpRequest& req, const RouteMatch&
             store_.list("/registry/pods/" + ns + "/", pod_jsons);
             HttpResponse sel_err;
             if (!filter_list(req, pod_jsons, sel_err)) return sel_err;
+            omit_inline_images(req, pod_jsons);
             const uint64_t rv = store_.current_version();
-            if (client_sock != nullptr) {
+            if (stream_list(client_sock)) {
                 ChunkedStreamWriter writer(*client_sock);
                 if (req.as_table) {
                     TableSerializer::serialize_pods_table_from_json(writer, pod_jsons, rv);
@@ -1061,14 +1491,14 @@ HttpResponse RouteHandler::handle_pods(const HttpRequest& req, const RouteMatch&
             std::string pod_json = doc.to_string();
 
             // Run autonomous scheduler if pod does not already have an assigned node
-            if (scheduler_) {
+            if (scheduler_ && !dry_run()) {
                 std::string explicit_node = spec ? spec->get_string("nodeName", "") : "";
                 if (explicit_node.empty() || explicit_node == "<none>") {
                     scheduler_->schedule_pod_manifest(pod_json);
                 }
             }
 
-            store_.put(key, pod_json, false);
+            if (storage::Status ps = store_.put(key, pod_json, false); !ps.ok()) return store_failure(ps, "pods", pod_name);
 
             HttpResponse resp;
             resp.status_code = 201;
@@ -1118,7 +1548,7 @@ HttpResponse RouteHandler::handle_pods(const HttpRequest& req, const RouteMatch&
                 target_doc.set("status", *in_status);
             }
             std::string updated = target_doc.to_string();
-            store_.put(key, updated, true);
+            if (storage::Status ps = store_.put(key, updated, true); !ps.ok()) return store_failure(ps, "pods", name);
             HttpResponse resp;
             resp.status_code = 200;
             resp.content_type = "application/json";
@@ -1126,11 +1556,16 @@ HttpResponse RouteHandler::handle_pods(const HttpRequest& req, const RouteMatch&
             return resp;
         }
 
-        store_.put(key, req.body, true);
+        {
+            models::JsonValue old_doc;
+            if (models::parse_json(existing_json, old_doc, err)) carry_server_fields(old_doc, doc, true);
+        }
+        const std::string updated_pod = doc.to_string();
+        if (storage::Status ps = store_.put(key, updated_pod, true); !ps.ok()) return store_failure(ps, "pods", name);
         HttpResponse resp;
         resp.status_code = 200;
         resp.content_type = "application/json";
-        resp.body = req.body;
+        resp.body = updated_pod;
         return resp;
     } else if (req.method == HttpMethod::Patch) {
         if (req.body.empty()) {
@@ -1153,7 +1588,7 @@ HttpResponse RouteHandler::handle_pods(const HttpRequest& req, const RouteMatch&
         }
         models::merge_json(target_doc, patch_doc);
         std::string updated_json = target_doc.to_string();
-        store_.put(key, updated_json, true);
+        if (storage::Status ps = store_.put(key, updated_json, true); !ps.ok()) return store_failure(ps, "pods", name);
 
         HttpResponse resp;
         resp.status_code = 200;
@@ -1217,7 +1652,7 @@ HttpResponse RouteHandler::handle_pods(const HttpRequest& req, const RouteMatch&
             meta->set("deletionTimestamp", jstr(now));
             meta->set("deletionGracePeriodSeconds", jnum(static_cast<double>(grace)));
             std::string updated = pdoc.to_string();
-            store_.put(key, updated, true);
+            if (storage::Status ps = store_.put(key, updated, true); !ps.ok()) return store_failure(ps, "pods", name);
             HttpResponse resp;
             resp.status_code = 200;
             resp.content_type = "application/json";
@@ -1225,9 +1660,10 @@ HttpResponse RouteHandler::handle_pods(const HttpRequest& req, const RouteMatch&
             return resp;
         }
         store_.remove(key);
-        metrics_.forget_pod(ns, name);
+        if (!dry_run()) metrics_.forget_pod(ns, name);
         // The log mirror stays readable for followers draining the last lines;
-        // the store evicts it by LRU.
+        // the store evicts it by LRU. Its files go with the pod.
+        if (!dry_run()) runtime::PodLogStore::apiserver().remove_persisted(ns + "/" + name);
         return make_status(200, "Success", "pods \"" + name + "\" deleted");
     }
 
@@ -1253,7 +1689,7 @@ HttpResponse RouteHandler::handle_deployments(const HttpRequest& req, const Rout
             HttpResponse sel_err;
             if (!filter_list(req, dep_jsons, sel_err)) return sel_err;
             const uint64_t rv = store_.current_version();
-            if (client_sock != nullptr) {
+            if (stream_list(client_sock)) {
                 ChunkedStreamWriter writer(*client_sock);
                 if (req.as_table) {
                     TableSerializer::serialize_deployments_table_from_json(writer, dep_jsons, rv);
@@ -1322,7 +1758,7 @@ HttpResponse RouteHandler::handle_deployments(const HttpRequest& req, const Rout
             }
 
             std::string dep_json = doc.to_string();
-            store_.put(key, dep_json, false);
+            if (storage::Status ps = store_.put(key, dep_json, false); !ps.ok()) return store_failure(ps, "deployments.apps", dep_name);
 
             HttpResponse resp;
             resp.status_code = 201;
@@ -1382,8 +1818,10 @@ HttpResponse RouteHandler::handle_deployments(const HttpRequest& req, const Rout
                 doc.set("spec", std::move(ns_spec));
                 dspec = doc.get_mut("spec");
             }
+            const models::JsonValue old_doc = doc;
             dspec->set("replicas", jnum(static_cast<double>(replicas)));
-            store_.put(key, doc.to_string(), true);
+            carry_server_fields(old_doc, doc, false);
+            if (storage::Status ps = store_.put(key, doc.to_string(), true); !ps.ok()) return store_failure(ps, "deployments.apps", name);
         }
 
         HttpResponse resp;
@@ -1413,11 +1851,14 @@ HttpResponse RouteHandler::handle_deployments(const HttpRequest& req, const Rout
         if (!store_.get(key, existing_json).ok()) {
             return make_status(404, "NotFound", "deployments.apps \"" + name + "\" not found", name, "deployments");
         }
-        store_.put(key, req.body, true);
+        models::JsonValue old_doc;
+        if (models::parse_json(existing_json, old_doc, err)) carry_server_fields(old_doc, doc, true);
+        const std::string updated = doc.to_string();
+        if (storage::Status ps = store_.put(key, updated, true); !ps.ok()) return store_failure(ps, "deployments.apps", name);
         HttpResponse resp;
         resp.status_code = 200;
         resp.content_type = "application/json";
-        resp.body = req.body;
+        resp.body = updated;
         return resp;
     } else if (req.method == HttpMethod::Patch) {
         if (req.body.empty()) {
@@ -1436,9 +1877,11 @@ HttpResponse RouteHandler::handle_deployments(const HttpRequest& req, const Rout
         if (!models::parse_json(existing_json, target_doc, err)) {
             return make_status(500, "InternalError", "Failed to parse existing resource");
         }
+        const models::JsonValue old_doc = target_doc;
         models::merge_json(target_doc, patch_doc);
+        if (match.category != RouteCategory::DeploymentStatus) carry_server_fields(old_doc, target_doc, false);
         std::string updated_json = target_doc.to_string();
-        store_.put(key, updated_json, true);
+        if (storage::Status ps = store_.put(key, updated_json, true); !ps.ok()) return store_failure(ps, "deployments.apps", name);
 
         HttpResponse resp;
         resp.status_code = 200;
@@ -1481,6 +1924,15 @@ HttpResponse RouteHandler::handle_deployments(const HttpRequest& req, const Rout
     return make_status(405, "MethodNotAllowed", std::string(http_method_str(req.method)) + " not allowed on " + req.path);
 }
 
+// A kubelet without a wall clock renews its lease without renewTime; the
+// control plane stamps the renewal on arrival when its own clock is set.
+static void fill_renew_time(models::JsonValue& lease) {
+    models::JsonValue* spec = lease.get_mut("spec");
+    if (!spec || !spec->is_object() || !spec->get_string("renewTime", "").empty()) return;
+    std::string now = models::now_micro_time();
+    if (!now.empty()) spec->set("renewTime", jstr(now));
+}
+
 HttpResponse RouteHandler::handle_leases(const HttpRequest& req, const RouteMatch& match, mem::MonotonicArena& arena, osal::Socket* client_sock) {
     (void)arena;
     (void)client_sock;
@@ -1518,12 +1970,10 @@ HttpResponse RouteHandler::handle_leases(const HttpRequest& req, const RouteMatc
             ResourceInfo linfo;
             resource_info(RouteCategory::LeasesNsCollection, linfo);
             stamp_new_object(doc, ns, linfo);
+            fill_renew_time(doc);
             std::string lease_json = doc.to_string();
             store_.put(key, lease_json, true);
 
-            if (on_lease_renewed_) {
-                on_lease_renewed_(lease_name);
-            }
 
             HttpResponse resp;
             resp.status_code = 201;
@@ -1574,11 +2024,9 @@ HttpResponse RouteHandler::handle_leases(const HttpRequest& req, const RouteMatc
                 }
             }
             stamp_new_object(doc, ns, linfo);
+            fill_renew_time(doc);
             std::string lease_json = doc.to_string();
             store_.put(key, lease_json, true);
-            if (on_lease_renewed_) {
-                on_lease_renewed_(name);
-            }
             HttpResponse resp;
             resp.status_code = 200;
             resp.content_type = "application/json";
@@ -1589,27 +2037,21 @@ HttpResponse RouteHandler::handle_leases(const HttpRequest& req, const RouteMatc
                 return make_status(400, "BadRequest", "Empty body");
             }
             std::string existing_json;
-            storage::Status s = store_.get(key, existing_json);
-            std::string final_json = req.body;
-            if (s.ok()) {
-                models::JsonValue orig_doc, patch_doc;
-                std::string err;
-                if (models::parse_json(existing_json, orig_doc, err) && orig_doc.is_object() &&
-                    models::parse_json(req.body, patch_doc, err) && patch_doc.is_object()) {
-                    const models::JsonValue* patch_spec = patch_doc.get("spec");
-                    models::JsonValue* orig_spec = orig_doc.get_mut("spec");
-                    if (patch_spec && orig_spec) {
-                        for (const auto& kv : patch_spec->obj_val) {
-                            orig_spec->set(kv.first, kv.second);
-                        }
-                        final_json = orig_doc.to_string();
-                    }
-                }
+            if (!store_.get(key, existing_json).ok()) {
+                return make_status(404, "NotFound", "leases.coordination.k8s.io \"" + name + "\" not found", name, "leases");
             }
+            models::JsonValue orig_doc, patch_doc;
+            std::string err;
+            if (!models::parse_json(req.body, patch_doc, err) || !patch_doc.is_object()) {
+                return make_status(400, "BadRequest", "Failed to parse JSON: " + err);
+            }
+            if (!models::parse_json(existing_json, orig_doc, err) || !orig_doc.is_object()) {
+                return make_status(500, "InternalError", "Failed to parse existing resource");
+            }
+            models::merge_json(orig_doc, patch_doc);
+            fill_renew_time(orig_doc);
+            std::string final_json = orig_doc.to_string();
             store_.put(key, final_json, true);
-            if (on_lease_renewed_) {
-                on_lease_renewed_(name);
-            }
             HttpResponse resp;
             resp.status_code = 200;
             resp.content_type = "application/json";
@@ -1625,241 +2067,6 @@ HttpResponse RouteHandler::handle_leases(const HttpRequest& req, const RouteMatc
 
     return make_status(404, "NotFound", "Not found");
 }
-
-HttpResponse RouteHandler::handle_services(const HttpRequest& req, const RouteMatch& match, mem::MonotonicArena& arena) {
-    (void)arena;
-    const bool cluster_wide = match.namespace_name.empty() && match.category == RouteCategory::ServicesNsCollection;
-    std::string ns = match.namespace_name.empty() ? "default" : std::string(match.namespace_name);
-    ResourceInfo sinfo;
-    resource_info(RouteCategory::ServicesNsCollection, sinfo);
-    if (match.category == RouteCategory::ServicesNsCollection) {
-        if (req.method == HttpMethod::Post) {
-            models::JsonValue doc;
-            std::string err;
-            if (!models::parse_json(req.body, doc, err) || !doc.is_object()) {
-                return make_status(400, "BadRequest", "Invalid JSON: " + err);
-            }
-            const models::JsonValue* meta = doc.get("metadata");
-            std::string name = meta ? meta->get_string("name", "") : "";
-            if (name.empty()) return make_status(400, "BadRequest", "Missing metadata.name");
-            std::string key = "/registry/services/" + ns + "/" + name;
-            stamp_new_object(doc, ns, sinfo);
-            std::string svc_json = doc.to_string();
-            store_.put(key, svc_json, true);
-            HttpResponse resp;
-            resp.status_code = 201;
-            resp.content_type = "application/json";
-            resp.body = svc_json;
-            return resp;
-        } else if (req.method == HttpMethod::Get) {
-            std::vector<std::string> svc_jsons;
-            store_.list(cluster_wide ? std::string("/registry/services/") : "/registry/services/" + ns + "/", svc_jsons);
-            HttpResponse sel_err;
-            if (!filter_list(req, svc_jsons, sel_err)) return sel_err;
-            return list_response(req, sinfo, svc_jsons, list_json(sinfo, svc_jsons), store_.current_version());
-        }
-    } else if (match.category == RouteCategory::ServiceItem) {
-        std::string name = std::string(match.resource_name);
-        std::string key = "/registry/services/" + ns + "/" + name;
-        if (req.method == HttpMethod::Get) {
-            std::string svc_json;
-            if (!store_.get(key, svc_json).ok()) {
-                return make_status(404, "NotFound", "service \"" + name + "\" not found", name, "Service");
-            }
-            HttpResponse resp;
-            resp.status_code = 200;
-            resp.content_type = "application/json";
-            resp.body = svc_json;
-            return resp;
-        } else if (req.method == HttpMethod::Delete) {
-            store_.remove(key);
-            return make_status(200, "Success", "service \"" + name + "\" deleted", name, "Service");
-        }
-    }
-    return make_status(405, "MethodNotAllowed", "Method not allowed on service endpoint");
-}
-
-HttpResponse RouteHandler::handle_daemonsets(const HttpRequest& req, const RouteMatch& match, mem::MonotonicArena& arena) {
-    (void)arena;
-    std::string ns = match.namespace_name.empty() ? "default" : std::string(match.namespace_name);
-    if (match.category == RouteCategory::DaemonSetsNsCollection) {
-        if (req.method == HttpMethod::Post) {
-            models::JsonValue doc;
-            std::string err;
-            if (!models::parse_json(req.body, doc, err) || !doc.is_object()) {
-                return make_status(400, "BadRequest", "Invalid JSON: " + err);
-            }
-            const models::JsonValue* meta = doc.get("metadata");
-            std::string name = meta ? meta->get_string("name", "") : "";
-            if (name.empty()) return make_status(400, "BadRequest", "Missing metadata.name");
-            std::string key = "/registry/daemonsets/" + ns + "/" + name;
-            store_.put(key, req.body, true);
-
-            const models::JsonValue* spec = doc.get("spec");
-            const models::JsonValue* tmpl = spec ? spec->get("template") : nullptr;
-            if (tmpl && tmpl->is_object()) {
-                std::vector<std::string> node_jsons;
-                store_.list("/registry/nodes/", node_jsons);
-                for (const auto& nj : node_jsons) {
-                    models::JsonValue ndoc;
-                    if (models::parse_json(nj, ndoc, err) && ndoc.is_object()) {
-                        std::string nname = ndoc.get("metadata")->get_string("name", "");
-                        if (!nname.empty()) {
-                            std::string pod_name = name + "-" + (nname.find("02") != std::string::npos ? "02" : "01");
-                            models::JsonValue pod_doc;
-                            pod_doc.type = models::JsonType::Object;
-                            pod_doc.set("apiVersion", models::JsonValue{models::JsonType::String, false, 0, "v1", {}, {}});
-                            pod_doc.set("kind", models::JsonValue{models::JsonType::String, false, 0, "Pod", {}, {}});
-                            models::JsonValue pmeta;
-                            pmeta.type = models::JsonType::Object;
-                            pmeta.set("name", models::JsonValue{models::JsonType::String, false, 0, pod_name, {}, {}});
-                            pmeta.set("namespace", models::JsonValue{models::JsonType::String, false, 0, ns, {}, {}});
-                            models::JsonValue plabels;
-                            plabels.type = models::JsonType::Object;
-                            plabels.set("kube32.io/daemonset", models::JsonValue{models::JsonType::String, false, 0, "true", {}, {}});
-                            pmeta.set("labels", std::move(plabels));
-                            pod_doc.set("metadata", std::move(pmeta));
-
-                            models::JsonValue pspec = tmpl->get("spec") ? *tmpl->get("spec") : models::JsonValue{};
-                            if (pspec.type != models::JsonType::Object) pspec.type = models::JsonType::Object;
-                            pspec.set("nodeName", models::JsonValue{models::JsonType::String, false, 0, nname, {}, {}});
-                            pod_doc.set("spec", std::move(pspec));
-
-                            models::JsonValue pstat;
-                            pstat.type = models::JsonType::Object;
-                            pstat.set("phase", models::JsonValue{models::JsonType::String, false, 0, "Running", {}, {}});
-                            pstat.set("podIP", models::JsonValue{models::JsonType::String, false, 0, (nname.find("02") != std::string::npos ? "192.168.4.2" : "192.168.4.1"), {}, {}});
-                            pod_doc.set("status", std::move(pstat));
-
-                            store_.put("/registry/pods/" + ns + "/" + pod_name, pod_doc.to_string(), true);
-                        }
-                    }
-                }
-            }
-
-            HttpResponse resp;
-            resp.status_code = 201;
-            resp.content_type = "application/json";
-            resp.body = req.body;
-            return resp;
-        } else if (req.method == HttpMethod::Get) {
-            std::vector<std::string> ds_jsons;
-            const bool cluster_wide = match.namespace_name.empty();
-            store_.list(cluster_wide ? std::string("/registry/daemonsets/") : "/registry/daemonsets/" + ns + "/", ds_jsons);
-            HttpResponse sel_err;
-            if (!filter_list(req, ds_jsons, sel_err)) return sel_err;
-            ResourceInfo dsinfo;
-            resource_info(RouteCategory::DaemonSetsNsCollection, dsinfo);
-            HttpResponse resp;
-            resp.status_code = 200;
-            resp.content_type = "application/json";
-            resp.body = list_json(dsinfo, ds_jsons);
-            return resp;
-        }
-    } else if (match.category == RouteCategory::DaemonSetItem) {
-        std::string name = std::string(match.resource_name);
-        std::string key = "/registry/daemonsets/" + ns + "/" + name;
-        if (req.method == HttpMethod::Get) {
-            std::string ds_json;
-            if (!store_.get(key, ds_json).ok()) {
-                return make_status(404, "NotFound", "daemonset \"" + name + "\" not found", name, "DaemonSet");
-            }
-            HttpResponse resp;
-            resp.status_code = 200;
-            resp.content_type = "application/json";
-            resp.body = ds_json;
-            return resp;
-        } else if (req.method == HttpMethod::Delete) {
-            store_.remove(key);
-            return make_status(200, "Success", "daemonset \"" + name + "\" deleted", name, "DaemonSet");
-        }
-    }
-    return make_status(405, "MethodNotAllowed", "Method not allowed on daemonset endpoint");
-}
-
-HttpResponse RouteHandler::handle_jobs(const HttpRequest& req, const RouteMatch& match, mem::MonotonicArena& arena) {
-    (void)arena;
-    std::string ns = match.namespace_name.empty() ? "default" : std::string(match.namespace_name);
-    if (match.category == RouteCategory::JobsNsCollection) {
-        if (req.method == HttpMethod::Post) {
-            models::JsonValue doc;
-            std::string err;
-            if (!models::parse_json(req.body, doc, err) || !doc.is_object()) {
-                return make_status(400, "BadRequest", "Invalid JSON: " + err);
-            }
-            const models::JsonValue* meta = doc.get("metadata");
-            std::string name = meta ? meta->get_string("name", "") : "";
-            if (name.empty()) return make_status(400, "BadRequest", "Missing metadata.name");
-            std::string key = "/registry/jobs/" + ns + "/" + name;
-            store_.put(key, req.body, true);
-
-            const models::JsonValue* spec = doc.get("spec");
-            const models::JsonValue* tmpl = spec ? spec->get("template") : nullptr;
-            if (tmpl && tmpl->is_object()) {
-                models::JsonValue pod_doc;
-                pod_doc.type = models::JsonType::Object;
-                pod_doc.set("apiVersion", models::JsonValue{models::JsonType::String, false, 0, "v1", {}, {}});
-                pod_doc.set("kind", models::JsonValue{models::JsonType::String, false, 0, "Pod", {}, {}});
-                models::JsonValue pmeta;
-                pmeta.type = models::JsonType::Object;
-                pmeta.set("name", models::JsonValue{models::JsonType::String, false, 0, name, {}, {}});
-                pmeta.set("namespace", models::JsonValue{models::JsonType::String, false, 0, ns, {}, {}});
-                pod_doc.set("metadata", std::move(pmeta));
-
-                models::JsonValue pspec = tmpl->get("spec") ? *tmpl->get("spec") : models::JsonValue{};
-                if (pspec.type != models::JsonType::Object) pspec.type = models::JsonType::Object;
-                pspec.set("nodeName", models::JsonValue{models::JsonType::String, false, 0, "esp32-node-01", {}, {}});
-                pod_doc.set("spec", std::move(pspec));
-
-                models::JsonValue pstat;
-                pstat.type = models::JsonType::Object;
-                pstat.set("phase", models::JsonValue{models::JsonType::String, false, 0, "Succeeded", {}, {}});
-                pstat.set("podIP", models::JsonValue{models::JsonType::String, false, 0, "192.168.4.1", {}, {}});
-                pod_doc.set("status", std::move(pstat));
-
-                store_.put("/registry/pods/" + ns + "/" + name, pod_doc.to_string(), true);
-            }
-
-            HttpResponse resp;
-            resp.status_code = 201;
-            resp.content_type = "application/json";
-            resp.body = req.body;
-            return resp;
-        } else if (req.method == HttpMethod::Get) {
-            std::vector<std::string> job_jsons;
-            const bool cluster_wide = match.namespace_name.empty();
-            store_.list(cluster_wide ? std::string("/registry/jobs/") : "/registry/jobs/" + ns + "/", job_jsons);
-            HttpResponse sel_err;
-            if (!filter_list(req, job_jsons, sel_err)) return sel_err;
-            ResourceInfo jinfo;
-            resource_info(RouteCategory::JobsNsCollection, jinfo);
-            HttpResponse resp;
-            resp.status_code = 200;
-            resp.content_type = "application/json";
-            resp.body = list_json(jinfo, job_jsons);
-            return resp;
-        }
-    } else if (match.category == RouteCategory::JobItem) {
-        std::string name = std::string(match.resource_name);
-        std::string key = "/registry/jobs/" + ns + "/" + name;
-        if (req.method == HttpMethod::Get) {
-            std::string job_json;
-            if (!store_.get(key, job_json).ok()) {
-                return make_status(404, "NotFound", "job \"" + name + "\" not found", name, "Job");
-            }
-            HttpResponse resp;
-            resp.status_code = 200;
-            resp.content_type = "application/json";
-            resp.body = job_json;
-            return resp;
-        } else if (req.method == HttpMethod::Delete) {
-            store_.remove(key);
-            return make_status(200, "Success", "job \"" + name + "\" deleted", name, "Job");
-        }
-    }
-    return make_status(405, "MethodNotAllowed", "Method not allowed on job endpoint");
-}
-
 
 // List response honouring Accept: as=Table for kinds with a server-side table.
 static HttpResponse list_response(const HttpRequest& req, const ResourceInfo& info, const std::vector<std::string>& jsons,
@@ -1906,6 +2113,8 @@ bool RouteHandler::resource_info(RouteCategory c, ResourceInfo& out) {
             out = {"ConfigMap", "v1", "ConfigMapList", "configmaps", "/registry/configmaps/", true}; return true;
         case RouteCategory::SecretsCollection: case RouteCategory::SecretItem:
             out = {"Secret", "v1", "SecretList", "secrets", "/registry/secrets/", true}; return true;
+        case RouteCategory::IngressesCollection: case RouteCategory::IngressItem:
+            out = {"Ingress", "networking.k8s.io/v1", "IngressList", "ingresses", "/registry/ingresses/", true}; return true;
         default:
             return false;
     }
@@ -1930,6 +2139,7 @@ std::string RouteHandler::openapi_v3_document(const std::string& path) const {
         {"apis/apps/v1", "apps", "v1", "DaemonSet", "daemonsets", true},
         {"apis/batch/v1", "batch", "v1", "Job", "jobs", true},
         {"apis/coordination.k8s.io/v1", "coordination.k8s.io", "v1", "Lease", "leases", true},
+        {"apis/networking.k8s.io/v1", "networking.k8s.io", "v1", "Ingress", "ingresses", true},
     };
     if (path == "/openapi/v3") {
         std::string out = "{\"paths\":{";
@@ -1961,7 +2171,7 @@ std::string RouteHandler::openapi_v3_document(const std::string& path) const {
     return out;
 }
 
-bool RouteHandler::strict_fields_ok(RouteCategory category, const std::string& body, std::string& out_unknown) const {
+bool RouteHandler::strict_fields_ok(RouteCategory category, std::string_view api_group, const std::string& body, std::string& out_unknown) const {
     ResourceInfo info;
     if (!resource_info(category, info)) return true;   // not a stored kind: nothing to check here
     models::JsonValue doc;
@@ -1973,6 +2183,9 @@ bool RouteHandler::strict_fields_ok(RouteCategory category, const std::string& b
     static const char* const kSecret[] = {"data", "stringData", "type", "immutable"};
     static const char* const kEvent[] = {"involvedObject", "reason", "message", "source", "firstTimestamp", "lastTimestamp", "count",
                                          "type", "eventTime", "series", "action", "related", "reportingComponent", "reportingInstance"};
+    static const char* const kEventV1[] = {"regarding", "related", "note", "reason", "type", "action", "reportingController",
+                                           "reportingInstance", "eventTime", "series", "deprecatedSource",
+                                           "deprecatedFirstTimestamp", "deprecatedLastTimestamp", "deprecatedCount"};
     static const char* const kLease[] = {"spec"};
     static const char* const kMeta[] = {"name", "generateName", "namespace", "uid", "resourceVersion", "generation", "creationTimestamp",
                                         "deletionTimestamp", "deletionGracePeriodSeconds", "labels", "annotations", "ownerReferences",
@@ -1988,6 +2201,7 @@ bool RouteHandler::strict_fields_ok(RouteCategory category, const std::string& b
         if (!ok) {
             if (kind == "ConfigMap") ok = in(key, kConfigMap, 3);
             else if (kind == "Secret") ok = in(key, kSecret, 4);
+            else if (kind == "Event" && api_group == "events.k8s.io") ok = in(key, kEventV1, sizeof(kEventV1) / sizeof(kEventV1[0]));
             else if (kind == "Event") ok = in(key, kEvent, sizeof(kEvent) / sizeof(kEvent[0]));
             else if (kind == "Lease") ok = in(key, kLease, 1);
             else ok = in(key, kSpecStatus, 2);
@@ -2058,6 +2272,44 @@ bool RouteHandler::filter_list(const HttpRequest& req, std::vector<std::string>&
         return false;
     }
     filter_jsons(sel, jsons);
+
+    // limit / continue
+    uint64_t limit = 0;
+    query_uint(req.query_string, "limit", limit);
+    std::string cont;
+    query_param(req.query_string, "continue", cont);
+    if (cont.empty() && (limit == 0 || jsons.size() <= limit)) return true;
+    std::string start;
+    if (!cont.empty()) {
+        std::string raw;
+        models::JsonValue tok;
+        std::string terr;
+        if (!base64url_decode(cont, raw) || !models::parse_json(raw, tok, terr) || !tok.is_object() || !tok.get("start")) {
+            err_out = make_status(400, "BadRequest", "continue key is not valid");
+            return false;
+        }
+        start = tok.get_string("start", "");
+    }
+    std::vector<std::pair<std::string, size_t>> order;
+    order.reserve(jsons.size());
+    for (size_t i = 0; i < jsons.size(); ++i) order.emplace_back(list_order_key(jsons[i]), i);
+    std::sort(order.begin(), order.end());
+    std::vector<std::string> page;
+    size_t taken = 0, after = 0;
+    std::string last;
+    for (const auto& o : order) {
+        if (!start.empty() && o.first <= start) continue;
+        if (limit > 0 && taken >= limit) { ++after; continue; }
+        page.push_back(std::move(jsons[o.second]));
+        last = o.first;
+        ++taken;
+    }
+    jsons.swap(page);
+    if (after > 0 && t_request) {
+        std::string raw = "{\"rv\":" + std::to_string(store_.current_version()) + ",\"start\":\"" + escape_json(last) + "\"}";
+        t_request->continue_token = base64url_encode(raw);
+        t_request->remaining = after;
+    }
     return true;
 }
 
@@ -2073,6 +2325,7 @@ void RouteHandler::stamp_new_object(models::JsonValue& doc, const std::string& n
     }
     if (info.namespaced && !ns.empty()) meta->set("namespace", jstr(ns));
     if (meta->get_string("uid", "").empty()) meta->set("uid", jstr(models::generate_uid()));
+    if (doc.get("spec") && meta->get_int("generation", 0) < 1) meta->set("generation", jnum(1));
     if (meta->get_string("creationTimestamp", "").empty()) {
         std::string now = models::now_rfc3339();
         if (!now.empty()) meta->set("creationTimestamp", jstr(now));
@@ -2150,12 +2403,69 @@ HttpResponse RouteHandler::handle_watch(const HttpRequest& req, const RouteMatch
 }
 
 // =============================================================================
-// Generic store-backed resources: namespaces, configmaps, secrets
+// Generic store-backed resources: namespaces, configmaps, secrets, services,
+// ingresses, daemonsets, jobs
 // =============================================================================
+// Pod templates of Jobs need restartPolicy Never or OnFailure, those of
+// DaemonSets Always (or none), as kube-apiserver validates them.
+bool RouteHandler::workload_template_ok(RouteCategory category, const std::string& body, std::string& out_why) const {
+    models::JsonValue doc;
+    std::string err;
+    if (!models::parse_json(body, doc, err) || !doc.is_object()) return true;   // handle_generic reports the parse error
+    const models::JsonValue* meta = doc.get("metadata");
+    const std::string name = meta ? meta->get_string("name", "") : "";
+    const models::JsonValue* spec = doc.get("spec");
+    const models::JsonValue* tmpl = spec ? spec->get("template") : nullptr;
+    const models::JsonValue* tspec = tmpl ? tmpl->get("spec") : nullptr;
+    const std::string policy = tspec ? tspec->get_string("restartPolicy", "") : "";
+    const bool job = (category == RouteCategory::JobsNsCollection || category == RouteCategory::JobItem);
+    if (job && policy != "Never" && policy != "OnFailure") {
+        out_why = "Job.batch \"" + name + "\" is invalid: spec.template.spec.restartPolicy: " +
+                  (policy.empty() ? std::string("Required value") : "Unsupported value: \"" + policy + "\"") +
+                  ": supported values: \"OnFailure\", \"Never\"";
+        return false;
+    }
+    if (!job && !policy.empty() && policy != "Always") {
+        out_why = "DaemonSet.apps \"" + name + "\" is invalid: spec.template.spec.restartPolicy: Unsupported value: \"" + policy +
+                  "\": supported values: \"Always\"";
+        return false;
+    }
+    return true;
+}
+
+// Service defaults kube-apiserver applies: type ClusterIP, sessionAffinity
+// None, single-stack IPv4, and per port protocol TCP and targetPort = port.
+// kube32 assigns no cluster IPs: clients reach pods through Ingress.
+static void default_service(models::JsonValue& svc) {
+    models::JsonValue* spec = svc.get_mut("spec");
+    if (!spec || !spec->is_object()) return;
+    if (spec->get_string("type", "").empty()) spec->set("type", jstr("ClusterIP"));
+    if (spec->get_string("sessionAffinity", "").empty()) spec->set("sessionAffinity", jstr("None"));
+    if (spec->get_string("internalTrafficPolicy", "").empty()) spec->set("internalTrafficPolicy", jstr("Cluster"));
+    if (spec->get_string("ipFamilyPolicy", "").empty()) spec->set("ipFamilyPolicy", jstr("SingleStack"));
+    if (!spec->get("ipFamilies")) {
+        models::JsonValue fam;
+        fam.type = models::JsonType::Array;
+        fam.arr_val.push_back(jstr("IPv4"));
+        spec->set("ipFamilies", std::move(fam));
+    }
+    if (models::JsonValue* ports = spec->get_mut("ports"); ports && ports->is_array()) {
+        for (auto& p : ports->arr_val) {
+            if (!p.is_object()) continue;
+            if (p.get_string("protocol", "").empty()) p.set("protocol", jstr("TCP"));
+            if (!p.get("targetPort") && p.get("port")) p.set("targetPort", *p.get("port"));
+        }
+    }
+}
+
 HttpResponse RouteHandler::handle_generic(const HttpRequest& req, const RouteMatch& match, const ResourceInfo& info) {
     const bool is_item = (match.category == RouteCategory::NamespaceItem ||
                           match.category == RouteCategory::ConfigMapItem ||
-                          match.category == RouteCategory::SecretItem);
+                          match.category == RouteCategory::SecretItem ||
+                          match.category == RouteCategory::DaemonSetItem ||
+                          match.category == RouteCategory::JobItem ||
+                          match.category == RouteCategory::ServiceItem ||
+                          match.category == RouteCategory::IngressItem);
     std::string ns(match.namespace_name);
     std::string root = info.root;
     std::string prefix = root;
@@ -2189,6 +2499,7 @@ HttpResponse RouteHandler::handle_generic(const HttpRequest& req, const RouteMat
                 return make_status(409, "AlreadyExists", plural + " \"" + name + "\" already exists", name, plural);
             }
             stamp_new_object(doc, ns, info);
+            if (match.category == RouteCategory::ServicesNsCollection) default_service(doc);
             if (match.category == RouteCategory::NamespacesCollection && !doc.get("status")) {
                 models::JsonValue st;
                 st.type = models::JsonType::Object;
@@ -2197,7 +2508,7 @@ HttpResponse RouteHandler::handle_generic(const HttpRequest& req, const RouteMat
             }
             std::string json = doc.to_string();
             storage::Status ps = store_.put(key, json, false);
-            if (!ps.ok()) return make_status(500, "InternalError", ps.message);
+            if (!ps.ok()) return store_failure(ps, plural, name);
             HttpResponse resp;
             resp.status_code = 201;
             resp.content_type = "application/json";
@@ -2214,6 +2525,10 @@ HttpResponse RouteHandler::handle_generic(const HttpRequest& req, const RouteMat
 
     if (req.method == HttpMethod::Get || req.method == HttpMethod::Head) {
         if (!exists) return make_status(404, "NotFound", plural + " \"" + name + "\" not found", name, plural);
+        if (req.as_table && TableSerializer::has_generic_table(info.kind)) {
+            // kubectl get <kind> <name> prints the same columns as a list
+            return list_response(req, info, {existing}, std::string(), store_.current_version());
+        }
         HttpResponse resp;
         resp.status_code = 200;
         resp.content_type = "application/json";
@@ -2235,22 +2550,17 @@ HttpResponse RouteHandler::handle_generic(const HttpRequest& req, const RouteMat
         if (!exists) return make_status(404, "NotFound", plural + " \"" + name + "\" not found", name, plural);
         models::JsonValue target;
         if (!models::parse_json(existing, target, err)) return make_status(500, "InternalError", "Failed to parse existing resource");
+        const models::JsonValue old_doc = target;
         if (req.method == HttpMethod::Patch) {
             models::merge_json(target, in);
+            carry_server_fields(old_doc, target, false);
         } else {
-            // Identity fields are server-owned: carry them over when the client omits them
-            const models::JsonValue* old_meta = target.get("metadata");
-            std::string uid = old_meta ? old_meta->get_string("uid", "") : "";
-            std::string created = old_meta ? old_meta->get_string("creationTimestamp", "") : "";
             target = std::move(in);
-            models::JsonValue* nm = target.get_mut("metadata");
-            if (nm && nm->is_object()) {
-                if (nm->get_string("uid", "").empty() && !uid.empty()) nm->set("uid", jstr(uid));
-                if (nm->get_string("creationTimestamp", "").empty() && !created.empty()) nm->set("creationTimestamp", jstr(created));
-            }
+            carry_server_fields(old_doc, target, true);
         }
+        if (match.category == RouteCategory::ServiceItem) default_service(target);
         std::string updated = target.to_string();
-        store_.put(key, updated, true);
+        if (storage::Status ps = store_.put(key, updated, true); !ps.ok()) return store_failure(ps, plural, name);
         HttpResponse resp;
         resp.status_code = 200;
         resp.content_type = "application/json";
@@ -2263,6 +2573,8 @@ HttpResponse RouteHandler::handle_generic(const HttpRequest& req, const RouteMat
 // =============================================================================
 // Events: core/v1 storage with an events.k8s.io/v1 projection
 // =============================================================================
+// events.k8s.io/v1 -> core/v1, field for field (see EventRecorder::to_events_v1
+// for the way back).
 static std::string events_v1_to_core(const models::JsonValue& in) {
     models::JsonValue out;
     out.type = models::JsonType::Object;
@@ -2270,11 +2582,35 @@ static std::string events_v1_to_core(const models::JsonValue& in) {
     out.set("apiVersion", jstr("v1"));
     if (const auto* m = in.get("metadata")) out.set("metadata", *m);
     if (const auto* r = in.get("regarding")) out.set("involvedObject", *r);
+    if (const auto* r = in.get("related")) out.set("related", *r);
     out.set("reason", jstr(in.get_string("reason", "")));
     out.set("message", jstr(in.get_string("note", "")));
     out.set("type", jstr(in.get_string("type", "Normal")));
+    if (!in.get_string("action", "").empty()) out.set("action", jstr(in.get_string("action", "")));
     out.set("reportingComponent", jstr(in.get_string("reportingController", "")));
     out.set("reportingInstance", jstr(in.get_string("reportingInstance", "")));
+    const std::string event_time = in.get_string("eventTime", "");
+    if (!event_time.empty()) out.set("eventTime", jstr(event_time));
+    std::string first = in.get_string("deprecatedFirstTimestamp", event_time);
+    std::string last = in.get_string("deprecatedLastTimestamp", "");
+    int64_t count = in.get_int("deprecatedCount", 0);
+    if (const auto* series = in.get("series"); series && series->is_object()) {
+        out.set("series", *series);
+        if (count == 0) count = series->get_int("count", 0);
+        if (last.empty()) last = series->get_string("lastObservedTime", "");
+    }
+    if (!first.empty()) out.set("firstTimestamp", jstr(first));
+    if (last.empty()) last = first;
+    if (!last.empty()) out.set("lastTimestamp", jstr(last));
+    if (count > 0) out.set("count", jnum(static_cast<double>(count)));
+    if (const auto* src = in.get("deprecatedSource")) {
+        out.set("source", *src);
+    } else if (!in.get_string("reportingController", "").empty()) {
+        models::JsonValue src_obj;
+        src_obj.type = models::JsonType::Object;
+        src_obj.set("component", jstr(in.get_string("reportingController", "")));
+        out.set("source", std::move(src_obj));
+    }
     return out.to_string();
 }
 
@@ -2380,7 +2716,21 @@ HttpResponse RouteHandler::handle_pod_log(const HttpRequest& req, const RouteMat
 
     if (req.method == HttpMethod::Post) {
         // Kubelet shipping: one JSON record per line
-        // {"epoch":E,"seq":S,"t":<unix ms or 0>,"u":<uptime ms>,"m":"text"}
+        // {"epoch":E,"seq":S,"t":<unix ms or 0>,"u":<uptime ms>,"r":<container instance>,"m":"text"}
+        // Lines are kept per pod object (metadata.uid), so a pod recreated
+        // under the same name starts with an empty log.
+        std::string pod_uid, container_name;
+        {
+            models::JsonValue pd;
+            std::string perr;
+            if (models::parse_json(pod_json, pd, perr)) {
+                const models::JsonValue* meta = pd.get("metadata");
+                if (meta) pod_uid = meta->get_string("uid", "");
+                const models::JsonValue* spec = pd.get("spec");
+                const models::JsonValue* cs = spec ? spec->get("containers") : nullptr;
+                if (cs && cs->is_array() && !cs->arr_val.empty()) container_name = cs->arr_val[0].get_string("name", "");
+            }
+        }
         size_t accepted = 0, seen = 0;
         std::string_view body = req.body;
         while (!body.empty()) {
@@ -2397,7 +2747,8 @@ HttpResponse RouteHandler::handle_pod_log(const HttpRequest& req, const RouteMat
             r.unix_ms = static_cast<uint64_t>(rec.get_int("t", 0));
             r.uptime_ms = static_cast<uint64_t>(rec.get_int("u", 0));
             r.text = rec.get_string("m", "");
-            if (logs.accept_shipped(pod_key, static_cast<uint64_t>(rec.get_int("epoch", 0)), r)) ++accepted;
+            if (logs.accept_shipped(pod_key, static_cast<uint64_t>(rec.get_int("epoch", 0)), r,
+                                    static_cast<uint32_t>(rec.get_int("r", 0)), pod_uid, container_name)) ++accepted;
         }
         HttpResponse resp;
         resp.status_code = 200;
@@ -2430,9 +2781,36 @@ HttpResponse RouteHandler::handle_pod_log(const HttpRequest& req, const RouteMat
     bool has_tail = query_uint(req.query_string, "tailLines", tail);
     bool has_since = query_uint(req.query_string, "sinceSeconds", since_s);
     bool has_limit = query_uint(req.query_string, "limitBytes", limit_bytes);
+    // ?previous=true: the log of the container instance before the last
+    // restart; it has ended, so it is never followed.
+    const bool previous = query_flag(req.query_string, "previous");
 
+    std::string cname = container;
+    if (cname.empty()) {
+        models::JsonValue pd;
+        std::string perr;
+        if (models::parse_json(pod_json, pd, perr)) {
+            const models::JsonValue* spec = pd.get("spec");
+            const models::JsonValue* cs = spec ? spec->get("containers") : nullptr;
+            if (cs && cs->is_array() && !cs->arr_val.empty()) cname = cs->arr_val[0].get_string("name", "");
+        }
+    }
     std::vector<runtime::PodLogRecord> recs;
-    bool have_ring = logs.tail(pod_key, has_tail ? static_cast<size_t>(tail) : 0, recs);
+    bool have_ring = false;
+    const size_t tail_count = has_tail ? static_cast<size_t>(tail) : 0;
+    if (previous) {
+        // The rotated file when the node keeps logs on disk, else the tail
+        // kept in RAM
+        if (!logs.read_persisted(pod_key, cname, true, tail_count, recs) && !logs.tail_previous(pod_key, tail_count, recs)) {
+            return make_status(400, "BadRequest", "previous terminated container \"" + (cname.empty() ? name : cname) +
+                               "\" in pod \"" + name + "\" not found");
+        }
+        have_ring = true;
+    } else {
+        have_ring = logs.tail(pod_key, tail_count, recs);
+        // Nothing in RAM (the API server restarted): the file, when there is one
+        if (!have_ring) have_ring = logs.read_persisted(pod_key, cname, false, tail_count, recs);
+    }
     if (!have_ring) {
         // Nothing shipped yet: a pod still waiting to start has no log
         models::JsonValue pd;
@@ -2462,7 +2840,7 @@ HttpResponse RouteHandler::handle_pod_log(const HttpRequest& req, const RouteMat
     }
     if (has_limit && body.size() > limit_bytes) body.resize(static_cast<size_t>(limit_bytes));
 
-    if (!follow || req.method == HttpMethod::Head) {
+    if (!follow || previous || req.method == HttpMethod::Head) {
         HttpResponse resp;
         resp.status_code = 200;
         resp.content_type = "text/plain";
@@ -2498,6 +2876,293 @@ HttpResponse RouteHandler::handle_pod_log(const HttpRequest& req, const RouteMat
     resp.socket_taken = true;
     resp.status_code = watch_hub_->add_log_follow(std::move(taken), std::move(spec)) ? 200 : 429;
     return resp;
+}
+
+// =============================================================================
+// Endpoints (core/v1) and EndpointSlices (discovery.k8s.io/v1), computed from
+// Services and their pods on every read: always current, nothing stored.
+// =============================================================================
+namespace {
+
+struct EndpointPod {
+    std::string ns, name, uid, ip, node;
+    std::map<std::string, std::string> labels;
+    std::map<std::string, int64_t> named_ports;
+    bool ready{false};
+    bool terminating{false};
+};
+
+struct ResolvedPort {
+    std::string name;
+    int64_t port{0};
+    std::string protocol;
+    bool operator<(const ResolvedPort& o) const {
+        return name != o.name ? name < o.name : (port != o.port ? port < o.port : protocol < o.protocol);
+    }
+};
+
+bool parse_endpoint_pod(const std::string& json, EndpointPod& out) {
+    models::JsonValue doc;
+    std::string err;
+    if (!models::parse_json(json, doc, err) || !doc.is_object()) return false;
+    const models::JsonValue* meta = doc.get("metadata");
+    const models::JsonValue* spec = doc.get("spec");
+    const models::JsonValue* st = doc.get("status");
+    if (!meta || !st) return false;
+    out.ip = st->get_string("podIP", "");
+    if (out.ip.empty()) return false;
+    out.ns = meta->get_string("namespace", "default");
+    out.name = meta->get_string("name", "");
+    out.uid = meta->get_string("uid", "");
+    out.terminating = !meta->get_string("deletionTimestamp", "").empty();
+    if (const models::JsonValue* l = meta->get("labels"); l && l->is_object()) {
+        for (const auto& kv : l->obj_val) if (kv.second.is_string()) out.labels[kv.first] = kv.second.str_val;
+    }
+    if (spec) {
+        out.node = spec->get_string("nodeName", "");
+        if (const models::JsonValue* cs = spec->get("containers"); cs && cs->is_array()) {
+            for (const auto& c : cs->arr_val) {
+                const models::JsonValue* ports = c.get("ports");
+                if (!ports || !ports->is_array()) continue;
+                for (const auto& p : ports->arr_val) {
+                    std::string n = p.get_string("name", "");
+                    if (!n.empty()) out.named_ports[n] = p.get_int("containerPort", 0);
+                }
+            }
+        }
+    }
+    if (st->get_string("phase", "") == "Running") {
+        if (const models::JsonValue* conds = st->get("conditions"); conds && conds->is_array()) {
+            for (const auto& c : conds->arr_val) {
+                if (c.get_string("type", "") == "Ready") out.ready = c.get_string("status", "") == "True";
+            }
+        }
+    }
+    return true;
+}
+
+models::JsonValue jobject() { models::JsonValue o; o.type = models::JsonType::Object; return o; }
+models::JsonValue jarray() { models::JsonValue a; a.type = models::JsonType::Array; return a; }
+models::JsonValue jboolean(bool v) { return models::JsonValue{models::JsonType::Boolean, v, 0, "", {}, {}}; }
+
+models::JsonValue target_ref(const EndpointPod* p) {
+    models::JsonValue ref = jobject();
+    ref.set("kind", jstr("Pod"));
+    ref.set("namespace", jstr(p->ns));
+    ref.set("name", jstr(p->name));
+    if (!p->uid.empty()) ref.set("uid", jstr(p->uid));
+    return ref;
+}
+
+// One Endpoints object, or the EndpointSlices, of a Service. Pods whose
+// named target ports resolve differently land in separate subsets/slices.
+void build_service_endpoints(const models::JsonValue& svc, const std::vector<EndpointPod>& pods, bool slices,
+                             const std::string& rv, std::vector<std::string>& out) {
+    const models::JsonValue* meta = svc.get("metadata");
+    const models::JsonValue* spec = svc.get("spec");
+    if (!meta || !spec) return;
+    const models::JsonValue* selector = spec->get("selector");
+    if (!selector || !selector->is_object() || selector->obj_val.empty()) return;   // selectorless: managed by the user
+    const std::string ns = meta->get_string("namespace", "default");
+    const std::string name = meta->get_string("name", "");
+
+    std::map<std::vector<ResolvedPort>, std::vector<const EndpointPod*>> groups;
+    for (const auto& pod : pods) {
+        if (pod.ns != ns) continue;
+        bool selected = true;
+        for (const auto& kv : selector->obj_val) {
+            auto it = pod.labels.find(kv.first);
+            if (it == pod.labels.end() || !kv.second.is_string() || it->second != kv.second.str_val) { selected = false; break; }
+        }
+        if (!selected) continue;
+        std::vector<ResolvedPort> ports;
+        if (const models::JsonValue* sp = spec->get("ports"); sp && sp->is_array()) {
+            for (const auto& p : sp->arr_val) {
+                ResolvedPort rp;
+                rp.name = p.get_string("name", "");
+                rp.protocol = p.get_string("protocol", "TCP");
+                const models::JsonValue* tp = p.get("targetPort");
+                if (tp && tp->is_string()) {
+                    auto it = pod.named_ports.find(tp->str_val);
+                    if (it == pod.named_ports.end()) continue;
+                    rp.port = it->second;
+                } else {
+                    rp.port = tp ? p.get_int("targetPort", 0) : p.get_int("port", 0);
+                }
+                if (rp.port > 0) ports.push_back(rp);
+            }
+        }
+        std::sort(ports.begin(), ports.end());
+        groups[ports].push_back(&pod);
+    }
+
+    models::JsonValue labels = jobject();
+    if (const models::JsonValue* l = meta->get("labels"); l && l->is_object()) labels = *l;
+    auto base_meta = [&](const std::string& object_name) {
+        models::JsonValue m = jobject();
+        m.set("name", jstr(object_name));
+        m.set("namespace", jstr(ns));
+        m.set("resourceVersion", jstr(rv));
+        std::string created = meta->get_string("creationTimestamp", "");
+        if (!created.empty()) m.set("creationTimestamp", jstr(created));
+        return m;
+    };
+    auto ports_json = [](const std::vector<ResolvedPort>& ports) {
+        models::JsonValue arr = jarray();
+        for (const auto& p : ports) {
+            models::JsonValue o = jobject();
+            if (!p.name.empty()) o.set("name", jstr(p.name));
+            o.set("port", jnum(static_cast<double>(p.port)));
+            o.set("protocol", jstr(p.protocol));
+            arr.arr_val.push_back(std::move(o));
+        }
+        return arr;
+    };
+
+    if (!slices) {
+        models::JsonValue ep = jobject();
+        ep.set("kind", jstr("Endpoints"));
+        ep.set("apiVersion", jstr("v1"));
+        models::JsonValue m = base_meta(name);
+        if (!labels.obj_val.empty()) m.set("labels", labels);
+        ep.set("metadata", std::move(m));
+        models::JsonValue subsets = jarray();
+        for (const auto& g : groups) {
+            models::JsonValue ready = jarray(), not_ready = jarray();
+            for (const EndpointPod* p : g.second) {
+                if (p->terminating) continue;
+                models::JsonValue a = jobject();
+                a.set("ip", jstr(p->ip));
+                if (!p->node.empty()) a.set("nodeName", jstr(p->node));
+                a.set("targetRef", target_ref(p));
+                (p->ready ? ready : not_ready).arr_val.push_back(std::move(a));
+            }
+            if (ready.arr_val.empty() && not_ready.arr_val.empty()) continue;
+            models::JsonValue sub = jobject();
+            if (!ready.arr_val.empty()) sub.set("addresses", std::move(ready));
+            if (!not_ready.arr_val.empty()) sub.set("notReadyAddresses", std::move(not_ready));
+            sub.set("ports", ports_json(g.first));
+            subsets.arr_val.push_back(std::move(sub));
+        }
+        if (!subsets.arr_val.empty()) ep.set("subsets", std::move(subsets));
+        out.push_back(ep.to_string());
+        return;
+    }
+
+    size_t index = 0;
+    if (groups.empty()) groups[{}];   // a selected-but-empty Service still has a slice
+    for (const auto& g : groups) {
+        models::JsonValue sl = jobject();
+        sl.set("kind", jstr("EndpointSlice"));
+        sl.set("apiVersion", jstr("discovery.k8s.io/v1"));
+        models::JsonValue m = base_meta(index == 0 ? name : name + "-" + std::to_string(index));
+        models::JsonValue l = labels;
+        l.set("kubernetes.io/service-name", jstr(name));
+        l.set("endpointslice.kubernetes.io/managed-by", jstr("endpointslice-controller.k8s.io"));
+        m.set("labels", std::move(l));
+        std::string uid = meta->get_string("uid", "");
+        if (!uid.empty()) {
+            models::JsonValue refs = jarray();
+            models::JsonValue ref = jobject();
+            ref.set("apiVersion", jstr("v1"));
+            ref.set("kind", jstr("Service"));
+            ref.set("name", jstr(name));
+            ref.set("uid", jstr(uid));
+            ref.set("controller", jboolean(true));
+            ref.set("blockOwnerDeletion", jboolean(true));
+            refs.arr_val.push_back(std::move(ref));
+            m.set("ownerReferences", std::move(refs));
+        }
+        sl.set("metadata", std::move(m));
+        sl.set("addressType", jstr("IPv4"));
+        models::JsonValue eps = jarray();
+        for (const EndpointPod* p : g.second) {
+            models::JsonValue e = jobject();
+            models::JsonValue addrs = jarray();
+            addrs.arr_val.push_back(jstr(p->ip));
+            e.set("addresses", std::move(addrs));
+            models::JsonValue c = jobject();
+            c.set("ready", jboolean(p->ready && !p->terminating));
+            c.set("serving", jboolean(p->ready));
+            c.set("terminating", jboolean(p->terminating));
+            e.set("conditions", std::move(c));
+            if (!p->node.empty()) e.set("nodeName", jstr(p->node));
+            e.set("targetRef", target_ref(p));
+            eps.arr_val.push_back(std::move(e));
+        }
+        sl.set("endpoints", std::move(eps));
+        sl.set("ports", ports_json(g.first));
+        out.push_back(sl.to_string());
+        ++index;
+    }
+}
+
+} // namespace
+
+HttpResponse RouteHandler::handle_endpoints(const HttpRequest& req, const RouteMatch& match) {
+    const bool slices = (match.category == RouteCategory::EndpointSlicesCollection || match.category == RouteCategory::EndpointSliceItem);
+    const bool item = (match.category == RouteCategory::EndpointsItem || match.category == RouteCategory::EndpointSliceItem);
+    ResourceInfo info = slices ? ResourceInfo{"EndpointSlice", "discovery.k8s.io/v1", "EndpointSliceList", "endpointslices", "", true}
+                               : ResourceInfo{"Endpoints", "v1", "EndpointsList", "endpoints", "", true};
+    const std::string plural = slices ? "endpointslices.discovery.k8s.io" : "endpoints";
+    if (req.method != HttpMethod::Get && req.method != HttpMethod::Head) {
+        return make_status(405, "MethodNotAllowed", plural + " are derived from Services and their pods and are read-only");
+    }
+    if (query_flag(req.query_string, "watch")) {
+        return make_status(405, "MethodNotAllowed", "watch is not supported for " + plural);
+    }
+    const std::string ns(match.namespace_name);
+    const std::string scope = ns.empty() ? std::string() : ns + "/";
+    std::vector<std::string> svc_jsons, pod_jsons;
+    store_.list("/registry/services/" + scope, svc_jsons);
+    store_.list("/registry/pods/" + scope, pod_jsons);
+    std::vector<EndpointPod> pods;
+    pods.reserve(pod_jsons.size());
+    for (const auto& j : pod_jsons) {
+        EndpointPod p;
+        if (parse_endpoint_pod(j, p)) pods.push_back(std::move(p));
+    }
+    std::sort(pods.begin(), pods.end(), [](const EndpointPod& a, const EndpointPod& b) {
+        return a.ns != b.ns ? a.ns < b.ns : a.name < b.name;
+    });
+    const std::string rv = std::to_string(store_.current_version());
+    std::vector<std::string> objects;
+    for (const auto& sj : svc_jsons) {
+        models::JsonValue svc;
+        std::string err;
+        if (!models::parse_json(sj, svc, err) || !svc.is_object()) continue;
+        if (item) {
+            const models::JsonValue* m = svc.get("metadata");
+            const std::string sname = m ? m->get_string("name", "") : "";
+            const std::string want(match.resource_name);
+            // A slice is named after its Service, with "-<n>" for extra slices
+            if (!(sname == want || (slices && want.rfind(sname + "-", 0) == 0))) continue;
+        }
+        build_service_endpoints(svc, pods, slices, rv, objects);
+    }
+
+    if (item) {
+        const std::string want(match.resource_name);
+        for (const auto& o : objects) {
+            models::JsonValue doc;
+            std::string err;
+            if (!models::parse_json(o, doc, err)) continue;
+            const models::JsonValue* m = doc.get("metadata");
+            if (!m || m->get_string("name", "") != want) continue;
+            if (req.as_table && TableSerializer::has_generic_table(info.kind)) {
+                return list_response(req, info, {o}, std::string(), store_.current_version());
+            }
+            HttpResponse resp;
+            resp.status_code = 200;
+            resp.content_type = "application/json";
+            resp.body = (req.method == HttpMethod::Head) ? "" : o;
+            return resp;
+        }
+        return make_status(404, "NotFound", plural + " \"" + want + "\" not found", want, slices ? "endpointslices" : "endpoints");
+    }
+    HttpResponse sel_err;
+    if (!filter_list(req, objects, sel_err)) return sel_err;
+    return list_response(req, info, objects, list_json(info, objects), store_.current_version());
 }
 
 // =============================================================================

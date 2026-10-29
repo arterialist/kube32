@@ -338,7 +338,11 @@ ChannelManager& ChannelManager::instance() {
     return s_mgr;
 }
 
-ChannelManager::ChannelManager() = default;
+// ~ChannelManager clears the routing table, so the table must outlive the
+// manager. Function-local statics are destroyed in the reverse order of their
+// construction; constructing the table here, before the manager's own
+// construction completes, makes it the later one to be destroyed.
+ChannelManager::ChannelManager() { (void)VirtualChannelRoutingTable::instance(); }
 ChannelManager::~ChannelManager() { shutdown(); }
 
 bool ChannelManager::init(uint32_t node_id, uint16_t base_udp_port) {

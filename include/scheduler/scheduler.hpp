@@ -17,6 +17,7 @@ struct ResourceSpec {
     uint64_t psram_bytes{0};
     uint32_t gpio_pins{0};
     uint32_t i2c_buses{0};
+    uint32_t uart_ports{0};
     uint32_t adc_channels{0};
     uint32_t cpu_cores{1};
 };

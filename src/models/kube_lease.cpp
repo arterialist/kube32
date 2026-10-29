@@ -1,5 +1,7 @@
 #include "models/kube_lease.hpp"
 #include "models/kube_models.hpp"
+#include "osal/system.hpp"
+#include <cstdio>
 #include <sstream>
 
 namespace kube32::models {
@@ -57,6 +59,16 @@ KubeLease KubeLease::from_json(const std::string& json_str) {
     }
 
     return lease;
+}
+
+std::string now_micro_time() {
+    uint64_t ms = osal::System::get_unix_time_ms();
+    if (ms == 0) return std::string();
+    std::string t = format_rfc3339(ms);
+    char frac[16];
+    snprintf(frac, sizeof(frac), ".%03u000Z", static_cast<unsigned>(ms % 1000));
+    if (!t.empty() && t.back() == 'Z') t.pop_back();
+    return t + frac;
 }
 
 } // namespace kube32::models

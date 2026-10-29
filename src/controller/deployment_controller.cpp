@@ -3,6 +3,7 @@
 #include "osal/system.hpp"
 
 #include <algorithm>
+#include <cstdlib>
 #include <iostream>
 #include <set>
 
@@ -312,27 +313,61 @@ void DeploymentController::reconcile_one(const std::string& key, const std::stri
     status.set("availableReplicas", jnum(static_cast<double>(available)));
     if (unavailable > 0) status.set("unavailableReplicas", jnum(static_cast<double>(unavailable)));
     else status.remove("unavailableReplicas");
-    models::JsonValue conds;
-    conds.type = models::JsonType::Array;
-    {
+    // Conditions as kube-controller-manager reports them, without claiming
+    // ReplicaSets: this controller owns the pods directly.
+    int64_t max_unavailable = 0;
+    if (desired > 0) {
+        const models::JsonValue* strategy = spec->get("strategy");
+        const std::string stype = strategy ? strategy->get_string("type", "RollingUpdate") : "RollingUpdate";
+        if (stype == "RollingUpdate") {
+            const models::JsonValue* ru = strategy ? strategy->get("rollingUpdate") : nullptr;
+            const models::JsonValue* mu = ru ? ru->get("maxUnavailable") : nullptr;
+            if (mu && mu->is_string() && !mu->str_val.empty() && mu->str_val.back() == '%') {
+                max_unavailable = desired * std::atoi(mu->str_val.c_str()) / 100;
+            } else if (mu && !mu->is_string()) {
+                max_unavailable = ru->get_int("maxUnavailable", 0);
+            } else {
+                max_unavailable = desired * 25 / 100;
+            }
+        }
+    }
+    const bool min_available = available >= desired - max_unavailable;
+    const bool complete = (updated == desired && available == desired && active == desired);
+    const std::string now = models::now_rfc3339();
+    const models::JsonValue* prev_conds = (prev && prev->is_object()) ? prev->get("conditions") : nullptr;
+    auto condition = [&](const char* type, bool ok, const std::string& reason, const std::string& message) {
         models::JsonValue c;
         c.type = models::JsonType::Object;
-        c.set("type", jstr("Available"));
-        c.set("status", jstr(available >= desired && desired > 0 ? "True" : "False"));
-        c.set("reason", jstr(available >= desired && desired > 0 ? "MinimumReplicasAvailable" : "MinimumReplicasUnavailable"));
-        c.set("message", jstr(std::to_string(available) + " of " + std::to_string(desired) + " replicas available"));
-        conds.arr_val.push_back(std::move(c));
-        models::JsonValue p;
-        p.type = models::JsonType::Object;
-        p.set("type", jstr("Progressing"));
-        bool complete = (updated == desired && available == desired);
-        p.set("status", jstr("True"));
-        p.set("reason", jstr(complete ? "NewReplicaSetAvailable" : "ReplicaSetUpdated"));
-        p.set("message", jstr(complete ? "Deployment \"" + name + "\" has successfully progressed."
-                                       : "Deployment \"" + name + "\" is progressing: " + std::to_string(updated) + " updated, " +
-                                         std::to_string(available) + " available of " + std::to_string(desired)));
-        conds.arr_val.push_back(std::move(p));
-    }
+        c.set("type", jstr(type));
+        c.set("status", jstr(ok ? "True" : "False"));
+        c.set("reason", jstr(reason));
+        c.set("message", jstr(message));
+        // Timestamps move only when the condition changes
+        std::string since;
+        if (prev_conds && prev_conds->is_array()) {
+            for (const auto& pc : prev_conds->arr_val) {
+                if (pc.get_string("type", "") == type && pc.get_string("status", "") == (ok ? "True" : "False") &&
+                    pc.get_string("reason", "") == reason) {
+                    since = pc.get_string("lastTransitionTime", "");
+                }
+            }
+        }
+        if (since.empty()) since = now;
+        if (!since.empty()) {
+            c.set("lastUpdateTime", jstr(since));
+            c.set("lastTransitionTime", jstr(since));
+        }
+        return c;
+    };
+    models::JsonValue conds;
+    conds.type = models::JsonType::Array;
+    conds.arr_val.push_back(condition("Available", min_available,
+                                      min_available ? "MinimumReplicasAvailable" : "MinimumReplicasUnavailable",
+                                      min_available ? "Deployment has minimum availability." : "Deployment does not have minimum availability."));
+    conds.arr_val.push_back(condition("Progressing", true, complete ? "NewReplicaSetAvailable" : "PodsUpdating",
+                                      complete ? "Deployment \"" + name + "\" has successfully progressed."
+                                               : "Deployment \"" + name + "\" is progressing: " + std::to_string(updated) + " of " +
+                                                 std::to_string(desired) + " pods updated, " + std::to_string(available) + " available"));
     status.set("conditions", std::move(conds));
     std::string new_status = status.to_string();
     std::string old_status = (prev && prev->is_object()) ? prev->to_string() : "";

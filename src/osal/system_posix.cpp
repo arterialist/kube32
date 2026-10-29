@@ -45,6 +45,10 @@ std::string System::get_os_image() {
     return std::string("ESP-IDF ") + esp_get_idf_version();
 }
 
+uint32_t System::get_cpu_cores() {
+    return portNUM_PROCESSORS;
+}
+
 std::string System::get_kernel_version() {
     return std::string("FreeRTOS ") + tskKERNEL_VERSION_NUMBER;
 }
@@ -84,36 +88,73 @@ void System::feed_watchdog() {
 #include <sys/utsname.h>
 
 #include <chrono>
+#include <cstdio>
 #include <cstdlib>
+#include <cstring>
+#include <thread>
 #include <sys/time.h>
+#include <unistd.h>
+#if defined(__APPLE__)
+#include <mach/mach.h>
+#include <sys/sysctl.h>
+#endif
 
 namespace kube32::osal {
 
 static const auto g_boot_time = std::chrono::steady_clock::now();
 
 size_t System::get_free_heap_bytes() {
-    // Simulates 240KB fast DRAM heap
-    return 240 * 1024;
+#if defined(__APPLE__)
+    // Free, inactive and speculative pages: what macOS can hand out without
+    // swapping (the figure vm_stat prints).
+    vm_statistics64_data_t vm;
+    mach_msg_type_number_t count = HOST_VM_INFO64_COUNT;
+    if (host_statistics64(mach_host_self(), HOST_VM_INFO64, reinterpret_cast<host_info64_t>(&vm), &count) != KERN_SUCCESS) return 0;
+    vm_size_t page = 0;
+    if (host_page_size(mach_host_self(), &page) != KERN_SUCCESS) return 0;
+    return static_cast<size_t>(vm.free_count + vm.inactive_count + vm.speculative_count) * static_cast<size_t>(page);
+#else
+    // MemAvailable from /proc/meminfo, in kB
+    FILE* f = std::fopen("/proc/meminfo", "r");
+    if (!f) return 0;
+    char line[128];
+    size_t kb = 0;
+    while (std::fgets(line, sizeof(line), f)) {
+        unsigned long long v = 0;
+        if (std::sscanf(line, "MemAvailable: %llu kB", &v) == 1) { kb = static_cast<size_t>(v); break; }
+    }
+    std::fclose(f);
+    return kb * 1024;
+#endif
 }
 
 size_t System::get_min_free_heap_bytes() {
-    return 180 * 1024;
+    return 0;
 }
 
 size_t System::get_free_psram_bytes() {
-    // Simulates 3840KB usable external SPI PSRAM (4MB total capacity)
-    return 3840 * 1024;
+    return 0;
 }
 
 size_t System::get_total_psram_bytes() {
-    return 4096 * 1024;
+    return 0;
 }
 
 size_t System::get_total_heap_bytes() {
-    // The simulator models a 320 KiB SRAM node (the free figure above is the
-    // matching simulated value); it is a declared simulation parameter, not a
-    // measurement of the host process.
-    return 320 * 1024;
+#if defined(__APPLE__)
+    uint64_t bytes = 0;
+    size_t len = sizeof(bytes);
+    if (sysctlbyname("hw.memsize", &bytes, &len, nullptr, 0) != 0) return 0;
+    return static_cast<size_t>(bytes);
+#else
+    long pages = sysconf(_SC_PHYS_PAGES);
+    long page = sysconf(_SC_PAGESIZE);
+    return (pages > 0 && page > 0) ? static_cast<size_t>(pages) * static_cast<size_t>(page) : 0;
+#endif
+}
+
+uint32_t System::get_cpu_cores() {
+    return std::thread::hardware_concurrency();
 }
 
 uint64_t System::get_unix_time_ms() {
@@ -124,7 +165,7 @@ uint64_t System::get_unix_time_ms() {
 }
 
 uint32_t System::get_cpu_freq_mhz() {
-    return 240;
+    return 0;
 }
 
 uint64_t System::get_uptime_ms() {

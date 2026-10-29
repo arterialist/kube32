@@ -99,11 +99,11 @@ bool TableSerializer::write_node_row(ChunkedStreamWriter& writer, const models::
     if (!writer.write("\",\"")) return false;
 
     // 4: VERSION
-    if (!writer.write(node.version.empty() ? "v1.33.0-kube32" : node.version.c_str())) return false;
+    if (!writer.write(node.version.c_str())) return false;
     if (!writer.write("\",\"")) return false;
 
     // 5: INTERNAL-IP
-    if (!writer.write(node.internal_ip.empty() ? "127.0.0.1" : node.internal_ip.c_str())) return false;
+    if (!writer.write(node.internal_ip.empty() ? "<none>" : node.internal_ip.c_str())) return false;
     if (!writer.write("\",\"")) return false;
 
     // 6: EXTERNAL-IP
@@ -111,15 +111,15 @@ bool TableSerializer::write_node_row(ChunkedStreamWriter& writer, const models::
     if (!writer.write("\",\"")) return false;
 
     // 7: OS-IMAGE
-    if (!writer.write(node.os_image.empty() ? "ESP-IDF v5.2" : node.os_image.c_str())) return false;
+    if (!writer.write(node.os_image.empty() ? "<unknown>" : node.os_image.c_str())) return false;
     if (!writer.write("\",\"")) return false;
 
     // 8: KERNEL-VERSION
-    if (!writer.write(node.kernel_version.empty() ? "FreeRTOS-v10.4" : node.kernel_version.c_str())) return false;
+    if (!writer.write(node.kernel_version.empty() ? "<unknown>" : node.kernel_version.c_str())) return false;
     if (!writer.write("\",\"")) return false;
 
     // 9: CONTAINER-RUNTIME
-    if (!writer.write(node.container_runtime.empty() ? "kube32-runtime://0.1.0" : node.container_runtime.c_str())) return false;
+    if (!writer.write(node.container_runtime.empty() ? "<unknown>" : node.container_runtime.c_str())) return false;
     if (!writer.write("\"],\"object\":{\"kind\":\"PartialObjectMetadata\",\"apiVersion\":\"meta.k8s.io/v1\",\"metadata\":{\"name\":\"")) return false;
     if (!writer.write_escaped_json(node.name.c_str())) return false;
     if (!writer.write("\"}}}")) return false;
@@ -399,12 +399,12 @@ std::string TableSerializer::build_nodes_table_json(const std::vector<std::strin
         format_age(node.age_seconds, age_buf, sizeof(age_buf));
         clean += "{\"cells\":[\"" + node.name + "\",\"" + (node.is_ready ? "Ready" : "NotReady") + "\",\"" +
                  (node.roles.empty() ? "worker" : node.roles) + "\",\"" + age_buf + "\",\"" +
-                 (node.version.empty() ? "v1.33.0-kube32" : node.version) + "\",\"" +
-                 (node.internal_ip.empty() ? "127.0.0.1" : node.internal_ip) + "\",\"" +
+                 node.version + "\",\"" +
+                 (node.internal_ip.empty() ? "<none>" : node.internal_ip) + "\",\"" +
                  (node.external_ip.empty() ? "<none>" : node.external_ip) + "\",\"" +
-                 (node.os_image.empty() ? "ESP-IDF v5.2" : node.os_image) + "\",\"" +
-                 (node.kernel_version.empty() ? "FreeRTOS-v10.4" : node.kernel_version) + "\",\"" +
-                 (node.container_runtime.empty() ? "kube32-runtime://0.1.0" : node.container_runtime) + "\"],"
+                 (node.os_image.empty() ? "<unknown>" : node.os_image) + "\",\"" +
+                 (node.kernel_version.empty() ? "<unknown>" : node.kernel_version) + "\",\"" +
+                 (node.container_runtime.empty() ? "<unknown>" : node.container_runtime) + "\"],"
                  "\"object\":{\"kind\":\"PartialObjectMetadata\",\"apiVersion\":\"meta.k8s.io/v1\",\"metadata\":{\"name\":\"" +
                  node.name + "\"}}}";
     }
@@ -509,7 +509,7 @@ std::string TableSerializer::build_deployments_list_json(const std::vector<std::
 
 
 // =============================================================================
-// Generic Tables (Event, Namespace, Service, ConfigMap, Secret, Lease)
+// Generic Tables (Event, Namespace, Service, ConfigMap, Secret, Lease, Ingress)
 // =============================================================================
 std::string TableSerializer::format_age(uint64_t duration_sec) {
     char buf[16];
@@ -540,7 +540,8 @@ static std::string col(const char* name, int priority) {
 }
 
 bool TableSerializer::has_generic_table(std::string_view kind) {
-    return kind == "Event" || kind == "Namespace" || kind == "Service" || kind == "ConfigMap" || kind == "Secret" || kind == "Lease";
+    return kind == "Event" || kind == "Namespace" || kind == "Service" || kind == "ConfigMap" || kind == "Secret" || kind == "Lease" ||
+           kind == "Ingress" || kind == "Endpoints" || kind == "EndpointSlice";
 }
 
 std::string TableSerializer::build_generic_table_json(std::string_view kind, const std::vector<std::string>& jsons, uint64_t resource_version) {
@@ -561,6 +562,13 @@ std::string TableSerializer::build_generic_table_json(std::string_view kind, con
         out += col("NAME", 0) + "," + col("TYPE", 0) + "," + col("DATA", 0) + "," + col("AGE", 0);
     } else if (kind == "Lease") {
         out += col("NAME", 0) + "," + col("HOLDER", 0) + "," + col("AGE", 0);
+    } else if (kind == "Ingress") {
+        out += col("NAME", 0) + "," + col("CLASS", 0) + "," + col("HOSTS", 0) + "," + col("ADDRESS", 0) + "," +
+               col("PORTS", 0) + "," + col("AGE", 0);
+    } else if (kind == "Endpoints") {
+        out += col("NAME", 0) + "," + col("ENDPOINTS", 0) + "," + col("AGE", 0);
+    } else if (kind == "EndpointSlice") {
+        out += col("NAME", 0) + "," + col("ADDRESSTYPE", 0) + "," + col("PORTS", 0) + "," + col("ENDPOINTS", 0) + "," + col("AGE", 0);
     } else {
         out += col("NAME", 0) + "," + col("AGE", 0);
     }
@@ -634,6 +642,79 @@ std::string TableSerializer::build_generic_table_json(std::string_view kind, con
         } else if (kind == "Lease") {
             const models::JsonValue* spec = doc.get("spec");
             cells = {name, spec ? spec->get_string("holderIdentity", "") : "", age};
+        } else if (kind == "Ingress") {
+            // Same cells as kubectl's printer: hosts of the rules ("*" for a
+            // rule without one), status.loadBalancer addresses, 80 or 80, 443 with TLS
+            const models::JsonValue* spec = doc.get("spec");
+            std::string cls = spec ? spec->get_string("ingressClassName", "") : "";
+            std::string hosts;
+            bool tls = false;
+            if (spec) {
+                const models::JsonValue* rules = spec->get("rules");
+                if (rules && rules->is_array()) {
+                    for (const auto& r : rules->arr_val) {
+                        std::string h = r.get_string("host", "");
+                        if (h.empty()) h = "*";
+                        if (!hosts.empty()) hosts += ",";
+                        hosts += h;
+                    }
+                }
+                const models::JsonValue* t = spec->get("tls");
+                tls = t && t->is_array() && !t->arr_val.empty();
+            }
+            std::string address;
+            if (const models::JsonValue* st = doc.get("status")) {
+                const models::JsonValue* lb = st->get("loadBalancer");
+                const models::JsonValue* list = lb ? lb->get("ingress") : nullptr;
+                if (list && list->is_array()) {
+                    for (const auto& a : list->arr_val) {
+                        std::string v = a.get_string("ip", a.get_string("hostname", ""));
+                        if (v.empty()) continue;
+                        if (!address.empty()) address += ",";
+                        address += v;
+                    }
+                }
+            }
+            cells = {name, cls.empty() ? "<none>" : cls, hosts.empty() ? "*" : hosts, address, tls ? "80, 443" : "80", age};
+        } else if (kind == "Endpoints" || kind == "EndpointSlice") {
+            // kubectl's printers: the first three endpoints, then "+ N more..."
+            std::vector<std::string> eps;
+            std::string ports;
+            if (kind == "Endpoints") {
+                if (const models::JsonValue* subsets = doc.get("subsets"); subsets && subsets->is_array()) {
+                    for (const auto& sub : subsets->arr_val) {
+                        const models::JsonValue* addrs = sub.get("addresses");
+                        const models::JsonValue* pl = sub.get("ports");
+                        if (!addrs || !addrs->is_array()) continue;
+                        for (const auto& a : addrs->arr_val) {
+                            if (pl && pl->is_array() && !pl->arr_val.empty()) {
+                                for (const auto& p : pl->arr_val) eps.push_back(a.get_string("ip", "") + ":" + std::to_string(p.get_int("port", 0)));
+                            } else {
+                                eps.push_back(a.get_string("ip", ""));
+                            }
+                        }
+                    }
+                }
+            } else {
+                if (const models::JsonValue* pl = doc.get("ports"); pl && pl->is_array()) {
+                    for (const auto& p : pl->arr_val) {
+                        if (!ports.empty()) ports += ",";
+                        ports += std::to_string(p.get_int("port", 0));
+                    }
+                }
+                if (const models::JsonValue* el = doc.get("endpoints"); el && el->is_array()) {
+                    for (const auto& e : el->arr_val) {
+                        const models::JsonValue* addrs = e.get("addresses");
+                        if (addrs && addrs->is_array()) for (const auto& a : addrs->arr_val) if (a.is_string()) eps.push_back(a.str_val);
+                    }
+                }
+            }
+            std::string list;
+            for (size_t k = 0; k < eps.size() && k < 3; ++k) list += (k ? "," : "") + eps[k];
+            if (eps.size() > 3) list += " + " + std::to_string(eps.size() - 3) + " more...";
+            if (list.empty()) list = "<none>";
+            if (kind == "Endpoints") cells = {name, list, age};
+            else cells = {name, doc.get_string("addressType", ""), ports.empty() ? "<unset>" : ports, list, age};
         } else {
             cells = {name, age};
         }

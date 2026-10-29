@@ -62,19 +62,14 @@ struct KubeNode {
     bool is_ready{true};
     std::string roles{"worker"};
     uint64_t age_seconds{~0ULL}; // AGE_UNKNOWN until creationTimestamp is known
-    std::string version{"v1.33.0-kube32"};
-    std::string internal_ip{"127.0.0.1"};
-    std::string external_ip{"<none>"};
-    std::string os_image{"ESP-IDF v5.2"};
-    std::string kernel_version{"FreeRTOS-v10.4"};
-    std::string container_runtime{"kube32-runtime://0.1.0"};
-
-    uint64_t memory_capacity{320 * 1024};
-    uint64_t memory_allocatable{240 * 1024};
-    uint32_t gpio_allocatable{14};
-    uint32_t i2c_allocatable{2};
-    uint32_t adc_allocatable{2};
-    uint64_t psram_allocatable{3840 * 1024};
+    // status.nodeInfo and addresses as the kubelet reported them; empty when
+    // absent (the node table then shows <none> or <unknown>, like kubectl).
+    std::string version;
+    std::string internal_ip;
+    std::string external_ip;
+    std::string os_image;
+    std::string kernel_version;
+    std::string container_runtime;
     std::map<std::string, std::string> labels;
 };
 
@@ -90,9 +85,11 @@ struct KubePod {
     uint64_t age_seconds{~0ULL};
     std::string ip{"<none>"};
     std::string node_name{"<none>"};
+    std::string restart_policy{"Always"};   // spec.restartPolicy: Always (the default), OnFailure or Never
 
     // Resource requests
     uint64_t memory_request_bytes{16 * 1024};
+    bool memory_request_set{false};          // requests.memory was given (memory_request_bytes is not the default)
     uint64_t psram_request_bytes{0};
     uint32_t gpio_request{0};
     uint32_t i2c_request{0};
@@ -101,14 +98,16 @@ struct KubePod {
 
     // Workload image and runtime configuration (first container)
     std::string container_name;              // first container's name (events, metrics)
-    std::string image;                       // e.g. "wasm://embedded/tessera-core:v1"
+    std::string image;                       // e.g. "wasm://embedded/my-app:v1"
     uint64_t memory_limit_bytes{0};          // resources.limits.memory, 0 when absent
     std::vector<std::pair<std::string, std::string>> env; // container env name/value pairs
     std::map<std::string, std::string> labels;
     std::map<std::string, std::string> annotations;
 };
 
-// Parses a Kubernetes resource quantity ("1536Ki", "2Mi", "64K", "4096") into bytes.
+// Parses a Kubernetes resource quantity ("1536Ki", "2Mi", "64k", "1e3", "4096")
+// into base units, rounded up as Quantity.Value() does ("500m" is 1). Input
+// that is not a quantity ("64K", "240ki") yields 0.
 uint64_t parse_quantity(const std::string& value);
 
 struct KubeDeployment {
@@ -140,6 +139,10 @@ uint64_t age_seconds_since(std::string_view rfc3339_timestamp);
 constexpr uint64_t AGE_UNKNOWN = ~0ULL;
 // RFC 4122 v4 layout from platform entropy; identifiers for metadata.uid.
 std::string generate_uid();
+
+// True when metadata.ownerReferences names an owner of `kind` (and, when
+// `uid` is given, that owner).
+bool has_owner(const JsonValue& obj, const std::string& kind, const std::string& uid = "");
 
 // Converters from JSON AST to typed structs
 KubeNode parse_node_manifest(const std::string& json_str);

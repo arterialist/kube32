@@ -23,6 +23,12 @@ WatchHub::~WatchHub() {
 bool WatchHub::start() {
     if (running_.load()) return true;
     running_.store(true);
+    {
+        // History before this hub started (an earlier boot of a persistent
+        // store included) cannot be replayed: such watches must relist
+        osal::LockGuard guard(mutex_);
+        if (store_.current_version() > oldest_evicted_version_) oldest_evicted_version_ = store_.current_version();
+    }
     store_watch_id_ = store_.watch("/registry/", [this](const storage::WatchEvent& ev) { on_store_event(ev); });
     thread_ = std::make_unique<osal::Thread>();
     osal::Thread::Config cfg;
@@ -193,6 +199,9 @@ bool WatchHub::prime(Stream& s) {
         osal::LockGuard guard(mutex_);
         // Events evicted from the ring that the client has not seen: it must relist
         if (oldest_evicted_version_ > s.watch.since_version) expired = true;
+        // A version this store never handed out (from before a restart of a
+        // store without persistence): relist rather than wait for it
+        if (s.watch.since_version > store_.current_version()) expired = true;
         for (const auto& e : replay_) {
             if (e->version > s.watch.since_version &&
                 e->key.compare(0, s.watch.prefix.size(), s.watch.prefix) == 0) {

@@ -169,12 +169,19 @@ bool Thread::start(EntryFn entry, void* arg, const Config& config) {
     return false;
 }
 
+// A thread stays joinable after its function returns (is_valid only says
+// whether it is still running): joining a finished thread returns at once.
 bool Thread::join() {
-    if (!impl_ || !impl_->is_valid || !impl_->joinable || !impl_->join_sem) return false;
+    if (!impl_ || !impl_->joinable || !impl_->join_sem) return false;
     BaseType_t rc = xSemaphoreTake(impl_->join_sem, portMAX_DELAY);
     if (rc == pdTRUE) {
         impl_->joinable = false;
         impl_->is_valid = false;
+        if (impl_->static_tcb && impl_->handle) {
+            // The trampoline gives join_sem just before vTaskDelete(NULL); a
+            // caller-owned stack may only be reused once the task is gone.
+            for (int i = 0; i < 100 && eTaskGetState(impl_->handle) != eDeleted; ++i) vTaskDelay(pdMS_TO_TICKS(1));
+        }
         return true;
     }
     return false;
@@ -187,7 +194,7 @@ void Thread::detach() {
 }
 
 bool Thread::is_joinable() const {
-    return impl_ && impl_->is_valid && impl_->joinable;
+    return impl_ && impl_->joinable;
 }
 
 bool Thread::create(EntryFn entry, void* arg, const Config& config) {
@@ -300,7 +307,13 @@ struct Thread::Impl {
 #if defined(__APPLE__)
             pthread_setname_np(impl->name_buf);
 #elif defined(__linux__)
-            pthread_setname_np(pthread_self(), impl->name_buf);
+            // Linux allows 15 characters plus the terminator; a longer name
+            // makes pthread_setname_np fail with ERANGE and leaves the
+            // process name in place.
+            char linux_name[16];
+            std::strncpy(linux_name, impl->name_buf, sizeof(linux_name) - 1);
+            linux_name[sizeof(linux_name) - 1] = '\0';
+            pthread_setname_np(pthread_self(), linux_name);
 #endif
         }
         if (impl && impl->entry) {
@@ -397,13 +410,47 @@ bool Thread::is_joinable() const {
     return impl_ && impl_->is_valid && impl_->joinable;
 }
 
+// The new thread gets its own copy of what it needs: there is no Thread
+// object it could read once create() has returned.
 bool Thread::create(EntryFn entry, void* arg, const Config& config) {
-    Thread t;
-    if (t.start(entry, arg, config)) {
-        t.detach();
-        return true;
+    struct Ctx {
+        EntryFn fn;
+        void* arg;
+        char name[32];
+    };
+    auto* ctx = new Ctx{entry, arg, {}};
+    if (config.name) std::strncpy(ctx->name, config.name, sizeof(ctx->name) - 1);
+    pthread_attr_t attr;
+    pthread_attr_init(&attr);
+    size_t min_stack = 65536;
+#if defined(PTHREAD_STACK_MIN)
+    min_stack = std::max(min_stack, static_cast<size_t>(PTHREAD_STACK_MIN));
+#endif
+    pthread_attr_setstacksize(&attr, std::max(config.stack_size, min_stack));
+    pthread_t handle;
+    int rc = pthread_create(&handle, &attr, [](void* p) -> void* {
+        auto* c = static_cast<Ctx*>(p);
+#if defined(__APPLE__)
+        if (c->name[0]) pthread_setname_np(c->name);
+#elif defined(__linux__)
+        char linux_name[16];
+        std::strncpy(linux_name, c->name, sizeof(linux_name) - 1);
+        linux_name[sizeof(linux_name) - 1] = '\0';
+        if (linux_name[0]) pthread_setname_np(pthread_self(), linux_name);
+#endif
+        EntryFn fn = c->fn;
+        void* a = c->arg;
+        delete c;
+        fn(a);
+        return nullptr;
+    }, ctx);
+    pthread_attr_destroy(&attr);
+    if (rc != 0) {
+        delete ctx;
+        return false;
     }
-    return false;
+    pthread_detach(handle);
+    return true;
 }
 
 void Thread::sleep_ms(uint32_t ms) {

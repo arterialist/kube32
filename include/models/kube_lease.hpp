@@ -17,4 +17,8 @@ struct KubeLease {
     static KubeLease from_json(const std::string& json_str);
 };
 
+// The wall clock as a metav1.MicroTime ("2026-10-28T12:00:00.123000Z"), empty
+// while the clock is not set.
+std::string now_micro_time();
+
 } // namespace kube32::models

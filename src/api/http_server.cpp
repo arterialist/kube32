@@ -11,7 +11,13 @@
 #include <algorithm>
 #include <iostream>
 #include <sys/select.h>
+#if defined(ESP_PLATFORM)
+#include <lwip/sockets.h>
+#else
+#include <sys/socket.h>
+#endif
 #include <sys/time.h>
+#include <fcntl.h>
 #include <exception>
 
 namespace kube32::api {
@@ -36,36 +42,13 @@ void HttpServerMetrics::percentiles(uint32_t& p50, uint32_t& p99) const {
 // =============================================================================
 // HttpConnection
 // =============================================================================
-HttpConnection::HttpConnection(HttpServer& server, osal::Socket& sock, HttpRequest& req, char* rx_buf, size_t rx_cap)
-    : server_(server), sock_(&sock), req_(req), rx_buf_(rx_buf), rx_cap_(rx_cap) {
+HttpConnection::HttpConnection(osal::Socket& sock, HttpRequest& req, char* rx_buf, size_t rx_cap)
+    : sock_(&sock), req_(req), rx_buf_(rx_buf), rx_cap_(rx_cap) {
     keep_alive_ = req.keep_alive;
 }
 
 const char* HttpConnection::status_text(int code) {
-    switch (code) {
-        case 200: return "OK";
-        case 201: return "Created";
-        case 204: return "No Content";
-        case 206: return "Partial Content";
-        case 301: return "Moved Permanently";
-        case 302: return "Found";
-        case 304: return "Not Modified";
-        case 400: return "Bad Request";
-        case 401: return "Unauthorized";
-        case 403: return "Forbidden";
-        case 404: return "Not Found";
-        case 405: return "Method Not Allowed";
-        case 408: return "Request Timeout";
-        case 409: return "Conflict";
-        case 413: return "Payload Too Large";
-        case 422: return "Unprocessable Entity";
-        case 429: return "Too Many Requests";
-        case 500: return "Internal Server Error";
-        case 502: return "Bad Gateway";
-        case 503: return "Service Unavailable";
-        case 504: return "Gateway Timeout";
-        default: return "Status";
-    }
+    return http_reason_phrase(code);
 }
 
 static size_t write_head(char* buf, size_t cap, int status, std::string_view content_type, bool keep_alive,
@@ -133,6 +116,86 @@ bool HttpConnection::send_blob(std::string_view content_type, const uint8_t* dat
         off += n2;
     }
     return true;
+}
+
+bool HttpConnection::begin_fixed(int status, std::string_view content_type, size_t length, std::string_view extra_headers) {
+    status_ = status;
+    if (responded_) return false;
+    responded_ = true;
+    char framing[48];
+    snprintf(framing, sizeof(framing), "Content-Length: %zu\r\n", length);
+    char head[768];
+    size_t hl = write_head(head, sizeof(head), status, content_type, keep_alive_, framing, extra_headers);
+    return hl > 0 && sock_->send_all(head, hl);
+}
+
+// Bytes of the body as sent: what came with the head first, then the socket
+long HttpConnection::raw_body(void* dst, size_t cap) {
+    if (pre_off_ < pre_len_) {
+        size_t n = pre_len_ - pre_off_;
+        if (n > cap) n = cap;
+        std::memmove(dst, rx_buf_ + pre_off_, n);
+        pre_off_ += n;
+        return static_cast<long>(n);
+    }
+    ssize_t r = sock_->recv(dst, cap);
+    return r <= 0 ? -1 : static_cast<long>(r);
+}
+
+long HttpConnection::read_body(void* dst, size_t cap) {
+    if (body_left_ == 0 || cap == 0) return 0;
+    if (!chunked_body_) {
+        long n = raw_body(dst, cap < body_left_ ? cap : body_left_);
+        if (n > 0) body_left_ -= static_cast<size_t>(n);
+        return n;
+    }
+    // Chunked: raw bytes are decoded in place, data moving to the front
+    uint8_t* p = static_cast<uint8_t*>(dst);
+    for (;;) {
+        // Never read past the current chunk's data: the bytes after it may
+        // be the next request on this connection
+        size_t want = (ck_state_ == 2 && ck_left_ < cap) ? ck_left_ : cap;
+        long n = raw_body(dst, want);
+        if (n <= 0) return -1;
+        size_t out = 0;
+        for (long i = 0; i < n; ++i) {
+            const uint8_t c = p[i];
+            switch (ck_state_) {
+                case 0:   // size line
+                case 1: {
+                    if (c == '\n') {
+                        if (!ck_digits_) return -1;
+                        ck_state_ = ck_left_ ? 2 : 4;
+                        ck_digits_ = false;
+                    } else if (c == '\r') {
+                    } else if (c == ';' || ck_state_ == 1) {
+                        ck_state_ = 1;
+                    } else {
+                        int v = (c >= '0' && c <= '9') ? c - '0' : (c >= 'a' && c <= 'f') ? c - 'a' + 10 : (c >= 'A' && c <= 'F') ? c - 'A' + 10 : -1;
+                        if (v < 0 || ck_left_ > (SIZE_MAX >> 4)) return -1;
+                        ck_left_ = (ck_left_ << 4) | static_cast<size_t>(v);
+                        ck_digits_ = true;
+                    }
+                    break;
+                }
+                case 2:   // data
+                    p[out++] = c;
+                    if (--ck_left_ == 0) ck_state_ = 3;
+                    break;
+                case 3:   // CRLF after the data
+                    if (c == '\n') ck_state_ = 0;
+                    break;
+                case 4:   // trailer: ends with an empty line
+                    if (c == '\n') { body_left_ = 0; return static_cast<long>(out); }
+                    if (c != '\r') ck_state_ = 5;
+                    break;
+                case 5:
+                    if (c == '\n') ck_state_ = 4;
+                    break;
+            }
+        }
+        if (out > 0) return static_cast<long>(out);
+    }
 }
 
 bool HttpConnection::begin_chunked(int status, std::string_view content_type, std::string_view extra_headers) {
@@ -213,6 +276,10 @@ bool HttpServer::start() {
     }
 
     running_.store(true);
+    if (wake_sock_.create(osal::SocketType::Udp) && wake_sock_.bind("127.0.0.1", 0)) {
+        wake_sock_.set_nonblocking(true);
+        wake_port_ = wake_sock_.local_port();
+    }
 
     // Streaming hub for the Kubernetes router (watch, log follow)
     if (route_handler_ && store_ && options_.watch_streams > 0) {
@@ -247,6 +314,7 @@ bool HttpServer::start() {
         cfg.priority = 5;
         cfg.core_affinity = options_.worker_core_affinity;
         cfg.stack_in_psram = options_.worker_stack_in_psram;
+        cfg.stack_buffer = (i == 0) ? options_.worker_stack_buffer : nullptr;
         Worker* raw = w.get();
         if (!w->thread->start([](void* p) {
                 auto* self = static_cast<Worker*>(p);
@@ -303,42 +371,51 @@ void HttpServer::stop() {
         watch_hub_->stop();
         watch_hub_.reset();
     }
-    // Drain any sockets never served
-    for (auto& item : queue_) {
-        osal::Socket s(item.fd);
-        s.close();
-    }
+    // Drain any sockets never served (closed by their destructors)
     queue_.clear();
-    for (auto& ic : idle_) {
-        osal::Socket s(ic.fd);
-        s.close();
-    }
     idle_.clear();
+    wake_port_ = 0;
+    wake_sock_.close();
 }
 
-void HttpServer::park_idle(int fd, const std::string& ip) {
+void HttpServer::park_idle(osal::Socket sock, const std::string& ip) {
     osal::LockGuard guard(idle_mutex_);
-    if (idle_.size() >= 16) {
+    if (sock.is_tls()) {
+        size_t tls_idle = 0;
+        for (const auto& ic : idle_) if (ic.sock.is_tls()) ++tls_idle;
+        if (tls_idle >= options_.max_idle_tls_sessions) {
+            // Too many idle TLS sessions: close the oldest one
+            for (auto it = idle_.begin(); it != idle_.end(); ++it) {
+                if (it->sock.is_tls()) { idle_.erase(it); break; }
+            }
+        }
+    }
+    if (idle_.size() >= options_.max_idle_connections && !idle_.empty()) {
         // Too many idle connections: drop the oldest
-        osal::Socket victim(idle_.front().fd);
-        victim.close();
         idle_.erase(idle_.begin());
     }
-    idle_.push_back({fd, ip, osal::System::get_uptime_ms() + options_.keepalive_timeout_ms});
+    idle_.push_back({std::move(sock), ip, osal::System::get_uptime_ms() + options_.keepalive_timeout_ms});
+    if (wake_port_) wake_sock_.sendto("w", 1, "127.0.0.1", wake_port_);
 }
 
 void HttpServer::run_acceptor() {
     int listen_fd = listen_sock_.native_handle();
+    const int wake_fd = wake_sock_.native_handle();
     while (running_.load()) {
         fd_set rfds;
         FD_ZERO(&rfds);
         FD_SET(listen_fd, &rfds);
         int maxfd = listen_fd;
+        if (wake_fd >= 0) {
+            FD_SET(wake_fd, &rfds);
+            if (wake_fd > maxfd) maxfd = wake_fd;
+        }
         {
             osal::LockGuard guard(idle_mutex_);
             for (const auto& ic : idle_) {
-                FD_SET(ic.fd, &rfds);
-                if (ic.fd > maxfd) maxfd = ic.fd;
+                const int fd = ic.sock.native_handle();
+                FD_SET(fd, &rfds);
+                if (fd > maxfd) maxfd = fd;
             }
         }
         struct timeval tv;
@@ -347,8 +424,30 @@ void HttpServer::run_acceptor() {
         int ready = ::select(maxfd + 1, &rfds, nullptr, nullptr, &tv);
         if (!running_.load()) break;
         if (ready < 0) {
+            // A parked connection that is no longer a valid descriptor would
+            // fail every select() and stop all accepts: drop such entries
+            const int err = errno;
+            size_t dropped = 0;
+            {
+                osal::LockGuard guard(idle_mutex_);
+                for (size_t i = 0; i < idle_.size();) {
+                    if (::fcntl(idle_[i].sock.native_handle(), F_GETFL) < 0) {
+                        idle_.erase(idle_.begin() + static_cast<long>(i));
+                        ++dropped;
+                    } else {
+                        ++i;
+                    }
+                }
+            }
+            static int logged = 0;
+            if (logged < 8) { logged++; printf("[HTTP] %s select failed: errno %d, %u stale connection(s) dropped\n", options_.name, err, (unsigned)dropped); }
             osal::Thread::sleep_ms(5);
             continue;
+        }
+
+        if (wake_fd >= 0 && FD_ISSET(wake_fd, &rfds)) {
+            char drain[16];
+            while (wake_sock_.recvfrom(drain, sizeof(drain), nullptr, nullptr) > 0) {}
         }
 
         // Idle connections that became readable (next request) or expired
@@ -357,12 +456,10 @@ void HttpServer::run_acceptor() {
         {
             osal::LockGuard guard(idle_mutex_);
             for (size_t i = 0; i < idle_.size();) {
-                if (FD_ISSET(idle_[i].fd, &rfds)) {
-                    resumed.push_back({idle_[i].fd, idle_[i].ip, true});
+                if (FD_ISSET(idle_[i].sock.native_handle(), &rfds)) {
+                    resumed.push_back({std::move(idle_[i].sock), idle_[i].ip, true});
                     idle_.erase(idle_.begin() + static_cast<long>(i));
                 } else if (now >= idle_[i].deadline_ms) {
-                    osal::Socket s(idle_[i].fd);
-                    s.close();
                     idle_.erase(idle_.begin() + static_cast<long>(i));
                 } else {
                     ++i;
@@ -387,7 +484,6 @@ void HttpServer::run_acceptor() {
             }
             metrics_.connections.fetch_add(1, std::memory_order_relaxed);
             client.set_tcp_nodelay(true);   // responses are written in large coalesced chunks
-            int fd = client.native_handle();
             osal::LockGuard guard(queue_mutex_);
             if (queue_.size() >= options_.accept_queue_depth) {
                 const char* busy = "HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nRetry-After: 1\r\nConnection: close\r\n\r\n";
@@ -396,8 +492,7 @@ void HttpServer::run_acceptor() {
                 metrics_.errors.fetch_add(1, std::memory_order_relaxed);
                 continue;
             }
-            client.release();
-            queue_.push_back({fd, client_ip, false});
+            queue_.push_back({std::move(client), client_ip, false});
             queue_cv_.notify_one();
         }
     }
@@ -405,7 +500,7 @@ void HttpServer::run_acceptor() {
 
 void HttpServer::run_worker(Worker& w) {
     while (running_.load()) {
-        QueuedConn qc{-1, "", false};
+        QueuedConn qc{osal::Socket(), "", false};
         {
             osal::UniqueLock<osal::Mutex> lock(queue_mutex_);
             queue_cv_.wait_for(lock, 500, [this]() { return !queue_.empty() || !running_.load(); });
@@ -414,7 +509,25 @@ void HttpServer::run_worker(Worker& w) {
             qc = std::move(queue_.front());
             queue_.pop_front();
         }
-        osal::Socket sock(qc.fd);
+        osal::Socket sock = std::move(qc.sock);
+        if (options_.tls && !qc.resumed) {
+            // A TLS ClientHello starts with a handshake record (0x16); anything
+            // else is plain HTTP on the same port
+            sock.set_timeout(options_.request_timeout_ms, 5000);
+            unsigned char first = 0;
+            if (sock.recv(&first, 1, MSG_PEEK) == 1 && first == 0x16) {
+                if (!sock.tls_accept(*options_.tls)) {
+                    metrics_.errors.fetch_add(1, std::memory_order_relaxed);
+                    continue;
+                }
+                // Clients open connections ahead of the requests they will
+                // carry: wait for the first one with the acceptor, not here
+                if (!sock.tls_pending()) {
+                    park_idle(std::move(sock), qc.ip);
+                    continue;
+                }
+            }
+        }
         metrics_.active.fetch_add(1, std::memory_order_relaxed);
         serve_connection(w, std::move(sock), qc.ip);
         metrics_.active.fetch_sub(1, std::memory_order_relaxed);
@@ -509,6 +622,10 @@ bool HttpServer::parse_request_headers(const char* buf, size_t len, HttpRequest&
             out_req.request_id = std::string(val);
         } else if (header_is(key, "X-Kube32-Pod")) {
             out_req.target_pod = std::string(val);
+        } else if (header_is(key, "X-Kube32-Call-Chain")) {
+            out_req.call_chain = std::string(val);
+        } else if (header_is(key, "Authorization")) {
+            out_req.authorization = std::string(val);
         } else if (header_is(key, "Transfer-Encoding")) {
             if (val.find("chunked") != std::string_view::npos) out_req.chunked_body = true;
         }
@@ -524,9 +641,10 @@ void HttpServer::serve_connection(Worker& w, osal::Socket sock, const std::strin
         if (leftover == static_cast<size_t>(-1)) break;      // connection finished or failed
         if (!keep_alive) break;
         if (leftover > 0) { have = leftover; continue; }     // pipelined request already buffered
+        if (sock.tls_pending()) continue;                    // the next request is decrypted already
         // Nothing pending: let the acceptor watch this idle connection so this
         // worker can serve someone else
-        park_idle(sock.release(), client_ip);
+        park_idle(std::move(sock), client_ip);
         return;
     }
     sock.close();
@@ -566,27 +684,41 @@ size_t HttpServer::serve_one(Worker& w, osal::Socket& sock, const std::string& c
     if (t_start == 0) t_start = osal::Thread::get_time_us();
 
     if (req.invalid_content_length) { send_status_only(sock, 400, "Bad Request"); metrics_.errors.fetch_add(1); return static_cast<size_t>(-1); }
-    if (req.chunked_body) { send_status_only(sock, 411, "Length Required"); metrics_.errors.fetch_add(1); return static_cast<size_t>(-1); }
-    if (req.content_length > options_.max_body_size) { send_status_only(sock, 413, "Payload Too Large"); metrics_.errors.fetch_add(1); return static_cast<size_t>(-1); }
+    const bool stream_body = handler_ && (req.content_length > 0 || req.chunked_body) && handler_->streams_body(req);
+    if (req.chunked_body && !stream_body) { send_status_only(sock, 411, "Length Required"); metrics_.errors.fetch_add(1); return static_cast<size_t>(-1); }
+    if (!stream_body && req.content_length > options_.max_body_size) { send_status_only(sock, 413, http_reason_phrase(413)); metrics_.errors.fetch_add(1); return static_cast<size_t>(-1); }
 
     size_t body_in_buf = have - header_bytes;
-    size_t take = std::min(body_in_buf, req.content_length);
-    req.body.assign(buf + header_bytes, take);
+    // A chunked body's length is unknown: whatever came with the head is its start
+    size_t take = req.chunked_body ? body_in_buf : std::min(body_in_buf, req.content_length);
     size_t leftover = body_in_buf - take;
-    while (req.body.size() < req.content_length) {
-        size_t needed = std::min(cap, req.content_length - req.body.size());
-        ssize_t r = sock.recv(buf, needed);
-        if (r <= 0) return static_cast<size_t>(-1);
-        req.body.append(buf, static_cast<size_t>(r));
+    if (stream_body) {
+        // The handler reads the body; what came with the head moves to the
+        // front of the buffer for read_body(). A pipelined request after it
+        // is not kept: the connection closes after this one.
+        std::memmove(buf, buf + header_bytes, take);
+    } else {
+        req.body.assign(buf + header_bytes, take);
+        while (req.body.size() < req.content_length) {
+            size_t needed = std::min(cap, req.content_length - req.body.size());
+            ssize_t r = sock.recv(buf, needed);
+            if (r <= 0) return static_cast<size_t>(-1);
+            req.body.append(buf, static_cast<size_t>(r));
+        }
     }
-    if (leftover > 0 && take == req.content_length) {
+    if (!stream_body && leftover > 0 && take == req.content_length) {
         std::memmove(buf, buf + header_bytes + take, leftover);
     } else {
         leftover = 0;
     }
     req.client_ip = client_ip;
 
-    HttpConnection conn(*this, sock, req, buf, cap);
+    HttpConnection conn(sock, req, buf, cap);
+    if (stream_body) {
+        conn.set_body_stream(take, req.content_length, req.chunked_body);
+        // Bytes after the body cannot be told apart from it in the buffer
+        if (body_in_buf > take || req.chunked_body) conn.set_close();
+    }
     bool handled = false;
     try {
         if (handler_) handled = handler_->handle(conn);
@@ -618,7 +750,10 @@ size_t HttpServer::serve_one(Worker& w, osal::Socket& sock, const std::string& c
                 metrics_.record(static_cast<uint32_t>(osal::Thread::get_time_us() - t_start));
                 return static_cast<size_t>(-1);
             }
-            conn.set_close(); // Kubernetes responses keep the historical close semantics
+            // Kubernetes responses close the connection, except over TLS: a
+            // kept-alive session spares kubectl and k9s a handshake per call.
+            // Streamed lists announce Connection: close themselves.
+            if (!sock.is_tls() || !req.keep_alive || resp.is_chunked) conn.set_close();
             if (!resp.is_chunked) conn.send_simple(resp.status_code, resp.content_type, resp.body);
             else conn.mark_responded(resp.status_code);
         } else {
@@ -627,6 +762,7 @@ size_t HttpServer::serve_one(Worker& w, osal::Socket& sock, const std::string& c
     } else if (!conn.responded()) {
         conn.send_simple(500, "application/json", "{\"error\":\"handler_no_response\"}");
     }
+    if (stream_body && conn.body_remaining() > 0) conn.set_close();   // unread body bytes would be taken for the next request
 
     uint32_t took_us = static_cast<uint32_t>(osal::Thread::get_time_us() - t_start);
     metrics_.record(took_us);
