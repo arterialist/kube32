@@ -2,7 +2,9 @@
 #include "hal/sd_card.hpp"
 
 #include <cerrno>
+#include <exception>
 #include <mutex>
+#include <utility>
 #include <sys/stat.h>
 
 #if defined(KUBE32_TARGET_ESP32)
@@ -10,9 +12,9 @@
 #include "esp_heap_caps.h"
 #include "esp_cpu.h"
 #include "esp_memory_utils.h"
-#include "esp_expression_with_stack.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
+#include "freertos/task.h"
 #else
 #include <sys/statvfs.h>
 #endif
@@ -28,18 +30,34 @@ NodeStorageInfo s_info;
 
 constexpr const char* kFlashMount = "/data";
 constexpr const char* kFlashPartition = "storage";
-// FATFS, wear levelling and the flash driver on one call path: about 3 KB
-// measured; the rest is headroom
-constexpr size_t kSharedStackBytes = 6144;
+// Stack of the storage task: FATFS, wear levelling and the flash driver on
+// one call path take about 3 KB; a journal batch written for an API request
+// (records encoded, compaction moving older records) needs several more
+constexpr uint32_t kStorageTaskStackBytes = 16384;
 
 wl_handle_t s_wl = WL_INVALID_HANDLE;
-uint8_t* s_shared_stack = nullptr;
-SemaphoreHandle_t s_stack_lock = nullptr;
+// Flash is written with the cache off, so a call must not run on a PSRAM
+// stack. Callers on one hand their call to this task (stack in internal RAM)
+// and wait. A task rather than a stack switch: ESP-IDF's shared stack
+// function keeps its state in globals, and pod calls already use it for the
+// interpreter stack, sometimes with a storage call nested inside.
+TaskHandle_t s_storage_task = nullptr;
+SemaphoreHandle_t s_call_ready = nullptr;
+SemaphoreHandle_t s_call_done = nullptr;
 std::mutex s_call_mutex;
 const std::function<void()>* s_call = nullptr;
+std::exception_ptr s_call_error;
 
-void run_shared_call() {
-    if (s_call) (*s_call)();
+void storage_task(void*) {
+    for (;;) {
+        if (xSemaphoreTake(s_call_ready, portMAX_DELAY) != pdTRUE) continue;
+        try {
+            (*s_call)();
+        } catch (...) {
+            s_call_error = std::current_exception();
+        }
+        xSemaphoreGive(s_call_done);
+    }
 }
 
 bool mount_internal_flash(std::string& error) {
@@ -64,8 +82,11 @@ bool mount_internal_flash(std::string& error) {
     if (psram) {
         // Tasks with PSRAM stacks (pods, the kubelet, API workers) reach the
         // volume through this internal-RAM stack
-        s_shared_stack = static_cast<uint8_t*>(heap_caps_malloc(kSharedStackBytes, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
-        s_stack_lock = xSemaphoreCreateMutex();
+        s_call_ready = xSemaphoreCreateBinary();
+        s_call_done = xSemaphoreCreateBinary();
+        if (s_call_ready && s_call_done) {
+            xTaskCreatePinnedToCore(storage_task, "k32_storage", kStorageTaskStackBytes, nullptr, 5, &s_storage_task, tskNO_AFFINITY);
+        }
     }
     return true;
 }
@@ -192,11 +213,15 @@ std::string node_storage_path(const std::string& relative) {
 
 void node_storage_call(const std::function<void()>& fn) {
 #if defined(KUBE32_TARGET_ESP32)
-    if (s_shared_stack && s_stack_lock && esp_ptr_external_ram(reinterpret_cast<void*>(esp_cpu_get_sp()))) {
+    if (s_storage_task && xTaskGetCurrentTaskHandle() != s_storage_task &&
+        esp_ptr_external_ram(reinterpret_cast<void*>(esp_cpu_get_sp()))) {
         std::lock_guard<std::mutex> lock(s_call_mutex);
         s_call = &fn;
-        esp_execute_shared_stack_function(s_stack_lock, s_shared_stack, kSharedStackBytes, run_shared_call);
+        s_call_error = nullptr;
+        xSemaphoreGive(s_call_ready);
+        xSemaphoreTake(s_call_done, portMAX_DELAY);
         s_call = nullptr;
+        if (s_call_error) std::rethrow_exception(std::exchange(s_call_error, nullptr));
         return;
     }
 #endif
