@@ -1435,6 +1435,11 @@ M3Result m3_CompileModule (IM3Module io_module)
 {
     M3Result result = m3Err_none;
 
+    // Kube32: one scratch for the whole module, taken before any code page:
+    // a fresh one per function needs a 6 KB hole each time, which a nearly
+    // full pod pool no longer has by the last functions
+    io_module->compileScratch = m3_AllocStruct(M3Compilation);
+
     for (u32 i = 0; i < io_module->numFunctions; ++i) {
         IM3Function f = &io_module->functions[i];
         if (f->wasm and not f->compiled) {
@@ -1442,7 +1447,10 @@ _           (CompileFunction(f));
         }
     }
 
-    _catch: return result;
+    _catch:
+    m3_Free(io_module->compileScratch);
+    io_module->compileScratch = NULL;
+    return result;
 }
 
 #if d_m3HasExceptionHandling

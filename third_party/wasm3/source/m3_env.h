@@ -443,6 +443,9 @@ typedef struct M3Module {
 
     u32                   numFuncImports;
     u32                   numFunctions;
+    // Kube32: m3_CompileModule's compile scratch (an M3Compilation), reused
+    // for every function instead of a 6 KB allocation per function
+    void*                 compileScratch;
     u32                   allFunctions;           // allocated functions count
     M3Function*           functions;
 

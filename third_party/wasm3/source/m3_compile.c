@@ -6437,8 +6437,15 @@ M3Result CompileFunction (IM3Function io_function)
                                                                         io_function->index, m3_GetFunctionName (io_function), SPrintFuncTypeSignature (funcType), (u32) (io_function->wasmEnd - io_function->wasm));
     IM3Runtime runtime = io_function->module->runtime;
 
-    // Scratch for this compile only (Kube32: not kept in the runtime)
-    IM3Compilation o = m3_AllocStruct(M3Compilation);               d_m3Assert (d_m3MaxFunctionSlots >= d_m3MaxFunctionStackHeight * (d_m3Use32BitSlots + 1))  // need twice as many slots in 32-bit mode
+    // Scratch for this compile only (Kube32: not kept in the runtime; the
+    // module's while m3_CompileModule runs, else allocated here)
+    IM3Compilation o = (IM3Compilation) io_function->module->compileScratch;
+    const bool sharedScratch = (o != NULL);
+    if (sharedScratch) {
+        memset(o, 0, sizeof(M3Compilation));
+    } else {
+        o = m3_AllocStruct(M3Compilation);
+    }                                                               d_m3Assert (d_m3MaxFunctionSlots >= d_m3MaxFunctionStackHeight * (d_m3Use32BitSlots + 1))  // need twice as many slots in 32-bit mode
     if (not o) {
         return m3Err_mallocFailed;
     }
@@ -6573,7 +6580,7 @@ _   (CompileBlockStatements(o));
     m3_Free(o->localInitDepth);
 #endif
 
-    m3_Free(o);
+    if (not sharedScratch) m3_Free(o);
 
     return result;
 }
