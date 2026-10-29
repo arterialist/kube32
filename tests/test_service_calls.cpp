@@ -8,6 +8,7 @@
 #include "app/pod_server.hpp"
 #include "storage/store.hpp"
 #include "runtime/k32_app_abi.h"
+#include "runtime/pod_memory_pool.h"
 #include "osal/system.hpp"
 #include "osal/thread.hpp"
 
@@ -242,6 +243,15 @@ int main() {
     assert(h.status == 508);
     h = k32test::http(po.port, "GET", "/hello", "X-Kube32-Pod: default/b-0\r\nX-Kube32-Call-Chain: default/a-0\r\n");
     assert(h.status == 200 && h.body == "hello from b-0\n");
+    // With one interpreter stack per node, a call whose chain holds a pod of
+    // this node is refused at once: that pod holds the stack, waiting
+    static uint8_t interp[64];
+    kube32_interp_stack_set(interp, sizeof(interp));
+    h = k32test::http(po.port, "GET", "/hello", "X-Kube32-Pod: default/b-0\r\nX-Kube32-Call-Chain: default/a-0\r\n");
+    assert(h.status == 508);
+    h = k32test::http(po.port, "GET", "/hello", "X-Kube32-Pod: default/b-0\r\nX-Kube32-Call-Chain: default/elsewhere-0\r\n");
+    assert(h.status == 200);
+    kube32_interp_stack_set(nullptr, 0);
     server.stop();
 
     app::install_service_client(nullptr);

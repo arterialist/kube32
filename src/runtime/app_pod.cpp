@@ -1,4 +1,5 @@
 #include "runtime/app_pod.hpp"
+#include "runtime/pod_memory_pool.h"
 #include "runtime/container_lifecycle.hpp"
 #include "runtime/pod_log.hpp"
 #include "runtime/pod_fs.hpp"
@@ -983,11 +984,28 @@ static void send_error(AppResponseSink& sink, int status, const char* body) {
 int32_t AppPodHost::dispatch(const std::string& pod_id, const AppRequest& req, AppResponseSink& sink, uint32_t wait_ms, bool nested) {
     Entry* e = nullptr;
     osal::Mutex* cm = nullptr;
+    bool stack_held_by_chain = false;
     {
         osal::LockGuard guard(mutex_);
         e = find_locked(pod_id);
         if (!e || !e->has_handle) return nested ? K32_ERR_NOENT : -2;
         cm = e->call_mutex.get();
+        // A pod of this node earlier in the chain waits in a service call on
+        // the node's one interpreter stack: this call could only run once
+        // that one had timed out
+        if (!nested && kube32_interp_stack_active()) {
+            for (size_t start = 0; start < req.call_chain.size() && !stack_held_by_chain;) {
+                size_t end = req.call_chain.find(',', start);
+                if (end == std::string_view::npos) end = req.call_chain.size();
+                const Entry* c = find_locked(std::string(req.call_chain.substr(start, end - start)));
+                stack_held_by_chain = c && c->has_handle;
+                start = end + 1;
+            }
+        }
+    }
+    if (stack_held_by_chain && !chain_contains(req.call_chain, pod_id)) {
+        send_error(sink, 508, "{\"error\":\"loop_detected\",\"message\":\"a pod of this node earlier in the call chain holds its interpreter\"}");
+        return 508;
     }
     if (chain_contains(req.call_chain, pod_id)) {
         // The pod is already serving this request further up the chain:
