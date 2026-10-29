@@ -189,3 +189,50 @@ class TestDeployments(BaseTestCase):
 
         get_resp = self.http.get(f"/apis/apps/v1/namespaces/default/deployments/{deploy_name}")
         self.assertEqual(get_resp.status_code, 404)
+
+    def test_strategic_merge_patch_keeps_other_container_fields(self):
+        """
+        Verify a strategic merge patch (what kubectl apply sends) merges the
+        containers list by name: a changed field leaves the image and env, and
+        a JSON merge patch still replaces the list.
+        """
+        deploy_name = self.unique_name("deploy-smp")
+        manifest = {
+            "apiVersion": "apps/v1",
+            "kind": "Deployment",
+            "metadata": {"name": deploy_name, "namespace": "default"},
+            "spec": {
+                "replicas": 0,
+                "selector": {"matchLabels": {"app": deploy_name}},
+                "template": {
+                    "metadata": {"labels": {"app": deploy_name}},
+                    "spec": {"containers": [{
+                        "name": "app",
+                        "image": "wasm://embedded/echo",
+                        "env": [{"name": "A", "value": "1"}],
+                        "resources": {"requests": {"memory": "48Ki"}, "limits": {"memory": "48Ki"}},
+                    }]},
+                },
+            },
+        }
+        self.register_cleanup("deployment", "default", deploy_name)
+        resp = self.http.post("/apis/apps/v1/namespaces/default/deployments", body=manifest)
+        self.assertEqual(resp.status_code, 201, resp.text)
+
+        path = f"/apis/apps/v1/namespaces/default/deployments/{deploy_name}"
+        patch = {"spec": {"template": {"spec": {
+            "$setElementOrder/containers": [{"name": "app"}],
+            "containers": [{"name": "app", "resources": {"requests": {"memory": "16Ki"}, "limits": {"memory": "16Ki"}}}],
+        }}}}
+        resp = self.http.patch(path, body=patch, headers={"Content-Type": "application/strategic-merge-patch+json"})
+        self.assertEqual(resp.status_code, 200, resp.text)
+        container = self.http.get(path).json()["spec"]["template"]["spec"]["containers"][0]
+        self.assertEqual(container.get("image"), "wasm://embedded/echo")
+        self.assertEqual(container.get("env"), [{"name": "A", "value": "1"}])
+        self.assertEqual(container["resources"]["requests"]["memory"], "16Ki")
+
+        resp = self.http.patch(path, body={"spec": {"template": {"spec": {"containers": [{"name": "app", "image": "wasm://embedded/echo"}]}}}},
+                               headers={"Content-Type": "application/merge-patch+json"})
+        self.assertEqual(resp.status_code, 200, resp.text)
+        container = self.http.get(path).json()["spec"]["template"]["spec"]["containers"][0]
+        self.assertNotIn("env", container)

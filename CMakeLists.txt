@@ -458,6 +458,13 @@ else()
     target_link_libraries(test_pod_buses PRIVATE kube32_core)
     add_test(NAME test_pod_buses COMMAND test_pod_buses)
 
+    # JSON merge patch and strategic merge patch
+    add_executable(test_patch
+        tests/test_patch.cpp
+    )
+    target_link_libraries(test_patch PRIVATE kube32_core)
+    add_test(NAME test_patch COMMAND test_patch)
+
 endif()
 
 

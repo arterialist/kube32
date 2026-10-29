@@ -51,7 +51,16 @@ struct JsonValue {
 
 // JSON Parser & Serializer Functions
 bool parse_json(std::string_view input, JsonValue& out_value, std::string& out_error);
+// JSON merge patch (RFC 7386): objects merge, null removes a member, any
+// other value (lists included) replaces.
 void merge_json(JsonValue& target, const JsonValue& patch);
+// Strategic merge patch, as kubectl apply and kubectl patch send it: lists
+// of the core types merge by their key (containers and env by name, ports
+// by containerPort or port, ...), and the $patch, $setElementOrder,
+// $deleteFromPrimitiveList and $retainKeys directives apply.
+void strategic_merge_json(JsonValue& target, const JsonValue& patch);
+// The patch semantics a request's Content-Type selects
+void apply_patch(JsonValue& target, const JsonValue& patch, std::string_view content_type);
 
 // =============================================================================
 // Strongly-Typed Model Structs for Table Serialization and Scheduler

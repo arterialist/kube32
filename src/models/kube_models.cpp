@@ -563,11 +563,15 @@ void merge_json(JsonValue& target, const JsonValue& patch) {
         return;
     }
     if (target.type != JsonType::Object) {
-        target = patch;
-        return;
+        target = JsonValue();
+        target.type = JsonType::Object;
     }
 
     for (const auto& kv : patch.obj_val) {
+        if (kv.second.is_null()) {
+            target.remove(kv.first);
+            continue;
+        }
         JsonValue* existing = target.get_mut(kv.first);
         if (existing) {
             if (existing->type == JsonType::Object && kv.second.type == JsonType::Object) {
@@ -576,9 +580,197 @@ void merge_json(JsonValue& target, const JsonValue& patch) {
                 *existing = kv.second;
             }
         } else {
-            target.set(kv.first, kv.second);
+            JsonValue fresh;
+            merge_json(fresh, kv.second);   // drops nulls inside a new member
+            target.set(kv.first, std::move(fresh));
         }
     }
+}
+
+namespace {
+
+constexpr std::string_view kSetElementOrder = "$setElementOrder/";
+constexpr std::string_view kDeleteFromPrimitiveList = "$deleteFromPrimitiveList/";
+
+bool starts_with(const std::string& s, std::string_view prefix) {
+    return s.size() >= prefix.size() && s.compare(0, prefix.size(), prefix) == 0;
+}
+
+bool is_directive(const std::string& key) {
+    return key == "$patch" || key == "$retainKeys" || starts_with(key, kSetElementOrder) || starts_with(key, kDeleteFromPrimitiveList);
+}
+
+// A patch value without its directives, for members the target does not have
+JsonValue strip_directives(const JsonValue& v) {
+    if (v.is_object()) {
+        JsonValue out;
+        out.type = JsonType::Object;
+        for (const auto& kv : v.obj_val) {
+            if (is_directive(kv.first) || kv.second.is_null()) continue;
+            out.obj_val.emplace_back(kv.first, strip_directives(kv.second));
+        }
+        return out;
+    }
+    if (v.is_array()) {
+        JsonValue out;
+        out.type = JsonType::Array;
+        for (const auto& e : v.arr_val) {
+            if (e.is_object() && e.get("$patch")) continue;
+            out.arr_val.push_back(strip_directives(e));
+        }
+        return out;
+    }
+    return v;
+}
+
+// The merge key of a list field (patchMergeKey in the Kubernetes API types),
+// or nullptr for a list that a patch replaces whole. Fields are matched by
+// name: the names below mean the same list wherever they appear.
+const char* list_merge_key(const std::string& field, const JsonValue& patch_list) {
+    if (field == "containers" || field == "initContainers" || field == "ephemeralContainers" || field == "env" ||
+        field == "volumes" || field == "imagePullSecrets") {
+        return "name";
+    }
+    if (field == "ports") {
+        // Container ports merge by containerPort, Service ports by port
+        for (const auto& e : patch_list.arr_val) {
+            if (e.is_object() && e.get("containerPort")) return "containerPort";
+        }
+        return "port";
+    }
+    if (field == "volumeMounts") return "mountPath";
+    if (field == "volumeDevices") return "devicePath";
+    if (field == "hostAliases") return "ip";
+    if (field == "conditions") return "type";
+    if (field == "ownerReferences") return "uid";
+    if (field == "topologySpreadConstraints") return "topologyKey";
+    return nullptr;
+}
+
+bool same_value(const JsonValue& a, const JsonValue& b) {
+    return a.type == b.type && a.to_string() == b.to_string();
+}
+
+void merge_list(const std::string& field, JsonValue& target, const JsonValue& patch) {
+    for (const auto& e : patch.arr_val) {
+        if (e.is_object() && e.get_string("$patch") == "replace") {
+            target = strip_directives(patch);
+            return;
+        }
+    }
+    const char* key = list_merge_key(field, patch);
+    if (!key) {
+        if (field == "finalizers") {
+            // A list of strings that merges: what the patch adds is kept with the rest
+            for (const auto& e : patch.arr_val) {
+                bool have = false;
+                for (const auto& t : target.arr_val) have = have || same_value(t, e);
+                if (!have) target.arr_val.push_back(e);
+            }
+        } else {
+            target = strip_directives(patch);
+        }
+        return;
+    }
+    for (const auto& e : patch.arr_val) {
+        const JsonValue* k = e.is_object() ? e.get(key) : nullptr;
+        if (!k) {
+            if (!(e.is_object() && e.get("$patch"))) target.arr_val.push_back(strip_directives(e));
+            continue;
+        }
+        auto it = target.arr_val.begin();
+        for (; it != target.arr_val.end(); ++it) {
+            const JsonValue* tk = it->is_object() ? it->get(key) : nullptr;
+            if (tk && same_value(*tk, *k)) break;
+        }
+        if (e.get_string("$patch") == "delete") {
+            if (it != target.arr_val.end()) target.arr_val.erase(it);
+        } else if (it != target.arr_val.end()) {
+            strategic_merge_json(*it, e);
+        } else {
+            target.arr_val.push_back(strip_directives(e));
+        }
+    }
+}
+
+// $setElementOrder/<field>: the list in the order the patch gives, members
+// it does not name after them
+void order_list(JsonValue& list, const JsonValue& order, const char* key) {
+    if (!list.is_array() || !order.is_array()) return;
+    std::vector<JsonValue> rest = std::move(list.arr_val);
+    list.arr_val.clear();
+    for (const auto& o : order.arr_val) {
+        const JsonValue* want = (key && o.is_object()) ? o.get(key) : &o;
+        if (!want) continue;
+        for (auto it = rest.begin(); it != rest.end(); ++it) {
+            const JsonValue* have = (key && it->is_object()) ? it->get(key) : &*it;
+            if (have && same_value(*have, *want)) {
+                list.arr_val.push_back(std::move(*it));
+                rest.erase(it);
+                break;
+            }
+        }
+    }
+    for (auto& r : rest) list.arr_val.push_back(std::move(r));
+}
+
+} // namespace
+
+void strategic_merge_json(JsonValue& target, const JsonValue& patch) {
+    if (!patch.is_object()) {
+        target = strip_directives(patch);
+        return;
+    }
+    if (patch.get_string("$patch") == "replace" || !target.is_object()) {
+        target = strip_directives(patch);
+        return;
+    }
+    for (const auto& kv : patch.obj_val) {
+        if (is_directive(kv.first)) continue;
+        if (kv.second.is_null() || (kv.second.is_object() && kv.second.get_string("$patch") == "delete")) {
+            target.remove(kv.first);
+            continue;
+        }
+        JsonValue* existing = target.get_mut(kv.first);
+        if (!existing) {
+            target.set(kv.first, strip_directives(kv.second));
+        } else if (existing->is_object() && kv.second.is_object()) {
+            strategic_merge_json(*existing, kv.second);
+        } else if (existing->is_array() && kv.second.is_array()) {
+            merge_list(kv.first, *existing, kv.second);
+        } else {
+            *existing = strip_directives(kv.second);
+        }
+    }
+    for (const auto& kv : patch.obj_val) {
+        if (starts_with(kv.first, kDeleteFromPrimitiveList)) {
+            JsonValue* list = target.get_mut(kv.first.substr(kDeleteFromPrimitiveList.size()));
+            if (!list || !list->is_array() || !kv.second.is_array()) continue;
+            auto& a = list->arr_val;
+            for (const auto& gone : kv.second.arr_val) {
+                for (auto it = a.begin(); it != a.end();) it = same_value(*it, gone) ? a.erase(it) : it + 1;
+            }
+        } else if (starts_with(kv.first, kSetElementOrder)) {
+            const std::string field = kv.first.substr(kSetElementOrder.size());
+            JsonValue* list = target.get_mut(field);
+            if (list) order_list(*list, kv.second, list_merge_key(field, kv.second));
+        }
+    }
+    if (const JsonValue* retain = patch.get("$retainKeys")) {
+        if (retain->is_array()) {
+            auto& members = target.obj_val;
+            for (auto it = members.begin(); it != members.end();) {
+                bool keep = false;
+                for (const auto& r : retain->arr_val) keep = keep || (r.is_string() && r.str_val == it->first);
+                it = keep ? it + 1 : members.erase(it);
+            }
+        }
+    }
+}
+
+void apply_patch(JsonValue& target, const JsonValue& patch, std::string_view content_type) {
+    if (content_type.rfind("application/strategic-merge-patch+json", 0) == 0) strategic_merge_json(target, patch);
+    else merge_json(target, patch);
 }
 
 // =============================================================================

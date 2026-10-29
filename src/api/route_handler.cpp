@@ -836,10 +836,10 @@ HttpResponse RouteHandler::dispatch(const HttpRequest& req, const RouteMatch& ma
         return resp;
     }
 
-    // Patches are applied as JSON merge patches (strategic merge patches the
-    // same way). Server-side apply needs field ownership tracking and JSON
-    // patch an RFC 6902 engine; both are refused with the media types that
-    // are accepted, as kube-apiserver answers an unknown patch type.
+    // Patches are JSON merge patches or strategic merge patches
+    // (models::apply_patch). Server-side apply needs field ownership tracking
+    // and JSON patch an RFC 6902 engine; both are refused with the media
+    // types that are accepted, as kube-apiserver answers an unknown patch type.
     if (req.method == HttpMethod::Patch) {
         const std::string& ct = req.content_type;
         if (ct.rfind("application/apply-patch", 0) == 0 || ct.rfind("application/json-patch+json", 0) == 0) {
@@ -1308,7 +1308,7 @@ HttpResponse RouteHandler::handle_nodes(const HttpRequest& req, const RouteMatch
         if (!models::parse_json(existing_json, target_doc, err)) {
             return make_status(500, "InternalError", "Failed to parse existing resource");
         }
-        models::merge_json(target_doc, patch_doc);
+        models::apply_patch(target_doc, patch_doc, req.content_type);
         std::string updated_json = target_doc.to_string();
         if (storage::Status ps = store_.put(key, updated_json, true); !ps.ok()) return store_failure(ps, "nodes", name);
 
@@ -1609,7 +1609,7 @@ HttpResponse RouteHandler::handle_pods(const HttpRequest& req, const RouteMatch&
         if (!models::parse_json(existing_json, target_doc, err)) {
             return make_status(500, "InternalError", "Failed to parse existing resource");
         }
-        models::merge_json(target_doc, patch_doc);
+        models::apply_patch(target_doc, patch_doc, req.content_type);
         if (match.category != RouteCategory::PodStatus) {
             if (models::JsonValue* pspec = target_doc.get_mut("spec"); pspec && pspec->is_object()) models::add_default_tolerations(*pspec);
         }
@@ -1904,7 +1904,7 @@ HttpResponse RouteHandler::handle_deployments(const HttpRequest& req, const Rout
             return make_status(500, "InternalError", "Failed to parse existing resource");
         }
         const models::JsonValue old_doc = target_doc;
-        models::merge_json(target_doc, patch_doc);
+        models::apply_patch(target_doc, patch_doc, req.content_type);
         if (match.category != RouteCategory::DeploymentStatus) carry_server_fields(old_doc, target_doc, false);
         std::string updated_json = target_doc.to_string();
         if (storage::Status ps = store_.put(key, updated_json, true); !ps.ok()) return store_failure(ps, "deployments.apps", name);
@@ -2074,7 +2074,7 @@ HttpResponse RouteHandler::handle_leases(const HttpRequest& req, const RouteMatc
             if (!models::parse_json(existing_json, orig_doc, err) || !orig_doc.is_object()) {
                 return make_status(500, "InternalError", "Failed to parse existing resource");
             }
-            models::merge_json(orig_doc, patch_doc);
+            models::apply_patch(orig_doc, patch_doc, req.content_type);
             fill_renew_time(orig_doc);
             std::string final_json = orig_doc.to_string();
             store_.put(key, final_json, true);
@@ -2578,7 +2578,7 @@ HttpResponse RouteHandler::handle_generic(const HttpRequest& req, const RouteMat
         if (!models::parse_json(existing, target, err)) return make_status(500, "InternalError", "Failed to parse existing resource");
         const models::JsonValue old_doc = target;
         if (req.method == HttpMethod::Patch) {
-            models::merge_json(target, in);
+            models::apply_patch(target, in, req.content_type);
             carry_server_fields(old_doc, target, false);
         } else {
             target = std::move(in);
@@ -2715,7 +2715,7 @@ HttpResponse RouteHandler::handle_events(const HttpRequest& req, const RouteMatc
             models::parse_json(core, in, err);
         }
         if (!models::parse_json(existing, target, err)) return make_status(500, "InternalError", "Failed to parse existing resource");
-        if (req.method == HttpMethod::Patch) models::merge_json(target, in); else target = std::move(in);
+        if (req.method == HttpMethod::Patch) models::apply_patch(target, in, req.content_type); else target = std::move(in);
         std::string updated = target.to_string();
         store_.put_extended(key, updated, true, false);
         HttpResponse resp;
