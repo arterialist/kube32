@@ -16,7 +16,7 @@ class TestPeripherals(BaseTestCase):
 
     def test_gpio_request_within_capacity(self):
         """
-        Verify a pod requesting 2 GPIO pins schedules onto a node with 11 allocatable GPIOs.
+        Verify a pod requesting 2 GPIO pins schedules onto a node with enough allocatable GPIOs.
         """
         pod = self.create_pod(self.unique_name("gpio-fit-pod"), {"memory": "32Ki", "esp32.io/gpio": "2"})
         self.assertTrue(len(pod["spec"]["nodeName"]) > 0)
@@ -24,10 +24,11 @@ class TestPeripherals(BaseTestCase):
 
     def test_excessive_gpio_request_remains_pending(self):
         """
-        Verify a pod requesting 30 GPIO pins (more than any node has) fails the predicate
+        Verify a pod requesting one more GPIO pin than the node has fails the predicate
         filter and remains Pending.
         """
-        pod = self.create_pod(self.unique_name("gpio-excess-pod"), {"memory": "32Ki", "esp32.io/gpio": "30"})
+        gpios = int(self.first_node()["status"]["allocatable"]["esp32.io/gpio"])
+        pod = self.create_pod(self.unique_name("gpio-excess-pod"), {"memory": "32Ki", "esp32.io/gpio": str(gpios + 1)})
         self.assertEqual(pod["status"]["phase"], "Pending")
         self.assertEqual(pod["spec"].get("nodeName", ""), "")
 

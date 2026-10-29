@@ -85,8 +85,8 @@ jobs:
         run: |
           rm -rf "$RUNNER_TEMP/sim"
           mkdir -p "$RUNNER_TEMP/sim"
-          build/kube32-sim --role control-plane --node-name cp-0 --node-id 0 --port 6443 --ipc-port 17100 \
-            --pod-port 17000 --psram 8Mi --data-dir "$RUNNER_TEMP/sim" > "$RUNNER_TEMP/sim.log" 2>&1 &
+          build/kube32-sim --role standalone --workers "" --node-name cp-0 --node-id 0 --port 6443 --ipc-port 17100 \
+            --pod-port 17000 --psram 0 --data-dir "$RUNNER_TEMP/sim" > "$RUNNER_TEMP/sim.log" 2>&1 &
           sim=$!
           trap 'kill $sim; wait $sim' EXIT
           for _ in $(seq 60); do
