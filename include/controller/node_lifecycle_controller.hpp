@@ -2,24 +2,30 @@
 
 // Node health from Lease objects (coordination.k8s.io/v1, namespace
 // kube-node-lease), as kube-controller-manager's node lifecycle controller
-// derives it.
+// derives it, and eviction by NoExecute taint, as its taint manager does it.
 //
 // A kubelet renews its Lease every heartbeat. The controller notes when it
 // sees spec.renewTime change (the arrival time on this node's monotonic clock,
 // so the boards' wall clocks need not agree) and marks the node NotReady
 // (Ready=Unknown, reason NodeStatusUnknown, taint
 // node.kubernetes.io/unreachable:NoSchedule) once no renewal has been seen
-// for spec.leaseDurationSeconds. After a further eviction delay its pods are
-// evicted for rescheduling (DaemonSet pods stay) and the NoExecute taint is
-// added. A renewal clears both taints; the kubelet's next status update
-// restores Ready.
+// for spec.leaseDurationSeconds. After a further delay it adds
+// node.kubernetes.io/unreachable:NoExecute with timeAdded. A pod on the node
+// is evicted for rescheduling at once when no toleration of the pod matches
+// that taint, once the matching toleration's tolerationSeconds have passed
+// since the taint was added, and never when that toleration has no
+// tolerationSeconds. The API server gives pods 300 s; DaemonSet pods are not
+// evicted. A renewal clears both taints and the pods that are still bound
+// stay; the kubelet's next status update restores Ready. Other NoExecute
+// taints are not acted on: the scheduler does not filter on taints.
 //
 // Leases are not persisted. After a control-plane restart a node whose
 // stored Ready condition was True gets a full lease duration from the moment
 // the controller first sees it: it had no control plane to renew against. A
-// node that was already NotReady stays NotReady, and its eviction delay runs
-// from the condition's lastTransitionTime when the wall clock allows,
-// otherwise from the restart.
+// node that was already NotReady stays NotReady, and the delay to the
+// NoExecute taint runs from the condition's lastTransitionTime when the wall
+// clock allows, otherwise from the restart. Tolerations of a NoExecute taint
+// that is already on the node run from its timeAdded in the same way.
 
 #include "storage/store.hpp"
 #include "api/event_recorder.hpp"
@@ -29,6 +35,7 @@
 #include <string>
 #include <map>
 #include <atomic>
+#include <functional>
 #include <memory>
 #include <cstdint>
 
@@ -39,9 +46,12 @@ struct NodeLifecycleConfig {
     // Lease duration assumed when a Lease does not state one, and for a node
     // that has not renewed since this controller started
     uint32_t not_ready_threshold_ms{15000};
-    // Time since the last renewal after which pods are evicted (the eviction
-    // delay is this minus the lease duration, at least 0)
+    // Time since the last renewal after which the NoExecute taint is added
+    // (the delay after NotReady is this minus the lease duration, at least 0)
     uint32_t eviction_threshold_ms{30000};
+    // Wall clock in Unix milliseconds, 0 while unset: timeAdded and
+    // lastTransitionTime. Empty: osal::System::get_unix_time_ms.
+    std::function<uint64_t()> unix_time_ms;
 };
 
 class NodeLifecycleController {
@@ -67,7 +77,9 @@ private:
         uint64_t grace_ms{0};         // lease duration
         bool not_ready{false};
         uint64_t not_ready_since_ms{0};
-        bool evicted{false};
+        bool no_execute{false};         // the unreachable NoExecute taint is on the node
+        uint64_t no_execute_seen_ms{0}; // when the controller added it, or first saw it
+        uint64_t no_execute_age_ms{0};  // its age at no_execute_seen_ms (from timeAdded)
     };
 
     static void task_entry(void* arg);
@@ -75,8 +87,10 @@ private:
 
     void mark_not_ready(const std::string& node_name, uint64_t since_ms);
     void mark_recovered(const std::string& node_name);
-    void evict_pods_from_node(const std::string& node_name);
-    bool update_node(const std::string& node_name, bool not_ready, bool no_execute);
+    // `tainted`: nodes with the NoExecute taint, and how long they have had it
+    void evict_pods(const std::map<std::string, uint64_t>& tainted);
+    bool update_node(const std::string& node_name, bool not_ready, bool no_execute, uint64_t no_execute_for_ms = 0);
+    uint64_t wall_clock_ms() const;
     void record_node_event(const std::string& node_name, const char* reason, const std::string& message, bool warning);
 
     storage::Store& store_;

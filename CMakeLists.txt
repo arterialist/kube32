@@ -111,6 +111,7 @@ else()
         src/storage/store.cpp
         src/models/kube_models.cpp
         src/models/kube_lease.cpp
+        src/models/tolerations.cpp
         src/net/network_manager.cpp
         src/net/mdns_discovery.cpp
         src/controller/node_lifecycle_controller.cpp

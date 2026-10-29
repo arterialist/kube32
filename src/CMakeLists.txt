@@ -52,6 +52,7 @@ set(KUBE32_APP_SRCS
     mem/monotonic_arena.cpp
     models/kube_lease.cpp
     models/kube_models.cpp
+    models/tolerations.cpp
     net/mdns_discovery.cpp
     net/network_manager.cpp
     osal/condition_variable_posix.cpp

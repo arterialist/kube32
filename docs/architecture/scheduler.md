@@ -54,11 +54,14 @@ Each kubelet renews a Lease in `kube-node-lease` with `leaseDurationSeconds: 15`
 | Time without renewal | Action |
 | --- | --- |
 | 15 s, or `leaseDurationSeconds` | Sets Node `Ready` to `Unknown` with reason `NodeStatusUnknown`, adds a `node.kubernetes.io/unreachable:NoSchedule` taint, and emits `NodeNotReady` |
-| +15 s, or 30 s total | Adds a `node.kubernetes.io/unreachable:NoExecute` taint and evicts non-DaemonSet pods |
+| +15 s, or 30 s total | Adds a `node.kubernetes.io/unreachable:NoExecute` taint with `timeAdded` |
+| +300 s, or 330 s total (default) | Evicts pods whose `node.kubernetes.io/unreachable:NoExecute` toleration has expired |
 
-Simulator timeouts are configurable with `--not-ready-timeout` and `--eviction-timeout`. A lease renewal clears both taints and emits `NodeReady`. After a control-plane restart, a previously `Ready` node gets a full lease duration before timing out.
+Simulator timeouts are configurable with `--not-ready-timeout` and `--eviction-timeout`. A lease renewal before toleration expiry clears both taints and emits `NodeReady`; bound pods stay on the node and keep running. After a control-plane restart, a previously `Ready` node gets a full lease duration before timing out, and existing `NoExecute` tolerations continue counting from the taint's `timeAdded`.
 
-Eviction clears `spec.nodeName`, sets phase to `Pending` with reason `Evicted`, adds a `DisruptionTarget` condition, and records an `Evicted` event so the scheduler can rebind the pod. The controller removes terminating pods from the store, and leaves `Succeeded`, `Failed`, and DaemonSet pods on the node.
+Pod admission and the Deployment and Job controllers add default `node.kubernetes.io/not-ready:NoExecute` and `node.kubernetes.io/unreachable:NoExecute` tolerations (`operator: Exists`, `tolerationSeconds: 300`) unless the pod already tolerates those taints. A pod is evicted when it has no matching toleration or when `tolerationSeconds` has elapsed since `timeAdded` (`<= 0` evicts immediately; omitting `tolerationSeconds` tolerates indefinitely). DaemonSet pods receive both tolerations without `tolerationSeconds` and are never evicted for these taints.
+
+Eviction clears `spec.nodeName`, sets phase to `Pending` with reason `Evicted`, adds a `DisruptionTarget` condition, and records an `Evicted` event so the scheduler can rebind the pod. The controller removes terminating pods from the store when their toleration expires, and leaves `Succeeded`, `Failed`, and DaemonSet pods on the node.
 
 ## Deployment controller
 

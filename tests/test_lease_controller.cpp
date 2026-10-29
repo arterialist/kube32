@@ -1,5 +1,6 @@
 #include "models/kube_lease.hpp"
 #include "controller/node_lifecycle_controller.hpp"
+#include "controller/deployment_controller.hpp"
 #include "controller/workload_controller.hpp"
 #include "storage/store.hpp"
 #include "scheduler/scheduler.hpp"
@@ -11,6 +12,7 @@
 #include <iostream>
 #include <cassert>
 #include <cstring>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -592,6 +594,339 @@ void test_pod_create_four_key_manifest() {
     std::cout << "[PASS] test_pod_create_four_key_manifest" << std::endl;
 }
 
+// --- NoExecute taint and tolerations ----------------------------------------
+
+static const char* const kNotReadyKey = "node.kubernetes.io/not-ready";
+static const char* const kUnreachableKey = "node.kubernetes.io/unreachable";
+
+static JsonValue stored_pod(Store& store, const std::string& name) {
+    std::string json, err;
+    JsonValue doc;
+    assert(store.get("/registry/pods/default/" + name, json).ok() && parse_json(json, doc, err));
+    return doc;
+}
+
+static const JsonValue* toleration_for(const JsonValue& pod, const std::string& key, const std::string& effect = "NoExecute") {
+    const JsonValue* tols = pod.get("spec")->get("tolerations");
+    if (!tols || !tols->is_array()) return nullptr;
+    for (const auto& t : tols->arr_val) {
+        if (t.get_string("key", "") == key && t.get_string("effect", "") == effect) return &t;
+    }
+    return nullptr;
+}
+
+static size_t toleration_count(const JsonValue& pod) {
+    const JsonValue* tols = pod.get("spec")->get("tolerations");
+    return tols && tols->is_array() ? tols->arr_val.size() : 0;
+}
+
+// Tolerations as the DefaultTolerationSeconds plugin leaves them: Exists,
+// NoExecute and 300 s (or no tolerationSeconds, `seconds` -1)
+static void assert_toleration(const JsonValue& pod, const std::string& key, int64_t seconds) {
+    const JsonValue* t = toleration_for(pod, key);
+    assert(t);
+    assert(t->get_string("operator", "") == "Exists");
+    if (seconds < 0) assert(!t->get("tolerationSeconds"));
+    else assert(t->get_int("tolerationSeconds", -1) == seconds);
+}
+
+static std::string pod_manifest(const std::string& name, const std::string& node, const std::string& tolerations_json = "") {
+    return "{\"apiVersion\":\"v1\",\"kind\":\"Pod\",\"metadata\":{\"name\":\"" + name + "\"},\"spec\":{" +
+           (node.empty() ? std::string() : "\"nodeName\":\"" + node + "\",") +
+           (tolerations_json.empty() ? std::string() : "\"tolerations\":" + tolerations_json + ",") +
+           "\"containers\":[{\"name\":\"c\",\"image\":\"wasm://embedded/echo:v1\"}]}}";
+}
+
+void test_default_tolerations_on_create() {
+    std::cout << "[RUN] test_default_tolerations_on_create" << std::endl;
+    StoreOptions opts;
+    opts.enable_flash_persistence = false;
+    auto store = create_radix_store(opts);
+    store->put("/registry/nodes/node-a", ready_node_json("node-a", "devkit"), true);
+    auto sched = kube32::scheduler::create_scheduler(*store);
+    RouteHandler api(*store, sched.get());
+    const std::string pods = "/api/v1/namespaces/default/pods";
+
+    // No tolerations: not-ready and unreachable NoExecute for 300 s each
+    HttpResponse created = api_call(api, HttpMethod::Post, pods, pod_manifest("plain", "node-a"));
+    assert(created.status_code == 201);
+    assert(created.body.find("\"tolerationSeconds\":300") != std::string::npos);
+    JsonValue pod = stored_pod(*store, "plain");
+    assert(toleration_count(pod) == 2);
+    assert_toleration(pod, kNotReadyKey, 300);
+    assert_toleration(pod, kUnreachableKey, 300);
+
+    // The pod's own toleration of a taint is kept; only the other one is added
+    assert(api_call(api, HttpMethod::Post, pods, pod_manifest("own", "node-a",
+        "[{\"key\":\"node.kubernetes.io/unreachable\",\"operator\":\"Exists\",\"effect\":\"NoExecute\"}]")).status_code == 201);
+    pod = stored_pod(*store, "own");
+    assert(toleration_count(pod) == 2);
+    assert_toleration(pod, kUnreachableKey, -1);
+    assert_toleration(pod, kNotReadyKey, 300);
+
+    // An empty effect covers NoExecute; a NoSchedule toleration does not
+    assert(api_call(api, HttpMethod::Post, pods, pod_manifest("effects", "node-a",
+        "[{\"key\":\"node.kubernetes.io/unreachable\",\"operator\":\"Exists\"},"
+        "{\"key\":\"node.kubernetes.io/not-ready\",\"operator\":\"Exists\",\"effect\":\"NoSchedule\"}]")).status_code == 201);
+    pod = stored_pod(*store, "effects");
+    assert(toleration_count(pod) == 3);
+    assert(!toleration_for(pod, kUnreachableKey));
+    assert_toleration(pod, kNotReadyKey, 300);
+
+    // An empty key with Exists tolerates every taint: nothing is added
+    assert(api_call(api, HttpMethod::Post, pods, pod_manifest("all", "node-a", "[{\"operator\":\"Exists\"}]")).status_code == 201);
+    assert(toleration_count(stored_pod(*store, "all")) == 1);
+
+    // Admission runs on updates as well: a replaced spec gets them again
+    assert(api_call(api, HttpMethod::Put, pods + "/plain", pod_manifest("plain", "node-a")).status_code == 200);
+    pod = stored_pod(*store, "plain");
+    assert(toleration_count(pod) == 2);
+    assert_toleration(pod, kUnreachableKey, 300);
+
+    // Pods the controllers create get the same; DaemonSet pods tolerate both
+    // taints without a limit, also over a toleration with seconds in the template
+    const std::string tmpl_spec = "\"containers\":[{\"name\":\"c\",\"image\":\"wasm://embedded/echo:v1\",\"resources\":{\"requests\":{\"memory\":\"4Ki\"}}}]";
+    assert(api_call(api, HttpMethod::Post, "/apis/apps/v1/namespaces/default/deployments",
+        "{\"apiVersion\":\"apps/v1\",\"kind\":\"Deployment\",\"metadata\":{\"name\":\"web\"},\"spec\":{\"replicas\":1,"
+        "\"selector\":{\"matchLabels\":{\"app\":\"web\"}},\"template\":{\"metadata\":{\"labels\":{\"app\":\"web\"}},\"spec\":{" + tmpl_spec + "}}}}").status_code == 201);
+    assert(api_call(api, HttpMethod::Post, "/apis/batch/v1/namespaces/default/jobs",
+        "{\"apiVersion\":\"batch/v1\",\"kind\":\"Job\",\"metadata\":{\"name\":\"once\"},\"spec\":{\"template\":{\"spec\":{"
+        "\"restartPolicy\":\"Never\"," + tmpl_spec + "}}}}").status_code == 201);
+    assert(api_call(api, HttpMethod::Post, "/apis/apps/v1/namespaces/default/daemonsets",
+        "{\"apiVersion\":\"apps/v1\",\"kind\":\"DaemonSet\",\"metadata\":{\"name\":\"agent\"},\"spec\":{\"template\":{"
+        "\"metadata\":{\"labels\":{\"app\":\"agent\"}},\"spec\":{\"tolerations\":[{\"key\":\"node.kubernetes.io/unreachable\","
+        "\"operator\":\"Exists\",\"effect\":\"NoExecute\",\"tolerationSeconds\":60}]," + tmpl_spec + "}}}}").status_code == 201);
+    DeploymentController dc(*store, sched.get());
+    dc.reconcile();
+    WorkloadController wc(*store, sched.get());
+    wc.reconcile();
+    std::vector<std::string> all;
+    store->list("/registry/pods/", all);
+    size_t checked = 0;
+    for (const auto& j : all) {
+        JsonValue p;
+        std::string err;
+        assert(parse_json(j, p, err));
+        if (has_owner(p, "Deployment") || has_owner(p, "Job")) {
+            assert(toleration_count(p) == 2);
+            assert_toleration(p, kNotReadyKey, 300);
+            assert_toleration(p, kUnreachableKey, 300);
+            ++checked;
+        } else if (has_owner(p, "DaemonSet")) {
+            assert(toleration_count(p) == 2);
+            assert_toleration(p, kNotReadyKey, -1);
+            assert_toleration(p, kUnreachableKey, -1);
+            ++checked;
+        }
+    }
+    assert(checked == 3);
+    std::cout << "[PASS] test_default_tolerations_on_create" << std::endl;
+}
+
+// A Ready node "edge" whose kubelet last renewed its 15 s lease at kRenewed,
+// pods bound to it through the API, and a lifecycle controller that adds the
+// NoExecute taint 30 s after the last renewal. at() moves the controller's
+// monotonic and wall clocks together and runs a pass.
+struct LostNode {
+    static constexpr uint64_t kRenewed = 100000;
+    static constexpr uint64_t kWallAtRenewal = 1790000000000ULL;   // 2026-09-21
+    std::unique_ptr<Store> store;
+    std::unique_ptr<RouteHandler> api;
+    std::unique_ptr<NodeLifecycleController> controller;
+    uint64_t wall{kWallAtRenewal};
+
+    LostNode() {
+        StoreOptions opts;
+        opts.enable_flash_persistence = false;
+        store = create_radix_store(opts);
+        store->put("/registry/nodes/edge", ready_node_json("edge", "cardputer"), true);
+        api = std::make_unique<RouteHandler>(*store);
+        controller = make_controller();
+        put_lease(*store, "edge", "2026-09-21T00:00:00.000000Z");
+        at(0);
+    }
+    std::unique_ptr<NodeLifecycleController> make_controller() {
+        NodeLifecycleConfig cfg;
+        cfg.not_ready_threshold_ms = 15000;
+        cfg.eviction_threshold_ms = 30000;
+        cfg.unix_time_ms = [this] { return wall; };
+        return std::make_unique<NodeLifecycleController>(*store, cfg);
+    }
+    // `since_renewal_ms` after the last renewal
+    void at(uint64_t since_renewal_ms) {
+        wall = kWallAtRenewal + since_renewal_ms;
+        controller->reconcile_nodes(kRenewed + since_renewal_ms);
+    }
+    void pod(const std::string& name, const std::string& tolerations_json = "") {
+        assert(api_call(*api, HttpMethod::Post, "/api/v1/namespaces/default/pods", pod_manifest(name, "edge", tolerations_json)).status_code == 201);
+    }
+    bool bound(const std::string& name) {
+        return stored_pod(*store, name).get("spec")->get_string("nodeName", "") == "edge";
+    }
+    bool evicted(const std::string& name) {
+        JsonValue p = stored_pod(*store, name);
+        return p.get("spec")->get_string("nodeName", "").empty() && p.get("status")->get_string("reason", "") == "Evicted";
+    }
+    const JsonValue* no_execute_taint(JsonValue& node) {
+        std::string json, err;
+        assert(store->get("/registry/nodes/edge", json).ok() && parse_json(json, node, err));
+        const JsonValue* taints = node.get("spec")->get("taints");
+        if (!taints) return nullptr;
+        for (const auto& t : taints->arr_val) {
+            if (t.get_string("key", "") == kUnreachableKey && t.get_string("effect", "") == "NoExecute") return &t;
+        }
+        return nullptr;
+    }
+};
+
+static std::string unreachable_toleration(int64_t seconds) {
+    return "[{\"key\":\"node.kubernetes.io/unreachable\",\"operator\":\"Exists\",\"effect\":\"NoExecute\"" +
+           (seconds < 0 ? std::string() : ",\"tolerationSeconds\":" + std::to_string(seconds)) + "}]";
+}
+
+void test_no_eviction_at_32s() {
+    std::cout << "[RUN] test_no_eviction_at_32s" << std::endl;
+    LostNode n;
+    n.pod("web");   // default tolerations: 300 s
+    n.at(15000);    // lease expired: NotReady and NoSchedule
+    n.at(30000);    // NoExecute
+    n.at(32000);
+    JsonValue node;
+    const JsonValue* taint = n.no_execute_taint(node);
+    assert(taint);
+    assert(taint->get_string("timeAdded", "") == format_rfc3339(LostNode::kWallAtRenewal + 30000));
+    assert(n.bound("web"));
+    std::string p = stored_pod(*n.store, "web").to_string();
+    assert(p.find("Evicted") == std::string::npos && p.find("DisruptionTarget") == std::string::npos);
+    std::cout << "[PASS] test_no_eviction_at_32s" << std::endl;
+}
+
+void test_eviction_after_toleration_seconds() {
+    std::cout << "[RUN] test_eviction_after_toleration_seconds" << std::endl;
+    LostNode n;
+    n.pod("web");                                // 300 s by default
+    n.pod("short", unreachable_toleration(60));
+    n.at(15000);
+    n.at(30000);                                 // the taint goes on here
+    n.at(30000 + 59000);
+    assert(n.bound("short") && n.bound("web"));
+    n.at(30000 + 60000);
+    assert(n.evicted("short"));
+    assert(n.bound("web"));
+    n.at(30000 + 299000);
+    assert(n.bound("web"));
+    n.at(30000 + 300000);
+    assert(n.evicted("web"));
+    JsonValue p = stored_pod(*n.store, "web");
+    assert(p.get("status")->get_string("phase", "") == "Pending");
+    assert(p.to_string().find("\"type\":\"DisruptionTarget\"") != std::string::npos);
+    std::cout << "[PASS] test_eviction_after_toleration_seconds" << std::endl;
+}
+
+void test_zero_toleration_seconds_evicts_at_once() {
+    std::cout << "[RUN] test_zero_toleration_seconds_evicts_at_once" << std::endl;
+    LostNode n;
+    n.pod("zero", unreachable_toleration(0));
+    n.pod("web");
+    // A pod stored without tolerations (not admitted by this API server) does not tolerate the taint
+    n.store->put("/registry/pods/default/bare", R"({"kind":"Pod","metadata":{"name":"bare","namespace":"default"},
+        "spec":{"nodeName":"edge","containers":[{"name":"c","image":"wasm://x"}]},"status":{"phase":"Running"}})", true);
+    n.at(15000);
+    n.at(29000);
+    assert(n.bound("zero") && n.bound("bare"));   // NotReady alone evicts nothing
+    n.at(30000);
+    assert(n.evicted("zero"));
+    assert(n.evicted("bare"));
+    assert(n.bound("web"));
+    std::cout << "[PASS] test_zero_toleration_seconds_evicts_at_once" << std::endl;
+}
+
+void test_toleration_without_seconds_never_evicts() {
+    std::cout << "[RUN] test_toleration_without_seconds_never_evicts" << std::endl;
+    LostNode n;
+    n.pod("stays", unreachable_toleration(-1));
+    n.pod("wildcard", "[{\"operator\":\"Exists\"}]");
+    n.at(15000);
+    n.at(30000);
+    n.at(30000 + 300000);
+    n.at(24ULL * 3600 * 1000);
+    assert(n.bound("stays"));
+    assert(n.bound("wildcard"));
+    std::cout << "[PASS] test_toleration_without_seconds_never_evicts" << std::endl;
+}
+
+void test_recovery_before_expiry_keeps_pods() {
+    std::cout << "[RUN] test_recovery_before_expiry_keeps_pods" << std::endl;
+    LostNode n;
+    n.pod("web");
+    n.pod("short", unreachable_toleration(60));
+    n.at(15000);
+    n.at(30000);
+    n.at(30000 + 45000);
+
+    // The kubelet renews again: both taints go, the pods stay bound
+    put_lease(*n.store, "edge", "2026-09-21T00:01:15.000000Z");
+    n.at(30000 + 50000);
+    JsonValue node;
+    assert(!n.no_execute_taint(node));
+    assert(node.to_string().find(kUnreachableKey) == std::string::npos);
+    n.at(30000 + 120000);   // past the 60 s the taint would have allowed
+    assert(n.bound("web") && n.bound("short"));
+
+    // A later outage runs the tolerations from the new taint, not the old one
+    const uint64_t renewed = 30000 + 120000;
+    put_lease(*n.store, "edge", "2026-09-21T00:02:30.000000Z");
+    n.at(renewed);
+    n.at(renewed + 15000);
+    n.at(renewed + 30000);
+    const JsonValue* taint = n.no_execute_taint(node);
+    assert(taint && taint->get_string("timeAdded", "") == format_rfc3339(LostNode::kWallAtRenewal + renewed + 30000));
+    n.at(renewed + 30000 + 59000);
+    assert(n.bound("short"));
+    n.at(renewed + 30000 + 60000);
+    assert(n.evicted("short"));
+    assert(n.bound("web"));
+    std::cout << "[PASS] test_recovery_before_expiry_keeps_pods" << std::endl;
+}
+
+// The taint's timeAdded carries the tolerations over a control-plane restart;
+// a taint added while the wall clock was unset gets one once it is set.
+void test_no_execute_time_added_over_restart() {
+    std::cout << "[RUN] test_no_execute_time_added_over_restart" << std::endl;
+    LostNode n;
+    n.pod("web");
+    n.at(15000);
+    n.at(30000);
+    n.at(30000 + 200000);
+    assert(n.bound("web"));
+
+    // A new controller (leases are gone with the old one) sees the taint 200 s old
+    n.controller = n.make_controller();
+    n.store->remove("/registry/leases/kube-node-lease/edge");
+    n.at(30000 + 200000);
+    n.at(30000 + 299000);
+    assert(n.bound("web"));
+    n.at(30000 + 300000);
+    assert(n.evicted("web"));
+
+    // No wall clock when the taint goes on: no timeAdded until there is one
+    LostNode m;
+    m.pod("web");
+    m.wall = 0;
+    m.controller->reconcile_nodes(LostNode::kRenewed + 30000);
+    JsonValue node;
+    const JsonValue* taint = m.no_execute_taint(node);
+    assert(taint && !taint->get("timeAdded"));
+    m.at(30000 + 10000);
+    taint = m.no_execute_taint(node);
+    assert(taint && taint->get_string("timeAdded", "") == format_rfc3339(LostNode::kWallAtRenewal + 30000));
+    m.at(30000 + 299000);
+    assert(m.bound("web"));
+    m.at(30000 + 300000);
+    assert(m.evicted("web"));
+    std::cout << "[PASS] test_no_execute_time_added_over_restart" << std::endl;
+}
+
 int main() {
     std::cout << "========================================" << std::endl;
     std::cout << " Running Node Lease & Controller Tests  " << std::endl;
@@ -606,6 +941,13 @@ int main() {
     test_daemonset_rolling_update();
     test_job_controller();
     test_pod_create_four_key_manifest();
+    test_default_tolerations_on_create();
+    test_no_eviction_at_32s();
+    test_eviction_after_toleration_seconds();
+    test_zero_toleration_seconds_evicts_at_once();
+    test_toleration_without_seconds_never_evicts();
+    test_recovery_before_expiry_keeps_pods();
+    test_no_execute_time_added_over_restart();
 
     std::cout << "All Node Lease & Controller tests passed successfully!" << std::endl;
     return 0;

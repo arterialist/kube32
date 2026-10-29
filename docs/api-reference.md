@@ -38,7 +38,7 @@ Discovery endpoints accept `GET` and `HEAD`.
 
 | Group | Kind | Short | Verbs and subresources | Notes |
 | --- | --- | --- | --- | --- |
-| core `v1` | Pod | `po` | get, list, watch, create, update, patch, delete; `status`, `log`, `binding` | Graceful deletion when bound to a node, 30 s by default or `gracePeriodSeconds`. `DELETE` returns the `Pod` for bound pods and a `Status` for unbound pods |
+| core `v1` | Pod | `po` | get, list, watch, create, update, patch, delete; `status`, `log`, `binding` | Graceful deletion when bound to a node, 30 s by default or `gracePeriodSeconds`. `DELETE` returns the `Pod` for bound pods and a `Status` for unbound pods. Create, update and non-status patch add 300 s `NoExecute` tolerations for `node.kubernetes.io/not-ready` and `node.kubernetes.io/unreachable` unless already tolerated |
 | core `v1` | Node | `no` | get, list, watch, create, update, patch, delete; `status`, `proxy` | Registered by kubelets. `/api/v1/nodes/<node>/proxy/storage/<path>` supports `GET`, `PUT` and `DELETE`; `PUT` accepts chunked or `Content-Length` bodies up to 8 MiB by default, writes `<path>.part` and renames it into place |
 | core `v1` | Namespace | `ns` | get, list, watch, create, update, patch, delete | Seeded at boot: `default`, `kube-system`, `kube-public`, `kube-node-lease`, `kube32-cluster` |
 | core `v1` | Service | `svc` | get, list, watch, create, update, patch, delete | Selects Running pods for Ingress, `k32_http_call` and environment variables |
@@ -49,7 +49,7 @@ Discovery endpoints accept `GET` and `HEAD`.
 | `apps/v1` | Deployment | `deploy` | get, list, watch, create, update, patch, delete; `status`, `scale` | Manages pods directly using `pod-template-hash` |
 | `apps/v1` | DaemonSet | `ds` | get, list, watch, create, update, patch, delete | Template `restartPolicy` must be `Always` or unset, 422 otherwise |
 | `batch/v1` | Job | `job` | get, list, watch, create, update, patch, delete | Template `restartPolicy` must be `Never` or `OnFailure`, 422 otherwise |
-| `coordination.k8s.io/v1` | Lease | | get, list, watch, create, update, patch, delete | Kept in RAM for node heartbeats with duration `max(15 s, 3 * heartbeat)`. `POST` and `PUT` upsert. When a lease expires, the node is marked `Ready=Unknown` (`NodeStatusUnknown`) and evicted pods are unbound and rescheduled |
+| `coordination.k8s.io/v1` | Lease | | get, list, watch, create, update, patch, delete | Kept in RAM for node heartbeats with duration `max(15 s, 3 * heartbeat)`. `POST` and `PUT` upsert. When a lease expires, the node is marked `Ready=Unknown` (`NodeStatusUnknown`) with `node.kubernetes.io/unreachable:NoSchedule`; after the eviction timeout (30 s by default) `node.kubernetes.io/unreachable:NoExecute` is added and pods are unbound and rescheduled once their matching `tolerationSeconds` elapses |
 | `networking.k8s.io/v1` | Ingress | `ing` | get, list, watch, create, update, patch, delete | Routes HTTP traffic on port 80 |
 | `discovery.k8s.io/v1` | EndpointSlice | | get, list | Read-only. Computed on read from Services and their pods |
 | `metrics.k8s.io/v1beta1` | NodeMetrics, PodMetrics | | get, list | Kubelet samples, up to 32 pods with a 30 s TTL |

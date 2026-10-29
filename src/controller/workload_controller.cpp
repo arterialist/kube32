@@ -1,5 +1,6 @@
 #include "controller/workload_controller.hpp"
 #include "models/kube_models.hpp"
+#include "models/tolerations.hpp"
 #include "osal/system.hpp"
 
 #include <algorithm>
@@ -204,6 +205,10 @@ std::string WorkloadController::create_pod(const std::string& owner_kind, const 
         if (!sel || !sel->is_object()) { pspec.set("nodeSelector", jobj()); sel = pspec.get_mut("nodeSelector"); }
         sel->set(kHostnameLabel, jstr(pin_node));
     }
+    // A DaemonSet pod tolerates a not-ready or unreachable node without a
+    // limit; any other pod gets what the API server's admission adds (300 s)
+    if (owner_kind == "DaemonSet") models::add_daemon_pod_tolerations(pspec);
+    models::add_default_tolerations(pspec);
     pod.set("spec", std::move(pspec));
     models::JsonValue st = jobj();
     st.set("phase", jstr("Pending"));

@@ -115,7 +115,7 @@ static void print_sim_usage(std::ostream& out) {
            "Timing (milliseconds):\n"
            "  --lease-interval <ms>       node heartbeat interval (default 5000)\n"
            "  --not-ready-timeout <ms>    NotReady after this without a heartbeat (default 15000)\n"
-           "  --eviction-timeout <ms>     evict pods from NotReady nodes after this (default 30000)\n"
+           "  --eviction-timeout <ms>     taint a node NoExecute after this long without a heartbeat (default 30000)\n"
            "  --reconcile-interval <ms>   controller loop interval (default 1000)\n"
            "\n"
            "  -h, --help                  show this help\n";
@@ -414,7 +414,7 @@ int main(int argc, char* argv[]) {
         return 1;
     }
     std::cout << "[INIT] Node Lifecycle Controller active (NotReady: " << opts.not_ready_timeout_ms
-              << "ms, Evict: " << opts.eviction_timeout_ms << "ms)." << std::endl;
+              << "ms, NoExecute: " << opts.eviction_timeout_ms << "ms)." << std::endl;
 
     // Start Autonomous Scheduler
     kube32::scheduler::SchedulerConfig sched_config;

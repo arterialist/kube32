@@ -6,6 +6,7 @@
 #include "api/version_info.hpp"
 #include "models/kube_models.hpp"
 #include "models/kube_lease.hpp"
+#include "models/tolerations.hpp"
 #include "runtime/pod_log.hpp"
 #include "api/protobuf_body.hpp"
 #include "osal/socket.hpp"
@@ -1505,6 +1506,9 @@ HttpResponse RouteHandler::handle_pods(const HttpRequest& req, const RouteMatch&
                 st.set("phase", jstr("Pending"));
                 doc.set("status", std::move(st));
             }
+            // DefaultTolerationSeconds admission: 300 s on a not-ready or
+            // unreachable node unless the pod sets its own toleration
+            models::add_default_tolerations(*doc.get_mut("spec"));
 
             std::string pod_json = doc.to_string();
 
@@ -1577,6 +1581,8 @@ HttpResponse RouteHandler::handle_pods(const HttpRequest& req, const RouteMatch&
             models::JsonValue old_doc;
             if (models::parse_json(existing_json, old_doc, err)) carry_server_fields(old_doc, doc, true);
         }
+        // Admission runs on updates too: a replaced spec keeps the default tolerations
+        if (models::JsonValue* pspec = doc.get_mut("spec"); pspec && pspec->is_object()) models::add_default_tolerations(*pspec);
         const std::string updated_pod = doc.to_string();
         if (storage::Status ps = store_.put(key, updated_pod, true); !ps.ok()) return store_failure(ps, "pods", name);
         HttpResponse resp;
@@ -1604,6 +1610,9 @@ HttpResponse RouteHandler::handle_pods(const HttpRequest& req, const RouteMatch&
             return make_status(500, "InternalError", "Failed to parse existing resource");
         }
         models::merge_json(target_doc, patch_doc);
+        if (match.category != RouteCategory::PodStatus) {
+            if (models::JsonValue* pspec = target_doc.get_mut("spec"); pspec && pspec->is_object()) models::add_default_tolerations(*pspec);
+        }
         std::string updated_json = target_doc.to_string();
         if (storage::Status ps = store_.put(key, updated_json, true); !ps.ok()) return store_failure(ps, "pods", name);
 

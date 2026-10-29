@@ -39,7 +39,7 @@ Use `kubectl` and k9s to manage the cluster. Use the tools below to run the host
 | `--peer <name:id:port>` | none | Static UDP IPC peer (repeatable). |
 | `--lease-interval <ms>` | `5000` | Node heartbeat interval in milliseconds. |
 | `--not-ready-timeout <ms>` | `15000` | Mark a node `NotReady` after this many milliseconds without a heartbeat. |
-| `--eviction-timeout <ms>` | `30000` | Evict pods from `NotReady` nodes after this many milliseconds. |
+| `--eviction-timeout <ms>` | `30000` | Add `node.kubernetes.io/unreachable:NoExecute` after this many milliseconds without a heartbeat; pods are evicted once their matching `tolerationSeconds` (default `300` s) elapses. |
 | `--reconcile-interval <ms>` | `1000` | Controller and scheduler loop interval in milliseconds. |
 | `-h`, `--help` | | Print all options with defaults and exit `0`. |
 
