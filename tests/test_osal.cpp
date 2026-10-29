@@ -283,9 +283,9 @@ void test_timer_oneshot_state_reset() {
     assert(timer.start(20, false)); // 20ms one-shot
     assert(timer.is_running());
 
-    // Wait until callback fires (up to 100ms)
+    // Wait until callback fires (up to 1 s: CI runners can stall a timer thread)
     uint64_t start = Thread::get_time_ms();
-    while (!fired.load() && (Thread::get_time_ms() - start < 100)) {
+    while (!fired.load() && (Thread::get_time_ms() - start < 1000)) {
         Thread::sleep_ms(5);
     }
     assert(fired.load());
