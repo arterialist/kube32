@@ -27,6 +27,20 @@ Unresolved images or images too large for node memory fail the pod with `ErrImag
 - At boot, PSRAM nodes reserve one 1,284 KiB PSRAM block (`20 * 64 KiB + 4 KiB` header) and one shared 64 KiB interpreter stack in PSRAM. Nodes without PSRAM reserve one 67 KiB internal RAM block and one shared 40 KiB interpreter stack.
 - On boards without PSRAM, the 67 KiB pool block holds one large linear memory (>= 48 KiB and at least half the block) from its start and places smaller pod allocations (wasm3 runtime, compiled code, small linear memories) from its end. Every pod allocation comes from the pool block first and falls back to the general heap only when the block is full, except while a pod whose linear memory needs >= 48 KiB loads, when its runtime structures go to the general heap so the block stays whole. The general heap stays for the kubelet, Wi-Fi, and lwIP, with 16 KiB reserved for the system.
 - The per-pod wasm3 value stack defaults to 4 KiB when the pod memory limit is 64 KiB or less and 16 KiB above. The pod annotation `kube32.io/wasm-stack` sets it between `512` and `64Ki`. C and Rust locals use a shadow stack in linear memory.
+- Every function is compiled when the pod loads, and the unused end of the last 4 KiB code page goes back to the pool block. A module that runs out of memory while it loads or compiles fails to load instead of failing in a later call.
+- Pod allocations never take the last 16 KiB of the internal heap. A pod that needs more fails to load, or traps with `OOMKilled` when `memory.grow` or a later allocation is refused.
+
+## Memory admission
+
+Before a pod starts, the kubelet estimates the memory it needs to load: value stack, linear memory, compiled code (about 3.2 times the code section on a 32-bit board), module structures, host-side state and the compiler's scratch. It compares the estimate with what pods can still be given: the free part of the pool block, the general heap above the 16 KiB reserve, and PSRAM above a 16 KiB stack reserve.
+
+| Outcome | Pod status | Event |
+| --- | --- | --- |
+| Fits | Started | `Pulled`, `Created`, `Started` |
+| Fits once other pods free their memory | `Pending`, container waiting with reason `InsufficientMemory`; admitted again every 5 s | `InsufficientMemory` (Warning), once |
+| Larger than the node can give with no other pod running | `Failed` with reason `OutOfmemory`, as the Kubernetes kubelet rejects a pod that does not fit | `OutOfmemory` (Warning) |
+
+A pod that passes admission but runs out of memory while it loads also waits with `InsufficientMemory` instead of crash looping. A pod deleted and created again under the same name replaces the old container even when the kubelet did not see the deletion.
 
 ## Threads
 
@@ -34,7 +48,7 @@ Unresolved images or images too large for node memory fail the pod with `ErrImag
 | --- | --- | --- |
 | `pod_<ns>/<name>` | 64 KiB PSRAM / not supported | Dedicated thread per entry-point pod (PSRAM boards only). |
 | `k32_tick` | 8 KiB PSRAM / 4 KiB internal | Calls `k32_tick(uptime_ms)` at 1 Hz, or every 10 ms while a pod returns > 0. |
-| `k32_events` | 8 KiB PSRAM / 6 KiB internal | Runs while any pod subscribes via `kube32.io/event-topics` and dispatches messages to `k32_event`. |
+| `k32_events` | 8 KiB PSRAM / 4 KiB internal | Runs while any pod subscribes via `kube32.io/event-topics` and dispatches messages to `k32_event`. |
 
 All host-initiated pod calls (`k32_init`, `k32_alloc`, `k32_handle`, `k32_tick`, `k32_event`) switch onto the shared interpreter stack (64 KiB in PSRAM, or 40 KiB of internal RAM without PSRAM) and run serialized across the node. `k32_init` runs from `k32_kubelet` (24 KiB PSRAM stack or 12 KiB internal stack), and `k32_handle` runs from the ingress worker or pod server thread. Run `K32_CMD:TASKS` to inspect native stack sizes and high-water marks.
 

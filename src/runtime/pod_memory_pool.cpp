@@ -6,6 +6,7 @@
 #include <mutex>
 #if defined(ESP_PLATFORM)
 #include "esp_heap_caps.h"
+#include "esp_memory_utils.h"
 #elif defined(__APPLE__)
 #include <malloc/malloc.h>
 #else
@@ -95,6 +96,20 @@ void sub_free_locked(void* p) {
     if (--s_sub_allocs == 0) s_sub_active = false;
     else sub_coalesce();
 }
+
+// Caller holds s_sub_mutex. The chunk keeps `bytes` and its start; the rest
+// becomes a free chunk when it is at least a minimal one.
+bool sub_shrink_locked(void* p, size_t bytes) {
+    SubChunk* c = static_cast<SubChunk*>(p) - 1;
+    const size_t need = align8(bytes) + sizeof(SubChunk);
+    if (c->size < need + kMinChunk) return false;
+    SubChunk* tail = reinterpret_cast<SubChunk*>(reinterpret_cast<uint8_t*>(c) + need);
+    tail->size = static_cast<uint32_t>(c->size - need);
+    tail->used = 0;
+    c->size = static_cast<uint32_t>(need);
+    sub_coalesce();
+    return true;
+}
 } // namespace
 
 extern "C" {
@@ -112,6 +127,13 @@ int kube32_pool_sub_free(void* ptr) {
     if (!s_sub_active || static_cast<uint8_t*>(ptr) <= s_sub_base) return 0;
     sub_free_locked(ptr);
     return 1;
+}
+
+int kube32_rt_shrink(void* ptr, size_t bytes) {
+    if (!ptr || !sub_in_range(ptr)) return 0;
+    std::lock_guard<std::mutex> lock(s_sub_mutex);
+    if (!s_sub_active || static_cast<uint8_t*>(ptr) <= s_sub_base) return 0;
+    return sub_shrink_locked(ptr, bytes) ? 1 : 0;
 }
 
 size_t kube32_pool_whole_capacity(void) {
@@ -213,12 +235,17 @@ void* kube32_pool_alloc(size_t bytes) {
 //     then the general heap, which stays for the kubelet, Wi-Fi and lwIP.
 //     A pod whose linear memory wants the block whole asks for the general
 //     heap first while it loads (kube32_pool_prefer_general).
-// Bytes pods hold in the general heap are counted; the host simulator can
-// cap them at a board's heap (kube32_pool_set_heap_budget).
+// Bytes pods hold in the general heap and in PSRAM are counted. The general
+// heap keeps a reserve for the system that pods are never given: on the
+// board 16 KiB of internal RAM stay free for the kubelet, Wi-Fi and lwIP; the
+// host simulator models a board's heap with a budget instead
+// (kube32_pool_set_heap_budget).
 static std::atomic<int> s_prefer_general{0};
 static std::atomic<size_t> s_general_bytes{0};
+static std::atomic<size_t> s_psram_bytes{0};
 static size_t s_heap_budget = 0;                    // 0: not modelled
-static const size_t k_system_reserve = 16 * 1024;   // of the modelled heap, never given to pods
+static const size_t k_system_reserve = 16 * 1024;
+static const size_t k_psram_stack_reserve = 16 * 1024;   // PSRAM kept for thread stacks made later
 
 static size_t general_size(void* p) {
 #if defined(ESP_PLATFORM)
@@ -230,10 +257,20 @@ static size_t general_size(void* p) {
 #endif
 }
 
-static void* general_calloc(size_t bytes) {
-    if (s_heap_budget && s_general_bytes.load() + bytes + k_system_reserve > s_heap_budget) return nullptr;
+// Whether `bytes` more of the general heap leave the system reserve free
+static bool general_has_room(size_t bytes) {
+    if (s_heap_budget) return s_general_bytes.load() + bytes + k_system_reserve <= s_heap_budget;
 #if defined(ESP_PLATFORM)
-    void* p = heap_caps_calloc(bytes, 1, MALLOC_CAP_8BIT);
+    return heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT) >= bytes + k_system_reserve;
+#else
+    return true;
+#endif
+}
+
+static void* general_calloc(size_t bytes) {
+    if (!general_has_room(bytes)) return nullptr;
+#if defined(ESP_PLATFORM)
+    void* p = heap_caps_calloc(bytes, 1, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
 #else
     void* p = std::calloc(bytes, 1);
 #endif
@@ -247,14 +284,54 @@ void kube32_pool_prefer_general(int on) { s_prefer_general.fetch_add(on ? 1 : -1
 void kube32_pool_set_heap_budget(size_t bytes) { s_heap_budget = bytes; }
 size_t kube32_pool_heap_budget(void) { return s_heap_budget; }
 size_t kube32_pool_general_bytes(void) { return s_general_bytes.load(); }
+size_t kube32_pool_system_reserve(void) { return k_system_reserve; }
+
+size_t kube32_pool_pod_room(size_t memory_bytes, size_t* out_capacity) {
+    size_t room = 0;
+    if (s_heap_budget) {
+        const size_t used = s_general_bytes.load() + k_system_reserve;
+        room = s_heap_budget > used ? s_heap_budget - used : 0;
+    } else {
+#if defined(ESP_PLATFORM)
+        const size_t internal = heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+        room = internal > k_system_reserve ? internal - k_system_reserve : 0;
+        const size_t psram = heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
+        if (psram > k_psram_stack_reserve) room += psram - k_psram_stack_reserve;
+#else
+        room = static_cast<size_t>(1) << 30;   // the host's heap: not modelled
+#endif
+    }
+    // The block is not part of the heap figures above. An internal block is
+    // shared by small pods; an external one serves one large linear memory.
+    size_t pool_held = 0;
+    if (s_block && (!s_external || memory_bytes >= k_threshold)) {
+        const size_t pool_free = kube32_pool_available(nullptr);
+        room += pool_free;
+        pool_held = s_block_size - pool_free;
+    }
+    if (out_capacity) *out_capacity = room + pool_held + s_general_bytes.load() + s_psram_bytes.load();
+    return room;
+}
+
+static bool in_psram(const void* p) {
+#if defined(ESP_PLATFORM)
+    return esp_ptr_external_ram(p);
+#else
+    (void)p;
+    return false;
+#endif
+}
 
 void* kube32_rt_calloc(size_t bytes) {
 #if defined(ESP_PLATFORM)
     // Keep a small PSRAM reserve for stacks allocated later; everything else
     // the interpreter needs is better off external than in the 300 KB SRAM.
-    if (heap_caps_get_free_size(MALLOC_CAP_SPIRAM) > bytes + 16384) {
+    if (heap_caps_get_free_size(MALLOC_CAP_SPIRAM) > bytes + k_psram_stack_reserve) {
         void* p = heap_caps_calloc(bytes, 1, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-        if (p) return p;
+        if (p) {
+            s_psram_bytes.fetch_add(general_size(p));
+            return p;
+        }
     }
 #endif
     if (pool_first()) {
@@ -280,9 +357,28 @@ void* kube32_rt_realloc(void* ptr, size_t bytes) {
         return moved;
     }
     const size_t old = general_size(ptr);
-    if (s_heap_budget && bytes > old && s_general_bytes.load() + (bytes - old) + k_system_reserve > s_heap_budget) return nullptr;
+    if (in_psram(ptr)) {
+        // Grown in place in PSRAM, or moved to wherever kube32_rt_calloc finds room
+        void* p = nullptr;
 #if defined(ESP_PLATFORM)
-    void* p = heap_caps_realloc(ptr, bytes, MALLOC_CAP_8BIT);
+        if (bytes <= old || heap_caps_get_free_size(MALLOC_CAP_SPIRAM) > (bytes - old) + k_psram_stack_reserve) {
+            p = heap_caps_realloc(ptr, bytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        }
+#endif
+        if (p) {
+            s_psram_bytes.fetch_sub(old);
+            s_psram_bytes.fetch_add(general_size(p));
+            return p;
+        }
+        void* moved = kube32_rt_calloc(bytes);
+        if (!moved) return nullptr;
+        std::memcpy(moved, ptr, old < bytes ? old : bytes);
+        kube32_rt_free(ptr);
+        return moved;
+    }
+    if (bytes > old && !general_has_room(bytes - old)) return nullptr;
+#if defined(ESP_PLATFORM)
+    void* p = heap_caps_realloc(ptr, bytes, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
 #else
     void* p = std::realloc(ptr, bytes);
 #endif
@@ -295,7 +391,7 @@ void* kube32_rt_realloc(void* ptr, size_t bytes) {
 
 void kube32_rt_free(void* ptr) {
     if (!ptr || kube32_pool_sub_free(ptr)) return;
-    s_general_bytes.fetch_sub(general_size(ptr));
+    (in_psram(ptr) ? s_psram_bytes : s_general_bytes).fetch_sub(general_size(ptr));
 #if defined(ESP_PLATFORM)
     heap_caps_free(ptr);
 #else

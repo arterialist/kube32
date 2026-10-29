@@ -145,6 +145,12 @@ void* m3_ReallocLinear_Impl (void* i_ptr, size_t i_newSize, size_t i_oldSize)
     return m3_Realloc_Impl(i_ptr, i_newSize, i_oldSize);
 }
 
+bool m3_Shrink_Impl (void* i_ptr, size_t i_size)
+{
+    (void)i_ptr; (void)i_size;
+    return false;
+}
+
 #else
 
 // Kube32: large allocations (linear memory) may come from a block reserved at
@@ -158,6 +164,7 @@ extern void*  kube32_rt_calloc(size_t bytes);
 extern void*  kube32_pool_sub_alloc(size_t bytes);
 extern void*  kube32_rt_realloc(void* ptr, size_t bytes);
 extern void   kube32_rt_free(void* ptr);
+extern int    kube32_rt_shrink(void* ptr, size_t bytes);
 
 void* m3_Malloc_Impl (size_t i_size)
 {
@@ -179,6 +186,11 @@ void m3_Free_Impl (void* io_ptr)
 {
     if (kube32_pool_free(io_ptr)) return;
     kube32_rt_free(io_ptr);
+}
+
+bool m3_Shrink_Impl (void* i_ptr, size_t i_size)
+{
+    return kube32_rt_shrink(i_ptr, i_size) != 0;
 }
 
 void* m3_Realloc_Impl (void* i_ptr, size_t i_newSize, size_t i_oldSize)

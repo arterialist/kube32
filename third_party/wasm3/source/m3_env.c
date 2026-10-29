@@ -2875,6 +2875,27 @@ IM3CodePage AcquireCodePage (IM3Runtime i_runtime)
 }
 
 
+// Kube32: a module compiled whole leaves its last code page partly empty.
+// Each open page is cut to the lines it holds, without moving (compiled code
+// points into it), and is closed: code compiled later gets a page of its own.
+u32 m3_TrimCodePages (IM3Runtime io_runtime)
+{
+    u32 bytes = 0;
+
+    while (io_runtime->pagesOpen) {
+        IM3CodePage page = PopCodePage(&io_runtime->pagesOpen);
+        const u32 unused = NumFreeLines(page);
+        if (unused and m3_Shrink_Impl(page, sizeof(M3CodePageHeader) + sizeof(code_t) * page->info.lineIndex)) {
+            page->info.numLines = page->info.lineIndex;
+            bytes += unused * (u32)sizeof(code_t);
+        }
+        PushCodePage(&io_runtime->pagesFull, page);
+    }
+
+    return bytes;
+}
+
+
 void ReleaseCodePage (IM3Runtime i_runtime, IM3CodePage i_codePage)
 {
     if (i_codePage) {

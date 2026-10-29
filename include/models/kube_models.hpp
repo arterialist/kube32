@@ -81,6 +81,7 @@ struct KubePod {
     uint32_t ready_containers{1};
     uint32_t total_containers{1};
     std::string status{"Pending"}; // Running, Pending, CrashLoopBackOff
+    std::string phase{"Pending"};  // status.phase as stored
     uint32_t restart_count{0};
     uint64_t age_seconds{~0ULL};
     std::string ip{"<none>"};

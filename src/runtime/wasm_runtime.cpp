@@ -8,6 +8,9 @@
 #include "runtime/k32_app_abi.h"
 #include "osal/mutex.hpp"
 
+#include "wasm3.h"
+#include "m3_compile.h"
+
 #include <iostream>
 #include <map>
 #include <vector>
@@ -229,6 +232,58 @@ int32_t WasmRuntime::execute_function(const std::string& pod_id, const std::stri
 
 std::unique_ptr<WasmRuntime> create_wasm_runtime() {
     return std::make_unique<WasmRuntime>();
+}
+
+namespace {
+
+bool read_leb(const uint8_t*& p, const uint8_t* end, uint32_t& out) {
+    out = 0;
+    for (int shift = 0; p < end && shift < 35; shift += 7) {
+        const uint8_t b = *p++;
+        out |= static_cast<uint32_t>(b & 0x7f) << shift;
+        if (!(b & 0x80)) return true;
+    }
+    return false;
+}
+
+} // namespace
+
+size_t estimate_pod_memory(const uint8_t* wasm, size_t len, uint32_t memory_limit_bytes, uint32_t stack_bytes) {
+    // What the module declares: imports and functions, the size of the code
+    // section and the first memory's initial pages
+    size_t code = len, functions = 0;
+    uint32_t initial_pages = 0;
+    if (wasm && len > 8) {
+        const uint8_t* p = wasm + 8;
+        const uint8_t* end = wasm + len;
+        while (p < end) {
+            const uint8_t id = *p++;
+            uint32_t size = 0;
+            if (!read_leb(p, end, size) || size > static_cast<size_t>(end - p)) break;
+            const uint8_t* s = p;
+            p += size;
+            uint32_t count = 0;
+            if ((id == 2 || id == 3) && read_leb(s, p, count)) functions += count;
+            if (id == 5 && read_leb(s, p, count) && count > 0) {
+                uint32_t flags = 0;
+                if (read_leb(s, p, flags)) read_leb(s, p, initial_pages);
+            }
+            if (id == 10) code = size;
+        }
+    }
+    const size_t page = 64 * 1024;
+    const size_t linear = memory_limit_bytes < page ? memory_limit_bytes : (initial_pages ? initial_pages : 1) * page;
+    // Measured on the board: function bodies compile to about 3.2 times their
+    // size; each function keeps about 100 bytes of structures and the rest of
+    // the module about half its size; the runtime and environment take under
+    // 1 KiB, the pod's log ring, environment and registration about 2 KiB.
+    return 768 + stack_bytes + 64 + linear + 16 + code * 13 / 4 + functions * 100 + (len - code) / 2 + 2048 +
+           sizeof(M3Compilation);
+}
+
+bool deploy_error_is_out_of_memory(const std::string& error) {
+    // m3Err_mallocFailedCodePage begins with m3Err_mallocFailed's text
+    return error.find(m3Err_mallocFailed) != std::string::npos;
 }
 
 } // namespace kube32::runtime

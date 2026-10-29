@@ -6,6 +6,7 @@
 #include "runtime/pod_memory_pool.h"
 #include "kubelet/kubelet.hpp"
 #include "m3_core.h"
+#include "m3_env.h"
 
 #include <cassert>
 #include <cstring>
@@ -61,11 +62,24 @@ static std::string base64(const std::vector<uint8_t>& in) {
 class ListClient : public kubelet::KubeApiClient {
 public:
     std::vector<std::pair<models::KubePod, std::string>> pods;
+    std::vector<std::string> status_patches, events;
+    bool create_event(const std::string&, const std::string& ev) override { events.push_back(ev); return true; }
     bool register_node(const std::string&, bool& c) override { c = false; return true; }
     bool patch_node_status(const std::string&, const std::string&) override { return true; }
     bool list_pods(std::vector<models::KubePod>&) override { return true; }
     bool list_pods_raw(std::vector<std::pair<models::KubePod, std::string>>& out) override { out = pods; return true; }
-    bool patch_pod_status(const std::string&, const std::string&, const std::string&) override { return true; }
+    bool patch_pod_status(const std::string&, const std::string& name, const std::string& patch) override {
+        status_patches.push_back(name + " " + patch);
+        return true;
+    }
+    size_t count(const std::vector<std::string>& in, const std::string& what) const {
+        size_t n = 0;
+        for (const auto& s : in) if (s.find(what) != std::string::npos) ++n;
+        return n;
+    }
+    void remove(const std::string& name) {
+        for (auto it = pods.begin(); it != pods.end(); ++it) if (it->first.name == name) { pods.erase(it); return; }
+    }
     void add(const std::string& name, const std::string& resources, const std::string& image_b64, const std::string& stack = "") {
         std::string m = "{\"metadata\":{\"name\":\"" + name + "\",\"namespace\":\"default\",\"annotations\":{\"kube32.io/wasm-base64\":\"" + image_b64 +
                         "\"" + (stack.empty() ? std::string() : ",\"kube32.io/wasm-stack\":\"" + stack + "\"") + "}},\"spec\":{\"nodeName\":\"n1\",\"containers\":[{\"name\":\"c\",\"image\":\"wasm://inline/" + name + "\"" +
@@ -159,6 +173,13 @@ int main() {
         assert(big);
         void* grown = kube32_rt_realloc(c, 2000);           // fits in place
         assert(grown == c);
+        // Cut in place: the rest of the chunk is free again (wasm3's last code page)
+        const size_t before_shrink = kube32_pool_available(nullptr);
+        assert(kube32_rt_shrink(big, 4000) == 1 && kube32_pool_available(nullptr) >= before_shrink + 16000);
+        assert(static_cast<uint8_t*>(big)[3999] == 0);
+        assert(kube32_rt_shrink(big, 3990) == 0);           // too little to give back
+        int on_stack = 0;
+        assert(kube32_rt_shrink(&on_stack, 1) == 0);        // not the pool's
         kube32_rt_free(big);
         kube32_rt_free(c);
         assert(kube32_pool_available(nullptr) == block);
@@ -219,6 +240,74 @@ int main() {
         assert(placed >= 1 && placed < 8 && err.find("allocation failed") != std::string::npos);
         assert(kube32_pool_general_bytes() <= 4 * 1024);
         for (int i = 0; i < placed; ++i) rt->terminate("default/fill-" + std::to_string(i));
+        kube32_pool_set_heap_budget(0);
+        assert(kube32_pool_available(nullptr) == block);
+    }
+
+    // Once a module is compiled its open code page is cut to the lines it
+    // holds and closed; the rest goes back to the pool block
+    {
+        IM3Environment env = m3_NewEnvironment();
+        IM3Runtime runtime = m3_NewRuntime(env, 4096, nullptr);
+        IM3Module module = nullptr;
+        assert(m3_ParseModule(env, &module, probe.data(), static_cast<uint32_t>(probe.size())) == m3Err_none);
+        assert(m3_LoadModule(runtime, module) == m3Err_none);
+        assert(m3_CompileModule(module) == m3Err_none);
+        assert(runtime->pagesOpen && runtime->pagesOpen->info.lineIndex < runtime->pagesOpen->info.numLines);
+        const size_t before = kube32_pool_available(nullptr);
+        const uint32_t trimmed = m3_TrimCodePages(runtime);
+        std::cout << "[trim] probe module: " << trimmed << " bytes of code page given back" << std::endl;
+        assert(trimmed > 0 && !runtime->pagesOpen && kube32_pool_available(nullptr) >= before + trimmed - 16);
+        for (IM3CodePage pg = runtime->pagesFull; pg; pg = pg->info.next) assert(pg->info.lineIndex == pg->info.numLines || pg->info.numLines - pg->info.lineIndex < 9);
+        m3_FreeRuntime(runtime);
+        m3_FreeEnvironment(env);
+        assert(kube32_pool_available(nullptr) == block);
+    }
+
+    // Memory admission on the modelled board heap: a pod larger than the
+    // node could ever give it is rejected (Failed, OutOfmemory); one that
+    // fits once memory is free waits Pending (InsufficientMemory) with the
+    // reason in its status and one Event, and starts when there is room
+    {
+        kube32_pool_set_heap_budget(24 * 1024);
+        auto client = std::make_unique<ListClient>();
+        ListClient* c = client.get();
+        const std::string img = base64(probe);
+        c->add("first", "{\"limits\":{\"memory\":\"40Ki\"}}", img);
+        c->add("huge", "{\"limits\":{\"memory\":\"128Ki\"}}", img);
+        kubelet::KubeletConfig cfg;
+        cfg.node_name = "n1";
+        cfg.memory_retry_ms = 0;
+        auto wrt = runtime::create_wasm_runtime();
+        kubelet::Kubelet k(cfg, *wrt, std::move(client));
+        k.sync_assigned_pods();
+        kubelet::LocalPodRecord rec;
+        assert(k.get_pod_record("default/first", rec) && rec.execution_phase == kubelet::PodExecutionPhase::Running);
+        assert(k.get_pod_record("default/huge", rec) && rec.execution_phase == kubelet::PodExecutionPhase::Failed);
+        std::cout << "[admission] huge: " << rec.last_error_message << std::endl;
+        assert(c->count(c->status_patches, "huge {\"status\":{\"phase\":\"Failed\",\"reason\":\"OutOfmemory\"") == 1);
+        assert(c->count(c->events, "\"reason\":\"OutOfmemory\"") == 1);
+        assert(!wrt->is_deployed("default/huge"));
+
+        c->add("second", "{\"limits\":{\"memory\":\"40Ki\"}}", img);
+        k.sync_assigned_pods();
+        k.sync_assigned_pods();
+        assert(k.get_pod_record("default/second", rec) && rec.execution_phase == kubelet::PodExecutionPhase::InsufficientMemory);
+        std::cout << "[admission] second: " << rec.last_error_message << std::endl;
+        assert(!wrt->is_deployed("default/second"));
+        assert(c->count(c->status_patches, "second {\"status\":{\"phase\":\"Pending\"") == 1);
+        assert(c->count(c->status_patches, "\"waiting\":{\"reason\":\"InsufficientMemory\"") == 1);
+        assert(c->count(c->events, "\"reason\":\"InsufficientMemory\"") == 1);   // once, not per retry
+
+        // The first pod goes away: the second is admitted on a later pass
+        c->remove("first");
+        k.sync_assigned_pods();
+        k.sync_assigned_pods();
+        assert(k.get_pod_record("default/second", rec) && rec.execution_phase == kubelet::PodExecutionPhase::Running);
+        assert(wrt->is_deployed("default/second"));
+        assert(c->count(c->status_patches, "second {\"status\":{\"phase\":\"Running\"") == 1);
+        c->pods.clear();
+        k.sync_assigned_pods();
         kube32_pool_set_heap_budget(0);
         assert(kube32_pool_available(nullptr) == block);
     }

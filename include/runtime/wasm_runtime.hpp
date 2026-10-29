@@ -111,4 +111,16 @@ private:
 // Factory function
 std::unique_ptr<WasmRuntime> create_wasm_runtime();
 
+// Memory a pod needs to start on the board: its runtime, value stack, linear
+// memory (memory_limit_bytes below one page, else the module's initial
+// pages), compiled code and module structures, its host-side state, and the
+// compiler's scratch while it loads. Estimated from the module's sections
+// with the factors measured on a 32-bit board; `wasm` may be null when only
+// the size is known.
+size_t estimate_pod_memory(const uint8_t* wasm, size_t len, uint32_t memory_limit_bytes, uint32_t stack_bytes);
+
+// Whether a deploy error is the node running out of memory while the module
+// loaded, rather than a fault of the module.
+bool deploy_error_is_out_of_memory(const std::string& error);
+
 } // namespace kube32::runtime

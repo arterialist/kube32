@@ -2,6 +2,7 @@
 #include "models/kube_models.hpp"
 #include "runtime/image_registry.hpp"
 
+#include <algorithm>
 #include <cctype>
 #include <map>
 
@@ -191,77 +192,114 @@ private:
     std::map<std::string, Fetched> secrets_;
 };
 
-// Service link variables for the namespace's Services.
-void collect_service_links(const PodEnvContext& ctx, const std::string& ns, const JsonValue& pod, EnvVars& out) {
-    if (!ctx.api_get) return;
+// Calls `fn` with each item of the list at `path`. A context that streams
+// lists hands the items over one at a time, so only one item is ever parsed;
+// otherwise the list is read whole. False when the list cannot be read.
+bool for_each_item(const PodEnvContext& ctx, const std::string& path, const std::function<void(const JsonValue&)>& fn) {
+    if (ctx.api_list) {
+        return ctx.api_list(path, [&](std::string&& text) {
+            JsonValue item;
+            std::string err;
+            const bool parsed = models::parse_json(text, item, err);
+            std::string().swap(text);
+            if (parsed && item.is_object()) fn(item);
+        }) == 200;
+    }
+    if (!ctx.api_get) return false;
     std::string body;
-    if (ctx.api_get("/api/v1/namespaces/" + ns + "/services", body) != 200) return;
+    if (ctx.api_get(path, body) != 200) return false;
     JsonValue list;
     std::string err;
-    if (!models::parse_json(body, list, err)) return;
+    if (!models::parse_json(body, list, err)) return false;
     const JsonValue* items = list.get("items");
-    if (!items || !items->is_array()) return;
+    if (items && items->is_array()) {
+        for (const auto& item : items->arr_val) fn(item);
+    }
+    return true;
+}
 
+// What a Service's link variables are made of
+struct LinkedService {
+    std::string name;
+    bool selects_pod{false};          // the starting pod is one of its backends
+    std::string host;
+    std::vector<ResolvedPort> ports;  // in the Service's order; port 0 until resolved
+};
+
+// Service link variables for the namespace's Services. A Service selecting
+// the starting pod points at this node; any other at the first ready address
+// of its Endpoints, with the target ports the Endpoints resolved.
+void collect_service_links(const PodEnvContext& ctx, const std::string& ns, const JsonValue& pod, EnvVars& out) {
     const JsonValue* own_meta = pod.get("metadata");
     const JsonValue* own_labels = own_meta ? own_meta->get("labels") : nullptr;
     const JsonValue* own_spec = pod.get("spec");
 
-    for (const auto& svc : items->arr_val) {
+    std::vector<LinkedService> services;
+    bool others = false;
+    if (!for_each_item(ctx, "/api/v1/namespaces/" + ns + "/services", [&](const JsonValue& svc) {
         const JsonValue* meta = svc.get("metadata");
         const JsonValue* spec = svc.get("spec");
-        if (!meta || !spec) continue;
-        const std::string name = meta->get_string("name", "");
+        if (!meta || !spec) return;
+        LinkedService ls;
+        ls.name = meta->get_string("name", "");
         // Headless and ExternalName Services get no variables, as in Kubernetes
-        if (name.empty() || spec->get_string("clusterIP", "") == "None" || spec->get_string("type", "") == "ExternalName") continue;
+        if (ls.name.empty() || spec->get_string("clusterIP", "") == "None" || spec->get_string("type", "") == "ExternalName") return;
         const JsonValue* sel = spec->get("selector");
         const JsonValue* ports = spec->get("ports");
-        if (!sel || !sel->is_object() || sel->obj_val.empty() || !ports || !ports->is_array() || ports->arr_val.empty()) continue;
+        if (!sel || !sel->is_object() || sel->obj_val.empty() || !ports || !ports->is_array() || ports->arr_val.empty()) return;
         std::vector<std::pair<std::string, std::string>> selector;
         for (const auto& kv : sel->obj_val) {
             if (kv.second.is_string()) selector.emplace_back(kv.first, kv.second.str_val);
         }
-
-        // A backing pod: this one when the Service selects it, else a Running
-        // pod of the namespace the Service selects.
-        std::string host;
-        const JsonValue* backend_spec = nullptr;
-        JsonValue backends;
-        if (labels_match(own_labels, selector)) {
-            host = ctx.node_ip;
-            backend_spec = own_spec;
-        } else {
-            std::string q;
-            for (const auto& kv : selector) q += (q.empty() ? "" : ",") + kv.first + "=" + kv.second;
-            std::string pods_body;
-            // inlineImages=omit: a pod carrying its module inline would make
-            // this list too large for a node without PSRAM
-            if (ctx.api_get("/api/v1/namespaces/" + ns + "/pods?inlineImages=omit&labelSelector=" + url_encode(q), pods_body) != 200) continue;
-            if (!models::parse_json(pods_body, backends, err)) continue;
-            const JsonValue* pitems = backends.get("items");
-            if (!pitems || !pitems->is_array()) continue;
-            for (const auto& p : pitems->arr_val) {
-                const JsonValue* pm = p.get("metadata");
-                const JsonValue* st = p.get("status");
-                if (!pm || !st || !pm->get_string("deletionTimestamp", "").empty()) continue;
-                if (st->get_string("phase", "") != "Running" || st->get_string("podIP", "").empty()) continue;
-                if (!labels_match(pm->get("labels"), selector)) continue;
-                host = st->get_string("podIP", "");
-                backend_spec = p.get("spec");
-                break;
-            }
-        }
-        if (host.empty()) continue;
-
-        std::vector<ResolvedPort> resolved;
+        ls.selects_pod = labels_match(own_labels, selector);
+        if (ls.selects_pod) ls.host = ctx.node_ip;
         for (const auto& p : ports->arr_val) {
             ResolvedPort rp;
             rp.name = p.get_string("name", "");
             rp.protocol = upper(p.get_string("protocol", "TCP"));
-            rp.port = target_port(p, backend_spec);
-            if (rp.port <= 0 || rp.port > 65535) continue;
-            resolved.push_back(std::move(rp));
+            if (ls.selects_pod) rp.port = target_port(p, own_spec);
+            ls.ports.push_back(std::move(rp));
         }
-        add_service_links(out, name, host, resolved);
+        others = others || !ls.selects_pod;
+        services.push_back(std::move(ls));
+    })) return;
+
+    if (others) {
+        for_each_item(ctx, "/api/v1/namespaces/" + ns + "/endpoints", [&](const JsonValue& ep) {
+            const JsonValue* meta = ep.get("metadata");
+            const std::string name = meta ? meta->get_string("name", "") : "";
+            auto it = std::find_if(services.begin(), services.end(), [&](const LinkedService& s) { return s.name == name; });
+            if (it == services.end() || it->selects_pod) return;
+            const JsonValue* subsets = ep.get("subsets");
+            if (!subsets || !subsets->is_array()) return;
+            for (const auto& sub : subsets->arr_val) {
+                const JsonValue* addrs = sub.get("addresses");
+                if (!addrs || !addrs->is_array() || addrs->arr_val.empty()) continue;
+                const std::string ip = addrs->arr_val[0].get_string("ip", "");
+                if (ip.empty()) continue;
+                it->host = ip;
+                const JsonValue* eports = sub.get("ports");
+                for (auto& rp : it->ports) {
+                    if (!eports || !eports->is_array()) break;
+                    for (const auto& e : eports->arr_val) {
+                        if (e.get_string("name", "") == rp.name && upper(e.get_string("protocol", "TCP")) == rp.protocol) {
+                            rp.port = e.get_int("port", 0);
+                            break;
+                        }
+                    }
+                }
+                break;
+            }
+        });
+    }
+
+    for (const auto& ls : services) {
+        if (ls.host.empty()) continue;
+        std::vector<ResolvedPort> resolved;
+        for (const auto& rp : ls.ports) {
+            if (rp.port > 0 && rp.port <= 65535) resolved.push_back(rp);
+        }
+        add_service_links(out, ls.name, ls.host, resolved);
     }
 }
 

@@ -759,6 +759,7 @@ KubePod parse_pod_manifest(const std::string& json_str) {
     const JsonValue* status = doc.get("status");
     if (status && status->is_object()) {
         pod.status = status->get_string("phase", "Pending");
+        pod.phase = pod.status;
         // kubectl's pod printer: a waiting/terminated container reason wins
         // over the phase, and a deletionTimestamp shows as Terminating.
         const JsonValue* cst = status->get("containerStatuses");

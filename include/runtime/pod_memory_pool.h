@@ -48,17 +48,28 @@ size_t kube32_pool_whole_capacity(void);
 /* Nesting counter: while above zero, pod allocations try the general heap
  * first (a pod loading whose linear memory wants the block whole). */
 void  kube32_pool_prefer_general(int on);
-/* Bytes pods hold in the general heap. With a budget set (the host modelling
- * a board's heap), pods may hold at most budget - 16 KiB there. */
+/* Bytes pods hold in the general heap. Pods never take its last 16 KiB
+ * (kube32_pool_system_reserve): on the board that much internal RAM stays
+ * free for the kubelet, Wi-Fi and lwIP; with a budget set (the host
+ * modelling a board's heap) pods may hold at most budget - 16 KiB there. */
 size_t kube32_pool_general_bytes(void);
+size_t kube32_pool_system_reserve(void);
 void  kube32_pool_set_heap_budget(size_t bytes);
 size_t kube32_pool_heap_budget(void);
+/* Bytes a pod whose linear memory is `memory_bytes` could be given now: the
+ * pool block's free part, the general heap above the system reserve and
+ * PSRAM above its stack reserve. *out_capacity (optional) adds what pods
+ * hold already: what the pod could be given with no other pod running. */
+size_t kube32_pool_pod_room(size_t memory_bytes, size_t* out_capacity);
 /* General allocator for the interpreter: external RAM first when present,
  * internal otherwise. Keeps code pages and runtime structures out of the
  * 300 KB internal heap that Wi-Fi and lwIP need. */
 void* kube32_rt_calloc(size_t bytes);
 void* kube32_rt_realloc(void* ptr, size_t bytes);
 void  kube32_rt_free(void* ptr);
+/* Gives back all but the first `bytes` of an allocation without moving it;
+ * 1 when it did (allocations from the pool block's small heap), else 0. */
+int   kube32_rt_shrink(void* ptr, size_t bytes);
 #ifdef __cplusplus
 }
 #endif

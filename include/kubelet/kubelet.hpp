@@ -23,6 +23,7 @@ enum class PodExecutionPhase {
     Running,
     CrashLoopBackOff,
     CreateContainerConfigError,   // env references could not be resolved; retried after next_restart_allowed_ms
+    InsufficientMemory,           // the node cannot give the pod its memory now; retried after next_restart_allowed_ms
     Terminating,
     Completed,
     Failed
@@ -85,6 +86,9 @@ struct KubeletConfig {
     // doubled per consecutive restart up to the maximum, as in Kubernetes.
     uint32_t restart_backoff_initial_ms{10000};
     uint32_t restart_backoff_max_ms{300000};
+    // A pod the node has no memory for yet waits (Pending, InsufficientMemory)
+    // and is admitted again after this long
+    uint32_t memory_retry_ms{5000};
 
     // Task & concurrency configuration
     size_t task_stack_size{65536};
@@ -138,6 +142,9 @@ private:
     // Pod lifecycle actions. `previous` carries restart state when the pod
     // is being restarted after a back-off.
     bool deploy_and_start_pod(const models::KubePod& pod, const std::string& manifest_json, const LocalPodRecord* previous = nullptr);
+    // deploy_and_start_pod, with running out of memory half way turned into
+    // waiting for memory
+    void start_pod_guarded(const models::KubePod& pod, const std::string& manifest_json, const LocalPodRecord* previous);
     // The container ended (exit, trap or failed start): restart it after a
     // back-off when restartPolicy asks for it, otherwise report the pod
     // Succeeded or Failed. Releases the container either way.
@@ -147,6 +154,10 @@ private:
     void handle_pod_failure(LocalPodRecord& rec, const runtime::ContainerStatus& cs);
     void handle_pod_failure(LocalPodRecord& rec, const std::string& exit_msg, int32_t exit_code = 137, const std::string& reason = "ContainerFailed");
     void record_pod_event(const LocalPodRecord& rec, const char* reason, const std::string& message, bool warning);
+    // The pod cannot start for lack of memory now: it stays Pending with the
+    // reason in its container status and is admitted again after
+    // memory_retry_ms. Status and Event go out when it starts waiting.
+    bool wait_for_memory(const std::string& pod_key, LocalPodRecord& rec, const std::string& why, const LocalPodRecord* previous);
     void ship_pod_logs_locked(const std::string& pod_key, LocalPodRecord& rec);
 
     KubeletConfig config_;

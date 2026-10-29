@@ -392,6 +392,11 @@ M3Result       m3_LoadModule (IM3Runtime io_runtime, IM3Module io_module);
 // Optional, compiles all functions in the module
 M3Result       m3_CompileModule (IM3Module io_module);
 
+// Kube32: after m3_CompileModule, returns the unused end of the runtime's
+// code pages to the allocator (when it can shrink them in place) and closes
+// them. Returns the bytes given back.
+uint32_t       m3_TrimCodePages (IM3Runtime io_runtime);
+
 // Calling m3_RunStart is optional
 M3Result       m3_RunStart (IM3Module i_module);
 

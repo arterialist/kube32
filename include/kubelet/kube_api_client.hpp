@@ -31,6 +31,11 @@ public:
     // GET of an API path (ConfigMaps, Secrets, Services, pods by label for the
     // container environment). Returns the HTTP status, 0 when unreachable.
     virtual int get(const std::string& /*path*/, std::string& out_body) { out_body.clear(); return 0; }
+    // GET of a list: each element of its "items" reaches `on_item` as one
+    // JSON text, one at a time. Returns the HTTP status; 0 when the server
+    // could not be reached or the list arrived incomplete. The default reads
+    // the list whole through get().
+    virtual int list_items(const std::string& path, const std::function<void(std::string&&)>& on_item);
     // Module bytes of a pod's inline image (annotation kube32.io/wasm-base64),
     // fetched with the pod and decoded as it streams in. Pod lists leave the
     // annotation's value out (see list_pods_raw).
@@ -57,6 +62,9 @@ public:
     bool push_metrics(const std::string& node_name, const std::string& sample_json) override;
     bool delete_pod(const std::string& ns, const std::string& name) override;
     int get(const std::string& path, std::string& out_body) override;
+    // Splits the list into items as it streams in: the whole response or a
+    // JSON tree of it is never held.
+    int list_items(const std::string& path, const std::function<void(std::string&&)>& on_item) override;
     bool get_pod_image(const std::string& ns, const std::string& name, std::vector<uint8_t>& out, std::string& why) override;
     // Restricts list_pods_raw to pods bound to this node (server-side fieldSelector).
     // The list asks the server to leave inline image annotations empty
@@ -79,7 +87,9 @@ private:
         std::string body;
     };
 
-    HttpResponse send_http_request(const char* method, const std::string& path, const std::string& body);
+    // With keep_body false only the start of the response body is kept (for
+    // error messages): calls whose answer is not used do not hold it.
+    HttpResponse send_http_request(const char* method, const std::string& path, const std::string& body, bool keep_body = true);
     int stream_request(const char* method, const std::string& path, const std::string& body,
                        const std::function<bool(const char*, size_t)>& on_data, long* out_content_length = nullptr);
 

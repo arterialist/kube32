@@ -63,10 +63,16 @@ const char* kServices = R"({"kind":"ServiceList","items":[
    "spec":{"selector":{"app":"nothing-runs"},"ports":[{"port":80}]}}
 ]})";
 
-const char* kEchoPods = R"({"kind":"PodList","items":[
-  {"metadata":{"name":"echo-old","labels":{"app":"echo"},"deletionTimestamp":"2026-01-01T00:00:00Z"},"status":{"phase":"Running","podIP":"10.0.0.9"}},
-  {"metadata":{"name":"echo-pending","labels":{"app":"echo"}},"status":{"phase":"Pending"}},
-  {"metadata":{"name":"echo-1","labels":{"app":"echo"}},"status":{"phase":"Running","podIP":"10.0.0.5"}}
+// As the API server derives them: echo-api's ready pod, a pod of it that is
+// not ready, ports in name order; nothing ready behind idle; the starting
+// pod's own Service, whose Endpoints do not count
+const char* kEndpoints = R"({"kind":"EndpointsList","items":[
+  {"metadata":{"name":"echo-api","namespace":"default"},"subsets":[
+    {"notReadyAddresses":[{"ip":"10.0.0.9"}],"ports":[{"name":"http","port":7001,"protocol":"TCP"}]},
+    {"addresses":[{"ip":"10.0.0.5"}],"ports":[{"name":"metrics","port":9100,"protocol":"UDP"},{"name":"http","port":7000,"protocol":"TCP"}]}]},
+  {"metadata":{"name":"self","namespace":"default"},"subsets":[{"addresses":[{"ip":"10.0.0.8"}],"ports":[{"port":7999,"protocol":"TCP"}]}]},
+  {"metadata":{"name":"headless","namespace":"default"},"subsets":[{"addresses":[{"ip":"10.0.0.5"}],"ports":[{"port":80,"protocol":"TCP"}]}]},
+  {"metadata":{"name":"idle","namespace":"default"},"subsets":[{"notReadyAddresses":[{"ip":"10.0.0.6"}],"ports":[{"port":80,"protocol":"TCP"}]}]}
 ]})";
 
 std::string pod_manifest(const std::string& extra_spec, const std::string& container_extra) {
@@ -91,17 +97,13 @@ void test_expand_env_refs() {
     std::cout << "[PASS] test_expand_env_refs" << std::endl;
 }
 
-void test_service_links() {
-    FakeApi api;
-    api.objects["/api/v1/namespaces/default/services"] = kServices;
-    api.objects["/api/v1/namespaces/default/pods?inlineImages=omit&labelSelector=app%3Decho"] = kEchoPods;
-    api.objects["/api/v1/namespaces/default/pods?inlineImages=omit&labelSelector=app%3Dnothing-runs"] = R"({"items":[]})";
-    PodEnvContext ctx = context_for(api);
+void check_service_links(PodEnvContext& ctx, FakeApi& api) {
     EnvVars env;
     std::string err;
     assert(build_container_env(pod_manifest("", R"(,"env":[{"name":"ECHO_URL","value":"http://$(ECHO_API_SERVICE_HOST):$(ECHO_API_SERVICE_PORT)/echo"},
                                                          {"name":"SELF_SERVICE_PORT","value":"override"}])"), ctx, env, err));
-    // A Running, non-terminating pod backs echo-api; its target ports are advertised
+    // The ready address of echo-api's Endpoints; its target ports are
+    // advertised in the Service's port order
     assert(value_of(env, "ECHO_API_SERVICE_HOST") == "10.0.0.5");
     assert(value_of(env, "ECHO_API_SERVICE_PORT") == "7000");
     assert(value_of(env, "ECHO_API_SERVICE_PORT_HTTP") == "7000");
@@ -130,6 +132,40 @@ void test_service_links() {
     assert(build_container_env(pod_manifest(R"(,"enableServiceLinks":false)", ""), ctx, env, err));
     assert(!has(env, "ECHO_API_SERVICE_HOST") && has(env, "KUBERNETES_SERVICE_HOST"));
     assert(api.requested.empty());
+}
+
+void test_service_links() {
+    FakeApi api;
+    api.objects["/api/v1/namespaces/default/services"] = kServices;
+    api.objects["/api/v1/namespaces/default/endpoints"] = kEndpoints;
+    PodEnvContext ctx = context_for(api);
+    check_service_links(ctx, api);
+
+    // Lists read item by item (the kubelet streams them): the same variables
+    // from two list requests, Services and Endpoints
+    size_t items = 0;
+    ctx.api_list = [&api, &items](const std::string& path, const std::function<void(std::string&&)>& on_item) {
+        std::string body;
+        const int status = api.get(path, body);
+        models::JsonValue list;
+        std::string perr;
+        if (status != 200 || !models::parse_json(body, list, perr)) return status;
+        for (const auto& item : list.get("items")->arr_val) { ++items; on_item(item.to_string()); }
+        return status;
+    };
+    api.requested.clear();
+    check_service_links(ctx, api);
+    assert(items == 8);
+
+    // Only Services selecting the starting pod: the Endpoints are not read
+    api.objects["/api/v1/namespaces/default/services"] = R"({"items":[
+      {"metadata":{"name":"self"},"spec":{"selector":{"app":"me"},"ports":[{"port":80,"targetPort":"web"}]}}]})";
+    api.requested.clear();
+    EnvVars env;
+    std::string err;
+    assert(build_container_env(pod_manifest("", ""), ctx, env, err));
+    assert(value_of(env, "SELF_SERVICE_HOST") == "10.0.0.7" && value_of(env, "SELF_SERVICE_PORT") == "7000");
+    assert(api.requested.size() == 1 && api.requested[0] == "/api/v1/namespaces/default/services");
     std::cout << "[PASS] test_service_links" << std::endl;
 }
 

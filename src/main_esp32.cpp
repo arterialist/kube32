@@ -689,7 +689,9 @@ void cluster_task(void* pv) {
         kube32_pool_reserve_stack(40960);
         size_t interp_size = kube32_pool_stack_size();
         kube32_interp_stack_set(kube32_pool_stack_alloc(interp_size), interp_size);
-        kube32::runtime::AppPodHost::instance().set_event_thread_stack(6144, false);
+        // Events reach k32_event the way ticks reach k32_tick, on the shared
+        // stack: the event thread needs no more stack than the tick thread
+        kube32::runtime::AppPodHost::instance().set_event_thread_stack(4096, false);
         kube32::runtime::PodLogStore::runtime().set_ring_capacity(1024);   // 300 KB SRAM: a short log per pod
     } else {
         // Keep the largest PSRAM block whole for a big data pod (20 Wasm pages

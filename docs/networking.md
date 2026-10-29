@@ -26,11 +26,11 @@ The API server computes read-only `core/v1` `Endpoints` and `discovery.k8s.io/v1
 
 When a pod starts, the kubelet injects environment variables for every Service in the same namespace that has a selector, unless the Service sets `clusterIP: None` or `type: ExternalName`, or the pod spec sets `enableServiceLinks: false`. Every pod also receives `KUBERNETES_SERVICE_HOST` and `KUBERNETES_SERVICE_PORT` for the API server, even when `enableServiceLinks` is `false`.
 
-For a Service named `<svc>` with uppercase underscore prefix `<SVC>`, the host is the `podIP` of a `Running` pod selected by the Service, or the local node IP when the Service selects the starting pod itself. The port is the resolved target port:
+For a Service named `<svc>` with uppercase underscore prefix `<SVC>`, the host is the first ready address in the Service's `Endpoints`, or the local node IP when the Service selects the starting pod itself. The port is the resolved target port. The kubelet reads the Services and Endpoints of the namespace as two lists and parses them one item at a time:
 
 | Variable | Value |
 | --- | --- |
-| `<SVC>_SERVICE_HOST` | Backing pod IP |
+| `<SVC>_SERVICE_HOST` | Ready backing pod IP |
 | `<SVC>_SERVICE_PORT` | First resolved target port |
 | `<SVC>_SERVICE_PORT_<NAME>` | Resolved target port for the named Service port |
 | `<SVC>_PORT` | `<proto>://<host>:<port>` for the first port |

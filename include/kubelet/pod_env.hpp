@@ -16,10 +16,13 @@
 //
 // Service addresses: there is no ClusterIP or service proxy, and a pod's IP is
 // the address of the node running it, where the node's pod HTTP server answers
-// on the Service's target port. So <NAME>_SERVICE_HOST is the IP of a Running
-// pod the Service selects (this node's IP when the starting pod is selected
-// itself) and the port variables carry the resolved target ports. A Service
-// whose pods are not running yet gets no variables.
+// on the Service's target port. So <NAME>_SERVICE_HOST is the first ready
+// address of the Service's Endpoints (this node's IP when the starting pod is
+// selected itself) and the port variables carry the resolved target ports. A
+// Service without a ready pod yet gets no variables.
+//
+// Services and Endpoints are read as lists of items; with api_list each item
+// is parsed on its own, so a node never holds a whole list or its JSON tree.
 
 #include <cstdint>
 #include <functional>
@@ -35,6 +38,11 @@ struct PodEnvContext {
     // GET <path> on the API server: returns the HTTP status (0 when the server
     // cannot be reached) and fills the body.
     std::function<int(const std::string& path, std::string& body)> api_get;
+    // GET of a list at <path>, its items handed to `on_item` one at a time as
+    // JSON texts: returns the HTTP status (0 when the server cannot be reached
+    // or the list arrived incomplete). Lists are read through api_get when
+    // this is not set.
+    std::function<int(const std::string& path, const std::function<void(std::string&&)>& on_item)> api_list;
     std::string node_name;
     std::string node_ip;      // this node: the starting pod's IP and hostIP
     std::string api_host;     // the API server as pods address it

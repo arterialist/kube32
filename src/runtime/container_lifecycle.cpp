@@ -297,8 +297,24 @@ bool ContainerLifecycleController::deploy(const uint8_t* wasm_bytes, size_t len)
     link_host_functions(module, config_.pod_id);
     link_app_host_functions(module, config_.pod_id);
 
-    // Optional pre-compile
-    m3_CompileModule(module);
+    // Every function is compiled now, so the pod's code is in place before it
+    // runs: a module that does not fit fails here, cleanly, instead of in a
+    // later call. A function that does not compile for another reason fails
+    // when it is called, as before.
+    r = m3_CompileModule(module);
+    if (r == m3Err_mallocFailed || r == m3Err_mallocFailedCodePage) {
+        status_.phase = ContainerPhase::Failed;
+        status_.exit_message = std::string("Wasm compile error: ") + r;
+#if defined(ESP_PLATFORM)
+        status_.exit_message += " (free heap " + std::to_string(heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT)) +
+                                ", largest block " + std::to_string(heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT)) +
+                                ", pod pool " + std::to_string(kube32_pool_available(nullptr)) + ")";
+#endif
+        cleanup_runtime();
+        return false;
+    }
+    // The last code page is cut to what the module needs
+    m3_TrimCodePages(reinterpret_cast<IM3Runtime>(m3_runtime_));
 
     size_t mem_size = m3_GetMemorySize(module, 0);
     status_.memory_used_bytes = static_cast<uint32_t>(mem_size);

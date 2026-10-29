@@ -2,6 +2,7 @@
 #include "osal/socket.hpp"
 #include "models/kube_models.hpp"
 
+#include <algorithm>
 #include <sstream>
 #include <iostream>
 #include <cstring>
@@ -265,10 +266,15 @@ int HttpKubeClient::stream_request(const char* method, const std::string& path, 
     return status;
 }
 
-HttpKubeClient::HttpResponse HttpKubeClient::send_http_request(const char* method, const std::string& path, const std::string& body) {
+HttpKubeClient::HttpResponse HttpKubeClient::send_http_request(const char* method, const std::string& path, const std::string& body, bool keep_body) {
     HttpResponse resp;
     bool too_big = false;
     resp.status_code = stream_request(method, path, body, [&](const char* data, size_t len) {
+        if (!keep_body) {
+            constexpr size_t kKept = 160;
+            if (resp.body.size() < kKept) resp.body.append(data, std::min(len, kKept - resp.body.size()));
+            return true;
+        }
         if (max_body_ && resp.body.size() + len > max_body_) {
             too_big = true;
             return false;
@@ -286,7 +292,7 @@ HttpKubeClient::HttpResponse HttpKubeClient::send_http_request(const char* metho
 
 bool HttpKubeClient::register_node(const std::string& node_json, bool& out_conflict) {
     out_conflict = false;
-    HttpResponse resp = send_http_request("POST", "/api/v1/nodes", node_json);
+    HttpResponse resp = send_http_request("POST", "/api/v1/nodes", node_json, false);
     if (resp.status_code == 201) {
         return true;
     }
@@ -298,7 +304,7 @@ bool HttpKubeClient::register_node(const std::string& node_json, bool& out_confl
 }
 
 bool HttpKubeClient::patch_node_status(const std::string& node_name, const std::string& patch_json) {
-    HttpResponse resp = send_http_request("PATCH", "/api/v1/nodes/" + node_name, patch_json);
+    HttpResponse resp = send_http_request("PATCH", "/api/v1/nodes/" + node_name, patch_json, false);
     if (resp.status_code != 200) {
         std::cout << "[KUBELET] node status patch failed: http " << resp.status_code
                   << (resp.body.empty() ? std::string() : " " + resp.body.substr(0, 120)) << std::endl;
@@ -316,12 +322,12 @@ bool HttpKubeClient::renew_node_lease(const std::string& node_name, uint32_t dur
                              "\"leaseDurationSeconds\":" + std::to_string(duration_sec) +
                              (renew_time_iso8601.empty() ? std::string() : ",\"renewTime\":\"" + renew_time_iso8601 + "\"") + "}}";
 
-    HttpResponse resp = send_http_request("PUT", path, lease_json);
+    HttpResponse resp = send_http_request("PUT", path, lease_json, false);
     if (resp.status_code == 200 || resp.status_code == 201) {
         return true;
     }
     if (resp.status_code == 404) {
-        HttpResponse post_resp = send_http_request("POST", "/apis/coordination.k8s.io/v1/namespaces/kube-node-lease/leases", lease_json);
+        HttpResponse post_resp = send_http_request("POST", "/apis/coordination.k8s.io/v1/namespaces/kube-node-lease/leases", lease_json, false);
         return post_resp.status_code == 200 || post_resp.status_code == 201;
     }
     return false;
@@ -451,23 +457,42 @@ private:
 
 } // namespace
 
+int KubeApiClient::list_items(const std::string& path, const std::function<void(std::string&&)>& on_item) {
+    std::string body;
+    const int status = get(path, body);
+    if (status != 200) return status;
+    models::JsonValue list;
+    std::string err;
+    if (!models::parse_json(body, list, err) || !list.is_object()) return 0;
+    std::string().swap(body);
+    if (const models::JsonValue* items = list.get("items"); items && items->is_array()) {
+        for (const auto& item : items->arr_val) on_item(item.to_string());
+    }
+    return status;
+}
+
+int HttpKubeClient::list_items(const std::string& path, const std::function<void(std::string&&)>& on_item) {
+    ListItemSplitter splitter([&](std::string&& item) { on_item(std::move(item)); });
+    const int status = stream_request("GET", path, "", [&](const char* data, size_t len) {
+        splitter.feed(data, len);
+        return true;
+    });
+    return (status == 200 && !splitter.complete()) ? 0 : status;
+}
+
 bool HttpKubeClient::list_pods_raw(std::vector<std::pair<models::KubePod, std::string>>& out_pods_with_manifest) {
     std::string path = node_filter_.empty() ? std::string("/api/v1/pods?inlineImages=omit")
                                             : ("/api/v1/pods?fieldSelector=spec.nodeName%3D" + node_filter_ + "&inlineImages=omit");
     bool unreadable = false;
-    ListItemSplitter splitter([&](std::string&& item) {
+    const int status = list_items(path, [&](std::string&& item) {
         models::KubePod pod = models::parse_pod_manifest(item);
         // An item that does not parse (out of memory) must not read as a pod gone
         if (pod.name.empty()) unreadable = true;
         out_pods_with_manifest.emplace_back(std::move(pod), std::move(item));
     });
-    int status = stream_request("GET", path, "", [&](const char* data, size_t len) {
-        splitter.feed(data, len);
-        return true;
-    });
     // A list cut short (connection lost, node out of memory) is no list: the
     // pods missing from it must not be taken as deleted
-    if (status != 200 || !splitter.complete() || unreadable) {
+    if (status != 200 || unreadable) {
         out_pods_with_manifest.clear();
         return false;
     }
@@ -511,13 +536,13 @@ bool HttpKubeClient::get_pod_image(const std::string& ns, const std::string& nam
 
 bool HttpKubeClient::patch_pod_status(const std::string& ns, const std::string& name, const std::string& status_patch_json) {
     std::string path = "/api/v1/namespaces/" + ns + "/pods/" + name + "/status";
-    HttpResponse resp = send_http_request("PATCH", path, status_patch_json);
+    HttpResponse resp = send_http_request("PATCH", path, status_patch_json, false);
     if (resp.status_code == 200) {
         return true;
     }
     // Also try PUT if PATCH returns 405
     if (resp.status_code == 405) {
-        resp = send_http_request("PUT", path, status_patch_json);
+        resp = send_http_request("PUT", path, status_patch_json, false);
         return resp.status_code == 200;
     }
     return false;
@@ -525,12 +550,12 @@ bool HttpKubeClient::patch_pod_status(const std::string& ns, const std::string& 
 
 
 bool HttpKubeClient::create_event(const std::string& ns, const std::string& event_json) {
-    HttpResponse resp = send_http_request("POST", "/api/v1/namespaces/" + ns + "/events", event_json);
+    HttpResponse resp = send_http_request("POST", "/api/v1/namespaces/" + ns + "/events", event_json, false);
     return resp.status_code == 201 || resp.status_code == 200;
 }
 
 bool HttpKubeClient::push_pod_logs(const std::string& ns, const std::string& name, const std::string& ndjson) {
-    HttpResponse resp = send_http_request("POST", "/api/v1/namespaces/" + ns + "/pods/" + name + "/log", ndjson);
+    HttpResponse resp = send_http_request("POST", "/api/v1/namespaces/" + ns + "/pods/" + name + "/log", ndjson, false);
     return resp.status_code == 200;
 }
 
@@ -541,12 +566,12 @@ int HttpKubeClient::get(const std::string& path, std::string& out_body) {
 }
 
 bool HttpKubeClient::delete_pod(const std::string& ns, const std::string& name) {
-    HttpResponse resp = send_http_request("DELETE", "/api/v1/namespaces/" + ns + "/pods/" + name + "?gracePeriodSeconds=0", "");
+    HttpResponse resp = send_http_request("DELETE", "/api/v1/namespaces/" + ns + "/pods/" + name + "?gracePeriodSeconds=0", "", false);
     return resp.status_code == 200 || resp.status_code == 404;
 }
 
 bool HttpKubeClient::push_metrics(const std::string& node_name, const std::string& sample_json) {
-    HttpResponse resp = send_http_request("POST", "/apis/metrics.k8s.io/v1beta1/nodes/" + node_name, sample_json);
+    HttpResponse resp = send_http_request("POST", "/apis/metrics.k8s.io/v1beta1/nodes/" + node_name, sample_json, false);
     return resp.status_code == 200;
 }
 

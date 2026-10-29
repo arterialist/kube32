@@ -235,6 +235,34 @@ void test_kubelet_differential_pod_sync() {
     std::cout << "[PASS] test_kubelet_differential_pod_sync" << std::endl;
 }
 
+// The pod is deleted and created again under the same name before this node
+// saw the deletion: the old container stops and the new pod starts
+void test_kubelet_recreated_pod_replaces_old() {
+    KubeletConfig cfg;
+    cfg.node_name = "test-node-01";
+    auto wasm_rt = kube32::runtime::create_wasm_runtime();
+    auto mock_client = std::make_unique<MockKubeClient>();
+    MockKubeClient* client_ref = mock_client.get();
+    auto manifest = [](const std::string& uid) {
+        return R"({"metadata":{"name":"sensor-app","namespace":"default","uid":")" + uid + R"("},
+                   "spec":{"nodeName":"test-node-01","containers":[{"name":"reader","image":"wasm://sensor"}]}})";
+    };
+    client_ref->mock_pods.emplace_back(parse_pod_manifest(manifest("uid-old")), manifest("uid-old"));
+    Kubelet kubelet(cfg, *wasm_rt, std::move(mock_client));
+    kubelet.sync_assigned_pods();
+    LocalPodRecord rec;
+    assert(kubelet.get_pod_record("default/sensor-app", rec) && rec.uid == "uid-old" && rec.execution_phase == PodExecutionPhase::Running);
+
+    client_ref->mock_pods.clear();
+    client_ref->mock_pods.emplace_back(parse_pod_manifest(manifest("uid-new")), manifest("uid-new"));
+    client_ref->last_pod_status_patch.clear();
+    kubelet.sync_assigned_pods();
+    assert(kubelet.get_pod_record("default/sensor-app", rec) && rec.uid == "uid-new" && rec.execution_phase == PodExecutionPhase::Running);
+    assert(rec.restart_count == 0);
+    assert(client_ref->last_pod_status_patch.find("\"phase\":\"Running\"") != std::string::npos);
+    std::cout << "[PASS] test_kubelet_recreated_pod_replaces_old" << std::endl;
+}
+
 void test_kubelet_thread_lifecycle() {
     KubeletConfig cfg;
     cfg.node_name = "thread-node-01";
@@ -599,6 +627,7 @@ int main() {
     test_node_status_reporter();
     test_kubelet_mock_registration_and_heartbeat();
     test_kubelet_differential_pod_sync();
+    test_kubelet_recreated_pod_replaces_old();
     test_kubelet_thread_lifecycle();
     test_kubelet_capability_admission_rejection();
     test_kubelet_dynamic_trap_status_reporting();

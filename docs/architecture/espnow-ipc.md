@@ -12,14 +12,14 @@ Pods exchange messages across `src/ipc/channel.cpp` over ESP-NOW and UDP port 74
 | `kube32_channel_send(handle, data, len)` | Delivers to the local queue only | Open handle |
 | `k32_event(topic_ptr, topic_len, ptr, len)` | Receives topics listed in `kube32.io/event-topics` | `k32_event` and `k32_alloc` exports |
 
-Set the pod annotation `kube32.io/event-topics: a,b` to deliver channel topics from any node to the pod's `k32_event` export. Messages queue up to 16 entries and run on the `k32_events` thread, which uses a 16 KiB internal RAM stack or a 32 KiB PSRAM stack. In the `tessera` app, `tessera-hud` publishes keystrokes with `k32_event_emit("tessera.input", ...)` and reads `tessera.events` with `kube32_channel_open` and `kube32_channel_recv`. `tessera-api` subscribes to `tessera.input` via `kube32.io/event-topics` and publishes updates on `tessera.events`, which the Ingress streams as Server-Sent Events via `kube32.io/event-stream`.
+Set the pod annotation `kube32.io/event-topics: a,b` to deliver channel topics from any node to the pod's `k32_event` export. Messages queue up to 16 entries and run on the `k32_events` thread, which uses an 8 KiB PSRAM stack, or 4 KiB of internal RAM on boards without PSRAM. Its calls into pods run on the shared interpreter stack. In the `tessera` app, `tessera-hud` publishes keystrokes with `k32_event_emit("tessera.input", ...)` and reads `tessera.events` with `kube32_channel_open` and `kube32_channel_recv`. `tessera-api` subscribes to `tessera.input` via `kube32.io/event-topics` and publishes updates on `tessera.events`, which the Ingress streams as Server-Sent Events via `kube32.io/event-stream`.
 
 ## Limits
 
 | Item | Limit |
 | --- | --- |
 | `k32_event_emit` payload | 200 bytes; topic 1 to 64 bytes |
-| `k32_events` queue | 16 messages; stack 16 KiB internal RAM or 32 KiB PSRAM, 256 KiB on the simulator |
+| `k32_events` queue | 16 messages; stack 8 KiB PSRAM or 4 KiB internal RAM, 256 KiB on the simulator |
 | Published message | 1024 bytes, split into 224-byte payload frames |
 | Reassembly | 32 fragments, 500 ms timeout, 8 messages in flight |
 | Receive queue per channel | 8 slots of 512 bytes on hardware; 16 slots of 1024 bytes on the simulator |

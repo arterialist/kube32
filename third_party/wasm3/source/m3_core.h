@@ -323,6 +323,9 @@ void* m3_Realloc_Impl (void* i_ptr, size_t i_newSize, size_t i_oldSize);
 // Kube32: linear memory, which may come from the pod pool (pod_memory_pool.h)
 void* m3_ReallocLinear_Impl (void* i_ptr, size_t i_newSize, size_t i_oldSize);
 void  m3_Free_Impl (void* i_ptr);
+// Kube32: gives back all but the first i_size bytes of an allocation without
+// moving it; false when the allocator cannot
+bool  m3_Shrink_Impl (void* i_ptr, size_t i_size);
 void* m3_CopyMem (const void* i_from, size_t i_size);
 
 #if d_m3LogHeapOps
