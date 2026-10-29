@@ -62,24 +62,22 @@ Profile commands write to the `k32` NVS namespace, return `K32_OK ..., rebooting
 
 ### HTTP over the console
 
-Send an HTTP request with `Connection: close` over the serial console:
+`tools/kube32_serial_gateway.py` carries HTTP over the console in streams (`include/app/console_relay.hpp`). Host lines end with `\n` only. Board frames start with the byte `0x1e` and the board writes each frame as a single unit. Log output can surround a frame, but it never splits one. CRCs use CRC-32 (zlib) in hexadecimal.
 
-```
-K32_HTTP <port> <length> [<crc32 hex>]\n<length bytes of HTTP request>
-```
+| From | Frame | Effect |
+| --- | --- | --- |
+| Host | `K32_RESET` | Ends every stream. The board answers `K32_READY <streams> <role>`. |
+| Host | `K32_OPEN <id> <port> <length> <crc32>\n<request>` | Opens stream `<id>` and sends an HTTP request under 64 KiB with `Connection: close` to `<port>` on the control plane. A worker forwards the request over Wi-Fi. |
+| Board | `K32_DATA <id> <length> <crc32>\n<bytes>` | Carries the next bytes of the response. |
+| Board | `K32_END <id> <0\|1>` | Ends the response: `0` when complete, `1` when cut short. |
+| Host | `K32_CLOSE <id>` | Indicates that the client closed the connection. The board closes its connection. |
+| Board | `K32_ERR crc <id>` | Indicates a request CRC mismatch. The host resends the request. |
 
-The control plane replays the request against its local port and returns `K32_RESP <length>\n<raw response>`, or `K32_ERR crc` on a CRC mismatch. A worker forwards the request to the control plane. Requests are capped at 64 KiB and responses at 256 KiB.
+A board with PSRAM runs up to 10 streams at once. A board without PSRAM runs up to 2. The board answers `503` when the host opens a stream beyond the limit. If the server sends nothing on a stream for 5 minutes, the board ends the stream with `K32_END <id> 1`.
 
-Run `tools/kube32_serial_gateway.py` to forward local TCP ports 6443 and 8080 to board ports 6443 and 80 over USB:
+`K32_HTTP <port> <length> [<crc32>]\n<request>` sends a single request. The board returns `K32_RESP <length>\n<raw response>` when the response finishes, or `K32_ERR crc` on a CRC mismatch. The board caps responses at 256 KiB.
 
-```
-python3 tools/kube32_serial_gateway.py --port <serial port>
-kubectl --server http://127.0.0.1:6443 get pods
-```
-
-### Limitations
-
-- `tools/kube32_serial_gateway.py` handles one request at a time after connection close, so watches, `kubectl logs -f`, and k9s require a network connection.
+Opening a native USB-Serial/JTAG or CH340 port with RTS high and DTR low resets the board. Clear RTS before DTR, as `tools/kube32_serial_gateway.py` does.
 
 ## Troubleshooting
 

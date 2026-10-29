@@ -60,6 +60,9 @@ jobs:
         run: |
           rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal --target wasm32-unknown-unknown
           rustup default "$RUST_TOOLCHAIN"
+      # The serial gateway tests drive it over a pseudo-terminal
+      - name: Install pyserial
+        run: python3 -m pip install pyserial==3.5
       - name: unittest
         run: python3 -m unittest discover -s tools/tests -v
 

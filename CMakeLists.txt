@@ -149,6 +149,7 @@ else()
         src/app/pod_server.cpp
         src/app/service_client.cpp
         src/app/node_storage_api.cpp
+        src/app/console_relay.cpp
         src/kubelet/node_status_reporter.cpp
         src/kubelet/metrics_provider.cpp
         src/kubelet/kube_api_client.cpp
@@ -464,6 +465,13 @@ else()
     )
     target_link_libraries(test_patch PRIVATE kube32_core)
     add_test(NAME test_patch COMMAND test_patch)
+
+    # HTTP streams over the serial console
+    add_executable(test_console_relay
+        tests/test_console_relay.cpp
+    )
+    target_link_libraries(test_console_relay PRIVATE kube32_core)
+    add_test(NAME test_console_relay COMMAND test_console_relay)
 
 endif()
 

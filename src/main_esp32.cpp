@@ -40,6 +40,7 @@
 #include "app/pod_server.hpp"
 #include "app/service_client.hpp"
 #include "app/node_storage_api.hpp"
+#include "app/console_relay.hpp"
 #include "api/node_proxy.hpp"
 #include "kubelet/kube_api_client.hpp"
 #include "osal/thread.hpp"
@@ -239,15 +240,26 @@ struct Console {
     }
     void write(const char* data, size_t len) {
         if (last_from_usb || !uart_enabled) {
+            // The driver takes a write whole or not at all, and never one
+            // larger than its TX ring
             size_t off = 0;
             while (off < len) {
-                int n = usb_serial_jtag_write_bytes(data + off, len - off, pdMS_TO_TICKS(200));
+                size_t part = len - off < 1024 ? len - off : 1024;
+                int n = usb_serial_jtag_write_bytes(data + off, part, pdMS_TO_TICKS(200));
                 if (n <= 0) break;
                 off += static_cast<size_t>(n);
             }
         } else {
             uart_write_bytes(UART_NUM_0, data, len);
         }
+    }
+    // One frame in one driver write: log output can surround it but never
+    // split it. The frame must fit the TX ring (4096 or 2048 bytes on USB).
+    bool write_frame(const char* data, size_t len, uint32_t timeout_ms) {
+        if (last_from_usb || !uart_enabled) {
+            return usb_serial_jtag_write_bytes(data, len, pdMS_TO_TICKS(timeout_ms)) == static_cast<int>(len);
+        }
+        return uart_write_bytes(UART_NUM_0, data, len) == static_cast<int>(len);
     }
 };
 
@@ -261,6 +273,7 @@ static std::string s_journal_location;                         // control plane:
 static bool s_api_token_set = false;
 static kube32::osal::TlsServer* s_tls = nullptr;               // control plane: the API server's certificate
 static kube32::api::HttpServer* s_ingress_server = nullptr;
+static std::unique_ptr<kube32::app::ConsoleRelay> s_relay;     // streams for tools/kube32_serial_gateway.py
 std::string loopback_http(uint16_t port, const std::string& request) {
     std::string response;
     kube32::osal::Socket sock;
@@ -384,6 +397,7 @@ static uint32_t crc32_bytes(const uint8_t* p, size_t n) {
 }
 
 // Console protocol (line oriented, binary-safe payloads):
+//   K32_RESET, K32_OPEN, K32_CLOSE: concurrent streamed HTTP (include/app/console_relay.hpp)
 //   K32_HTTP <port> <len> [crc32hex]\n<len bytes of HTTP request> -> K32_RESP <len>\n<bytes>
 //   A CRC mismatch answers K32_ERR crc so the gateway can resend.
 //   K32_CMD:STATUS                                       -> telemetry line
@@ -399,6 +413,23 @@ void console_task(void* arg) {
     NodeIdentity& ident = *ctx->second;
     std::string line;
     char rx[256];
+    // The `len` bytes after a frame header: what rx holds past index i, then
+    // further reads of exactly the bytes still missing. Leaves i on the last
+    // byte taken from rx, so a frame that follows in the same read is kept.
+    auto read_payload = [&](int& i, int n, size_t len) {
+        std::string data;
+        data.reserve(len);
+        int j = i + 1;
+        while (j < n && data.size() < len) data.push_back(rx[j++]);
+        i = j - 1;
+        uint32_t waited = 0;
+        while (data.size() < len && waited < 5000) {
+            size_t want = len - data.size();
+            int m = con.read(rx, want < sizeof(rx) ? want : sizeof(rx), 100);
+            if (m > 0) data.append(rx, static_cast<size_t>(m)); else waited += 100;
+        }
+        return data;
+    };
     while (true) {
         int n = con.read(rx, sizeof(rx), 50);
         if (n <= 0) continue;
@@ -409,20 +440,21 @@ void console_task(void* arg) {
                 continue;
             }
             if (line.empty()) continue;
-            if (line.rfind("K32_HTTP ", 0) == 0) {
+            if (line == "K32_RESET") {
+                s_relay->reset();
+            } else if (line.rfind("K32_OPEN ", 0) == 0) {
+                unsigned id = 0, port = 0, len = 0, crc = 0;
+                if (sscanf(line.c_str() + 9, "%u %u %u %x", &id, &port, &len, &crc) == 4 && len > 0 && len < 64 * 1024) {
+                    std::string req = read_payload(i, n, len);
+                    s_relay->open(id, static_cast<uint16_t>(port), std::move(req), crc);
+                }
+            } else if (line.rfind("K32_CLOSE ", 0) == 0) {
+                s_relay->close(static_cast<uint32_t>(strtoul(line.c_str() + 10, nullptr, 10)));
+            } else if (line.rfind("K32_HTTP ", 0) == 0) {
                 unsigned port = 0, len = 0, crc = 0;
                 int fields = sscanf(line.c_str() + 9, "%u %u %x", &port, &len, &crc);
                 if (fields >= 2 && len > 0 && len < 64 * 1024) {
-                    std::string req;
-                    req.reserve(len);
-                    // Bytes left in rx after the newline belong to the payload
-                    for (int j = i + 1; j < n && req.size() < len; ++j) req.push_back(rx[j]);
-                    i = n;
-                    uint32_t waited = 0;
-                    while (req.size() < len && waited < 5000) {
-                        int m = con.read(rx, sizeof(rx) < (len - req.size()) ? sizeof(rx) : (len - req.size()), 100);
-                        if (m > 0) req.append(rx, static_cast<size_t>(m)); else waited += 100;
-                    }
+                    std::string req = read_payload(i, n, len);
                     if (fields == 3 && crc32_bytes(reinterpret_cast<const uint8_t*>(req.data()), req.size()) != crc) {
                         con.write("K32_ERR crc\n", 12);
                         line.clear();
@@ -1237,6 +1269,20 @@ void cluster_task(void* pv) {
     console.init(ident.has_display);   // USB-Serial-JTAG on the display board, UART0 (CH340) on the devkit
     if (!ident.is_control_plane) s_forward_host = api_host;   // workers relay console HTTP to the control plane
     if (ingress) s_ingress_server = ingress->server();
+    {
+        kube32::app::ConsoleRelayOptions ro;
+        ro.host = s_forward_host;
+        ro.role = ident.is_control_plane ? "control-plane" : "worker";
+        // An idle stream (an event stream or a watch) costs a socket; the
+        // ingress takes 6 event streams and the API server 8 watches
+        ro.slots = ident.has_psram ? 10 : 2;
+        ro.chunk = ident.has_psram ? 2048 : 768;   // a DATA frame fits the 4096 or 2048-byte TX ring
+        ro.stack_size = ident.has_psram ? 6144 : 5120;
+        ro.stack_in_psram = ident.has_psram;
+        s_relay = std::make_unique<kube32::app::ConsoleRelay>(ro, [](const char* data, size_t len) {
+            return console.write_frame(data, len, 2000);
+        });
+    }
     static std::pair<Console*, NodeIdentity*> console_ctx(&console, &ident);
     xTaskCreatePinnedToCore(console_task, "k32_console", 4096, &console_ctx, 4, nullptr, 0);
 

@@ -76,6 +76,7 @@ set(KUBE32_APP_SRCS
     app/pod_server.cpp
     app/service_client.cpp
     app/node_storage_api.cpp
+    app/console_relay.cpp
     embedded/embedded_blobs_esp.cpp
     scheduler/scheduler.cpp
     storage/littlefs_journal.cpp

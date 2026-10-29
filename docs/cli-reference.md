@@ -88,19 +88,19 @@ scripts/flash.sh <serial port> [baud]
 
 ## kube32_serial_gateway.py
 
-Requires `pyserial`. Listens on local TCP ports and relays each HTTP request over the USB console using `K32_HTTP` framing, see [HTTP over the console](flashing-troubleshooting.md#http-over-the-console):
+Requires `pyserial`. Listens on local TCP ports and relays each connection to a board as a stream over the USB console. See [HTTP over the console](flashing-troubleshooting.md#http-over-the-console). Streams run concurrently, so watches, `kubectl logs -f`, k9s, and Server-Sent Events run alongside other requests.
 
 ```
 python3 tools/kube32_serial_gateway.py [--port <serial port>] [--map <local>:<device>]...
 ```
 
-- Without `--port`, checks `KUBE32_SERIAL_PORT`, then native USB-Serial/JTAG, vendor ID `0x303a`, then CH340, vendor ID `0x1a86`.
-- Default port mappings are `6443:6443` for the API server and `8080:80` for the ingress.
-- Connects to any node; a worker forwards relayed requests to the control plane over Wi-Fi.
-
-### Limitations
-
-- Relays one request at a time after connection close; watches, `kubectl logs -f`, and k9s do not work over the serial gateway.
+- Without `--port`, the gateway reads `KUBE32_SERIAL_PORT`, or queries each native USB-Serial/JTAG device (vendor ID `0x303a`) and CH340 bridge (vendor ID `0x1a86`) for its role and selects the control plane.
+- Default port mappings are `6443:6443` for the API server and `8080:80` for the ingress, on `127.0.0.1`.
+- A worker forwards streams to the control plane over Wi-Fi.
+- The gateway opens the port without resetting the board.
+- The gateway prints device output to stdout and sends lines from stdin to the console, such as `K32_CMD:STATUS`.
+- When the board restarts, the gateway ends open streams and holds new requests until the board answers again. When the port disappears, the gateway reopens it.
+- The gateway answers `411` to requests with a chunked body and `413` to requests of 60 KiB or more.
 
 ## tessera_loadtest.py
 
