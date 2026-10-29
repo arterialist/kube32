@@ -284,6 +284,7 @@ int Thread::get_current_core() {
 #else // Host POSIX implementation
 
 #include <pthread.h>
+#include <cstdio>
 #include <chrono>
 #include <thread>
 #include <cstring>
@@ -374,7 +375,11 @@ bool Thread::start(EntryFn entry, void* arg, const Config& config) {
         min_stack = std::max(min_stack, static_cast<size_t>(PTHREAD_STACK_MIN));
 #endif
         size_t actual_stack = std::max(config.stack_size, min_stack);
-        pthread_attr_setstacksize(&attr, actual_stack);
+        int src = pthread_attr_setstacksize(&attr, actual_stack);
+        if (src != 0) {
+            std::fprintf(stderr, "[OSAL] thread %s: stack size %zu rejected: %s\n",
+                         impl_->name_buf, actual_stack, std::strerror(src));
+        }
     }
 
     int rc = pthread_create(&impl_->handle, &attr, Impl::posix_trampoline, impl_);
@@ -385,6 +390,7 @@ bool Thread::start(EntryFn entry, void* arg, const Config& config) {
         impl_->joinable = true;
         return true;
     }
+    std::fprintf(stderr, "[OSAL] thread %s could not be created: %s\n", impl_->name_buf, std::strerror(rc));
     return false;
 }
 

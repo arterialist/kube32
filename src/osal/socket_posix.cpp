@@ -2,6 +2,7 @@
 #include "osal/tls.hpp"
 #include <cerrno>
 #include <cstring>
+#include <cstdio>
 
 #if defined(ESP_PLATFORM)
 #include <lwip/sockets.h>
@@ -68,7 +69,11 @@ bool Socket::bind(const char* ip, uint16_t port) {
     } else {
         if (inet_pton(AF_INET, ip, &addr.sin_addr) <= 0) return false;
     }
-    return (::bind(fd_, reinterpret_cast<struct sockaddr*>(&addr), sizeof(addr)) == 0);
+    if (::bind(fd_, reinterpret_cast<struct sockaddr*>(&addr), sizeof(addr)) != 0) {
+        std::fprintf(stderr, "[OSAL] bind to port %u failed: %s\n", static_cast<unsigned>(port), std::strerror(errno));
+        return false;
+    }
+    return true;
 }
 
 bool Socket::listen(int backlog) {
