@@ -222,22 +222,29 @@ public:
 
     void reboot() override { esp_restart(); }
 
+    // NVS reads and writes reach flash with the cache off, which a thread
+    // whose stack is in PSRAM must not do: they run on the storage task
     std::string note(const char* key) override {
-        nvs_handle_t h;
-        if (nvs_open(kNvsNamespace, NVS_READONLY, &h) != ESP_OK) return std::string();
         char v[96] = {0};
-        size_t vl = sizeof(v);
-        const bool ok = nvs_get_str(h, key, v, &vl) == ESP_OK;
-        nvs_close(h);
+        bool ok = false;
+        node_storage_call([&] {
+            nvs_handle_t h;
+            if (nvs_open(kNvsNamespace, NVS_READONLY, &h) != ESP_OK) return;
+            size_t vl = sizeof(v);
+            ok = nvs_get_str(h, key, v, &vl) == ESP_OK;
+            nvs_close(h);
+        });
         return ok ? std::string(v) : std::string();
     }
 
     void set_note(const char* key, const std::string& value) override {
-        nvs_handle_t h;
-        if (nvs_open(kNvsNamespace, NVS_READWRITE, &h) != ESP_OK) return;
-        if (value.empty()) nvs_erase_key(h, key); else nvs_set_str(h, key, value.c_str());
-        nvs_commit(h);
-        nvs_close(h);
+        node_storage_call([&] {
+            nvs_handle_t h;
+            if (nvs_open(kNvsNamespace, NVS_READWRITE, &h) != ESP_OK) return;
+            if (value.empty()) nvs_erase_key(h, key); else nvs_set_str(h, key, value.c_str());
+            nvs_commit(h);
+            nvs_close(h);
+        });
     }
 
 private:
