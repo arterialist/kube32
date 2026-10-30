@@ -95,6 +95,13 @@ void MockHal::reset() {
         for (auto& rx : uart_rx_buffers_) rx.clear();
         for (auto& tx : uart_tx_buffers_) tx.clear();
     }
+
+    {
+        std::lock_guard<std::mutex> lock(rmt_mutex_);
+        rmt_tx_frames_.clear();
+        rmt_tx_carrier_.clear();
+    }
+    rmt_loopback_.store(false);
 }
 
 int32_t MockHal::gpio_set_mode(uint32_t pin, PinMode mode) {
@@ -189,6 +196,36 @@ std::vector<uint8_t> MockHal::get_uart_tx_bytes(uint32_t port) {
     if (port >= 4) return {};
     std::lock_guard<std::mutex> lock(uart_mutex_);
     return uart_tx_buffers_[port];
+}
+
+int32_t MockHal::rmt_transmit(uint32_t pin, const uint16_t* durations, size_t count, uint32_t carrier_hz) {
+    if (pin >= 64 || !durations) return HAL_ERR_INVAL;
+    std::lock_guard<std::mutex> lock(rmt_mutex_);
+    auto& frames = rmt_tx_frames_[pin];
+    if (frames.size() == kRmtTxFramesKept) frames.erase(frames.begin());
+    frames.emplace_back(durations, durations + count);
+    rmt_tx_carrier_[pin] = carrier_hz;
+    return static_cast<int32_t>(count);
+}
+
+std::vector<std::vector<uint16_t>> MockHal::get_rmt_tx_frames(uint32_t pin) {
+    std::lock_guard<std::mutex> lock(rmt_mutex_);
+    auto it = rmt_tx_frames_.find(pin);
+    return it == rmt_tx_frames_.end() ? std::vector<std::vector<uint16_t>>() : it->second;
+}
+
+uint32_t MockHal::get_rmt_tx_carrier(uint32_t pin) {
+    std::lock_guard<std::mutex> lock(rmt_mutex_);
+    auto it = rmt_tx_carrier_.find(pin);
+    return it == rmt_tx_carrier_.end() ? 0 : it->second;
+}
+
+void MockHal::set_rmt_loopback(bool on) {
+    rmt_loopback_.store(on);
+}
+
+bool MockHal::rmt_loopback() const {
+    return rmt_loopback_.load();
 }
 
 uint32_t MockHal::get_gpio_write_count(uint32_t pin) const {

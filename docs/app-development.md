@@ -43,12 +43,15 @@ All imports belong to the `env` module (`src/runtime/app_pod.cpp`, `src/runtime/
 | Storage | `k32_fs_open/read/write/close/size/list/remove` | `i(iii)`, `i(iii)`, `i(iii)`, `i(i)`, `i(i)`, `i(iiii)`, `i(ii)` | `hardware.kube32.io/sd` (`SD`) and a volume claim | [Storage](storage.md), [storage](storage.md) |
 | Cardputer UI | `k32_display_text`, `k32_display_rect`, `k32_display_bar`, `k32_key_read`, `k32_tone` | `i(iiiiii)`, `i(iiiii)`, `i(iiiiiii)`, `i()`, `i(iii)` | `hardware.kube32.io/tft-display` (`DISPLAY`), `keyboard` (`KEYBOARD`), `speaker` (`SPEAKER`) | [Peripherals](peripherals.md), [Capability firewall](architecture/capability-firewall.md) |
 | ESP32 peripherals | `esp32_gpio_set_mode/write/read`, `esp32_adc_read`, `esp32_i2c_write/read`, `esp32_uart_write/read` | `i(ii)`, `i(ii)`, `i(i)`, `i(i)`, `i(iiii)`, `i(iiii)`, `i(iii)`, `i(iii)` | `esp32.io/*` resources | [Peripherals](peripherals.md), [GPIO and other peripherals](peripherals.md) |
+| Infrared (RMT) | `esp32_rmt_send`, `esp32_rmt_receive` | `i(ii)`, `i(ii)` | `esp32.io/rmt-tx`, `esp32.io/rmt-rx` | [Peripherals](peripherals.md#infrared-rmt) |
 
 Calls without the required resource or capability return `K32_ERR_PERM` (`-1`) and log a firewall violation.
 
 `k32_resp_asset(path, len, status)` streams a file from the pod's image bundle (`images/web/<name>/` for embedded images, `kube32/images/<name>/` on the card for `wasm://sd/<name>` images) without copying it into linear memory (`status` `0` means `200`; `HEAD` requests are supported). It serves the `.gz` variant when the client accepts gzip, or replies `406` if only the `.gz` file exists and the client refuses gzip. When the file does not exist it returns `K32_ERR_NOENT` (`-2`) without sending anything and leaves earlier headers pending.
 
 `k32_http_call(method, method_len, url, url_len, headers, headers_len, body, body_len, resp, resp_cap, *resp_len, timeout_ms)` sends a synchronous HTTP request to `http://<service>[.<ns>][:<port>]/path` (`timeout_ms` `0` defaults to `5000` ms, maximum `60` s). A target on the same node is called in-process; a target on another node is called over HTTP/1.1. The target receives `Content-Type`, `Cookie`, `X-Request-Id`, and `Accept-Encoding` from the caller's headers. It copies up to `resp_cap` response bytes into `resp`, stores the byte count in `*resp_len`, and returns the HTTP status or a negative error: `K32_ERR_PERM` (`-1`), `K32_ERR_NOENT` (`-2`), `K32_ERR_IO` (`-5`), `K32_ERR_TOOBIG` (`-7`, after copying the first `resp_cap` bytes), `K32_ERR_LOOP` (`-40`, self-call or cycle across pods detected via `X-Kube32-Call-Chain`), or `K32_ERR_TIMEOUT` (`-110`).
+
+`esp32_rmt_send(durations_us, count)` sends one IR frame (mark and space durations in microseconds, mark first) on the pod's RMT TX channel and returns `count` once the frame is out, or `K32_ERR_PERM` (`-1`), `K32_ERR_INVAL` (`-22`, an empty, overlong, or zero-duration frame), or `K32_ERR_FAULT` (`-14`). `esp32_rmt_receive(out_us, cap)` never waits: it copies the oldest frame the pod's RMT RX channel captured and returns its duration count, or `K32_ERR_AGAIN` (`-11`) when none is queued, `K32_ERR_TOOBIG` (`-7`, the first `cap` durations copied and the frame dropped), or `K32_ERR_PERM` (`-1`). Poll it from `k32_tick`; see [Peripherals](peripherals.md#infrared-rmt) for pins, carrier, and the receive queue.
 
 ---
 
@@ -65,6 +68,8 @@ Calls without the required resource or capability return `K32_ERR_PERM` (`-1`) a
 | Log line | 512 bytes | Line is dropped |
 | `k32_display_text` | 64 bytes | Returns `K32_ERR_FAULT` (`-14`) |
 | `k32_tone` | 2000 ms, 100% volume | Clamped |
+| IR frame | 512 durations (`K32_RMT_MAX_DURATIONS`); 500 ms sent (`K32_RMT_MAX_FRAME_US`) | `esp32_rmt_send` returns `K32_ERR_INVAL` (`-22`); a longer frame received is dropped and logged |
+| IR receive queue | 8 frames (`K32_RMT_RX_QUEUE_FRAMES`), 512 durations (`K32_RMT_RX_QUEUE_DURATIONS`) | Frames are dropped; the next `esp32_rmt_receive` logs the count |
 | Files | 96-byte paths (`K32_FS_MAX_PATH`), 4 open per pod (`K32_FS_MAX_FDS`) and per node, 4096 bytes per call (`K32_FS_MAX_IO`) | Returns negative `K32_ERR_*`; see [Storage](storage.md) |
 | Execution budget per call | 4,000,000,000 wasm3 gas units (`kDefaultGasBudgetPerCall`) | Call traps with exit code `152` |
 
@@ -108,7 +113,7 @@ Pods support `restartPolicy: Always`, `OnFailure`, and `Never`. Failed or restar
 | Feature of `kube32-sdk` | Provides |
 | --- | --- |
 | `panic-handler` (default) | `#[panic_handler]` that logs through `k32_log` and traps |
-| `hardware` | `hardware::{display_text, display_rect, display_bar, key_read, tone, rgb565}` |
+| `hardware` | `hardware::{display_text, display_rect, display_bar, key_read, tone, rgb565, rmt_send, rmt_receive}` |
 | `fs` | `fs::{File, list, remove}` over `k32_fs_*` |
 
 ### Request pod
@@ -252,7 +257,7 @@ K32_EXPORT("k32_handle") int32_t k32_handle(uint32_t ptr, uint32_t len) {
 }
 ```
 
-`kube32-cli build` compiles `.c` files with `clang --target=wasm32 -O2 -nostdlib -ffreestanding -fno-exceptions -mcpu=mvp -msign-ext -mbulk-memory` and links them with `rust-lld` or `wasm-ld`. If the directory contains a `Makefile`, `kube32-cli build` runs `make -C <dir>` (pass `--artifact <path>` when the output `.wasm` cannot be inferred from `make -n -B`). See `apps/echo`, `apps/sdnote`, `apps/i2cscan`, and `apps/tessera` for complete C pods.
+`kube32-cli build` compiles `.c` files with `clang --target=wasm32 -O2 -nostdlib -ffreestanding -fno-exceptions -mcpu=mvp -msign-ext -mbulk-memory` and links them with `rust-lld` or `wasm-ld`. If the directory contains a `Makefile`, `kube32-cli build` runs `make -C <dir>` (pass `--artifact <path>` when the output `.wasm` cannot be inferred from `make -n -B`). See `apps/echo`, `apps/sdnote`, `apps/i2cscan`, `apps/irremote`, and `apps/tessera` for complete C pods.
 
 ---
 
@@ -420,7 +425,7 @@ Rebuild the firmware with `pio run -e esp32s3`, or reconfigure and build the hos
 | `resources.requests.memory`, `limits.memory` | Scheduler heap accounting and Wasm linear memory limit (supports sub-page limits below `64Ki`) |
 | `resources.requests["esp32.io/psram"]` | Places the Wasm sandbox in PSRAM and raises the sandbox size to `max(memory, psram)` |
 | `resources.requests["hardware.kube32.io/*"]` | Grants `ipc`, `tft-display`, `keyboard`, `speaker`, `sd` |
-| `resources.requests["esp32.io/*"]` | Claims `gpio-<N>`, `gpio`, `adc`, `i2c`, `i2c-bus-<N>`, `uart`, `uart-<N>` |
+| `resources.requests["esp32.io/*"]` | Claims `gpio-<N>`, `gpio`, `adc`, `i2c`, `i2c-bus-<N>`, `uart`, `uart-<N>`, `rmt-tx`, `rmt-rx` |
 | `securityContext.capabilities.add` | Grants `CHANNEL_IPC`, `DISPLAY`, `KEYBOARD`, `SPEAKER`, `SD`, `SERVICE_CALL` |
 | `spec.volumes[].persistentVolumeClaim.claimName` | Mounts `<root>/kube32/volumes/<claim>` on card or internal flash (`kube32.io/sd: {claim: ...}` requires a card) |
 | `ports[].containerPort` | Target port named by Services (`7000` is the node's pod HTTP server port) |
@@ -436,6 +441,8 @@ Rebuild the firmware with `pio run -e esp32s3`, or reconfigure and build the hos
 | `kube32.io/event-topics` | Pod | Comma-separated channel topics delivered to the pod's `k32_event` export |
 | `kube32.io/i2c-bus-<N>` | Pod | Bus pins and speed, e.g. `"sda=8,scl=9,hz=100000"` |
 | `kube32.io/uart-<N>` | Pod | UART pins and baud rate, e.g. `"tx=17,rx=18,baud=115200"` |
+| `kube32.io/rmt-tx` | Pod | IR transmit pin and carrier, e.g. `"pin=2,carrier=38000,duty=33"` (`carrier=0`: no carrier) |
+| `kube32.io/rmt-rx` | Pod | IR receive pin, mark level, and end-of-frame gap, e.g. `"pin=1,active=low,idle_us=12000"` |
 | `kube32.io/event-stream` | Ingress | Serves SSE streams of channel topics: `"<path>=<topic>[,<topic>...][;<path>=...]"` |
 | `kube32.io/cluster-telemetry` | Ingress | Serves cluster telemetry JSON at `<path>` |
 | `kube32.io/stats-topic` | Ingress | Publishes `{"t":"stats","ingress":"<ns>/<name>","rps":N,"viewers":N}` every second on `<topic>` |

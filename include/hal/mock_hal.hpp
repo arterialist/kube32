@@ -57,6 +57,16 @@ public:
     void inject_uart_rx_bytes(uint32_t port, const uint8_t* data, size_t len);
     std::vector<uint8_t> get_uart_tx_bytes(uint32_t port);
 
+    // RMT (IR) Operations: the frames sent on each pin (the last
+    // kRmtTxFramesKept), and an IR loopback in which every frame sent also
+    // reaches the node's receivers, as an LED facing them would
+    int32_t rmt_transmit(uint32_t pin, const uint16_t* durations, size_t count, uint32_t carrier_hz);
+    std::vector<std::vector<uint16_t>> get_rmt_tx_frames(uint32_t pin);
+    uint32_t get_rmt_tx_carrier(uint32_t pin);
+    void set_rmt_loopback(bool on);
+    bool rmt_loopback() const;
+    static constexpr size_t kRmtTxFramesKept = 16;
+
     // Test Inspection Helpers
     uint32_t get_gpio_write_count(uint32_t pin) const;
     void reset();
@@ -79,6 +89,11 @@ private:
     std::mutex uart_mutex_;
     std::array<std::vector<uint8_t>, 4> uart_rx_buffers_;
     std::array<std::vector<uint8_t>, 4> uart_tx_buffers_;
+
+    std::mutex rmt_mutex_;
+    std::map<uint32_t, std::vector<std::vector<uint16_t>>> rmt_tx_frames_;
+    std::map<uint32_t, uint32_t> rmt_tx_carrier_;
+    std::atomic<bool> rmt_loopback_{false};
 };
 
 } // namespace kube32::hal

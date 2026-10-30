@@ -29,6 +29,10 @@ struct NodeTelemetry {
     uint32_t allocatable_uart_count{0};
     uint32_t total_adc_count{0};     // ADC1 channels whose pin is claimable
     uint32_t allocatable_adc_count{0};
+    uint32_t total_rmt_tx_count{0};  // RMT (IR) TX channels with a pin to run on
+    uint32_t allocatable_rmt_tx_count{0};
+    uint32_t total_rmt_rx_count{0};  // RMT (IR) RX channels with a pin to run on
+    uint32_t allocatable_rmt_rx_count{0};
     // microSD card (hardware.kube32.io/sd): measured at collection, absent without a card
     bool sd_present{false};
     uint64_t sd_total_bytes{0};

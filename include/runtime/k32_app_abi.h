@@ -67,9 +67,9 @@ extern "C" {
 #define K32_ERR_PERM        (-1)    /* capability not granted to this pod            */
 #define K32_ERR_NOENT       (-2)    /* no such file or directory                     */
 #define K32_ERR_IO          (-5)    /* I/O error: the card, or the connection to a remote pod */
-#define K32_ERR_TOOBIG      (-7)    /* response body larger than the buffer (E2BIG)   */
+#define K32_ERR_TOOBIG      (-7)    /* response body or IR frame larger than the buffer (E2BIG) */
 #define K32_ERR_BADF        (-9)    /* fd not open, or opened for the other direction */
-#define K32_ERR_AGAIN       (-11)
+#define K32_ERR_AGAIN       (-11)   /* nothing queued yet (key, IR frame)              */
 #define K32_ERR_NOMEM       (-12)
 #define K32_ERR_FAULT       (-14)   /* pointer/length outside linear memory           */
 #define K32_ERR_EXIST       (-17)   /* K32_FS_O_EXCL and the file exists              */
@@ -118,6 +118,43 @@ extern "C" {
 #define K32_MAX_REQUEST_BYTES   (16 * 1024)
 #define K32_MAX_EVENT_BYTES     (200)        /* fits one ESP-NOW frame after the K32C header */
 #define K32_MAX_HEADER_BYTES    (256)
+
+/* ---- Infrared: RMT pulse trains, gated by the capability firewall -------
+ * The pod claims one RMT channel per direction and names its pin in an
+ * annotation, or uses the board's default pin (the Cardputer's TX default is
+ * its IR LED on GPIO 44; RX has no default):
+ *
+ *   metadata:
+ *     annotations:
+ *       kube32.io/rmt-tx: "pin=2,carrier=38000,duty=33"   # carrier=0 sends bare pulses
+ *       kube32.io/rmt-rx: "pin=1,active=low,idle_us=12000"
+ *   spec:
+ *     containers:
+ *       - resources:
+ *           requests: { esp32.io/rmt-tx: "1", esp32.io/rmt-rx: "1" }
+ *
+ * A frame is alternating mark and space durations in microseconds (1 to
+ * 65535 each), mark first. esp32_rmt_send transmits one, marks modulated
+ * with the claim's carrier, and returns when it is out: count, or
+ * K32_ERR_PERM (no esp32.io/rmt-tx claim), K32_ERR_INVAL (count 0 or above
+ * K32_RMT_MAX_DURATIONS, a zero duration, a frame longer than
+ * K32_RMT_MAX_FRAME_US), K32_ERR_FAULT (durations outside linear memory).
+ * The calling pod waits for the frame; where pods share one interpreter
+ * (boards without PSRAM) every other pod's call waits as well.
+ *
+ * The receiver is armed from admission until the pod ends. It queues up to
+ * K32_RMT_RX_QUEUE_FRAMES frames, K32_RMT_RX_QUEUE_DURATIONS durations in
+ * all; a space of idle_us ends a frame. esp32_rmt_receive never waits: it
+ * returns the duration count of the oldest frame (a mark is the receiver's
+ * active level), K32_ERR_AGAIN when none is queued, K32_ERR_TOOBIG when the
+ * frame has more than cap durations (the first cap are copied and the frame
+ * leaves the queue), or K32_ERR_PERM (no esp32.io/rmt-rx claim). The next
+ * call reports frames the receiver dropped (queue full, or longer than
+ * K32_RMT_MAX_DURATIONS) in the pod's log. */
+#define K32_RMT_MAX_DURATIONS       512       /* per frame, sent or received */
+#define K32_RMT_MAX_FRAME_US        500000    /* total length of a frame sent */
+#define K32_RMT_RX_QUEUE_FRAMES     8
+#define K32_RMT_RX_QUEUE_DURATIONS  512
 
 #if defined(__wasm32__)
 #define K32_IMPORT(name) __attribute__((import_module("env"), import_name(name)))
@@ -219,10 +256,14 @@ K32_IMPORT("esp32_i2c_read")   int32_t esp32_i2c_read(uint32_t bus, uint32_t add
 K32_IMPORT("esp32_uart_write") int32_t esp32_uart_write(uint32_t port, const void* data, uint32_t len);              /* bytes queued or error */
 K32_IMPORT("esp32_uart_read")  int32_t esp32_uart_read(uint32_t port, void* buf, uint32_t max_len);                  /* bytes received within 50 ms, or error */
 
+/* ---- Infrared, gated by esp32.io/rmt-tx and esp32.io/rmt-rx (see above) -- */
+K32_IMPORT("esp32_rmt_send")    int32_t esp32_rmt_send(const uint16_t* durations_us, uint32_t count);   /* count once sent, or error */
+K32_IMPORT("esp32_rmt_receive") int32_t esp32_rmt_receive(uint16_t* out_us, uint32_t cap);              /* durations of the oldest frame, K32_ERR_AGAIN, or error */
+
 /* Existing low-level imports (see host_functions.cpp) remain available:
  * esp32_gpio_set_mode, esp32_gpio_write, esp32_gpio_read, esp32_adc_read,
  * esp32_i2c_write, esp32_i2c_read, esp32_uart_write, esp32_uart_read,
- * esp32_get_time_us, esp32_delay_ms, kube32_channel_open/send/recv/close. */
+ * esp32_rmt_send, esp32_rmt_receive, esp32_get_time_us, esp32_delay_ms, kube32_channel_open/send/recv/close. */
 K32_IMPORT("esp32_delay_ms")      void    esp32_delay_ms(uint32_t ms);
 K32_IMPORT("kube32_channel_open") int32_t kube32_channel_open(const char* name, uint32_t flags);
 K32_IMPORT("kube32_channel_send") int32_t kube32_channel_send(int32_t handle, const void* data, uint32_t len);

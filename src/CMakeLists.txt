@@ -41,6 +41,7 @@ set(KUBE32_APP_SRCS
     hal/sd_card.cpp
     hal/node_storage.cpp
     hal/pod_buses.cpp
+    hal/pod_rmt.cpp
     hal/tft_keyboard_hardware.cpp
     ipc/channel.cpp
     kubelet/kube_api_client.cpp
@@ -104,6 +105,7 @@ idf_component_register(
         vfs
         driver
         esp_driver_gpio
+        esp_driver_rmt
         esp_lcd
         esp_adc
         esp_driver_spi
@@ -138,12 +140,14 @@ add_dependencies(${COMPONENT_LIB} kube32_build_info)
 target_include_directories(${COMPONENT_LIB} PRIVATE ${CMAKE_CURRENT_BINARY_DIR})
 set_source_files_properties(${CMAKE_CURRENT_LIST_DIR}/api/version_info.cpp PROPERTIES OBJECT_DEPENDS ${KUBE32_BUILD_INFO_H})
 
-# Container environment, log persistence and bus setup run once per container
-# start or every few seconds: built for size, they take half the flash -O2 gives them.
+# Container environment, log persistence, bus setup and IR channels run once
+# per container start, every few seconds or once per IR frame: built for size,
+# they take half the flash -O2 gives them.
 set_source_files_properties(
     ${CMAKE_CURRENT_LIST_DIR}/kubelet/pod_env.cpp
     ${CMAKE_CURRENT_LIST_DIR}/runtime/pod_log.cpp
     ${CMAKE_CURRENT_LIST_DIR}/hal/pod_buses.cpp
+    ${CMAKE_CURRENT_LIST_DIR}/hal/pod_rmt.cpp
     ${CMAKE_CURRENT_LIST_DIR}/app/node_storage_api.cpp
     ${CMAKE_CURRENT_LIST_DIR}/api/node_proxy.cpp
     ${CMAKE_CURRENT_LIST_DIR}/api/protobuf_body.cpp

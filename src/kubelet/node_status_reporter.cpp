@@ -83,6 +83,12 @@ NodeTelemetry NodeStatusReporter::collect_telemetry() const {
     const uint8_t uart = fw.claimable_uart_mask();
     t.total_uart_count = count_bits(uart);
     t.allocatable_uart_count = count_bits(uart & static_cast<uint8_t>(~fw.get_allocated_uart_mask()));
+    t.total_rmt_tx_count = fw.claimable_rmt_tx_count();
+    const uint32_t rmt_tx_held = fw.get_allocated_rmt_tx_count();
+    t.allocatable_rmt_tx_count = t.total_rmt_tx_count > rmt_tx_held ? t.total_rmt_tx_count - rmt_tx_held : 0;
+    t.total_rmt_rx_count = fw.claimable_rmt_rx_count();
+    const uint32_t rmt_rx_held = fw.get_allocated_rmt_rx_count();
+    t.allocatable_rmt_rx_count = t.total_rmt_rx_count > rmt_rx_held ? t.total_rmt_rx_count - rmt_rx_held : 0;
 
     hal::SdInfo sd = hal::sd_info();
     t.sd_present = sd.mounted;
@@ -140,6 +146,16 @@ static void append_resources(Out& json, const NodeTelemetry& t, bool capacity) {
         const uint64_t v = capacity ? t.total_adc_count : t.allocatable_adc_count;
         count("esp.io/adc", v);
         count("esp32.io/adc", v);
+    }
+    if (t.total_rmt_tx_count > 0) {
+        const uint64_t v = capacity ? t.total_rmt_tx_count : t.allocatable_rmt_tx_count;
+        count("esp.io/rmt-tx", v);
+        count("esp32.io/rmt-tx", v);
+    }
+    if (t.total_rmt_rx_count > 0) {
+        const uint64_t v = capacity ? t.total_rmt_rx_count : t.allocatable_rmt_rx_count;
+        count("esp.io/rmt-rx", v);
+        count("esp32.io/rmt-rx", v);
     }
     if (t.total_psram_bytes > 0) {
         for (const char* name : {"esp.io/psram", "esp32.io/psram"}) {

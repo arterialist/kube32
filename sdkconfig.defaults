@@ -65,3 +65,11 @@ CONFIG_WL_SECTOR_SIZE_512=y
 # record buffers are allocated per record instead of held per connection
 CONFIG_MBEDTLS_CUSTOM_MEM_ALLOC=y
 CONFIG_MBEDTLS_DYNAMIC_BUFFER=y
+
+# RMT (IR channels of pods): the driver's interrupt handlers and encoders run
+# from flash. A symbol of an IR frame lasts hundreds of microseconds, so a
+# cache miss costs nothing, and the 4 KiB of IRAM stays heap on boards
+# without PSRAM
+# CONFIG_RMT_TX_ISR_HANDLER_IN_IRAM is not set
+# CONFIG_RMT_RX_ISR_HANDLER_IN_IRAM is not set
+# CONFIG_RMT_ENCODER_FUNC_IN_IRAM is not set

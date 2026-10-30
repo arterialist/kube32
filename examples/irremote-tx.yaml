@@ -1,0 +1,41 @@
+# irremote-tx: the irremote pod as a transmitter only, on the Cardputer's
+# built-in IR LED (GPIO 44, the board's default RMT TX pin).
+#
+# The pod claims esp32.io/rmt-tx and no receiver: its first receive is
+# refused, it logs "irremote: no esp32.io/rmt-rx claim: not receiving,
+# sending only" once and from then on only sends. The Grove port (GPIO 2/1)
+# stays free, so a pod that claims I2C0 there (a reader on the Grove I2C
+# pins, say) runs beside it and has codes sent by publishing them on the
+# channel topic ir.send:
+#
+#   nec 0x04 0x08        NEC address and command, decimal or 0x hex
+#   nec repeat           the NEC repeat code
+#   raw 9000,4500,560    durations in microseconds, mark first
+#
+#   kubectl --context kube32 apply -f examples/irremote-tx.yaml
+#   kubectl --context kube32 logs -f irremote-tx
+#
+# POST /send on the node's pod HTTP server (port 7000, header X-Kube32-Pod:
+# default/irremote-tx) transmits its body the same way.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: irremote-tx
+  namespace: default
+  labels:
+    app: irremote
+  annotations:
+    kube32.io/event-topics: ir.send
+spec:
+  nodeSelector:
+    kube32.io/board: cardputer
+  restartPolicy: Always
+  containers:
+    - name: irremote
+      image: wasm://embedded/irremote
+      resources:
+        requests:
+          memory: 12Ki                     # linear memory: 1 KiB stack, 7.3 KiB data and buffers
+          esp32.io/rmt-tx: "1"             # carrier 38 kHz at 33% unless kube32.io/rmt-tx says otherwise
+        limits:
+          memory: 12Ki

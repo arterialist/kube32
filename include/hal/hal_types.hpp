@@ -11,6 +11,8 @@ constexpr int32_t HAL_OK           = 0;
 constexpr int32_t HAL_ERR_PERM     = -1;    // -EPERM  (Operation not permitted / Firewall denied)
 constexpr int32_t HAL_ERR_NOENT    = -2;    // -ENOENT (No such peripheral)
 constexpr int32_t HAL_ERR_IO       = -5;    // -EIO    (Physical I/O transmission error)
+constexpr int32_t HAL_ERR_TOOBIG   = -7;    // -E2BIG  (Data larger than the caller's buffer)
+constexpr int32_t HAL_ERR_AGAIN    = -11;   // -EAGAIN (Nothing available yet)
 constexpr int32_t HAL_ERR_NOMEM    = -12;   // -ENOMEM (Out of memory)
 constexpr int32_t HAL_ERR_FAULT    = -14;   // -EFAULT (Bad memory address / Wasm linear bounds violation)
 constexpr int32_t HAL_ERR_BUSY     = -16;   // -EBUSY  (Resource collision / Device already claimed)
@@ -28,7 +30,9 @@ enum class PeripheralType : uint8_t {
     Keyboard = 6,   // On-board matrix keyboard (hardware.kube32.io/keyboard)
     Speaker  = 7,   // On-board I2S speaker (hardware.kube32.io/speaker)
     SdCard   = 8,   // microSD volume of the pod (hardware.kube32.io/sd)
-    ServiceCall = 9 // k32_http_call to Services (securityContext capability SERVICE_CALL)
+    ServiceCall = 9, // k32_http_call to Services (securityContext capability SERVICE_CALL)
+    RmtTx    = 10,  // RMT (IR) transmit channel (esp32.io/rmt-tx)
+    RmtRx    = 11   // RMT (IR) receive channel (esp32.io/rmt-rx)
 };
 
 enum class AccessMode : uint8_t {
@@ -57,6 +61,8 @@ constexpr uint32_t KUBE32_CAP_KEYBOARD = (1U << 2);
 constexpr uint32_t KUBE32_CAP_SPEAKER  = (1U << 3);
 constexpr uint32_t KUBE32_CAP_SD       = (1U << 4);   // k32_fs_* on the pod's SD volume
 constexpr uint32_t KUBE32_CAP_SERVICE_CALL = (1U << 5);   // k32_http_call
+constexpr uint32_t KUBE32_CAP_RMT_TX   = (1U << 6);   // esp32_rmt_send on the pod's RMT TX channel
+constexpr uint32_t KUBE32_CAP_RMT_RX   = (1U << 7);   // esp32_rmt_receive from the pod's RMT RX channel
 
 // 24-Byte Ultra-Compact Device Grant Representation
 #pragma pack(push, 1)

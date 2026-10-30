@@ -2,6 +2,7 @@
 
 #include "hal/hal_types.hpp"
 #include "hal/pod_buses.hpp"
+#include "hal/pod_rmt.hpp"
 #include "osal/mutex.hpp"
 
 #include <string>
@@ -43,6 +44,13 @@ struct BoardProfile {
     // needs pins in the pod's annotations.
     BusPins i2c_pins[2]{{8, 9}, {}};
     BusPins uart_pins[3]{{}, {17, 18}, {}};
+    // RMT (IR) channels run on claimable pins and, for TX, also on the pins
+    // of rmt_tx_pin_mask: an IR LED on a pad the chip mask reserves (a
+    // console UART pin the board leaves unused). The default pins serve a
+    // claim without a pin in its annotation; -1 means the claim must name one.
+    uint64_t rmt_tx_pin_mask{0};
+    int8_t rmt_tx_default_pin{-1};
+    int8_t rmt_rx_default_pin{-1};
 };
 
 struct PodSecurityRecord {
@@ -55,6 +63,7 @@ struct PodSecurityRecord {
     std::string sd_claim;
     bool card_required{false};   // kube32.io/sd volume or hardware.kube32.io/sd: only a microSD card will do
     std::vector<BusAssignment> buses;   // I2C/UART controllers with their pins (drivers installed)
+    std::vector<RmtAssignment> rmt;     // RMT channels with their pins and settings (channels created)
 };
 
 class CapabilityFirewall {
@@ -73,6 +82,13 @@ public:
     // claims (refused when the chip or the board reserves them or another pod
     // holds them) and the bus driver is installed on them; unregister_pod
     // removes it.
+    //
+    // RMT claims (esp32.io/rmt-tx, esp32.io/rmt-rx: "1", one channel of each
+    // per pod) take their pin and settings from
+    //   kube32.io/rmt-tx: "pin=<n>[,carrier=<Hz>][,duty=<percent>]"
+    //   kube32.io/rmt-rx: "pin=<n>[,active=low|high][,idle_us=<n>]"
+    // or the board profile's default pin, and are claimed and installed the
+    // same way.
     bool register_pod(const std::string& pod_id, const std::string& pod_manifest_json, std::string& out_error);
 
     // Direct registration with pre-compiled grant
@@ -109,8 +125,17 @@ public:
     uint16_t claimable_adc1_mask() const;
     uint8_t  claimable_i2c_mask() const;
     uint8_t  claimable_uart_mask() const;
+    // RMT channels pods can claim on this board (esp32.io/rmt-tx and
+    // esp32.io/rmt-rx capacity): one per pin a channel can use, at most the
+    // chip's four of each direction
+    uint32_t claimable_rmt_tx_count() const;
+    uint32_t claimable_rmt_rx_count() const;
+    uint32_t get_allocated_rmt_tx_count() const;
+    uint32_t get_allocated_rmt_rx_count() const;
     // Buses (with pins) the pod was admitted with
     std::vector<BusAssignment> pod_buses(const std::string& pod_id) const;
+    // RMT channels the pod was admitted with
+    std::vector<RmtAssignment> pod_rmt(const std::string& pod_id) const;
 
     // Reset all allocations and the board profile (used in test teardown)
     void reset();
@@ -129,16 +154,32 @@ private:
     bool allocate_generic_i2c(uint32_t count, DeviceGrant& grant, const std::string& pod_id, std::vector<uint32_t>& out_claimed, std::string& out_error);
     bool allocate_generic_adc(uint32_t count, DeviceGrant& grant, const std::string& pod_id, std::vector<uint32_t>& out_claimed, std::string& out_error);
     bool allocate_generic_uart(uint32_t count, DeviceGrant& grant, const std::string& pod_id, std::vector<uint32_t>& out_claimed, std::string& out_error);
+    // Claims `pin` for the pod as part of `what` ("I2C0 sda", "RMT TX"):
+    // refused when the chip or the board reserves it (unless `also_allowed`
+    // offers it) or when another pod, or this one already, holds it.
+    bool claim_pin(const std::string& pod_id, uint32_t pin, const std::string& what, uint64_t also_allowed, std::vector<uint32_t>& out_claimed_pins,
+                   std::string& out_error);
     // Pins of every bus in `grant`: from `annotations` (kube32.io/i2c-bus-N,
     // kube32.io/uart-N) or the board defaults, claimed for the pod.
     bool claim_bus_pins(const std::string& pod_id, const DeviceGrant& grant, const std::map<std::string, std::string>& annotations,
                         std::vector<BusAssignment>& out_buses, std::vector<uint32_t>& out_claimed_pins, std::string& out_error);
-    bool register_pod_locked(const std::string& pod_id, const std::string& pod_manifest_json, std::vector<BusAssignment>& out_buses, std::string& out_error);
-    bool grant_capabilities_locked(const std::string& pod_id, const DeviceGrant& grant, std::vector<BusAssignment>& out_buses, std::string& out_error);
-    // Installs the drivers of a registered pod's buses; unregisters it on failure.
-    bool install_buses(const std::string& pod_id, const std::vector<BusAssignment>& buses, std::string& out_error);
+    // The RMT channels of `grant` with their pins and settings: from
+    // `annotations` (kube32.io/rmt-tx, kube32.io/rmt-rx) or the board
+    // defaults, pins claimed for the pod.
+    bool claim_rmt_pins(const std::string& pod_id, const DeviceGrant& grant, const std::map<std::string, std::string>& annotations,
+                        std::vector<RmtAssignment>& out_rmt, std::vector<uint32_t>& out_claimed_pins, std::string& out_error);
+    bool register_pod_locked(const std::string& pod_id, const std::string& pod_manifest_json, std::vector<BusAssignment>& out_buses,
+                             std::vector<RmtAssignment>& out_rmt, std::string& out_error);
+    bool grant_capabilities_locked(const std::string& pod_id, const DeviceGrant& grant, std::vector<BusAssignment>& out_buses,
+                                   std::vector<RmtAssignment>& out_rmt, std::string& out_error);
+    // Installs the bus drivers and RMT channels of a registered pod;
+    // unregisters it on failure.
+    bool install_drivers(const std::string& pod_id, const std::vector<BusAssignment>& buses, const std::vector<RmtAssignment>& rmt,
+                         std::string& out_error);
     uint64_t claimable_gpio_mask_locked() const;
     uint16_t claimable_adc1_mask_locked() const;
+    uint32_t claimable_rmt_count_locked(RmtDir dir) const;
+    uint32_t allocated_rmt_count_locked(RmtDir dir) const;
 
     mutable osal::Mutex mutex_;
     std::map<std::string, PodSecurityRecord> pod_records_;

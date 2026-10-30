@@ -134,6 +134,7 @@ else()
         src/hal/sd_card.cpp
         src/hal/node_storage.cpp
         src/hal/pod_buses.cpp
+        src/hal/pod_rmt.cpp
         src/hal/mock_hal.cpp
         src/runtime/host_functions.cpp
         src/runtime/container_lifecycle.cpp
@@ -458,6 +459,13 @@ else()
     )
     target_link_libraries(test_pod_buses PRIVATE kube32_core)
     add_test(NAME test_pod_buses COMMAND test_pod_buses)
+
+    # RMT (IR) for pods: admission, channel lifecycle, receive queue, node capacity, the irremote example
+    add_executable(test_pod_rmt
+        tests/test_pod_rmt.cpp
+    )
+    target_link_libraries(test_pod_rmt PRIVATE kube32_core)
+    add_test(NAME test_pod_rmt COMMAND test_pod_rmt)
 
     # JSON merge patch and strategic merge patch
     add_executable(test_patch

@@ -44,6 +44,8 @@ ResourceSpec extract_pod_resource_requests(const std::string& pod_json) {
     uint32_t total_i2c = 0;
     uint32_t total_uart = 0;
     uint32_t total_adc = 0;
+    uint32_t total_rmt_tx = 0;
+    uint32_t total_rmt_rx = 0;
 
     for (const auto& c : containers->arr_val) {
         if (!c.is_object()) continue;
@@ -97,6 +99,12 @@ ResourceSpec extract_pod_resource_requests(const std::string& pod_json) {
             if (k.rfind("esp32.io/i2c-bus-", 0) == 0 || k.rfind("esp.io/i2c-bus-", 0) == 0) total_i2c += 1;
             else if (k.rfind("esp32.io/uart-", 0) == 0 || k.rfind("esp.io/uart-", 0) == 0) total_uart += 1;
         }
+
+        // RMT (IR) channels: esp.io/rmt-tx or esp32.io/rmt-tx, and rmt-rx
+        std::string rmt_tx_str = req->get_string("esp.io/rmt-tx", req->get_string("esp32.io/rmt-tx", ""));
+        if (!rmt_tx_str.empty()) total_rmt_tx += static_cast<uint32_t>(parse_quantity(rmt_tx_str));
+        std::string rmt_rx_str = req->get_string("esp.io/rmt-rx", req->get_string("esp32.io/rmt-rx", ""));
+        if (!rmt_rx_str.empty()) total_rmt_rx += static_cast<uint32_t>(parse_quantity(rmt_rx_str));
     }
 
     spec.memory_bytes = (total_mem > 0) ? total_mem : (16 * 1024);
@@ -105,6 +113,8 @@ ResourceSpec extract_pod_resource_requests(const std::string& pod_json) {
     spec.i2c_buses = total_i2c;
     spec.uart_ports = total_uart;
     spec.adc_channels = total_adc;
+    spec.rmt_tx_channels = total_rmt_tx;
+    spec.rmt_rx_channels = total_rmt_rx;
     return spec;
 }
 
@@ -141,6 +151,8 @@ ResourceSpec extract_node_allocatable(const std::string& node_json) {
     spec.i2c_buses = static_cast<uint32_t>(parse_quantity(alloc->get_string("esp.io/i2c", alloc->get_string("esp32.io/i2c", ""))));
     spec.uart_ports = static_cast<uint32_t>(parse_quantity(alloc->get_string("esp.io/uart", alloc->get_string("esp32.io/uart", ""))));
     spec.adc_channels = static_cast<uint32_t>(parse_quantity(alloc->get_string("esp.io/adc", alloc->get_string("esp32.io/adc", ""))));
+    spec.rmt_tx_channels = static_cast<uint32_t>(parse_quantity(alloc->get_string("esp.io/rmt-tx", alloc->get_string("esp32.io/rmt-tx", ""))));
+    spec.rmt_rx_channels = static_cast<uint32_t>(parse_quantity(alloc->get_string("esp.io/rmt-rx", alloc->get_string("esp32.io/rmt-rx", ""))));
     spec.psram_bytes = parse_quantity(alloc->get_string("esp.io/psram", alloc->get_string("esp32.io/psram", "")));
 
     return spec;
@@ -211,6 +223,8 @@ ResourceSpec calculate_node_allocated_resources(storage::Store& store, const std
         allocated.gpio_pins += req.gpio_pins;
         allocated.i2c_buses += req.i2c_buses;
         allocated.uart_ports += req.uart_ports;
+        allocated.rmt_tx_channels += req.rmt_tx_channels;
+        allocated.rmt_rx_channels += req.rmt_rx_channels;
         allocated.adc_channels += req.adc_channels;
         allocated.psram_bytes += req.psram_bytes;
     }
@@ -332,6 +346,20 @@ bool NodePeripheralPredicate::evaluate(const std::string&,
         ? (node_allocatable.adc_channels - node_allocated.adc_channels) : 0;
     if (avail_adc < pod_req.adc_channels) {
         failure_reason = "Insufficient esp32.io/adc";
+        return false;
+    }
+
+    uint32_t avail_rmt_tx = (node_allocatable.rmt_tx_channels >= node_allocated.rmt_tx_channels)
+        ? (node_allocatable.rmt_tx_channels - node_allocated.rmt_tx_channels) : 0;
+    if (avail_rmt_tx < pod_req.rmt_tx_channels) {
+        failure_reason = "Insufficient esp32.io/rmt-tx";
+        return false;
+    }
+
+    uint32_t avail_rmt_rx = (node_allocatable.rmt_rx_channels >= node_allocated.rmt_rx_channels)
+        ? (node_allocatable.rmt_rx_channels - node_allocated.rmt_rx_channels) : 0;
+    if (avail_rmt_rx < pod_req.rmt_rx_channels) {
+        failure_reason = "Insufficient esp32.io/rmt-rx";
         return false;
     }
 

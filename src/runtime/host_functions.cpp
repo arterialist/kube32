@@ -12,9 +12,13 @@
 #include <mutex>
 #include <map>
 #include <iostream>
+#include <cstdio>
 #include <cstring>
 
 #include "hal/pod_buses.hpp"
+#include "hal/pod_rmt.hpp"
+#include "runtime/pod_log.hpp"
+#include "runtime/k32_app_abi.h"
 
 #if defined(KUBE32_TARGET_ESP32)
 #include "driver/gpio.h"
@@ -41,6 +45,19 @@ static std::string get_pod_id(IM3Runtime runtime, IM3ImportContext _ctx) {
         return static_cast<const char*>(ud);
     }
     return "default-pod";
+}
+
+static_assert(K32_RMT_MAX_DURATIONS == hal::kRmtMaxDurations && K32_RMT_MAX_FRAME_US == hal::kRmtMaxFrameUs &&
+                  K32_RMT_RX_QUEUE_FRAMES == hal::kRmtRxQueueFrames && K32_RMT_RX_QUEUE_DURATIONS == hal::kRmtRxQueueDurations,
+              "k32_app_abi.h and hal/pod_rmt.hpp disagree on the RMT limits");
+
+// The pod of a host call, by reference: the entry lives as long as the pod's
+// runtime, so a call on a hot path copies no string.
+static const std::string& get_pod_ref(IM3Runtime runtime) {
+    static const std::string kUnknown("default-pod");
+    std::lock_guard<std::mutex> lock(s_pod_registry_mutex);
+    auto it = s_runtime_to_pod.find(runtime);
+    return it != s_runtime_to_pod.end() ? it->second : kUnknown;
 }
 
 // -----------------------------------------------------------------------------
@@ -237,6 +254,74 @@ static const void* raw_esp32_uart_read(IM3Runtime runtime, IM3ImportContext _ctx
     return m3Err_none;
 }
 
+// esp32_rmt_send: signature "i(ii)" -> returns int32_t, args: (durations_offset, count)
+// Sends one IR frame on the pod's RMT TX channel: `count` uint16 durations
+// in microseconds, mark first. Returns count once the frame is out, or a
+// negative error.
+static const void* raw_esp32_rmt_send(IM3Runtime runtime, IM3ImportContext _ctx, uint64_t* _sp, void* _mem) {
+    (void)_ctx;
+    uint32_t data_offset = static_cast<uint32_t>(_sp[1]);
+    uint32_t count       = static_cast<uint32_t>(_sp[2]);
+    const std::string& pod_id = get_pod_ref(runtime);
+    int32_t& ret = *reinterpret_cast<int32_t*>(_sp);
+
+    if (!hal::CapabilityFirewall::instance().check_permission(pod_id, hal::PeripheralType::RmtTx, 0, hal::AccessMode::Write)) {
+        ret = hal::HAL_ERR_PERM;
+        return m3Err_none;
+    }
+    if (count == 0 || count > hal::kRmtMaxDurations) {
+        ret = hal::HAL_ERR_INVAL;
+        return m3Err_none;
+    }
+    size_t mem_size = m3_GetMemorySizeAt(_mem);
+    if (static_cast<uint64_t>(data_offset) + 2ULL * count > mem_size) {
+        ret = hal::HAL_ERR_FAULT;
+        return m3Err_none;
+    }
+    if (runtime_stop_requested(runtime)) return m3Err_trapOutOfGas;   // being stopped: end here, no new frame
+    ret = hal::rmt_send(pod_id, static_cast<const uint8_t*>(_mem) + data_offset, count);
+    return m3Err_none;
+}
+
+// esp32_rmt_receive: signature "i(ii)" -> returns int32_t, args: (buf_offset, cap)
+// The oldest frame the pod's RMT RX channel captured, without waiting: the
+// number of uint16 durations copied, K32_ERR_AGAIN when none is queued,
+// K32_ERR_TOOBIG when the frame has more than `cap` (the first `cap` are
+// copied, the frame is gone). Frames the receiver dropped since the last
+// call are reported in the pod's log.
+static const void* raw_esp32_rmt_receive(IM3Runtime runtime, IM3ImportContext _ctx, uint64_t* _sp, void* _mem) {
+    (void)_ctx;
+    uint32_t buf_offset = static_cast<uint32_t>(_sp[1]);
+    uint32_t cap        = static_cast<uint32_t>(_sp[2]);
+    const std::string& pod_id = get_pod_ref(runtime);
+    int32_t& ret = *reinterpret_cast<int32_t*>(_sp);
+
+    if (!hal::CapabilityFirewall::instance().check_permission(pod_id, hal::PeripheralType::RmtRx, 0, hal::AccessMode::Read)) {
+        ret = hal::HAL_ERR_PERM;
+        return m3Err_none;
+    }
+    if (cap > hal::kRmtMaxDurations) cap = hal::kRmtMaxDurations;   // no frame is longer
+    size_t mem_size = m3_GetMemorySizeAt(_mem);
+    if (static_cast<uint64_t>(buf_offset) + 2ULL * cap > mem_size) {
+        ret = hal::HAL_ERR_FAULT;
+        return m3Err_none;
+    }
+    hal::RmtDrops drops;
+    ret = hal::rmt_receive(pod_id, static_cast<uint8_t*>(_mem) + buf_offset, cap, &drops);
+    if (drops.queue_full || drops.too_long) {
+        char line[128];
+        int n = snprintf(line, sizeof line, "[kube32] RMT receiver dropped");
+        if (drops.queue_full) n += snprintf(line + n, sizeof line - n, " %u frame(s) on a full queue", (unsigned)drops.queue_full);
+        if (drops.too_long) {
+            n += snprintf(line + n, sizeof line - n, "%s %u frame(s) longer than %u durations", drops.queue_full ? "," : "", (unsigned)drops.too_long,
+                          (unsigned)hal::kRmtMaxDurations);
+        }
+        printf("[POD %s] %s\n", pod_id.c_str(), line);
+        PodLogStore::runtime().append(pod_id, std::string_view(line, static_cast<size_t>(n)));
+    }
+    return m3Err_none;
+}
+
 // esp32_get_time_us: signature "I()" -> returns int64_t
 static const void* raw_esp32_get_time_us(IM3Runtime runtime, IM3ImportContext _ctx, uint64_t* _sp, void* _mem) {
     (void)runtime;
@@ -384,6 +469,8 @@ bool link_host_functions(IM3Module module, const std::string& pod_id) {
     m3_LinkRawFunction(module, "env", "esp32_i2c_read",      "i(iiii)", &raw_esp32_i2c_read);
     m3_LinkRawFunction(module, "env", "esp32_uart_write",    "i(iii)",  &raw_esp32_uart_write);
     m3_LinkRawFunction(module, "env", "esp32_uart_read",     "i(iii)",  &raw_esp32_uart_read);
+    m3_LinkRawFunction(module, "env", "esp32_rmt_send",      "i(ii)",   &raw_esp32_rmt_send);
+    m3_LinkRawFunction(module, "env", "esp32_rmt_receive",   "i(ii)",   &raw_esp32_rmt_receive);
     m3_LinkRawFunction(module, "env", "esp32_get_time_us",   "I()",     &raw_esp32_get_time_us);
     m3_LinkRawFunction(module, "env", "esp32_delay_ms",      "v(i)",    &raw_esp32_delay_ms);
 

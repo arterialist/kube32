@@ -1,0 +1,55 @@
+# irremote: decodes infrared remote codes and sends NEC codes on a
+# Cardputer with an M5Stack Unit IR in its Grove port.
+#
+# The pod claims one RMT receiver and one RMT transmitter (esp32.io/rmt-rx,
+# esp32.io/rmt-tx). The receiver runs on the unit's demodulating receiver,
+# Grove white (GPIO 1), whose output is low during a mark (active=low, the
+# default). The transmitter uses the board's default TX pin, the Cardputer's
+# own IR LED on GPIO 44. To send through the unit's LED (Grove yellow,
+# GPIO 2) instead, uncomment the kube32.io/rmt-tx annotation. Either way the
+# pod holds GPIO 1, so an I2C or UART pod cannot use the Grove port beside
+# it; examples/irremote-tx.yaml sends only and leaves the port free.
+#
+# Every NEC code received is logged ("irremote: nec addr=0x04 cmd=0x08")
+# and published on the channel topic ir.received; messages on ir.send
+# ("nec 0x04 0x08", "nec repeat", "raw 9000,4500,560") are transmitted. With
+# IR_SEND_EVERY_S set the pod sends IR_SEND_CODE that often: with the LED
+# facing the unit's receiver it receives its own frames.
+#
+#   kubectl --context kube32 apply -f examples/irremote.yaml
+#   kubectl --context kube32 logs -f irremote
+#
+# GET / and POST /send are answered by the node's pod HTTP server (port
+# 7000, header X-Kube32-Pod: default/irremote): GET / lists the recent codes
+# as JSON, POST /send transmits its body ("nec 0x04 0x08").
+apiVersion: v1
+kind: Pod
+metadata:
+  name: irremote
+  namespace: default
+  labels:
+    app: irremote
+  annotations:
+    kube32.io/rmt-rx: "pin=1"              # Unit IR receiver, Grove white; idle_us=12000 ends a frame
+    # kube32.io/rmt-tx: "pin=2"            # Unit IR LED, Grove yellow (default: the built-in LED, GPIO 44)
+    kube32.io/event-topics: ir.send
+spec:
+  nodeSelector:
+    kube32.io/board: cardputer
+  restartPolicy: Always
+  containers:
+    - name: irremote
+      image: wasm://embedded/irremote
+      env:
+        - name: IR_SEND_EVERY_S            # 0: send only on request
+          value: "0"
+        - name: IR_SEND_CODE
+          value: "nec 0x04 0x08"
+      resources:
+        requests:
+          memory: 12Ki                     # linear memory: 1 KiB stack, 7.3 KiB data and buffers
+          esp32.io/rmt-tx: "1"
+          esp32.io/rmt-rx: "1"
+          hardware.kube32.io/ipc: "1"      # publishes on ir.received
+        limits:
+          memory: 12Ki

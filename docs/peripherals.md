@@ -16,6 +16,8 @@ The firewall reads `resources.requests`, or `resources.limits` when `requests` i
 | `esp32.io/i2c: "<count>"` | None | `<count>` free I2C controllers |
 | `esp32.io/uart-<1\|2>: "1"` | None | UART port `1` or `2` and its TX/RX pins |
 | `esp32.io/uart: "<count>"` | None | `<count>` free UART ports |
+| `esp32.io/rmt-tx: "1"` | None | One RMT (infrared) transmit channel and its pin: `esp32_rmt_send` |
+| `esp32.io/rmt-rx: "1"` | None | One RMT (infrared) receive channel and its pin: `esp32_rmt_receive` |
 | `hardware.kube32.io/tft-display: "1"` | `DISPLAY`, `TFT_DISPLAY` | `k32_display_text`, `k32_display_rect`, `k32_display_bar` |
 | `hardware.kube32.io/keyboard: "1"` | `KEYBOARD` | `k32_key_read` |
 | `hardware.kube32.io/speaker: "1"` | `SPEAKER`, `AUDIO` | `k32_tone` |
@@ -26,7 +28,7 @@ If a requested pin, channel, or bus is reserved or owned by another pod, admissi
 
 ## Host functions
 
-### GPIO, ADC, I2C, and UART
+### GPIO, ADC, I2C, UART, and infrared
 
 Declared in `include/runtime/k32_app_abi.h` and linked in `src/runtime/host_functions.cpp`:
 
@@ -40,6 +42,8 @@ Declared in `include/runtime/k32_app_abi.h` and linked in `src/runtime/host_func
 | `esp32_i2c_read` | `i(iiii)` | `int32_t esp32_i2c_read(uint32_t bus, uint32_t addr, void* buf, uint32_t len)` | Reads `len` bytes from 7-bit `addr` on `bus` (100 ms timeout). Returns bytes read or negative error. |
 | `esp32_uart_write` | `i(iii)` | `int32_t esp32_uart_write(uint32_t port, const void* data, uint32_t len)` | Writes `len` bytes to UART `port` (`1` or `2`). Returns bytes queued or negative error. |
 | `esp32_uart_read` | `i(iii)` | `int32_t esp32_uart_read(uint32_t port, void* buf, uint32_t max_len)` | Reads up to `max_len` bytes from UART `port` within 50 ms. Returns bytes read or negative error. |
+| `esp32_rmt_send` | `i(ii)` | `int32_t esp32_rmt_send(const uint16_t* durations_us, uint32_t count)` | Sends one IR frame of `count` mark and space durations on the pod's RMT TX channel ([infrared](#infrared-rmt)). Returns `count` once the frame is out, or negative error. |
+| `esp32_rmt_receive` | `i(ii)` | `int32_t esp32_rmt_receive(uint16_t* out_us, uint32_t cap)` | Copies the oldest frame the pod's RMT RX channel captured, without waiting. Returns its duration count, `K32_ERR_AGAIN` when none is queued, or negative error. |
 | `esp32_delay_ms` | `v(i)` | `void esp32_delay_ms(uint32_t ms)` | Sleeps for `ms` milliseconds in 20 ms slices. Requires no grant. |
 | `esp32_get_time_us` | `I()` | `int64_t esp32_get_time_us(void)` | Returns microseconds since boot. Requires no grant. |
 
@@ -48,10 +52,12 @@ Error codes (`include/runtime/k32_app_abi.h`, `include/hal/hal_types.hpp`):
 * `K32_OK`, `0`, success
 * `K32_ERR_PERM`, `-1`, capability not granted to this pod
 * `K32_ERR_IO`, `-5`, physical I/O error
+* `K32_ERR_TOOBIG`, `-7`, IR frame longer than the buffer
+* `K32_ERR_AGAIN`, `-11`, no IR frame queued
 * `K32_ERR_NOMEM`, `-12`, out of memory
 * `K32_ERR_FAULT`, `-14`, buffer pointer and length outside linear memory
 * `K32_ERR_NODEV`, `-19`, bus not installed or no device acknowledged
-* `K32_ERR_INVAL`, `-22`, invalid bus, port, or 7-bit address above `0x7f`
+* `K32_ERR_INVAL`, `-22`, invalid bus, port, or 7-bit address above `0x7f`; empty, overlong, or zero-duration IR frame
 * `K32_ERR_TIMEOUT`, `-110`, transfer timed out
 
 ### Cardputer display, keypad, and speaker
@@ -111,11 +117,115 @@ Calling `esp32_i2c_write(bus, addr, ptr, 0)` with `len` set to `0` probes `addr`
 * Returns `0` (`K32_OK`) when a device at `addr` acknowledges.
 * Returns `-19` (`K32_ERR_NODEV`) when no device answers.
 
+## Infrared (RMT)
+
+The ESP32-S3 RMT peripheral sends and captures pulse trains, the signal of infrared remote controls. A pod claims one transmit channel (`esp32.io/rmt-tx: "1"`), one receive channel (`esp32.io/rmt-rx: "1"`), or one of each. The chip has four channels of each direction; a node advertises at most four of each and only as many as it has pins for, so a profile without a claimable pin for a direction advertises none of it.
+
+### Pins and settings
+
+```yaml
+metadata:
+  annotations:
+    kube32.io/rmt-tx: "pin=2,carrier=38000,duty=33"
+    kube32.io/rmt-rx: "pin=1,active=low,idle_us=12000"
+```
+
+| Annotation | Setting | Default | Meaning |
+| --- | --- | --- | --- |
+| `kube32.io/rmt-tx` | `pin` | Board default | Output pin |
+| | `carrier` | `38000` | Frequency in Hz of the carrier that modulates every mark, `10000` to `500000`; `0` sends a mark as a steady high level |
+| | `duty` | `33` | Carrier duty cycle in percent, `1` to `99` |
+| `kube32.io/rmt-rx` | `pin` | Board default | Input pin |
+| | `active` | `low` | Line level during a mark: `low` for IR demodulating receivers, which pull their output low while they see the carrier; `high` for a non-inverted signal |
+| | `idle_us` | `12000` | A level that lasts this long ends the frame, `1000` to `32767` |
+
+| Board profile | Allocatable counts | Default TX pin | Default RX pin |
+| --- | --- | --- | --- |
+| `generic` | 4 RMT TX, 4 RMT RX | None | None |
+| `cardputer` | 4 RMT TX, 4 RMT RX | GPIO 44, the built-in IR LED | None |
+
+Channel pins are claimed like bus pins: admission fails when the chip or the board reserves the pin, when another pod holds it, or when the claim names no pin and the board has no default (`RMT RX has no default pin on the cardputer board: set annotation kube32.io/rmt-rx: "pin=<n>"`).
+
+GPIO 44 is the UART0 RX pad, reserved on every board by `KUBE32_RESERVED_GPIO_MASK`. The `cardputer` profile offers it to RMT TX channels only (`BoardProfile::rmt_tx_pin_mask`): the board wires its IR LED there and nothing else, and its console runs on the native USB port, so no UART0 driver reads the pad. It stays unavailable as a GPIO and as an RX pin. On the `generic` profile the pad belongs to the USB-UART bridge and cannot be claimed.
+
+With an M5Stack Unit IR in the Cardputer's Grove port, the unit's receiver output is GPIO 1 (white wire, active low) and its LED input is GPIO 2 (yellow wire). A receiver on GPIO 1 takes the Grove port, so `I2C0` and `UART1` cannot be claimed beside it; a pod that only sends through the built-in LED on GPIO 44 leaves the port free for them.
+
+### Frames
+
+A frame is alternating mark and space durations in microseconds, mark first, each from 1 to 65535.
+
+`esp32_rmt_send` transmits one frame and returns when it is out. The host turns the durations into RMT symbols while the frame plays, reading them from the pod's linear memory, so a send allocates nothing. A frame holds at most `K32_RMT_MAX_DURATIONS` (512) durations and lasts at most `K32_RMT_MAX_FRAME_US` (500 ms). The calling pod waits for the frame (an NEC frame takes 68 ms); on boards without PSRAM, where all pods run on one interpreter, every other pod's call waits as well.
+
+The receiver is armed from admission until the pod's channels are released. It captures with 1 µs resolution and ignores pulses shorter than 1.25 µs. Each captured frame goes into the channel's queue, which holds up to `K32_RMT_RX_QUEUE_FRAMES` (8) frames and `K32_RMT_RX_QUEUE_DURATIONS` (512) durations in all. A frame that finds the queue full, or that has more than 512 durations, is dropped, and the pod's next `esp32_rmt_receive` call writes the count to the pod's log:
+
+```
+[kube32] RMT receiver dropped 2 frame(s) on a full queue
+```
+
+`esp32_rmt_receive` never waits. It returns the oldest frame with its marks normalized to the `active` setting, `K32_ERR_AGAIN` when the queue is empty, or `K32_ERR_TOOBIG` when the frame has more durations than `cap`; the first `cap` durations are then copied and the frame leaves the queue. A buffer of 512 durations holds any frame. A pod that polls the queue from `k32_tick` and returns `1` after taking a frame is ticked again within about 10 ms, so it keeps up with a remote's repeat codes.
+
+### Channel lifecycle and memory
+
+After admission succeeds, `src/hal/pod_rmt.cpp` creates the channels with `rmt_new_tx_channel` and `rmt_new_rx_channel` from `driver/rmt_tx.h` and `driver/rmt_rx.h` (1 MHz resolution, one 48-symbol memory block each, no DMA), applies the carrier with `rmt_apply_carrier`, and arms the receiver with `rmt_receive`. The receiver is armed again from the RMT interrupt at the end of every frame. When the pod stops or is deleted, `unregister_pod` disables and deletes the channels, frees the queue, and resets the pins with `gpio_reset_pin`. If a channel cannot be created, the pod is not admitted and nothing it claimed stays installed.
+
+A receive channel allocates its 1 KiB queue and a 192-byte capture block from internal RAM; each channel's driver objects take a few hundred bytes more. A node pays only for channels its pods have claimed, and the node log reports what each channel cost when it was created:
+
+```
+[HAL] RMT RX installed for default/irremote: GPIO 1, active low, idle 12000 us, <n> bytes of internal RAM
+```
+
+The firmware builds the RMT driver's interrupt handlers and encoders into flash instead of IRAM (`CONFIG_RMT_*_IN_IRAM` off in `sdkconfig.defaults`): an IR symbol lasts hundreds of microseconds, so a cache miss costs nothing.
+
+On the host simulator the channels keep the same lifecycle and queue. `MockHal::get_rmt_tx_frames(pin)` returns the frames sent on a pin, `hal::rmt_inject(pin, ...)` hands a frame to the receiver on a pin, and `MockHal::set_rmt_loopback(true)` delivers every frame sent to the node's receivers, as an LED facing them would.
+
+### Example: IR remote
+
+`apps/irremote/irremote.c` decodes NEC codes, including repeat codes and 16-bit extended addresses, and logs any other frame as raw durations. It publishes the codes on the channel topic `ir.received` and sends the codes it receives on `ir.send`, as `POST /send` bodies, or periodically from `IR_SEND_CODE`:
+
+```
+nec 0x04 0x08        NEC address and command
+nec repeat           the NEC repeat code
+raw 9000,4500,560    durations in microseconds, mark first
+```
+
+It polls the receiver from `k32_tick` and never blocks, so it runs on the Cardputer's shared interpreter. Without the `esp32.io/rmt-rx` claim it logs `irremote: no esp32.io/rmt-rx claim: not receiving, sending only` once and only sends.
+
+`examples/irremote.yaml` receives through a Unit IR on GPIO 1 and sends through the built-in LED; `examples/irremote-tx.yaml` only sends and leaves the Grove port free:
+
+```yaml
+metadata:
+  name: irremote
+  annotations:
+    kube32.io/rmt-rx: "pin=1"              # Unit IR receiver, Grove white
+    # kube32.io/rmt-tx: "pin=2"            # Unit IR LED, Grove yellow (default: the built-in LED, GPIO 44)
+    kube32.io/event-topics: ir.send
+spec:
+  nodeSelector:
+    kube32.io/board: cardputer
+  containers:
+    - name: irremote
+      image: wasm://embedded/irremote
+      resources:
+        requests:
+          memory: 12Ki
+          esp32.io/rmt-tx: "1"
+          esp32.io/rmt-rx: "1"
+          hardware.kube32.io/ipc: "1"      # publishes on ir.received
+        limits:
+          memory: 12Ki
+```
+
+```
+make -C apps/irremote
+kubectl --context kube32 apply -f examples/irremote.yaml
+kubectl --context kube32 logs -f irremote
+```
+
 ## Reserved pins
 
 The ESP32-S3 provides GPIO 0 to 21 and 26 to 48. The firewall blocks claims on reserved pins (`include/hal/capability_firewall.hpp`):
 
-* Every board (`KUBE32_RESERVED_GPIO_MASK`) reserves GPIO `0` for boot strapping, `19` and `20` for native USB, `26` to `32` for SPI flash and quad PSRAM, and `43` and `44` for the UART0 console.
+* Every board (`KUBE32_RESERVED_GPIO_MASK`) reserves GPIO `0` for boot strapping, `19` and `20` for native USB, `26` to `32` for SPI flash and quad PSRAM, and `43` and `44` for the UART0 console. The `cardputer` profile offers GPIO `44` to RMT TX channels for its IR LED.
 * The `cardputer` profile also reserves LCD SPI pins `33` to `38`, I2S speaker pins `41` to `43`, keyboard matrix pins `3` to `9`, `11`, `13`, and `15`, and microSD SPI pins `12`, `14`, `39`, and `40`.
 
 An ADC1 channel `N` from `0` to `9` is claimable only when its pad, GPIO `N + 1`, is claimable by the board profile.

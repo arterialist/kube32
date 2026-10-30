@@ -16,6 +16,7 @@ CapabilityFirewall::CapabilityFirewall() {
 
 void CapabilityFirewall::reset() {
     bus_release_all();
+    rmt_release_all();
     osal::LockGuard guard(mutex_);
     profile_ = BoardProfile{};
     pod_records_.clear();
@@ -34,6 +35,7 @@ void CapabilityFirewall::set_board_profile(const BoardProfile& profile) {
     profile_ = profile;
     profile_.i2c_bus_mask &= KUBE32_CHIP_I2C_MASK;
     profile_.uart_port_mask &= KUBE32_CHIP_UART_MASK;
+    profile_.rmt_tx_pin_mask &= KUBE32_CHIP_GPIO_MASK;
 }
 
 BoardProfile CapabilityFirewall::board_profile() const {
@@ -67,6 +69,43 @@ uint16_t CapabilityFirewall::claimable_adc1_mask() const {
 uint8_t CapabilityFirewall::claimable_i2c_mask() const {
     osal::LockGuard guard(mutex_);
     return profile_.i2c_bus_mask;
+}
+
+uint32_t CapabilityFirewall::claimable_rmt_count_locked(RmtDir dir) const {
+    uint64_t pins = claimable_gpio_mask_locked();
+    if (dir == RmtDir::Tx) pins |= profile_.rmt_tx_pin_mask;
+    uint32_t n = 0;
+    for (; pins; pins &= pins - 1) n++;
+    return n < kRmtChannels ? n : kRmtChannels;
+}
+
+uint32_t CapabilityFirewall::allocated_rmt_count_locked(RmtDir dir) const {
+    const uint32_t cap = dir == RmtDir::Tx ? KUBE32_CAP_RMT_TX : KUBE32_CAP_RMT_RX;
+    uint32_t n = 0;
+    for (const auto& kv : pod_records_) {
+        if (kv.second.grant.has_capability(cap)) n++;
+    }
+    return n;
+}
+
+uint32_t CapabilityFirewall::claimable_rmt_tx_count() const {
+    osal::LockGuard guard(mutex_);
+    return claimable_rmt_count_locked(RmtDir::Tx);
+}
+
+uint32_t CapabilityFirewall::claimable_rmt_rx_count() const {
+    osal::LockGuard guard(mutex_);
+    return claimable_rmt_count_locked(RmtDir::Rx);
+}
+
+uint32_t CapabilityFirewall::get_allocated_rmt_tx_count() const {
+    osal::LockGuard guard(mutex_);
+    return allocated_rmt_count_locked(RmtDir::Tx);
+}
+
+uint32_t CapabilityFirewall::get_allocated_rmt_rx_count() const {
+    osal::LockGuard guard(mutex_);
+    return allocated_rmt_count_locked(RmtDir::Rx);
 }
 
 bool CapabilityFirewall::allocate_generic_gpios(uint32_t count, DeviceGrant& grant, const std::string& pod_id, std::vector<uint32_t>& out_claimed, std::string& out_error) {
@@ -150,23 +189,25 @@ bool CapabilityFirewall::allocate_generic_adc(uint32_t count, DeviceGrant& grant
 
 bool CapabilityFirewall::register_pod(const std::string& pod_id, const std::string& pod_manifest_json, std::string& out_error) {
     std::vector<BusAssignment> buses;
+    std::vector<RmtAssignment> rmt;
     {
         osal::LockGuard guard(mutex_);
-        if (!register_pod_locked(pod_id, pod_manifest_json, buses, out_error)) return false;
+        if (!register_pod_locked(pod_id, pod_manifest_json, buses, rmt, out_error)) return false;
     }
-    return install_buses(pod_id, buses, out_error);
+    return install_drivers(pod_id, buses, rmt, out_error);
 }
 
 // Driver installs take milliseconds and touch no firewall state: they run
 // without the lock, so host calls of other pods are not held up.
-bool CapabilityFirewall::install_buses(const std::string& pod_id, const std::vector<BusAssignment>& buses, std::string& out_error) {
-    if (buses.empty() || bus_install(pod_id, buses, out_error)) return true;
+bool CapabilityFirewall::install_drivers(const std::string& pod_id, const std::vector<BusAssignment>& buses, const std::vector<RmtAssignment>& rmt,
+                                         std::string& out_error) {
+    if ((buses.empty() || bus_install(pod_id, buses, out_error)) && (rmt.empty() || rmt_install(pod_id, rmt, out_error))) return true;
     unregister_pod(pod_id);
     return false;
 }
 
 bool CapabilityFirewall::register_pod_locked(const std::string& pod_id, const std::string& pod_manifest_json, std::vector<BusAssignment>& out_buses,
-                                             std::string& out_error) {
+                                             std::vector<RmtAssignment>& out_rmt, std::string& out_error) {
     if (pod_records_.find(pod_id) != pod_records_.end()) {
         out_error = "Pod already registered in capability firewall: " + pod_id;
         return false;
@@ -186,7 +227,7 @@ bool CapabilityFirewall::register_pod_locked(const std::string& pod_id, const st
     uint32_t generic_i2c_count = 0;
     uint32_t generic_uart_count = 0;
     uint32_t generic_adc_count = 0;
-    std::map<std::string, std::string> bus_annotations;   // kube32.io/i2c-bus-N, kube32.io/uart-N
+    std::map<std::string, std::string> bus_annotations;   // kube32.io/i2c-bus-N, kube32.io/uart-N, kube32.io/rmt-tx, kube32.io/rmt-rx
 
     std::vector<uint32_t> claimed_gpios;
     std::vector<uint32_t> claimed_adcs;
@@ -221,7 +262,9 @@ bool CapabilityFirewall::register_pod_locked(const std::string& pod_id, const st
                 grant.capabilities_mask |= KUBE32_CAP_IPC;
             }
             for (const auto& kv : annotations->obj_val) {
-                if ((kv.first.rfind("kube32.io/i2c-bus-", 0) == 0 || kv.first.rfind("kube32.io/uart-", 0) == 0) && kv.second.is_string()) {
+                if ((kv.first.rfind("kube32.io/i2c-bus-", 0) == 0 || kv.first.rfind("kube32.io/uart-", 0) == 0 || kv.first == "kube32.io/rmt-tx" ||
+                     kv.first == "kube32.io/rmt-rx") &&
+                    kv.second.is_string()) {
                     bus_annotations[kv.first] = kv.second.str_val;
                 }
             }
@@ -394,6 +437,16 @@ bool CapabilityFirewall::register_pod_locked(const std::string& pod_id, const st
                         allocated_uart_mask_ |= (1U << port);
                         claimed_uarts.push_back(port);
                     }
+                    // RMT (IR) channel: "esp32.io/rmt-tx": "1" or "esp32.io/rmt-rx": "1", one of each per pod
+                    else if (key == "esp32.io/rmt-tx" || key == "esp.io/rmt-tx" || key == "esp32.io/rmt-rx" || key == "esp.io/rmt-rx") {
+                        if (val_str == "0") continue;
+                        if (val_str != "1") {
+                            cleanup_claimed();
+                            out_error = "Invalid " + key + ": \"" + val_str + "\" (a pod claims one channel: \"1\")";
+                            return false;
+                        }
+                        grant.capabilities_mask |= (key.find("rmt-tx") != std::string::npos) ? KUBE32_CAP_RMT_TX : KUBE32_CAP_RMT_RX;
+                    }
                     // Virtual Channel IPC: "kube32.io/ipc" / "hardware.kube32.io/ipc": "1" or "true"
                     else if (key == "kube32.io/ipc" || key == "hardware.kube32.io/ipc") {
                         if (val_str == "1" || val_str == "true") {
@@ -491,6 +544,11 @@ bool CapabilityFirewall::register_pod_locked(const std::string& pod_id, const st
         cleanup_claimed();
         return false;
     }
+    std::vector<RmtAssignment> rmt;
+    if (!claim_rmt_pins(pod_id, grant, bus_annotations, rmt, claimed_gpios, out_error)) {
+        cleanup_claimed();
+        return false;
+    }
     if (generic_gpio_count > 0 && !allocate_generic_gpios(generic_gpio_count, grant, pod_id, claimed_gpios, out_error)) {
         cleanup_claimed();
         return false;
@@ -508,8 +566,10 @@ bool CapabilityFirewall::register_pod_locked(const std::string& pod_id, const st
     record.sd_claim = sd_claim;
     record.card_required = !sd_claim.empty() && (sd_requested || card_volume);
     record.buses = buses;
+    record.rmt = rmt;
     pod_records_[pod_id] = record;
     out_buses = std::move(buses);
+    out_rmt = std::move(rmt);
 
     return true;
 }
@@ -537,15 +597,16 @@ std::string CapabilityFirewall::sd_claim(const std::string& pod_id) const {
 
 bool CapabilityFirewall::grant_capabilities(const std::string& pod_id, const DeviceGrant& grant, std::string& out_error) {
     std::vector<BusAssignment> buses;
+    std::vector<RmtAssignment> rmt;
     {
         osal::LockGuard guard(mutex_);
-        if (!grant_capabilities_locked(pod_id, grant, buses, out_error)) return false;
+        if (!grant_capabilities_locked(pod_id, grant, buses, rmt, out_error)) return false;
     }
-    return install_buses(pod_id, buses, out_error);
+    return install_drivers(pod_id, buses, rmt, out_error);
 }
 
 bool CapabilityFirewall::grant_capabilities_locked(const std::string& pod_id, const DeviceGrant& grant, std::vector<BusAssignment>& out_buses,
-                                                   std::string& out_error) {
+                                                   std::vector<RmtAssignment>& out_rmt, std::string& out_error) {
     if (pod_records_.find(pod_id) != pod_records_.end()) {
         out_error = "Pod already registered in capability firewall: " + pod_id;
         return false;
@@ -651,10 +712,11 @@ bool CapabilityFirewall::grant_capabilities_locked(const std::string& pod_id, co
         }
     }
 
-    // Granted buses run on the board's default pins
+    // Granted buses and RMT channels run on the board's default pins
     std::vector<BusAssignment> buses;
+    std::vector<RmtAssignment> rmt;
     std::vector<uint32_t> bus_pins;
-    if (!claim_bus_pins(pod_id, grant, {}, buses, bus_pins, out_error)) {
+    if (!claim_bus_pins(pod_id, grant, {}, buses, bus_pins, out_error) || !claim_rmt_pins(pod_id, grant, {}, rmt, bus_pins, out_error)) {
         for (uint32_t p : claimed_gpios) { gpio_owners_[p].clear(); allocated_gpio_mask_ &= ~(1ULL << p); }
         for (uint32_t p : bus_pins) { gpio_owners_[p].clear(); allocated_gpio_mask_ &= ~(1ULL << p); }
         for (uint32_t c : claimed_adcs) { adc1_owners_[c].clear(); allocated_adc1_mask_ &= ~(1U << c); }
@@ -669,14 +731,16 @@ bool CapabilityFirewall::grant_capabilities_locked(const std::string& pod_id, co
     record.action = SecurityAction::LogAndDeny;
     record.violation_count = 0;
     record.buses = buses;
+    record.rmt = rmt;
     pod_records_[pod_id] = record;
     out_buses = std::move(buses);
+    out_rmt = std::move(rmt);
     return true;
 }
 
-// "sda=8,scl=9,hz=400000" -> {sda: 8, scl: 9, hz: 400000}; false when an item
-// is not <name>=<decimal number>.
-static bool parse_bus_spec(const std::string& spec, std::map<std::string, uint32_t>& out) {
+// "sda=8,scl=9" or "pin=1,active=low" -> {name: value}, names in lower case;
+// false when an item is not <name>=<value>.
+static bool parse_settings(const std::string& spec, std::map<std::string, std::string>& out) {
     auto trim = [](std::string v) {
         while (!v.empty() && (v.front() == ' ' || v.front() == '\t')) v.erase(v.begin());
         while (!v.empty() && (v.back() == ' ' || v.back() == '\t')) v.pop_back();
@@ -693,35 +757,56 @@ static bool parse_bus_spec(const std::string& spec, std::map<std::string, uint32
         if (eq == std::string::npos) return false;
         std::string key = trim(item.substr(0, eq));
         std::string val = trim(item.substr(eq + 1));
-        if (key.empty() || val.empty() || val.size() > 9) return false;
-        for (char c : val) if (c < '0' || c > '9') return false;
+        if (key.empty() || val.empty()) return false;
         for (auto& c : key) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
-        out[key] = static_cast<uint32_t>(std::stoul(val));
+        out[key] = val;
     }
+    return true;
+}
+
+// A decimal number of at most 9 digits
+static bool parse_setting_uint(const std::string& val, uint32_t& out) {
+    if (val.empty() || val.size() > 9) return false;
+    for (char c : val) if (c < '0' || c > '9') return false;
+    out = static_cast<uint32_t>(std::stoul(val));
+    return true;
+}
+
+// "sda=8,scl=9,hz=400000" -> {sda: 8, scl: 9, hz: 400000}; false when an item
+// is not <name>=<decimal number>.
+static bool parse_bus_spec(const std::string& spec, std::map<std::string, uint32_t>& out) {
+    std::map<std::string, std::string> items;
+    if (!parse_settings(spec, items)) return false;
+    for (const auto& kv : items) {
+        if (!parse_setting_uint(kv.second, out[kv.first])) return false;
+    }
+    return true;
+}
+
+bool CapabilityFirewall::claim_pin(const std::string& pod_id, uint32_t pin, const std::string& what, uint64_t also_allowed,
+                                   std::vector<uint32_t>& out_claimed_pins, std::string& out_error) {
+    const bool offered = pin < 64 && (also_allowed & (1ULL << pin)) != 0;
+    if (!offered && (pin >= 64 || (KUBE32_SAFE_GPIO_MASK & (1ULL << pin)) == 0)) {
+        out_error = "Security Violation: Pin GPIO " + std::to_string(pin) + " (" + what + ") is reserved or unsafe.";
+        return false;
+    }
+    if (!offered && (profile_.reserved_gpio_mask & (1ULL << pin)) != 0) {
+        out_error = "Security Violation: Pin GPIO " + std::to_string(pin) + " (" + what + ") is used by the " + profile_.name + " board.";
+        return false;
+    }
+    if (!gpio_owners_[pin].empty()) {
+        out_error = gpio_owners_[pin] == pod_id ? "GPIO " + std::to_string(pin) + " (" + what + ") is claimed twice by the pod"
+                                                : "Hardware Collision: GPIO " + std::to_string(pin) + " (" + what + ") already claimed by " + gpio_owners_[pin];
+        return false;
+    }
+    gpio_owners_[pin] = pod_id;
+    allocated_gpio_mask_ |= (1ULL << pin);
+    out_claimed_pins.push_back(pin);
     return true;
 }
 
 bool CapabilityFirewall::claim_bus_pins(const std::string& pod_id, const DeviceGrant& grant, const std::map<std::string, std::string>& annotations,
                                         std::vector<BusAssignment>& out_buses, std::vector<uint32_t>& out_claimed_pins, std::string& out_error) {
-    auto claim_pin = [&](uint32_t pin, const std::string& what) {
-        if (pin >= 64 || (KUBE32_SAFE_GPIO_MASK & (1ULL << pin)) == 0) {
-            out_error = "Security Violation: Pin GPIO " + std::to_string(pin) + " (" + what + ") is reserved or unsafe.";
-            return false;
-        }
-        if ((profile_.reserved_gpio_mask & (1ULL << pin)) != 0) {
-            out_error = "Security Violation: Pin GPIO " + std::to_string(pin) + " (" + what + ") is used by the " + profile_.name + " board.";
-            return false;
-        }
-        if (!gpio_owners_[pin].empty()) {
-            out_error = gpio_owners_[pin] == pod_id ? "GPIO " + std::to_string(pin) + " (" + what + ") is claimed twice by the pod"
-                                                    : "Hardware Collision: GPIO " + std::to_string(pin) + " (" + what + ") already claimed by " + gpio_owners_[pin];
-            return false;
-        }
-        gpio_owners_[pin] = pod_id;
-        allocated_gpio_mask_ |= (1ULL << pin);
-        out_claimed_pins.push_back(pin);
-        return true;
-    };
     struct Kind {
         BusKind kind;
         uint8_t mask;
@@ -777,11 +862,86 @@ bool CapabilityFirewall::claim_bus_pins(const std::string& pod_id, const DeviceG
                 out_error = "Invalid " + key + ": " + k.pin_a + " and " + k.pin_b + " are the same pin";
                 return false;
             }
-            if (!claim_pin(static_cast<uint32_t>(pa), label + " " + k.pin_a) || !claim_pin(static_cast<uint32_t>(pb), label + " " + k.pin_b)) return false;
+            if (!claim_pin(pod_id, static_cast<uint32_t>(pa), label + " " + k.pin_a, 0, out_claimed_pins, out_error) ||
+                !claim_pin(pod_id, static_cast<uint32_t>(pb), label + " " + k.pin_b, 0, out_claimed_pins, out_error)) {
+                return false;
+            }
             b.pin_a = static_cast<uint8_t>(pa);
             b.pin_b = static_cast<uint8_t>(pb);
             out_buses.push_back(b);
         }
+    }
+    return true;
+}
+
+bool CapabilityFirewall::claim_rmt_pins(const std::string& pod_id, const DeviceGrant& grant, const std::map<std::string, std::string>& annotations,
+                                        std::vector<RmtAssignment>& out_rmt, std::vector<uint32_t>& out_claimed_pins, std::string& out_error) {
+    for (RmtDir dir : {RmtDir::Tx, RmtDir::Rx}) {
+        const bool tx = dir == RmtDir::Tx;
+        if (!grant.has_capability(tx ? KUBE32_CAP_RMT_TX : KUBE32_CAP_RMT_RX)) continue;
+        const std::string label = tx ? "RMT TX" : "RMT RX";
+        const std::string key = tx ? "kube32.io/rmt-tx" : "kube32.io/rmt-rx";
+        const char* want = tx ? "pin=<n>[,carrier=<Hz>][,duty=<percent>]" : "pin=<n>[,active=low|high][,idle_us=<n>]";
+        if (allocated_rmt_count_locked(dir) >= claimable_rmt_count_locked(dir)) {
+            out_error = "Insufficient allocatable " + label + " channels: requested 1, available 0";
+            return false;
+        }
+        RmtAssignment a;
+        a.dir = dir;
+        a.carrier_hz = kRmtDefaultCarrierHz;
+        a.duty_pct = kRmtDefaultDutyPct;
+        a.active_low = true;
+        a.idle_us = kRmtDefaultIdleUs;
+        int32_t pin = tx ? profile_.rmt_tx_default_pin : profile_.rmt_rx_default_pin;
+        auto it = annotations.find(key);
+        if (it != annotations.end()) {
+            std::map<std::string, std::string> v;
+            uint32_t n = 0;
+            if (!parse_settings(it->second, v) || !v.count("pin") || !parse_setting_uint(v["pin"], n)) {
+                out_error = "Invalid " + key + " \"" + it->second + "\" (want \"" + want + "\")";
+                return false;
+            }
+            pin = static_cast<int32_t>(n < 64 ? n : 64);
+            for (const auto& kv : v) {
+                const std::string& name = kv.first;
+                if (name == "pin") continue;
+                if (tx && name == "carrier") {
+                    if (!parse_setting_uint(kv.second, n) || (n != 0 && (n < kRmtMinCarrierHz || n > kRmtMaxCarrierHz))) {
+                        out_error = "Invalid " + key + ": carrier must be 0 (off) or " + std::to_string(kRmtMinCarrierHz) + ".." +
+                                    std::to_string(kRmtMaxCarrierHz) + " Hz";
+                        return false;
+                    }
+                    a.carrier_hz = n;
+                } else if (tx && name == "duty") {
+                    if (!parse_setting_uint(kv.second, n) || n < 1 || n > 99) {
+                        out_error = "Invalid " + key + ": duty must be 1..99 percent";
+                        return false;
+                    }
+                    a.duty_pct = static_cast<uint8_t>(n);
+                } else if (!tx && name == "active") {
+                    if (kv.second != "low" && kv.second != "high") {
+                        out_error = "Invalid " + key + ": active must be low or high";
+                        return false;
+                    }
+                    a.active_low = kv.second == "low";
+                } else if (!tx && name == "idle_us") {
+                    if (!parse_setting_uint(kv.second, n) || n < kRmtMinIdleUs || n > kRmtMaxIdleUs) {
+                        out_error = "Invalid " + key + ": idle_us must be " + std::to_string(kRmtMinIdleUs) + ".." + std::to_string(kRmtMaxIdleUs);
+                        return false;
+                    }
+                    a.idle_us = n;
+                } else {
+                    out_error = "Invalid " + key + ": unknown setting \"" + name + "\"";
+                    return false;
+                }
+            }
+        } else if (pin < 0) {
+            out_error = label + " has no default pin on the " + profile_.name + " board: set annotation " + key + ": \"pin=<n>\"";
+            return false;
+        }
+        if (!claim_pin(pod_id, static_cast<uint32_t>(pin), label, tx ? profile_.rmt_tx_pin_mask : 0, out_claimed_pins, out_error)) return false;
+        a.pin = static_cast<uint8_t>(pin);
+        out_rmt.push_back(a);
     }
     return true;
 }
@@ -816,9 +976,16 @@ std::vector<BusAssignment> CapabilityFirewall::pod_buses(const std::string& pod_
     return it == pod_records_.end() ? std::vector<BusAssignment>() : it->second.buses;
 }
 
+std::vector<RmtAssignment> CapabilityFirewall::pod_rmt(const std::string& pod_id) const {
+    osal::LockGuard guard(mutex_);
+    auto it = pod_records_.find(pod_id);
+    return it == pod_records_.end() ? std::vector<RmtAssignment>() : it->second.rmt;
+}
+
 void CapabilityFirewall::unregister_pod(const std::string& pod_id) {
-    // The driver goes before the pins are free for anyone else
+    // The drivers go before the pins are free for anyone else
     bus_release(pod_id);
+    rmt_release(pod_id);
     osal::LockGuard guard(mutex_);
     pod_records_.erase(pod_id);
     for (size_t i = 0; i < gpio_owners_.size(); ++i) {
@@ -889,6 +1056,12 @@ bool CapabilityFirewall::check_permission(const std::string& pod_id, PeripheralT
         case PeripheralType::ServiceCall:
             permitted = grant.has_capability(KUBE32_CAP_SERVICE_CALL);
             break;
+        case PeripheralType::RmtTx:
+            permitted = grant.has_capability(KUBE32_CAP_RMT_TX);
+            break;
+        case PeripheralType::RmtRx:
+            permitted = grant.has_capability(KUBE32_CAP_RMT_RX);
+            break;
     }
 
     if (!permitted) {
@@ -933,7 +1106,7 @@ void CapabilityFirewall::log_violation(const std::string& pod_id, PeripheralType
     static int logged = 0;
     if (logged >= 16) return;
     logged++;
-    static const char* const names[] = {"gpio", "adc", "i2c", "uart", "ipc", "display", "keyboard", "speaker", "sd", "service-call"};   // PeripheralType order
+    static const char* const names[] = {"gpio", "adc", "i2c", "uart", "ipc", "display", "keyboard", "speaker", "sd", "service-call", "rmt-tx", "rmt-rx"};   // PeripheralType order
     unsigned ti = static_cast<unsigned>(type);
     std::cout << "[FIREWALL] denied " << pod_id << ": " << (ti < sizeof(names) / sizeof(names[0]) ? names[ti] : "peripheral")
               << " " << target << " " << (mode == AccessMode::Write ? "write" : "read") << std::endl;

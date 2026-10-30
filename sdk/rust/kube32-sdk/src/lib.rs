@@ -28,8 +28,9 @@
 //!
 //! * `panic-handler` (default): a `#[panic_handler]` that logs through
 //!   `k32_log` and traps.
-//! * `hardware`: [`hardware`] wraps `k32_display_*`, `k32_key_read` and
-//!   `k32_tone`.
+//! * `hardware`: [`hardware`] wraps `k32_display_*`, `k32_key_read`,
+//!   `k32_tone` and the infrared imports `esp32_rmt_send` and
+//!   `esp32_rmt_receive`.
 //! * `fs`: [`fs`] wraps the `k32_fs_*` imports (pod storage on the microSD card).
 //!
 //! An import is only linked into the module when the app calls it, so the
@@ -68,6 +69,7 @@ pub const MAX_HEADER_BYTES: usize = 256;
 pub const ERR_PERM: i32 = -1;
 pub const ERR_NOENT: i32 = -2;
 pub const ERR_IO: i32 = -5;
+pub const ERR_TOOBIG: i32 = -7;
 pub const ERR_BADF: i32 = -9;
 pub const ERR_AGAIN: i32 = -11;
 pub const ERR_NOMEM: i32 = -12;
@@ -90,6 +92,9 @@ pub enum Error {
     NotFound,
     /// I/O error on the card or the radio (`K32_ERR_IO`).
     Io,
+    /// The data does not fit the buffer (`K32_ERR_TOOBIG`): an IR frame
+    /// longer than the buffer, whose first part was copied.
+    TooBig,
     /// File descriptor not open, or opened for the other direction (`K32_ERR_BADF`).
     BadFd,
     /// Pointer or length outside linear memory (`K32_ERR_FAULT`).
@@ -120,6 +125,7 @@ impl Error {
             ERR_PERM => Err(Error::Permission),
             ERR_NOENT => Err(Error::NotFound),
             ERR_IO => Err(Error::Io),
+            ERR_TOOBIG => Err(Error::TooBig),
             ERR_BADF => Err(Error::BadFd),
             ERR_FAULT => Err(Error::Fault),
             ERR_EXIST => Err(Error::Exists),
@@ -139,6 +145,7 @@ impl Error {
             Error::Permission => ERR_PERM,
             Error::NotFound => ERR_NOENT,
             Error::Io => ERR_IO,
+            Error::TooBig => ERR_TOOBIG,
             Error::BadFd => ERR_BADF,
             Error::Fault => ERR_FAULT,
             Error::Exists => ERR_EXIST,
@@ -150,6 +157,36 @@ impl Error {
             Error::NameTooLong => ERR_NAMETOOLONG,
             Error::Host(n) => n,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn host_codes_map_to_errors_and_back() {
+        let all = [
+            Error::Permission,
+            Error::NotFound,
+            Error::Io,
+            Error::TooBig,
+            Error::BadFd,
+            Error::Fault,
+            Error::Exists,
+            Error::NoDevice,
+            Error::IsDir,
+            Error::Invalid,
+            Error::TooManyFiles,
+            Error::NoSpace,
+            Error::NameTooLong,
+        ];
+        for e in all {
+            assert_eq!(Error::from_rc(e.code()), Err(e));
+        }
+        assert_eq!(Error::from_rc(ERR_TOOBIG), Err(Error::TooBig));
+        assert_eq!(Error::from_rc(67), Ok(67));
+        assert_eq!(Error::from_rc(ERR_AGAIN), Err(Error::Host(ERR_AGAIN)));
     }
 }
 

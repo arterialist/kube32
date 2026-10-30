@@ -7,8 +7,16 @@
 //! | `display_*`        | `hardware.kube32.io/tft-display: "1"` | `DISPLAY`  |
 //! | `key_read`         | `hardware.kube32.io/keyboard: "1"`    | `KEYBOARD` |
 //! | `tone`             | `hardware.kube32.io/speaker: "1"`     | `SPEAKER`  |
+//! | `rmt_send`         | `esp32.io/rmt-tx: "1"`                | none       |
+//! | `rmt_receive`      | `esp32.io/rmt-rx: "1"`                | none       |
 //!
 //! Colors are RGB565. The display on the reference board is 240 x 135.
+//!
+//! An IR frame is alternating mark and space durations in microseconds, mark
+//! first. The RMT channels take their pin and settings from the annotations
+//! `kube32.io/rmt-tx: "pin=<n>[,carrier=<Hz>][,duty=<percent>]"` and
+//! `kube32.io/rmt-rx: "pin=<n>[,active=low|high][,idle_us=<n>]"`, or from
+//! the board's default pin (docs/peripherals.md).
 
 use crate::abi;
 use crate::Error;
@@ -50,4 +58,32 @@ pub fn key_read() -> Result<Option<u8>, Error> {
 pub fn tone(freq_hz: u32, duration_ms: u32, volume_pct: u32) -> Result<(), Error> {
     let rc = unsafe { abi::k32_tone(freq_hz, duration_ms, volume_pct) };
     Error::from_rc(rc).map(|_| ())
+}
+
+/// Most durations in one IR frame, sent or received (`K32_RMT_MAX_DURATIONS`).
+pub const RMT_MAX_DURATIONS: usize = 512;
+/// Longest frame `rmt_send` accepts, in microseconds (`K32_RMT_MAX_FRAME_US`).
+pub const RMT_MAX_FRAME_US: u32 = 500_000;
+
+/// Sends one IR frame on the pod's RMT TX channel and returns once it is out.
+/// Marks are modulated with the claim's carrier. `Error::Invalid` for an
+/// empty frame, more than `RMT_MAX_DURATIONS` durations, a zero duration, or
+/// a frame longer than `RMT_MAX_FRAME_US`.
+pub fn rmt_send(durations_us: &[u16]) -> Result<(), Error> {
+    let rc = unsafe { abi::esp32_rmt_send(durations_us.as_ptr(), durations_us.len() as u32) };
+    Error::from_rc(rc).map(|_| ())
+}
+
+/// The oldest frame the pod's RMT RX channel captured, without waiting:
+/// `Ok(Some(n))` with the durations in `out[..n]` (a mark is the receiver's
+/// active level), `Ok(None)` when no frame is queued, `Err(Error::TooBig)`
+/// when the frame has more durations than `out` holds (`out` gets the first
+/// ones and the frame leaves the queue). A buffer of `RMT_MAX_DURATIONS`
+/// holds any frame.
+pub fn rmt_receive(out: &mut [u16]) -> Result<Option<usize>, Error> {
+    let rc = unsafe { abi::esp32_rmt_receive(out.as_mut_ptr(), out.len() as u32) };
+    if rc == crate::ERR_AGAIN {
+        return Ok(None);
+    }
+    Error::from_rc(rc).map(|n| Some(n as usize))
 }

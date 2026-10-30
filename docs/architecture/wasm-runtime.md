@@ -92,7 +92,7 @@ Restarts back off for 10 s, doubling up to 5 minutes, and reset to 10 s after 10
 Every module links two function groups in the `env` module:
 
 - `src/runtime/app_pod.cpp` links `k32_resp_begin`, `k32_resp_header`, `k32_resp_write`, `k32_resp_end`, `k32_resp_asset`, `k32_http_call`, `k32_event_emit`, `k32_time_ms`, `k32_log`, `k32_random`, `k32_env_get`, `k32_mem_stats`, `k32_display_text`, `k32_display_rect`, `k32_display_bar`, `k32_key_read`, `k32_tone`, and `k32_fs_open`/`read`/`write`/`close`/`size`/`list`/`remove`.
-- `src/runtime/host_functions.cpp` links `esp32_gpio_set_mode`, `esp32_gpio_write`, `esp32_gpio_read`, `esp32_adc_read`, `esp32_i2c_write`, `esp32_i2c_read`, `esp32_uart_write`, `esp32_uart_read`, `esp32_get_time_us`, `esp32_delay_ms`, and `kube32_channel_open`/`send`/`recv`/`close`.
+- `src/runtime/host_functions.cpp` links `esp32_gpio_set_mode`, `esp32_gpio_write`, `esp32_gpio_read`, `esp32_adc_read`, `esp32_i2c_write`, `esp32_i2c_read`, `esp32_uart_write`, `esp32_uart_read`, `esp32_rmt_send`, `esp32_rmt_receive`, `esp32_get_time_us`, `esp32_delay_ms`, and `kube32_channel_open`/`send`/`recv`/`close`.
 
 The [capability firewall](capability-firewall.md) gates hardware, storage, IPC, and `SERVICE_CALL` requests. Run `tools/kube32-cli check` to validate module imports and memory against the ABI.
 

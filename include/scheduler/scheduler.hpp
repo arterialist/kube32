@@ -19,6 +19,8 @@ struct ResourceSpec {
     uint32_t i2c_buses{0};
     uint32_t uart_ports{0};
     uint32_t adc_channels{0};
+    uint32_t rmt_tx_channels{0};
+    uint32_t rmt_rx_channels{0};
     uint32_t cpu_cores{1};
 };
 

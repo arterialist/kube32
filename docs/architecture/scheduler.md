@@ -20,7 +20,7 @@ Candidate nodes must pass each filter in order:
 3. `nodeSelector` labels match the node labels.
 4. `requests.memory`, or `limits.memory` if requests are omitted, fits within allocatable `memory`. Pods without a memory declaration default to 16 KiB.
 5. `esp32.io/psram` or `esp.io/psram` fits within allocatable PSRAM.
-6. `esp32.io/gpio`, `esp32.io/i2c`, `esp32.io/uart`, and `esp32.io/adc` counts fit within allocatable limits. Named buses such as `esp32.io/i2c-bus-0` or `esp32.io/uart-1` each consume one bus from the node's count.
+6. `esp32.io/gpio`, `esp32.io/i2c`, `esp32.io/uart`, `esp32.io/adc`, `esp32.io/rmt-tx`, and `esp32.io/rmt-rx` counts fit within allocatable limits. Named buses such as `esp32.io/i2c-bus-0` or `esp32.io/uart-1` each consume one bus from the node's count.
 
 Quantities follow Kubernetes: `Ki`, `Mi`, `Gi` are binary, `k`, `M`, `G` decimal, and `m` is milli. Unrecognized suffixes count as 0.
 

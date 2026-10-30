@@ -877,7 +877,11 @@ void cluster_task(void* pv) {
     // peripherals use, and the buses the board has pins for. A bare devkit
     // offers both I2C controllers and UART1/UART2 (defaults: I2C0 on GPIO
     // 8/9, UART1 on 17/18). The Cardputer's only free connector is the Grove
-    // port (GPIO 2 and 1), so it offers I2C0 or UART1 there.
+    // port (GPIO 2 and 1), so it offers I2C0 or UART1 there. Its IR LED
+    // hangs on GPIO 44, the UART0 RX pad: the board wires nothing else to it
+    // and its console is the USB port, so an RMT TX channel may drive it
+    // (the default TX pin); on a devkit the pad belongs to the USB-UART
+    // bridge and stays reserved.
     {
         kube32::hal::BoardProfile profile;
         profile.name = ident.has_display ? "cardputer" : "generic";
@@ -888,6 +892,8 @@ void cluster_task(void* pv) {
             profile.i2c_pins[1] = {};
             profile.uart_port_mask = 0x2;
             profile.uart_pins[1] = {2, 1};    // Grove TX, RX
+            profile.rmt_tx_pin_mask = 1ULL << 44;
+            profile.rmt_tx_default_pin = 44;  // IR LED
         }
         kube32::hal::CapabilityFirewall::instance().set_board_profile(profile);
     }

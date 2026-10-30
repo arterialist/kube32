@@ -2,9 +2,10 @@
 //!
 //! Signatures mirror the `m3_LinkRawFunction` calls in
 //! `src/runtime/app_pod.cpp` (`k32_*`) and `src/runtime/host_functions.cpp`
-//! (`esp32_delay_ms`, `kube32_channel_*`): pointers and lengths are
-//! `i32`/`u32` in wasm, `k32_time_ms` returns `i64`. The GPIO, ADC, I2C and
-//! UART imports of host_functions.cpp are not wrapped by this crate.
+//! (`esp32_delay_ms`, `esp32_rmt_*`, `kube32_channel_*`): pointers and
+//! lengths are `i32`/`u32` in wasm, `k32_time_ms` returns `i64`. The GPIO,
+//! ADC, I2C and UART imports of host_functions.cpp are not wrapped by this
+//! crate.
 //! Everything here is `unsafe`; the safe wrappers live in the other modules.
 #![allow(clippy::missing_safety_doc)]
 
@@ -42,6 +43,10 @@ extern "C" {
     pub fn k32_fs_size(fd: i32) -> i32;
     pub fn k32_fs_list(dir: *const u8, dir_len: u32, out: *mut u8, out_cap: u32) -> i32;
     pub fn k32_fs_remove(path: *const u8, path_len: u32) -> i32;
+
+    // Infrared (RMT pulse trains), gated by esp32.io/rmt-tx and esp32.io/rmt-rx
+    pub fn esp32_rmt_send(durations_us: *const u16, count: u32) -> i32;
+    pub fn esp32_rmt_receive(out_us: *mut u16, cap: u32) -> i32;
 
     // Low-level imports from host_functions.cpp that app pods use
     pub fn esp32_delay_ms(ms: u32);
@@ -82,6 +87,8 @@ mod stubs {
     pub unsafe fn k32_fs_size(fd: i32) -> i32 { no_host() }
     pub unsafe fn k32_fs_list(dir: *const u8, dir_len: u32, out: *mut u8, out_cap: u32) -> i32 { no_host() }
     pub unsafe fn k32_fs_remove(path: *const u8, path_len: u32) -> i32 { no_host() }
+    pub unsafe fn esp32_rmt_send(durations_us: *const u16, count: u32) -> i32 { no_host() }
+    pub unsafe fn esp32_rmt_receive(out_us: *mut u16, cap: u32) -> i32 { no_host() }
     pub unsafe fn esp32_delay_ms(ms: u32) { no_host() }
     pub unsafe fn kube32_channel_open(name: *const u8, flags: u32) -> i32 { no_host() }
     pub unsafe fn kube32_channel_send(handle: i32, data: *const u8, len: u32) -> i32 { no_host() }

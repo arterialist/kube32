@@ -95,6 +95,8 @@ LOW_LEVEL_IMPORTS = {
     "esp32_i2c_read": "i(iiii)",
     "esp32_uart_write": "i(iii)",
     "esp32_uart_read": "i(iii)",
+    "esp32_rmt_send": "i(ii)",
+    "esp32_rmt_receive": "i(ii)",
     "esp32_get_time_us": "I()",
     "esp32_delay_ms": "v(i)",
     "kube32_channel_open": "i(ii)",
@@ -104,9 +106,10 @@ LOW_LEVEL_IMPORTS = {
 }
 KNOWN_IMPORTS = dict(APP_IMPORTS)
 KNOWN_IMPORTS.update(LOW_LEVEL_IMPORTS)
-# GPIO/ADC/I2C/UART: granted by esp32.io/* resources, not by --hardware
+# GPIO/ADC/I2C/UART/RMT: granted by esp32.io/* resources, not by --hardware
 PERIPHERAL_IMPORTS = ("esp32_gpio_set_mode", "esp32_gpio_write", "esp32_gpio_read", "esp32_adc_read",
-                      "esp32_i2c_write", "esp32_i2c_read", "esp32_uart_write", "esp32_uart_read")
+                      "esp32_i2c_write", "esp32_i2c_read", "esp32_uart_write", "esp32_uart_read",
+                      "esp32_rmt_send", "esp32_rmt_receive")
 
 # Exports the host looks up (k32_app_abi.h, app_pod.cpp, container_lifecycle.cpp)
 REQUEST_EXPORTS = {
@@ -830,7 +833,7 @@ def format_report(res):
         else:
             lines.append("hardware: none")
         if res.peripheral_imports:
-            lines.append("peripheral imports: %s  (granted by esp32.io/* resources, see docs/workloads/gpio-blinker.md)"
+            lines.append("peripheral imports: %s  (granted by esp32.io/* resources, see docs/peripherals.md)"
                          % ", ".join(res.peripheral_imports))
     for w in res.warnings:
         lines.append("warning: " + w)
