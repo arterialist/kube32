@@ -2,13 +2,15 @@
 # Cardputer with an M5Stack Unit IR in its Grove port.
 #
 # The pod claims one RMT receiver and one RMT transmitter (esp32.io/rmt-rx,
-# esp32.io/rmt-tx). The receiver runs on the unit's demodulating receiver,
-# Grove white (GPIO 1), whose output is low during a mark (active=low, the
-# default). The transmitter uses the board's default TX pin, the Cardputer's
-# own IR LED on GPIO 44. To send through the unit's LED (Grove yellow,
-# GPIO 2) instead, uncomment the kube32.io/rmt-tx annotation. Either way the
-# pod holds GPIO 1, so an I2C or UART pod cannot use the Grove port beside
-# it; examples/irremote-tx.yaml sends only and leaves the port free.
+# esp32.io/rmt-tx). The receiver uses the unit's demodulating receiver on Grove
+# white (GPIO 1), whose output goes low during a mark (active=low, the
+# default). The transmitter drives the unit's LED on Grove yellow (GPIO 2) and
+# holds the pin low between frames. An undriven GPIO 2 floats high, so the LED
+# conducts and the adjacent receiver reports noise frames. Without the
+# kube32.io/rmt-tx annotation, the transmitter uses the board's default TX pin,
+# which is the Cardputer's built-in IR LED on GPIO 44. Because this pod holds
+# GPIO 1 and 2, an I2C or UART pod cannot share the Grove port;
+# examples/irremote-tx.yaml only transmits and leaves the port free.
 #
 # Every NEC code received is logged ("irremote: nec addr=0x04 cmd=0x08")
 # and published on the channel topic ir.received; messages on ir.send
@@ -31,7 +33,7 @@ metadata:
     app: irremote
   annotations:
     kube32.io/rmt-rx: "pin=1"              # Unit IR receiver, Grove white; idle_us=12000 ends a frame
-    # kube32.io/rmt-tx: "pin=2"            # Unit IR LED, Grove yellow (default: the built-in LED, GPIO 44)
+    kube32.io/rmt-tx: "pin=2"              # Unit IR LED, Grove yellow
     kube32.io/event-topics: ir.send
 spec:
   nodeSelector:

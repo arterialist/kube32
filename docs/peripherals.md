@@ -215,14 +215,14 @@ raw 9000,4500,560    durations in microseconds, mark first
 
 It polls the receiver from `k32_tick` and never blocks, so it runs on the Cardputer's shared interpreter. Without the `esp32.io/rmt-rx` claim it logs `irremote: no esp32.io/rmt-rx claim: not receiving, sending only` once and only sends.
 
-`examples/irremote.yaml` receives through a Unit IR on GPIO 1 and sends through the built-in LED; `examples/irremote-tx.yaml` only sends and leaves the Grove port free:
+`examples/irremote.yaml` receives and sends through an M5Stack Unit IR on the Cardputer's Grove port: the receiver uses GPIO 1 and the unit's LED uses GPIO 2. The transmit channel holds GPIO 2 low between frames. Without the transmit channel, the pin floats high, the unit's LED conducts, and its receiver reports noise frames. `examples/irremote-tx.yaml` sends through the Cardputer's built-in LED on GPIO 44 and leaves the Grove port free:
 
 ```yaml
 metadata:
   name: irremote
   annotations:
     kube32.io/rmt-rx: "pin=1"              # Unit IR receiver, Grove white
-    # kube32.io/rmt-tx: "pin=2"            # Unit IR LED, Grove yellow (default: the built-in LED, GPIO 44)
+    kube32.io/rmt-tx: "pin=2"              # Unit IR LED, Grove yellow
     kube32.io/event-topics: ir.send
 spec:
   nodeSelector:
