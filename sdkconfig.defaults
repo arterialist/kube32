@@ -69,6 +69,14 @@ CONFIG_WL_SECTOR_SIZE_512=y
 CONFIG_MBEDTLS_CUSTOM_MEM_ALLOC=y
 CONFIG_MBEDTLS_DYNAMIC_BUFFER=y
 
+# Pods' https:// calls (made on the control plane) trust the common CA subset
+# of Mozilla's list, the roots behind nearly all public sites: 18 KB of flash
+# where the full bundle takes 69 KB. Validity dates are checked against the wall clock
+# in src/osal/tls_mbedtls.cpp once SNTP has set it, so MBEDTLS_HAVE_TIME_DATE
+# stays off: a clock that is not set must not reject every certificate.
+CONFIG_MBEDTLS_CERTIFICATE_BUNDLE=y
+CONFIG_MBEDTLS_CERTIFICATE_BUNDLE_DEFAULT_CMN=y
+
 # RMT (IR channels of pods): the driver's interrupt handlers and encoders run
 # from flash. A symbol of an IR frame lasts hundreds of microseconds, so a
 # cache miss costs nothing, and the 4 KiB of IRAM stays heap on boards

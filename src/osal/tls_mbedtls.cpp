@@ -5,13 +5,18 @@
 
 #if defined(ESP_PLATFORM)
 
+#include "osal/system.hpp"
+
 #include <array>
 #include <cstdio>
+#include <ctime>
 #include <mutex>
+#include <new>
 #include <vector>
 #include <lwip/sockets.h>
 #include <lwip/inet.h>
 
+#include "esp_crt_bundle.h"
 #include "mbedtls/base64.h"
 #include "mbedtls/ctr_drbg.h"
 #include "mbedtls/ecp.h"
@@ -214,6 +219,102 @@ std::unique_ptr<TlsServer> TlsServer::create(const std::vector<std::string>& dns
     return server;
 }
 
+// ---------------------------------------------------------------------------
+// Client
+// ---------------------------------------------------------------------------
+struct TlsClient::Impl {
+    mbedtls_entropy_context entropy;
+    mbedtls_ctr_drbg_context drbg;
+    std::mutex rng_mutex;
+    mbedtls_x509_crt roots;   // extra roots; the bundle covers the public CAs
+    mbedtls_ssl_config conf;
+};
+
+} // namespace kube32::osal
+
+// esp_crt_bundle.c: matches the top of a chain against the bundle (what
+// esp_crt_bundle_attach installs as the verify callback)
+extern "C" int esp_crt_verify_callback(void* buf, mbedtls_x509_crt* crt, int depth, uint32_t* flags);
+
+namespace kube32::osal {
+namespace {
+
+int client_random(void* p, unsigned char* out, size_t len) {
+    auto* impl = static_cast<TlsClient::Impl*>(p);
+    std::lock_guard<std::mutex> lock(impl->rng_mutex);
+    return mbedtls_ctr_drbg_random(&impl->drbg, out, len);
+}
+
+bool time_before(const mbedtls_x509_time& a, const mbedtls_x509_time& b) {
+    const int x[] = {a.year, a.mon, a.day, a.hour, a.min, a.sec};
+    const int y[] = {b.year, b.mon, b.day, b.hour, b.min, b.sec};
+    for (int i = 0; i < 6; ++i) {
+        if (x[i] != y[i]) return x[i] < y[i];
+    }
+    return false;
+}
+
+// The bundle's check, then the validity dates: the build leaves
+// MBEDTLS_HAVE_TIME_DATE off so that a board whose clock is not set yet does
+// not refuse every certificate as not yet valid. A chain the bundle does not
+// anchor stays NOT_TRUSTED: the bundle's callback reports it as an error,
+// which mbedTLS would turn into a fatal error instead of a refused
+// certificate.
+int verify_certificate(void* ctx, mbedtls_x509_crt* crt, int depth, uint32_t* flags) {
+    const uint32_t found = *flags;
+    if (esp_crt_verify_callback(ctx, crt, depth, flags) != 0) *flags = found | MBEDTLS_X509_BADCERT_NOT_TRUSTED;
+    const uint64_t unix_ms = System::get_unix_time_ms();
+    if (unix_ms == 0) return 0;
+    const time_t secs = static_cast<time_t>(unix_ms / 1000);
+    struct tm tm;
+    gmtime_r(&secs, &tm);
+    const mbedtls_x509_time now{tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday, tm.tm_hour, tm.tm_min, tm.tm_sec};
+    if (time_before(crt->valid_to, now)) *flags |= MBEDTLS_X509_BADCERT_EXPIRED;
+    if (time_before(now, crt->valid_from)) *flags |= MBEDTLS_X509_BADCERT_FUTURE;
+    return 0;
+}
+
+} // namespace
+
+TlsClient::TlsClient() : impl_(std::make_unique<Impl>()) {}
+
+TlsClient::~TlsClient() {
+    mbedtls_ssl_config_free(&impl_->conf);
+    mbedtls_x509_crt_free(&impl_->roots);
+    mbedtls_ctr_drbg_free(&impl_->drbg);
+    mbedtls_entropy_free(&impl_->entropy);
+}
+
+std::unique_ptr<TlsClient> TlsClient::create(const std::string& extra_roots_pem, std::string& error) {
+    std::unique_ptr<TlsClient> client(new TlsClient());
+    Impl& impl = *client->impl_;
+    mbedtls_entropy_init(&impl.entropy);
+    mbedtls_ctr_drbg_init(&impl.drbg);
+    mbedtls_x509_crt_init(&impl.roots);
+    mbedtls_ssl_config_init(&impl.conf);
+    static const char kPers[] = "kube32-egress";
+    int rc = mbedtls_ctr_drbg_seed(&impl.drbg, mbedtls_entropy_func, &impl.entropy,
+                                   reinterpret_cast<const unsigned char*>(kPers), sizeof(kPers) - 1);
+    if (rc != 0) { error = "random generator: " + mbedtls_message(rc); return nullptr; }
+    if ((rc = mbedtls_ssl_config_defaults(&impl.conf, MBEDTLS_SSL_IS_CLIENT, MBEDTLS_SSL_TRANSPORT_STREAM, MBEDTLS_SSL_PRESET_DEFAULT)) != 0) {
+        error = "configuration: " + mbedtls_message(rc);
+        return nullptr;
+    }
+    mbedtls_ssl_conf_rng(&impl.conf, client_random, &impl);
+    mbedtls_ssl_conf_authmode(&impl.conf, MBEDTLS_SSL_VERIFY_REQUIRED);
+    if (esp_crt_bundle_attach(&impl.conf) != ESP_OK) {
+        error = "the certificate bundle cannot be read";
+        return nullptr;
+    }
+    if (!extra_roots_pem.empty()) {
+        rc = mbedtls_x509_crt_parse(&impl.roots, reinterpret_cast<const unsigned char*>(extra_roots_pem.c_str()), extra_roots_pem.size() + 1);
+        if (rc != 0) { error = "extra roots: " + mbedtls_message(rc); return nullptr; }
+        mbedtls_ssl_conf_ca_chain(&impl.conf, &impl.roots, nullptr);
+    }
+    mbedtls_ssl_conf_verify(&impl.conf, verify_certificate, nullptr);
+    return client;
+}
+
 namespace detail {
 
 struct TlsSession {
@@ -256,6 +357,48 @@ TlsSession* tls_handshake(TlsServer& server, int fd) {
         return nullptr;
     }
     return s;
+}
+
+TlsSession* tls_connect(TlsClient& client, int fd, const char* host, uint64_t deadline_ms, mem::FunctionRef<bool()> stop,
+                        TlsStatus& status, std::string* why) {
+    auto* s = new (std::nothrow) TlsSession();
+    if (!s) {
+        status = TlsStatus::Handshake;
+        if (why) *why = "out of memory";
+        return nullptr;
+    }
+    s->fd = fd;
+    mbedtls_ssl_init(&s->ssl);
+    status = TlsStatus::Ok;
+    int rc = mbedtls_ssl_setup(&s->ssl, &client.impl().conf);
+    if (rc == 0) rc = mbedtls_ssl_set_hostname(&s->ssl, host);
+    if (rc == 0) {
+        mbedtls_ssl_set_bio(&s->ssl, &s->fd, bio_send, bio_recv, nullptr);
+        while ((rc = mbedtls_ssl_handshake(&s->ssl)) == MBEDTLS_ERR_SSL_WANT_READ || rc == MBEDTLS_ERR_SSL_WANT_WRITE) {
+            if (stop()) { status = TlsStatus::Cancelled; break; }
+            if (System::get_uptime_ms() >= deadline_ms) { status = TlsStatus::Timeout; break; }
+        }
+    }
+    if (rc == 0 && status == TlsStatus::Ok) return s;
+    if (status == TlsStatus::Ok) {
+        // BAD_CERTIFICATE: a key usage that does not allow a TLS server
+        if (rc == MBEDTLS_ERR_X509_CERT_VERIFY_FAILED || (rc == MBEDTLS_ERR_SSL_BAD_CERTIFICATE && mbedtls_ssl_get_verify_result(&s->ssl) != 0)) {
+            status = TlsStatus::Certificate;
+            if (why) {
+                char info[160];
+                info[0] = '\0';
+                mbedtls_x509_crt_verify_info(info, sizeof(info), "", mbedtls_ssl_get_verify_result(&s->ssl));
+                *why = info;
+                *why = why->substr(0, why->find('\n'));   // the first reason
+            }
+        } else {
+            status = TlsStatus::Handshake;
+            if (why) *why = mbedtls_message(rc);
+        }
+    }
+    mbedtls_ssl_free(&s->ssl);
+    delete s;
+    return nullptr;
 }
 
 ssize_t tls_send(TlsSession* s, const void* buf, size_t len) {
@@ -306,9 +449,23 @@ std::unique_ptr<TlsServer> TlsServer::create(const std::vector<std::string>&, co
     return nullptr;
 }
 
+struct TlsClient::Impl {};
+TlsClient::TlsClient() : impl_(std::make_unique<Impl>()) {}
+TlsClient::~TlsClient() = default;
+
+std::unique_ptr<TlsClient> TlsClient::create(const std::string&, std::string& error) {
+    error = "this build has no TLS";
+    return nullptr;
+}
+
 namespace detail {
 struct TlsSession {};
 TlsSession* tls_handshake(TlsServer&, int) { return nullptr; }
+TlsSession* tls_connect(TlsClient&, int, const char*, uint64_t, mem::FunctionRef<bool()>, TlsStatus& status, std::string* why) {
+    status = TlsStatus::Handshake;
+    if (why) *why = "this build has no TLS";
+    return nullptr;
+}
 ssize_t tls_send(TlsSession*, const void*, size_t) { errno = ENOTSUP; return -1; }
 ssize_t tls_recv(TlsSession*, void*, size_t) { errno = ENOTSUP; return -1; }
 void tls_free(TlsSession*) {}

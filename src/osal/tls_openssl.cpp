@@ -1,13 +1,17 @@
-// Server-side TLS for host builds (OpenSSL), the counterpart of the mbedTLS
+// TLS for host builds (OpenSSL), the counterpart of the mbedTLS
 // implementation the firmware uses (tls_mbedtls.cpp): same certificate shape,
-// same session interface for osal::Socket.
+// same session interface for osal::Socket. Clients trust the system's store.
 
 #if !defined(ESP_PLATFORM) && defined(KUBE32_HAS_OPENSSL)
 
 #include "osal/tls.hpp"
+#include "osal/system.hpp"
+
+#include <arpa/inet.h>
 
 #include <cerrno>
 #include <cstdio>
+#include <cstring>
 #include <string>
 #include <vector>
 
@@ -140,6 +144,47 @@ std::unique_ptr<TlsServer> TlsServer::create(const std::vector<std::string>& dns
     return server;
 }
 
+struct TlsClient::Impl {
+    SSL_CTX* ctx{nullptr};
+};
+
+TlsClient::TlsClient() : impl_(std::make_unique<Impl>()) {}
+
+TlsClient::~TlsClient() {
+    if (impl_->ctx) SSL_CTX_free(impl_->ctx);
+}
+
+std::unique_ptr<TlsClient> TlsClient::create(const std::string& extra_roots_pem, std::string& error) {
+    std::unique_ptr<TlsClient> client(new TlsClient());
+    Impl& impl = *client->impl_;
+    impl.ctx = SSL_CTX_new(TLS_client_method());
+    if (!impl.ctx || SSL_CTX_set_min_proto_version(impl.ctx, TLS1_2_VERSION) != 1) {
+        error = "configuration: " + openssl_error();
+        return nullptr;
+    }
+    SSL_CTX_set_verify(impl.ctx, SSL_VERIFY_PEER, nullptr);
+    // A server that closes without close_notify ends the stream (as mbedTLS
+    // reports it); the HTTP framing tells whether the answer was complete
+    SSL_CTX_set_options(impl.ctx, SSL_OP_IGNORE_UNEXPECTED_EOF);
+    SSL_CTX_set_default_verify_paths(impl.ctx);
+    if (!extra_roots_pem.empty()) {
+        BIO* bio = BIO_new_mem_buf(extra_roots_pem.data(), static_cast<int>(extra_roots_pem.size()));
+        X509_STORE* store = SSL_CTX_get_cert_store(impl.ctx);
+        int added = 0;
+        while (X509* cert = bio ? PEM_read_bio_X509(bio, nullptr, nullptr, nullptr) : nullptr) {
+            if (X509_STORE_add_cert(store, cert) == 1) ++added;
+            X509_free(cert);
+        }
+        if (bio) BIO_free(bio);
+        ERR_clear_error();   // the end of the PEM data
+        if (added == 0) {
+            error = "extra roots: no certificate";
+            return nullptr;
+        }
+    }
+    return client;
+}
+
 namespace detail {
 
 struct TlsSession {
@@ -157,6 +202,50 @@ TlsSession* tls_handshake(TlsServer& server, int fd) {
         return nullptr;
     }
     return new TlsSession{ssl};
+}
+
+TlsSession* tls_connect(TlsClient& client, int fd, const char* host, uint64_t deadline_ms, mem::FunctionRef<bool()> stop,
+                        TlsStatus& status, std::string* why) {
+    status = TlsStatus::Ok;
+    SSL* ssl = SSL_new(client.impl().ctx);
+    if (!ssl) {
+        status = TlsStatus::Handshake;
+        if (why) *why = openssl_error();
+        return nullptr;
+    }
+    SSL_set_fd(ssl, fd);
+    struct in_addr addr;
+    if (inet_pton(AF_INET, host, &addr) == 1) {
+        X509_VERIFY_PARAM_set1_ip_asc(SSL_get0_param(ssl), host);
+    } else {
+        SSL_set_tlsext_host_name(ssl, host);
+        SSL_set1_host(ssl, host);
+    }
+    int rc;
+    while ((rc = SSL_connect(ssl)) != 1) {
+        const int err = SSL_get_error(ssl, rc);
+        if (err != SSL_ERROR_WANT_READ && err != SSL_ERROR_WANT_WRITE) break;
+        if (stop()) { status = TlsStatus::Cancelled; break; }
+        if (System::get_uptime_ms() >= deadline_ms) { status = TlsStatus::Timeout; break; }
+    }
+    if (rc == 1) return new TlsSession{ssl};
+    if (status == TlsStatus::Ok) {
+        const int sys_errno = errno;
+        const long verified = SSL_get_verify_result(ssl);
+        if (verified != X509_V_OK) {
+            status = TlsStatus::Certificate;
+            if (why) *why = X509_verify_cert_error_string(verified);
+        } else {
+            status = TlsStatus::Handshake;
+            if (why) {
+                *why = ERR_peek_error() ? openssl_error()
+                                        : std::string("the connection ended during the handshake") + (sys_errno ? std::string(": ") + std::strerror(sys_errno) : "");
+            }
+        }
+    }
+    ERR_clear_error();
+    SSL_free(ssl);
+    return nullptr;
 }
 
 ssize_t tls_send(TlsSession* s, const void* buf, size_t len) {

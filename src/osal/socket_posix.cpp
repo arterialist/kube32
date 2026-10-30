@@ -414,6 +414,19 @@ bool Socket::tls_accept(TlsServer& server) {
     return tls_ != nullptr;
 }
 
+TlsStatus Socket::tls_connect(TlsClient& client, const std::string& host, uint32_t timeout_ms, mem::FunctionRef<bool()> stop,
+                              std::string* why) {
+    if (fd_ < 0 || tls_) {
+        if (why) *why = "not a connected plain socket";
+        return TlsStatus::Handshake;
+    }
+    set_timeout(250, 250);
+    TlsStatus status = TlsStatus::Ok;
+    tls_ = detail::tls_connect(client, fd_, host.c_str(), System::get_uptime_ms() + timeout_ms, stop, status, why);
+    if (!tls_) close();
+    return tls_ ? TlsStatus::Ok : status;
+}
+
 bool Socket::init_networking() { return true; }
 void Socket::cleanup_networking() {}
 

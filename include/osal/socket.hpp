@@ -15,6 +15,8 @@
 namespace kube32::osal {
 
 class TlsServer;
+class TlsClient;
+enum class TlsStatus;
 namespace detail { struct TlsSession; }
 
 enum class SocketType {
@@ -82,6 +84,12 @@ public:
     // afterwards send, recv and close go through the session. On failure
     // the socket is closed.
     bool tls_accept(TlsServer& server);
+    // Client side of a TLS handshake on this connected socket for `host`
+    // (the name the server's certificate must carry) in at most timeout_ms;
+    // `stop` is asked every 250 ms whether to give up. On failure the socket
+    // is closed and `why` (optional) says what failed.
+    TlsStatus tls_connect(TlsClient& client, const std::string& host, uint32_t timeout_ms, mem::FunctionRef<bool()> stop,
+                          std::string* why = nullptr);
     bool is_tls() const { return tls_ != nullptr; }
     // TLS data already read from the descriptor and not yet handed out: the
     // descriptor may not turn readable for it.
