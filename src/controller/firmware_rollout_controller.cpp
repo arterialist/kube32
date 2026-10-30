@@ -4,6 +4,7 @@
 #include "osal/sha256.hpp"
 #include "osal/system.hpp"
 
+#include <algorithm>
 #include <cstdio>
 
 namespace kube32::controller {
@@ -59,8 +60,8 @@ std::vector<FirmwareRolloutController::NodeView> FirmwareRolloutController::load
         }
         if (!n.name.empty()) nodes.push_back(std::move(n));
     }
-    // Workers first, then the control plane; by name within each. The store
-    // lists nodes by name already, and a cluster has a handful of them.
+    // Workers first, then the control plane; by name within each
+    std::sort(nodes.begin(), nodes.end(), [](const NodeView& a, const NodeView& b) { return a.name < b.name; });
     std::vector<NodeView> ordered;
     ordered.reserve(nodes.size());
     for (int control_plane = 0; control_plane < 2; ++control_plane) {

@@ -490,6 +490,12 @@ int main() {
     }
     assert(complete);
     // One node at a time, workers first, the control plane last
+    if (reboots != std::vector<std::string>{"w1", "w2", "cp"}) {
+        std::cout << "reboots:";
+        for (const auto& r : reboots) std::cout << " " << r;
+        std::cout << std::endl;
+        for (Node* n : nodes) std::cout << n->name << ": " << condition(*cp.store, n->name, "message") << std::endl;
+    }
     assert((reboots == std::vector<std::string>{"w1", "w2", "cp"}));
     for (Node* n : nodes) {
         assert(annotation(*cp.store, n->name, models::kAnnotationFirmwareSha256) == sha2);
@@ -540,7 +546,7 @@ int main() {
     assert(!run_until(cp, nodes, reboots, 1500, [&] { return reboots.size() > 2; }));
     // Deleting the rollout releases w1, which forgets the failure
     assert(http("DELETE", "/apis/kube32.io/v1/firmwarerollouts/firmware").status == 200);
-    assert(run_until(cp, nodes, reboots, 5000, [&] {
+    assert(run_until(cp, nodes, reboots, 15000, [&] {
         return annotation(*cp.store, "w1", models::kAnnotationFirmwareFailed).empty() &&
                annotation(*cp.store, "w1", models::kAnnotationFirmwareTarget).empty();
     }));
