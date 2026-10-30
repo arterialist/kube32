@@ -49,8 +49,10 @@ public:
         idle_cv_.wait(lock, [this] { return threads_ == 0; });
     }
     // False when `size` calls are already running, or no thread is free and
-    // none can be started
-    bool start(std::function<void()> job) {
+    // none can be started. The job may call `release` once its connection
+    // is closed and before it tells its caller: the next call then finds
+    // the session free, not still ending
+    bool start(TlsJob job) {
         osal::LockGuard guard(mutex_);
         if (stopping_ || jobs_.size() + running_ >= size_) return false;
         if (jobs_.size() + running_ >= threads_) {
@@ -74,18 +76,24 @@ private:
         for (;;) {
             work_cv_.wait(lock, [this] { return stopping_ || !jobs_.empty(); });
             if (jobs_.empty()) break;
-            std::function<void()> job = std::move(jobs_.front());
+            TlsJob job = std::move(jobs_.front());
             jobs_.pop_front();
             ++running_;
             lock.unlock();
+            bool released = false;
+            const std::function<void()> release = [this, &released]() {
+                osal::LockGuard guard(mutex_);
+                if (!released) --running_;
+                released = true;
+            };
             try {
-                job();
+                job(release);
             } catch (const std::exception&) {
                 // the job reports its own failures; nothing may leave the thread
             }
             job = nullptr;
+            release();
             lock.lock();
-            --running_;
         }
         --threads_;
         idle_cv_.notify_all();
@@ -97,7 +105,7 @@ private:
     osal::Mutex mutex_;
     osal::ConditionVariable work_cv_;
     osal::ConditionVariable idle_cv_;
-    std::deque<std::function<void()>> jobs_;
+    std::deque<TlsJob> jobs_;
     size_t threads_{0};
     size_t running_{0};
     bool stopping_{false};
@@ -650,7 +658,7 @@ int32_t ServiceClient::call(const runtime::ServiceCallRequest& req, runtime::Buf
     return call_service(req, t, ns, eps, out);
 }
 
-bool ServiceClient::start_tls_session(std::function<void()> job) {
+bool ServiceClient::start_tls_session(TlsJob job) {
     if (!opts_.tls) return false;
     osal::LockGuard guard(sessions_mutex_);
     if (!sessions_) sessions_ = std::make_unique<TlsSessions>(opts_.tls_sessions, opts_.tls_stack_bytes, opts_.tls_stack_in_psram);
@@ -685,7 +693,7 @@ int32_t ServiceClient::call_https(const runtime::ServiceCallRequest& req, const 
         int32_t rc{K32_ERR_IO};
     };
     auto done = std::make_shared<Done>();
-    const bool started = start_tls_session([this, &req, &t, &out, done]() {
+    const bool started = start_tls_session([this, &req, &t, &out, done](const std::function<void()>& release) {
         int32_t rc;
         try {
             rc = call_external(req, t, out);
@@ -694,6 +702,7 @@ int32_t ServiceClient::call_https(const runtime::ServiceCallRequest& req, const 
         } catch (const std::exception&) {
             rc = K32_ERR_IO;
         }
+        release();
         osal::LockGuard guard(done->mutex);
         done->rc = rc;
         done->finished = true;
@@ -961,7 +970,10 @@ int32_t ServiceClient::call_gateway(const runtime::ServiceCallRequest& req, cons
         return fail(left_ms() == 0 ? K32_ERR_TIMEOUT : K32_ERR_IO);
     }
     bool reusable = false;
-    const int32_t rc = read_response(sock, req, out, deadline, false, true, buf.get(), kRecvBuf, reusable, true);
+    // To the last chunk, which the gateway sends once the call's session is
+    // free: the pod's next call then finds it free. The gateway cuts the
+    // body at the limit + 1 bytes that tell K32_ERR_TOOBIG.
+    const int32_t rc = read_response(sock, req, out, deadline, false, false, buf.get(), kRecvBuf, reusable, true);
     sock.close();
     if (rc == K32_ERR_PERM) log_denied(req.caller_pod, origin, "refused by the egress gateway");
     return rc < 0 ? fail(rc) : rc;

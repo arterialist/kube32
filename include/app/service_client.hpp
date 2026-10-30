@@ -101,6 +101,10 @@ struct ServiceClientOptions {
 };
 
 struct ResponseBody;   // where an answer goes as it is read (service_client.cpp)
+
+// Work for a TLS session thread; `release` frees its session for the next
+// call before the job returns
+using TlsJob = std::function<void(const std::function<void()>& release)>;
 class TlsSessions;
 
 class ServiceClient {
@@ -114,8 +118,10 @@ public:
 
     // The egress gateway's side of a forwarded https call. Runs `job` on a
     // free TLS session thread; false when every session is in use (or this
-    // node makes no TLS connections).
-    bool start_tls_session(std::function<void()> job);
+    // node makes no TLS connections). The job calls the `release` it is
+    // given once the host's connection is closed, before the caller hears
+    // the end of the answer.
+    bool start_tls_session(TlsJob job);
     // An https call of pod req.caller_pod, on the current thread (a TLS
     // session): its NetworkPolicies, the connection, the answer to `sink` as
     // it arrives; reading ends once more than `limit` body bytes came.

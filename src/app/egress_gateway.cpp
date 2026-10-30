@@ -90,8 +90,11 @@ public:
         sent_ += take;
         return true;
     }
-    void end() override {
-        if (ok_) ok_ = sock_.send_all("0\r\n\r\n", 5);
+    // The last chunk waits for finish(), sent once the host's connection is
+    // closed and the session is free
+    void end() override { ended_ = true; }
+    void finish() {
+        if (ok_ && ended_) ok_ = sock_.send_all("0\r\n\r\n", 5);
     }
     bool began() const { return began_; }
 
@@ -100,11 +103,12 @@ private:
     size_t limit_;
     size_t sent_{0};
     bool began_{false};
+    bool ended_{false};
     bool ok_{false};
 };
 
 // Runs on a TLS session
-void make_call(ServiceClient& client, Forwarded& call) {
+void make_call(ServiceClient& client, Forwarded& call, const std::function<void()>& release) {
     const uint64_t spent = osal::System::get_uptime_ms() - call.arrived_ms;
     runtime::ServiceCallRequest req;
     req.caller_pod = call.pod;
@@ -125,7 +129,10 @@ void make_call(ServiceClient& client, Forwarded& call) {
     } catch (const std::exception&) {
         rc = K32_ERR_IO;
     }
+    // The node may make its next call as soon as it has the answer
+    release();
     if (rc < 0 && !sink.began()) send_error(call.sock, rc, reason_for(rc));
+    sink.finish();
     call.sock.close();
 }
 
@@ -255,7 +262,7 @@ bool EgressGateway::handle(api::HttpConnection& conn) {
     // The connection goes to a TLS session; this API worker is free again
     call->sock = conn.take_socket();
     ServiceClient* client = &client_;
-    if (!client_.start_tls_session([client, call]() { make_call(*client, *call); })) {
+    if (!client_.start_tls_session([client, call](const std::function<void()>& release) { make_call(*client, *call, release); })) {
         send_error(call->sock, K32_ERR_BUSY, reason_for(K32_ERR_BUSY), "Retry-After: 1\r\n");
         call->sock.close();
     }
