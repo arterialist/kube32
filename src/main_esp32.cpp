@@ -5,7 +5,8 @@
 // overrides that, and the NVS key "board" (K32_CMD:BOARD:) selects the
 // peripheral profile.
 //   control plane  API server, scheduler, controllers, object store, ingress
-//                  on port 80 and a local kubelet
+//                  on port 80 and a local kubelet; it stages firmware images
+//                  and rolls them out (docs/firmware-updates.md)
 //   worker         kubelet; with the "cardputer" profile the display, keypad,
 //                  speaker and microSD card are exposed to pods
 // A node is named by the NVS key "name" (K32_CMD:NAME:), or "esp32-" and the
@@ -22,6 +23,9 @@
 #include "controller/node_lifecycle_controller.hpp"
 #include "controller/deployment_controller.hpp"
 #include "controller/workload_controller.hpp"
+#include "controller/firmware_rollout_controller.hpp"
+#include "api/firmware_api.hpp"
+#include "hal/firmware_slots.hpp"
 #include "hal/capability_firewall.hpp"
 #include "hal/i2c_discovery.hpp"
 #include "kubelet/metrics_provider.hpp"
@@ -309,6 +313,8 @@ static bool s_api_token_set = false;
 static kube32::osal::TlsServer* s_tls = nullptr;               // control plane: the API server's certificate
 static kube32::api::HttpServer* s_ingress_server = nullptr;
 static std::unique_ptr<kube32::app::ConsoleRelay> s_relay;     // streams for tools/kube32_serial_gateway.py
+static std::shared_ptr<kube32::hal::FirmwareSlots> s_firmware_slots;   // the app slots (firmware rollouts)
+static kube32::api::FirmwareApi* s_firmware_api = nullptr;     // control plane: the staged image
 std::string loopback_http(uint16_t port, const std::string& request) {
     std::string response;
     kube32::osal::Socket sock;
@@ -443,6 +449,7 @@ static uint32_t crc32_bytes(const uint8_t* p, size_t n) {
 //   K32_CMD:APPASS:<cluster access point password>       -> stored in NVS, reboot
 //   K32_CMD:APPASS                                       -> K32_APPASS <password>
 //   K32_CMD:CERT                                         -> the API server's TLS certificate (PEM)
+//   K32_CMD:FIRMWARE                                     -> the running image and its slot (and what is staged)
 //   K32_CMD:REBOOT
 void console_task(void* arg) {
     auto* ctx = static_cast<std::pair<Console*, NodeIdentity*>*>(arg);
@@ -553,6 +560,20 @@ void console_task(void* arg) {
                 } else {
                     con.write("K32_ERR no TLS on this node\n", 28);
                 }
+            } else if (line == "K32_CMD:FIRMWARE") {
+                char buf[320];
+                int l;
+                if (s_firmware_slots) {
+                    const kube32::hal::FirmwareInfo fw = s_firmware_slots->running();
+                    const kube32::api::StagedFirmware st = s_firmware_api ? s_firmware_api->staged() : kube32::api::StagedFirmware{};
+                    l = snprintf(buf, sizeof(buf), "K32_FIRMWARE version=%s sha256=%s slot=%s state=%s update_slot=%s staged=%s staged_sha256=%s staged_version=%s\n",
+                                 fw.version.c_str(), fw.sha256.c_str(), fw.slot.c_str(), fw.pending_verify ? "Verifying" : "Confirmed",
+                                 s_firmware_slots->passive_slot().c_str(), s_firmware_api ? st.phase.c_str() : "-",
+                                 st.sha256.empty() ? "-" : st.sha256.c_str(), st.version.empty() ? "-" : st.version.c_str());
+                } else {
+                    l = snprintf(buf, sizeof(buf), "K32_ERR no firmware slots\n");
+                }
+                con.write(buf, static_cast<size_t>(l));
             } else if (line == "K32_CMD:APPASS") {
                 const std::string pass = read_nvs_str("appass");
                 const std::string out = pass.empty() ? "K32_ERR no cluster access point password stored\n" : "K32_APPASS " + pass + "\n";
@@ -930,6 +951,15 @@ void cluster_task(void* pv) {
             printf("[STORAGE] none: %s\n", si.error.c_str());
         }
     }
+    // The app slots: the running image (its SHA-256 is computed here, while
+    // the heap is whole) and the slot an update goes to
+    s_firmware_slots = kube32::hal::create_esp_firmware_slots();
+    {
+        const kube32::hal::FirmwareInfo fw = s_firmware_slots->running();
+        printf("[FIRMWARE] %s (%s) on %s, %s; updates go to %s\n", fw.version.c_str(), fw.sha256.substr(0, 12).c_str(), fw.slot.c_str(),
+               fw.pending_verify ? "unconfirmed" : "confirmed", s_firmware_slots->passive_slot().empty() ? "nowhere (no second app slot)"
+                                                                                                     : s_firmware_slots->passive_slot().c_str());
+    }
     install_hardware_hooks(has_display);
     kube32::app::install_default_platform_hooks();   // event_emit through the channel layer
     // What pods may claim: the chip's pins minus those the board's own
@@ -1057,6 +1087,7 @@ void cluster_task(void* pv) {
     std::unique_ptr<kube32::scheduler::Scheduler> scheduler;
     std::unique_ptr<kube32::controller::DeploymentController> deployments;
     std::unique_ptr<kube32::controller::WorkloadController> workloads;
+    std::unique_ptr<kube32::controller::FirmwareRolloutController> firmware_rollouts;
     std::unique_ptr<kube32::api::HttpServer> api_server;
     std::unique_ptr<kube32::kubelet::Kubelet> kubelet;
     std::unique_ptr<kube32::app::IngressController> ingress;
@@ -1089,6 +1120,15 @@ void cluster_task(void* pv) {
         return discovery.labels();
     };
     kubelet_cfg.node_label_prefix = "i2c.kube32.io/";
+    // Firmware rollouts: the kubelet downloads the image into the update slot
+    // in ranges, or on the control plane boots the slot it was staged in;
+    // before the restart the control plane writes out its store journal
+    kubelet_cfg.firmware_slots = s_firmware_slots;
+    kubelet_cfg.firmware.local_staging = ident.is_control_plane;
+    kubelet_cfg.firmware.range_bytes = ident.has_psram ? 32 * 1024 : 16 * 1024;
+    kubelet_cfg.firmware.before_reboot = [] {
+        if (s_store) s_store->flush(true);
+    };
 
     if (ident.is_control_plane) {
         // The object store's journal: the raw `journal` partition on a board
@@ -1188,6 +1228,11 @@ void cluster_task(void* pv) {
         workloads = std::make_unique<kube32::controller::WorkloadController>(*store, scheduler.get(), wc_cfg);
         workloads->start();
 
+        // FirmwareRollouts: driven from the housekeeping loop below
+        firmware_rollouts = std::make_unique<kube32::controller::FirmwareRolloutController>(*store, [] {
+            return s_firmware_api ? s_firmware_api->staged() : kube32::api::StagedFirmware{};
+        });
+
         kube32::api::HttpServerOptions http_opts;
         http_opts.host = "0.0.0.0";
         http_opts.port = 6443;
@@ -1234,7 +1279,12 @@ void cluster_task(void* pv) {
                 return kube32::app::serve_node_storage(conn, path, std::string(), 8u * 1024 * 1024);
             });
         if (s_api_token_set) node_proxy->set_node_token(api_token);
-        api_server->set_handler(node_proxy.get());
+        // The staged firmware image (/apis/kube32.io/v1/firmware); everything
+        // else goes on to the node proxy
+        static std::unique_ptr<kube32::api::FirmwareApi> firmware_api;
+        firmware_api = std::make_unique<kube32::api::FirmwareApi>(*s_firmware_slots, *store, api_server->route_handler(), node_proxy.get());
+        s_firmware_api = firmware_api.get();
+        api_server->set_handler(firmware_api.get());
         if (!api_server->start()) ESP_LOGE(TAG, "API server failed to start");
 
         // k32_http_call: Services and NetworkPolicies read from the store
@@ -1395,6 +1445,13 @@ void cluster_task(void* pv) {
         vTaskDelay(pdMS_TO_TICKS(1000));
         iter++;
         if (ingress) ingress->tick();
+        if (firmware_rollouts && iter % 3 == 0) {
+            try {
+                firmware_rollouts->reconcile();
+            } catch (const std::exception& e) {
+                printf("[FIRMWARE] rollout pass skipped: %s\n", e.what());
+            }
+        }
         if (store) {
             // Changes no API request waited for (controllers, Node
             // heartbeats) reach the journal here

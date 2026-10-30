@@ -33,9 +33,11 @@ set(KUBE32_APP_SRCS
     api/timestamp_backfill.cpp
     api/node_proxy.cpp
     api/protobuf_body.cpp
+    api/firmware_api.cpp
     controller/node_lifecycle_controller.cpp
     controller/deployment_controller.cpp
     controller/workload_controller.cpp
+    controller/firmware_rollout_controller.cpp
     hal/capability_firewall.cpp
     hal/mock_hal.cpp
     hal/sd_card.cpp
@@ -44,12 +46,14 @@ set(KUBE32_APP_SRCS
     hal/i2c_discovery.cpp
     hal/pod_rmt.cpp
     hal/tft_keyboard_hardware.cpp
+    hal/firmware_slots.cpp
     ipc/channel.cpp
     kubelet/kube_api_client.cpp
     kubelet/kubelet.cpp
     kubelet/pod_env.cpp
     kubelet/metrics_provider.cpp
     kubelet/node_status_reporter.cpp
+    kubelet/firmware_agent.cpp
     mem/memory_tier.cpp
     mem/monotonic_arena.cpp
     models/kube_lease.cpp
@@ -63,6 +67,7 @@ set(KUBE32_APP_SRCS
     osal/socket_posix.cpp
     osal/tls_mbedtls.cpp
     osal/system_posix.cpp
+    osal/sha256.cpp
     osal/thread_posix.cpp
     osal/timer_posix.cpp
     runtime/container_lifecycle.cpp
@@ -117,6 +122,8 @@ idf_component_register(
         fatfs
         esp_partition
         mbedtls
+        app_update
+        bootloader_support
 )
 
 # Build identity for GET /version (commit, tree state, build time); see
@@ -144,8 +151,9 @@ target_include_directories(${COMPONENT_LIB} PRIVATE ${CMAKE_CURRENT_BINARY_DIR})
 set_source_files_properties(${CMAKE_CURRENT_LIST_DIR}/api/version_info.cpp PROPERTIES OBJECT_DEPENDS ${KUBE32_BUILD_INFO_H})
 
 # Container environment, log persistence, bus setup and IR channels run once
-# per container start, every few seconds or once per IR frame: built for size,
-# they take half the flash -O2 gives them.
+# per container start, every few seconds or once per IR frame, firmware
+# rollouts once per update: built for size, they take half the flash -O2
+# gives them.
 set_source_files_properties(
     ${CMAKE_CURRENT_LIST_DIR}/kubelet/pod_env.cpp
     ${CMAKE_CURRENT_LIST_DIR}/runtime/pod_log.cpp
@@ -158,4 +166,8 @@ set_source_files_properties(
     ${CMAKE_CURRENT_LIST_DIR}/app/egress_policy.cpp
     ${CMAKE_CURRENT_LIST_DIR}/net/network_policy.cpp
     ${CMAKE_CURRENT_LIST_DIR}/runtime/pod_assets.cpp
+    ${CMAKE_CURRENT_LIST_DIR}/api/firmware_api.cpp
+    ${CMAKE_CURRENT_LIST_DIR}/controller/firmware_rollout_controller.cpp
+    ${CMAKE_CURRENT_LIST_DIR}/hal/firmware_slots.cpp
+    ${CMAKE_CURRENT_LIST_DIR}/kubelet/firmware_agent.cpp
     PROPERTIES COMPILE_OPTIONS "-Os")

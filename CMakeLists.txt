@@ -102,6 +102,7 @@ else()
         src/osal/tls_mbedtls.cpp
         src/osal/tls_openssl.cpp
         src/osal/system_posix.cpp
+        src/osal/sha256.cpp
         src/mem/memory_tier.cpp
         src/mem/monotonic_arena.cpp
         src/storage/radix_tree.cpp
@@ -118,6 +119,7 @@ else()
         src/controller/node_lifecycle_controller.cpp
         src/controller/deployment_controller.cpp
         src/controller/workload_controller.cpp
+        src/controller/firmware_rollout_controller.cpp
         src/ipc/channel.cpp
         src/api/table_serializer.cpp
         src/api/selectors.cpp
@@ -130,6 +132,7 @@ else()
         src/api/timestamp_backfill.cpp
         src/api/node_proxy.cpp
         src/api/protobuf_body.cpp
+        src/api/firmware_api.cpp
         src/scheduler/scheduler.cpp
         src/hal/capability_firewall.cpp
         src/hal/sd_card.cpp
@@ -138,6 +141,7 @@ else()
         src/hal/i2c_discovery.cpp
         src/hal/pod_rmt.cpp
         src/hal/mock_hal.cpp
+        src/hal/firmware_slots.cpp
         src/runtime/host_functions.cpp
         src/runtime/container_lifecycle.cpp
         src/runtime/wasm_runtime.cpp
@@ -159,6 +163,7 @@ else()
         src/kubelet/kube_api_client.cpp
         src/kubelet/kubelet.cpp
         src/kubelet/pod_env.cpp
+        src/kubelet/firmware_agent.cpp
         ${CMAKE_BINARY_DIR}/generated/embedded_blobs.cpp
     )
 
@@ -503,6 +508,14 @@ else()
     )
     target_link_libraries(test_console_relay PRIVATE kube32_core)
     add_test(NAME test_console_relay COMMAND test_console_relay)
+
+    # Firmware rollouts: staging over HTTP, the rollout controller, the
+    # kubelet's update agent and the slots' rollback state machine
+    add_executable(test_firmware_rollout
+        tests/test_firmware_rollout.cpp
+    )
+    target_link_libraries(test_firmware_rollout PRIVATE kube32_core)
+    add_test(NAME test_firmware_rollout COMMAND test_firmware_rollout)
 
 endif()
 

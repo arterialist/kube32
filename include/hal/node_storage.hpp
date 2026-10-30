@@ -58,6 +58,9 @@ std::string node_storage_path(const std::string& relative);
 // switch stacks. `fn` must not throw. It is invoked in place, so a call
 // takes nothing from the heap.
 void node_storage_call(mem::FunctionRef<void()> fn);
+// False when this thread's stack is in PSRAM and there is no storage task to
+// move a call to: internal flash must not be touched from here.
+bool node_storage_call_available();
 
 // mkdir -p, inside node_storage_call.
 bool node_storage_make_dirs(const std::string& path);

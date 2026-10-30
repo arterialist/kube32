@@ -1,4 +1,5 @@
 #include "api/route_handler.hpp"
+#include "osal/sha256.hpp"
 #include <iostream>
 #include "api/table_serializer.hpp"
 #include "api/selectors.hpp"
@@ -600,7 +601,31 @@ RouteMatch RouteHandler::match_route(std::string_view path) {
         return match;
     }
 
-    // 7. networking.k8s.io Ingresses and NetworkPolicies
+    // 7. kube32.io FirmwareRollouts (cluster-scoped)
+    if (path == "/apis/kube32.io") {
+        match.category = RouteCategory::DiscoveryApisKube32Group;
+        return match;
+    }
+    if (path == "/apis/kube32.io/v1") {
+        match.category = RouteCategory::DiscoveryApisKube32V1;
+        return match;
+    }
+    static constexpr std::string_view kRolloutsPrefix = "/apis/kube32.io/v1/firmwarerollouts";
+    if (path.rfind(kRolloutsPrefix, 0) == 0) {
+        std::string_view rest = path.substr(kRolloutsPrefix.size());
+        match.api_group = "kube32.io";
+        if (rest.empty()) {
+            match.category = RouteCategory::FirmwareRolloutsCollection;
+            return match;
+        }
+        if (rest.size() > 1 && rest[0] == '/' && rest.find('/', 1) == std::string_view::npos) {
+            match.category = RouteCategory::FirmwareRolloutItem;
+            match.resource_name = rest.substr(1);
+            return match;
+        }
+    }
+
+    // 8. networking.k8s.io Ingresses and NetworkPolicies
     if (path == "/apis/networking.k8s.io") {
         match.category = RouteCategory::DiscoveryApisNetworkingGroup;
         return match;
@@ -903,6 +928,8 @@ HttpResponse RouteHandler::dispatch(const HttpRequest& req, const RouteMatch& ma
         case RouteCategory::DiscoveryApisNetworkingV1:
         case RouteCategory::DiscoveryApisDiscoveryGroup:
         case RouteCategory::DiscoveryApisDiscoveryV1:
+        case RouteCategory::DiscoveryApisKube32Group:
+        case RouteCategory::DiscoveryApisKube32V1:
         case RouteCategory::SelfSubjectAccessReviews:
         case RouteCategory::SelfSubjectRulesReviews:
         case RouteCategory::DiscoveryOpenApiV3:
@@ -922,6 +949,24 @@ HttpResponse RouteHandler::dispatch(const HttpRequest& req, const RouteMatch& ma
         case RouteCategory::NetworkPolicyItem: {
             ResourceInfo info;
             resource_info(match.category, info);
+            return handle_generic(req, match, info);
+        }
+
+        // Created by kube32-cli firmware rollout (or kubectl); the firmware
+        // rollout controller writes their status
+        case RouteCategory::FirmwareRolloutsCollection:
+        case RouteCategory::FirmwareRolloutItem: {
+            ResourceInfo info;
+            resource_info(match.category, info);
+            if ((req.method == HttpMethod::Post || req.method == HttpMethod::Put) && !req.body.empty()) {
+                models::JsonValue doc;
+                std::string err;
+                const models::JsonValue* spec = models::parse_json(req.body, doc, err) ? doc.get("spec") : nullptr;
+                if (!osal::Sha256::valid_hex(spec ? spec->get_string("sha256", "") : "")) {
+                    return make_status(422, "Invalid", "FirmwareRollout.kube32.io is invalid: spec.sha256: "
+                                                       "the SHA-256 of the staged firmware image (64 hex digits) is required");
+                }
+            }
             return handle_generic(req, match, info);
         }
 
@@ -1029,7 +1074,9 @@ HttpResponse RouteHandler::handle_discovery(const HttpRequest& req, RouteCategor
                         "{\"name\":\"discovery.k8s.io\",\"versions\":[{\"groupVersion\":\"discovery.k8s.io/v1\",\"version\":\"v1\"}],"
                         "\"preferredVersion\":{\"groupVersion\":\"discovery.k8s.io/v1\",\"version\":\"v1\"}},"
                         "{\"name\":\"metrics.k8s.io\",\"versions\":[{\"groupVersion\":\"metrics.k8s.io/v1beta1\",\"version\":\"v1beta1\"}],"
-                        "\"preferredVersion\":{\"groupVersion\":\"metrics.k8s.io/v1beta1\",\"version\":\"v1beta1\"}}"
+                        "\"preferredVersion\":{\"groupVersion\":\"metrics.k8s.io/v1beta1\",\"version\":\"v1beta1\"}},"
+                        "{\"name\":\"kube32.io\",\"versions\":[{\"groupVersion\":\"kube32.io/v1\",\"version\":\"v1\"}],"
+                        "\"preferredVersion\":{\"groupVersion\":\"kube32.io/v1\",\"version\":\"v1\"}}"
                         "]}";
             break;
 
@@ -1123,6 +1170,19 @@ HttpResponse RouteHandler::handle_discovery(const HttpRequest& req, RouteCategor
             resp.body = "{\"kind\":\"APIResourceList\",\"apiVersion\":\"v1\",\"groupVersion\":\"discovery.k8s.io/v1\",\"resources\":["
                         "{\"name\":\"endpointslices\",\"singularName\":\"endpointslice\",\"namespaced\":true,\"kind\":\"EndpointSlice\","
                         "\"verbs\":[\"get\",\"list\"]}"
+                        "]}";
+            break;
+
+        case RouteCategory::DiscoveryApisKube32Group:
+            resp.body = "{\"kind\":\"APIGroup\",\"apiVersion\":\"v1\",\"name\":\"kube32.io\","
+                        "\"versions\":[{\"groupVersion\":\"kube32.io/v1\",\"version\":\"v1\"}],"
+                        "\"preferredVersion\":{\"groupVersion\":\"kube32.io/v1\",\"version\":\"v1\"}}";
+            break;
+
+        case RouteCategory::DiscoveryApisKube32V1:
+            resp.body = "{\"kind\":\"APIResourceList\",\"apiVersion\":\"v1\",\"groupVersion\":\"kube32.io/v1\",\"resources\":["
+                        "{\"name\":\"firmwarerollouts\",\"singularName\":\"firmwarerollout\",\"namespaced\":false,\"kind\":\"FirmwareRollout\","
+                        "\"verbs\":[\"get\",\"list\",\"watch\",\"create\",\"update\",\"patch\",\"delete\"],\"shortNames\":[\"fwr\"]}"
                         "]}";
             break;
 
@@ -2159,6 +2219,8 @@ bool RouteHandler::resource_info(RouteCategory c, ResourceInfo& out) {
             out = {"Ingress", "networking.k8s.io/v1", "IngressList", "ingresses", "/registry/ingresses/", true}; return true;
         case RouteCategory::NetworkPoliciesCollection: case RouteCategory::NetworkPolicyItem:
             out = {"NetworkPolicy", "networking.k8s.io/v1", "NetworkPolicyList", "networkpolicies", "/registry/networkpolicies/", true}; return true;
+        case RouteCategory::FirmwareRolloutsCollection: case RouteCategory::FirmwareRolloutItem:
+            out = {"FirmwareRollout", "kube32.io/v1", "FirmwareRolloutList", "firmwarerollouts", "/registry/firmwarerollouts/", false}; return true;
         default:
             return false;
     }
@@ -2185,6 +2247,7 @@ std::string RouteHandler::openapi_v3_document(const std::string& path) const {
         {"apis/coordination.k8s.io/v1", "coordination.k8s.io", "v1", "Lease", "leases", true},
         {"apis/networking.k8s.io/v1", "networking.k8s.io", "v1", "Ingress", "ingresses", true},
         {"apis/networking.k8s.io/v1", "networking.k8s.io", "v1", "NetworkPolicy", "networkpolicies", true},
+        {"apis/kube32.io/v1", "kube32.io", "v1", "FirmwareRollout", "firmwarerollouts", false},
     };
     if (path == "/openapi/v3") {
         std::string out = "{\"paths\":{";
@@ -2511,7 +2574,8 @@ HttpResponse RouteHandler::handle_generic(const HttpRequest& req, const RouteMat
                           match.category == RouteCategory::JobItem ||
                           match.category == RouteCategory::ServiceItem ||
                           match.category == RouteCategory::IngressItem ||
-                          match.category == RouteCategory::NetworkPolicyItem);
+                          match.category == RouteCategory::NetworkPolicyItem ||
+                          match.category == RouteCategory::FirmwareRolloutItem);
     std::string ns(match.namespace_name);
     std::string root = info.root;
     std::string prefix = root;

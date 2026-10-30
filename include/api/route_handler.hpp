@@ -84,6 +84,12 @@ enum class RouteCategory {
     DiscoveryApisDiscoveryV1,
     EndpointSlicesCollection,
     EndpointSliceItem,
+    // kube32.io/v1 FirmwareRollouts (the staged image itself is served by
+    // api/firmware_api.hpp)
+    DiscoveryApisKube32Group,
+    DiscoveryApisKube32V1,
+    FirmwareRolloutsCollection,
+    FirmwareRolloutItem,
     // /healthz, /livez, /readyz
     Health,
     NotFound

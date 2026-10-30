@@ -42,6 +42,12 @@ struct NodeTelemetry {
     bool ready{false};
     const char* ready_reason{"KubeletNotReady"};
     char ready_message[72]{"kubelet has not completed a pod sync yet"};
+    // FirmwareUpdate condition (kubelet/firmware_agent.hpp), on nodes that
+    // update their firmware through the cluster
+    bool firmware_reported{false};
+    bool firmware_updating{false};
+    char firmware_reason[16]{""};
+    char firmware_message[128]{""};
 };
 
 class NodeStatusReporter {
@@ -65,6 +71,10 @@ public:
     void set_labels(const std::map<std::string, std::string>& labels) { labels_ = labels; }
     // Port of the node's kubelet endpoint (status.daemonEndpoints), 0 for none
     void set_kubelet_port(uint16_t port) { kubelet_port_ = port; }
+    // The firmware version in nodeInfo.osImage (this build's by default)
+    void set_firmware_version(const std::string& version) { firmware_version_ = version; }
+    // Annotations of the Node object (the running firmware image)
+    void set_annotations(const std::map<std::string, std::string>& annotations) { annotations_ = annotations; }
 
     const std::string& node_name() const { return node_name_; }
     const std::string& node_ip() const { return node_ip_; }
@@ -78,6 +88,8 @@ private:
     std::string node_ip_;
     bool control_plane_{false};
     std::map<std::string, std::string> labels_;
+    std::map<std::string, std::string> annotations_;
+    std::string firmware_version_;
     uint16_t kubelet_port_{0};
 };
 

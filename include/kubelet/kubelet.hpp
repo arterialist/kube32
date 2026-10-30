@@ -3,6 +3,7 @@
 #include "kubelet/node_status_reporter.hpp"
 #include "kubelet/kube_api_client.hpp"
 #include "kubelet/metrics_provider.hpp"
+#include "kubelet/firmware_agent.hpp"
 #include "runtime/wasm_runtime.hpp"
 #include "net/network_policy.hpp"
 #include "osal/thread.hpp"
@@ -115,6 +116,10 @@ struct KubeletConfig {
     // listed again.
     std::shared_ptr<net::NodeNetworkPolicies> network_policies;
     uint32_t network_policy_refresh_ms{5000};
+    // The node's firmware slots: with them the kubelet takes part in firmware
+    // rollouts (kubelet/firmware_agent.hpp; firmware.node_name is filled in)
+    std::shared_ptr<hal::FirmwareSlots> firmware_slots;
+    FirmwareAgentConfig firmware;
 
     // Task & concurrency configuration
     size_t task_stack_size{65536};
@@ -159,6 +164,8 @@ public:
     // Measures node and pod usage and pushes the sample (called with the heartbeat).
     void push_metrics_sample();
     void set_metrics_provider(std::unique_ptr<MetricsProvider> provider) { metrics_ = std::move(provider); }
+    // Null without firmware slots
+    FirmwareAgent* firmware() const { return firmware_.get(); }
 
 private:
     static void task_entry(void* arg);
@@ -168,6 +175,7 @@ private:
 
     // Fills the Ready condition from the health of the pod sync loop.
     void fill_ready_condition(NodeTelemetry& t) const;
+    void fill_firmware_condition(NodeTelemetry& t) const;
 
     // Pod lifecycle actions. `previous` carries restart state when the pod
     // is being restarted after a back-off.
@@ -199,6 +207,7 @@ private:
     std::unique_ptr<KubeApiClient> api_client_;
     std::unique_ptr<NodeStatusReporter> status_reporter_;
     std::unique_ptr<MetricsProvider> metrics_;
+    std::unique_ptr<FirmwareAgent> firmware_;
     uint64_t log_epoch_{0};               // identifies this kubelet's process lifetime to the mirror
     bool has_node_sample_{false};
     NodeResourceSample last_node_sample_;

@@ -21,6 +21,11 @@ struct BuildInfo {
 
 const BuildInfo& build_info();
 
+// The firmware version this build reports for its node: $KUBE32_VERSION at
+// build time, or the checkout's describe string. The image carries it after
+// the marker "kube32-version:", so tools read it from a firmware file.
+const char* firmware_version();
+
 // JSON body of GET /version (k8s.io/apimachinery version.Info).
 std::string version_json();
 

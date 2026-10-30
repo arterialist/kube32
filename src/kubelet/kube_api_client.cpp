@@ -849,4 +849,52 @@ bool HttpKubeClient::push_metrics(const std::string& node_name, std::string_view
     return exchange("POST", path.view(), sample_json) == 200;
 }
 
+int KubeApiClient::get_node_annotation(const std::string& node, std::string_view key, std::string& out) {
+    out.clear();
+    std::string body;
+    const int status = get("/api/v1/nodes/" + node, body);
+    if (status != 200) return status;
+    models::JsonValue doc;
+    std::string err;
+    if (!models::parse_json(body, doc, err) || !doc.is_object()) return 0;
+    const models::JsonValue* meta = doc.get("metadata");
+    const models::JsonValue* ann = meta ? meta->get("annotations") : nullptr;
+    if (ann) out = ann->get_string(std::string(key), "");
+    return status;
+}
+
+int HttpKubeClient::stream_get(const std::string& path, mem::FunctionRef<bool(const char*, size_t)> on_data, long* out_length) {
+    return stream_request("GET", path, std::string_view(), on_data, out_length);
+}
+
+int HttpKubeClient::get_node_annotation(const std::string& node, std::string_view key, std::string& out) {
+    out.clear();
+    // "<key>":"<value>", as the API server writes JSON (no spaces). The key
+    // holds no quote, so after a mismatch the match restarts at a quote or
+    // at the beginning.
+    char pattern[96];
+    const int plen = snprintf(pattern, sizeof(pattern), "\"%.*s\":\"", static_cast<int>(key.size()), key.data());
+    if (plen <= 0 || static_cast<size_t>(plen) >= sizeof(pattern)) return 0;
+    size_t matched = 0;
+    bool capturing = false, done = false;
+    PathBuf path;
+    path.add("/api/v1/nodes/").add(node);
+    const int status = stream_request("GET", path.view(), std::string_view(), [&](const char* data, size_t len) {
+        for (size_t i = 0; i < len && !done; ++i) {
+            const char c = data[i];
+            if (capturing) {
+                if (c == '"' || out.size() >= 128) done = true;
+                else out.push_back(c);
+            } else if (c == pattern[matched]) {
+                if (++matched == static_cast<size_t>(plen)) capturing = true;
+            } else {
+                matched = c == '"' ? 1 : 0;
+            }
+        }
+        return !done;
+    });
+    if (status != 200 || (capturing && !done)) out.clear();
+    return status;
+}
+
 } // namespace kube32::kubelet

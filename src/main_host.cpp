@@ -20,6 +20,11 @@
 #include "app/service_client.hpp"
 #include "app/node_storage_api.hpp"
 #include "api/node_proxy.hpp"
+#include "api/firmware_api.hpp"
+#include "api/version_info.hpp"
+#include "controller/firmware_rollout_controller.hpp"
+#include "hal/firmware_slots.hpp"
+#include "osal/sha256.hpp"
 #include "kubelet/kube_api_client.hpp"
 #include "osal/system.hpp"
 #include "runtime/image_registry.hpp"
@@ -94,7 +99,8 @@ static void print_sim_usage(std::ostream& out) {
            "  --join <url>                worker: API server to register with\n"
            "  --token <token>             API bearer token (also KUBE32_API_TOKEN)\n"
            "  --tls                       serve HTTPS next to plain HTTP on the API port\n"
-           "  --data-dir <dir>            store and node storage root (default /tmp/kube32_<node>_data)\n"
+           "  --data-dir <dir>            store and node storage root (default /tmp/kube32_<node>_data);\n"
+           "                              each node's firmware slots are files below it (firmware*/)\n"
            "  --enable-flash              persist the object store in <data-dir>\n"
            "\n"
            "Nodes:\n"
@@ -211,6 +217,27 @@ static bool parse_url(const std::string& url, std::string& out_host, uint16_t& o
         out_port = 80;
     }
     return true;
+}
+
+// The firmware a simulated node runs before any rollout: this build's
+// version and the SHA-256 of the simulator executable
+static kube32::hal::FirmwareInfo sim_firmware(const char* argv0) {
+    kube32::hal::FirmwareInfo fw;
+    fw.version = kube32::api::firmware_version();
+    std::ifstream in(argv0, std::ios::binary);
+    kube32::osal::Sha256 sha;
+    char buf[8192];
+    while (in.read(buf, sizeof(buf)) || in.gcount() > 0) sha.update(buf, static_cast<size_t>(in.gcount()));
+    fw.sha256 = kube32::osal::Sha256::hex(sha.finish());
+    return fw;
+}
+
+// A node's firmware slots: files under the data directory. When the node
+// switched slots it "reboots": an in-process worker restarts its kubelet,
+// the process's own node ends the process (started again, it boots the new
+// slot).
+static std::shared_ptr<kube32::hal::FileFirmwareSlots> sim_slots(const std::string& dir, const kube32::hal::FirmwareInfo& builtin) {
+    return std::make_shared<kube32::hal::FileFirmwareSlots>(dir, builtin);
 }
 
 int main(int argc, char* argv[]) {
@@ -332,6 +359,8 @@ int main(int argc, char* argv[]) {
         };
         kubelet_cfg.node_label_prefix = "i2c.kube32.io/";
         kubelet_cfg.kubelet_port = opts.pod_port;
+        auto worker_slots = sim_slots(opts.data_dir + "/firmware", sim_firmware(argv[0]));
+        kubelet_cfg.firmware_slots = worker_slots;
 
         // k32_http_call: Services resolved through the API server; the
         // kubelet keeps the NetworkPolicies of this node's namespaces
@@ -366,6 +395,10 @@ int main(int argc, char* argv[]) {
         while (g_sim_running.load()) {
             const uint32_t wait = kube32::runtime::AppPodHost::instance().tick_due(kube32::osal::System::get_uptime_ms(), 250);
             kube32::osal::Thread::sleep_ms(std::max<uint32_t>(wait, 10));
+            if (worker_slots->reboot_requested()) {
+                std::cout << "[SIM] " << opts.node_name << " switched firmware slots: start kube32-sim again to boot it" << std::endl;
+                break;
+            }
         }
 
         std::cout << "\n[SHUTDOWN] Stopping Kubelet worker agent..." << std::endl;
@@ -505,7 +538,14 @@ int main(int argc, char* argv[]) {
             return kube32::app::serve_node_storage(conn, path, std::string(), 64u * 1024 * 1024);
         });
     node_proxy.set_node_token(opts.token);
-    server->set_handler(&node_proxy);
+
+    // Firmware rollouts: the image is staged in this node's update slot (a
+    // file under --data-dir), the controller runs in the loop below
+    const kube32::hal::FirmwareInfo builtin_firmware = sim_firmware(argv[0]);
+    auto cp_slots = sim_slots(opts.data_dir + "/firmware", builtin_firmware);
+    kube32::api::FirmwareApi firmware_api(*cp_slots, *store, server->route_handler(), &node_proxy);
+    server->set_handler(&firmware_api);
+    kube32::controller::FirmwareRolloutController firmware_rollouts(*store, [&firmware_api] { return firmware_api.staged(); });
 
     // k32_http_call: Services and NetworkPolicies read from the store
     kube32::app::ServiceClient service_client(kube32::app::make_store_service_resolver(*store), kube32::app::ServiceClientOptions{},
@@ -533,6 +573,7 @@ int main(int argc, char* argv[]) {
 
     std::unique_ptr<kube32::kubelet::Kubelet> local_kubelet;
     std::vector<std::unique_ptr<kube32::kubelet::Kubelet>> worker_kubelets;
+    std::vector<kube32::kubelet::KubeletConfig> worker_configs;
     std::unique_ptr<kube32::runtime::Runtime> wasm_runtime;
     // The standalone simulator's nodes share one pod HTTP server, which is
     // also their kubelet endpoint (node storage through the node proxy)
@@ -564,6 +605,8 @@ int main(int argc, char* argv[]) {
         };
         kubelet_cfg.node_label_prefix = "i2c.kube32.io/";
         kubelet_cfg.kubelet_port = pod_server ? opts.pod_port : 0;
+        kubelet_cfg.firmware_slots = cp_slots;
+        kubelet_cfg.firmware.local_staging = true;
         local_kubelet = std::make_unique<kube32::kubelet::Kubelet>(kubelet_cfg, *wasm_runtime);
         local_kubelet->start();
         std::cout << "[INIT] Kubelet running for simulated node " << opts.kubelet_name << " (control plane)." << std::endl;
@@ -575,6 +618,9 @@ int main(int argc, char* argv[]) {
             wcfg.node_labels["kube32.io/board"] = opts.worker_board;
             wcfg.node_label_source = nullptr;
             wcfg.node_label_prefix.clear();
+            wcfg.firmware_slots = sim_slots(opts.data_dir + "/firmware-" + worker, builtin_firmware);
+            wcfg.firmware.local_staging = false;
+            worker_configs.push_back(wcfg);
             worker_kubelets.push_back(std::make_unique<kube32::kubelet::Kubelet>(wcfg, *wasm_runtime));
             worker_kubelets.back()->start();
             std::cout << "[INIT] Kubelet running for simulated node " << worker << " (worker)." << std::endl;
@@ -609,6 +655,23 @@ int main(int argc, char* argv[]) {
             last_tick = now;
             if (ingress) ingress->tick();
             store->flush(false);
+            static uint32_t seconds = 0;
+            if (++seconds % 3 == 0) firmware_rollouts.reconcile();
+            // A worker that switched firmware slots boots again
+            for (size_t i = 0; i < worker_kubelets.size(); ++i) {
+                auto* slots = static_cast<kube32::hal::FileFirmwareSlots*>(worker_configs[i].firmware_slots.get());
+                if (!slots->reboot_requested()) continue;
+                worker_kubelets[i]->stop();
+                worker_kubelets[i].reset();
+                worker_configs[i].firmware_slots = sim_slots(opts.data_dir + "/firmware-" + worker_configs[i].node_name, builtin_firmware);
+                worker_kubelets[i] = std::make_unique<kube32::kubelet::Kubelet>(worker_configs[i], *wasm_runtime);
+                worker_kubelets[i]->start();
+                std::cout << "[SIM] " << worker_configs[i].node_name << " rebooted" << std::endl;
+            }
+            if (cp_slots->reboot_requested()) {
+                std::cout << "[SIM] " << local_node << " switched firmware slots: start kube32-sim again to boot it" << std::endl;
+                break;
+            }
         }
     }
 

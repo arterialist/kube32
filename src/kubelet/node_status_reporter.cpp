@@ -39,7 +39,7 @@ static uint32_t count_bits(uint64_t v) {
 }
 
 NodeStatusReporter::NodeStatusReporter(const std::string& node_name, const std::string& node_ip, bool control_plane)
-    : node_name_(node_name), node_ip_(node_ip), control_plane_(control_plane) {}
+    : node_name_(node_name), node_ip_(node_ip), control_plane_(control_plane), firmware_version_(api::firmware_version()) {}
 
 NodeTelemetry NodeStatusReporter::collect_telemetry() const {
     NodeTelemetry t;
@@ -179,6 +179,21 @@ static void append_ready_condition(Out& json, const NodeTelemetry& t) {
 }
 
 template <typename Out>
+static void append_firmware_condition(Out& json, const NodeTelemetry& t) {
+    if (!t.firmware_reported) return;
+    json += ",{\"type\":\"FirmwareUpdate\",\"status\":\"";
+    json += t.firmware_updating ? "True" : "False";
+    json += "\",\"reason\":\"";
+    json += t.firmware_reason;
+    json += "\",\"message\":\"";
+    for (const char* p = t.firmware_message; *p; ++p) {
+        if (*p == '"' || *p == '\\') json += '\\';
+        json += *p;
+    }
+    json += "\"}";
+}
+
+template <typename Out>
 void NodeStatusReporter::append_registration(Out& json, const NodeTelemetry& telemetry) const {
     json += "{\"kind\":\"Node\",\"apiVersion\":\"v1\",";
     json += "\"metadata\":{\"name\":\"";
@@ -195,11 +210,27 @@ void NodeStatusReporter::append_registration(Out& json, const NodeTelemetry& tel
         json += kv.second;
         json += "\",";
     }
-    json += control_plane_ ? "\"node-role.kubernetes.io/control-plane\":\"\"}}," : "\"node-role.kubernetes.io/worker\":\"\"}},";
+    json += control_plane_ ? "\"node-role.kubernetes.io/control-plane\":\"\"}" : "\"node-role.kubernetes.io/worker\":\"\"}";
+    if (!annotations_.empty()) {
+        json += ",\"annotations\":{";
+        bool first = true;
+        for (const auto& kv : annotations_) {
+            if (!first) json += ",";
+            first = false;
+            json += "\"";
+            json += kv.first;
+            json += "\":\"";
+            json += kv.second;
+            json += "\"";
+        }
+        json += "}";
+    }
+    json += "},";
     json += "\"spec\":{\"unschedulable\":false},";
     json += "\"status\":{";
     json += "\"conditions\":[";
     append_ready_condition(json, telemetry);
+    append_firmware_condition(json, telemetry);
     json += "],";
     json += "\"addresses\":[{\"type\":\"InternalIP\",\"address\":\"";
     json += node_ip_;
@@ -211,8 +242,11 @@ void NodeStatusReporter::append_registration(Out& json, const NodeTelemetry& tel
     }
     json += "\"nodeInfo\":{\"kubeletVersion\":\"";
     json += api::KUBE32_GIT_VERSION;
-    json += "\",\"osImage\":\"";
+    json += "\",\"osImage\":\"kube32 ";
+    json += firmware_version_;
+    json += " (";
     json += osal::System::get_os_image();
+    json += ")";
     json += "\",\"kernelVersion\":\"";
     json += osal::System::get_kernel_version();
     json += "\",\"containerRuntimeVersion\":\"wasm3://";
@@ -248,6 +282,7 @@ static void append_heartbeat_patch(Out& json, const NodeTelemetry& telemetry, bo
     json += "\",\"reason\":\"";
     json += memory_pressure ? "KubeletHasMemoryPressure" : "KubeletHasSufficientMemory";
     json += "\"}";
+    append_firmware_condition(json, telemetry);
     json += "],";
     json += "\"allocatable\":{";
     append_resources(json, telemetry, false);

@@ -118,6 +118,12 @@ Kubelet::Kubelet(const KubeletConfig& config,
     status_reporter_->set_labels(config_.node_labels);
     status_reporter_->set_kubelet_port(config_.kubelet_port);
     metrics_ = create_platform_metrics_provider();
+    if (config_.firmware_slots) {
+        FirmwareAgentConfig fw = config_.firmware;
+        fw.node_name = config_.node_name;
+        firmware_ = std::make_unique<FirmwareAgent>(*config_.firmware_slots, *api_client_, fw);
+        status_reporter_->set_firmware_version(firmware_->running().version);
+    }
     // Unique per process lifetime: the mirror resets its duplicate filter when it changes
     log_epoch_ = osal::Thread::get_time_us() ^ (static_cast<uint64_t>(std::hash<std::string>{}(config_.node_name)) << 20);
     if (log_epoch_ == 0) log_epoch_ = 1;
@@ -203,7 +209,8 @@ void Kubelet::run_heartbeat_loop() {
         try {
             if (registered_.load()) {
                 uint64_t now = osal::System::get_uptime_ms();
-                if (heartbeat_due_.exchange(false) || now - last_heartbeat_ms_ >= config_.heartbeat_interval_ms) {
+                const bool firmware_due = firmware_ && firmware_->heartbeat_wanted();
+                if (heartbeat_due_.exchange(false) || firmware_due || now - last_heartbeat_ms_ >= config_.heartbeat_interval_ms) {
                     report_heartbeat();
                 }
             }
@@ -256,6 +263,9 @@ void Kubelet::run_loop() {
                     refresh_node_labels();
                 }
             }
+            // Runs unregistered too: an image that cannot reach the API
+            // server must still reject itself in time
+            if (firmware_) firmware_->tick(osal::System::get_uptime_ms(), registered_.load());
         } catch (const std::exception& e) {
             std::cout << "[KUBELET] loop iteration failed: " << e.what() << " (free heap "
                       << osal::System::get_free_heap_bytes() << ")" << std::endl;
@@ -274,6 +284,8 @@ void Kubelet::reconcile_node_registration() {
 
     NodeTelemetry t = status_reporter_->collect_telemetry();
     fill_ready_condition(t);
+    fill_firmware_condition(t);
+    if (firmware_) status_reporter_->set_annotations(firmware_->annotations());
     std::string reg_heap;
     std::string_view reg_json;
     mem::FixedText reg(registration_buf_.get(), registration_buf_ ? kRegistrationBufBytes : 0);
@@ -294,6 +306,9 @@ void Kubelet::reconcile_node_registration() {
             drop_stale_node_labels();
         }
         registered_.store(true);
+        // The firmware annotations again: a Node that outlived this kubelet
+        // may carry ones this boot no longer has
+        if (firmware_) firmware_->mark_annotations_dirty();
         report_heartbeat();
         last_heartbeat_ms_ = osal::System::get_uptime_ms();
     }
@@ -378,10 +393,11 @@ void Kubelet::report_heartbeat() {
 
     NodeTelemetry t = status_reporter_->collect_telemetry();
     fill_ready_condition(t);
+    fill_firmware_condition(t);
     bool memory_pressure = (t.free_heap_bytes < config_.memory_pressure_threshold_bytes);
     // Written on this thread's stack; a patch that does not fit (a board
     // with an unusual set of resources) is built on the heap instead
-    char patch_buf[768];
+    char patch_buf[1024];
     mem::FixedText patch(patch_buf);
     const bool patched = status_reporter_->write_heartbeat_patch_json(patch, t, memory_pressure)
         ? api_client_->patch_node_status(config_.node_name, patch.view())
@@ -402,7 +418,17 @@ void Kubelet::report_heartbeat() {
         heartbeat_failures_ = 0;
         push_metrics_sample();
     }
+    if (firmware_) firmware_->on_heartbeat(patched, t.ready, now_ms);
     last_heartbeat_ms_ = now_ms;
+}
+
+void Kubelet::fill_firmware_condition(NodeTelemetry& t) const {
+    if (!firmware_) return;
+    const FirmwareConditionView c = firmware_->condition();
+    t.firmware_reported = true;
+    t.firmware_updating = c.updating;
+    std::memcpy(t.firmware_reason, c.reason, sizeof(t.firmware_reason));
+    std::memcpy(t.firmware_message, c.message, sizeof(t.firmware_message));
 }
 
 void Kubelet::fill_ready_condition(NodeTelemetry& t) const {

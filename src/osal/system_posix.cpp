@@ -185,7 +185,7 @@ void System::feed_watchdog() {
 
 std::string System::get_os_image() {
     struct utsname u;
-    if (uname(&u) == 0) return std::string(u.sysname) + " " + u.release + " (kube32 host simulator)";
+    if (uname(&u) == 0) return std::string(u.sysname) + " " + u.release + " host simulator";
     return "host simulator";
 }
 

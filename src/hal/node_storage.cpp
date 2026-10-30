@@ -231,6 +231,14 @@ void node_storage_call(mem::FunctionRef<void()> fn) {
     fn();
 }
 
+bool node_storage_call_available() {
+#if defined(KUBE32_TARGET_ESP32)
+    return s_storage_task || !esp_ptr_external_ram(reinterpret_cast<void*>(esp_cpu_get_sp()));
+#else
+    return true;
+#endif
+}
+
 bool node_storage_make_dirs(const std::string& path) {
     bool ok = true;
     node_storage_call([&]() {

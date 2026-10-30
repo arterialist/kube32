@@ -607,7 +607,7 @@ static std::string format_label_selector(const models::JsonValue* sel) {
 
 bool TableSerializer::has_generic_table(std::string_view kind) {
     return kind == "Event" || kind == "Namespace" || kind == "Service" || kind == "ConfigMap" || kind == "Secret" || kind == "Lease" ||
-           kind == "Ingress" || kind == "NetworkPolicy" || kind == "Endpoints" || kind == "EndpointSlice";
+           kind == "Ingress" || kind == "NetworkPolicy" || kind == "Endpoints" || kind == "EndpointSlice" || kind == "FirmwareRollout";
 }
 
 std::string TableSerializer::build_generic_table_json(std::string_view kind, const std::vector<std::string>& jsons, uint64_t resource_version) {
@@ -637,6 +637,9 @@ std::string TableSerializer::build_generic_table_json(std::string_view kind, con
         out += col("NAME", 0) + "," + col("ENDPOINTS", 0) + "," + col("AGE", 0);
     } else if (kind == "EndpointSlice") {
         out += col("NAME", 0) + "," + col("ADDRESSTYPE", 0) + "," + col("PORTS", 0) + "," + col("ENDPOINTS", 0) + "," + col("AGE", 0);
+    } else if (kind == "FirmwareRollout") {
+        out += col("NAME", 0) + "," + col("VERSION", 0) + "," + col("IMAGE", 0) + "," + col("PHASE", 0) + "," + col("NODE", 0) + "," +
+               col("UPDATED", 0) + "," + col("AGE", 0) + "," + col("MESSAGE", 1);
     } else {
         out += col("NAME", 0) + "," + col("AGE", 0);
     }
@@ -747,6 +750,18 @@ std::string TableSerializer::build_generic_table_json(std::string_view kind, con
         } else if (kind == "NetworkPolicy") {
             const models::JsonValue* spec = doc.get("spec");
             cells = {name, format_label_selector(spec ? spec->get("podSelector") : nullptr), age};
+        } else if (kind == "FirmwareRollout") {
+            const models::JsonValue* spec = doc.get("spec");
+            const models::JsonValue* st = doc.get("status");
+            const std::string sha = spec ? spec->get_string("sha256", "") : "";
+            auto field = [&](const char* key) {
+                const std::string v = st ? st->get_string(key, "") : "";
+                return v.empty() ? std::string("<none>") : v;
+            };
+            const std::string updated = st ? std::to_string(st->get_int("updatedNodes", 0)) + "/" + std::to_string(st->get_int("totalNodes", 0))
+                                           : std::string("0/0");
+            cells = {name, field("version"), sha.substr(0, 12), st ? st->get_string("phase", "Pending") : "Pending", field("node"),
+                     updated, age, st ? st->get_string("message", "") : ""};
         } else if (kind == "Endpoints" || kind == "EndpointSlice") {
             // kubectl's printers: the first three endpoints, then "+ N more..."
             std::vector<std::string> eps;

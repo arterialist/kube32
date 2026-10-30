@@ -3,6 +3,14 @@
 
 namespace kube32::api {
 
+// Kept whole in the image, marker included, for the tools that read the
+// version from a firmware file (hal::find_image_version, kube32-cli)
+extern "C" __attribute__((used)) const char kube32_firmware_version_tag[] = "kube32-version:" KUBE32_FIRMWARE_VERSION;
+
+const char* firmware_version() {
+    return kube32_firmware_version_tag + sizeof("kube32-version:") - 1;
+}
+
 static std::string compiler_string() {
 #if defined(__clang__)
     return std::string("clang ") + __clang_version__;

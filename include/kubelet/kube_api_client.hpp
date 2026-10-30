@@ -62,6 +62,16 @@ public:
         why = "not supported by this client";
         return false;
     }
+    // GET whose body reaches `on_data` as it arrives (false from it ends the
+    // read). Returns the HTTP status, 0 when unreachable or cut short; the
+    // body length is in `out_length` when the server sent one (else -1).
+    virtual int stream_get(const std::string& /*path*/, mem::FunctionRef<bool(const char*, size_t)> /*on_data*/, long* out_length = nullptr) {
+        if (out_length) *out_length = -1;
+        return 0;
+    }
+    // The value of annotation `key` on Node `node` ("" when it has none).
+    // Returns the HTTP status of the read. The default reads the Node through get().
+    virtual int get_node_annotation(const std::string& node, std::string_view key, std::string& out);
 };
 
 // Standard HTTP/1.1 REST Client implementation for Kubelet
@@ -89,6 +99,9 @@ public:
     // JSON tree of it is never held.
     int list_items(const std::string& path, const std::function<void(std::string&&)>& on_item) override;
     bool get_pod_image(const std::string& ns, const std::string& name, std::vector<uint8_t>& out, std::string& why) override;
+    int stream_get(const std::string& path, mem::FunctionRef<bool(const char*, size_t)> on_data, long* out_length = nullptr) override;
+    // Scans the Node as it streams in: nothing but the value is kept
+    int get_node_annotation(const std::string& node, std::string_view key, std::string& out) override;
     // Restricts list_pods_raw to pods bound to this node (server-side fieldSelector).
     // The list asks the server to leave inline image annotations empty
     // (?inlineImages=omit) and is split into pods as it streams in, so a
