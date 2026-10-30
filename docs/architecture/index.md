@@ -51,12 +51,12 @@ See the detailed pages for each subsystem:
 
 1. Read node identity from hardware and NVS. A board with PSRAM becomes the control plane, and any other board becomes a worker, unless overridden by `K32_CMD:ROLE:control-plane|worker|auto`. The node name comes from `K32_CMD:NAME:<name>` or defaults to `esp32-` plus the last three Wi-Fi MAC bytes in hex. `K32_CMD:BOARD:cardputer|generic` selects the peripheral profile.
 2. Reserve pod memory while the heap is unfragmented. Boards without PSRAM reserve 80 KiB of internal RAM for pods and their 28 KiB interpreter stack, and 1 KiB log rings. Boards with PSRAM reserve one 1,284 KiB PSRAM block for one large pod.
-3. Initialize peripherals and storage. On the `cardputer` profile, this starts the ST7789 display, I2S speaker, and key-matrix scanner. The node mounts its storage root on the microSD card (`/sd`) if present, or on the internal flash FAT partition (`/data`). It then configures the [capability firewall](capability-firewall.md) with the board profile's available pins and buses.
+3. Initialize peripherals and storage. On the `cardputer` profile, this starts the ST7789 display, I2S speaker, and key-matrix scanner. The node mounts its storage root on the microSD card (`/sd`) if present, or on the internal flash FAT partition (`/data`). It then configures the [capability firewall](capability-firewall.md) with the board profile's available pins and buses. It also reads its running firmware image: version, SHA-256, app slot, and whether it booted from an unconfirmed update ([firmware updates](../firmware-updates.md)).
 4. Start Wi-Fi. With credentials from `K32_CMD:WIFI:<ssid>:<password>`, the board joins that network as a station and waits up to 10 s for SNTP time sync. Objects created before clock sync receive backfilled timestamps once the clock synchronizes. A control plane also runs the `Kube32-Cluster` access point unless `K32_CMD:AP:off` is set. Without stored credentials, the control plane runs only the access point, and workers join it using the password set by `K32_CMD:APPASS`. A control plane without a stored password generates one at boot.
 5. Start [event channels](espnow-ipc.md) over ESP-NOW and UDP port 7400, with peer discovery every 3 s.
 6. Register embedded Wasm images compiled from `images/*.wasm`.
 7. Start role services. The control plane recovers the [object store](radix-store.md), starts the node lifecycle, [scheduler, Deployment, DaemonSet, and Job controllers](scheduler.md), starts the API server on port 6443 (serving HTTP and TLS on the same port), starts a local kubelet pointing to `127.0.0.1:6443`, and starts the Ingress controller on port 80. A worker starts its kubelet pointing to `K32_CMD:API:<host>` (default `192.168.4.1`) and, if the board has PSRAM, starts a pod HTTP server on port 7000.
-8. Start the serial console task, the pod tick thread (calling each pod's `k32_tick` once per `kube32.io/tick-interval`, 1 s by default, or after 10 ms when a tick returns pending work), and the 1 s housekeeping loop (flushing batched controller and deferred node heartbeat store writes, ticking the Ingress controller, and seeding UDP peers from node `InternalIP` addresses every 10 s).
+8. Start the serial console task, the pod tick thread (calling each pod's `k32_tick` once per `kube32.io/tick-interval`, 1 s by default, or after 10 ms when a tick returns pending work), and the 1 s housekeeping loop (flushing batched controller and deferred node heartbeat store writes, ticking the Ingress controller, running the firmware rollout controller every 3 s, and seeding UDP peers from node `InternalIP` addresses every 10 s).
 
 Run `K32_CMD:TASKS` on the serial console to inspect the live task table and stack high-water marks.
 
@@ -79,7 +79,7 @@ The Ingress controller on the control plane listens on port 80 (`src/app/ingress
 
 ## Persistence
 
-Each board mounts one node storage root: `/sd` when a microSD card is inserted, or `/data` on the 3.5 MB internal flash FAT partition (with wear levelling).
+Each board mounts one node storage root: `/sd` when a microSD card is inserted, or `/data` on the 384 KB internal flash FAT partition (with wear levelling).
 
 | Path under `<root>/kube32/` | Contents |
 | --- | --- |

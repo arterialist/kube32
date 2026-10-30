@@ -51,11 +51,12 @@ Layout in `partitions.csv` for 8 MB flash:
 | Name | Offset | Size | Use |
 | --- | --- | --- | --- |
 | `nvs` | `0x9000` | 32 KB | Node configuration, Wi-Fi, role, board profile, name, API address, token, TLS credentials |
-| `phy_init` | `0x11000` | 4 KB | Radio calibration |
-| `factory` | `0x20000` | 3 MB | Application image |
-| `storage` | `0x320000` | 3.5 MB | FAT filesystem with wear levelling at `/data`, used when no microSD card is mounted |
+| `otadata` | `0x11000` | 8 KB | Selects the active boot slot and tracks the confirmation state of an updated image |
+| `phy_init` | `0x13000` | 4 KB | Radio calibration |
+| `ota_0` | `0x20000` | 3.25 MB | App slot |
+| `ota_1` | `0x360000` | 3.25 MB | App slot: a [firmware update](firmware-updates.md) writes to the inactive slot |
 | `journal` | `0x6A0000` | 1 MB | Raw object store journal (`data`, subtype `0x40`), used when no microSD card is mounted |
-| `reserved` | `0x7A0000` | 384 KB | Unused |
+| `storage` | `0x7A0000` | 384 KB | FAT filesystem with wear levelling at `/data`, used when no microSD card is mounted |
 
 ## Configuration notes
 
@@ -67,5 +68,4 @@ Settings in `platformio.ini` and `sdkconfig.defaults`:
 ## Limitations
 
 - Boards with octal PSRAM require `CONFIG_SPIRAM_MODE_OCT=y` in `sdkconfig.defaults`.
-- There is no OTA partition. Flash firmware updates over USB.
 - Pods cannot claim strapping, USB, flash/PSRAM, or board profile peripheral pins. See [Capability firewall](architecture/capability-firewall.md#reserved-pins).

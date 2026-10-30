@@ -52,6 +52,7 @@ nav:
       - Quick start: quickstart.md
       - Hardware: hardware-spec.md
       - Flashing and the serial console: flashing-troubleshooting.md
+      - Firmware updates: firmware-updates.md
       - Cluster access: cluster-access.md
   - Building apps:
       - Writing pods: app-development.md

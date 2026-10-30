@@ -31,7 +31,7 @@ Discovery endpoints accept `GET` and `HEAD`.
 | `/version` | `gitVersion` `v1.33.0-kube32`, git commit, tree state, UTC build time, compiler and platform: `darwin/arm64`, `linux/amd64` or `freertos/xtensa`. `goVersion` is empty |
 | `/healthz`, `/livez`, `/readyz` | `200 OK` with body `ok` |
 | `/api`, `/api/v1` | core `v1` |
-| `/apis`, `/apis/<group>`, `/apis/<group>/<version>` | `apps/v1`, `batch/v1`, `coordination.k8s.io/v1`, `discovery.k8s.io/v1`, `events.k8s.io/v1`, `networking.k8s.io/v1`, `authorization.k8s.io/v1`, `metrics.k8s.io/v1beta1` |
+| `/apis`, `/apis/<group>`, `/apis/<group>/<version>` | `apps/v1`, `batch/v1`, `coordination.k8s.io/v1`, `discovery.k8s.io/v1`, `events.k8s.io/v1`, `networking.k8s.io/v1`, `authorization.k8s.io/v1`, `metrics.k8s.io/v1beta1`, `kube32.io/v1` |
 | `/openapi/v3`, `/openapi/v3/<group version>` | OpenAPI v3 index and per-group documents listing the `fieldValidation` parameter without schemas. `/openapi/v2` and unknown groups return 404 |
 
 ## Resources
@@ -55,6 +55,7 @@ Discovery endpoints accept `GET` and `HEAD`.
 | `discovery.k8s.io/v1` | EndpointSlice | | get, list | Read-only. Computed on read from Services and their pods |
 | `metrics.k8s.io/v1beta1` | NodeMetrics, PodMetrics | | get, list | Kubelet samples, up to 32 pods with a 30 s TTL |
 | `authorization.k8s.io/v1` | SelfSubjectAccessReview, SelfSubjectRulesReview | | create | Always returns allowed |
+| `kube32.io/v1` | FirmwareRollout | `fwr` | get, list, watch, create, update, patch, delete | Cluster-scoped. `spec.sha256` names the staged firmware image. The rollout controller updates nodes one at a time and writes `status`. The API server serves the staged image at `/apis/kube32.io/v1/firmware`. See [Firmware updates](firmware-updates.md#api). |
 
 ## kubectl and k9s
 

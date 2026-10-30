@@ -11,12 +11,14 @@ bash scripts/flash.sh <serial port> 921600
 
 `scripts/flash.sh <serial port> [baud]` defaults to `460800` baud and reads `KUBE32_SERIAL_PORT` when you omit the port argument. The script locates `pio` on `PATH`, then in `$PLATFORMIO_CORE_DIR/penv/bin` or `~/.platformio/penv/bin`. It runs `esptool` from PlatformIO's virtualenv or from a system `python3` with `esptool` installed.
 
-- Writes `bootloader.bin` at `0x0`, `partitions.bin` at `0x8000`, and `firmware.bin` at `0x20000` from `.pio/build/esp32s3/` in `dio` mode with an 8 MB flash size. Runs `pio run` if the binaries are missing.
+- Writes `bootloader.bin` at `0x0`, `partitions.bin` at `0x8000`, an erased `otadata` at `0x11000`, and `firmware.bin` into the `ota_0` app slot at `0x20000` from `.pio/build/esp32s3/` in `dio` mode with an 8 MB flash size, using the offsets from `partitions.csv`. The board boots the flashed image. This leaves NVS and the object store journal untouched. Runs `pio run` if the binaries are missing.
 - Writes 256-byte blocks with a 1.5 ms pause on CH340 USB-UART bridges, vendor ID `0x1a86`. Uses `esptool` defaults on native USB-Serial/JTAG ports.
 - Resets native USB boards through the RTC watchdog with `--after watchdog-reset`, and resets CH340 boards with `--after hard-reset`.
 - Reads `KUBE32_FLASH_BEFORE` for `--before`, defaulting to `default-reset`, and `KUBE32_FLASH_AFTER` for `--after`.
 
 To enter ROM download mode from the serial console when USB auto-reset fails, send `K32_CMD:BOOTLOADER`, then flash with `KUBE32_FLASH_BEFORE=no-reset`.
+
+Flash a board running the single-app partition table once with a current build to move it to the A/B layout; see [Firmware updates](firmware-updates.md#moving-a-board-to-this-layout). After that, update boards through the cluster with `kube32-cli firmware push` and `kube32-cli firmware rollout`.
 
 ## Serial console
 
@@ -49,6 +51,7 @@ Profile commands write to the `k32` NVS namespace, return `K32_OK ..., rebooting
 | `K32_CMD:STATUS` | `K32_STATUS node=... role=... mac=... free_heap=... min_free_heap=... free_psram=... uptime_ms=... pods=... storage=... auth=... tls=...` |
 | `K32_CMD:STORE` | `K32_STORE journal=... keys=... live_bytes=... capacity_bytes=... sectors=.../... pending=... records=... bytes=... moved=... unchanged=... errors=... revision=...` on the control plane, or `K32_STORE journal=none`. |
 | `K32_CMD:CERT` | The API server's self-signed TLS certificate in PEM format as `K32_CERT <line>` lines followed by `K32_OK cert`. |
+| `K32_CMD:FIRMWARE` | `K32_FIRMWARE version=... sha256=... slot=... state=Confirmed\|Verifying update_slot=... staged=... staged_sha256=... staged_version=...`: reports the running image and, on the control plane, the staged image. See [Firmware updates](firmware-updates.md). |
 | `K32_CMD:SCAN` | Up to 20 `K32_AP ssid="..." rssi=... ch=... auth=...` lines for 2.4 GHz networks. |
 | `K32_CMD:TASKS` | One `K32_TASK` line per FreeRTOS task with state, priority, core, free stack high-water mark, and run time. |
 | `K32_CMD:TASKBT:<task name prefix>` | First 48 words of a blocked task's saved stack for `addr2line`. Exact name matches take precedence over prefix matches. |
@@ -94,3 +97,5 @@ Opening a native USB-Serial/JTAG or CH340 port with RTS high and DTR low resets 
 | Keypad events do not reach the control plane across different access points | Verify the worker node object has an `InternalIP` for UDP transport. |
 | Android Chrome cannot reach the board on LAN | Enable the Local network permission for Chrome on Android 17. |
 | Cardputer flash is corrupted after flashing | Reflash without pressing G0. |
+| Boot log shows `updates go to nowhere (no second app slot)` | The board uses the single-app partition table. Flash it once with `scripts/flash.sh`. |
+| A board comes back on its other firmware after a rollout | The updated image reset or did not report Ready before confirming itself. Run `kubectl describe node <node>` to read the reason in the `FirmwareUpdate` condition; see [Rollback](firmware-updates.md#rollback). |

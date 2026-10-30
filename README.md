@@ -16,6 +16,7 @@ kube32 is a Kubernetes-compatible control plane and WebAssembly pod runtime for 
 - Peripheral access gated per pod by a capability firewall covering GPIO pins, ADC channels, I2C and UART buses, ST7789 display, key matrix, I2S speaker, and microSD storage.
 - Container lifecycle management with `restartPolicy` set to `Always`, `OnFailure`, or `Never`, exponential CrashLoopBackOff, and distinct exit codes for Wasm traps, gas exhaustion, and `OOMKilled`.
 - Optional bearer-token authentication and automatic self-signed ECDSA P-256 TLS on port 6443.
+- Firmware rollouts through the cluster: one node at a time, SHA-256 checked, with bootloader rollback when an image does not come up healthy.
 - Pub/sub events via `k32_event_emit` and `kube32.io/event-topics`, bridged across nodes over ESP-NOW and UDP port 7400.
 - Multi-node host simulator `kube32-sim` and `kube32-cli` for building, checking, and deploying pods over the network or to node storage.
 

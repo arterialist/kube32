@@ -23,11 +23,14 @@ On the host simulator, `KUBE32_SD_ROOT=/some/directory` mounts a directory as `/
 | Name | Type | Subtype | Offset | Size |
 | --- | --- | --- | --- | --- |
 | `nvs` | `data` | `nvs` | `0x9000` | 32 KB (`0x8000`) |
-| `phy_init` | `data` | `phy` | `0x11000` | 4 KB (`0x1000`) |
-| `factory` | `app` | `factory` | `0x20000` | 3 MB (`0x300000`) |
-| `storage` | `data` | `fat` | `0x320000` | 3.5 MB (`0x380000`) |
+| `otadata` | `data` | `ota` | `0x11000` | 8 KB (`0x2000`) |
+| `phy_init` | `data` | `phy` | `0x13000` | 4 KB (`0x1000`) |
+| `ota_0` | `app` | `ota_0` | `0x20000` | 3.25 MB (`0x340000`) |
+| `ota_1` | `app` | `ota_1` | `0x360000` | 3.25 MB (`0x340000`) |
 | `journal` | `data` | `0x40` | `0x6A0000` | 1 MB (`0x100000`) |
-| `reserved` | `data` | `0xff` | `0x7A0000` | 384 KB (`0x60000`) |
+| `storage` | `data` | `fat` | `0x7A0000` | 384 KB (`0x60000`) |
+
+One app slot holds the running firmware, and the other receives the image written by a [firmware update](firmware-updates.md).
 
 ### microSD hardware and mount
 

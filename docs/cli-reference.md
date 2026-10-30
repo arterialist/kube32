@@ -22,7 +22,7 @@ Use `kubectl` and k9s to manage the cluster. Use the tools below to run the host
 | `--join <url>` | `""` | Worker: API server URL to register with, or `auto` for mDNS discovery. |
 | `--token <token>` | `$KUBE32_API_TOKEN` | API bearer token. |
 | `--tls` | off | Serve HTTPS alongside plain HTTP on `--port`; key and certificate are stored in `<data-dir>/kube32/tls/`. |
-| `--data-dir <dir>` | `/tmp/kube32_<node>_data` | Object store and node storage root (unless `KUBE32_SD_ROOT` is set). |
+| `--data-dir <dir>` | `/tmp/kube32_<node>_data` | Object store and node storage root (unless `KUBE32_SD_ROOT` is set). Each node's firmware slots are files under this directory (`firmware/`, `firmware-<worker>/`). See [Firmware updates](firmware-updates.md#simulator). |
 | `--enable-flash` | off | Persist the object store journal in `<data-dir>/kube32/store/journal.img`. |
 | `--node-name <name>` | `esp32-master` | Control-plane or standalone node name. |
 | `--kubelet-name <name>` | `esp32-node-01` | Kubelet node name in `standalone` mode. |
@@ -62,6 +62,16 @@ The simulator is a 64-bit host build where `wasm3` runtime structures are about 
 | `sd-push <file> (--to <mount point> \| --node <node>)` | Copy a checked module to `kube32/images/<name>[-<tag>].wasm` for `wasm://sd/<name>[:<tag>]`, either to a locally mounted card with `--to <dir>` or over the network to a node's storage with `--node <node>`. Flags: `--to <dir>`, `--node <node>`, `--name <name>`, `--tag <tag>`, `--context`, `--kubeconfig`, `--server`, `--kubectl`. |
 | `push <file\|dir> --node <node> [--path <path>]` | Upload a file or directory tree over the network to `<storage-root>/kube32/<path>` via `kubectl replace --raw /api/v1/nodes/<node>/proxy/storage/<path>` (kubeconfig credentials apply). Default `--path` is `images/<filename>` for a file or `images` for a directory, uploading files recursively to `<path>/<relative-path>`. Prints one line per file plus a directory total, stops at the first error, and exits `1` if a directory is empty. Flags: `--node <node>`, `--path <path>`, `--context`, `--kubeconfig`, `--server`, `--kubectl`. |
 
+Firmware commands (see [Firmware updates](firmware-updates.md)) reach the API server through `kubectl --raw` (kubeconfig credentials apply) and accept `--context`, `--kubeconfig`, `--server`, and `--kubectl`:
+
+| Command | Description |
+| --- | --- |
+| `firmware push <firmware.bin>` | Check the image (an ESP32 image whose last 32 bytes are its SHA-256) and upload it into the control plane's update slot in ranges, resuming where an interrupted upload stopped. Does nothing when the image is already staged. Flags: `--chunk <qty>`, default `16Ki` (the control plane holds a range in memory while writing it to flash), `--retries <n>`, default `5`. |
+| `firmware rollout` | Create the `FirmwareRollout` `firmware` for the staged image, replacing a finished one, and print progress until it completes or fails. Flags: `--sha256 <hex>` (refuses unless it matches the staged image), `--node-timeout <s>`, `--no-wait`, `--timeout <s>`, default `3600`, `--interval <s>`, default `5`. |
+| `firmware status` | Print the staged image, the rollout, and a node table showing version, image, slot, confirmation state, target, and `FirmwareUpdate` condition. |
+| `firmware abort` | Delete the rollout. Nodes that have not switched keep their running firmware. |
+| `firmware info <firmware.bin>` | Print the version and SHA-256 of an image file. |
+
 Exit codes:
 
 | Code | Meaning |
@@ -71,7 +81,8 @@ Exit codes:
 | 2 | Usage error |
 | 3 | ABI check failed |
 | 4 | `kubectl` failed |
-| 5 | Pod already exists during `deploy`; pass `--replace` |
+| 5 | Pod already exists during `deploy` (pass `--replace`), or a firmware rollout is in progress during `firmware rollout` |
+| 6 | The firmware rollout failed or did not finish within `--timeout` |
 
 ## flash.sh
 
@@ -84,6 +95,7 @@ scripts/flash.sh <serial port> [baud]
 - Uses `<serial port>` or `KUBE32_SERIAL_PORT`, and defaults to `460800` baud.
 - Locates `pio` on `PATH` or in `${PLATFORMIO_CORE_DIR:-~/.platformio}/penv/bin`, and `esptool` in PlatformIO's virtualenv or system `python3`.
 - Runs `pio run -e esp32s3` if `bootloader.bin`, `partitions.bin`, or `firmware.bin` is missing from `.pio/build/esp32s3/`.
+- Writes the bootloader at `0x0`, the partition table at `0x8000`, an erased `otadata`, and the firmware into the first app slot, at the offsets in `partitions.csv`.
 - Writes 256-byte paced blocks on CH340 bridges, vendor ID `0x1a86`. Uses `KUBE32_FLASH_BEFORE`, default `default-reset`, and `KUBE32_FLASH_AFTER`, default `hard-reset` on CH340 and `watchdog-reset` on native USB.
 
 ## kube32_serial_gateway.py
