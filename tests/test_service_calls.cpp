@@ -1,11 +1,15 @@
-// k32_http_call: pod-to-pod calls through Services (app/service_client.hpp).
+// k32_http_call: pod-to-pod calls through Services, calls to hosts outside
+// the cluster, and NetworkPolicy egress on both (app/service_client.hpp).
 //
 // Local targets run in-process; remote ones are reached over HTTP, here a
-// scripted server standing in for another node's pod HTTP server.
+// scripted server standing in for another node's pod HTTP server and for a
+// host outside the cluster.
 
 #include "pod_test_util.hpp"
 #include "app/service_client.hpp"
 #include "app/pod_server.hpp"
+#include "api/route_handler.hpp"
+#include "mem/monotonic_arena.hpp"
 #include "storage/store.hpp"
 #include "runtime/k32_app_abi.h"
 #include "runtime/pod_memory_pool.h"
@@ -101,6 +105,7 @@ struct FakeNode {
             path = path.substr(0, path.find(' '));
             std::string out;
             if (path == "/cl") out = "HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello";
+            else if (path == "/large") out = "HTTP/1.1 200 OK\r\nContent-Length: 20000\r\n\r\n" + std::string(20000, 'x');
             else if (path == "/chunked") out = "HTTP/1.1 201 Created\r\nTransfer-Encoding: chunked\r\n\r\n3;ext=1\r\nhel\r\n2\r\nlo\r\n0\r\n\r\n";
             else if (path == "/echo") out = "HTTP/1.1 200 OK\r\nContent-Length: " + std::to_string(body.size()) + "\r\n\r\n" + body;
             else if (path == "/slow") { osal::Thread::sleep_ms(1500); out = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok"; }
@@ -114,6 +119,124 @@ struct FakeNode {
     }
     std::string last_head() { std::lock_guard<std::mutex> l(mu); return heads.empty() ? "" : heads.back(); }
 };
+
+// A NetworkPolicy request to the API server; returns the HTTP status
+static int policy_request(api::RouteHandler& api, api::HttpMethod method, const std::string& name, const std::string& spec = "") {
+    api::HttpRequest r;
+    r.method = method;
+    r.path = "/apis/networking.k8s.io/v1/namespaces/default/networkpolicies" + std::string(method == api::HttpMethod::Post ? "" : "/" + name);
+    if (!spec.empty()) {
+        r.body = "{\"apiVersion\":\"networking.k8s.io/v1\",\"kind\":\"NetworkPolicy\",\"metadata\":{\"name\":\"" + name + "\"},\"spec\":" + spec + "}";
+        r.content_type = method == api::HttpMethod::Patch ? "application/merge-patch+json" : "application/json";
+    }
+    mem::MonotonicArena arena;
+    return api.handle_request(r, arena).status_code;
+}
+
+// End to end on the control plane: the svcprobe pod calls a host outside the
+// cluster (the scripted server on 127.0.0.1) and Services, with
+// NetworkPolicies created through the API server.
+static void test_egress(storage::Store& store, FakeNode& node) {
+    std::cout << "=== k32_http_call: egress and NetworkPolicy ===" << std::endl;
+    api::RouteHandler api(store);
+    app::ServiceClientOptions opts;
+    // Host names, as a name server would answer them
+    opts.resolve_host = [](const std::string& host, uint32_t, uint32_t& out) -> int {
+        if (host == "fake.example" || host == "fake.lan") { out = 0x7F000001; return 0; }
+        if (host == "slow.example") return ETIMEDOUT;
+        return ENOENT;
+    };
+    app::ServiceClient client(app::make_store_service_resolver(store), opts, app::make_store_egress_source(store));
+    app::install_service_client(&client);
+    const std::string port = std::to_string(node.port);
+    const std::string out = "http://127.0.0.1:" + port;
+
+    // No policy: addresses, names, a <name>.<name> that is no Service
+    k32test::Collect c = call_pod("default/a-0", "/call?u=" + out + "/cl");
+    std::cout << "[external] " << c.body << std::endl;
+    assert(json_int(c.body, "rc") == 200 && c.body.find("\"body\":\"hello\"") != std::string::npos);
+    std::string head = node.last_head();
+    assert(head.find("GET /cl HTTP/1.1\r\nHost: 127.0.0.1:" + port + "\r\n") == 0);
+    assert(head.find("Connection: close") != std::string::npos && head.find("X-Kube32") == std::string::npos);
+    c = call_pod("default/a-0", "/call?u=http://fake.example:" + port + "/cl");
+    assert(json_int(c.body, "rc") == 200 && node.last_head().find("Host: fake.example:" + port + "\r\n") != std::string::npos);
+    c = call_pod("default/a-0", "/call?u=http://fake.lan:" + port + "/cl");
+    assert(json_int(c.body, "rc") == 200);
+    c = call_pod("default/a-0", "/call?u=http://b.default/hello");   // <service>.<namespace> that is a Service stays in the cluster
+    assert(json_int(c.body, "rc") == 200 && c.body.find("hello from b-0") != std::string::npos);
+    c = call_pod("default/a-0", "/call?u=http://nosuch.example/");
+    assert(json_int(c.body, "rc") == K32_ERR_NOENT);
+    c = call_pod("default/a-0", "/call?u=http://slow.example/");
+    assert(json_int(c.body, "rc") == K32_ERR_TIMEOUT);
+    c = call_pod("default/a-0", "/call?u=https://fake.example/");
+    assert(json_int(c.body, "rc") == K32_ERR_NOTSUP);
+    c = call_pod("default/a-0", "/call?u=http://127.0.0.1:1/");
+    assert(json_int(c.body, "rc") == K32_ERR_CONNREFUSED);
+    // Larger than the buffer: the first bytes, and the connection is not read to its end
+    c = call_pod("default/a-0", "/call?u=" + out + "/large&cap=1000");
+    assert(json_int(c.body, "rc") == K32_ERR_TOOBIG && json_int(c.body, "len") == 1000);
+    std::string bin("\x00\x01\xff\r\n\x7f", 6);
+    c = call_pod("default/a-0", "/call?u=" + out + "/echo&m=POST", "POST", bin);
+    assert(json_int(c.body, "rc") == 200 && json_int(c.body, "len") == 6);
+    assert(node.last_head().find("Content-Type: application/octet-stream") != std::string::npos);
+    c = call_pod("default/a-0", "/call?u=" + out + "/slow&t=300");
+    assert(json_int(c.body, "rc") == K32_ERR_TIMEOUT);
+    assert(client.stats().external.load() >= 9);
+
+    // A policy selecting a with no egress rule: nothing, in the cluster or out of it
+    assert(policy_request(api, api::HttpMethod::Post, "lockdown", R"({"podSelector":{"matchLabels":{"app":"a"}},"policyTypes":["Egress"]})") == 201);
+    c = call_pod("default/a-0", "/call?u=" + out + "/cl");
+    std::cout << "[denied] " << c.body << std::endl;
+    assert(json_int(c.body, "rc") == K32_ERR_PERM);
+    c = call_pod("default/a-0", "/call?u=http://b/hello");
+    assert(json_int(c.body, "rc") == K32_ERR_PERM);
+    c = call_pod("default/a-0", "/call?u=http://fake.example:" + port + "/cl");
+    assert(json_int(c.body, "rc") == K32_ERR_PERM);
+    c = call_pod("default/b-0", "/call?u=" + out + "/cl");   // b is not selected
+    assert(json_int(c.body, "rc") == 200);
+
+    // The fake host's address block on its port: allowed; b (same address,
+    // port 7000) is not
+    assert(policy_request(api, api::HttpMethod::Post, "loopback", R"({"podSelector":{"matchLabels":{"app":"a"}},"policyTypes":["Egress"],
+        "egress":[{"to":[{"ipBlock":{"cidr":"127.0.0.0/8"}}],"ports":[{"port":)" + port + "}]}]}") == 201);
+    c = call_pod("default/a-0", "/call?u=" + out + "/cl");
+    std::cout << "[allowed] " << c.body << std::endl;
+    assert(json_int(c.body, "rc") == 200);
+    c = call_pod("default/a-0", "/call?u=http://fake.example:" + port + "/cl");
+    assert(json_int(c.body, "rc") == 200);
+    c = call_pod("default/a-0", "/call?u=http://b/hello");
+    assert(json_int(c.body, "rc") == K32_ERR_PERM);
+    // ... minus the fake host's own address
+    assert(policy_request(api, api::HttpMethod::Patch, "loopback", R"({"egress":[{"to":[{"ipBlock":{"cidr":"127.0.0.0/8","except":["127.0.0.1/32"]}}]}]})") == 200);
+    c = call_pod("default/a-0", "/call?u=" + out + "/cl");
+    assert(json_int(c.body, "rc") == K32_ERR_PERM);
+
+    // Pods by label on a named port: b-0's "http" is 7000, its Service's target
+    assert(policy_request(api, api::HttpMethod::Post, "to-b", R"({"podSelector":{"matchLabels":{"app":"a"}},"policyTypes":["Egress"],
+        "egress":[{"to":[{"podSelector":{"matchLabels":{"app":"b"}}}],"ports":[{"port":"http"}]}]})") == 201);
+    c = call_pod("default/a-0", "/call?u=http://b/hello");
+    assert(json_int(c.body, "rc") == 200 && c.body.find("hello from b-0") != std::string::npos);
+    // r-0 on the other node: its "http" (7000) is not the port its Service
+    // targets, a port range is
+    assert(policy_request(api, api::HttpMethod::Post, "to-r", R"({"podSelector":{"matchLabels":{"app":"a"}},"policyTypes":["Egress"],
+        "egress":[{"to":[{"namespaceSelector":{"matchLabels":{"kubernetes.io/metadata.name":"default"}},"podSelector":{"matchLabels":{"app":"r"}}}],
+                   "ports":[{"port":"http"}]}]})") == 201);
+    c = call_pod("default/a-0", "/call?u=http://r:8080/cl");
+    assert(json_int(c.body, "rc") == K32_ERR_PERM);
+    assert(policy_request(api, api::HttpMethod::Patch, "to-r", R"({"egress":[{"to":[{"podSelector":{"matchLabels":{"app":"r"}}}],
+        "ports":[{"port":)" + std::to_string(node.port - 1) + ",\"endPort\":" + std::to_string(node.port + 1) + "}]}]}") == 200);
+    c = call_pod("default/a-0", "/call?u=http://r:8080/cl");
+    assert(json_int(c.body, "rc") == 200 && c.body.find("\"body\":\"hello\"") != std::string::npos);
+    assert(client.stats().denied.load() >= 6);
+
+    // Policies gone: everything allowed again
+    for (const char* name : {"lockdown", "loopback", "to-b", "to-r"}) assert(policy_request(api, api::HttpMethod::Delete, name) == 200);
+    c = call_pod("default/a-0", "/call?u=" + out + "/cl");
+    assert(json_int(c.body, "rc") == 200);
+    c = call_pod("default/a-0", "/call?u=http://b/hello");
+    assert(json_int(c.body, "rc") == 200);
+    std::cout << "[PASS] k32_http_call: hosts outside the cluster, NetworkPolicy egress" << std::endl;
+}
 
 int main() {
     std::cout << "=== k32_http_call ===" << std::endl;
@@ -253,6 +376,8 @@ int main() {
     assert(h.status == 200);
     kube32_interp_stack_set(nullptr, 0);
     server.stop();
+
+    test_egress(*store, node);
 
     app::install_service_client(nullptr);
     node.stop();

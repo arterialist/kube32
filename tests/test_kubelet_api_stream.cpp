@@ -238,14 +238,16 @@ int main() {
         osal::Socket l;
         std::thread srv = serve_once(l, 18697, r + size_line + body + "\r\n0\r\n\r\n");
         kubelet::HttpKubeClient lister("127.0.0.1", 18697);
-        std::vector<std::string> seen;
+        std::vector<std::string> seen, labels;
         assert(lister.for_each_node_pod([&](const kubelet::PodListEntry& e) {
             seen.push_back(std::string(e.namespace_name) + "/" + std::string(e.name) + " " + std::string(e.uid) + " " +
                            std::string(e.node_name) + " " + std::string(e.phase) + (e.deleting ? " deleting" : ""));
+            labels.push_back(std::string(e.labels));
         }));
         srv.join();
         l.close();
         assert(seen.size() == 3);
+        assert(labels[0] == "{\"x\":\"[}{\"}" && labels[1].empty() && labels[2].empty());   // as JSON text, for NetworkPolicy
         assert(seen[0] == "ns1/a u1 n1 Running deleting");
         assert(seen[1] == "ns1/b u2 n2 Succeeded");
         assert(seen[2] == "ns1/c u3 n1 Pending");

@@ -1,0 +1,26 @@
+# egress-policy: the probe of examples/egress.yaml may reach TCP port 8000
+# on hosts outside the cluster access point's subnet, and nothing else: no
+# other port, no host on the access point, no Service.
+#   kubectl --context kube32 apply -f examples/egress-policy.yaml
+#   kubectl --context kube32 get netpol
+# Denied calls return K32_ERR_PERM (-1), and the calling node logs
+#   [NETPOL] default/egress-probe -> <host> denied: no NetworkPolicy egress rule allows it
+# A worker applies a change within about 7 s; the control plane on its next call.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: egress-probe
+  namespace: default
+spec:
+  podSelector:
+    matchLabels:
+      app: egress-probe
+  policyTypes: ["Egress"]
+  egress:
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+            except: ["192.168.4.0/24"]
+      ports:
+        - protocol: TCP
+          port: 8000

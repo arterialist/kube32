@@ -6,7 +6,8 @@ All notable changes to this project will be documented in this file. The format 
 
 ### Added
 
-- Kubernetes API server on port 6443 serving Pod, Node, Namespace, Service, Endpoints, EndpointSlice, ConfigMap, Secret, Event, Deployment, DaemonSet, Job, Lease, Ingress, NodeMetrics, PodMetrics, and subject access reviews.
+- Kubernetes API server on port 6443 serving Pod, Node, Namespace, Service, Endpoints, EndpointSlice, ConfigMap, Secret, Event, Deployment, DaemonSet, Job, Lease, Ingress, NetworkPolicy, NodeMetrics, PodMetrics, and subject access reviews.
+- Pod egress: `k32_http_call` reaches HTTP hosts outside the cluster by IPv4 address or DNS name, resolving Service names as Kubernetes DNS does; NetworkPolicy egress rules (`ipBlock` with `except`, pod and namespace selectors, numbered, named and ranged ports) restrict Service and outside calls on the calling node; the control plane routes its cluster access point to its station uplink with NAT and offers the uplink's name server.
 - Watch streams with bookmarks and `sendInitialEvents`, Table output, OpenAPI v3 index, `fieldValidation=Strict`, `dryRun=All`, pagination, merge and strategic-merge patches, and protobuf request bodies for ConfigMap, Secret, Namespace, Service, Deployment, and Job.
 - Pod scheduler filtering by node state, `nodeName`, `nodeSelector`, memory, `esp32.io/psram`, and peripheral counts (`esp32.io/gpio`, `esp32.io/i2c`, `esp32.io/adc`, `esp32.io/uart`).
 - Deployment, DaemonSet, and Job controllers, plus node Lease tracking with automatic tainting and pod eviction.

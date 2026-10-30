@@ -1,5 +1,7 @@
 #pragma once
 
+#include "mem/function_ref.hpp"
+
 #include <cstdint>
 #include <cstddef>
 #include <string>
@@ -44,6 +46,11 @@ public:
     bool listen(int backlog = 10);
     Socket accept(std::string* client_ip = nullptr, uint16_t* client_port = nullptr);
     bool connect(const char* host_or_ip, uint16_t port, uint32_t timeout_ms = 5000);
+    // Connects to an IPv4 address (host byte order) in at most timeout_ms;
+    // `stop` is asked every 250 ms whether to give up. Returns 0 with the
+    // socket blocking again, or the errno of the failure (ETIMEDOUT,
+    // ECONNREFUSED, ECONNRESET, EHOSTUNREACH, ENETUNREACH, ECANCELED, ...).
+    int connect_within(uint32_t ipv4, uint16_t port, uint32_t timeout_ms, mem::FunctionRef<bool()> stop);
 
     // Stream operations (TCP)
     ssize_t send(const void* buf, size_t len, int flags = 0);
@@ -85,6 +92,12 @@ public:
     // Gives up ownership of the descriptor without closing it (plain
     // sockets only: a TLS session cannot outlive its Socket).
     int release() { int fd = fd_; fd_ = -1; return fd; }
+
+    // Resolves a host name to an IPv4 address (host byte order) in at most
+    // timeout_ms: lwIP's resolver on the boards, the system's on the host.
+    // `stop` is asked every few ms whether to give up. Returns 0, ENOENT (no
+    // such name, or no answer from the name server), ETIMEDOUT or ECANCELED.
+    static int resolve_ipv4(const char* host, uint32_t timeout_ms, mem::FunctionRef<bool()> stop, uint32_t& out);
 
     // Platform networking initialization
     static bool init_networking();

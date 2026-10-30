@@ -77,6 +77,7 @@ set(KUBE32_APP_SRCS
     app/ingress_routes.cpp
     app/pod_server.cpp
     app/service_client.cpp
+    app/egress_policy.cpp
     app/node_storage_api.cpp
     app/console_relay.cpp
     embedded/embedded_blobs_esp.cpp
@@ -153,6 +154,7 @@ set_source_files_properties(
     ${CMAKE_CURRENT_LIST_DIR}/api/node_proxy.cpp
     ${CMAKE_CURRENT_LIST_DIR}/api/protobuf_body.cpp
     ${CMAKE_CURRENT_LIST_DIR}/app/service_client.cpp
+    ${CMAKE_CURRENT_LIST_DIR}/app/egress_policy.cpp
     ${CMAKE_CURRENT_LIST_DIR}/net/network_policy.cpp
     ${CMAKE_CURRENT_LIST_DIR}/runtime/pod_assets.cpp
     PROPERTIES COMPILE_OPTIONS "-Os")

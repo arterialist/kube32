@@ -55,7 +55,7 @@ nav:
       - Cluster access: cluster-access.md
   - Building apps:
       - Writing pods: app-development.md
-      - Services, Ingress and pod-to-pod calls: networking.md
+      - Services, Ingress, calls and NetworkPolicy: networking.md
       - Storage and volumes: storage.md
       - Peripherals: peripherals.md
       - "Example: Tessera": examples/tessera.md

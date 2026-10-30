@@ -1,23 +1,32 @@
 #include "osal/socket.hpp"
 #include "osal/tls.hpp"
+#include "osal/system.hpp"
+#include "osal/thread.hpp"
+#include <atomic>
 #include <cerrno>
 #include <cstring>
 #include <cstdio>
+#include <memory>
+#include <new>
 
 #if defined(ESP_PLATFORM)
 #include <lwip/sockets.h>
 #include <lwip/netdb.h>
 #include <lwip/inet.h>
+#include <lwip/dns.h>
+#include <lwip/tcpip.h>
 #include <fcntl.h>
 #define KUBE32_CLOSE_SOCKET lwip_close
 #else
 #include <sys/socket.h>
+#include <sys/select.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <arpa/inet.h>
 #include <unistd.h>
 #include <fcntl.h>
 #include <netdb.h>
+#include <thread>
 #define KUBE32_CLOSE_SOCKET ::close
 #endif
 
@@ -122,6 +131,145 @@ bool Socket::connect(const char* host_or_ip, uint16_t port, uint32_t timeout_ms)
     }
     return (::connect(fd_, reinterpret_cast<struct sockaddr*>(&addr), sizeof(addr)) == 0);
 }
+
+int Socket::connect_within(uint32_t ipv4, uint16_t port, uint32_t timeout_ms, mem::FunctionRef<bool()> stop) {
+    if (fd_ < 0) return EBADF;
+    struct sockaddr_in addr;
+    std::memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(port);
+    addr.sin_addr.s_addr = htonl(ipv4);
+    if (!set_nonblocking(true)) return EIO;
+    if (::connect(fd_, reinterpret_cast<struct sockaddr*>(&addr), sizeof(addr)) == 0) return set_nonblocking(false) ? 0 : EIO;
+    if (errno != EINPROGRESS) return errno;
+    // Writable (or failed) once the handshake ends; waited for in 250 ms
+    // slices so that a stopping caller is noticed
+    const uint64_t deadline = System::get_uptime_ms() + timeout_ms;
+    for (;;) {
+        const uint64_t now = System::get_uptime_ms();
+        if (now >= deadline) return ETIMEDOUT;
+        if (stop()) return ECANCELED;
+        const uint64_t slice = (deadline - now < 250) ? deadline - now : 250;
+        fd_set wfds, efds;
+        FD_ZERO(&wfds);
+        FD_ZERO(&efds);
+        FD_SET(fd_, &wfds);
+        FD_SET(fd_, &efds);
+        struct timeval tv;
+        tv.tv_sec = 0;
+        tv.tv_usec = static_cast<long>(slice * 1000);
+        const int n = ::select(fd_ + 1, nullptr, &wfds, &efds, &tv);
+        if (n < 0 && errno == EINTR) continue;
+        if (n < 0) return errno;
+        if (n == 0) continue;
+        int so_error = 0;
+        socklen_t len = sizeof(so_error);
+        if (::getsockopt(fd_, SOL_SOCKET, SO_ERROR, &so_error, &len) != 0) return errno;
+        if (so_error != 0) return so_error;
+        return set_nonblocking(false) ? 0 : EIO;
+    }
+}
+
+#if defined(ESP_PLATFORM)
+namespace {
+// One lookup in lwIP's resolver, which runs on the tcpip thread. The query
+// is shared by the caller and the resolver's callback; whichever lets go
+// last frees it, so a caller that gave up leaves nothing behind.
+struct DnsQuery {
+    std::atomic<int> refs{2};
+    std::atomic<int> state{0};    // 0 pending, 1 found, 2 failed
+    uint32_t addr{0};             // host byte order
+    char name[DNS_MAX_NAME_LENGTH + 1];
+};
+
+void dns_release(DnsQuery* q) {
+    if (q->refs.fetch_sub(1) == 1) delete q;
+}
+
+void dns_found(const char*, const ip_addr_t* ip, void* arg) {
+    auto* q = static_cast<DnsQuery*>(arg);
+    if (ip && IP_IS_V4(ip)) {
+        q->addr = lwip_ntohl(ip_2_ip4(ip)->addr);
+        q->state.store(1);
+    } else {
+        q->state.store(2);
+    }
+    dns_release(q);
+}
+
+void dns_start(void* arg) {
+    auto* q = static_cast<DnsQuery*>(arg);
+    ip_addr_t ip;
+    const err_t e = dns_gethostbyname_addrtype(q->name, &ip, dns_found, q, LWIP_DNS_ADDRTYPE_IPV4);
+    if (e == ERR_OK) {
+        dns_found(q->name, &ip, q);   // cached: no callback follows
+    } else if (e != ERR_INPROGRESS) {
+        q->state.store(2);
+        dns_release(q);
+    }
+}
+} // namespace
+
+int Socket::resolve_ipv4(const char* host, uint32_t timeout_ms, mem::FunctionRef<bool()> stop, uint32_t& out) {
+    const size_t len = host ? std::strlen(host) : 0;
+    if (len == 0 || len > DNS_MAX_NAME_LENGTH) return ENOENT;
+    auto* q = new (std::nothrow) DnsQuery;
+    if (!q) return ENOMEM;
+    std::memcpy(q->name, host, len + 1);
+    if (tcpip_callback(dns_start, q) != ERR_OK) {
+        delete q;
+        return ENOMEM;
+    }
+    const uint64_t deadline = System::get_uptime_ms() + timeout_ms;
+    int rc = 0;
+    for (;;) {
+        const int st = q->state.load();
+        if (st == 1) { out = q->addr; break; }
+        if (st == 2) { rc = ENOENT; break; }
+        if (System::get_uptime_ms() >= deadline) { rc = ETIMEDOUT; break; }
+        if (stop()) { rc = ECANCELED; break; }
+        Thread::sleep_ms(10);
+    }
+    dns_release(q);
+    return rc;
+}
+#else
+int Socket::resolve_ipv4(const char* host, uint32_t timeout_ms, mem::FunctionRef<bool()> stop, uint32_t& out) {
+    if (!host || !*host) return ENOENT;
+    // getaddrinfo cannot be interrupted: it runs on a thread of its own that
+    // a caller who gave up leaves to finish
+    struct Query {
+        std::atomic<int> state{0};    // 0 pending, 1 found, 2 failed
+        uint32_t addr{0};
+        std::string name;
+    };
+    auto q = std::make_shared<Query>();
+    q->name = host;
+    std::thread([q]() {
+        struct addrinfo hints;
+        std::memset(&hints, 0, sizeof(hints));
+        hints.ai_family = AF_INET;
+        hints.ai_socktype = SOCK_STREAM;
+        struct addrinfo* res = nullptr;
+        if (::getaddrinfo(q->name.c_str(), nullptr, &hints, &res) == 0 && res) {
+            q->addr = ntohl(reinterpret_cast<struct sockaddr_in*>(res->ai_addr)->sin_addr.s_addr);
+            q->state.store(1);
+        } else {
+            q->state.store(2);
+        }
+        if (res) ::freeaddrinfo(res);
+    }).detach();
+    const uint64_t deadline = System::get_uptime_ms() + timeout_ms;
+    for (;;) {
+        const int st = q->state.load();
+        if (st == 1) { out = q->addr; return 0; }
+        if (st == 2) return ENOENT;
+        if (System::get_uptime_ms() >= deadline) return ETIMEDOUT;
+        if (stop()) return ECANCELED;
+        Thread::sleep_ms(5);
+    }
+}
+#endif
 
 ssize_t Socket::send(const void* buf, size_t len, int flags) {
     if (fd_ < 0 || !buf) return -1;

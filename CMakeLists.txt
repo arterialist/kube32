@@ -150,6 +150,7 @@ else()
         src/app/ingress_routes.cpp
         src/app/pod_server.cpp
         src/app/service_client.cpp
+        src/app/egress_policy.cpp
         src/app/node_storage_api.cpp
         src/app/console_relay.cpp
         src/kubelet/node_status_reporter.cpp
@@ -336,6 +337,12 @@ else()
     add_executable(test_protobuf_body tests/test_protobuf_body.cpp)
     target_link_libraries(test_protobuf_body PRIVATE kube32_core)
     add_test(NAME test_protobuf_body COMMAND test_protobuf_body)
+
+    # NetworkPolicy egress: URL resolution, policy evaluation, the API
+    # resource and a worker's view kept by its kubelet
+    add_executable(test_network_policy tests/test_network_policy.cpp)
+    target_link_libraries(test_network_policy PRIVATE kube32_core)
+    add_test(NAME test_network_policy COMMAND test_network_policy)
 
     # Service calls, bundle files, sub-page memory limits, the kubelet's
     # streamed API reads and node storage over HTTP (pods: apps/svcprobe)

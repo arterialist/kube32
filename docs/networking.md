@@ -1,6 +1,6 @@
-# Services, Ingress and pod-to-pod calls
+# Services, Ingress, calls and NetworkPolicy
 
-The control plane runs an HTTP Ingress controller on port 80, and every node (including the control plane) runs a pod HTTP server on port 7000 and reports that port in `status.daemonEndpoints.kubeletEndpoint.Port` on its `Node` object. On the host simulator, set these ports with `--ingress-port` and `--pod-port`. Services select running pods by label for Ingress routing, `k32_http_call` requests, and environment variable injection.
+The control plane runs an HTTP Ingress controller on port 80, and every node (including the control plane) runs a pod HTTP server on port 7000 and reports that port in `status.daemonEndpoints.kubeletEndpoint.Port` on its `Node` object. On the host simulator, set these ports with `--ingress-port` and `--pod-port`. Services select running pods by label for Ingress routing, `k32_http_call` requests, and environment variable injection. Pods also reach HTTP hosts outside the cluster with `k32_http_call`, restricted by `NetworkPolicy` objects.
 
 ```mermaid
 flowchart LR
@@ -101,9 +101,9 @@ backend:
 - `kube32.cluster` sends a `cluster` SSE event with cluster telemetry JSON every 2 s while a client is connected.
 - `kube32.presence` sends a `presence` SSE event with `{"viewers":N}` whenever the stream's viewer count changes.
 
-## Pod-to-pod calls with k32_http_call
+## Calls from pods with k32_http_call
 
-Pods call Services synchronously with `k32_http_call`, declared in `include/runtime/k32_app_abi.h`:
+Pods call Services in the cluster and HTTP hosts outside it synchronously with `k32_http_call`, declared in `include/runtime/k32_app_abi.h`:
 
 ```c
 int32_t k32_http_call(const char* method, uint32_t method_len,
@@ -122,25 +122,108 @@ securityContext:
     add: ["SERVICE_CALL"]
 ```
 
-- `url` takes the form `http://<service>[.<namespace>][:<port>]<path>` and accepts `.svc` and `.svc.cluster.local` suffixes. When omitted, the namespace defaults to the caller's namespace and the port defaults to the Service's first port.
-- The control plane resolves Services from the object store and invalidates its cache when a `Service` or `Pod` changes. Worker nodes fetch the `Service` and its `Endpoints` from the API server and cache the result for 3 s.
-- `headers` takes optional `Name: value\r\n` lines. Only `Content-Type`, `Cookie`, `X-Request-Id`, and `Accept-Encoding` from caller headers reach the target pod.
-- `timeout_ms` defaults to `5000` when `0`, up to a maximum of `60000`.
-- The host calls a backing pod on the same node in-process on the caller's thread, which requires 16 KiB of free native stack on boards or 128 KiB on the simulator. For a pod on another node, the host sends an HTTP/1.1 request over a keep-alive connection pool to the target node's pod HTTP server with `X-Kube32-Pod` and `X-Kube32-Call-Chain`.
+`url` takes the form `http://<host>[:<port>]<path>`. The host resolves the way a Kubernetes DNS name resolves inside a pod:
+
+| Host | Target |
+| --- | --- |
+| `<service>` | The Service in the caller's namespace |
+| `<service>.<namespace>` | That Service. When no such Service exists, the name is looked up as a host outside the cluster |
+| `<service>.<namespace>.svc`, `<service>.<namespace>.svc.cluster.local` | The Service |
+| An IPv4 address or any other DNS name | A host outside the cluster |
+
+- A Service's port defaults to its first port, a host's port to `80`.
+- `https://` URLs return `K32_ERR_NOTSUP`: `k32_http_call` speaks plain HTTP/1.1.
+- `headers` takes optional `Name: value\r\n` lines.
+- `timeout_ms` defaults to `5000` when `0`, up to a maximum of `60000`. It bounds the whole call: the name lookup, the connection and the response.
 - The host copies up to `resp_cap` bytes of the response body into `resp` and writes the copied byte count to `*resp_len`.
+- The calling pod's thread blocks until the call returns. Stopping the pod interrupts the call.
+- When `NetworkPolicy` objects restrict the calling pod, every connection is checked against them (see [NetworkPolicy](#networkpolicy)).
+
+### Services
+
+- The control plane resolves Services from the object store and invalidates its cache when a `Service` or `Pod` changes. Worker nodes fetch the `Service` and its `Endpoints` from the API server and cache the result for 3 s.
+- Only `Content-Type`, `Cookie`, `X-Request-Id`, and `Accept-Encoding` from caller headers reach the target pod.
+- The host calls a backing pod on the same node in-process on the caller's thread, which requires 16 KiB of free native stack on boards or 128 KiB on the simulator. For a pod on another node, the host sends an HTTP/1.1 request over a keep-alive connection pool to the target node's pod HTTP server with `X-Kube32-Pod` and `X-Kube32-Call-Chain`.
+
+### Hosts outside the cluster
+
+- The node looks names up with its own resolver: lwIP and the name server from DHCP on the boards (`.local` names over mDNS), the operating system on the simulator. Name lookups are not subject to NetworkPolicy.
+- Each call opens a connection of its own with `Connection: close`. The node reads the response as it arrives and closes the connection when the response is complete, or as soon as the body exceeds `resp_cap` (`K32_ERR_TOOBIG` with the first `resp_cap` bytes copied).
+- The host receives the `Host` header from the URL and every caller header except `X-Kube32-*` and the headers the connection owns (`Host`, `Content-Length`, `Connection`, `Transfer-Encoding`, `Keep-Alive`, `Upgrade`, `TE`, `Trailer`).
+- Redirects return to the caller as they are.
+- Workers on the cluster access point reach hosts outside the cluster through the control plane (see [Routing for the cluster access point](#routing-for-the-cluster-access-point)).
 
 | Return value | Code | Meaning |
 | --- | --- | --- |
-| HTTP status | `100`..`599` | Response status from the target pod |
-| `K32_ERR_PERM` | `-1` | Pod lacks the `SERVICE_CALL` capability |
-| `K32_ERR_NOENT` | `-2` | Service or port not found, or no ready pod selected |
-| `K32_ERR_IO` | `-5` | Target node unreachable or connection failed |
+| HTTP status | `100`..`599` | Response status from the target pod or host |
+| `K32_ERR_PERM` | `-1` | Pod lacks the `SERVICE_CALL` capability, or no NetworkPolicy allows the connection |
+| `K32_ERR_NOENT` | `-2` | Service or port not found, no ready pod selected, or the host name does not resolve |
+| `K32_ERR_IO` | `-5` | Target node unreachable, or the connection failed |
 | `K32_ERR_TOOBIG` | `-7` | Response body exceeded `resp_cap`; first `resp_cap` bytes are copied |
 | `K32_ERR_NOMEM` | `-12` | Insufficient native stack for an in-process call |
 | `K32_ERR_FAULT` | `-14` | Pointer or length out of bounds in linear memory |
 | `K32_ERR_INVAL` | `-22` | Malformed URL or arguments |
 | `K32_ERR_LOOP` | `-40` | Target pod is already in `X-Kube32-Call-Chain`, or chain length reached 8 |
+| `K32_ERR_NOTSUP` | `-95` | `https://` URL |
 | `K32_ERR_TIMEOUT` | `-110` | No complete response within `timeout_ms` |
+| `K32_ERR_CONNREFUSED` | `-111` | The host refused the connection |
+| `K32_ERR_HOSTUNREACH` | `-113` | No route to the host |
+
+## NetworkPolicy
+
+`networking.k8s.io/v1` `NetworkPolicy` objects restrict the connections `k32_http_call` opens, to Services and to hosts outside the cluster, with Kubernetes egress semantics:
+
+- A pod that no policy with `Egress` in `spec.policyTypes` selects (`spec.podSelector`, in the policy's namespace) may open any connection.
+- A pod that such policies select may open only the connections that an egress rule of one of them allows. `egress: []` allows none.
+- A rule allows a connection when one of its `to` peers and one of its `ports` match. A rule without `to` matches every destination, a rule without `ports` every port.
+- `ipBlock.cidr`, minus the blocks in `except`, matches the destination address: the address of a host outside the cluster, or the pod IP of a pod behind a Service.
+- `podSelector` and `namespaceSelector` match the pods behind a Service and their namespace; `podSelector` alone matches pods in the policy's namespace. Every namespace carries the label `kubernetes.io/metadata.name: <name>`. Selectors never match hosts outside the cluster.
+- `port` matches the target port of a pod behind a Service or the port of a host, as a number, as a range up to `endPort`, or as the name of a `containerPort` of the target pod. Only `protocol: TCP` matches.
+- A call to a Service goes to one of its pods that the policies allow. When they allow none, or deny the host, the call returns `K32_ERR_PERM` and the node logs `[NETPOL] <pod> -> <target> denied: <reason>`, at most once per second.
+
+The API server validates policies as kube-apiserver does, and defaults `spec.policyTypes` (`Ingress`, plus `Egress` when the policy has egress rules) and `protocol: TCP`. `kubectl get netpol` prints the pod selector.
+
+From `examples/egress-policy.yaml`, a policy that lets the probe of `examples/egress.yaml` reach TCP port 8000 on hosts outside the cluster access point's subnet, and nothing else:
+
+```yaml
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: egress-probe
+  namespace: default
+spec:
+  podSelector:
+    matchLabels:
+      app: egress-probe
+  policyTypes: ["Egress"]
+  egress:
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+            except: ["192.168.4.0/24"]
+      ports:
+        - protocol: TCP
+          port: 8000
+```
+
+### Enforcement and propagation
+
+The node of the calling pod enforces the policies.
+
+- The control plane reads policies, pods and namespaces from its object store. A change applies from the next call.
+- A worker's kubelet records the labels of the node's pods at every pod sync (every 2 s on the boards) and loads the policies of a namespace before the first pod of that namespace starts on the node. It lists the policies of every namespace with pods on the node again every 5 s. A policy change reaches a worker within about 7 s, a change to a calling pod's labels within one pod sync.
+- A worker reads a pod behind a Service from the API server when a rule compares its labels or port names, and keeps it for 3 s.
+- A worker that has not loaded the policies of a pod's namespace denies the pod's calls.
+
+## Routing for the cluster access point
+
+When the control plane has Wi-Fi credentials (`K32_CMD:WIFI`) and keeps the `Kube32-Cluster` access point on, it joins that network as a station and serves the access point at `192.168.4.1`. While the station holds an address:
+
+- The control plane forwards traffic from the access point's stations to the station network with NAT (lwIP NAPT). The NAT table takes 16 KiB, from PSRAM, when the uplink first comes up.
+- The access point's DHCP server offers the station's name server, with two-minute leases. A worker that joined before the uplink came up learns the name server when it renews its lease, within a minute.
+- When the station loses its address, the control plane turns NAT off until the station has one again.
+
+The control plane logs `[NET] uplink up: NAT from the cluster AP on, DNS <server> offered (internal RAM <n> bytes, PSRAM <n> bytes)` and `[NET] uplink down: NAT from the cluster AP off`.
 
 ## Serving files from a pod image with k32_resp_asset
 
@@ -237,3 +320,4 @@ curl -sN http://<control-plane-ip>/echo/events
 
 - `Endpoints` and `EndpointSlice` are read-only and do not support `watch`.
 - The API server does not serve `IngressClass` objects, and the Ingress controller routes only Ingresses with `ingressClassName: kube32` or unset.
+- NetworkPolicy ingress rules are stored and not enforced.

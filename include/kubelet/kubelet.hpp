@@ -4,6 +4,7 @@
 #include "kubelet/kube_api_client.hpp"
 #include "kubelet/metrics_provider.hpp"
 #include "runtime/wasm_runtime.hpp"
+#include "net/network_policy.hpp"
 #include "osal/thread.hpp"
 #include "osal/mutex.hpp"
 
@@ -98,7 +99,13 @@ struct KubeletConfig {
     // A pod the node has no memory for yet waits (Pending, InsufficientMemory)
     // and is admitted again after this long
     uint32_t memory_retry_ms{5000};
-
+    // Workers enforce NetworkPolicy egress on their pods' calls with this
+    // view (null: none kept here). Each pod sync records the labels of the
+    // node's pods and loads the policies of a namespace new to the node;
+    // every network_policy_refresh_ms the policies of all its namespaces are
+    // listed again.
+    std::shared_ptr<net::NodeNetworkPolicies> network_policies;
+    uint32_t network_policy_refresh_ms{5000};
 
     // Task & concurrency configuration
     size_t task_stack_size{65536};
@@ -172,6 +179,9 @@ private:
     bool wait_for_memory(const std::string& pod_key, LocalPodRecord& rec, const std::string& why, const LocalPodRecord* previous);
     void repack_pool(uint64_t now_ms);
     void ship_pod_logs_locked(const std::string& pod_key, LocalPodRecord& rec);
+    // Lists the NetworkPolicies of the namespaces new to config_.network_policies,
+    // and of all of them once the refresh interval passed
+    void refresh_network_policies(uint64_t now_ms);
 
     KubeletConfig config_;
     runtime::Runtime& runtime_;
@@ -203,6 +213,7 @@ private:
     // Local state map: key = namespace/name (looked up by view)
     std::map<std::string, LocalPodRecord, std::less<>> active_pods_;
     uint32_t sync_pass_{0};
+    uint64_t last_policy_refresh_ms_{0};
 };
 
 } // namespace kube32::kubelet

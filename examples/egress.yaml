@@ -1,0 +1,43 @@
+# egress: a pod calls HTTP hosts outside the cluster with k32_http_call.
+#
+# The probe is apps/svcprobe: GET /call?u=<url> makes the call and answers
+#   {"rc":<HTTP status or K32_ERR_*>,"len":<bytes>,"ms":<call time>,"body":"<first 64 bytes>"}
+# It travels inline in its pod (kube32-cli deploy grants SERVICE_CALL from
+# the module's imports and labels the pod app=egress-probe):
+#   make -C apps/svcprobe
+#   python3 tools/kube32-cli deploy images/sd/svcprobe.wasm --name egress-probe --node <node> --memory 16Ki
+#   kubectl --context kube32 apply -f examples/egress.yaml
+# The control plane's ingress reaches it by host name:
+#   curl -s -H 'Host: egress.kube32' 'http://<control-plane>/call?u=http://<host>:<port>/'
+# Without a NetworkPolicy the probe reaches every host; examples/egress-policy.yaml
+# restricts it.
+apiVersion: v1
+kind: Service
+metadata:
+  name: egress-probe
+  namespace: default
+spec:
+  selector:
+    app: egress-probe
+  ports:
+    - name: http
+      port: 80
+      targetPort: http
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: egress-probe
+  namespace: default
+spec:
+  rules:
+    - host: egress.kube32
+      http:
+        paths:
+          - path: /call
+            pathType: Prefix
+            backend:
+              service:
+                name: egress-probe
+                port:
+                  number: 80

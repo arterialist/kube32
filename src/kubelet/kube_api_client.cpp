@@ -514,6 +514,7 @@ public:
                     if (k == "name") return string(e.name);
                     if (k == "namespace") return string(e.namespace_name);
                     if (k == "uid") return string(e.uid);
+                    if (k == "labels") return raw(e.labels);
                     if (k == "deletionTimestamp") {
                         std::string_view v;
                         if (!string(v)) return false;
@@ -547,6 +548,14 @@ private:
     bool string(std::string_view& out) {
         ws();
         return (p_ < end_ && *p_ == '"') ? raw_string(out) : skip();
+    }
+    // Any value, as its JSON text
+    bool raw(std::string_view& out) {
+        ws();
+        const char* start = p_;
+        if (!skip()) return false;
+        out = std::string_view(start, static_cast<size_t>(p_ - start));
+        return true;
     }
     bool skip() {
         ws();

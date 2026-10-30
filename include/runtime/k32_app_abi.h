@@ -80,7 +80,10 @@ extern "C" {
 #define K32_ERR_NOSPC       (-28)   /* card full                                      */
 #define K32_ERR_NAMETOOLONG (-36)   /* path longer than K32_FS_MAX_PATH               */
 #define K32_ERR_LOOP        (-40)   /* the call would re-enter a pod already serving it (ELOOP) */
+#define K32_ERR_NOTSUP      (-95)   /* https:// URL: k32_http_call speaks plain HTTP (EOPNOTSUPP) */
 #define K32_ERR_TIMEOUT     (-110)  /* no answer within the timeout (ETIMEDOUT)       */
+#define K32_ERR_CONNREFUSED (-111)  /* the host refused the connection (ECONNREFUSED) */
+#define K32_ERR_HOSTUNREACH (-113)  /* no route to the host (EHOSTUNREACH)            */
 
 /* ---- Pod storage (microSD volume) -------------------------------------
  * A pod gets a directory of its own on the node's microSD card when its
@@ -192,25 +195,40 @@ K32_IMPORT("k32_mem_stats")   int32_t k32_mem_stats(uint32_t* out_used, uint32_t
  * answered 406 to a client that does not accept gzip. */
 K32_IMPORT("k32_resp_asset")  int32_t k32_resp_asset(const char* path, uint32_t path_len, uint32_t status);
 
-/* Synchronous HTTP request to a Service in the cluster.
- * url: "http://<service>[.<namespace>][:<port>]<path>"; the namespace
- * defaults to the caller's and the port to the Service's first port.
- * headers: optional "Name: value\r\n" lines. The response body is copied
- * into resp up to resp_cap; *resp_len receives the number of bytes copied.
+/* Synchronous HTTP request to a Service in the cluster or to a host outside it.
+ * url: "http://<host>[:<port>]<path>". The host resolves as Kubernetes DNS
+ * names do in a pod:
+ *   <service>                                a Service in the caller's namespace
+ *   <service>.<namespace>                    that Service; a host on the network
+ *                                            when there is no such Service
+ *   <service>.<namespace>.svc[.cluster.local] a Service
+ *   anything else                            a host outside the cluster: an IPv4
+ *                                            address or a DNS name (port 80)
+ * A Service's port defaults to its first port. headers: optional
+ * "Name: value\r\n" lines. The response body is copied into resp up to
+ * resp_cap; *resp_len receives the number of bytes copied.
  * Returns the HTTP status, or a negative error:
- *   K32_ERR_NOENT    no such Service, or no ready pod behind it
- *   K32_ERR_TIMEOUT  no complete answer within timeout_ms (0: 5000 ms)
- *   K32_ERR_TOOBIG   the body is larger than resp_cap (the first resp_cap
- *                    bytes are copied)
- *   K32_ERR_LOOP     the target pod is already serving this call chain
- *                    (a pod calling itself, or a cycle across pods)
- *   K32_ERR_IO       the pod's node could not be reached
- *   K32_ERR_PERM     the pod lacks the SERVICE_CALL capability:
- *                      securityContext: { capabilities: { add: [SERVICE_CALL] } }
+ *   K32_ERR_NOENT       no such Service, no ready pod behind it, or the
+ *                       host name does not resolve
+ *   K32_ERR_TIMEOUT     no complete answer within timeout_ms (0: 5000 ms)
+ *   K32_ERR_TOOBIG      the body is larger than resp_cap (the first resp_cap
+ *                       bytes are copied)
+ *   K32_ERR_LOOP        the target pod is already serving this call chain
+ *                       (a pod calling itself, or a cycle across pods)
+ *   K32_ERR_IO          the pod's node could not be reached, or the
+ *                       connection failed
+ *   K32_ERR_CONNREFUSED the host refused the connection
+ *   K32_ERR_HOSTUNREACH no route to the host
+ *   K32_ERR_NOTSUP      an https:// URL (TLS is not supported)
+ *   K32_ERR_PERM        the pod lacks the SERVICE_CALL capability:
+ *                         securityContext: { capabilities: { add: [SERVICE_CALL] } }
+ *                       or a NetworkPolicy does not allow the connection
  * A pod on the same node is called in-process; others are reached through
  * their node's pod HTTP server. The calling pod is suspended (its thread
  * blocks) until the answer arrives. Request headers the target sees:
- * Content-Type, Cookie, X-Request-Id and Accept-Encoding. */
+ * Content-Type, Cookie, X-Request-Id and Accept-Encoding; a host outside the
+ * cluster gets every header except the ones the connection owns (Host,
+ * Content-Length, Connection, ...). */
 K32_IMPORT("k32_http_call")   int32_t k32_http_call(const char* method, uint32_t method_len, const char* url, uint32_t url_len,
                                                     const char* headers, uint32_t headers_len, const uint8_t* body, uint32_t body_len,
                                                     uint8_t* resp, uint32_t resp_cap, uint32_t* resp_len, uint32_t timeout_ms);

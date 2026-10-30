@@ -20,6 +20,7 @@ struct PodListEntry {
     std::string_view node_name;            // spec.nodeName
     std::string_view phase;                // status.phase
     bool deleting{false};                  // metadata.deletionTimestamp is set
+    std::string_view labels;               // metadata.labels as JSON text, when the client read the fields in place
     std::string_view manifest;             // the pod's JSON
     const models::KubePod* pod{nullptr};   // the pod as the client parsed it, if it did
 };

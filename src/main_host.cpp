@@ -325,11 +325,14 @@ int main(int argc, char* argv[]) {
         kubelet_cfg.node_labels["kube32.io/board"] = opts.board;
         kubelet_cfg.kubelet_port = opts.pod_port;
 
-        // k32_http_call: Services resolved through the API server
+        // k32_http_call: Services resolved through the API server; the
+        // kubelet keeps the NetworkPolicies of this node's namespaces
         auto api_client = std::make_shared<kube32::kubelet::HttpKubeClient>(master_host, master_port);
         api_client->set_bearer_token(opts.token);
-        kube32::app::ServiceClient service_client(kube32::app::make_api_service_resolver(
-            [api_client](const std::string& path, std::string& body) { return api_client->get(path, body); }));
+        auto api_get = [api_client](const std::string& path, std::string& body) { return api_client->get(path, body); };
+        kubelet_cfg.network_policies = std::make_shared<kube32::net::NodeNetworkPolicies>();
+        kube32::app::ServiceClient service_client(kube32::app::make_api_service_resolver(api_get), kube32::app::ServiceClientOptions{},
+                                                  kube32::app::make_node_egress_source(kubelet_cfg.network_policies, api_get));
         kube32::app::install_service_client(&service_client);
 
         auto kubelet = std::make_unique<kube32::kubelet::Kubelet>(kubelet_cfg, *wasm_runtime);
@@ -504,8 +507,9 @@ int main(int argc, char* argv[]) {
     node_proxy.set_node_token(opts.token);
     server->set_handler(&node_proxy);
 
-    // k32_http_call: Services resolved from the store
-    kube32::app::ServiceClient service_client(kube32::app::make_store_service_resolver(*store));
+    // k32_http_call: Services and NetworkPolicies read from the store
+    kube32::app::ServiceClient service_client(kube32::app::make_store_service_resolver(*store), kube32::app::ServiceClientOptions{},
+                                              kube32::app::make_store_egress_source(*store));
     kube32::app::install_service_client(&service_client);
 
     if (!server->start()) {

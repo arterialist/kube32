@@ -368,6 +368,58 @@ static std::string_view pod_key_view(std::string_view ns, std::string_view name,
     return std::string_view(buf, ns.size() + 1 + name.size());
 }
 
+// A pod's labels as listed, hashed (FNV-1a): their JSON text when the client
+// read the fields in place, the parsed map otherwise
+static uint32_t labels_hash(const PodListEntry& e) {
+    uint32_t h = 2166136261u;
+    auto add = [&h](std::string_view s) {
+        for (unsigned char c : s) { h ^= c; h *= 16777619u; }
+        h ^= 0xFF;
+        h *= 16777619u;
+    };
+    if (e.pod) {
+        for (const auto& kv : e.pod->labels) { add(kv.first); add(kv.second); }
+    } else {
+        add(e.labels);
+    }
+    return h;
+}
+
+static net::LabelMap labels_from(const PodListEntry& e) {
+    net::LabelMap out;
+    if (e.pod) {
+        for (const auto& kv : e.pod->labels) out.emplace_back(kv.first, kv.second);
+        return out;
+    }
+    models::JsonValue doc;
+    std::string err;
+    if (e.labels.empty() || !models::parse_json(e.labels, doc, err) || !doc.is_object()) return out;
+    for (const auto& kv : doc.obj_val) {
+        if (kv.second.is_string()) out.emplace_back(kv.first, kv.second.str_val);
+    }
+    return out;
+}
+
+void Kubelet::refresh_network_policies(uint64_t now_ms) {
+    net::NodeNetworkPolicies& policies = *config_.network_policies;
+    const bool all = now_ms - last_policy_refresh_ms_ >= config_.network_policy_refresh_ms;
+    if (all) last_policy_refresh_ms_ = now_ms;
+    for (const std::string& ns : policies.namespaces(!all)) {
+        net::NamespacePolicies compiled;
+        const int status = api_client_->list_items("/apis/networking.k8s.io/v1/namespaces/" + ns + "/networkpolicies", [&](std::string&& item) {
+            models::JsonValue doc;
+            std::string err;
+            if (models::parse_json(item, doc, err) && doc.is_object()) compiled.push_back(net::compile_network_policy(doc));
+        });
+        // An API server without the kind has no policy to enforce
+        if (status == 200 || status == 404) {
+            policies.set_policies(ns, std::move(compiled));
+        } else if (all) {
+            std::cout << "[KUBELET] cannot list the network policies of namespace " << ns << " (http " << status << ")" << std::endl;
+        }
+    }
+}
+
 void Kubelet::sync_assigned_pods() {
     last_sync_ms_ = osal::System::get_uptime_ms();
     const uint32_t pass = ++sync_pass_;
@@ -383,15 +435,22 @@ void Kubelet::sync_assigned_pods() {
     std::vector<PodStart> starts;
     std::vector<std::pair<std::string, std::string>> terminating;   // (ns, name), deletionTimestamp set
     char key_buf[320];
+    net::NodeNetworkPolicies* policies = config_.network_policies.get();
     const bool listed = api_client_->for_each_node_pod([&](const PodListEntry& e) {
         if (e.node_name != config_.node_name) return;
+        const std::string_view key = pod_key_view(e.namespace_name, e.name, key_buf, sizeof(key_buf));
+        // The labels NetworkPolicy selects this pod by, parsed only when
+        // they changed
+        if (policies) {
+            const uint32_t hash = labels_hash(e);
+            if (!policies->pod_current(key, hash, pass)) policies->set_pod(key, hash, labels_from(e), pass);
+        }
         // Pods carrying a deletionTimestamp are to be stopped and then
         // finalized by us
         if (e.deleting) {
             terminating.emplace_back(std::string(e.namespace_name), std::string(e.name));
             return;
         }
-        const std::string_view key = pod_key_view(e.namespace_name, e.name, key_buf, sizeof(key_buf));
         bool start = false;
         {
             osal::LockGuard guard(state_mutex_);
@@ -426,6 +485,12 @@ void Kubelet::sync_assigned_pods() {
     });
     if (!listed) {
         return;
+    }
+    // Before any pod starts: a pod's calls are checked against the policies
+    // of its namespace from its first instruction
+    if (policies) {
+        policies->retain(pass);
+        refresh_network_policies(now_ms);
     }
 
     // Started in key order, as the API server lists them

@@ -1168,11 +1168,12 @@ void cluster_task(void* pv) {
         api_server->set_handler(node_proxy.get());
         if (!api_server->start()) ESP_LOGE(TAG, "API server failed to start");
 
-        // k32_http_call: Services resolved from the store
+        // k32_http_call: Services and NetworkPolicies read from the store
         static std::unique_ptr<kube32::app::ServiceClient> service_client;
         kube32::app::ServiceClientOptions sc_opts;
         sc_opts.pool_size = 4;
-        service_client = std::make_unique<kube32::app::ServiceClient>(kube32::app::make_store_service_resolver(*store), sc_opts);
+        service_client = std::make_unique<kube32::app::ServiceClient>(kube32::app::make_store_service_resolver(*store), sc_opts,
+                                                                      kube32::app::make_store_egress_source(*store));
         kube32::app::install_service_client(service_client.get());
         s_api_server = api_server.get();
         printf("[CONTROL-PLANE] API server http://%s:6443, scheduler + node lifecycle active\n", ip.c_str());
@@ -1246,14 +1247,19 @@ void cluster_task(void* pv) {
         pod_server = std::make_unique<kube32::app::PodServer>(po);
         if (pod_server->start()) kubelet_cfg.kubelet_port = po.port;
 
-        // k32_http_call: Services and their Endpoints read from the API server
+        // k32_http_call: Services and their Endpoints read from the API
+        // server; the kubelet keeps the NetworkPolicies of this node's
+        // namespaces with its pod sync
         static std::shared_ptr<kube32::kubelet::HttpKubeClient> svc_api;
         svc_api = std::make_shared<kube32::kubelet::HttpKubeClient>(api_host, 6443);
         if (s_api_token_set) svc_api->set_bearer_token(api_token);
         if (!ident.has_psram) svc_api->set_max_body(16 * 1024);
+        auto api_get = [](const std::string& path, std::string& body) { return svc_api->get(path, body); };
+        kubelet_cfg.network_policies = std::make_shared<kube32::net::NodeNetworkPolicies>();
         static std::unique_ptr<kube32::app::ServiceClient> service_client;
-        service_client = std::make_unique<kube32::app::ServiceClient>(kube32::app::make_api_service_resolver(
-            [](const std::string& path, std::string& body) { return svc_api->get(path, body); }));
+        service_client = std::make_unique<kube32::app::ServiceClient>(kube32::app::make_api_service_resolver(api_get),
+                                                                      kube32::app::ServiceClientOptions{},
+                                                                      kube32::app::make_node_egress_source(kubelet_cfg.network_policies, api_get));
         kube32::app::install_service_client(service_client.get());
 
         kubelet = std::make_unique<kube32::kubelet::Kubelet>(kubelet_cfg, *wasm_runtime);
