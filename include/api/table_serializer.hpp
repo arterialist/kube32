@@ -74,7 +74,8 @@ public:
     static std::string build_deployments_list_json(const std::vector<std::string>& deployment_jsons, uint64_t resource_version = 0);
 
     // Server-side Tables for the remaining kinds kubectl prints: Event,
-    // Namespace, Service, ConfigMap, Secret, Lease, Ingress. Columns follow kubectl's
+    // Namespace, Service, ConfigMap, Secret, Lease, Ingress, NetworkPolicy,
+    // Endpoints, EndpointSlice. Columns follow kubectl's
     // own printers; every cell is read from the stored object.
     static bool has_generic_table(std::string_view kind);
     static std::string build_generic_table_json(std::string_view kind, const std::vector<std::string>& jsons, uint64_t resource_version);

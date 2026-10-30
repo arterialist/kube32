@@ -75,6 +75,8 @@ enum class RouteCategory {
     DiscoveryApisNetworkingV1,
     IngressesCollection,
     IngressItem,
+    NetworkPoliciesCollection,
+    NetworkPolicyItem,
     // Computed from Services and their pods on every read (read-only)
     EndpointsCollection,
     EndpointsItem,

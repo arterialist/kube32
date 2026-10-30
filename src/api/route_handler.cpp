@@ -7,6 +7,7 @@
 #include "models/kube_models.hpp"
 #include "models/kube_lease.hpp"
 #include "models/tolerations.hpp"
+#include "net/network_policy.hpp"
 #include "runtime/pod_log.hpp"
 #include "api/protobuf_body.hpp"
 #include "osal/socket.hpp"
@@ -599,7 +600,7 @@ RouteMatch RouteHandler::match_route(std::string_view path) {
         return match;
     }
 
-    // 7. networking.k8s.io Ingresses
+    // 7. networking.k8s.io Ingresses and NetworkPolicies
     if (path == "/apis/networking.k8s.io") {
         match.category = RouteCategory::DiscoveryApisNetworkingGroup;
         return match;
@@ -610,6 +611,11 @@ RouteMatch RouteHandler::match_route(std::string_view path) {
     }
     if (path == "/apis/networking.k8s.io/v1/ingresses") {
         match.category = RouteCategory::IngressesCollection;
+        match.api_group = "networking.k8s.io";
+        return match;
+    }
+    if (path == "/apis/networking.k8s.io/v1/networkpolicies") {
+        match.category = RouteCategory::NetworkPoliciesCollection;
         match.api_group = "networking.k8s.io";
         return match;
     }
@@ -625,6 +631,12 @@ RouteMatch RouteHandler::match_route(std::string_view path) {
             if (rest.rfind("ingresses/", 0) == 0 && rest.find('/', 10) == std::string_view::npos && rest.size() > 10) {
                 match.category = RouteCategory::IngressItem;
                 match.resource_name = rest.substr(10);
+                return match;
+            }
+            if (rest == "networkpolicies") { match.category = RouteCategory::NetworkPoliciesCollection; return match; }
+            if (rest.rfind("networkpolicies/", 0) == 0 && rest.find('/', 16) == std::string_view::npos && rest.size() > 16) {
+                match.category = RouteCategory::NetworkPolicyItem;
+                match.resource_name = rest.substr(16);
                 return match;
             }
         }
@@ -905,7 +917,9 @@ HttpResponse RouteHandler::dispatch(const HttpRequest& req, const RouteMatch& ma
         case RouteCategory::ServicesNsCollection:
         case RouteCategory::ServiceItem:
         case RouteCategory::IngressesCollection:
-        case RouteCategory::IngressItem: {
+        case RouteCategory::IngressItem:
+        case RouteCategory::NetworkPoliciesCollection:
+        case RouteCategory::NetworkPolicyItem: {
             ResourceInfo info;
             resource_info(match.category, info);
             return handle_generic(req, match, info);
@@ -1093,7 +1107,9 @@ HttpResponse RouteHandler::handle_discovery(const HttpRequest& req, RouteCategor
         case RouteCategory::DiscoveryApisNetworkingV1:
             resp.body = "{\"kind\":\"APIResourceList\",\"apiVersion\":\"v1\",\"groupVersion\":\"networking.k8s.io/v1\",\"resources\":["
                         "{\"name\":\"ingresses\",\"singularName\":\"ingress\",\"namespaced\":true,\"kind\":\"Ingress\","
-                        "\"verbs\":[\"get\",\"list\",\"watch\",\"create\",\"update\",\"patch\",\"delete\"],\"shortNames\":[\"ing\"]}"
+                        "\"verbs\":[\"get\",\"list\",\"watch\",\"create\",\"update\",\"patch\",\"delete\"],\"shortNames\":[\"ing\"]},"
+                        "{\"name\":\"networkpolicies\",\"singularName\":\"networkpolicy\",\"namespaced\":true,\"kind\":\"NetworkPolicy\","
+                        "\"verbs\":[\"get\",\"list\",\"watch\",\"create\",\"update\",\"patch\",\"delete\"],\"shortNames\":[\"netpol\"]}"
                         "]}";
             break;
 
@@ -2141,6 +2157,8 @@ bool RouteHandler::resource_info(RouteCategory c, ResourceInfo& out) {
             out = {"Secret", "v1", "SecretList", "secrets", "/registry/secrets/", true}; return true;
         case RouteCategory::IngressesCollection: case RouteCategory::IngressItem:
             out = {"Ingress", "networking.k8s.io/v1", "IngressList", "ingresses", "/registry/ingresses/", true}; return true;
+        case RouteCategory::NetworkPoliciesCollection: case RouteCategory::NetworkPolicyItem:
+            out = {"NetworkPolicy", "networking.k8s.io/v1", "NetworkPolicyList", "networkpolicies", "/registry/networkpolicies/", true}; return true;
         default:
             return false;
     }
@@ -2166,6 +2184,7 @@ std::string RouteHandler::openapi_v3_document(const std::string& path) const {
         {"apis/batch/v1", "batch", "v1", "Job", "jobs", true},
         {"apis/coordination.k8s.io/v1", "coordination.k8s.io", "v1", "Lease", "leases", true},
         {"apis/networking.k8s.io/v1", "networking.k8s.io", "v1", "Ingress", "ingresses", true},
+        {"apis/networking.k8s.io/v1", "networking.k8s.io", "v1", "NetworkPolicy", "networkpolicies", true},
     };
     if (path == "/openapi/v3") {
         std::string out = "{\"paths\":{";
@@ -2430,7 +2449,7 @@ HttpResponse RouteHandler::handle_watch(const HttpRequest& req, const RouteMatch
 
 // =============================================================================
 // Generic store-backed resources: namespaces, configmaps, secrets, services,
-// ingresses, daemonsets, jobs
+// ingresses, networkpolicies, daemonsets, jobs
 // =============================================================================
 // Pod templates of Jobs need restartPolicy Never or OnFailure, those of
 // DaemonSets Always (or none), as kube-apiserver validates them.
@@ -2491,7 +2510,8 @@ HttpResponse RouteHandler::handle_generic(const HttpRequest& req, const RouteMat
                           match.category == RouteCategory::DaemonSetItem ||
                           match.category == RouteCategory::JobItem ||
                           match.category == RouteCategory::ServiceItem ||
-                          match.category == RouteCategory::IngressItem);
+                          match.category == RouteCategory::IngressItem ||
+                          match.category == RouteCategory::NetworkPolicyItem);
     std::string ns(match.namespace_name);
     std::string root = info.root;
     std::string prefix = root;
@@ -2526,6 +2546,13 @@ HttpResponse RouteHandler::handle_generic(const HttpRequest& req, const RouteMat
             }
             stamp_new_object(doc, ns, info);
             if (match.category == RouteCategory::ServicesNsCollection) default_service(doc);
+            if (match.category == RouteCategory::NetworkPoliciesCollection) {
+                std::string why;
+                if (!net::validate_network_policy(doc, why)) {
+                    return make_status(422, "Invalid", "NetworkPolicy.networking.k8s.io \"" + name + "\" is invalid: " + why);
+                }
+                net::default_network_policy(doc);
+            }
             if (match.category == RouteCategory::NamespacesCollection && !doc.get("status")) {
                 models::JsonValue st;
                 st.type = models::JsonType::Object;
@@ -2585,6 +2612,13 @@ HttpResponse RouteHandler::handle_generic(const HttpRequest& req, const RouteMat
             carry_server_fields(old_doc, target, true);
         }
         if (match.category == RouteCategory::ServiceItem) default_service(target);
+        if (match.category == RouteCategory::NetworkPolicyItem) {
+            std::string why;
+            if (!net::validate_network_policy(target, why)) {
+                return make_status(422, "Invalid", "NetworkPolicy.networking.k8s.io \"" + name + "\" is invalid: " + why);
+            }
+            net::default_network_policy(target);
+        }
         std::string updated = target.to_string();
         if (storage::Status ps = store_.put(key, updated, true); !ps.ok()) return store_failure(ps, plural, name);
         HttpResponse resp;

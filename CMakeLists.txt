@@ -114,6 +114,7 @@ else()
         src/models/tolerations.cpp
         src/net/network_manager.cpp
         src/net/mdns_discovery.cpp
+        src/net/network_policy.cpp
         src/controller/node_lifecycle_controller.cpp
         src/controller/deployment_controller.cpp
         src/controller/workload_controller.cpp

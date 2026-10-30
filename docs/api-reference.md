@@ -51,6 +51,7 @@ Discovery endpoints accept `GET` and `HEAD`.
 | `batch/v1` | Job | `job` | get, list, watch, create, update, patch, delete | Template `restartPolicy` must be `Never` or `OnFailure`, 422 otherwise |
 | `coordination.k8s.io/v1` | Lease | | get, list, watch, create, update, patch, delete | Kept in RAM for node heartbeats with duration `max(15 s, 3 * heartbeat)`. `POST` and `PUT` upsert. When a lease expires, the node is marked `Ready=Unknown` (`NodeStatusUnknown`) with `node.kubernetes.io/unreachable:NoSchedule`; after the eviction timeout (30 s by default) `node.kubernetes.io/unreachable:NoExecute` is added and pods are unbound and rescheduled once their matching `tolerationSeconds` elapses |
 | `networking.k8s.io/v1` | Ingress | `ing` | get, list, watch, create, update, patch, delete | Routes HTTP traffic on port 80 |
+| `networking.k8s.io/v1` | NetworkPolicy | `netpol` | get, list, watch, create, update, patch, delete | Validated and defaulted as by kube-apiserver. Egress rules restrict `k32_http_call` on the calling pod's node ([NetworkPolicy](networking.md#networkpolicy)); ingress rules are stored and not enforced |
 | `discovery.k8s.io/v1` | EndpointSlice | | get, list | Read-only. Computed on read from Services and their pods |
 | `metrics.k8s.io/v1beta1` | NodeMetrics, PodMetrics | | get, list | Kubelet samples, up to 32 pods with a 30 s TTL |
 | `authorization.k8s.io/v1` | SelfSubjectAccessReview, SelfSubjectRulesReview | | create | Always returns allowed |

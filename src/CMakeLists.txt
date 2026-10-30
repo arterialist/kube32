@@ -56,6 +56,7 @@ set(KUBE32_APP_SRCS
     models/tolerations.cpp
     net/mdns_discovery.cpp
     net/network_manager.cpp
+    net/network_policy.cpp
     osal/condition_variable_posix.cpp
     osal/mutex_posix.cpp
     osal/socket_posix.cpp
@@ -152,5 +153,6 @@ set_source_files_properties(
     ${CMAKE_CURRENT_LIST_DIR}/api/node_proxy.cpp
     ${CMAKE_CURRENT_LIST_DIR}/api/protobuf_body.cpp
     ${CMAKE_CURRENT_LIST_DIR}/app/service_client.cpp
+    ${CMAKE_CURRENT_LIST_DIR}/net/network_policy.cpp
     ${CMAKE_CURRENT_LIST_DIR}/runtime/pod_assets.cpp
     PROPERTIES COMPILE_OPTIONS "-Os")

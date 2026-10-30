@@ -4,6 +4,7 @@
 #include <cstdio>
 #include <cstring>
 #include <cctype>
+#include <algorithm>
 #include <sstream>
 
 namespace kube32::api {
@@ -509,7 +510,7 @@ std::string TableSerializer::build_deployments_list_json(const std::vector<std::
 
 
 // =============================================================================
-// Generic Tables (Event, Namespace, Service, ConfigMap, Secret, Lease, Ingress)
+// Generic Tables (Event, Namespace, Service, ConfigMap, Secret, Lease, Ingress, NetworkPolicy)
 // =============================================================================
 std::string TableSerializer::format_age(uint64_t duration_sec) {
     char buf[16];
@@ -539,9 +540,41 @@ static std::string col(const char* name, int priority) {
     return std::string("{\"name\":\"") + name + "\",\"type\":\"string\",\"priority\":" + std::to_string(priority) + "}";
 }
 
+// A LabelSelector as kubectl prints it (metav1.FormatLabelSelector):
+// requirements sorted by key, "k=v", "k in (a,b)", "k notin (a,b)", "k", "!k"
+static std::string format_label_selector(const models::JsonValue* sel) {
+    std::vector<std::pair<std::string, std::string>> parts;
+    if (sel && sel->is_object()) {
+        if (const models::JsonValue* ml = sel->get("matchLabels"); ml && ml->is_object()) {
+            for (const auto& kv : ml->obj_val) parts.emplace_back(kv.first, kv.first + "=" + (kv.second.is_string() ? kv.second.str_val : ""));
+        }
+        if (const models::JsonValue* me = sel->get("matchExpressions"); me && me->is_array()) {
+            for (const auto& e : me->arr_val) {
+                const std::string key = e.get_string("key", "");
+                const std::string op = e.get_string("operator", "");
+                std::vector<std::string> values;
+                if (const models::JsonValue* v = e.get("values"); v && v->is_array()) {
+                    for (const auto& s : v->arr_val) if (s.is_string()) values.push_back(s.str_val);
+                }
+                std::sort(values.begin(), values.end());
+                std::string list;
+                for (const auto& v : values) list += (list.empty() ? "" : ",") + v;
+                if (op == "In") parts.emplace_back(key, key + " in (" + list + ")");
+                else if (op == "NotIn") parts.emplace_back(key, key + " notin (" + list + ")");
+                else if (op == "Exists") parts.emplace_back(key, key);
+                else if (op == "DoesNotExist") parts.emplace_back(key, "!" + key);
+            }
+        }
+    }
+    std::stable_sort(parts.begin(), parts.end(), [](const auto& a, const auto& b) { return a.first < b.first; });
+    std::string out;
+    for (const auto& p : parts) out += (out.empty() ? "" : ",") + p.second;
+    return out.empty() ? "<none>" : out;
+}
+
 bool TableSerializer::has_generic_table(std::string_view kind) {
     return kind == "Event" || kind == "Namespace" || kind == "Service" || kind == "ConfigMap" || kind == "Secret" || kind == "Lease" ||
-           kind == "Ingress" || kind == "Endpoints" || kind == "EndpointSlice";
+           kind == "Ingress" || kind == "NetworkPolicy" || kind == "Endpoints" || kind == "EndpointSlice";
 }
 
 std::string TableSerializer::build_generic_table_json(std::string_view kind, const std::vector<std::string>& jsons, uint64_t resource_version) {
@@ -565,6 +598,8 @@ std::string TableSerializer::build_generic_table_json(std::string_view kind, con
     } else if (kind == "Ingress") {
         out += col("NAME", 0) + "," + col("CLASS", 0) + "," + col("HOSTS", 0) + "," + col("ADDRESS", 0) + "," +
                col("PORTS", 0) + "," + col("AGE", 0);
+    } else if (kind == "NetworkPolicy") {
+        out += col("NAME", 0) + "," + col("POD-SELECTOR", 0) + "," + col("AGE", 0);
     } else if (kind == "Endpoints") {
         out += col("NAME", 0) + "," + col("ENDPOINTS", 0) + "," + col("AGE", 0);
     } else if (kind == "EndpointSlice") {
@@ -676,6 +711,9 @@ std::string TableSerializer::build_generic_table_json(std::string_view kind, con
                 }
             }
             cells = {name, cls.empty() ? "<none>" : cls, hosts.empty() ? "*" : hosts, address, tls ? "80, 443" : "80", age};
+        } else if (kind == "NetworkPolicy") {
+            const models::JsonValue* spec = doc.get("spec");
+            cells = {name, format_label_selector(spec ? spec->get("podSelector") : nullptr), age};
         } else if (kind == "Endpoints" || kind == "EndpointSlice") {
             // kubectl's printers: the first three endpoints, then "+ N more..."
             std::vector<std::string> eps;
