@@ -213,9 +213,12 @@ bool ContainerLifecycleController::deploy(const uint8_t* wasm_bytes, size_t len)
 
     // wasm3 keeps pointers into the binary for the lifetime of the module, so
     // the bytes must stay valid. Images embedded in flash are memory mapped and
-    // are used in place; anything else (manifest-inline images) is copied.
+    // are used in place; anything else (manifest-inline images) is copied. The
+    // S3 maps flash and PSRAM into one data address range: a buffer in PSRAM
+    // is not flash, and the pod's own copy is kept wherever it lives.
+    const bool own_copy = !wasm_bytecode_.empty() && wasm_bytes == wasm_bytecode_.data();
 #if defined(ESP_PLATFORM)
-    if (esp_ptr_in_drom(wasm_bytes)) {
+    if (!own_copy && esp_ptr_in_drom(wasm_bytes) && !esp_ptr_external_ram(wasm_bytes)) {
         wasm_bytecode_.clear();
         wasm_bytecode_.shrink_to_fit();
         wasm_view_ = wasm_bytes;
@@ -223,7 +226,7 @@ bool ContainerLifecycleController::deploy(const uint8_t* wasm_bytes, size_t len)
     } else
 #endif
     {
-        if (wasm_bytes != wasm_bytecode_.data()) wasm_bytecode_.assign(wasm_bytes, wasm_bytes + len);   // restart reuses the copy
+        if (!own_copy) wasm_bytecode_.assign(wasm_bytes, wasm_bytes + len);   // restart reuses the copy
         wasm_view_ = wasm_bytecode_.data();
         wasm_view_len_ = wasm_bytecode_.size();
     }

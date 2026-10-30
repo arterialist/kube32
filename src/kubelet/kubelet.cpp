@@ -904,6 +904,14 @@ bool Kubelet::deploy_and_start_pod(const models::KubePod& pod_in, const std::str
                     image_bytes = inline_bytes.data();
                     image_len = inline_bytes.size();
                     image_source = "inline annotation";
+                    uint32_t crc = 0xFFFFFFFFu;
+                    for (uint8_t b : inline_bytes) {
+                        crc ^= b;
+                        for (int k = 0; k < 8; ++k) crc = (crc >> 1) ^ (0xEDB88320u & (0u - (crc & 1u)));
+                    }
+                    char crc_hex[12];
+                    snprintf(crc_hex, sizeof(crc_hex), "%08x", static_cast<unsigned>(~crc));
+                    std::cout << "[KUBELET] " << pod_key << ": inline image, " << image_len << " bytes, crc32 " << crc_hex << std::endl;
                 } else if (!why.empty()) {
                     std::cout << "[KUBELET] " << pod_key << ": inline image: " << why << std::endl;
                     image_error = why;
