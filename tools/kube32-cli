@@ -9,6 +9,9 @@ kube32-cli: build, check, deploy and ship WebAssembly pods for Kube32.
     kube32-cli sd-push <file.wasm>   copy the module onto a microSD card as kube32/images/<name>.wasm
                                      (a mounted card with --to, or a node's card over the network with --node)
     kube32-cli push    <file|dir>    upload a file or directory tree to a node's storage (kube32/<path>) through the API server
+    kube32-cli firmware push <firmware.bin>   stage a firmware image on the control plane
+    kube32-cli firmware rollout              update every node to the staged image, one at a time
+    kube32-cli firmware status|abort|info    the rollout and each node's firmware; stop a rollout; read an image file
 
 The ABI it checks against is include/runtime/k32_app_abi.h; the import
 signatures are the m3_LinkRawFunction calls in src/runtime/app_pod.cpp and
@@ -21,7 +24,8 @@ Exit codes:
     2  usage error (bad arguments)
     3  the module does not satisfy the ABI (check failed)
     4  kubectl failed
-    5  deploy: the pod already exists and --replace was not given
+    5  deploy: the pod already exists and --replace was not given; firmware rollout: one is in progress
+    6  firmware rollout: the rollout failed or did not finish in time
 """
 import argparse
 import base64
@@ -45,6 +49,7 @@ EXIT_USAGE = 2
 EXIT_CHECK = 3
 EXIT_KUBECTL = 4
 EXIT_EXISTS = 5
+EXIT_ROLLOUT = 6
 
 TOOLS_DIR = os.path.dirname(os.path.abspath(__file__))
 REPO_ROOT = os.path.dirname(TOOLS_DIR)
@@ -1533,12 +1538,319 @@ def cmd_sd_push(args):
 
 
 # ---------------------------------------------------------------------------
+# firmware: stage an image on the control plane and roll it out
+# ---------------------------------------------------------------------------
+FIRMWARE_PATH = "/apis/kube32.io/v1/firmware"
+ROLLOUTS_PATH = "/apis/kube32.io/v1/firmwarerollouts"
+ROLLOUT_NAME = "firmware"
+ESP_IMAGE_MAGIC = 0xE9
+VERSION_MARKER = b"kube32-version:"    # src/api/version_info.cpp
+
+
+class ApiError(Exception):
+    pass
+
+
+def firmware_image_info(data):
+    """(version, sha256 hex) of a firmware file, or raise ValueError: an ESP32
+    image whose last 32 bytes are the SHA-256 of the rest, as esptool writes it."""
+    if len(data) < 64 or data[0] != ESP_IMAGE_MAGIC:
+        raise ValueError("not an ESP32 firmware image (first byte 0x%02x, expected 0xe9)" % (data[0] if data else 0))
+    if hashlib.sha256(data[:-32]).digest() != data[-32:]:
+        raise ValueError("the image does not end with its own SHA-256 (a truncated or modified file?)")
+    version = ""
+    at = data.find(VERSION_MARKER)
+    if at >= 0:
+        end = data.find(b"\0", at, at + len(VERSION_MARKER) + 33)
+        if end > 0:
+            version = data[at + len(VERSION_MARKER):end].decode("ascii", "replace")
+    return version, hashlib.sha256(data).hexdigest()
+
+
+def api_call(args, verb, path, body=None):
+    """kubectl <verb> --raw <path> (kubeconfig credentials apply). Returns the
+    parsed JSON answer, None for an empty one; raises ApiError."""
+    base = kubectl_base(args)
+    if not shutil.which(base[0]):
+        raise ApiError("%s not found in PATH" % base[0])
+    cmd = base + [verb, "--raw", path]
+    tmp = None
+    if body is not None:
+        with tempfile.NamedTemporaryFile(prefix="kube32-fw-", delete=False) as f:
+            f.write(body)
+            tmp = f.name
+        cmd += ["-f", tmp]
+    try:
+        proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    finally:
+        if tmp:
+            os.unlink(tmp)
+    if proc.returncode != 0:
+        msg = (proc.stderr or proc.stdout).decode("utf-8", "replace").strip()
+        raise ApiError(msg or "kubectl exit %d" % proc.returncode)
+    out = proc.stdout.decode("utf-8", "replace").strip()
+    if not out:
+        return None
+    try:
+        return json.loads(out)
+    except ValueError:
+        raise ApiError("unexpected answer: %s" % out[:200])
+
+
+def staged_status(args):
+    return (api_call(args, "get", FIRMWARE_PATH) or {}).get("status", {})
+
+
+def short(sha):
+    return (sha or "")[:12] or "-"
+
+
+def cmd_firmware_push(args):
+    try:
+        with open(args.file, "rb") as f:
+            data = f.read()
+    except OSError as e:
+        return err_exit("cannot read %s: %s" % (args.file, e.strerror or e), EXIT_INPUT)
+    try:
+        version, sha = firmware_image_info(data)
+    except ValueError as e:
+        return err_exit("%s: %s" % (args.file, e), EXIT_INPUT)
+    try:
+        chunk = parse_quantity(args.chunk)
+    except ValueError as e:
+        return err_exit(str(e), EXIT_USAGE)
+    if chunk < 1024:
+        return err_exit("--chunk must be at least 1Ki", EXIT_USAGE)
+    print("image %s: %s bytes, version %s, sha256 %s" % (args.file, fmt_bytes(len(data)), version or "unknown", sha))
+    try:
+        st = staged_status(args)
+    except ApiError as e:
+        return err_exit("cannot read the staged image: %s" % e, EXIT_KUBECTL)
+    slot = int(st.get("slotSize", 0))
+    if slot and len(data) > slot:
+        return err_exit("the image is %s bytes, the control plane's update slot %s" % (fmt_bytes(len(data)), fmt_bytes(slot)), EXIT_INPUT)
+    if st.get("phase") == "Staged" and st.get("sha256") == sha:
+        print("already staged in %s" % st.get("slot", "?"))
+        return EXIT_OK
+    offset = 0
+    if st.get("phase") == "Receiving" and st.get("sha256") == sha and int(st.get("size", 0)) == len(data):
+        offset = int(st.get("received", 0))
+        print("resuming at byte %s" % fmt_bytes(offset))
+    t0 = time.time()
+    sent = 0
+    retries = 0
+    shown = -1
+    while True:
+        n = min(chunk, len(data) - offset)
+        path = "%s/image?offset=%d&size=%d&sha256=%s" % (FIRMWARE_PATH, offset, len(data), sha)
+        try:
+            st = (api_call(args, "replace", path, data[offset:offset + n]) or {}).get("status", {})
+            retries = 0
+        except ApiError as e:
+            # The connection broke or the range was refused: continue where
+            # the control plane says the upload stands
+            retries += 1
+            if retries > args.retries:
+                return err_exit("upload failed at byte %s: %s" % (fmt_bytes(offset), e), EXIT_KUBECTL)
+            print("range at byte %s failed (%s), retrying" % (fmt_bytes(offset), str(e).splitlines()[-1][:120]), file=sys.stderr)
+            time.sleep(min(2 * retries, 10))
+            try:
+                st = staged_status(args)
+            except ApiError:
+                continue
+            if st.get("phase") == "Failed":
+                return err_exit("the control plane refused the image: %s" % st.get("message", ""), EXIT_KUBECTL)
+            if st.get("phase") == "Receiving" and st.get("sha256") == sha:
+                offset = int(st.get("received", 0))
+            elif st.get("phase") == "Staged" and st.get("sha256") == sha:
+                break
+            else:
+                offset = 0
+            continue
+        sent += n
+        offset = int(st.get("received", offset + n))
+        if st.get("phase") == "Staged":
+            break
+        if st.get("phase") != "Receiving":
+            return err_exit("the control plane answered phase %s: %s" % (st.get("phase"), st.get("message", "")), EXIT_KUBECTL)
+        if offset * 10 // len(data) != shown:
+            shown = offset * 10 // len(data)
+            took = max(time.time() - t0, 0.001)
+            print("  %s / %s bytes  %.1f KiB/s" % (fmt_bytes(offset), fmt_bytes(len(data)), sent / 1024.0 / took), flush=True)
+    took = max(time.time() - t0, 0.001)
+    print("staged %s (%s) in %s on the control plane: %s bytes in %.0f s" %
+          (st.get("version") or version or "image", short(sha), st.get("slot", "?"), fmt_bytes(len(data)), took))
+    print("next: kube32-cli firmware rollout")
+    return EXIT_OK
+
+
+def get_rollout(args):
+    try:
+        return api_call(args, "get", "%s/%s" % (ROLLOUTS_PATH, ROLLOUT_NAME))
+    except ApiError as e:
+        if "NotFound" in str(e) or "not found" in str(e):
+            return None
+        raise
+
+
+def node_rows(args):
+    nodes = (api_call(args, "get", "/api/v1/nodes") or {}).get("items", [])
+    rows = []
+    for n in nodes:
+        meta = n.get("metadata", {})
+        ann = meta.get("annotations", {}) or {}
+        labels = meta.get("labels", {}) or {}
+        cond = {}
+        for c in (n.get("status", {}) or {}).get("conditions", []) or []:
+            if c.get("type") == "FirmwareUpdate":
+                cond = c
+        rows.append({
+            "name": meta.get("name", ""),
+            "role": "control-plane" if "node-role.kubernetes.io/control-plane" in labels else "worker",
+            "version": ann.get("kube32.io/firmware-version", "-"),
+            "sha256": ann.get("kube32.io/firmware-sha256", ""),
+            "slot": ann.get("kube32.io/firmware-slot", "-"),
+            "state": ann.get("kube32.io/firmware-state", "-"),
+            "target": ann.get("kube32.io/firmware", ""),
+            "failed": ann.get("kube32.io/firmware-failed", ""),
+            "update": ("%s: %s" % (cond.get("reason", ""), cond.get("message", ""))) if cond else "-",
+        })
+    rows.sort(key=lambda r: (r["role"] == "control-plane", r["name"]))
+    return rows
+
+
+def print_table(rows, columns):
+    widths = [max(len(title), *(len(str(r[key])) for r in rows)) if rows else len(title) for title, key in columns]
+    print("  ".join(title.ljust(w) for (title, _), w in zip(columns, widths)).rstrip())
+    for r in rows:
+        print("  ".join(str(r[key]).ljust(w) for (_, key), w in zip(columns, widths)).rstrip())
+
+
+def print_firmware_status(args, staged=True):
+    if staged:
+        st = staged_status(args)
+        line = "staged:  %s" % st.get("phase", "?")
+        if st.get("sha256"):
+            line += "  %s (%s)  %s/%s bytes  slot %s" % (st.get("version") or "-", short(st.get("sha256")), fmt_bytes(int(st.get("received", 0))),
+                                                         fmt_bytes(int(st.get("size", 0))), st.get("slot", "?"))
+        if st.get("message"):
+            line += "  %s" % st["message"]
+        print(line)
+    ro = get_rollout(args)
+    if ro:
+        rs = ro.get("status", {}) or {}
+        print("rollout: %s  %s (%s)  %s/%s nodes%s  %s" % (rs.get("phase", "Pending"), rs.get("version") or "-", short(ro.get("spec", {}).get("sha256")),
+                                                         rs.get("updatedNodes", 0), rs.get("totalNodes", 0),
+                                                         ("  node " + rs["node"]) if rs.get("node") else "", rs.get("message", "")))
+    else:
+        print("rollout: none")
+    rows = node_rows(args)
+    for r in rows:
+        r["sha256"] = short(r["sha256"])
+        r["target"] = short(r["target"])
+    print_table(rows, [("NODE", "name"), ("ROLE", "role"), ("VERSION", "version"), ("IMAGE", "sha256"), ("SLOT", "slot"),
+                       ("STATE", "state"), ("TARGET", "target"), ("UPDATE", "update")])
+    return ro
+
+
+def cmd_firmware_status(args):
+    try:
+        print_firmware_status(args)
+    except ApiError as e:
+        return err_exit(str(e), EXIT_KUBECTL)
+    return EXIT_OK
+
+
+def cmd_firmware_rollout(args):
+    try:
+        st = staged_status(args)
+        if st.get("phase") != "Staged":
+            return err_exit("no image is staged (phase %s): kube32-cli firmware push <firmware.bin> first" % st.get("phase", "?"), EXIT_INPUT)
+        sha = st["sha256"]
+        if args.sha256 and args.sha256.lower() != sha:
+            return err_exit("the staged image is %s, not %s" % (sha, args.sha256), EXIT_INPUT)
+        ro = get_rollout(args)
+        if ro:
+            phase = (ro.get("status") or {}).get("phase", "")
+            if phase not in ("Complete", "Failed"):
+                return err_exit("rollout %s is in progress (kube32-cli firmware status; kube32-cli firmware abort stops it)" % ROLLOUT_NAME,
+                                EXIT_EXISTS)
+            api_call(args, "delete", "%s/%s" % (ROLLOUTS_PATH, ROLLOUT_NAME))
+        spec = {"sha256": sha}
+        if args.node_timeout:
+            spec["nodeTimeoutSeconds"] = args.node_timeout
+        manifest = {"apiVersion": "kube32.io/v1", "kind": "FirmwareRollout", "metadata": {"name": ROLLOUT_NAME}, "spec": spec}
+        api_call(args, "create", ROLLOUTS_PATH, json.dumps(manifest).encode())
+    except ApiError as e:
+        return err_exit(str(e), EXIT_KUBECTL)
+    print("rolling out %s (%s): workers one at a time, then the control plane" % (st.get("version") or "image", short(sha)))
+    if args.no_wait:
+        print("follow it with: kube32-cli firmware status, kubectl get firmwarerollouts, kubectl get events")
+        return EXIT_OK
+    # The control plane restarts last: the API is away for a while then
+    last = None
+    deadline = time.time() + args.timeout
+    while time.time() < deadline:
+        time.sleep(args.interval)
+        try:
+            ro = get_rollout(args)
+        except ApiError:
+            if last != "unreachable":
+                print("  the API server does not answer (the control plane restarts into the image?), waiting")
+                last = "unreachable"
+            continue
+        rs = (ro or {}).get("status", {}) or {}
+        phase = rs.get("phase", "Pending")
+        line = "  %s %s/%s nodes  %s" % (phase, rs.get("updatedNodes", 0), rs.get("totalNodes", 0), rs.get("message", ""))
+        if line != last:
+            print(line, flush=True)
+            last = line
+        if not ro:
+            return err_exit("the rollout was deleted", EXIT_KUBECTL)
+        if phase == "Complete":
+            try:
+                print_firmware_status(args, staged=False)
+            except ApiError:
+                pass
+            return EXIT_OK
+        if phase == "Failed":
+            return err_exit("rollout failed: %s" % rs.get("message", ""), EXIT_ROLLOUT)
+    return err_exit("the rollout did not finish within %d s (kube32-cli firmware status)" % args.timeout, EXIT_ROLLOUT)
+
+
+def cmd_firmware_abort(args):
+    try:
+        if not get_rollout(args):
+            print("no rollout")
+            return EXIT_OK
+        api_call(args, "delete", "%s/%s" % (ROLLOUTS_PATH, ROLLOUT_NAME))
+    except ApiError as e:
+        return err_exit(str(e), EXIT_KUBECTL)
+    print("rollout deleted: nodes that have not switched yet keep their firmware")
+    return EXIT_OK
+
+
+def cmd_firmware_info(args):
+    try:
+        with open(args.file, "rb") as f:
+            data = f.read()
+        version, sha = firmware_image_info(data)
+    except OSError as e:
+        return err_exit("cannot read %s: %s" % (args.file, e.strerror or e), EXIT_INPUT)
+    except ValueError as e:
+        return err_exit("%s: %s" % (args.file, e), EXIT_INPUT)
+    print("version: %s\nsha256:  %s\nsize:    %s bytes" % (version or "unknown", sha, fmt_bytes(len(data))))
+    return EXIT_OK
+
+
+# ---------------------------------------------------------------------------
 # main
 # ---------------------------------------------------------------------------
 def build_parser():
     p = argparse.ArgumentParser(prog="kube32-cli", description="Build, check, deploy and ship Kube32 WebAssembly pods.",
                                 epilog="exit codes: 0 ok, 1 input/toolchain problem, 2 usage, 3 ABI check failed, 4 kubectl failed, "
-                                       "5 deploy: pod exists (pass --replace)")
+                                       "5 deploy: pod exists (pass --replace), firmware rollout: one is in progress, "
+                                       "6 firmware rollout failed")
     p.add_argument("--version", action="version", version="kube32-cli " + VERSION)
     sub = p.add_subparsers(dest="command")
 
@@ -1608,6 +1920,33 @@ def build_parser():
     u.add_argument("--path", help="destination below kube32/ (default: images/<file name>; for a directory, images/ is the parent of its contents)")
     kubectl_flags(u)
     u.set_defaults(func=cmd_push)
+
+    fw = sub.add_parser("firmware", help="stage a firmware image on the control plane and roll it out to every node")
+    fws = fw.add_subparsers(dest="firmware_command")
+    fp = fws.add_parser("push", help="upload firmware.bin into the control plane's update slot, in ranges (resumes an interrupted upload)")
+    fp.add_argument("file", help="the image, e.g. .pio/build/esp32s3/firmware.bin")
+    fp.add_argument("--chunk", default="48Ki", help="bytes per request (default 48Ki: fits the serial console gateway's 60 KiB request limit)")
+    fp.add_argument("--retries", type=int, default=5, help="failed requests in a row before giving up (default 5)")
+    kubectl_flags(fp)
+    fp.set_defaults(func=cmd_firmware_push)
+    fr = fws.add_parser("rollout", help="update every node to the staged image: workers one at a time, then the control plane")
+    fr.add_argument("--sha256", help="refuse unless this is the staged image")
+    fr.add_argument("--node-timeout", type=int, help="seconds a node has to switch to the image and confirm it (default 900)")
+    fr.add_argument("--no-wait", action="store_true", help="start the rollout and return")
+    fr.add_argument("--timeout", type=int, default=3600, help="seconds to wait for the rollout (default 3600)")
+    fr.add_argument("--interval", type=float, default=5.0, help="seconds between status reads while waiting (default 5)")
+    kubectl_flags(fr)
+    fr.set_defaults(func=cmd_firmware_rollout)
+    fs = fws.add_parser("status", help="the staged image, the rollout and each node's firmware")
+    kubectl_flags(fs)
+    fs.set_defaults(func=cmd_firmware_status)
+    fa = fws.add_parser("abort", help="delete the rollout: nodes that have not switched yet keep their firmware")
+    kubectl_flags(fa)
+    fa.set_defaults(func=cmd_firmware_abort)
+    fi = fws.add_parser("info", help="the version and SHA-256 of a firmware file")
+    fi.add_argument("file")
+    fi.set_defaults(func=cmd_firmware_info)
+    fw.set_defaults(func=lambda args: (fw.print_help(), EXIT_USAGE)[1])
     return p
 
 

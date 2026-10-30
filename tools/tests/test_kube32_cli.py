@@ -908,5 +908,284 @@ class TestPush(TempDirCase):
         self.assertEqual(self.puts(), [{"put": "/api/v1/nodes/w1/proxy/storage/images/echo-v2.wasm", "size": os.path.getsize(ECHO)}])
 
 
+# ---------------------------------------------------------------------------
+# firmware
+# ---------------------------------------------------------------------------
+# A kubectl that answers the control plane's firmware API from a state file:
+# the staged image (bytes in <state>.img), the FirmwareRollout and the nodes
+FAKE_FIRMWARE_KUBECTL = textwrap.dedent('''\
+    #!/usr/bin/env python3
+    import hashlib, json, os, sys, urllib.parse
+    path_state = os.environ["FAKE_FW_STATE"]
+    st = json.load(open(path_state))
+    args = sys.argv[1:]
+    verb = [a for a in args if a in ("get", "create", "delete", "replace")][0]
+    raw = args[args.index("--raw") + 1]
+    body = open(args[args.index("-f") + 1], "rb").read() if "-f" in args else b""
+    with open(os.environ["FAKE_FW_LOG"], "a") as f:
+        f.write(json.dumps({"verb": verb, "path": raw, "size": len(body), "body": body.decode("latin-1") if verb == "create" else ""}) + "\\n")
+    url = urllib.parse.urlsplit(raw)
+    q = dict(urllib.parse.parse_qsl(url.query))
+    img_path = path_state + ".img"
+
+    def save():
+        json.dump(st, open(path_state, "w"))
+
+    def status():
+        return {"kind": "FirmwareImage", "status": st["staged"]}
+
+    def fail(msg):
+        sys.stderr.write(msg + "\\n")
+        save()
+        sys.exit(1)
+
+    if url.path == "/apis/kube32.io/v1/firmware" and verb == "get":
+        print(json.dumps(status()))
+    elif url.path == "/apis/kube32.io/v1/firmware/image" and verb == "replace":
+        s = st["staged"]
+        offset, size, sha = int(q["offset"]), int(q["size"]), q["sha256"]
+        if offset == 0:
+            open(img_path, "wb").close()
+            s.update({"phase": "Receiving", "sha256": sha, "size": size, "received": 0, "version": "", "message": ""})
+        elif s["phase"] != "Receiving" or s["sha256"] != sha or offset != s["received"]:
+            fail("Error from server (Conflict): the upload continues at offset %d" % s.get("received", 0))
+        if st.get("break_at") == offset:
+            # The connection breaks half way through the range
+            del st["break_at"]
+            body = body[:len(body) // 2]
+            with open(img_path, "ab") as f:
+                f.write(body)
+            s["received"] = offset + len(body)
+            fail("error: unexpected EOF")
+        with open(img_path, "ab") as f:
+            f.write(body)
+        s["received"] = offset + len(body)
+        if s["received"] == size:
+            data = open(img_path, "rb").read()
+            if hashlib.sha256(data).hexdigest() == sha:
+                s["phase"] = "Staged"
+                at = data.find(b"kube32-version:")
+                s["version"] = data[at + 15:data.find(b"\\0", at)].decode() if at >= 0 else ""
+            else:
+                s["phase"] = "Failed"
+                s["message"] = "the image's SHA-256 does not match"
+                fail("Error from server (Invalid): " + s["message"])
+        save()
+        print(json.dumps(status()))
+    elif url.path == "/apis/kube32.io/v1/firmwarerollouts/firmware":
+        if verb == "get":
+            if not st.get("rollout"):
+                fail('Error from server (NotFound): firmwarerollouts.kube32.io "firmware" not found')
+            ro = st["rollout"]
+            # Each read moves the rollout one step on
+            steps = st.get("steps", [])
+            if steps:
+                ro["status"] = steps.pop(0)
+            save()
+            print(json.dumps(ro))
+        elif verb == "delete":
+            st["rollout"] = None
+            save()
+            print("{}")
+    elif url.path == "/apis/kube32.io/v1/firmwarerollouts" and verb == "create":
+        st["rollout"] = json.loads(body)
+        save()
+        print(json.dumps(st["rollout"]))
+    elif url.path == "/api/v1/nodes" and verb == "get":
+        print(json.dumps({"items": st.get("nodes", [])}))
+    else:
+        fail("Error from server (NotFound): the server could not find the requested resource")
+''')
+
+
+def firmware_image(version, size=100000, seed=1):
+    """An image as esptool writes it: magic byte, the version marker, the
+    SHA-256 of the rest in the last 32 bytes."""
+    body = bytearray(hashlib.sha256(b"seed%d" % seed).digest() * (size // 32 + 1))[:size - 32]
+    body[0] = 0xE9
+    marker = b"kube32-version:" + version.encode() + b"\0"
+    body[4096:4096 + len(marker)] = marker
+    return bytes(body) + hashlib.sha256(bytes(body)).digest()
+
+
+def fw_node(name, sha, version, role="worker", target="", state="Confirmed", reason="UpToDate", message=""):
+    labels = {"node-role.kubernetes.io/" + role: ""}
+    ann = {"kube32.io/firmware-version": version, "kube32.io/firmware-sha256": sha, "kube32.io/firmware-slot": "ota_0",
+           "kube32.io/firmware-state": state}
+    if target:
+        ann["kube32.io/firmware"] = target
+    return {"metadata": {"name": name, "labels": labels, "annotations": ann},
+            "status": {"conditions": [{"type": "FirmwareUpdate", "status": "False", "reason": reason, "message": message}]}}
+
+
+class TestFirmware(TempDirCase):
+    def setUp(self):
+        super().setUp()
+        self.kubectl = self.write("kubectl", FAKE_FIRMWARE_KUBECTL)
+        os.chmod(self.kubectl, os.stat(self.kubectl).st_mode | stat.S_IXUSR)
+        self.state = os.path.join(self.tmp, "state.json")
+        self.log = os.path.join(self.tmp, "calls.jsonl")
+        self.set_state()
+
+    def set_state(self, **kw):
+        st = {"staged": {"phase": "Empty", "sha256": "", "size": 0, "received": 0, "version": "", "slot": "ota_1",
+                         "slotSize": 3407872, "message": ""}, "rollout": None}
+        st.update(kw)
+        with open(self.state, "w") as f:
+            json.dump(st, f)
+
+    def get_state(self):
+        with open(self.state) as f:
+            return json.load(f)
+
+    def fw(self, *args):
+        env = dict(os.environ, FAKE_FW_STATE=self.state, FAKE_FW_LOG=self.log)
+        return run_cli("firmware", *args, "--kubectl", self.kubectl, env=env)
+
+    def calls(self, verb=None):
+        if not os.path.isfile(self.log):
+            return []
+        with open(self.log) as f:
+            rows = [json.loads(line) for line in f]
+        return [r for r in rows if verb is None or r["verb"] == verb]
+
+    def test_image_info(self):
+        img = firmware_image("v1.2.3-4-gabcdef0")
+        p = self.write("fw.bin", img)
+        version, sha = cli.firmware_image_info(img)
+        self.assertEqual(version, "v1.2.3-4-gabcdef0")
+        self.assertEqual(sha, hashlib.sha256(img).hexdigest())
+        rc, out, _ = run_cli("firmware", "info", p)
+        self.assertEqual(rc, 0)
+        self.assertIn("version: v1.2.3-4-gabcdef0", out)
+        self.assertIn(sha, out)
+        # Not an image; an image whose appended SHA-256 does not match
+        with self.assertRaises(ValueError):
+            cli.firmware_image_info(b"\x00" * 100)
+        bad = bytearray(img)
+        bad[5000] ^= 1
+        rc, _, err = run_cli("firmware", "info", self.write("bad.bin", bytes(bad)))
+        self.assertEqual(rc, 1)
+        self.assertIn("does not end with its own SHA-256", err)
+
+    def test_push_in_ranges(self):
+        img = firmware_image("v2", size=100000)
+        rc, out, err = self.fw("push", self.write("fw.bin", img), "--chunk", "16Ki")
+        self.assertEqual(rc, 0, err)
+        puts = self.calls("replace")
+        self.assertEqual(len(puts), 7)
+        self.assertTrue(all(p["size"] <= 16384 for p in puts))
+        self.assertIn("offset=16384&size=100000&sha256=" + hashlib.sha256(img).hexdigest(), puts[1]["path"])
+        with open(self.state + ".img", "rb") as f:
+            self.assertEqual(f.read(), img)
+        self.assertEqual(self.get_state()["staged"]["phase"], "Staged")
+        self.assertIn("staged v2 (%s)" % hashlib.sha256(img).hexdigest()[:12], out)
+        # Pushing it again does nothing
+        rc, out, _ = self.fw("push", self.write("fw.bin", img))
+        self.assertEqual(rc, 0)
+        self.assertIn("already staged", out)
+        self.assertEqual(len(self.calls("replace")), 7)
+
+    def test_push_resumes(self):
+        img = firmware_image("v2", size=100000)
+        sha = hashlib.sha256(img).hexdigest()
+        # A range that breaks off half way: the upload goes on where the
+        # control plane says it stands
+        self.set_state(break_at=32768)
+        rc, out, err = self.fw("push", self.write("fw.bin", img), "--chunk", "16Ki")
+        self.assertEqual(rc, 0, err)
+        self.assertIn("retrying", err)
+        offsets = [int(re.search(r"offset=(\d+)", p["path"]).group(1)) for p in self.calls("replace")]
+        self.assertEqual(offsets[:4], [0, 16384, 32768, 32768 + 8192])
+        with open(self.state + ".img", "rb") as f:
+            self.assertEqual(f.read(), img)
+        # An upload a previous run left half done continues
+        st = self.get_state()["staged"]
+        st.update({"phase": "Receiving", "received": 49152})
+        self.set_state(staged=st)
+        with open(self.state + ".img", "wb") as f:
+            f.write(img[:49152])
+        os.unlink(self.log)
+        rc, out, err = self.fw("push", self.write("fw.bin", img), "--chunk", "16Ki")
+        self.assertEqual(rc, 0, err)
+        self.assertIn("resuming at byte 49,152", out)
+        self.assertIn("offset=49152&size=100000&sha256=" + sha, self.calls("replace")[0]["path"])
+
+    def test_push_errors(self):
+        img = firmware_image("v2", size=100000)
+        st = self.get_state()["staged"]
+        st["slotSize"] = 65536
+        self.set_state(staged=st)
+        rc, _, err = self.fw("push", self.write("fw.bin", img))
+        self.assertEqual(rc, 1)
+        self.assertIn("update slot", err)
+        rc, _, err = self.fw("push", self.write("x.bin", b"not firmware" * 10))
+        self.assertEqual(rc, 1)
+        self.assertIn("not an ESP32 firmware image", err)
+        rc, _, err = self.fw("push", os.path.join(self.tmp, "missing.bin"))
+        self.assertEqual(rc, 1)
+
+    def staged(self, img, version):
+        sha = hashlib.sha256(img).hexdigest()
+        st = self.get_state()["staged"]
+        st.update({"phase": "Staged", "sha256": sha, "size": len(img), "received": len(img), "version": version})
+        return st, sha
+
+    def test_rollout(self):
+        rc, _, err = self.fw("rollout", "--no-wait")
+        self.assertEqual(rc, 1)
+        self.assertIn("no image is staged", err)
+        st, sha = self.staged(firmware_image("v2"), "v2")
+        steps = [{"phase": "Progressing", "updatedNodes": 0, "totalNodes": 2, "node": "w1", "message": "updating node w1"},
+                 {"phase": "Progressing", "updatedNodes": 1, "totalNodes": 2, "node": "cp", "message": "updating node cp"},
+                 {"phase": "Complete", "updatedNodes": 2, "totalNodes": 2, "message": "2 node(s) run v2"}]
+        nodes = [fw_node("cp", sha, "v2", role="control-plane", target=sha), fw_node("w1", sha, "v2", target=sha)]
+        self.set_state(staged=st, steps=steps, nodes=nodes)
+        rc, out, err = self.fw("rollout", "--interval", "0", "--node-timeout", "600")
+        self.assertEqual(rc, 0, err)
+        manifest = json.loads(self.calls("create")[0]["body"])
+        self.assertEqual(manifest["kind"], "FirmwareRollout")
+        self.assertEqual(manifest["spec"], {"sha256": sha, "nodeTimeoutSeconds": 600})
+        self.assertIn("updating node w1", out)
+        self.assertIn("Complete 2/2 nodes", out)
+        # Workers before the control plane in the table
+        table = out[out.index("NODE"):].splitlines()
+        self.assertTrue(table[1].startswith("w1 ") and table[2].startswith("cp "))
+        # Another rollout while one runs is refused; a finished one is replaced
+        st2 = self.get_state()
+        st2["rollout"]["status"] = {"phase": "Progressing"}
+        self.set_state(staged=st, rollout=st2["rollout"])
+        rc, _, err = self.fw("rollout", "--no-wait")
+        self.assertEqual(rc, 5)
+        self.assertIn("in progress", err)
+        st2["rollout"]["status"] = {"phase": "Complete"}
+        self.set_state(staged=st, rollout=st2["rollout"])
+        rc, _, err = self.fw("rollout", "--no-wait")
+        self.assertEqual(rc, 0, err)
+        self.assertEqual(self.calls("delete")[-1]["path"], "/apis/kube32.io/v1/firmwarerollouts/firmware")
+        rc, _, err = self.fw("rollout", "--no-wait", "--sha256", "0" * 64)
+        self.assertEqual(rc, 1)
+
+    def test_rollout_failure_status_and_abort(self):
+        st, sha = self.staged(firmware_image("v3"), "v3")
+        steps = [{"phase": "Failed", "updatedNodes": 0, "totalNodes": 2, "node": "w1",
+                  "message": "node w1: image %s reset before it confirmed itself" % sha[:12]}]
+        nodes = [fw_node("w1", "a" * 64, "v2", target=sha, reason="RolledBack", message="image reset before it confirmed itself")]
+        self.set_state(staged=st, steps=steps, nodes=nodes)
+        rc, _, err = self.fw("rollout", "--interval", "0")
+        self.assertEqual(rc, 6)
+        self.assertIn("rollout failed: node w1", err)
+        rc, out, err = self.fw("status")
+        self.assertEqual(rc, 0, err)
+        self.assertIn("staged:  Staged  v3 (%s)" % sha[:12], out)
+        self.assertIn("rollout: Failed", out)
+        self.assertRegex(out, r"w1\s+worker\s+v2\s+aaaaaaaaaaaa\s+ota_0\s+Confirmed\s+%s\s+RolledBack: image reset" % sha[:12])
+        rc, out, _ = self.fw("abort")
+        self.assertEqual(rc, 0)
+        self.assertIsNone(self.get_state()["rollout"])
+        rc, out, _ = self.fw("abort")
+        self.assertIn("no rollout", out)
+
+
 if __name__ == "__main__":
     unittest.main()
