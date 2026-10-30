@@ -30,6 +30,11 @@ All notable changes to this project will be documented in this file. The format 
 - Each control plane generates a cluster access point password, and `K32_CMD:APPASS` configures it on workers.
 - Python integration test suites (`tests/integration/runner.py`) for API, validation, resources, workloads, cluster, and federation in CI.
 
+### Changed
+
+- Pods use less of the pod pool on boards without PSRAM. Without `kube32.io/wasm-stack`, the wasm3 value stack sizes to what the module's call chains need, up to the 4 KiB or 16 KiB default. The shared interpreter stack lends the compiler its scratch space while a module loads. Function constants follow their code on its code pages, and code pages shrink to fit the pool block's free pieces. Metering skips zero-cost charges, and the loader drops function names from the name section.
+- Memory admission estimates a pod's size from its module's sections and call chains using wasm3's ESP32-S3 structure sizes in both the simulator and the board. The `[POD]` load line reports the bytes a pod took from the pool block, the block's free bytes, and its largest free piece.
+
 ### Fixed
 
 - Pods leave a PSRAM reserve for the system (128 KiB on a control plane, 64 KiB on a worker with PSRAM). Without this reserve, pod code and structures can drop free PSRAM to 16 KiB, causing API requests to fail with 503 and firmware staging to run the control plane out of memory.
