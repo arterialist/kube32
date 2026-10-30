@@ -1,0 +1,88 @@
+# webhook: forwards channel events to an HTTPS endpoint as JSON. Beside the
+# rfid and irremote examples, every tag the rfid pod reads (rfid.tag) and
+# every code irremote decodes (ir.received) is POSTed to the URL as
+#
+#   {"topic":"rfid.tag","payload":"04a1b2c3d4e580","node":"<node>","time":"2026-10-30T12:34:56.789Z"}
+#
+# ("time" when the node's clock is set). Failed POSTs are retried with
+# back-off; at most six events wait.
+#
+# This tick and event pod uses 8 KiB of linear memory. It runs on the control
+# plane. A POST holds the node's shared interpreter until it ends (3 to 4 s
+# with the TLS handshake). On the Cardputer, each POST would pause the rfid
+# and irremote pods for that long, and they would miss taps. Those pods send
+# their events to this one over the cluster network. Without the
+# nodeSelector, the pod also runs on a worker, which routes https calls
+# through the control plane's egress gateway.
+#
+# The URL comes from a Secret, because a webhook URL often carries its
+# credential. Create it first; the pod waits in CreateContainerConfigError
+# until it exists:
+#
+#   kubectl --context kube32 create secret generic webhook --from-literal=url=https://<endpoint>
+#   kubectl --context kube32 apply -f examples/webhook.yaml
+#   kubectl --context kube32 logs -f webhook
+#
+# The NetworkPolicy lets the pod open TCP connections to port 443 and nothing
+# else. GET / on the node's pod HTTP server (port 7000, header X-Kube32-Pod:
+# default/webhook) answers the queue's counters as JSON.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: webhook
+  namespace: default
+  labels:
+    app: webhook
+  annotations:
+    kube32.io/event-topics: rfid.tag,ir.received   # delivered to k32_event
+spec:
+  nodeSelector:
+    node-role.kubernetes.io/control-plane: ""
+  restartPolicy: Always
+  containers:
+    - name: webhook
+      image: wasm://embedded/webhook
+      ports:
+        - containerPort: 7000
+          name: http
+      env:
+        - name: WEBHOOK_URL
+          valueFrom:
+            secretKeyRef:
+              name: webhook
+              key: url
+        - name: WEBHOOK_TOPICS             # forwarded: the topics the annotation subscribes to
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.annotations['kube32.io/event-topics']
+        - name: NODE_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: spec.nodeName
+        - name: WEBHOOK_TIMEOUT_MS
+          value: "8000"
+        # - name: WEBHOOK_TEXT_FIELD       # a one-line text field: "text" for Slack, "content" for Discord
+        #   value: text
+      resources:
+        requests:
+          memory: 8Ki                      # linear memory: 1 KiB stack, 5.7 KiB queue and buffers
+        limits:
+          memory: 8Ki
+      securityContext:
+        capabilities:
+          add: ["SERVICE_CALL"]
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: webhook-egress
+  namespace: default
+spec:
+  podSelector:
+    matchLabels:
+      app: webhook
+  policyTypes: ["Egress"]
+  egress:
+    - ports:
+        - protocol: TCP
+          port: 443

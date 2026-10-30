@@ -263,6 +263,8 @@ kubectl --context kube32 apply -f examples/rfid.yaml
 kubectl --context kube32 logs -l app=rfid -f
 ```
 
+`examples/webhook.yaml` forwards the `rfid.tag` and `ir.received` topics to an HTTPS endpoint as JSON ([`apps/webhook`](https://github.com/arterialist/kube32/tree/main/apps/webhook)).
+
 ## Reserved pins
 
 The ESP32-S3 provides GPIO 0 to 21 and 26 to 48. The firewall blocks claims on reserved pins (`include/hal/capability_firewall.hpp`):

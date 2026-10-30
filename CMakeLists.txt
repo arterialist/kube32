@@ -351,10 +351,11 @@ else()
     target_link_libraries(test_network_policy PRIVATE kube32_core)
     add_test(NAME test_network_policy COMMAND test_network_policy)
 
-    # Service calls, https calls and the egress gateway, bundle files,
-    # sub-page memory limits, what a pod takes of the pod pool, the kubelet's
-    # streamed API reads and node storage over HTTP (pods: apps/svcprobe)
-    foreach(t test_service_calls test_https_egress test_pod_assets test_pod_memory_caps test_pod_pool_fit test_kubelet_api_stream test_node_storage)
+    # Service calls, https calls and the egress gateway, the webhook example,
+    # bundle files, sub-page memory limits, what a pod takes of the pod pool,
+    # the kubelet's streamed API reads and node storage over HTTP (pods:
+    # apps/svcprobe, apps/webhook)
+    foreach(t test_service_calls test_https_egress test_webhook_app test_pod_assets test_pod_memory_caps test_pod_pool_fit test_kubelet_api_stream test_node_storage)
         add_executable(${t} tests/${t}.cpp)
         target_link_libraries(${t} PRIVATE kube32_core)
         target_compile_definitions(${t} PRIVATE KUBE32_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}")
