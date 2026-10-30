@@ -24,4 +24,13 @@ All notable changes to this project will be documented in this file. The format 
 - Rust guest SDK (`sdk/rust`), `tools/kube32-cli` (`build`, `check`, `deploy`, `embed`, `sd-push`, and recursive file/directory `push`), USB serial HTTP gateway with concurrent streamed requests (`tools/kube32_serial_gateway.py`), flashing script (`scripts/flash.sh`), and host simulator (`kube32-sim`, supporting `--psram 0` for boards without PSRAM, `--tls`, and `--help`).
 - Example workloads and manifests including the four-pod Tessera issue tracker (`apps/tessera`), `echo`, and `i2cscan`.
 - Infrared for pods: RMT transmit and receive channels (`esp32.io/rmt-tx`, `esp32.io/rmt-rx`) with pins and carrier from `kube32.io/rmt-tx` and `kube32.io/rmt-rx` annotations, `esp32_rmt_send` and the non-blocking `esp32_rmt_receive` with a per-channel frame queue, node capacity and scheduling, the Cardputer's IR LED as the default TX pin, Rust SDK bindings, and the `irremote` example that decodes and sends NEC codes.
+- I2C device discovery: nodes label themselves `i2c.kube32.io/0x<address>: bus-<n>` for devices detected on their I2C pins so `nodeSelector` can place pods on nodes with matching hardware, and the `rfid` example reads ISO 14443-A tags through an MFRC522-compatible reader.
+- `kube32.io/tick-interval` configures a pod's `k32_tick` period.
+- Each control plane generates a cluster access point password, and `K32_CMD:APPASS` configures it on workers.
 - Python integration test suites (`tests/integration/runner.py`) for API, validation, resources, workloads, cluster, and federation in CI.
+
+### Fixed
+
+- Fix loading inline and SD card images placed in PSRAM: the ESP32-S3 maps flash and PSRAM into a single address range, which caused the loader to treat the pod's PSRAM copy as flash and free it.
+- Include object metadata labels in Table rows so `kubectl get --show-labels` and `-L` display them.
+- Clear the I2C bus after a failed transfer.
