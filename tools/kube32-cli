@@ -1925,7 +1925,7 @@ def build_parser():
     fws = fw.add_subparsers(dest="firmware_command")
     fp = fws.add_parser("push", help="upload firmware.bin into the control plane's update slot, in ranges (resumes an interrupted upload)")
     fp.add_argument("file", help="the image, e.g. .pio/build/esp32s3/firmware.bin")
-    fp.add_argument("--chunk", default="48Ki", help="bytes per request (default 48Ki: fits the serial console gateway's 60 KiB request limit)")
+    fp.add_argument("--chunk", default="16Ki", help="bytes per request (default 16Ki: the control plane holds a request in memory while it writes it to flash)")
     fp.add_argument("--retries", type=int, default=5, help="failed requests in a row before giving up (default 5)")
     kubectl_flags(fp)
     fp.set_defaults(func=cmd_firmware_push)
