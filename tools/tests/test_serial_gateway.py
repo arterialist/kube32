@@ -180,6 +180,18 @@ class SerialGatewayTest(unittest.TestCase):
         self.assertIn(b"\r\nConnection: close\r\n", request)
         self.assertNotIn(b"Keep-Alive", request)
 
+    def test_chunked_body_is_sent_with_a_length(self):
+        s = self.connect()
+        s.sendall(b"PUT /echo HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n"
+                  b"5\r\nhello\r\n7;ext=1\r\n, world\r\n0\r\n\r\n")
+        while s.recv(65536):
+            pass
+        s.close()
+        request = self.board.requests[-1]
+        self.assertNotIn(b"Transfer-Encoding", request)
+        self.assertIn(b"\r\nContent-Length: 12\r\n", request)
+        self.assertTrue(request.endswith(b"\r\n\r\nhello, world"), request)
+
     def test_event_stream_beside_requests_and_close(self):
         events = self.connect()
         events.sendall(b"GET /events HTTP/1.1\r\nHost: x\r\n\r\n")

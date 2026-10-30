@@ -35,6 +35,7 @@ import serial.tools.list_ports
 
 BAUD = 115200            # native USB-Serial/JTAG ignores the baud rate; CH340 corrupts bytes above it
 MARK = b"\x1e"           # board frames start with this byte
+BOOT_TRIES = 6     # hellos to a named port before giving up: a board takes a few seconds to boot
 MAX_REQUEST = 60 * 1024  # the board takes requests below 64 KiB
 FIRST_BYTE_TIMEOUT = 30.0
 HELLO_TIMEOUT = 3.0
@@ -210,8 +211,38 @@ class Relay:
             s.chunks.put(END_CUT)
 
 
+def read_chunked(sock, data, limit):
+    """Decodes a chunked body whose first bytes are `data`; returns (body, error status)."""
+    body = b""
+    while True:
+        while b"\r\n" not in data:
+            more = sock.recv(8192)
+            if not more:
+                return None, None
+            data += more
+            if len(data) > limit + 4096:
+                return None, "413 Content Too Large"
+        size_line, _, data = data.partition(b"\r\n")
+        try:
+            size = int(size_line.split(b";")[0].strip(), 16)
+        except ValueError:
+            return None, "400 Bad Request"
+        if size == 0:
+            return body, None   # trailers, if any, are not forwarded
+        if len(body) + size > limit:
+            return None, "413 Content Too Large"
+        while len(data) < size + 2:
+            more = sock.recv(65536)
+            if not more:
+                return None, None
+            data += more
+        body += data[:size]
+        data = data[size + 2:]
+
+
 def read_request(sock):
-    """Reads one HTTP request; returns it with `Connection: close`, or an error status."""
+    """Reads one HTTP request; returns it with `Connection: close` and a
+    Content-Length (a chunked body is decoded), or an error status."""
     data = b""
     while b"\r\n\r\n" not in data:
         chunk = sock.recv(8192)
@@ -224,15 +255,24 @@ def read_request(sock):
     lines = head.split(b"\r\n")
     headers = []
     length = 0
+    chunked = False
     for h in lines[1:]:
         name = h.partition(b":")[0].strip().lower()
         if name == b"content-length":
             length = int(h.partition(b":")[2].strip() or 0)
         elif name == b"transfer-encoding":
-            return None, "411 Length Required"
+            chunked = b"chunked" in h.partition(b":")[2].lower()
+            continue
         if name in (b"connection", b"keep-alive", b"proxy-connection"):
             continue
         headers.append(h)
+    if chunked:
+        body, error = read_chunked(sock, body, MAX_REQUEST - len(head))
+        if body is None:
+            return None, error
+        headers = [h for h in headers if h.partition(b":")[0].strip().lower() != b"content-length"]
+        headers.append(b"Content-Length: %d" % len(body))
+        length = len(body)
     if len(head) + length > MAX_REQUEST:
         return None, "413 Content Too Large"
     while len(body) < length:
@@ -360,7 +400,12 @@ def connect(prefer):
         except (serial.SerialException, OSError) as e:
             print(f"[gateway] {port}: {e}", flush=True)
             continue
-        if not relay.hello():
+        # A board that is still booting (just flashed or reset) answers once
+        # its console task runs: a named port gets a few more tries
+        tries = BOOT_TRIES if prefer else 1
+        while tries and not relay.hello():
+            tries -= 1
+        if not relay.ready.is_set():
             print(f"[gateway] {port}: no answer to K32_RESET (firmware without the console relay?)", flush=True)
             relay.alive = False
             relay.ser.close()

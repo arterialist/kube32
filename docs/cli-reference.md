@@ -98,9 +98,10 @@ python3 tools/kube32_serial_gateway.py [--port <serial port>] [--map <local>:<de
 - Default port mappings are `6443:6443` for the API server and `8080:80` for the ingress, on `127.0.0.1`.
 - A worker forwards streams to the control plane over Wi-Fi.
 - The gateway opens the port without resetting the board.
+- If a board specified with `--port` does not respond because it is still booting, the gateway retries up to six times at 3-second intervals.
 - The gateway prints device output to stdout and sends lines from stdin to the console, such as `K32_CMD:STATUS`.
 - When the board restarts, the gateway ends open streams and holds new requests until the board answers again. When the port disappears, the gateway reopens it.
-- The gateway answers `411` to requests with a chunked body and `413` to requests of 60 KiB or more.
+- The gateway forwards chunked request bodies to the board with a `Content-Length` header, and responds with `413` to requests of 60 KiB or more.
 
 ## tessera_loadtest.py
 
