@@ -269,12 +269,21 @@ struct Console {
             uart_vfs_dev_use_driver(UART_NUM_0);
         }
     }
+    // Waits on the port that carried the last bytes and only polls the other.
+    // The USB-Serial/JTAG driver drops what arrives while its receive ring
+    // (4 KiB) is full, so a wait on UART0 while a request streams in over USB
+    // would lose part of it; UART0's own 8 KiB ring holds a line meanwhile.
     int read(char* buf, size_t cap, uint32_t timeout_ms) {
-        int n = usb_serial_jtag_read_bytes(buf, cap, pdMS_TO_TICKS(uart_enabled ? timeout_ms / 2 : timeout_ms));
+        if (!uart_enabled) return usb_serial_jtag_read_bytes(buf, cap, pdMS_TO_TICKS(timeout_ms));
+        const TickType_t wait = pdMS_TO_TICKS(timeout_ms);
+        int n = usb_serial_jtag_read_bytes(buf, cap, last_from_usb ? wait : 0);
         if (n > 0) { last_from_usb = true; return n; }
-        if (!uart_enabled) return n;
-        n = uart_read_bytes(UART_NUM_0, buf, cap, pdMS_TO_TICKS(timeout_ms / 2));
-        if (n > 0) last_from_usb = false;
+        n = uart_read_bytes(UART_NUM_0, buf, cap, last_from_usb ? 0 : wait);
+        if (n > 0) { last_from_usb = false; return n; }
+        if (!last_from_usb) {
+            n = usb_serial_jtag_read_bytes(buf, cap, 0);
+            if (n > 0) last_from_usb = true;
+        }
         return n;
     }
     void write(const char* data, size_t len) {
@@ -1416,7 +1425,11 @@ void cluster_task(void* pv) {
         });
     }
     static std::pair<Console*, NodeIdentity*> console_ctx(&console, &ident);
-    xTaskCreatePinnedToCore(console_task, "k32_console", 4096, &console_ctx, 4, nullptr, 0);
+    // The USB-Serial/JTAG driver drops what arrives while its receive ring is
+    // full (the host gets no backpressure), so the reader runs above the pod,
+    // kubelet, HTTP and storage threads and drains a request from the gateway
+    // as fast as it arrives. It blocks in reads nearly all the time.
+    xTaskCreatePinnedToCore(console_task, "k32_console", 4096, &console_ctx, 11, nullptr, 0);
 
     // Pod ticks run the interpreter, so they get a thread with a stack sized
     // for it rather than this 9 KB task. A pod is ticked once per
