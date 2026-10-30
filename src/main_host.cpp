@@ -28,6 +28,7 @@
 
 #include "osal/tls.hpp"
 
+#include <algorithm>
 #include <csignal>
 #include <fstream>
 #include <iterator>
@@ -352,20 +353,12 @@ int main(int argc, char* argv[]) {
         kube32::app::PodServer pod_server(po);
         pod_server.start();
 
-        // As on the boards: a pod whose k32_tick returns >0 has work left and
-        // is ticked again after 10 ms; otherwise once a second.
-        uint64_t last_tick = 0;
-        bool busy = false;
+        // As on the boards: a pod is ticked once per kube32.io/tick-interval;
+        // one whose k32_tick returns >0 has work left and is ticked again
+        // after 10 ms.
         while (g_sim_running.load()) {
-            kube32::osal::Thread::sleep_ms(busy ? 10 : 250);
-            uint64_t now = kube32::osal::System::get_uptime_ms();
-            if (busy || now - last_tick >= 1000) {
-                if (now - last_tick >= 1000) last_tick = now;
-                busy = false;
-                for (const auto& id : kube32::runtime::AppPodHost::instance().list_pods()) {
-                    if (kube32::runtime::AppPodHost::instance().tick(id, static_cast<uint32_t>(now)) > 0) busy = true;
-                }
-            }
+            const uint32_t wait = kube32::runtime::AppPodHost::instance().tick_due(kube32::osal::System::get_uptime_ms(), 250);
+            kube32::osal::Thread::sleep_ms(std::max<uint32_t>(wait, 10));
         }
 
         std::cout << "\n[SHUTDOWN] Stopping Kubelet worker agent..." << std::endl;
@@ -591,17 +584,11 @@ int main(int argc, char* argv[]) {
     // Pod ticks as on the boards (10 ms while a pod reports work left, else
     // 1 Hz); ingress and store housekeeping once a second.
     uint64_t last_tick = 0;
-    bool busy = false;
     while (g_sim_running.load()) {
-        kube32::osal::Thread::sleep_ms(busy ? 10 : 250);
+        const uint32_t wait = kube32::runtime::AppPodHost::instance().tick_due(kube32::osal::System::get_uptime_ms(), 250);
+        kube32::osal::Thread::sleep_ms(std::max<uint32_t>(wait, 10));
         uint64_t now = kube32::osal::System::get_uptime_ms();
         const bool second = now - last_tick >= 1000;
-        if (busy || second) {
-            busy = false;
-            for (const auto& id : kube32::runtime::AppPodHost::instance().list_pods()) {
-                if (kube32::runtime::AppPodHost::instance().tick(id, static_cast<uint32_t>(now)) > 0) busy = true;
-            }
-        }
         if (second) {
             last_tick = now;
             if (ingress) ingress->tick();

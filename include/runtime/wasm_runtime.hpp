@@ -39,6 +39,7 @@ struct DeploySpec {
     std::vector<std::pair<std::string, std::string>> env;
     uint64_t gas_budget_per_call{4000000000ULL};   // 0: no metering (see ContainerConfig)
     std::vector<std::string> event_topics;          // channel topics delivered to k32_event
+    uint32_t tick_interval_ms{1000};                // k32_tick period (kube32.io/tick-interval)
     // Bundle files the pod may send with k32_resp_asset: an embedded bundle
     // (images/web/<name>/) or a directory on node storage
     std::string asset_bundle;

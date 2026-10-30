@@ -439,6 +439,7 @@ Rebuild the firmware with `pio run -e esp32s3`, or reconfigure and build the hos
 | `kube32.io/execution-budget` | Pod | Per-call wasm3 gas limit (`<units>` or `"off"`, default `4000000000`) |
 | `kube32.io/wasm-stack` | Pod | Per-pod wasm3 value stack size (`512` to `64Ki`, default `4Ki` for pods up to `64Ki` of linear memory) |
 | `kube32.io/event-topics` | Pod | Comma-separated channel topics delivered to the pod's `k32_event` export |
+| `kube32.io/tick-interval` | Pod | Period of the pod's `k32_tick`: `"250ms"`, `"2s"`, or an integer in milliseconds, from 50 ms to 1 h (default 1 s) |
 | `kube32.io/i2c-bus-<N>` | Pod | Bus pins and speed, e.g. `"sda=8,scl=9,hz=100000"` |
 | `kube32.io/uart-<N>` | Pod | UART pins and baud rate, e.g. `"tx=17,rx=18,baud=115200"` |
 | `kube32.io/rmt-tx` | Pod | IR transmit pin and carrier, e.g. `"pin=2,carrier=38000,duty=33"` (`carrier=0`: no carrier) |

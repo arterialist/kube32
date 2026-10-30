@@ -85,6 +85,7 @@ bool WasmRuntime::deploy_impl(const std::string& pod_id, const uint8_t* wasm_byt
 
     AppPodHost::instance().set_env(pod_id, spec.env);
     AppPodHost::instance().set_event_topics(pod_id, spec.event_topics);
+    AppPodHost::instance().set_tick_interval(pod_id, spec.tick_interval_ms);
     AppPodHost::instance().set_assets(pod_id, AppAssetSource{spec.asset_bundle, spec.asset_directory});
 
     const uint64_t t_load = osal::Thread::get_time_us();

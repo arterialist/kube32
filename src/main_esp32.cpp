@@ -1300,9 +1300,10 @@ void cluster_task(void* pv) {
     xTaskCreatePinnedToCore(console_task, "k32_console", 4096, &console_ctx, 4, nullptr, 0);
 
     // Pod ticks run the interpreter, so they get a thread with a stack sized
-    // for it rather than this 9 KB task. A pod that returns >0 from k32_tick
-    // has background work left (incremental seeding, for example) and is
-    // ticked again after a short yield so requests interleave; otherwise 1 Hz.
+    // for it rather than this 9 KB task. A pod is ticked once per
+    // kube32.io/tick-interval (1 s by default); one that returns >0 from
+    // k32_tick has background work left (incremental seeding, for example)
+    // and is ticked again after a short yield so requests interleave.
     {
         kube32::osal::Thread::Config t_cfg;
         t_cfg.name = "k32_tick";
@@ -1311,15 +1312,9 @@ void cluster_task(void* pv) {
         t_cfg.priority = 4;
         t_cfg.core_affinity = 1;
         kube32::osal::Thread::create([](void*) {
-            std::vector<std::string> ids;   // reused: a tick round allocates nothing
             while (true) {
-                bool busy = false;
-                uint32_t now = static_cast<uint32_t>(kube32::osal::System::get_uptime_ms());
-                kube32::runtime::AppPodHost::instance().list_pods(ids);
-                for (const auto& id : ids) {
-                    if (kube32::runtime::AppPodHost::instance().tick(id, now) > 0) busy = true;
-                }
-                vTaskDelay(pdMS_TO_TICKS(busy ? 10 : 1000));
+                const uint32_t wait = kube32::runtime::AppPodHost::instance().tick_due(kube32::osal::System::get_uptime_ms());
+                vTaskDelay(pdMS_TO_TICKS(std::max<uint32_t>(wait, 10)));
             }
         }, nullptr, t_cfg);
     }

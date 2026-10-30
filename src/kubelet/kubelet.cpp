@@ -995,6 +995,23 @@ bool Kubelet::deploy_and_start_pod(const models::KubePod& pod_in, const std::str
             }
         }
     }
+    // kube32.io/tick-interval: k32_tick period, "250ms", "2s" or milliseconds,
+    // 50 ms to 1 h (default 1 s)
+    {
+        auto it = pod.annotations.find("kube32.io/tick-interval");
+        if (it != pod.annotations.end()) {
+            const std::string& v = it->second;
+            char* end = nullptr;
+            unsigned long long n = std::strtoull(v.c_str(), &end, 10);
+            const std::string unit = end ? std::string(end) : std::string();
+            if (unit == "s") n *= 1000;
+            if (end != v.c_str() && (unit.empty() || unit == "ms" || unit == "s") && n >= 50 && n <= 3600000) {
+                spec.tick_interval_ms = static_cast<uint32_t>(n);
+            } else {
+                std::cout << "[KUBELET] " << pod_key << ": ignoring kube32.io/tick-interval \"" << v << "\" (want 50ms to 1h, e.g. \"250ms\" or \"2s\")" << std::endl;
+            }
+        }
+    }
     // Heap images move into the runtime (no second copy); flash images are used in place
     bool deployed = inline_bytes.empty()
         ? runtime_.deploy_workload_ex(pod_key, image_bytes, image_len, spec, deploy_err)

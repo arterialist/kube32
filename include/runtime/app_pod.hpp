@@ -199,6 +199,12 @@ public:
     void set_assets(const std::string& pod_id, AppAssetSource src);
     AppAssetSource assets(const std::string& pod_id) const;
     int32_t tick(const std::string& pod_id, uint32_t uptime_ms);
+    // k32_tick period of a pod (default 1 s); set before it registers.
+    void set_tick_interval(const std::string& pod_id, uint32_t ms);
+    // Ticks every pod whose period has passed, and 10 ms after a tick that
+    // returned >0 (background work left). Returns the milliseconds until the
+    // next pod is due, at most `max_wait_ms`.
+    uint32_t tick_due(uint64_t now_ms, uint32_t max_wait_ms = 1000);
     int32_t event(const std::string& pod_id, std::string_view topic, const uint8_t* data, size_t len);
 
     AppPodStats stats(const std::string& pod_id) const;
@@ -214,6 +220,8 @@ private:
         bool has_tick{false};
         bool has_alloc{false};
         bool has_init{false};
+        uint32_t tick_interval_ms{1000};
+        uint64_t next_tick_ms{0};
         AppPodStats stats;
         std::unique_ptr<osal::Mutex> call_mutex; // serializes host-initiated calls per pod
     };
@@ -221,6 +229,8 @@ private:
     std::map<std::string, Entry> pods_;
     std::map<std::string, std::vector<std::pair<std::string, std::string>>> env_;
     std::map<std::string, AppAssetSource> assets_;
+    std::map<std::string, uint32_t> tick_intervals_;
+    std::vector<std::string> tick_scratch_;   // tick_due's list of due pods
 #if defined(ESP_PLATFORM)
     size_t nested_stack_reserve_{16 * 1024};
 #else

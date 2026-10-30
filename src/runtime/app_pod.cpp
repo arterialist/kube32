@@ -781,6 +781,8 @@ bool AppPodHost::register_pod(const std::string& pod_id, ContainerLifecycleContr
     if (!e.has_handle && !e.has_event && !e.has_tick && !e.has_init) return false;
     e.call_mutex = std::make_unique<osal::Mutex>();
     osal::LockGuard guard(mutex_);
+    auto interval = tick_intervals_.find(pod_id);
+    if (interval != tick_intervals_.end()) e.tick_interval_ms = interval->second;
     pods_[pod_id] = std::move(e);
     sync_topic_subscriptions_locked();
     return true;
@@ -810,6 +812,7 @@ void AppPodHost::unregister_pod(const std::string& pod_id) {
         env_.erase(pod_id);
         assets_.erase(pod_id);
         event_topics_.erase(pod_id);
+        tick_intervals_.erase(pod_id);
         sync_topic_subscriptions_locked();
     }
     if (hold) {
@@ -1108,6 +1111,43 @@ int32_t AppPodHost::tick(const std::string& pod_id, uint32_t uptime_ms) {
         if (e2) e2->stats.total_us += us;   // interpreter time feeds pod CPU metrics
     }
     return rc;
+}
+
+void AppPodHost::set_tick_interval(const std::string& pod_id, uint32_t ms) {
+    osal::LockGuard guard(mutex_);
+    tick_intervals_[pod_id] = ms ? ms : 1000;
+    Entry* e = find_locked(pod_id);
+    if (e) e->tick_interval_ms = tick_intervals_[pod_id];
+}
+
+uint32_t AppPodHost::tick_due(uint64_t now_ms, uint32_t max_wait_ms) {
+    // Called from one thread; strings keep their buffers, so a round allocates nothing
+    std::vector<std::string>& due = tick_scratch_;
+    size_t n = 0;
+    {
+        osal::LockGuard guard(mutex_);
+        for (const auto& kv : pods_) {
+            if (!kv.second.has_tick || kv.second.next_tick_ms > now_ms) continue;
+            if (n < due.size()) due[n].assign(kv.first);
+            else due.push_back(kv.first);
+            ++n;
+        }
+    }
+    for (size_t i = 0; i < n; ++i) {
+        const std::string& id = due[i];
+        const int32_t rc = tick(id, static_cast<uint32_t>(now_ms));
+        osal::LockGuard guard(mutex_);
+        Entry* e = find_locked(id);
+        if (e) e->next_tick_ms = now_ms + (rc > 0 ? 10 : e->tick_interval_ms);
+    }
+    uint64_t wait = max_wait_ms;
+    osal::LockGuard guard(mutex_);
+    for (const auto& kv : pods_) {
+        if (!kv.second.has_tick) continue;
+        const uint64_t next = kv.second.next_tick_ms;
+        wait = std::min<uint64_t>(wait, next > now_ms ? next - now_ms : 0);
+    }
+    return static_cast<uint32_t>(wait);
 }
 
 int32_t AppPodHost::event(const std::string& pod_id, std::string_view topic, const uint8_t* data, size_t len) {
