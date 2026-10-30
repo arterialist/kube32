@@ -73,3 +73,10 @@ CONFIG_MBEDTLS_DYNAMIC_BUFFER=y
 # CONFIG_RMT_TX_ISR_HANDLER_IN_IRAM is not set
 # CONFIG_RMT_RX_ISR_HANDLER_IN_IRAM is not set
 # CONFIG_RMT_ENCODER_FUNC_IN_IRAM is not set
+
+# The control plane routes the stations of its cluster access point to its
+# station uplink: lwIP NAPT on the AP interface while the uplink holds an
+# address (src/net/network_manager.cpp)
+CONFIG_LWIP_IP_FORWARD=y
+CONFIG_LWIP_IPV4_NAPT=y
+# CONFIG_LWIP_IPV4_NAPT_PORTMAP is not set

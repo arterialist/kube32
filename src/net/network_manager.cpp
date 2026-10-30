@@ -24,6 +24,8 @@ static constexpr uint16_t k_small_heap_mtu = 576;
 static constexpr int8_t k_roam_rssi = -70;
 static constexpr int8_t k_roam_margin_db = 10;
 static constexpr uint64_t k_roam_retry_us = 60ULL * 1000 * 1000;
+// lwIP's NAPT table: IP_NAPT_MAX (512) entries of 32 bytes
+static constexpr size_t k_napt_table_bytes = 512 * 32;
 #endif
 
 namespace kube32::net {
@@ -63,6 +65,7 @@ public:
         esp_wifi_set_storage(WIFI_STORAGE_RAM);
         esp_event_handler_register(WIFI_EVENT, ESP_EVENT_ANY_ID, &EspNetworkManager::wifi_event, this);
         esp_event_handler_register(IP_EVENT, IP_EVENT_STA_GOT_IP, &EspNetworkManager::ip_event, this);
+        esp_event_handler_register(IP_EVENT, IP_EVENT_STA_LOST_IP, &EspNetworkManager::ip_lost_event, this);
         return true;
     }
 
@@ -73,6 +76,7 @@ public:
         auto* self = static_cast<EspNetworkManager*>(arg);
         if (id == WIFI_EVENT_STA_DISCONNECTED && self->mode_ != NetworkMode::SoftAP) {
             self->sta_has_ip_ = false;
+            self->uplink_down();
             vTaskDelay(pdMS_TO_TICKS(1000));
             esp_wifi_connect();
         } else if (id == WIFI_EVENT_STA_START && self->mode_ != NetworkMode::SoftAP) {
@@ -112,6 +116,59 @@ public:
         // that is not on the AP subnet through the uplink, whatever joined last.
         if (self->sta_netif_) esp_netif_set_default_netif(self->sta_netif_);
         ESP_LOGI(TAG, "station got ip " IPSTR " (default route)", IP2STR(&ev->ip_info.ip));
+        if (self->mode_ == NetworkMode::StationAndSoftAP) self->uplink_up();
+    }
+    static void ip_lost_event(void* arg, esp_event_base_t, int32_t, void*) {
+        auto* self = static_cast<EspNetworkManager*>(arg);
+        self->sta_has_ip_ = false;
+        self->uplink_down();
+    }
+
+    // Stations of the cluster AP reach hosts outside the cluster through
+    // this node: while the uplink holds an address the AP's traffic is
+    // forwarded to it with NAT (lwIP NAPT, a 16 KiB table taken on first use,
+    // from PSRAM where the board has it), and the AP's DHCP server offers the
+    // uplink's name server.
+    void uplink_up() {
+        if (!ap_netif_ || !sta_netif_) return;
+        esp_netif_dns_info_t dns = {};
+        if (esp_netif_get_dns_info(sta_netif_, ESP_NETIF_DNS_MAIN, &dns) == ESP_OK && dns.ip.u_addr.ip4.addr != 0) {
+            esp_netif_set_dns_info(ap_netif_, ESP_NETIF_DNS_MAIN, &dns);
+        }
+        if (napt_on_) return;
+        // The table must fit: lwIP asserts when it cannot allocate it
+        if (heap_caps_get_largest_free_block(MALLOC_CAP_8BIT) < k_napt_table_bytes + 4096) {
+            ESP_LOGW(TAG, "uplink up, but no %u byte block for the NAT table: cluster AP stations stay without a route out",
+                     (unsigned)k_napt_table_bytes);
+            return;
+        }
+        const size_t internal0 = heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
+        const size_t psram0 = heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
+        if (esp_netif_napt_enable(ap_netif_) != ESP_OK) {
+            ESP_LOGW(TAG, "NAT for the cluster AP could not be enabled");
+            return;
+        }
+        napt_on_ = true;
+        printf("[NET] uplink up: NAT from the cluster AP on, DNS " IPSTR " offered (internal RAM %d bytes, PSRAM %d bytes)\n",
+               IP2STR(&dns.ip.u_addr.ip4), (int)((long)internal0 - (long)heap_caps_get_free_size(MALLOC_CAP_INTERNAL)),
+               (int)((long)psram0 - (long)heap_caps_get_free_size(MALLOC_CAP_SPIRAM)));
+    }
+    void uplink_down() {
+        if (!napt_on_ || !ap_netif_) return;
+        esp_netif_napt_disable(ap_netif_);
+        napt_on_ = false;
+        printf("[NET] uplink down: NAT from the cluster AP off\n");
+    }
+
+    // Before the AP starts: its DHCP server offers a name server (the uplink's
+    // once there is one; none until then) and two-minute leases, so a station
+    // that joined before the uplink came up learns the name server when it
+    // renews, within a minute
+    void prepare_ap_dhcp() {
+        uint8_t offer_dns = 1;
+        esp_netif_dhcps_option(ap_netif_, ESP_NETIF_OP_SET, ESP_NETIF_DOMAIN_NAME_SERVER, &offer_dns, sizeof(offer_dns));
+        uint32_t lease_minutes = 2;
+        esp_netif_dhcps_option(ap_netif_, ESP_NETIF_OP_SET, ESP_NETIF_IP_ADDRESS_LEASE_TIME, &lease_minutes, sizeof(lease_minutes));
     }
 
     // Networks with several APs under one name: the station joins the
@@ -225,7 +282,10 @@ public:
     }
 
     bool start_station_and_softap() override {
-        if (!ap_netif_) ap_netif_ = esp_netif_create_default_wifi_ap();
+        if (!ap_netif_) {
+            ap_netif_ = esp_netif_create_default_wifi_ap();
+            prepare_ap_dhcp();
+        }
         wifi_config_t ap_cfg = {};
         std::strncpy(reinterpret_cast<char*>(ap_cfg.ap.ssid), config_.ap_ssid.c_str(), sizeof(ap_cfg.ap.ssid));
         std::strncpy(reinterpret_cast<char*>(ap_cfg.ap.password), config_.ap_password.c_str(), sizeof(ap_cfg.ap.password));
@@ -291,6 +351,7 @@ private:
     bool connected_{false};
     volatile bool sta_has_ip_{false};
     volatile bool roam_scan_{false};
+    bool napt_on_{false};   // read and written on the event loop task only
     esp_timer_handle_t roam_timer_{nullptr};
 };
 
