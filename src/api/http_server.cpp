@@ -685,10 +685,31 @@ size_t HttpServer::serve_one(Worker& w, osal::Socket& sock, const std::string& c
 
     if (req.invalid_content_length) { send_status_only(sock, 400, "Bad Request"); metrics_.errors.fetch_add(1); return static_cast<size_t>(-1); }
     const bool stream_body = handler_ && (req.content_length > 0 || req.chunked_body) && handler_->streams_body(req);
-    if (req.chunked_body && !stream_body) { send_status_only(sock, 411, "Length Required"); metrics_.errors.fetch_add(1); return static_cast<size_t>(-1); }
     if (!stream_body && req.content_length > options_.max_body_size) { send_status_only(sock, 413, http_reason_phrase(413)); metrics_.errors.fetch_add(1); return static_cast<size_t>(-1); }
 
     size_t body_in_buf = have - header_bytes;
+    // A chunked body for the router (kubectl create --raw -f <file> sends
+    // one) is decoded here, up to max_body_size. What follows it in the
+    // buffer cannot be told apart from it: the connection closes after.
+    const bool chunked_read = req.chunked_body && !stream_body;
+    if (chunked_read) {
+        std::memmove(buf, buf + header_bytes, body_in_buf);
+        HttpConnection reader(sock, req, buf, cap);
+        reader.set_body_stream(body_in_buf, 0, true);
+        while (reader.body_remaining() > 0) {
+            const long n = reader.read_body(buf, cap);
+            if (n < 0) { send_status_only(sock, 400, "Bad Request"); metrics_.errors.fetch_add(1); return static_cast<size_t>(-1); }
+            if (req.body.size() + static_cast<size_t>(n) > options_.max_body_size) {
+                send_status_only(sock, 413, http_reason_phrase(413));
+                metrics_.errors.fetch_add(1);
+                return static_cast<size_t>(-1);
+            }
+            req.body.append(buf, static_cast<size_t>(n));
+        }
+        req.content_length = req.body.size();
+        req.keep_alive = false;
+        body_in_buf = 0;
+    }
     // A chunked body's length is unknown: whatever came with the head is its start
     size_t take = req.chunked_body ? body_in_buf : std::min(body_in_buf, req.content_length);
     size_t leftover = body_in_buf - take;
@@ -697,7 +718,7 @@ size_t HttpServer::serve_one(Worker& w, osal::Socket& sock, const std::string& c
         // front of the buffer for read_body(). A pipelined request after it
         // is not kept: the connection closes after this one.
         std::memmove(buf, buf + header_bytes, take);
-    } else {
+    } else if (!chunked_read) {
         req.body.assign(buf + header_bytes, take);
         while (req.body.size() < req.content_length) {
             size_t needed = std::min(cap, req.content_length - req.body.size());
