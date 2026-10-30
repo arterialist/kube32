@@ -35,6 +35,10 @@ public:
     // Station: leaves the access point and joins it again (the station
     // rejoins by itself after any disconnect). False without a station.
     virtual bool rejoin() { return false; }
+    // Station: stops and starts the Wi-Fi driver, which drops every link
+    // state it kept (802.11w keys included); the station joins again after
+    // the start. False without a station.
+    virtual bool restart_radio() { return false; }
 
     virtual bool is_connected() const = 0;
     // Station: associated and holding an address

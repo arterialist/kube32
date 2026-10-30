@@ -318,6 +318,12 @@ public:
         return esp_wifi_disconnect() == ESP_OK;
     }
 
+    bool restart_radio() override {
+        if (mode_ != NetworkMode::Station && mode_ != NetworkMode::StationAndSoftAP) return false;
+        sta_has_ip_ = false;
+        return esp_wifi_stop() == ESP_OK && esp_wifi_start() == ESP_OK;   // WIFI_EVENT_STA_START joins
+    }
+
     bool is_connected() const override { return connected_; }
     bool station_has_ip() const override { return sta_has_ip_; }
     NetworkMode current_mode() const override { return mode_; }
