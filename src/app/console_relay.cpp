@@ -273,6 +273,10 @@ void ConsoleRelay::end_frame(uint32_t id, bool cut) {
 }
 
 // A whole response from the relay itself
+void ConsoleRelay::refuse(uint32_t id, const char* status) {
+    respond(id, status);
+}
+
 void ConsoleRelay::respond(uint32_t id, const char* status) {
     std::string r = std::string("HTTP/1.1 ") + status + "\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
     if (data_frame(id, r.data(), r.size())) end_frame(id, false);

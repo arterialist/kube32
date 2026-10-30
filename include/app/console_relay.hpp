@@ -60,6 +60,9 @@ public:
     // Starts stream `id` when `request` matches `crc`; answers K32_ERR crc otherwise.
     void open(uint32_t id, uint16_t port, std::string request, uint32_t crc);
     void close(uint32_t id);
+    // Answers stream `id` with `status` ("503 Service Unavailable") without
+    // opening a connection: for a request the node could not take in.
+    void refuse(uint32_t id, const char* status);
 
     static uint32_t crc32(const void* data, size_t len);
 

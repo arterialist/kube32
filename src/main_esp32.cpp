@@ -469,17 +469,34 @@ void console_task(void* arg) {
     // The `len` bytes after a frame header: what rx holds past index i, then
     // further reads of exactly the bytes still missing. Leaves i on the last
     // byte taken from rx, so a frame that follows in the same read is kept.
-    auto read_payload = [&](int& i, int n, size_t len) {
+    // A payload the heap has no room for is read and dropped (`fits` false),
+    // so the bytes after it are still read as frames.
+    auto read_payload = [&](int& i, int n, size_t len, bool& fits) {
         std::string data;
-        data.reserve(len);
+        fits = true;
+        try {
+            data.reserve(len);
+        } catch (const std::bad_alloc&) {
+            fits = false;
+        }
+        size_t got = 0;
         int j = i + 1;
-        while (j < n && data.size() < len) data.push_back(rx[j++]);
+        while (j < n && got < len) {
+            if (fits) data.push_back(rx[j]);
+            ++j;
+            ++got;
+        }
         i = j - 1;
         uint32_t waited = 0;
-        while (data.size() < len && waited < 5000) {
-            size_t want = len - data.size();
+        while (got < len && waited < 5000) {
+            size_t want = len - got;
             int m = con.read(rx, want < sizeof(rx) ? want : sizeof(rx), 100);
-            if (m > 0) data.append(rx, static_cast<size_t>(m)); else waited += 100;
+            if (m > 0) {
+                if (fits) data.append(rx, static_cast<size_t>(m));
+                got += static_cast<size_t>(m);
+            } else {
+                waited += 100;
+            }
         }
         return data;
     };
@@ -498,8 +515,10 @@ void console_task(void* arg) {
             } else if (line.rfind("K32_OPEN ", 0) == 0) {
                 unsigned id = 0, port = 0, len = 0, crc = 0;
                 if (sscanf(line.c_str() + 9, "%u %u %u %x", &id, &port, &len, &crc) == 4 && len > 0 && len < 64 * 1024) {
-                    std::string req = read_payload(i, n, len);
-                    s_relay->open(id, static_cast<uint16_t>(port), std::move(req), crc);
+                    bool fits = true;
+                    std::string req = read_payload(i, n, len, fits);
+                    if (fits) s_relay->open(id, static_cast<uint16_t>(port), std::move(req), crc);
+                    else s_relay->refuse(id, "503 Service Unavailable\r\nRetry-After: 1");
                 }
             } else if (line.rfind("K32_CLOSE ", 0) == 0) {
                 s_relay->close(static_cast<uint32_t>(strtoul(line.c_str() + 10, nullptr, 10)));
@@ -507,7 +526,13 @@ void console_task(void* arg) {
                 unsigned port = 0, len = 0, crc = 0;
                 int fields = sscanf(line.c_str() + 9, "%u %u %x", &port, &len, &crc);
                 if (fields >= 2 && len > 0 && len < 64 * 1024) {
-                    std::string req = read_payload(i, n, len);
+                    bool fits = true;
+                    std::string req = read_payload(i, n, len, fits);
+                    if (!fits) {
+                        con.write("K32_ERR memory\n", 15);
+                        line.clear();
+                        continue;
+                    }
                     if (fields == 3 && crc32_bytes(reinterpret_cast<const uint8_t*>(req.data()), req.size()) != crc) {
                         con.write("K32_ERR crc\n", 12);
                         line.clear();
