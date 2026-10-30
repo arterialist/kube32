@@ -1,5 +1,6 @@
 #include "hal/capability_firewall.hpp"
 #include "models/kube_models.hpp"
+#include "osal/thread.hpp"
 #include <cctype>
 #include <iostream>
 
@@ -28,6 +29,8 @@ void CapabilityFirewall::reset() {
     allocated_adc1_mask_ = 0;
     allocated_i2c_mask_ = 0;
     allocated_uart_mask_ = 0;
+    lent_i2c_mask_ = 0;
+    admissions_ = 0;
 }
 
 void CapabilityFirewall::set_board_profile(const BoardProfile& profile) {
@@ -190,11 +193,55 @@ bool CapabilityFirewall::allocate_generic_adc(uint32_t count, DeviceGrant& grant
 bool CapabilityFirewall::register_pod(const std::string& pod_id, const std::string& pod_manifest_json, std::string& out_error) {
     std::vector<BusAssignment> buses;
     std::vector<RmtAssignment> rmt;
+    begin_admission();
+    bool ok;
     {
         osal::LockGuard guard(mutex_);
-        if (!register_pod_locked(pod_id, pod_manifest_json, buses, rmt, out_error)) return false;
+        ok = register_pod_locked(pod_id, pod_manifest_json, buses, rmt, out_error);
     }
-    return install_drivers(pod_id, buses, rmt, out_error);
+    end_admission();
+    return ok && install_drivers(pod_id, buses, rmt, out_error);
+}
+
+void CapabilityFirewall::begin_admission() {
+    {
+        osal::LockGuard guard(mutex_);
+        ++admissions_;
+    }
+    // A lent bus comes back within milliseconds (one scan of the bus);
+    // no new lend starts while admissions_ is non-zero
+    for (int i = 0; i < 200; ++i) {
+        {
+            osal::LockGuard guard(mutex_);
+            if (lent_i2c_mask_ == 0) return;
+        }
+        osal::Thread::sleep_ms(5);
+    }
+}
+
+void CapabilityFirewall::end_admission() {
+    osal::LockGuard guard(mutex_);
+    if (admissions_ > 0) --admissions_;
+}
+
+bool CapabilityFirewall::lend_i2c_bus(uint8_t bus, BusPins& out_pins) {
+    osal::LockGuard guard(mutex_);
+    if (bus >= 2 || admissions_ > 0 || (lent_i2c_mask_ & (1U << bus)) != 0) return false;
+    if ((profile_.i2c_bus_mask & (1U << bus)) == 0 || !i2c_owners_[bus].empty()) return false;
+    const BusPins pins = profile_.i2c_pins[bus];
+    if (pins.a < 0 || pins.b < 0) return false;
+    const uint64_t claimable = claimable_gpio_mask_locked();
+    for (int8_t pin : {pins.a, pins.b}) {
+        if ((claimable & (1ULL << pin)) == 0 || !gpio_owners_[pin].empty()) return false;
+    }
+    lent_i2c_mask_ |= static_cast<uint8_t>(1U << bus);
+    out_pins = pins;
+    return true;
+}
+
+void CapabilityFirewall::return_i2c_bus(uint8_t bus) {
+    osal::LockGuard guard(mutex_);
+    if (bus < 2) lent_i2c_mask_ &= static_cast<uint8_t>(~(1U << bus));
 }
 
 // Driver installs take milliseconds and touch no firewall state: they run
@@ -598,11 +645,14 @@ std::string CapabilityFirewall::sd_claim(const std::string& pod_id) const {
 bool CapabilityFirewall::grant_capabilities(const std::string& pod_id, const DeviceGrant& grant, std::string& out_error) {
     std::vector<BusAssignment> buses;
     std::vector<RmtAssignment> rmt;
+    begin_admission();
+    bool ok;
     {
         osal::LockGuard guard(mutex_);
-        if (!grant_capabilities_locked(pod_id, grant, buses, rmt, out_error)) return false;
+        ok = grant_capabilities_locked(pod_id, grant, buses, rmt, out_error);
     }
-    return install_drivers(pod_id, buses, rmt, out_error);
+    end_admission();
+    return ok && install_drivers(pod_id, buses, rmt, out_error);
 }
 
 bool CapabilityFirewall::grant_capabilities_locked(const std::string& pod_id, const DeviceGrant& grant, std::vector<BusAssignment>& out_buses,

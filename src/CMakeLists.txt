@@ -41,6 +41,7 @@ set(KUBE32_APP_SRCS
     hal/sd_card.cpp
     hal/node_storage.cpp
     hal/pod_buses.cpp
+    hal/i2c_discovery.cpp
     hal/pod_rmt.cpp
     hal/tft_keyboard_hardware.cpp
     ipc/channel.cpp

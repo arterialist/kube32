@@ -23,6 +23,7 @@
 #include "controller/deployment_controller.hpp"
 #include "controller/workload_controller.hpp"
 #include "hal/capability_firewall.hpp"
+#include "hal/i2c_discovery.hpp"
 #include "kubelet/metrics_provider.hpp"
 #include "esp_sntp.h"
 #include "soc/rtc_cntl_reg.h"
@@ -1081,6 +1082,13 @@ void cluster_task(void* pv) {
     s_api_token_set = valid_token(api_token);
     if (s_api_token_set) kubelet_cfg.api_token = api_token;
     kubelet_cfg.node_labels["kube32.io/board"] = ident.has_display ? "cardputer" : "generic";
+    // Devices answering on the board's I2C pins become node labels
+    kubelet_cfg.node_label_source = [] {
+        static kube32::hal::I2cDiscovery discovery;
+        discovery.scan();
+        return discovery.labels();
+    };
+    kubelet_cfg.node_label_prefix = "i2c.kube32.io/";
 
     if (ident.is_control_plane) {
         // The object store's journal: the raw `journal` partition on a board

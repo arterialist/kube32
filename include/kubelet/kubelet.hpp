@@ -77,6 +77,15 @@ struct KubeletConfig {
     // Labels the node sets on its Node object besides kubernetes.io/hostname,
     // kubernetes.io/arch and the role label (for example kube32.io/board).
     std::map<std::string, std::string> node_labels;
+    // Labels the node finds on itself (attached hardware), read before
+    // registering and every node_label_refresh_ms after; changes are patched
+    // onto the Node: new and changed labels set, vanished ones removed
+    std::function<std::map<std::string, std::string>()> node_label_source;
+    uint32_t node_label_refresh_ms{10000};
+    // Key prefix of the labels node_label_source owns: when the Node outlived
+    // this kubelet (a reboot), its labels with the prefix that are no longer
+    // found are removed
+    std::string node_label_prefix;
     std::string node_ip{"127.0.0.1"};
     // Port of this node's kubelet endpoint (the pod HTTP server: node storage
     // through the API server's node proxy), 0 when the node runs none
@@ -130,6 +139,8 @@ public:
     // Core reconciler loops (invoked sequentially by the main task loop)
     void reconcile_node_registration();
     void refresh_node_ip();
+    void refresh_node_labels();
+    void drop_stale_node_labels();
     void report_heartbeat();
     void sync_assigned_pods();
     void monitor_and_report_pod_statuses();
@@ -202,6 +213,8 @@ private:
     uint64_t last_heartbeat_ms_{0};
     uint64_t last_sync_ms_{0};
     uint64_t last_status_report_ms_{0};
+    uint64_t last_label_refresh_ms_{0};
+    std::map<std::string, std::string> found_labels_;   // from node_label_source, as on the Node
     uint32_t heartbeat_failures_{0};
     // The Node object is written here, allocated at start while the heap is
     // whole: re-registering must work when the heap is fragmented

@@ -135,6 +135,7 @@ else()
         src/hal/sd_card.cpp
         src/hal/node_storage.cpp
         src/hal/pod_buses.cpp
+        src/hal/i2c_discovery.cpp
         src/hal/pod_rmt.cpp
         src/hal/mock_hal.cpp
         src/runtime/host_functions.cpp
@@ -467,6 +468,13 @@ else()
     )
     target_link_libraries(test_pod_buses PRIVATE kube32_core)
     add_test(NAME test_pod_buses COMMAND test_pod_buses)
+
+    # I2C device discovery: bus lending, node labels, label patches
+    add_executable(test_i2c_discovery
+        tests/test_i2c_discovery.cpp
+    )
+    target_link_libraries(test_i2c_discovery PRIVATE kube32_core)
+    add_test(NAME test_i2c_discovery COMMAND test_i2c_discovery)
 
     # RMT (IR) for pods: admission, channel lifecycle, receive queue, node capacity, the irremote example
     add_executable(test_pod_rmt

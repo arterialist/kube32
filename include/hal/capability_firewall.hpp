@@ -137,6 +137,14 @@ public:
     // RMT channels the pod was admitted with
     std::vector<RmtAssignment> pod_rmt(const std::string& pod_id) const;
 
+    // Lends I2C controller `bus` on the board's default pins to the node
+    // itself (device discovery, hal/i2c_discovery.hpp) when the board offers
+    // the bus and no pod holds the controller or the pins. Pod admission
+    // waits until the bus is returned; a lend is refused while an admission
+    // is in progress.
+    bool lend_i2c_bus(uint8_t bus, BusPins& out_pins);
+    void return_i2c_bus(uint8_t bus);
+
     // Reset all allocations and the board profile (used in test teardown)
     void reset();
 
@@ -178,6 +186,9 @@ private:
                          std::string& out_error);
     uint64_t claimable_gpio_mask_locked() const;
     uint16_t claimable_adc1_mask_locked() const;
+    // Marks a pod admission in progress and waits for buses lent to the node
+    void begin_admission();
+    void end_admission();
     uint32_t claimable_rmt_count_locked(RmtDir dir) const;
     uint32_t allocated_rmt_count_locked(RmtDir dir) const;
 
@@ -187,6 +198,8 @@ private:
     uint16_t allocated_adc1_mask_{0};
     uint8_t  allocated_i2c_mask_{0};
     uint8_t  allocated_uart_mask_{0};
+    uint8_t  lent_i2c_mask_{0};    // I2C controllers lent to the node
+    uint32_t admissions_{0};       // pod admissions in progress
     BoardProfile profile_;
 
     // Global Hardware Ownership Registry (for collision detection)

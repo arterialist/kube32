@@ -251,6 +251,10 @@ void Kubelet::run_loop() {
                 if (now - last_status_report_ms_ >= config_.pod_status_frequency_ms) {
                     monitor_and_report_pod_statuses();
                 }
+
+                if (config_.node_label_source && now - last_label_refresh_ms_ >= config_.node_label_refresh_ms) {
+                    refresh_node_labels();
+                }
             }
         } catch (const std::exception& e) {
             std::cout << "[KUBELET] loop iteration failed: " << e.what() << " (free heap "
@@ -266,6 +270,7 @@ void Kubelet::run_loop() {
 void Kubelet::reconcile_node_registration() {
     refresh_node_ip();
     if (registered_.load()) return;
+    if (config_.node_label_source && last_label_refresh_ms_ == 0) refresh_node_labels();
 
     NodeTelemetry t = status_reporter_->collect_telemetry();
     fill_ready_condition(t);
@@ -284,11 +289,71 @@ void Kubelet::reconcile_node_registration() {
     if (ok) {
         // The Node object survived this kubelet (a worker reboot): bring its
         // labels, nodeInfo and capacity up to date with this boot.
-        if (conflict) api_client_->patch_node_status(config_.node_name, reg_json);
+        if (conflict) {
+            api_client_->patch_node_status(config_.node_name, reg_json);
+            drop_stale_node_labels();
+        }
         registered_.store(true);
         report_heartbeat();
         last_heartbeat_ms_ = osal::System::get_uptime_ms();
     }
+}
+
+void Kubelet::refresh_node_labels() {
+    last_label_refresh_ms_ = osal::System::get_uptime_ms();
+    std::map<std::string, std::string> found = config_.node_label_source();
+    if (found == found_labels_) return;
+    if (registered_.load()) {
+        // JSON merge patch: null removes a label
+        std::string patch = "{\"metadata\":{\"labels\":{";
+        bool first = true;
+        auto add = [&](const std::string& key, const std::string* value) {
+            if (!first) patch += ",";
+            first = false;
+            patch += "\"" + key + "\":";
+            patch += value ? "\"" + *value + "\"" : std::string("null");
+        };
+        for (const auto& kv : found) {
+            auto it = found_labels_.find(kv.first);
+            if (it == found_labels_.end() || it->second != kv.second) add(kv.first, &kv.second);
+        }
+        for (const auto& kv : found_labels_) {
+            if (!found.count(kv.first)) add(kv.first, nullptr);
+        }
+        patch += "}}}";
+        if (!api_client_->patch_node_status(config_.node_name, patch)) return;   // tried again next round
+    }
+    for (const auto& kv : found) {
+        auto it = found_labels_.find(kv.first);
+        if (it == found_labels_.end() || it->second != kv.second) std::cout << "[KUBELET] node label " << kv.first << "=" << kv.second << std::endl;
+    }
+    for (const auto& kv : found_labels_) {
+        if (!found.count(kv.first)) std::cout << "[KUBELET] node label " << kv.first << " removed" << std::endl;
+    }
+    found_labels_ = std::move(found);
+    std::map<std::string, std::string> labels = config_.node_labels;
+    labels.insert(found_labels_.begin(), found_labels_.end());   // configured labels win
+    status_reporter_->set_labels(labels);
+}
+
+void Kubelet::drop_stale_node_labels() {
+    if (config_.node_label_prefix.empty()) return;
+    std::string body;
+    if (api_client_->get("/api/v1/nodes/" + config_.node_name, body) != 200) return;
+    models::JsonValue doc;
+    std::string err;
+    if (!models::parse_json(body, doc, err) || !doc.is_object()) return;
+    const models::JsonValue* meta = doc.get("metadata");
+    const models::JsonValue* labels = meta ? meta->get("labels") : nullptr;
+    if (!labels || !labels->is_object()) return;
+    std::string patch;
+    for (const auto& kv : labels->obj_val) {
+        if (kv.first.rfind(config_.node_label_prefix, 0) != 0 || found_labels_.count(kv.first)) continue;
+        patch += patch.empty() ? "{\"metadata\":{\"labels\":{" : ",";
+        patch += "\"" + kv.first + "\":null";
+        std::cout << "[KUBELET] node label " << kv.first << " removed" << std::endl;
+    }
+    if (!patch.empty()) api_client_->patch_node_status(config_.node_name, patch + "}}}");
 }
 
 void Kubelet::refresh_node_ip() {

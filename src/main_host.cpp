@@ -1,5 +1,6 @@
 #include "osal/socket.hpp"
 #include "hal/sd_card.hpp"
+#include "hal/i2c_discovery.hpp"
 #include "hal/node_storage.hpp"
 #include "storage/flash_log.hpp"
 #include "osal/thread.hpp"
@@ -324,6 +325,12 @@ int main(int argc, char* argv[]) {
         kubelet_cfg.heartbeat_interval_ms = opts.lease_interval_ms;
         kubelet_cfg.api_token = opts.token;
         kubelet_cfg.node_labels["kube32.io/board"] = opts.board;
+        kubelet_cfg.node_label_source = [] {
+            static kube32::hal::I2cDiscovery discovery;
+            discovery.scan();
+            return discovery.labels();
+        };
+        kubelet_cfg.node_label_prefix = "i2c.kube32.io/";
         kubelet_cfg.kubelet_port = opts.pod_port;
 
         // k32_http_call: Services resolved through the API server; the
@@ -549,6 +556,13 @@ int main(int argc, char* argv[]) {
         kubelet_cfg.heartbeat_interval_ms = opts.lease_interval_ms;
         kubelet_cfg.api_token = opts.token;
         kubelet_cfg.node_labels["kube32.io/board"] = opts.board;
+        // The simulator's own buses belong to this node, not to the extra workers
+        kubelet_cfg.node_label_source = [] {
+            static kube32::hal::I2cDiscovery discovery;
+            discovery.scan();
+            return discovery.labels();
+        };
+        kubelet_cfg.node_label_prefix = "i2c.kube32.io/";
         kubelet_cfg.kubelet_port = pod_server ? opts.pod_port : 0;
         local_kubelet = std::make_unique<kube32::kubelet::Kubelet>(kubelet_cfg, *wasm_runtime);
         local_kubelet->start();
@@ -559,6 +573,8 @@ int main(int argc, char* argv[]) {
             wcfg.node_name = worker;
             wcfg.control_plane = false;
             wcfg.node_labels["kube32.io/board"] = opts.worker_board;
+            wcfg.node_label_source = nullptr;
+            wcfg.node_label_prefix.clear();
             worker_kubelets.push_back(std::make_unique<kube32::kubelet::Kubelet>(wcfg, *wasm_runtime));
             worker_kubelets.back()->start();
             std::cout << "[INIT] Kubelet running for simulated node " << worker << " (worker)." << std::endl;

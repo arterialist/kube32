@@ -119,6 +119,29 @@ Calling `esp32_i2c_write(bus, addr, ptr, 0)` with `len` set to `0` probes `addr`
 * Returns `0` (`K32_OK`) when a device at `addr` acknowledges.
 * Returns `-19` (`K32_ERR_NODEV`) when no device answers.
 
+### Device discovery
+
+Each node probes its board's default I2C pins (I2C0 on GPIO 8/9 on a devkit, I2C0 on the Grove port GPIO 2/1 on the Cardputer) before it registers and every 10 seconds after (`src/hal/i2c_discovery.cpp`). Each address that acknowledges a zero-length write becomes a node label, so a pod can select the node with that device attached:
+
+| Label | Value |
+| --- | --- |
+| `i2c.kube32.io/0x<address>` | `bus-<n>`, the lowest bus the address answers on |
+
+```yaml
+spec:
+  nodeSelector:
+    i2c.kube32.io/0x28: bus-0
+```
+
+```
+kubectl --context kube32 get nodes -L i2c.kube32.io/0x28
+```
+
+* A scan runs only when no pod holds the controller or its pins. While a pod holds a bus, the node keeps the labels from the last scan. Pod admission waits while a scan holds the bus (one scan takes milliseconds).
+* If the bus lines read low with internal pull-ups enabled, something other than an idle I2C bus drives them. The node skips the scan and reports no devices on that bus.
+* The kubelet patches label changes onto its Node: it adds labels for detected devices and removes labels for devices that stop answering. When a node re-registers after a reboot, it removes `i2c.kube32.io/` labels it no longer finds.
+* As in Kubernetes, removing a label does not evict a running pod.
+
 ## Infrared (RMT)
 
 The ESP32-S3 RMT peripheral sends and captures pulse trains, the signal of infrared remote controls. A pod claims one transmit channel (`esp32.io/rmt-tx: "1"`), one receive channel (`esp32.io/rmt-rx: "1"`), or one of each. The chip has four channels of each direction; a node advertises at most four of each and only as many as it has pins for, so a profile without a claimable pin for a direction advertises none of it.
