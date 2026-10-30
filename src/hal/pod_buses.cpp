@@ -47,6 +47,19 @@ int32_t esp_to_hal(esp_err_t e) {
 }
 #endif
 
+#if defined(ESP_PLATFORM)
+// A failed transfer can leave a device's I2C logic mid-byte, holding SDA or
+// ignoring its address until it sees a STOP: clock the bus free (nine SCL
+// pulses, then a STOP) before the next transfer. Slot mutex held.
+int32_t i2c_failed(I2cSlot& s, unsigned index, uint8_t addr, esp_err_t e) {
+    if (s.bus) i2c_master_bus_reset(s.bus);
+    if (++s.state.recoveries <= 3 || s.state.recoveries % 100 == 0) {
+        printf("[HAL] I2C%u: %s talking to 0x%02x, bus cleared (%u times)\n", index, esp_err_to_name(e), addr, (unsigned)s.state.recoveries);
+    }
+    return e == ESP_ERR_TIMEOUT ? HAL_ERR_TIMEDOUT : HAL_ERR_IO;
+}
+#endif
+
 // Slot mutex held by the caller
 bool install_i2c(I2cSlot& s, const std::string& pod_id, const BusAssignment& b, std::string& err) {
 #if defined(ESP_PLATFORM)
@@ -70,6 +83,7 @@ bool install_i2c(I2cSlot& s, const std::string& pod_id, const BusAssignment& b, 
     s.state.pin_b = b.pin_b;
     s.state.speed = b.speed ? b.speed : kDefaultI2cHz;
     s.state.installs++;
+    s.state.recoveries = 0;
     printf("[HAL] I2C%u installed for %s: SDA %u, SCL %u, %u Hz\n", b.index, pod_id.c_str(), b.pin_a, b.pin_b, (unsigned)s.state.speed);
     return true;
 }
@@ -211,7 +225,7 @@ int32_t i2c_bus_write(uint32_t bus, uint8_t addr, const uint8_t* data, size_t le
         s.dev_addr = addr;
     }
     esp_err_t e = i2c_master_transmit(s.dev, data, len, 100);
-    return e == ESP_OK ? static_cast<int32_t>(len) : (e == ESP_ERR_TIMEOUT ? HAL_ERR_TIMEDOUT : HAL_ERR_IO);
+    return e == ESP_OK ? static_cast<int32_t>(len) : i2c_failed(s, bus, addr, e);
 #else
     static const uint8_t none = 0;
     int32_t r = MockHal::instance().i2c_write(bus, addr, len ? data : &none, len);
@@ -239,7 +253,7 @@ int32_t i2c_bus_read(uint32_t bus, uint8_t addr, uint8_t* buf, size_t len) {
         s.dev_addr = addr;
     }
     esp_err_t e = i2c_master_receive(s.dev, buf, len, 100);
-    return e == ESP_OK ? static_cast<int32_t>(len) : (e == ESP_ERR_TIMEOUT ? HAL_ERR_TIMEDOUT : HAL_ERR_IO);
+    return e == ESP_OK ? static_cast<int32_t>(len) : i2c_failed(s, bus, addr, e);
 #else
     return MockHal::instance().i2c_read(bus, addr, buf, len);
 #endif

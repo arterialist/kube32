@@ -56,6 +56,7 @@ struct BusState {
     uint8_t pin_b{0};
     uint32_t speed{0};
     uint32_t installs{0};   // driver installs since boot
+    uint32_t recoveries{0}; // bus clears after failed transfers since the install
 };
 BusState i2c_bus_state(uint32_t bus);
 BusState uart_port_state(uint32_t port);

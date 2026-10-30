@@ -110,6 +110,8 @@ After admission succeeds, `src/hal/pod_buses.cpp` installs the ESP-IDF driver on
 
 When the pod stops or is deleted, `unregister_pod` deletes the driver with `i2c_del_master_bus` or `uart_driver_delete`, resets the GPIO pins with `gpio_reset_pin`, and releases the pin and bus claims.
 
+After a failed I2C transfer, the driver clears the bus with `i2c_master_bus_reset` (nine SCL pulses followed by a STOP condition) so a device stuck mid-byte releases SDA before the next transfer. The node console logs `[HAL] I2C<n>: <error> talking to 0x<address>, bus cleared (<count> times)` for the first three clears after driver installation and every hundredth clear after.
+
 ### I2C address probing
 
 Calling `esp32_i2c_write(bus, addr, ptr, 0)` with `len` set to `0` probes `addr` using `i2c_master_probe` with a 50 ms timeout:
