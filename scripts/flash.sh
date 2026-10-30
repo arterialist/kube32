@@ -3,6 +3,11 @@
 #
 #   scripts/flash.sh <serial port> [baud]
 #
+# Writes the bootloader, the partition table, an empty otadata partition and
+# the firmware into the first app slot, at the offsets partitions.csv gives:
+# the board boots the image just flashed, whichever slot a firmware rollout
+# had switched it to. NVS and the object store journal are left as they are.
+#
 # Builds the esp32s3 environment first if the images are missing. PlatformIO
 # is taken from PATH, then from $PLATFORMIO_CORE_DIR or ~/.platformio.
 set -e
@@ -42,6 +47,7 @@ echo "flashing $PORT at $BAUD baud"
 BOOTLOADER=".pio/build/esp32s3/bootloader.bin"
 PARTITIONS=".pio/build/esp32s3/partitions.bin"
 FIRMWARE=".pio/build/esp32s3/firmware.bin"
+OTADATA=".pio/build/esp32s3/ota_data_initial.bin"
 
 if [ ! -f "$FIRMWARE" ] || [ ! -f "$BOOTLOADER" ] || [ ! -f "$PARTITIONS" ]; then
     if [ -z "$PIO" ]; then
@@ -61,6 +67,29 @@ baud = int("$BAUD")
 bootloader = "$BOOTLOADER"
 partitions = "$PARTITIONS"
 firmware = "$FIRMWARE"
+otadata = "$OTADATA"
+
+# Offsets from partitions.csv: otadata, and the first app slot (ota_0)
+otadata_offset = app_offset = None
+with open("partitions.csv") as f:
+    for line in f:
+        cols = [c.strip() for c in line.split("#", 1)[0].split(",")]
+        if len(cols) < 5 or not cols[3]:
+            continue
+        if cols[1] == "data" and cols[2] == "ota":
+            otadata_offset, otadata_size = int(cols[3], 0), int(cols[4], 0)
+        elif cols[1] == "app" and app_offset is None:
+            app_offset = int(cols[3], 0)
+if app_offset is None:
+    sys.exit("partitions.csv has no app partition")
+images = ['0x0', bootloader, '0x8000', partitions]
+if otadata_offset is not None:
+    # Erased otadata: the bootloader starts from the first app slot
+    if not os.path.exists(otadata):
+        with open(otadata, "wb") as f:
+            f.write(b"\xff" * otadata_size)
+    images += [hex(otadata_offset), otadata]
+images += [hex(app_offset), firmware]
 
 
 # CH340-style USB-UART bridges (VID 0x1a86) drop bytes with esptool's default
@@ -100,10 +129,7 @@ sys.argv = [
     '--flash-mode', 'dio',
     '--flash-size', '8MB',
     '--flash-freq', '80m',
-    '0x0', bootloader,
-    '0x8000', partitions,
-    '0x20000', firmware
-]
+] + images
 
 esptool._main()
 EOF

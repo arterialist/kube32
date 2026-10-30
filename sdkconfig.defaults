@@ -5,6 +5,9 @@ CONFIG_ESPTOOLPY_FLASHSIZE_8MB=y
 CONFIG_PARTITION_TABLE_CUSTOM=y
 CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
 CONFIG_PARTITION_TABLE_FILENAME="partitions.csv"
+# A firmware rollout boots the new image unconfirmed: a reset before it
+# confirms itself brings the previous slot back (docs/firmware-updates.md)
+CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE=y
 CONFIG_ESP32S3_SPIRAM_SUPPORT=y
 CONFIG_SPIRAM_MODE_QUAD=y
 CONFIG_SPIRAM_TYPE_AUTO=y
