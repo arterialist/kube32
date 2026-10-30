@@ -90,6 +90,7 @@
 #include "freertos/task.h"
 #include "driver/usb_serial_jtag.h"
 #include "driver/usb_serial_jtag_vfs.h"
+#include "hal/usb_serial_jtag_ll.h"
 #include "driver/uart.h"
 #include "driver/uart_vfs.h"
 
@@ -248,6 +249,29 @@ struct Console {
     bool last_from_usb{true};
     void init(bool usb_only) {
         if (!usb_serial_jtag_is_driver_installed()) {
+            // A reset other than power-on keeps the USB link of the boot
+            // before, and the clock changes at app start can leave it
+            // wedged: the host then receives nothing until the board is
+            // unplugged. Drop off the bus for a moment (D+ and D- pulled
+            // low) so the host enumerates the port again, as after a replug.
+            if (esp_reset_reason() != ESP_RST_POWERON) {
+                usb_serial_jtag_pull_override_vals_t pulls = {};
+                pulls.dp_pd = true;
+                pulls.dm_pd = true;
+                usb_serial_jtag_ll_phy_enable_pull_override(&pulls);
+                vTaskDelay(pdMS_TO_TICKS(100));
+                // Back to the reset values (D+ pull-up on) before the PHY
+                // takes the pulls over again: it keeps the register's bits
+                pulls = {};
+                pulls.dp_pu = true;
+                usb_serial_jtag_ll_phy_enable_pull_override(&pulls);
+                usb_serial_jtag_ll_phy_disable_pull_override();
+            }
+            // The early console flushes the TX FIFO only at a newline. A
+            // partial line left in it keeps the FIFO from ever emptying, and
+            // the driver sends nothing until it has emptied once: the port
+            // stays silent until a power cycle. Send whatever is pending first.
+            usb_serial_jtag_ll_txfifo_flush();
             // Console lines are short and writes wait for room: small rings
             // on a board without PSRAM, whose internal RAM pods need
             const bool psram = heap_caps_get_total_size(MALLOC_CAP_SPIRAM) > 0;

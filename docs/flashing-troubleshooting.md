@@ -24,6 +24,8 @@ Flash a board running the single-app partition table once with a current build t
 
 The firmware listens for newline-terminated commands up to 512 characters on USB serial at 115200 baud. Generic boards listen on both native USB-Serial/JTAG and UART0, answering on the port that received the command. The Cardputer profile listens on USB only.
 
+After any reset other than power-on (such as a reboot, a panic, or a firmware update), the board disconnects from the USB bus for 100 ms before starting its console. This causes the host to re-enumerate the port, and programs holding the port, including `tools/kube32_serial_gateway.py`, reopen it. The board blocks on whichever console port received the last bytes and only polls the other port, so a request streaming in over USB loses no bytes while UART0 is idle.
+
 Opening the USB port on a Cardputer or the CH340 port on a devkit resets the board. Wait for the boot log to finish before sending commands.
 
 ### Board profile
