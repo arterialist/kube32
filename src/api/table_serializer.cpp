@@ -9,6 +9,26 @@
 
 namespace kube32::api {
 
+namespace {
+// The labels of a row's object, as kubectl reads them for --show-labels and
+// -L: ,"labels":{...} inside the PartialObjectMetadata's metadata
+bool write_labels(ChunkedStreamWriter& w, const std::map<std::string, std::string>& labels) {
+    if (labels.empty()) return true;
+    if (!w.write(",\"labels\":{")) return false;
+    bool first = true;
+    for (const auto& kv : labels) {
+        if (!w.write(first ? "\"" : ",\"") || !w.write_escaped_json(kv.first.c_str()) || !w.write("\":\"") ||
+            !w.write_escaped_json(kv.second.c_str()) || !w.write("\"")) {
+            return false;
+        }
+        first = false;
+    }
+    return w.write("}");
+}
+} // namespace
+
+static std::string labels_field(const std::map<std::string, std::string>& labels);
+
 void TableSerializer::format_age(uint64_t duration_sec, char* out_buf, size_t out_buf_len) {
     if (out_buf_len == 0) return;
     if (duration_sec == models::AGE_UNKNOWN) {
@@ -123,7 +143,7 @@ bool TableSerializer::write_node_row(ChunkedStreamWriter& writer, const models::
     if (!writer.write(node.container_runtime.empty() ? "<unknown>" : node.container_runtime.c_str())) return false;
     if (!writer.write("\"],\"object\":{\"kind\":\"PartialObjectMetadata\",\"apiVersion\":\"meta.k8s.io/v1\",\"metadata\":{\"name\":\"")) return false;
     if (!writer.write_escaped_json(node.name.c_str())) return false;
-    if (!writer.write("\"}}}")) return false;
+    if (!writer.write("\"") || !write_labels(writer, node.labels) || !writer.write("}}}")) return false;
 
     osal::Thread::yield();
     return true;
@@ -169,7 +189,7 @@ bool TableSerializer::write_pod_row(ChunkedStreamWriter& writer, const models::K
     if (!writer.write_escaped_json(pod.name.c_str())) return false;
     if (!writer.write("\",\"namespace\":\"")) return false;
     if (!writer.write_escaped_json(pod.namespace_name.c_str())) return false;
-    if (!writer.write("\"}}}")) return false;
+    if (!writer.write("\"") || !write_labels(writer, pod.labels) || !writer.write("}}}")) return false;
 
     osal::Thread::yield();
     return true;
@@ -407,7 +427,7 @@ std::string TableSerializer::build_nodes_table_json(const std::vector<std::strin
                  (node.kernel_version.empty() ? "<unknown>" : node.kernel_version) + "\",\"" +
                  (node.container_runtime.empty() ? "<unknown>" : node.container_runtime) + "\"],"
                  "\"object\":{\"kind\":\"PartialObjectMetadata\",\"apiVersion\":\"meta.k8s.io/v1\",\"metadata\":{\"name\":\"" +
-                 node.name + "\"}}}";
+                 node.name + "\"" + labels_field(node.labels) + "}}}";
     }
     clean += "]}";
     return clean;
@@ -438,7 +458,7 @@ std::string TableSerializer::build_pods_table_json(const std::vector<std::string
                  age_buf + "\",\"" + (pod.ip.empty() ? "<none>" : pod.ip) + "\",\"" +
                  (pod.node_name.empty() ? "<none>" : pod.node_name) + "\",\"<none>\",\"<none>\"],"
                  "\"object\":{\"kind\":\"PartialObjectMetadata\",\"apiVersion\":\"meta.k8s.io/v1\",\"metadata\":{\"name\":\"" +
-                 pod.name + "\",\"namespace\":\"" + pod.namespace_name + "\"}}}";
+                 pod.name + "\",\"namespace\":\"" + pod.namespace_name + "\"" + labels_field(pod.labels) + "}}}";
     }
     clean += "]}";
     return clean;
@@ -534,6 +554,19 @@ static std::string json_cell(const std::string& v) {
     }
     out += "\"";
     return out;
+}
+
+// ,"labels":{...} for a row's PartialObjectMetadata (kubectl --show-labels, -L)
+static std::string labels_field(const std::map<std::string, std::string>& labels) {
+    if (labels.empty()) return std::string();
+    std::string out = ",\"labels\":{";
+    bool first = true;
+    for (const auto& kv : labels) {
+        if (!first) out += ",";
+        first = false;
+        out += json_cell(kv.first) + ":" + json_cell(kv.second);
+    }
+    return out + "}";
 }
 
 static std::string col(const char* name, int priority) {
@@ -764,6 +797,9 @@ std::string TableSerializer::build_generic_table_json(std::string_view kind, con
         }
         out += "],\"object\":{\"kind\":\"PartialObjectMetadata\",\"apiVersion\":\"meta.k8s.io/v1\",\"metadata\":{\"name\":" + json_cell(name);
         if (!ns.empty()) out += ",\"namespace\":" + json_cell(ns);
+        if (const models::JsonValue* labels = meta ? meta->get("labels") : nullptr; labels && labels->is_object() && !labels->obj_val.empty()) {
+            out += ",\"labels\":" + labels->to_string();
+        }
         out += "}}}";
     }
     out += "]}";
