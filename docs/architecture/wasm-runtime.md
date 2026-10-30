@@ -32,7 +32,7 @@ Unresolved images or images too large for node memory fail the pod with `ErrImag
 
 ## Memory admission
 
-Before a pod starts, the kubelet estimates the memory it needs to load: value stack, linear memory, compiled code (about 3.2 times the code section on a 32-bit board), module structures, host-side state and the compiler's scratch. It compares the estimate with what pods can still be given: the free part of the pool block, the general heap above the system reserve, and PSRAM above a 16 KiB stack reserve. On a board without PSRAM only the pool block counts: free general heap is what Wi-Fi and lwIP need in a burst.
+Before a pod starts, the kubelet estimates the memory it needs to load: value stack, linear memory, compiled code (about 3.2 times the code section on a 32-bit board), module structures, host-side state and the compiler's scratch. It compares the estimate with what pods can still be given: the free part of the pool block, the general heap above the system reserve, and PSRAM above its system reserve (128 KiB on a control plane, 64 KiB on a worker with PSRAM). The API server, object store, console relay, NAT, and firmware staging use this reserve. Control plane use peaks about 109 KiB above its boot level while staging a 3 MB image and serving lists and a watch. On a board without PSRAM only the pool block counts: free general heap is what Wi-Fi and lwIP need in a burst.
 
 | Outcome | Pod status | Event |
 | --- | --- | --- |

@@ -935,11 +935,12 @@ void log_memory(const char* stage) {
     if (const uint32_t n = s_alloc_fail_count.exchange(0)) {
         snprintf(failed, sizeof(failed), "  %u failed alloc(s), last %u bytes", (unsigned)n, (unsigned)s_alloc_fail_bytes.load());
     }
-    printf("[MEM] %-22s internal free %6u (min %6u, largest %6u)  psram free %7u%s\n", stage,
+    printf("[MEM] %-22s internal free %6u (min %6u, largest %6u)  psram free %7u (min %7u)%s\n", stage,
            (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
            (unsigned)heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
            (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
-           (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM), failed);
+           (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM),
+           (unsigned)heap_caps_get_minimum_free_size(MALLOC_CAP_SPIRAM), failed);
 }
 
 void cluster_task(void* pv) {
@@ -981,8 +982,13 @@ void cluster_task(void* pv) {
             kube32_interp_stack_set(interp, interp_size);
             kube32::runtime::AppPodHost::instance().set_event_thread_stack(8192, true);
         }
+        // PSRAM pods' code and structures may not take. A control plane's
+        // own use peaked 109 KiB above its boot level (API lists and a watch,
+        // the store, the console relay, NAT and staging a 3 MB image)
+        kube32_pool_set_psram_reserve(ident.is_control_plane ? 128 * 1024 : 64 * 1024);
     }
-    printf("[MEM] reserved %u bytes for pod linear memory\n", (unsigned)kube32_pool_block_size());
+    printf("[MEM] reserved %u bytes for pod linear memory, %u bytes of PSRAM for the system\n", (unsigned)kube32_pool_block_size(),
+           (unsigned)kube32_pool_psram_reserve());
 
     // Peripherals of the integrated display board
     bool has_display = false;

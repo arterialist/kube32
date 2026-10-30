@@ -826,7 +826,9 @@ bool Kubelet::deploy_and_start_pod(const models::KubePod& pod_in, const std::str
         const size_t need = runtime::estimate_pod_memory(module, module_len, rec.memory_limit_bytes, wasm_stack);
         size_t capacity = 0;
         const size_t room = kube32_pool_pod_room(rec.memory_limit_bytes, &capacity);
-        const std::string reserve = kib(kube32_pool_system_reserve());
+        const std::string reserve = osal::System::get_total_psram_bytes() > 0
+            ? kib(kube32_pool_system_reserve()) + " of internal RAM and " + kib(kube32_pool_psram_reserve()) + " of PSRAM"
+            : kib(kube32_pool_system_reserve());
         if (need > capacity) {
             const std::string why = "Pod was rejected: Node didn't have enough resource: memory, needs about " + kib(need) +
                                     ", the node can give pods at most " + kib(capacity) + " (" + reserve + " kept for the system)";

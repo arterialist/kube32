@@ -32,6 +32,8 @@ All notable changes to this project will be documented in this file. The format 
 
 ### Fixed
 
+- Pods leave a PSRAM reserve for the system (128 KiB on a control plane, 64 KiB on a worker with PSRAM). Without this reserve, pod code and structures can drop free PSRAM to 16 KiB, causing API requests to fail with 503 and firmware staging to run the control plane out of memory.
+- The USB console survives software resets: on any non-power-on reset, the board disconnects from the USB bus for 100 ms so the host enumerates the port again, and it flushes any partial line from the early console before its driver starts. Previously, a reboot could leave the port silent until the board is unplugged.
 - Fix loading inline and SD card images placed in PSRAM: the ESP32-S3 maps flash and PSRAM into a single address range, which caused the loader to treat the pod's PSRAM copy as flash and free it.
 - Include object metadata labels in Table rows so `kubectl get --show-labels` and `-L` display them.
 - Clear the I2C bus after a failed transfer.

@@ -248,7 +248,10 @@ static std::atomic<size_t> s_general_bytes{0};
 static std::atomic<size_t> s_psram_bytes{0};
 static size_t s_heap_budget = 0;                    // 0: not modelled
 static const size_t k_system_reserve_default = 16 * 1024;
-static const size_t k_psram_stack_reserve = 16 * 1024;   // PSRAM kept for thread stacks made later
+// PSRAM pods are never given: thread stacks made later, and on a control
+// plane the API server, the object store, the console relay and firmware
+// staging (kube32_pool_set_psram_reserve)
+static std::atomic<size_t> s_psram_reserve{16 * 1024};
 
 static size_t general_size(void* p) {
 #if defined(ESP_PLATFORM)
@@ -296,6 +299,8 @@ void kube32_pool_set_heap_budget(size_t bytes) { s_heap_budget = bytes; }
 size_t kube32_pool_heap_budget(void) { return s_heap_budget; }
 size_t kube32_pool_general_bytes(void) { return s_general_bytes.load(); }
 size_t kube32_pool_system_reserve(void) { return system_reserve(); }
+void kube32_pool_set_psram_reserve(size_t bytes) { s_psram_reserve.store(bytes); }
+size_t kube32_pool_psram_reserve(void) { return s_psram_reserve.load(); }
 
 size_t kube32_pool_pod_room(size_t memory_bytes, size_t* out_capacity) {
     size_t room = 0;
@@ -311,7 +316,7 @@ size_t kube32_pool_pod_room(size_t memory_bytes, size_t* out_capacity) {
         const size_t internal = heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
         if (!(s_block && !s_external)) room = internal > system_reserve() ? internal - system_reserve() : 0;
         const size_t psram = heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
-        if (psram > k_psram_stack_reserve) room += psram - k_psram_stack_reserve;
+        if (psram > s_psram_reserve.load()) room += psram - s_psram_reserve.load();
 #else
         room = static_cast<size_t>(1) << 30;   // the host's heap: not modelled
 #endif
@@ -368,7 +373,7 @@ void* kube32_rt_calloc(size_t bytes) {
 #if defined(ESP_PLATFORM)
     // Keep a small PSRAM reserve for stacks allocated later; everything else
     // the interpreter needs is better off external than in the 300 KB SRAM.
-    if (heap_caps_get_free_size(MALLOC_CAP_SPIRAM) > bytes + k_psram_stack_reserve) {
+    if (heap_caps_get_free_size(MALLOC_CAP_SPIRAM) > bytes + s_psram_reserve.load()) {
         void* p = heap_caps_calloc(bytes, 1, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
         if (p) {
             s_psram_bytes.fetch_add(general_size(p));
@@ -405,7 +410,7 @@ void* kube32_rt_realloc(void* ptr, size_t bytes) {
         // Grown in place in PSRAM, or moved to wherever kube32_rt_calloc finds room
         void* p = nullptr;
 #if defined(ESP_PLATFORM)
-        if (bytes <= old || heap_caps_get_free_size(MALLOC_CAP_SPIRAM) > (bytes - old) + k_psram_stack_reserve) {
+        if (bytes <= old || heap_caps_get_free_size(MALLOC_CAP_SPIRAM) > (bytes - old) + s_psram_reserve.load()) {
             p = heap_caps_realloc(ptr, bytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
         }
 #endif

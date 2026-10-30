@@ -61,11 +61,16 @@ void  kube32_pool_prefer_general(int on);
  * (the host modelling a board's heap) pods may hold at most budget - reserve. */
 size_t kube32_pool_general_bytes(void);
 size_t kube32_pool_system_reserve(void);
+/* PSRAM pods are never given (default 16 KiB, for thread stacks made later).
+ * A control plane keeps more for the API server, the object store, the
+ * console relay and firmware staging. Set at boot. */
+void  kube32_pool_set_psram_reserve(size_t bytes);
+size_t kube32_pool_psram_reserve(void);
 void  kube32_pool_set_heap_budget(size_t bytes);
 size_t kube32_pool_heap_budget(void);
 /* Bytes a pod whose linear memory is `memory_bytes` could be given now: the
  * pool block's free part, the general heap above the system reserve (on
- * the board, not with an internal pool block) and PSRAM above its stack
+ * the board, not with an internal pool block) and PSRAM above its
  * reserve. *out_capacity (optional) adds what pods
  * hold already: what the pod could be given with no other pod running. */
 size_t kube32_pool_pod_room(size_t memory_bytes, size_t* out_capacity);
