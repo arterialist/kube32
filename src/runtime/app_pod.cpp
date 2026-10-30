@@ -293,6 +293,11 @@ static const void* raw_time_ms(IM3Runtime, IM3ImportContext, uint64_t* sp, void*
     return m3Err_none;
 }
 
+static const void* raw_unix_time_ms(IM3Runtime, IM3ImportContext, uint64_t* sp, void*) {
+    *reinterpret_cast<int64_t*>(sp) = static_cast<int64_t>(osal::System::get_unix_time_ms());
+    return m3Err_none;
+}
+
 static const void* raw_log(IM3Runtime rt, IM3ImportContext ictx, uint64_t* sp, void* mem) {
     uint32_t off = static_cast<uint32_t>(sp[0]);
     uint32_t len = static_cast<uint32_t>(sp[1]);
@@ -623,6 +628,7 @@ void link_app_host_functions(IM3Module module, const std::string& pod_id) {
     m3_LinkRawFunction(module, "env", "k32_resp_end",     "v()",        &raw_resp_end);
     m3_LinkRawFunction(module, "env", "k32_event_emit",   "i(iiii)",    &raw_event_emit);
     m3_LinkRawFunction(module, "env", "k32_time_ms",      "I()",        &raw_time_ms);
+    m3_LinkRawFunction(module, "env", "k32_unix_time_ms", "I()",        &raw_unix_time_ms);
     m3_LinkRawFunction(module, "env", "k32_log",          "v(ii)",      &raw_log);
     m3_LinkRawFunction(module, "env", "k32_random",       "i()",        &raw_random);
     m3_LinkRawFunction(module, "env", "k32_env_get",      "i(iiii)",    &raw_env_get);

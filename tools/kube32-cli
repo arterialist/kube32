@@ -71,6 +71,7 @@ APP_IMPORTS = {
     "k32_resp_end": "v()",
     "k32_event_emit": "i(iiii)",
     "k32_time_ms": "I()",
+    "k32_unix_time_ms": "I()",
     "k32_log": "v(ii)",
     "k32_random": "i()",
     "k32_env_get": "i(iiii)",

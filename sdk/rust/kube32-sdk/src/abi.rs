@@ -23,6 +23,7 @@ extern "C" {
 
     // Node services
     pub fn k32_time_ms() -> i64;
+    pub fn k32_unix_time_ms() -> i64;
     pub fn k32_log(msg: *const u8, len: u32);
     pub fn k32_random() -> u32;
     pub fn k32_env_get(key: *const u8, key_len: u32, out: *mut u8, out_cap: u32) -> i32;
@@ -71,6 +72,7 @@ mod stubs {
     pub unsafe fn k32_resp_end() { no_host() }
     pub unsafe fn k32_event_emit(topic: *const u8, topic_len: u32, data: *const u8, len: u32) -> i32 { no_host() }
     pub unsafe fn k32_time_ms() -> i64 { no_host() }
+    pub unsafe fn k32_unix_time_ms() -> i64 { no_host() }
     pub unsafe fn k32_log(msg: *const u8, len: u32) { no_host() }
     pub unsafe fn k32_random() -> u32 { no_host() }
     pub unsafe fn k32_env_get(key: *const u8, key_len: u32, out: *mut u8, out_cap: u32) -> i32 { no_host() }

@@ -13,6 +13,14 @@ pub fn time_ms() -> i64 {
     unsafe { abi::k32_time_ms() }
 }
 
+/// Wall clock in Unix milliseconds; `None` while the node's clock is not set.
+pub fn unix_time_ms() -> Option<i64> {
+    match unsafe { abi::k32_unix_time_ms() } {
+        0 => None,
+        ms => Some(ms),
+    }
+}
+
 /// Hardware random number on ESP32, `rand()` on the host simulator.
 pub fn random() -> u32 {
     unsafe { abi::k32_random() }

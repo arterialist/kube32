@@ -178,6 +178,7 @@ K32_IMPORT("k32_resp_end")    void    k32_resp_end(void);
 K32_IMPORT("k32_event_emit")  int32_t k32_event_emit(const char* topic, uint32_t topic_len, const void* data, uint32_t len);
 
 K32_IMPORT("k32_time_ms")     int64_t k32_time_ms(void);      /* milliseconds since node boot */
+K32_IMPORT("k32_unix_time_ms") int64_t k32_unix_time_ms(void); /* wall clock, Unix milliseconds; 0 while the node's clock is not set */
 K32_IMPORT("k32_log")         void    k32_log(const char* msg, uint32_t len);
 K32_IMPORT("k32_random")      uint32_t k32_random(void);      /* hardware RNG on ESP32 */
 K32_IMPORT("k32_env_get")     int32_t k32_env_get(const char* key, uint32_t key_len, char* out, uint32_t out_cap); /* value length, or -1 */
