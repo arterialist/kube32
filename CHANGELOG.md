@@ -37,6 +37,7 @@ All notable changes to this project will be documented in this file. The format 
 
 ### Fixed
 
+- Stop the ESP-IDF I2C master driver from logging every failed transfer on a pod's I2C bus. The HAL reports the first three failures and every 100th.
 - Modules that run out of memory while wasm3 grows its function, global, tag, memory, or table arrays now fail to load instead of crashing the node.
 - Pods leave a PSRAM reserve for the system (128 KiB on a control plane, 64 KiB on a worker with PSRAM). Without this reserve, pod code and structures can drop free PSRAM to 16 KiB, causing API requests to fail with 503 and firmware staging to run the control plane out of memory.
 - The USB console survives software resets: on any non-power-on reset, the board disconnects from the USB bus for 100 ms so the host enumerates the port again, and it flushes any partial line from the early console before its driver starts. Previously, a reboot could leave the port silent until the board is unplugged.

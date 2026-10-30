@@ -10,6 +10,7 @@
 #include "driver/i2c_master.h"
 #include "driver/uart.h"
 #include "esp_err.h"
+#include "esp_log.h"
 #endif
 
 namespace kube32::hal {
@@ -70,6 +71,9 @@ bool install_i2c(I2cSlot& s, const std::string& pod_id, const BusAssignment& b, 
     cfg.clk_source = I2C_CLK_SRC_DEFAULT;
     cfg.glitch_ignore_cnt = 7;
     cfg.flags.enable_internal_pullup = true;   // keeps an empty bus idle-high; attached devices bring their own pull-ups
+    // i2c_failed reports failed transfers; the driver's line for every one
+    // floods the console while a pod polls a device that does not answer
+    esp_log_level_set("i2c.master", ESP_LOG_NONE);
     esp_err_t e = i2c_new_master_bus(&cfg, &s.bus);
     if (e != ESP_OK) {
         s.bus = nullptr;
