@@ -395,19 +395,28 @@ static const void* raw_http_call(IM3Runtime rt, IM3ImportContext ictx, uint64_t*
     if (!s_hooks.service_call) { ret = K32_ERR_IO; return m3Err_none; }
     const char* base = static_cast<const char*>(mem);
     CallContext* c = ctx_for(rt);
-    std::string chain = c ? c->chain : pod_id;   // k32_init / k32_tick: the pod alone
-    ServiceCallRequest req;
-    req.caller_pod = pod_id;
-    req.method = std::string_view(base + a[0], mlen);
-    req.url = std::string_view(base + a[2], ulen);
-    req.headers = std::string_view(base + a[4], hlen);
-    req.body = std::string_view(base + a[6], blen);
-    req.call_chain = chain;
-    req.timeout_ms = a[11] ? (a[11] > 60000 ? 60000 : a[11]) : 5000;
-    req.caller_runtime = rt;
     // The caller is suspended in this call, so its memory cannot move or grow
     BufferResponseSink sink(static_cast<uint8_t*>(mem) + a[8], rcap);
-    int32_t rc = s_hooks.service_call(req, sink);
+    // An exception must not unwind through the interpreter's C frames (that
+    // ends the node in std::terminate): a heap that runs out fails the call
+    int32_t rc;
+    try {
+        std::string chain = c ? c->chain : pod_id;   // k32_init / k32_tick: the pod alone
+        ServiceCallRequest req;
+        req.caller_pod = pod_id;
+        req.method = std::string_view(base + a[0], mlen);
+        req.url = std::string_view(base + a[2], ulen);
+        req.headers = std::string_view(base + a[4], hlen);
+        req.body = std::string_view(base + a[6], blen);
+        req.call_chain = chain;
+        req.timeout_ms = a[11] ? (a[11] > 60000 ? 60000 : a[11]) : 5000;
+        req.caller_runtime = rt;
+        rc = s_hooks.service_call(req, sink);
+    } catch (const std::bad_alloc&) {
+        rc = K32_ERR_NOMEM;
+    } catch (const std::exception&) {
+        rc = K32_ERR_IO;
+    }
     if (rc >= 0 && sink.overflow()) rc = K32_ERR_TOOBIG;
     uint32_t copied = static_cast<uint32_t>(sink.copied());
     std::memcpy(static_cast<uint8_t*>(mem) + a[10], &copied, 4);
