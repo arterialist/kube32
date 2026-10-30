@@ -44,6 +44,9 @@ struct ContainerConfig {
     std::string container_name;
     uint32_t memory_limit_bytes{64 * 1024};
     uint32_t stack_size_bytes{8 * 1024};
+    // The operand stack is sized from the compiled module (its deepest call
+    // chain, module_stack_need_bytes), stack_size_bytes at most
+    bool stack_from_module{false};
     RestartPolicy restart_policy{RestartPolicy::Always};
     ProbeSpec liveness_probe;
     ProbeSpec readiness_probe;
@@ -86,6 +89,10 @@ TrapReport describe_trap(const char* trap, const TrapContext& ctx);
 // otherwise on the caller's stack. `fn` is invoked in place: nothing is taken
 // from the heap.
 void run_on_interpreter_stack(mem::FunctionRef<void()> fn);
+
+// Whether a module loading now gets the compiler's scratch lent from the
+// shared interpreter stack (boards without PSRAM) instead of allocating it.
+bool compile_scratch_lent();
 
 // True once the container owning this wasm3 runtime is being stopped. Host
 // calls that wait (sleeps, channel receives, tones) check it and return early,
@@ -167,6 +174,12 @@ private:
     void* m3_env_{nullptr};
     void* m3_runtime_{nullptr};
     void* m3_module_{nullptr};
+    uint32_t wasm_stack_bytes_{0};          // the operand stack the module has (set by deploy)
+
+    // A stack sized from the module: what it has while the module loads
+    // (constant expressions), and what it gets above its computed need
+    static constexpr uint32_t kLoadStackBytes = 256;
+    static constexpr uint32_t kStackMarginBytes = 64;
 
     std::string thread_name_;
     std::unique_ptr<osal::Thread> worker_thread_;

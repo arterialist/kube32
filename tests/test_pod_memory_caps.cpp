@@ -352,9 +352,12 @@ int main() {
         assert(wrt->get_status("default/req16").memory_used_bytes == 16 * 1024);
         assert(wrt->get_status("default/lim8").memory_used_bytes == 8 * 1024);
         assert(wrt->get_status("default/plain").memory_used_bytes == 64 * 1024);
-        // kube32.io/wasm-stack sets the module's operand stack (default 4 KiB)
+        // kube32.io/wasm-stack sets the module's operand stack; without it the
+        // stack is what the module's calls can need, 4 KiB at most
         assert(wrt->get_status("default/stk").stack_bytes == 1024);
-        assert(wrt->get_status("default/req16").stack_bytes == 4096);
+        const uint64_t sized = wrt->get_status("default/req16").stack_bytes;
+        std::cout << "[kubelet] svcprobe's operand stack sized to " << sized << " bytes" << std::endl;
+        assert(sized > 0 && sized < 4096);
         std::cout << "[kubelet] budgets 16Ki, 8Ki, 64Ki applied" << std::endl;
     }
 

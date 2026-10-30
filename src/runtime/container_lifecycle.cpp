@@ -31,8 +31,11 @@
 
 namespace kube32::runtime {
 
-#if defined(ESP_PLATFORM)
+// Held while a call runs on the shared interpreter stack, and while a module
+// loads with its compile scratch lent from it (CompileScratchLoan)
 static std::mutex s_interp_mutex;
+
+#if defined(ESP_PLATFORM)
 static SemaphoreHandle_t s_interp_lock = nullptr;
 static const mem::FunctionRef<void()>* s_interp_fn = nullptr;
 static void interp_trampoline() { if (s_interp_fn) (*s_interp_fn)(); }
@@ -55,6 +58,32 @@ void run_on_interpreter_stack(mem::FunctionRef<void()> fn) {
 }
 
 static osal::RecursiveMutex s_wasm3_global_mutex;
+
+// While a module loads on a board without PSRAM, the parser, validator and
+// compiler share one scratch (m3_CompileScratchSize, about 6 KB) lent from
+// the shared interpreter stack, so the pod pool needs no room for it. No pod
+// call runs while the loan is held. Taken before a pod's call lock, as
+// call_function takes the stack. Not taken by a caller on the stack itself.
+bool compile_scratch_lent() {
+    int external = 0;
+    if (kube32_pool_block_size() == 0 || (kube32_pool_available(&external), external)) return false;
+    size_t size = 0;
+    return kube32_interp_stack_get(&size) && size >= m3_CompileScratchSize();
+}
+
+class CompileScratchLoan {
+public:
+    CompileScratchLoan() {
+        if (!compile_scratch_lent() || kube32_interp_stack_base_for(__builtin_frame_address(0))) return;
+        lock_ = std::unique_lock<std::mutex>(s_interp_mutex);
+        memory_ = kube32_interp_stack_get(nullptr);
+    }
+    void* memory() const { return memory_; }
+
+private:
+    std::unique_lock<std::mutex> lock_;
+    void* memory_{nullptr};
+};
 
 // Runtimes of containers being stopped (see runtime_stop_requested)
 static std::mutex s_stopping_mutex;
@@ -197,6 +226,7 @@ bool ContainerLifecycleController::deploy(std::vector<uint8_t>&& wasm_bytes) {
 }
 
 bool ContainerLifecycleController::deploy(const uint8_t* wasm_bytes, size_t len) {
+    CompileScratchLoan scratch;
     osal::LockGuard call_guard(call_mutex_);
     osal::LockGuard guard(mutex_);
     osal::LockGuard<osal::RecursiveMutex> global_guard(s_wasm3_global_mutex);
@@ -244,8 +274,20 @@ bool ContainerLifecycleController::deploy(const uint8_t* wasm_bytes, size_t len)
         status_.exit_message = "Failed to create Wasm3 environment";
         return false;
     }
+    // Lent for the parse, load and compile; taken back before anything runs
+    struct LentScratch {
+        void*& env_ref;      // m3_env_: a failed load frees the environment first
+        void* env;
+        LentScratch(void*& ref, void* scratch) : env_ref(ref), env(ref) { static_cast<IM3Environment>(env)->compileScratch = scratch; }
+        ~LentScratch() { if (env_ref == env) static_cast<IM3Environment>(env)->compileScratch = nullptr; }
+    } lent(m3_env_, scratch.memory());
 
-    m3_runtime_ = m3_NewRuntime(reinterpret_cast<IM3Environment>(m3_env_), config_.stack_size_bytes, nullptr);
+    // A stack sized from the module starts with room for the constant
+    // expressions evaluated while the module loads, and gets its size once
+    // every function is compiled
+    const uint32_t first_stack = config_.stack_from_module ? std::min<uint32_t>(config_.stack_size_bytes, kLoadStackBytes)
+                                                           : config_.stack_size_bytes;
+    m3_runtime_ = m3_NewRuntime(reinterpret_cast<IM3Environment>(m3_env_), first_stack, nullptr);
     // wasm3 compiles functions lazily and only emits gas checks into code
     // compiled while a gas limit is set. A metered pod is armed now so every
     // function is metered: that lets stop() interrupt a guest loop
@@ -322,10 +364,27 @@ bool ContainerLifecycleController::deploy(const uint8_t* wasm_bytes, size_t len)
     // The last code page is cut to what the module needs
     m3_TrimCodePages(reinterpret_cast<IM3Runtime>(m3_runtime_));
 
+    // The operand stack: what the module's deepest call chain needs (a
+    // little more), at most the pod's stack size; that size when the
+    // module recurses
+    uint32_t stack_bytes = config_.stack_size_bytes;
+    if (config_.stack_from_module) {
+        const uint32_t need = module_stack_need_bytes(module);
+        if (need > 0) stack_bytes = std::min(stack_bytes, (need + kStackMarginBytes + 15) & ~15u);
+        r = m3_ResizeStack(reinterpret_cast<IM3Runtime>(m3_runtime_), stack_bytes);
+        if (r != m3Err_none) {
+            status_.phase = ContainerPhase::Failed;
+            status_.exit_message = std::string("Wasm load error: ") + r + " (operand stack of " + std::to_string(stack_bytes) + " bytes)";
+            cleanup_runtime();
+            return false;
+        }
+    }
+    wasm_stack_bytes_ = stack_bytes;
+
     size_t mem_size = m3_GetMemorySize(module, 0);
     status_.memory_used_bytes = static_cast<uint32_t>(mem_size);
     status_.bytecode_bytes = wasm_bytecode_.size();
-    status_.stack_bytes = config_.stack_size_bytes;
+    status_.stack_bytes = stack_bytes;
     status_.runtime_bytes = m3_GetResourceUsage(reinterpret_cast<IM3Runtime>(m3_runtime_), c_m3Limit_MemoryBytes);
     status_.phase = ContainerPhase::Pending;
     status_.ready = false;
@@ -381,7 +440,7 @@ void ContainerLifecycleController::worker_thread_main() {
             ctx.stop_requested = stop_requested_.load();
             ctx.memory_grow_error = runtime->lastMemoryGrowError;
             ctx.memory_limit_bytes = config_.memory_limit_bytes;
-            ctx.wasm_stack_bytes = config_.stack_size_bytes;
+            ctx.wasm_stack_bytes = wasm_stack_bytes_;
             TrapReport t = describe_trap(r, ctx);
             on_trap_caught(t.message, t.exit_code, t.reason);
         }
@@ -680,7 +739,7 @@ int32_t ContainerLifecycleController::call_function(const std::string& fn_name, 
         ctx.stop_requested = stop_requested_.load();
         ctx.memory_grow_error = rt->lastMemoryGrowError;
         ctx.memory_limit_bytes = config_.memory_limit_bytes;
-        ctx.wasm_stack_bytes = config_.stack_size_bytes;
+        ctx.wasm_stack_bytes = wasm_stack_bytes_;
 #if d_m3HasGasMetering
         // AppPodHost arms the per-call budget; an unbounded limit means none
         uint64_t gas_limit = m3_GetResourceLimit(rt, c_m3Limit_GasUnits);

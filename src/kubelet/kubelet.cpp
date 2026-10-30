@@ -823,7 +823,7 @@ bool Kubelet::deploy_and_start_pod(const models::KubePod& pod_in, const std::str
         } else if (auto ann = pod.annotations.find("kube32.io/wasm-base64"); ann != pod.annotations.end()) {
             module_len = ann->second.size() / 4 * 3;   // empty in pod lists: then only the rest is estimated
         }
-        const size_t need = runtime::estimate_pod_memory(module, module_len, rec.memory_limit_bytes, wasm_stack);
+        const size_t need = runtime::estimate_pod_memory(module, module_len, rec.memory_limit_bytes, wasm_stack, !wasm_stack_set);
         size_t capacity = 0;
         const size_t room = kube32_pool_pod_room(rec.memory_limit_bytes, &capacity);
         const std::string reserve = osal::System::get_total_psram_bytes() > 0
