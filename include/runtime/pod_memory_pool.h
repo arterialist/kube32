@@ -83,6 +83,10 @@ void  kube32_rt_free(void* ptr);
 /* Gives back all but the first `bytes` of an allocation without moving it;
  * 1 when it did (allocations from the pool block's small heap), else 0. */
 int   kube32_rt_shrink(void* ptr, size_t bytes);
+/* What to allocate in place of `bytes` (at least `minimum`): the pool block's
+ * largest piece when pods are served from the block first and it has no
+ * piece of `bytes` left, so a code page stays in the block, smaller. */
+size_t kube32_rt_fit(size_t bytes, size_t minimum);
 #ifdef __cplusplus
 }
 #endif

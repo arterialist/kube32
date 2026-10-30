@@ -1027,14 +1027,21 @@ M3Result Parse_InitExprTyped (M3Module* io_module, bytes_t* io_bytes, cbytes_t i
 
     // this doesn't generate code pages. just walks the wasm bytecode to find the end
 
-    // Kube32: the scratch state is on the heap; on a task stack of a few KB
-    // it would not fit at any useful function stack height
+    // Kube32: the scratch state is on the heap (the environment's compile
+    // scratch while one is lent); on a task stack of a few KB it would not
+    // fit at any useful function stack height
 #if defined(d_m3PreferStaticAlloc)
     static M3Compilation compilation_storage;
     IM3Compilation compilation = &compilation_storage;
     memset(compilation, 0, sizeof(M3Compilation));
 #else
-    IM3Compilation compilation = m3_AllocStruct(M3Compilation);
+    IM3Compilation compilation = (IM3Compilation) io_module->environment->compileScratch;
+    const bool sharedScratch = (compilation != NULL);
+    if (sharedScratch) {
+        memset(compilation, 0, sizeof(M3Compilation));
+    } else {
+        compilation = m3_AllocStruct(M3Compilation);
+    }
     if (not compilation) return m3Err_mallocFailed;
 #endif
     compilation->module     = io_module;
@@ -1051,7 +1058,7 @@ M3Result Parse_InitExprTyped (M3Module* io_module, bytes_t* io_bytes, cbytes_t i
                                           : (m3type_t)c_m3Type_none;
     }
 #if !defined(d_m3PreferStaticAlloc)
-    m3_Free(compilation);
+    if (not sharedScratch) m3_Free(compilation);
 #endif
 
     return result;
@@ -1407,7 +1414,9 @@ M3Result ParseSection_Custom (M3Module* io_module, bytes_t i_bytes, cbytes_t i_e
 _   (Read_utf8(&name, &i_bytes, i_end));
                                                                                     m3log (parse, "** Custom: '%s'", name);
     if (strcmp(name, "name") == 0) {
+#if d_m3ParseNameSection
 _       (ParseSection_Name(io_module, i_bytes, i_end));
+#endif
 #if d_m3HasSnapshots
         // "snapshot" is the unnamed default, "snapshot.<name>" a named one. A bare
         // "snapshot." names nothing and is not either of them, so it is left to the

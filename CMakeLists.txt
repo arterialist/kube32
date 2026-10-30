@@ -90,7 +90,7 @@ else()
     )
     add_library(wasm3 STATIC ${WASM3_SRCS})
     target_include_directories(wasm3 PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/third_party/wasm3/source)
-    target_compile_definitions(wasm3 PUBLIC d_m3CodePageAlignSize=4096 d_m3MaxFunctionStackHeight=1024 d_m3HasExceptionHandling=0 d_m3HasTypedRefs=0 d_m3HasStackSwitching=0 d_m3HasSnapshots=0 d_m3RecordBacktraces=0)
+    target_compile_definitions(wasm3 PUBLIC d_m3CodePageAlignSize=4096 d_m3MaxFunctionStackHeight=1024 d_m3HasExceptionHandling=0 d_m3HasTypedRefs=0 d_m3HasStackSwitching=0 d_m3HasSnapshots=0 d_m3RecordBacktraces=0 d_m3ParseNameSection=0 d_m3MaxDuplicateFunctionImpl=1)
 
     # Core Library: OSAL, Memory Architecture, Storage Engine, API Server, Scheduler, HAL, Runtime, Kubelet
     set(KUBE32_CORE_SRCS

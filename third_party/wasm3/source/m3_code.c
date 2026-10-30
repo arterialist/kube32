@@ -27,11 +27,18 @@ IM3CodePage NewCodePage (IM3Runtime i_runtime, u32 i_minNumLines)
         return NULL;
     }
 
+    const u32 minimumSize = pageSize;
+
     pageSize = (pageSize + (d_m3CodePageAlignSize - 1)) & ~(d_m3CodePageAlignSize - 1); // align
     // check alignment overflow
     if (pageSize == 0) {
         return NULL;
     }
+
+    // Kube32: where the allocator's preferred memory has no room left for a
+    // whole page, it may offer a smaller one there (1 KiB at least, and what
+    // this page must hold) rather than a page elsewhere
+    pageSize = (u32)m3_CodePageFit(pageSize, M3_MAX(minimumSize, 1024));
 
     page = (IM3CodePage)m3_Malloc("M3CodePage", pageSize);
 

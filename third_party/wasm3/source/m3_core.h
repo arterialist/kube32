@@ -326,6 +326,9 @@ void  m3_Free_Impl (void* i_ptr);
 // Kube32: gives back all but the first i_size bytes of an allocation without
 // moving it; false when the allocator cannot
 bool  m3_Shrink_Impl (void* i_ptr, size_t i_size);
+// Kube32: the size of a code page to allocate in place of i_size, at least
+// i_minimum (a smaller page in the memory the allocator prefers)
+size_t m3_CodePageFit (size_t i_size, size_t i_minimum);
 void* m3_CopyMem (const void* i_from, size_t i_size);
 
 #if d_m3LogHeapOps

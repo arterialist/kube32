@@ -40,6 +40,13 @@
 #  define d_m3MaxConstantTableSize             120
 #endif
 
+// Kube32: function names from the custom "name" section are for traces and
+// for m3_FindFunction's search after the exports; an embedder that calls only
+// exports can leave them out (one allocation per function)
+#ifndef d_m3ParseNameSection
+#  define d_m3ParseNameSection                 1
+#endif
+
 #ifndef d_m3MaxDuplicateFunctionImpl
 #  define d_m3MaxDuplicateFunctionImpl         3
 #endif

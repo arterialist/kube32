@@ -309,6 +309,10 @@ IM3Runtime     m3_NewRuntime (IM3Environment io_environment,
 
 void           m3_FreeRuntime (IM3Runtime i_runtime);
 
+// Kube32: gives a runtime that is not running a call an operand stack of
+// i_stackSizeInBytes in place of the one it was made with.
+M3Result       m3_ResizeStack (IM3Runtime io_runtime, uint32_t i_stackSizeInBytes);
+
 // The validator runs as a pre-pass of compiling a function body, so it
 // follows lazy compilation: a body is checked the first time it is compiled.
 // Turning it off means trusting the module - nothing then checks a body's
@@ -391,6 +395,11 @@ M3Result       m3_LoadModule (IM3Runtime io_runtime, IM3Module io_module);
 
 // Optional, compiles all functions in the module
 M3Result       m3_CompileModule (IM3Module io_module);
+
+// Kube32: the bytes of the scratch the parser, validator and compiler share
+// (M3Environment.compileScratch). An embedder may lend one this large to an
+// environment for the length of a module's parse, load and compile.
+size_t         m3_CompileScratchSize (void);
 
 // Kube32: after m3_CompileModule, returns the unused end of the runtime's
 // code pages to the allocator (when it can shrink them in place) and closes

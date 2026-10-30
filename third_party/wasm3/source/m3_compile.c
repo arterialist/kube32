@@ -6020,6 +6020,14 @@ M3Result MeterOpcode (IM3Compilation o, m3opcode_t i_opcode)
 
         u32 cost = GetGasCost(i_opcode);
 
+        // Kube32: an `end` (free) that finds no segment open, after a branch
+        // or another `end`, would open one only to charge nothing: about a
+        // quarter of all charges in compiled C. Every loop still pays on each
+        // pass, through its branches.
+        if (cost == 0 and not o->isGasSegmentOpen and o->gasCost == 0 and IsGasSegmentEnd(i_opcode)) {
+            return m3Err_none;
+        }
+
         if (o->isGasSegmentOpen and o->gasCost > d_m3MaxSegmentGas - cost) {
             CloseGasSegment(o);
         }
@@ -6438,8 +6446,8 @@ M3Result CompileFunction (IM3Function io_function)
     IM3Runtime runtime = io_function->module->runtime;
 
     // Scratch for this compile only (Kube32: not kept in the runtime; the
-    // module's while m3_CompileModule runs, else allocated here)
-    IM3Compilation o = (IM3Compilation) io_function->module->compileScratch;
+    // environment's while m3_CompileModule runs, else allocated here)
+    IM3Compilation o = (IM3Compilation) io_function->module->environment->compileScratch;
     const bool sharedScratch = (o != NULL);
     if (sharedScratch) {
         memset(o, 0, sizeof(M3Compilation));
@@ -6561,8 +6569,13 @@ _   (CompileBlockStatements(o));
     io_function->numConstantBytes = numConstantSlots * sizeof(m3slot_t);
 
     if (numConstantSlots) {
-        io_function->constants = m3_CopyMem((cbytes_t)o->constants, io_function->numConstantBytes);
-        _throwifnull(io_function->constants);
+        // Kube32: the constants follow the function's code on its code page
+        // rather than taking an allocation of their own
+        const u32 numLines = (io_function->numConstantBytes + sizeof(code_t) - 1) / sizeof(code_t);
+_       (EnsureCodePageNumLines(o, numLines));
+        io_function->constants = (void*)GetPagePC(o->page);
+        memcpy(io_function->constants, o->constants, io_function->numConstantBytes);
+        o->page->info.lineIndex += numLines;
     }
 
 #if d_m3HasSnapshots

@@ -15,6 +15,7 @@
 #include "m3_bind.h"
 #include "m3_deterministic.h"
 #include "m3_compile.h"
+#include "m3_validate.h"
 #include "m3_host.h"
 #include "m3_exception.h"
 #include "m3_info.h"
@@ -235,6 +236,41 @@ IM3Runtime m3_NewRuntime (IM3Environment i_environment, u32 i_stackSizeInBytes, 
     }
 
     return runtime;
+}
+
+// Kube32: replaces the operand stack m3_NewRuntime made with one of
+// i_stackSizeInBytes, before any call runs on it (a stack sized once the
+// module is compiled). A smaller stack keeps its start and gives its end
+// back when the allocator can; the memories' headers get the new bound.
+M3Result m3_ResizeStack (IM3Runtime io_runtime, u32 i_stackSizeInBytes)
+{
+    const size_t oldBytes = io_runtime->numStackSlots * sizeof(m3slot_t) + 4 * sizeof(m3slot_t);
+    const size_t newBytes = i_stackSizeInBytes + 4 * sizeof(m3slot_t);
+    void* stack = io_runtime->originStack;
+
+    if (io_runtime->stack != stack) return "operand stack in use";
+
+    if (newBytes < oldBytes) {
+        m3_Shrink_Impl(stack, newBytes);
+    } else if (newBytes > oldBytes) {
+        stack = m3_Realloc("Wasm Stack", stack, newBytes, oldBytes);
+        if (not stack) return m3Err_mallocFailed;
+    }
+
+    io_runtime->originStack   = stack;
+    io_runtime->stack         = stack;
+    io_runtime->numStackSlots = i_stackSizeInBytes / sizeof(m3slot_t);
+
+    m3slot_t* maxStack = (m3slot_t*)stack + io_runtime->numStackSlots;
+    for (IM3Module module = io_runtime->modules; module; module = module->next) {
+        for (u32 i = 0; i < module->numMemories; ++i) {
+            IM3Memory memory = module->memories[i];
+            if (memory and memory->mallocated) memory->mallocated->maxStack = maxStack;
+        }
+        if (module->emptyMemory.mallocated) module->emptyMemory.mallocated->maxStack = maxStack;
+    }
+
+    return m3Err_none;
 }
 
 void m3_SetValidation (IM3Runtime i_runtime, bool i_enable)
@@ -646,7 +682,14 @@ M3Result EvaluateExpression (IM3Module i_module, void* o_expressed, m3type_t i_t
     IM3Runtime savedRuntime = i_module->runtime;
     i_module->runtime       = &runtime;
 
-    IM3Compilation o   = m3_AllocStruct(M3Compilation);
+    // Kube32: the environment's compile scratch while one is lent
+    IM3Compilation o   = (IM3Compilation) runtime.environment->compileScratch;
+    const bool sharedScratch = (o != NULL);
+    if (sharedScratch) {
+        memset(o, 0, sizeof(M3Compilation));
+    } else {
+        o = m3_AllocStruct(M3Compilation);
+    }
     if (not o) {
         i_module->runtime = savedRuntime;
         runtime.originStack = NULL;
@@ -722,7 +765,7 @@ M3Result EvaluateExpression (IM3Module i_module, void* o_expressed, m3type_t i_t
     i_module->runtime = savedRuntime;
 
     *io_bytes = o->wasm;
-    m3_Free(o);
+    if (not sharedScratch) m3_Free(o);
 
     return result;
 }
@@ -1435,10 +1478,15 @@ M3Result m3_CompileModule (IM3Module io_module)
 {
     M3Result result = m3Err_none;
 
-    // Kube32: one scratch for the whole module, taken before any code page:
-    // a fresh one per function needs a 6 KB hole each time, which a nearly
-    // full pod pool no longer has by the last functions
-    io_module->compileScratch = m3_AllocStruct(M3Compilation);
+    // Kube32: one scratch for the whole module, taken before any code page
+    // unless the embedder lent one: a fresh one per function needs a 6 KB
+    // hole each time, which a nearly full pod pool no longer has by the last
+    // functions
+    IM3Environment env = io_module->environment;
+    void* owned = NULL;
+    if (not env->compileScratch) {
+        owned = env->compileScratch = m3_Malloc("M3Compilation", m3_CompileScratchSize());
+    }
 
     for (u32 i = 0; i < io_module->numFunctions; ++i) {
         IM3Function f = &io_module->functions[i];
@@ -1448,9 +1496,16 @@ _           (CompileFunction(f));
     }
 
     _catch:
-    m3_Free(io_module->compileScratch);
-    io_module->compileScratch = NULL;
+    if (owned) {
+        m3_Free(owned);
+        env->compileScratch = NULL;
+    }
     return result;
+}
+
+size_t m3_CompileScratchSize (void)
+{
+    return M3_MAX(sizeof(M3Compilation), ValidationScratchSize());
 }
 
 #if d_m3HasExceptionHandling

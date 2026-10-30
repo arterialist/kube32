@@ -20,6 +20,10 @@ d_m3BeginExternC
 // Returns m3Err_none on success or a validation error.
 M3Result ValidateFunction (IM3Function i_function);
 
+// Kube32: the bytes of a validation context, which the compile scratch
+// (M3Environment.compileScratch) also has room for
+size_t   ValidationScratchSize (void);
+
 d_m3EndExternC
 
 #endif // m3_validate_h

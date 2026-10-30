@@ -1679,15 +1679,24 @@ static M3Result v_validate_body (ValCtx * v)
 
 static M3Result  ValidateFunctionWith  (ValCtx* v, IM3Function i_function);
 
-// Kube32: the context is scratch for one function, not kept in the runtime
+// Kube32: the context is scratch for one function, not kept in the runtime:
+// the environment's compile scratch when there is one (the compiler takes it
+// over only after validation), else allocated here
 M3Result  ValidateFunction  (IM3Function i_function)
 {
     if (!i_function->wasm) return m3Err_none;
-    ValCtx* v = m3_AllocStruct (ValCtx);
+    ValCtx* v = (ValCtx*) i_function->module->environment->compileScratch;
+    if (v) return ValidateFunctionWith(v, i_function);
+    v = m3_AllocStruct (ValCtx);
     if (!v) return m3Err_mallocFailed;
     M3Result r = ValidateFunctionWith(v, i_function);
     m3_Free(v);
     return r;
+}
+
+size_t  ValidationScratchSize  (void)
+{
+    return sizeof(ValCtx);
 }
 
 static M3Result  ValidateFunctionWith  (ValCtx* v, IM3Function i_function)
@@ -1765,6 +1774,11 @@ M3Result  ValidateFunction  (IM3Function i_function)
 {
     (void)i_function;
     return m3Err_none;
+}
+
+size_t  ValidationScratchSize  (void)
+{
+    return 0;
 }
 
 // clang-format on

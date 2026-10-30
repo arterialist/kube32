@@ -369,6 +369,15 @@ size_t kube32_pool_largest_free(void) {
     return largest;
 }
 
+size_t kube32_rt_fit(size_t bytes, size_t minimum) {
+    // Where the pool block comes first but has no piece of `bytes` left: its
+    // largest piece, when that holds `minimum`, so a code page stays in the
+    // block in a smaller size instead of going to the general heap
+    if (!pool_first() || bytes <= minimum) return bytes;
+    const size_t largest = kube32_pool_largest_free() & ~(kSubAlign - 1);
+    return (largest < bytes && largest >= minimum) ? largest : bytes;
+}
+
 void* kube32_rt_calloc(size_t bytes) {
 #if defined(ESP_PLATFORM)
     // Keep a small PSRAM reserve for stacks allocated later; everything else

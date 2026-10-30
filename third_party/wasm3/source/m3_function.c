@@ -128,7 +128,8 @@ void SnapshotMap_Free (M3SnapshotMap* i_map)
 
 void Function_Release (IM3Function i_function)
 {
-    m3_Free(i_function->constants);
+    // Kube32: the constants are on a code page (CompileFunction), freed with it
+    i_function->constants = NULL;
 
 #if d_m3HasSnapshots
     SnapshotMap_Free(i_function->snapshotMap);

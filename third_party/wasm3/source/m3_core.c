@@ -151,6 +151,12 @@ bool m3_Shrink_Impl (void* i_ptr, size_t i_size)
     return false;
 }
 
+size_t m3_CodePageFit (size_t i_size, size_t i_minimum)
+{
+    (void)i_minimum;
+    return i_size;
+}
+
 #else
 
 // Kube32: large allocations (linear memory) may come from a block reserved at
@@ -165,6 +171,7 @@ extern void*  kube32_pool_sub_alloc(size_t bytes);
 extern void*  kube32_rt_realloc(void* ptr, size_t bytes);
 extern void   kube32_rt_free(void* ptr);
 extern int    kube32_rt_shrink(void* ptr, size_t bytes);
+extern size_t kube32_rt_fit(size_t bytes, size_t minimum);
 
 void* m3_Malloc_Impl (size_t i_size)
 {
@@ -191,6 +198,11 @@ void m3_Free_Impl (void* io_ptr)
 bool m3_Shrink_Impl (void* i_ptr, size_t i_size)
 {
     return kube32_rt_shrink(i_ptr, i_size) != 0;
+}
+
+size_t m3_CodePageFit (size_t i_size, size_t i_minimum)
+{
+    return kube32_rt_fit(i_size, i_minimum);
 }
 
 void* m3_Realloc_Impl (void* i_ptr, size_t i_newSize, size_t i_oldSize)

@@ -443,9 +443,6 @@ typedef struct M3Module {
 
     u32                   numFuncImports;
     u32                   numFunctions;
-    // Kube32: m3_CompileModule's compile scratch (an M3Compilation), reused
-    // for every function instead of a 6 KB allocation per function
-    void*                 compileScratch;
     u32                   allFunctions;           // allocated functions count
     M3Function*           functions;
 
@@ -562,6 +559,13 @@ typedef struct M3Environment {
                                                                 // the number of elements must match the basic types as per M3ValueType
     u16              numFuncTypes;                       // hands out M3FuncType.canonicalIndex
     M3CodePage*      pagesReleased;
+
+    // Kube32: scratch of m3_CompileScratchSize() bytes that the parser, the
+    // validator and the compiler use in turn (one M3Compilation or validator
+    // context at a time) instead of a 6 KB allocation for each function and
+    // constant expression. Lent by the embedder, or allocated by
+    // m3_CompileModule for its own duration; never freed with the environment.
+    void*            compileScratch;
 
     M3SectionHandler customSectionHandler;
 } M3Environment;
