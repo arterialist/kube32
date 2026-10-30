@@ -476,6 +476,13 @@ else()
     target_link_libraries(test_i2c_discovery PRIVATE kube32_core)
     add_test(NAME test_i2c_discovery COMMAND test_i2c_discovery)
 
+    # The rfid example against a simulated MFRC522; pod tick intervals
+    add_executable(test_rfid_app
+        tests/test_rfid_app.cpp
+    )
+    target_link_libraries(test_rfid_app PRIVATE kube32_core)
+    add_test(NAME test_rfid_app COMMAND test_rfid_app)
+
     # RMT (IR) for pods: admission, channel lifecycle, receive queue, node capacity, the irremote example
     add_executable(test_pod_rmt
         tests/test_pod_rmt.cpp

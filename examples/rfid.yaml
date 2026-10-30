@@ -1,0 +1,89 @@
+# rfid: reads ISO 14443-A tags with an MFRC522-compatible reader on I2C, such
+# as the M5Stack RFID 2 unit (address 0x28) on the Cardputer's Grove port.
+#
+# The node finds the reader on its own I2C pins and labels itself
+# i2c.kube32.io/0x28=bus-0; the nodeSelector places the pod there, so moving
+# the reader to another board moves the pod. Each tag that comes into the
+# field is logged and published on rfid.tag; a TAG_<UID> variable maps a tag
+# to a message published on ACTION_TOPIC (ir.send by default, which the
+# irremote example transmits as an IR code), TAG_DEFAULT any other tag.
+#   kubectl --context kube32 apply -f examples/rfid.yaml
+#   kubectl --context kube32 logs -l app=rfid -f
+#   curl -s http://<control plane>/rfid           reader state and last tags
+#   curl -sN http://<control plane>/rfid/events   tags as Server-Sent Events
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: rfid
+  namespace: default
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: rfid
+  template:
+    metadata:
+      labels:
+        app: rfid
+      annotations:
+        kube32.io/tick-interval: 200ms   # one poll of the field per tick
+    spec:
+      nodeSelector:
+        i2c.kube32.io/0x28: bus-0
+      containers:
+        - name: rfid
+          image: wasm://embedded/rfid
+          ports:
+            - containerPort: 7000
+              name: http
+          env:
+            - name: I2C_BUS
+              value: "0"
+            - name: I2C_ADDR
+              value: "28"
+            # - name: TAG_04A1B2C3D4E580   # the tag's UID in upper-case hex
+            #   value: "nec 0x00 0x45"     # published on ACTION_TOPIC
+            # - name: TAG_DEFAULT          # any other tag
+            #   value: "nec 0x00 0x46"
+          resources:
+            requests:
+              memory: 4Ki                  # linear memory: 2 KiB stack, 1.5 KiB data
+              esp32.io/i2c-bus-0: "1"
+              hardware.kube32.io/ipc: "1"
+            limits:
+              memory: 4Ki
+          securityContext:
+            capabilities:
+              add: ["CHANNEL_IPC"]
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: rfid
+  namespace: default
+spec:
+  selector:
+    app: rfid
+  ports:
+    - name: http
+      port: 80
+      targetPort: 7000
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: rfid
+  namespace: default
+  annotations:
+    kube32.io/event-stream: "/rfid/events=rfid.tag"
+spec:
+  rules:
+    - http:
+        paths:
+          - path: /rfid
+            pathType: Prefix
+            backend:
+              service:
+                name: rfid
+                port:
+                  number: 80

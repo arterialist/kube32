@@ -246,6 +246,23 @@ kubectl --context kube32 apply -f examples/irremote.yaml
 kubectl --context kube32 logs -f irremote
 ```
 
+### Example: RFID reader
+
+`apps/rfid/rfid.c` reads ISO 14443-A tags (4, 7, and 10-byte UIDs) through an MFRC522-compatible I2C reader, such as the M5Stack RFID 2 unit (WS1850S, address `0x28`). Each tick wakes tags in the field (WUPA), selects one through the anticollision cascade, reads its UID, and halts it. The app runs from `k32_tick` with `kube32.io/tick-interval: 200ms`, so it runs on the Cardputer's shared interpreter in 4 KiB of linear memory.
+
+* When a tag enters the field, the app logs it (`rfid: tag 04a1b2c3d4e580 sak 0x00`) and publishes its hex UID to the `rfid.tag` channel topic. When a tag stays out of the field for three polls, the app logs that it left.
+* `TAG_<UID>` (UID in uppercase hex) maps a tag to a message published on `ACTION_TOPIC` (default `ir.send`, which `irremote` sends as an IR code). `TAG_DEFAULT` maps all other tags.
+* `GET` returns the reader state, poll counters, and last eight tags as JSON.
+* If the reader stops answering, the next tick reinitializes it.
+
+`examples/rfid.yaml` runs the app as a Deployment on the node labeled `i2c.kube32.io/0x28: bus-0` ([device discovery](#device-discovery)), with a Service and an Ingress that serves the JSON status on `/rfid` and tag events on `/rfid/events`:
+
+```
+make -C apps/rfid
+kubectl --context kube32 apply -f examples/rfid.yaml
+kubectl --context kube32 logs -l app=rfid -f
+```
+
 ## Reserved pins
 
 The ESP32-S3 provides GPIO 0 to 21 and 26 to 48. The firewall blocks claims on reserved pins (`include/hal/capability_firewall.hpp`):
