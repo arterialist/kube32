@@ -120,7 +120,7 @@ K32_CMD:API:<control-plane-ip>
 
 After reboot, the Cardputer LCD displays `ready`, its node IP, and `http://<control-plane-ip>/`.
 
-Without stored Wi-Fi credentials, the control plane starts a softAP named `Kube32-Cluster` at `192.168.4.1`, and unprovisioned workers join it automatically.
+Without stored Wi-Fi credentials, the control plane starts a WPA2 softAP named `Kube32-Cluster` at `192.168.4.1`. The control plane generates a password on first boot; run `K32_CMD:APPASS` on its console to print it. Send `K32_CMD:APPASS:<password>` to each worker so workers without other Wi-Fi credentials can join the access point.
 
 To run the cluster without a local network, keep both boards on that access point. Send `K32_CMD:WIFI:` to each board to erase stored credentials, and send `K32_CMD:API:auto` to the worker. Connect the control plane to the host computer over USB and run `tools/kube32_serial_gateway.py`. The gateway serves the API server at `http://127.0.0.1:6443` and the ingress at `http://127.0.0.1:8080`. Use `http://127.0.0.1:6443` as the server in step 3. If a worker on a connected link receives no response to pod syncs for 60 seconds, it disconnects from the access point and reconnects. This recovers the connection when the control plane restarts.
 

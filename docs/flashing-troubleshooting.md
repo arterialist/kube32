@@ -33,6 +33,8 @@ Profile commands write to the `k32` NVS namespace, return `K32_OK ..., rebooting
 | `K32_CMD:WIFI:<ssid>:<password>` | Join a 2.4 GHz network as a station. The station picks the strongest access point with that name and roams to one at least 10 dB stronger when signal drops below -70 dBm. The SSID cannot contain `:`. `K32_CMD:WIFI:` erases credentials. |
 | `K32_CMD:API:<host>` | Set the control plane address for a worker, default `192.168.4.1`. `auto` erases it. |
 | `K32_CMD:AP:off` | Disable the `Kube32-Cluster` access point on the control plane. `on` erases the setting. |
+| `K32_CMD:APPASS:<password>` | Set the `Kube32-Cluster` access point password (8 to 63 printable characters) on the control plane and on each worker that joins the access point. An empty value erases the password, and the control plane generates a replacement on its next boot. |
+| `K32_CMD:APPASS` | Print the stored access point password as `K32_APPASS <password>`. |
 | `K32_CMD:BOARD:cardputer` | Enable the Cardputer display, keypad, speaker, and microSD. `display` is an alias. `generic` erases it. |
 | `K32_CMD:ROLE:control-plane` / `worker` | Override the PSRAM-based role. `auto` erases it. |
 | `K32_CMD:NAME:<name>` | Set the node name to a DNS-1123 label, up to 63 characters of `a-z`, `0-9`, and `-`. `auto` erases it and falls back to `esp32-<mac>`. |
@@ -88,6 +90,7 @@ Opening a native USB-Serial/JTAG or CH340 port with RTS high and DTR low resets 
 | Garbled console output on the CH340 port | Set the baud rate to 115200 or use the native USB port. |
 | Worker never registers | Check `[WORKER] kubelet -> http://<host>:6443` in the boot log and set the control plane address with `K32_CMD:API:<host>`. |
 | Control plane logs `http://192.168.4.1:6443` while joined to a station network | Disable the softAP with `K32_CMD:AP:off`. |
+| Worker logs `[NET] no password for the cluster access point` | Read the password on the control plane with `K32_CMD:APPASS` and set it on the worker with `K32_CMD:APPASS:<password>`. |
 | Keypad events do not reach the control plane across different access points | Verify the worker node object has an `InternalIP` for UDP transport. |
 | Android Chrome cannot reach the board on LAN | Enable the Local network permission for Chrome on Android 17. |
 | Cardputer flash is corrupted after flashing | Reflash without pressing G0. |

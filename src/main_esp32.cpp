@@ -72,6 +72,7 @@
 #include "esp_wifi.h"
 #include "esp_event.h"
 #include "esp_random.h"
+#include "bootloader_random.h"
 #include "nvs_flash.h"
 #include "nvs.h"
 #include "esp_mac.h"
@@ -123,6 +124,7 @@ bool valid_token(const std::string& t) {
 }
 
 std::string read_nvs_str(const char* key);
+bool valid_ap_password(const std::string& p);
 
 NodeIdentity detect_identity() {
     uint8_t mac[6] = {0};
@@ -163,6 +165,37 @@ std::string read_nvs_str(const char* key) {
     bool ok = nvs_get_str(h, key, v, &vl) == ESP_OK;
     nvs_close(h);
     return ok ? std::string(v) : std::string();
+}
+
+// WPA2 passphrase of the cluster access point: 8 to 63 printable characters
+bool valid_ap_password(const std::string& p) {
+    if (p.size() < 8 || p.size() > 63) return false;
+    for (char c : p) {
+        if (c < 0x20 || c > 0x7e) return false;
+    }
+    return true;
+}
+
+// The cluster access point's password (NVS "appass", K32_CMD:APPASS:). A
+// control plane without one makes one up on its first boot and keeps it;
+// runs before Wi-Fi and the ADC are in use, while the SAR ADC can serve as
+// the entropy source.
+std::string cluster_ap_password(bool control_plane) {
+    std::string pass = read_nvs_str("appass");
+    if (valid_ap_password(pass) || !control_plane) return valid_ap_password(pass) ? pass : std::string();
+    static const char alphabet[] = "abcdefghjkmnpqrstuvwxyz23456789";
+    bootloader_random_enable();
+    pass.clear();
+    for (int i = 0; i < 16; ++i) pass.push_back(alphabet[esp_random() % (sizeof(alphabet) - 1)]);
+    bootloader_random_disable();
+    nvs_handle_t h;
+    if (nvs_open("k32", NVS_READWRITE, &h) == ESP_OK) {
+        nvs_set_str(h, "appass", pass.c_str());
+        nvs_commit(h);
+        nvs_close(h);
+    }
+    printf("[NET] generated a password for the cluster access point: K32_CMD:APPASS prints it\n");
+    return pass;
 }
 
 bool read_nvs_blob(const char* key, std::string& out) {
@@ -406,6 +439,8 @@ static uint32_t crc32_bytes(const uint8_t* p, size_t n) {
 //   K32_CMD:WIFI:<ssid>:<password>                       -> stored in NVS, reboot
 //   K32_CMD:NAME:<node name>|auto                        -> stored in NVS, reboot
 //   K32_CMD:TOKEN:<API bearer token>|off                 -> stored in NVS, reboot
+//   K32_CMD:APPASS:<cluster access point password>       -> stored in NVS, reboot
+//   K32_CMD:APPASS                                       -> K32_APPASS <password>
 //   K32_CMD:CERT                                         -> the API server's TLS certificate (PEM)
 //   K32_CMD:REBOOT
 void console_task(void* arg) {
@@ -516,6 +551,28 @@ void console_task(void* arg) {
                     con.write("K32_OK cert\n", 12);
                 } else {
                     con.write("K32_ERR no TLS on this node\n", 28);
+                }
+            } else if (line == "K32_CMD:APPASS") {
+                const std::string pass = read_nvs_str("appass");
+                const std::string out = pass.empty() ? "K32_ERR no cluster access point password stored\n" : "K32_APPASS " + pass + "\n";
+                con.write(out.data(), out.size());
+            } else if (line.rfind("K32_CMD:APPASS:", 0) == 0) {
+                // The same password on every node; empty erases it (a control
+                // plane makes up a new one at boot)
+                const std::string value = line.substr(15);
+                if (!value.empty() && !valid_ap_password(value)) {
+                    const char* why = "K32_ERR password must be 8 to 63 printable characters\n";
+                    con.write(why, std::strlen(why));
+                } else {
+                    nvs_handle_t h;
+                    if (nvs_open("k32", NVS_READWRITE, &h) == ESP_OK) {
+                        if (value.empty()) nvs_erase_key(h, "appass"); else nvs_set_str(h, "appass", value.c_str());
+                        nvs_commit(h);
+                        nvs_close(h);
+                    }
+                    con.write("K32_OK password stored, rebooting\n", 34);
+                    vTaskDelay(pdMS_TO_TICKS(200));
+                    esp_restart();
                 }
             } else if (line.rfind("K32_CMD:NAME:", 0) == 0 || line.rfind("K32_CMD:TOKEN:", 0) == 0) {
                 // Node name (a DNS-1123 label, "auto" for the MAC-derived one)
@@ -811,6 +868,7 @@ void cluster_task(void* pv) {
     static Console console;
     heap_caps_register_failed_alloc_callback(on_alloc_failed);
     print_banner(ident);
+    const std::string ap_password = cluster_ap_password(ident.is_control_plane);
 
     // Without PSRAM, reserve one Wasm page (+ interpreter headroom) now, before
     // Wi-Fi and lwIP fragment the heap, so a 64 KiB pod can still be placed.
@@ -902,9 +960,9 @@ void cluster_task(void* pv) {
     // Network
     kube32::net::WifiConfig wifi_cfg;
     wifi_cfg.ap_ssid = "Kube32-Cluster";
-    wifi_cfg.ap_password = "kube32password";
+    wifi_cfg.ap_password = ap_password;
     wifi_cfg.ssid = "Kube32-Cluster";
-    wifi_cfg.password = "kube32password";
+    wifi_cfg.password = ap_password;
     std::string uplink_ssid, uplink_pass;
     // Stored Wi-Fi credentials put the node on an existing network instead of
     // the cluster access point. A worker on an external network also needs the
@@ -927,6 +985,9 @@ void cluster_task(void* pv) {
     if (uplink) {
         wifi_cfg.ssid = uplink_ssid;
         wifi_cfg.password = uplink_pass;
+    } else if (!ident.is_control_plane && ap_password.empty()) {
+        printf("[NET] no password for the cluster access point: send K32_CMD:APPASS:<password> "
+               "(K32_CMD:APPASS on the control plane prints it)\n");
     }
     auto net_mgr = kube32::net::create_network_manager();
     net_mgr->init(wifi_cfg);
