@@ -1,7 +1,8 @@
 // What a pod takes from the pod pool of a board without PSRAM: an operand
 // stack sized from the module's call chains, no room for the compiler's
-// scratch (lent from the shared interpreter stack while a module loads), and
-// the kubelet's estimate against what a load really takes.
+// scratch (lent from the shared interpreter stack while a module loads), the
+// kubelet's estimate against what a load really takes, and loads that run
+// out of memory part way.
 
 #include "pod_test_util.hpp"
 #include "runtime/pod_memory_pool.h"
@@ -180,6 +181,43 @@ int main() {
             assert(estimate >= taken && estimate <= taken + taken / 5);
             assert(kube32_pool_available(nullptr) == block);
         }
+        kube32_interp_stack_set(nullptr, 0);
+    }
+
+    // A load short of memory at any point fails and gives back all it took:
+    // each image with the pool block used up and the general heap budget
+    // raised 1 KiB at a time until it loads
+    {
+        std::vector<uint8_t> interp(28 * 1024);
+        kube32_interp_stack_set(interp.data(), interp.size());
+        for (const char* name : {"tessera-db", "tessera-hud", "tessera-web", "tessera-api", "rfid", "irremote", "echo", "i2cscan"}) {
+            const std::vector<uint8_t> wasm = k32test::read_file(std::string(KUBE32_SOURCE_DIR) + "/images/" + name + ".wasm");
+            assert(!wasm.empty());
+            const uint32_t memory = std::strcmp(name, "tessera-api") == 0 ? 1280 * 1024 : 16 * 1024;
+            int failed = 0;
+            bool loaded = false;
+            for (size_t extra = 0; !loaded && extra < 1024 * 1024; extra += 1024) {
+                kube32_pool_set_heap_budget(kube32_pool_system_reserve() + extra);
+                std::vector<void*> held;
+                while (void* p = kube32_pool_sub_alloc(256)) held.push_back(p);
+                {
+                    runtime::ContainerConfig cfg;
+                    cfg.pod_id = std::string("default/short-") + name;
+                    cfg.memory_limit_bytes = memory;
+                    cfg.stack_size_bytes = 4096;
+                    cfg.stack_from_module = true;
+                    runtime::ContainerLifecycleController pod(cfg);
+                    loaded = pod.deploy(wasm.data(), wasm.size());
+                    if (!loaded) ++failed;
+                }
+                assert(kube32_pool_general_bytes() == 0);
+                for (void* p : held) kube32_rt_free(p);
+                assert(kube32_pool_available(nullptr) == block);
+            }
+            std::cout << "[short] " << name << ": " << failed << " loads short of memory failed cleanly" << std::endl;
+            assert(loaded && failed > 0);
+        }
+        kube32_pool_set_heap_budget(0);
         kube32_interp_stack_set(nullptr, 0);
     }
 

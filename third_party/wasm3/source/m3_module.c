@@ -190,8 +190,10 @@ _try {
     memory = m3_AllocStruct(M3Memory);
     _throwifnull(memory);
 
-    io_module->memories = m3_ReallocArray(IM3Memory, io_module->memories, index + 1, index);
-    _throwifnull(io_module->memories);
+    // Kube32: a failed realloc leaves the array as it was, still owned here
+    IM3Memory* memories = m3_ReallocArray(IM3Memory, io_module->memories, index + 1, index);
+    _throwifnull(memories);
+    io_module->memories = memories;
 
     memory->owner      = io_module;
     memory->imported   = i_isImported;
@@ -229,8 +231,9 @@ _try {
     table = m3_AllocStruct(M3Table);
     _throwifnull(table);
 
-    io_module->tables = m3_ReallocArray(IM3Table, io_module->tables, index + 1, index);
-    _throwifnull(io_module->tables);
+    IM3Table* tables = m3_ReallocArray(IM3Table, io_module->tables, index + 1, index);
+    _throwifnull(tables);
+    io_module->tables = tables;
 
     table->owner     = io_module;
     table->imported  = i_isImported;
@@ -261,10 +264,12 @@ _try {
 M3Result Module_AddTag (IM3Module io_module, IM3Tag* o_tag, IM3FuncType i_type, bool i_isImported)
 {
 _try {
-    u32 index = io_module->numTags++;
+    u32 index = io_module->numTags;
 
-    io_module->tags = m3_ReallocArray(M3Tag, io_module->tags, io_module->numTags, index);
-    _throwifnull(io_module->tags);
+    M3Tag* tags = m3_ReallocArray(M3Tag, io_module->tags, index + 1, index);
+    _throwifnull(tags);
+    io_module->tags = tags;
+    io_module->numTags = index + 1;
     M3Tag* tag = &io_module->tags[index];
 
     tag->type     = i_type;
@@ -319,10 +324,12 @@ IM3FuncType Module_ContTypeOfRef (IM3Module i_module, m3type_t i_refType)
 M3Result Module_AddGlobal (IM3Module io_module, IM3Global* o_global, m3type_t i_type, bool i_mutable, bool i_isImported)
 {
 _try {
-    u32 index = io_module->numGlobals++;
+    u32 index = io_module->numGlobals;
 
-    io_module->globals = m3_ReallocArray(M3Global, io_module->globals, io_module->numGlobals, index);
-    _throwifnull(io_module->globals);
+    M3Global* globals = m3_ReallocArray(M3Global, io_module->globals, index + 1, index);
+    _throwifnull(globals);
+    io_module->globals = globals;
+    io_module->numGlobals = index + 1;
     M3Global* global = &io_module->globals[index];
 
     global->type      = i_type;
@@ -341,9 +348,10 @@ M3Result Module_PreallocFunctions (IM3Module io_module, u32 i_totalFunctions)
 {
 _try {
     if (i_totalFunctions > io_module->allFunctions) {
-        io_module->functions    = m3_ReallocArray(M3Function, io_module->functions, i_totalFunctions, io_module->allFunctions);
+        M3Function* functions = m3_ReallocArray(M3Function, io_module->functions, i_totalFunctions, io_module->allFunctions);
+        _throwifnull(functions);
+        io_module->functions    = functions;
         io_module->allFunctions = i_totalFunctions;
-        _throwifnull(io_module->functions);
     }
 } _catch:
     return result;
@@ -353,8 +361,9 @@ M3Result Module_AddFunction (IM3Module io_module, u32 i_typeIndex, IM3ImportInfo
 {
 _try {
 
-    u32 index = io_module->numFunctions++;
-_   (Module_PreallocFunctions(io_module, io_module->numFunctions));
+    u32 index = io_module->numFunctions;
+_   (Module_PreallocFunctions(io_module, index + 1));
+    io_module->numFunctions = index + 1;
 
     _throwif("type sig index out of bounds", i_typeIndex >= io_module->numFuncTypes);
 
