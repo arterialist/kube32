@@ -65,6 +65,7 @@ public:
     bool write(const uint8_t* data, size_t len) override;
     void end() override { ended_ = true; }
     int status() const { return status_; }
+    size_t capacity() const { return cap_; }
     size_t copied() const { return len_; }
     bool overflow() const { return total_ > cap_; }
     bool ended() const { return ended_; }
@@ -111,6 +112,9 @@ struct ServiceCallRequest {
     std::string_view call_chain;    // pods serving the caller's request, the caller last
     uint32_t timeout_ms{5000};
     const void* caller_runtime{nullptr};   // wasm3 runtime of the caller (stop checks)
+    // A call made for another node (the egress gateway): true once that
+    // node no longer waits for the answer
+    std::function<bool()> abandoned;
 };
 
 // Platform services used by the hardware imports. The firmware installs these

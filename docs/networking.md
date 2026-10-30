@@ -1,6 +1,6 @@
 # Services, Ingress, calls and NetworkPolicy
 
-The control plane runs an HTTP Ingress controller on port 80, and every node (including the control plane) runs a pod HTTP server on port 7000 and reports that port in `status.daemonEndpoints.kubeletEndpoint.Port` on its `Node` object. On the host simulator, set these ports with `--ingress-port` and `--pod-port`. Services select running pods by label for Ingress routing, `k32_http_call` requests, and environment variable injection. Pods also reach HTTP hosts outside the cluster with `k32_http_call`, restricted by `NetworkPolicy` objects.
+The control plane runs an HTTP Ingress controller on port 80, and every node (including the control plane) runs a pod HTTP server on port 7000 and reports that port in `status.daemonEndpoints.kubeletEndpoint.Port` on its `Node` object. On the host simulator, set these ports with `--ingress-port` and `--pod-port`. Services select running pods by label for Ingress routing, `k32_http_call` requests, and environment variable injection. Pods also reach HTTP and HTTPS hosts outside the cluster with `k32_http_call`, restricted by `NetworkPolicy` objects.
 
 ```mermaid
 flowchart LR
@@ -103,7 +103,7 @@ backend:
 
 ## Calls from pods with k32_http_call
 
-Pods call Services in the cluster and HTTP hosts outside it synchronously with `k32_http_call`, declared in `include/runtime/k32_app_abi.h`:
+Pods call Services in the cluster and HTTP and HTTPS hosts outside it synchronously with `k32_http_call`, declared in `include/runtime/k32_app_abi.h`:
 
 ```c
 int32_t k32_http_call(const char* method, uint32_t method_len,
@@ -122,7 +122,7 @@ securityContext:
     add: ["SERVICE_CALL"]
 ```
 
-`url` takes the form `http://<host>[:<port>]<path>`. The host resolves the way a Kubernetes DNS name resolves inside a pod:
+`url` takes the form `http://<host>[:<port>]<path>` or `https://<host>[:<port>]<path>`. The host of an `http://` URL resolves the way a Kubernetes DNS name resolves inside a pod:
 
 | Host | Target |
 | --- | --- |
@@ -131,8 +131,8 @@ securityContext:
 | `<service>.<namespace>.svc`, `<service>.<namespace>.svc.cluster.local` | The Service |
 | An IPv4 address or any other DNS name | A host outside the cluster |
 
-- A Service's port defaults to its first port, a host's port to `80`.
-- `https://` URLs return `K32_ERR_NOTSUP`: `k32_http_call` speaks plain HTTP/1.1.
+- An `https://` URL always names a host outside the cluster, because pods serve plain HTTP. See [HTTPS](#https).
+- A Service's port defaults to its first port, a host's port to `80` (`443` for `https://`).
 - `headers` takes optional `Name: value\r\n` lines.
 - `timeout_ms` defaults to `5000` when `0`, up to a maximum of `60000`. It bounds the whole call: the name lookup, the connection and the response.
 - The host copies up to `resp_cap` bytes of the response body into `resp` and writes the copied byte count to `*resp_len`.
@@ -148,26 +148,69 @@ securityContext:
 ### Hosts outside the cluster
 
 - The node looks names up with its own resolver: lwIP and the name server from DHCP on the boards (`.local` names over mDNS), the operating system on the simulator. Name lookups are not subject to NetworkPolicy.
-- Each call opens a connection of its own with `Connection: close`. The node reads the response as it arrives and closes the connection when the response is complete, or as soon as the body exceeds `resp_cap` (`K32_ERR_TOOBIG` with the first `resp_cap` bytes copied).
-- The host receives the `Host` header from the URL and every caller header except `X-Kube32-*` and the headers the connection owns (`Host`, `Content-Length`, `Connection`, `Transfer-Encoding`, `Keep-Alive`, `Upgrade`, `TE`, `Trailer`).
+- Each call opens a connection of its own with `Connection: close`. The node reads the response as it arrives and closes the connection when the response is complete, or as soon as the body exceeds `resp_cap` (`K32_ERR_TOOBIG` with the first `resp_cap` bytes copied; `k32_http_status()` then returns the response's status).
+- The host receives the `Host` header from the URL and every caller header except `X-Kube32-*` and the headers the connection owns (`Host`, `Content-Length`, `Connection`, `Transfer-Encoding`, `Keep-Alive`, `Upgrade`, `TE`, `Trailer`, `Expect`). Interim `1xx` responses are skipped.
 - Redirects return to the caller as they are.
+- The response head (status line and headers) may take up to 8 KiB on the control plane, which makes every `https://` connection, and up to 1 KiB on workers. A larger head fails the call with `K32_ERR_IO`.
 - Workers on the cluster access point reach hosts outside the cluster through the control plane (see [Routing for the cluster access point](#routing-for-the-cluster-access-point)).
+
+### HTTPS
+
+The control plane makes every `https://` connection: directly for its own pods, and through its [egress gateway](#egress-gateway) for pods on workers. Workers make no TLS connections.
+
+- **Certificates.** The server's certificate chain must lead to a root in the firmware's certificate bundle and name the URL's host, as a DNS name or an IPv4 address. The bundle is the ESP-IDF common CA subset of Mozilla's list, which covers nearly all public sites. Once SNTP has set the control plane's clock, certificates outside their validity dates are refused too. A refused certificate returns `K32_ERR_CERT`, and any other handshake failure returns `K32_ERR_TLS`. The control plane logs `[EGRESS] <pod> -> https://<host>:<port>: certificate rejected: <reason>` at most once per second. The simulator trusts the operating system's roots and the PEM file given with `--egress-ca`.
+- **Sessions.** TLS runs on up to two session threads with 12 KiB stacks in PSRAM, started on the first call, and mbedTLS allocates its buffers from PSRAM. The calling pod waits for its session. When both sessions are in use, the call returns `K32_ERR_BUSY` at once.
+- **Connections.** TLS 1.2. Each call opens a connection of its own and handles the request and response as a plain HTTP call to a host outside the cluster does.
+
+#### Egress gateway
+
+A worker's service client forwards each `https://` call of its pods to the API server on the control plane:
+
+```
+POST /apis/kube32.io/v1/egress?pod=<namespace>/<name>&timeout=<ms>&limit=<bytes>
+Authorization: Bearer <cluster token>
+Content-Type: message/http
+
+GET https://example.com/path HTTP/1.1
+<the pod's request headers>
+
+<the pod's request body>
+```
+
+`timeout` is what is left of the pod's `timeout_ms`, and `limit` is its `resp_cap`. The API worker hands the connection to a TLS session and goes back to serving the API. The gateway streams the host's response back with the host's status, chunked as it arrives, and stops after `limit` + 1 body bytes. Every gateway answer carries `X-Kube32-Egress-Result`: the host's status, or the `K32_ERR_*` code of a call that failed before the host answered, with an HTTP `4xx` or `5xx` status (`503` and `Retry-After: 1` when every session is in use). The worker returns that code to the pod. An API server without the gateway answers `404`, which the worker reports as `K32_ERR_NOTSUP`.
+
+The gateway makes calls only for pods, and only on behalf of nodes:
+
+- When the API server has a bearer token (`K32_CMD:TOKEN`), the request must carry it, as kubelets do. A holder of the token can name any pod, since the token already grants full access to the API.
+- Without a token, the request must come from the `InternalIP` of the node the named pod is bound to. This keeps out devices that are not nodes, but the API server itself then accepts any client, including one that registers a Node of its own.
+- In both cases the named pod must exist and be bound to a node, and the gateway checks the call against that pod's NetworkPolicies in the object store, as it checks the control plane's own pods.
+
+Pods share their node's address, so a pod that can reach the API server could name another pod of its node. With a token, a pod needs the token to do so.
+
+The connection from a worker to the gateway is plain HTTP over the cluster network, like the kubelet's API requests. The call's URL, headers, body, answer, and the bearer token cross the cluster access point protected by its WPA2 password. TLS and its certificate checks cover the connection from the control plane to the host.
+
+A refused call returns `K32_ERR_PERM` to the pod, and the control plane logs `[EGRESS] gateway refused <address> (pod <pod>): <reason>` at most once per second. When the worker closes the connection (its pod stopped or timed out), the gateway ends the call and frees the session.
+
+### Return values
 
 | Return value | Code | Meaning |
 | --- | --- | --- |
 | HTTP status | `100`..`599` | Response status from the target pod or host |
-| `K32_ERR_PERM` | `-1` | Pod lacks the `SERVICE_CALL` capability, or no NetworkPolicy allows the connection |
+| `K32_ERR_PERM` | `-1` | Pod lacks the `SERVICE_CALL` capability, no NetworkPolicy allows the connection, or the egress gateway refused the pod's node |
 | `K32_ERR_NOENT` | `-2` | Service or port not found, no ready pod selected, or the host name does not resolve |
-| `K32_ERR_IO` | `-5` | Target node unreachable, or the connection failed |
+| `K32_ERR_IO` | `-5` | Target node or control plane unreachable, or the connection failed |
 | `K32_ERR_TOOBIG` | `-7` | Response body exceeded `resp_cap`; first `resp_cap` bytes are copied |
 | `K32_ERR_NOMEM` | `-12` | Insufficient native stack for an in-process call |
 | `K32_ERR_FAULT` | `-14` | Pointer or length out of bounds in linear memory |
+| `K32_ERR_BUSY` | `-16` | `https://`: every TLS session of the control plane is in use; retry later |
 | `K32_ERR_INVAL` | `-22` | Malformed URL or arguments |
 | `K32_ERR_LOOP` | `-40` | Target pod is already in `X-Kube32-Call-Chain`, or chain length reached 8 |
-| `K32_ERR_NOTSUP` | `-95` | `https://` URL |
+| `K32_ERR_TLS` | `-71` | `https://`: the TLS handshake failed |
+| `K32_ERR_NOTSUP` | `-95` | `https://` in a cluster whose control plane makes no TLS connections |
 | `K32_ERR_TIMEOUT` | `-110` | No complete response within `timeout_ms` |
 | `K32_ERR_CONNREFUSED` | `-111` | The host refused the connection |
 | `K32_ERR_HOSTUNREACH` | `-113` | No route to the host |
+| `K32_ERR_CERT` | `-129` | `https://`: the certificate is not trusted, names another host, or is outside its validity dates |
 
 ## NetworkPolicy
 
@@ -208,7 +251,7 @@ spec:
 
 ### Enforcement and propagation
 
-The node of the calling pod enforces the policies.
+The node of the calling pod enforces the policies, except for `https://` calls of pods on workers, which the control plane checks at the egress gateway with the policies and pod labels in its object store.
 
 - The control plane reads policies, pods and namespaces from its object store. A change applies from the next call.
 - A worker's kubelet records the labels of the node's pods at every pod sync (every 2 s on the boards) and loads the policies of a namespace before the first pod of that namespace starts on the node. It lists the policies of every namespace with pods on the node again every 5 s. A policy change reaches a worker within about 7 s, a change to a calling pod's labels within one pod sync.
@@ -321,3 +364,4 @@ curl -sN http://<control-plane-ip>/echo/events
 - `Endpoints` and `EndpointSlice` are read-only and do not support `watch`.
 - The API server does not serve `IngressClass` objects, and the Ingress controller routes only Ingresses with `ingressClassName: kube32` or unset.
 - NetworkPolicy ingress rules are stored and not enforced.
+- `https://` calls use TLS 1.2; a host that accepts only TLS 1.3 fails with `K32_ERR_TLS`.

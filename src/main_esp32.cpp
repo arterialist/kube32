@@ -44,6 +44,7 @@
 #include "app/ingress_controller.hpp"
 #include "app/pod_server.hpp"
 #include "app/service_client.hpp"
+#include "app/egress_gateway.hpp"
 #include "app/node_storage_api.hpp"
 #include "app/console_relay.hpp"
 #include "api/node_proxy.hpp"
@@ -1348,16 +1349,33 @@ void cluster_task(void* pv) {
         static std::unique_ptr<kube32::api::FirmwareApi> firmware_api;
         firmware_api = std::make_unique<kube32::api::FirmwareApi>(*s_firmware_slots, *store, api_server->route_handler(), node_proxy.get());
         s_firmware_api = firmware_api.get();
-        api_server->set_handler(firmware_api.get());
-        if (!api_server->start()) ESP_LOGE(TAG, "API server failed to start");
 
-        // k32_http_call: Services and NetworkPolicies read from the store
+        // k32_http_call: Services and NetworkPolicies read from the store.
+        // https:// calls are made here, for this node's pods and, through the
+        // egress gateway (/apis/kube32.io/v1/egress), for the workers' pods:
+        // at most two TLS sessions at once, their stacks and buffers in PSRAM.
+        // Public sites send response heads of several KB (cookies, policies).
+        static std::unique_ptr<kube32::osal::TlsClient> tls_client;
+        {
+            std::string tls_error;
+            tls_client = kube32::osal::TlsClient::create("", tls_error);
+            if (!tls_client) printf("[EGRESS] no https:// calls: %s\n", tls_error.c_str());
+        }
         static std::unique_ptr<kube32::app::ServiceClient> service_client;
         kube32::app::ServiceClientOptions sc_opts;
         sc_opts.pool_size = 4;
+        sc_opts.response_head_bytes = 8192;
+        sc_opts.tls = tls_client.get();
+        sc_opts.tls_sessions = 2;
+        sc_opts.tls_stack_bytes = 12288;
+        sc_opts.tls_stack_in_psram = ident.has_psram;
         service_client = std::make_unique<kube32::app::ServiceClient>(kube32::app::make_store_service_resolver(*store), sc_opts,
                                                                       kube32::app::make_store_egress_source(*store));
         kube32::app::install_service_client(service_client.get());
+        static std::unique_ptr<kube32::app::EgressGateway> egress_gateway;
+        egress_gateway = std::make_unique<kube32::app::EgressGateway>(*service_client, *store, api_server->route_handler(), firmware_api.get());
+        api_server->set_handler(egress_gateway.get());
+        if (!api_server->start()) ESP_LOGE(TAG, "API server failed to start");
         s_api_server = api_server.get();
         printf("[CONTROL-PLANE] API server http://%s:6443, scheduler + node lifecycle active\n", ip.c_str());
 
@@ -1432,16 +1450,20 @@ void cluster_task(void* pv) {
 
         // k32_http_call: Services and their Endpoints read from the API
         // server; the kubelet keeps the NetworkPolicies of this node's
-        // namespaces with its pod sync
+        // namespaces with its pod sync; https:// calls go to the control
+        // plane's egress gateway
         static std::shared_ptr<kube32::kubelet::HttpKubeClient> svc_api;
         svc_api = std::make_shared<kube32::kubelet::HttpKubeClient>(api_host, 6443);
         if (s_api_token_set) svc_api->set_bearer_token(api_token);
         if (!ident.has_psram) svc_api->set_max_body(16 * 1024);
         auto api_get = [](const std::string& path, std::string& body) { return svc_api->get(path, body); };
         kubelet_cfg.network_policies = std::make_shared<kube32::net::NodeNetworkPolicies>();
+        kube32::app::ServiceClientOptions sc_opts;
+        sc_opts.gateway_host = api_host;
+        sc_opts.gateway_port = 6443;
+        if (s_api_token_set) sc_opts.gateway_token = api_token;
         static std::unique_ptr<kube32::app::ServiceClient> service_client;
-        service_client = std::make_unique<kube32::app::ServiceClient>(kube32::app::make_api_service_resolver(api_get),
-                                                                      kube32::app::ServiceClientOptions{},
+        service_client = std::make_unique<kube32::app::ServiceClient>(kube32::app::make_api_service_resolver(api_get), sc_opts,
                                                                       kube32::app::make_node_egress_source(kubelet_cfg.network_policies, api_get));
         kube32::app::install_service_client(service_client.get());
 

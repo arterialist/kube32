@@ -18,6 +18,7 @@
 #include "app/ingress_controller.hpp"
 #include "app/pod_server.hpp"
 #include "app/service_client.hpp"
+#include "app/egress_gateway.hpp"
 #include "app/node_storage_api.hpp"
 #include "api/node_proxy.hpp"
 #include "api/firmware_api.hpp"
@@ -75,6 +76,7 @@ struct SimOptions {
     std::string worker_board{"cardputer"}; // kube32.io/board of the in-process workers
     std::string token;                     // API bearer token (also KUBE32_API_TOKEN)
     bool tls{false};                       // HTTPS on the API port next to plain HTTP
+    std::string egress_ca;                 // PEM file of further roots pods' https calls trust
     std::string node_ip{"127.0.0.1"};      // address the nodes report (pod IPs): a LAN address lets boards reach their pods
     // --psram 0 models a board without PSRAM: the internal pod pool, the
     // shared interpreter stack and this much heap left for pods and the
@@ -99,6 +101,7 @@ static void print_sim_usage(std::ostream& out) {
            "  --join <url>                worker: API server to register with\n"
            "  --token <token>             API bearer token (also KUBE32_API_TOKEN)\n"
            "  --tls                       serve HTTPS next to plain HTTP on the API port\n"
+           "  --egress-ca <file>          PEM roots that pods' https:// calls trust besides the system's\n"
            "  --data-dir <dir>            store and node storage root (default /tmp/kube32_<node>_data);\n"
            "                              each node's firmware slots are files below it (firmware*/)\n"
            "  --enable-flash              persist the object store in <data-dir>\n"
@@ -167,6 +170,7 @@ static SimOptions parse_sim_args(int argc, char* argv[]) {
         else if (arg == "--worker-board" && i + 1 < argc) opts.worker_board = argv[++i];
         else if (arg == "--token" && i + 1 < argc) opts.token = argv[++i];
         else if (arg == "--tls") opts.tls = true;
+        else if (arg == "--egress-ca" && i + 1 < argc) opts.egress_ca = argv[++i];
         else if (arg == "--node-ip" && i + 1 < argc) opts.node_ip = argv[++i];
         else if (arg == "--heap-budget" && i + 1 < argc) opts.heap_budget = static_cast<size_t>(kube32::models::parse_quantity(argv[++i]));
         else if (arg == "--psram" && i + 1 < argc) {
@@ -363,12 +367,17 @@ int main(int argc, char* argv[]) {
         kubelet_cfg.firmware_slots = worker_slots;
 
         // k32_http_call: Services resolved through the API server; the
-        // kubelet keeps the NetworkPolicies of this node's namespaces
+        // kubelet keeps the NetworkPolicies of this node's namespaces;
+        // https:// calls go to the control plane's egress gateway
         auto api_client = std::make_shared<kube32::kubelet::HttpKubeClient>(master_host, master_port);
         api_client->set_bearer_token(opts.token);
         auto api_get = [api_client](const std::string& path, std::string& body) { return api_client->get(path, body); };
         kubelet_cfg.network_policies = std::make_shared<kube32::net::NodeNetworkPolicies>();
-        kube32::app::ServiceClient service_client(kube32::app::make_api_service_resolver(api_get), kube32::app::ServiceClientOptions{},
+        kube32::app::ServiceClientOptions sc_opts;
+        sc_opts.gateway_host = master_host;
+        sc_opts.gateway_port = master_port;
+        sc_opts.gateway_token = opts.token;
+        kube32::app::ServiceClient service_client(kube32::app::make_api_service_resolver(api_get), sc_opts,
                                                   kube32::app::make_node_egress_source(kubelet_cfg.network_policies, api_get));
         kube32::app::install_service_client(&service_client);
 
@@ -544,13 +553,31 @@ int main(int argc, char* argv[]) {
     const kube32::hal::FirmwareInfo builtin_firmware = sim_firmware(argv[0]);
     auto cp_slots = sim_slots(opts.data_dir + "/firmware", builtin_firmware);
     kube32::api::FirmwareApi firmware_api(*cp_slots, *store, server->route_handler(), &node_proxy);
-    server->set_handler(&firmware_api);
     kube32::controller::FirmwareRolloutController firmware_rollouts(*store, [&firmware_api] { return firmware_api.staged(); });
 
-    // k32_http_call: Services and NetworkPolicies read from the store
-    kube32::app::ServiceClient service_client(kube32::app::make_store_service_resolver(*store), kube32::app::ServiceClientOptions{},
+    // k32_http_call: Services and NetworkPolicies read from the store; https://
+    // calls made here, for this process's pods and through the egress gateway
+    // for workers' pods, trusting the system's roots and --egress-ca
+    std::unique_ptr<kube32::osal::TlsClient> tls_client;
+    if (kube32::osal::tls_available()) {
+        std::string roots, err;
+        if (!opts.egress_ca.empty()) {
+            std::ifstream f(opts.egress_ca, std::ios::binary);
+            roots.assign(std::istreambuf_iterator<char>(f), std::istreambuf_iterator<char>());
+            if (roots.empty()) std::cerr << "[EGRESS] cannot read " << opts.egress_ca << std::endl;
+        }
+        tls_client = kube32::osal::TlsClient::create(roots, err);
+        if (!tls_client) std::cerr << "[EGRESS] no https:// calls: " << err << std::endl;
+    }
+    kube32::app::ServiceClientOptions sc_opts;
+    sc_opts.response_head_bytes = 8192;
+    sc_opts.tls = tls_client.get();
+    sc_opts.tls_stack_bytes = 262144;
+    kube32::app::ServiceClient service_client(kube32::app::make_store_service_resolver(*store), sc_opts,
                                               kube32::app::make_store_egress_source(*store));
     kube32::app::install_service_client(&service_client);
+    kube32::app::EgressGateway egress_gateway(service_client, *store, server->route_handler(), &firmware_api);
+    server->set_handler(&egress_gateway);
 
     if (!server->start()) {
         std::cerr << "[FATAL] Failed to bind HTTP API server to port " << opts.port << std::endl;

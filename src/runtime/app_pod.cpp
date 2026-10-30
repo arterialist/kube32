@@ -156,6 +156,12 @@ static void begin_response(CallContext* c, int status, std::string_view ctype) {
 static std::mutex s_ctx_mutex;
 static std::map<const void*, CallContext*> s_ctx_by_runtime;
 static std::map<const void*, std::string> s_pod_by_runtime;
+static std::map<const void*, int32_t> s_http_status_by_runtime;   // k32_http_status
+
+static void set_http_status(IM3Runtime rt, int32_t status) {
+    std::lock_guard<std::mutex> lock(s_ctx_mutex);
+    s_http_status_by_runtime[rt] = status;
+}
 
 static CallContext* ctx_for(IM3Runtime rt) {
     std::lock_guard<std::mutex> lock(s_ctx_mutex);
@@ -381,6 +387,7 @@ static const void* raw_http_call(IM3Runtime rt, IM3ImportContext ictx, uint64_t*
     for (int i = 0; i < 12; ++i) a[i] = static_cast<uint32_t>(sp[i + 1]);
     int32_t& ret = *reinterpret_cast<int32_t*>(sp);
     const std::string& pod_id = pod_for(rt, ictx);
+    set_http_status(rt, 0);
     if (!hal::CapabilityFirewall::instance().check_permission(pod_id, hal::PeripheralType::ServiceCall, 0, hal::AccessMode::ReadWrite)) {
         ret = K32_ERR_PERM;
         return m3Err_none;
@@ -418,10 +425,20 @@ static const void* raw_http_call(IM3Runtime rt, IM3ImportContext ictx, uint64_t*
         rc = K32_ERR_IO;
     }
     if (rc >= 0 && sink.overflow()) rc = K32_ERR_TOOBIG;
+    set_http_status(rt, sink.status());
     uint32_t copied = static_cast<uint32_t>(sink.copied());
     std::memcpy(static_cast<uint8_t*>(mem) + a[10], &copied, 4);
     ret = rc;
     if (runtime_stop_requested(rt)) return m3Err_trapOutOfGas;   // being stopped: end the guest here
+    return m3Err_none;
+}
+
+// k32_http_status() -> the status of the answer to the pod's last
+// k32_http_call (also when its body did not fit), 0 when none arrived
+static const void* raw_http_status(IM3Runtime rt, IM3ImportContext, uint64_t* sp, void*) {
+    std::lock_guard<std::mutex> lock(s_ctx_mutex);
+    auto it = s_http_status_by_runtime.find(rt);
+    *reinterpret_cast<int32_t*>(sp) = it != s_http_status_by_runtime.end() ? it->second : 0;
     return m3Err_none;
 }
 
@@ -590,6 +607,7 @@ static const void* raw_fs_remove(IM3Runtime rt, IM3ImportContext ictx, uint64_t*
 void unlink_app_host_functions(IM3Runtime runtime) {
     std::lock_guard<std::mutex> lock(s_ctx_mutex);
     s_pod_by_runtime.erase(runtime);
+    s_http_status_by_runtime.erase(runtime);
 }
 
 void link_app_host_functions(IM3Module module, const std::string& pod_id) {
@@ -611,6 +629,7 @@ void link_app_host_functions(IM3Module module, const std::string& pod_id) {
     m3_LinkRawFunction(module, "env", "k32_mem_stats",    "i(ii)",      &raw_mem_stats);
     m3_LinkRawFunction(module, "env", "k32_resp_asset",   "i(iii)",     &raw_resp_asset);
     m3_LinkRawFunction(module, "env", "k32_http_call",    "i(iiiiiiiiiiii)", &raw_http_call);
+    m3_LinkRawFunction(module, "env", "k32_http_status",  "i()",        &raw_http_status);
     m3_LinkRawFunction(module, "env", "k32_display_text", "i(iiiiii)",  &raw_display_text);
     m3_LinkRawFunction(module, "env", "k32_display_rect", "i(iiiii)",   &raw_display_rect);
     m3_LinkRawFunction(module, "env", "k32_display_bar",  "i(iiiiiii)", &raw_display_bar);

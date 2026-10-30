@@ -22,6 +22,7 @@ Use `kubectl` and k9s to manage the cluster. Use the tools below to run the host
 | `--join <url>` | `""` | Worker: API server URL to register with, or `auto` for mDNS discovery. |
 | `--token <token>` | `$KUBE32_API_TOKEN` | API bearer token. |
 | `--tls` | off | Serve HTTPS alongside plain HTTP on `--port`; key and certificate are stored in `<data-dir>/kube32/tls/`. |
+| `--egress-ca <file>` | none | PEM roots that pods' `https://` calls trust besides the operating system's (a private CA). Control plane and standalone roles. |
 | `--data-dir <dir>` | `/tmp/kube32_<node>_data` | Object store and node storage root (unless `KUBE32_SD_ROOT` is set). Each node's firmware slots are files under this directory (`firmware/`, `firmware-<worker>/`). See [Firmware updates](firmware-updates.md#simulator). |
 | `--enable-flash` | off | Persist the object store journal in `<data-dir>/kube32/store/journal.img`. |
 | `--node-name <name>` | `esp32-master` | Control-plane or standalone node name. |
