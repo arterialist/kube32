@@ -224,6 +224,7 @@ private:
         bool has_tick{false};
         bool has_alloc{false};
         bool has_init{false};
+        bool ticking{false};      // k32_init has returned 0 (or there is none): ticks may run
         uint32_t tick_interval_ms{1000};
         uint64_t next_tick_ms{0};
         AppPodStats stats;

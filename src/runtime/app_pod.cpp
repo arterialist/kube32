@@ -813,6 +813,9 @@ bool AppPodHost::register_pod(const std::string& pod_id, ContainerLifecycleContr
     e.has_alloc = ctrl->has_export(K32_EXPORT_ALLOC);
     e.has_init = ctrl->has_export(K32_EXPORT_INIT);
     if (!e.has_handle && !e.has_event && !e.has_tick && !e.has_init) return false;
+    // The tick thread may look at the pod between this and init_pod: its
+    // first tick waits for k32_init to return
+    e.ticking = !e.has_init;
     e.call_mutex = std::make_unique<osal::Mutex>();
     osal::LockGuard guard(mutex_);
     auto interval = tick_intervals_.find(pod_id);
@@ -927,6 +930,13 @@ int32_t AppPodHost::init_pod(const std::string& pod_id) {
     arm_call_budget(ctrl);
     int32_t init_rc = ctrl->call_function(K32_EXPORT_INIT);
     note_call_cost(ctrl, K32_EXPORT_INIT);
+    if (init_rc == 0) {
+        osal::LockGuard guard(mutex_);
+        if (Entry* e = find_locked(pod_id)) {
+            e->ticking = true;
+            e->next_tick_ms = 0;
+        }
+    }
     return init_rc;
 }
 
@@ -1161,7 +1171,7 @@ uint32_t AppPodHost::tick_due(uint64_t now_ms, uint32_t max_wait_ms) {
     {
         osal::LockGuard guard(mutex_);
         for (const auto& kv : pods_) {
-            if (!kv.second.has_tick || kv.second.next_tick_ms > now_ms) continue;
+            if (!kv.second.has_tick || !kv.second.ticking || kv.second.next_tick_ms > now_ms) continue;
             if (n < due.size()) due[n].assign(kv.first);
             else due.push_back(kv.first);
             ++n;
@@ -1177,7 +1187,7 @@ uint32_t AppPodHost::tick_due(uint64_t now_ms, uint32_t max_wait_ms) {
     uint64_t wait = max_wait_ms;
     osal::LockGuard guard(mutex_);
     for (const auto& kv : pods_) {
-        if (!kv.second.has_tick) continue;
+        if (!kv.second.has_tick || !kv.second.ticking) continue;
         const uint64_t next = kv.second.next_tick_ms;
         wait = std::min<uint64_t>(wait, next > now_ms ? next - now_ms : 0);
     }

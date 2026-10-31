@@ -11,7 +11,7 @@ A pod is a WebAssembly module that the node runs in its wasm3 interpreter. It co
 | Request pod | `k32_alloc`, `k32_handle`; optionally `k32_init`, `k32_tick`, `k32_event` | HTTP workers call `k32_handle` once per request. A timer calls `k32_tick`. Channel events arrive in `k32_event`. |
 | Entry-point pod | `_start`, `app_main`, or `main` | Runs on the pod's own thread (requires a board with PSRAM). Loops on its own and exits when the function returns. |
 
-A module can export both. The runtime looks up entry points in the order `_start`, `app_main`, `main`. `k32_init` runs once when the container starts, and a non-zero return fails the pod with `StartError` (`k32_init returned <n>`). The simulator and boards call `k32_tick` once per second, or every 10 ms while `k32_tick` returns a positive value. On boards without PSRAM, all pod calls share one interpreter stack and entry-point pods cannot start; use `k32_handle`, `k32_tick`, and `k32_event` pods on those boards.
+A module can export both. The runtime looks up entry points in the order `_start`, `app_main`, `main`. `k32_init` runs once when the container starts, and a non-zero return fails the pod with `StartError` (`k32_init returned <n>`). The simulator and boards call `k32_tick` once per second, or every 10 ms while `k32_tick` returns a positive value; the first tick comes after `k32_init` has returned. On boards without PSRAM, all pod calls share one interpreter stack and entry-point pods cannot start; use `k32_handle`, `k32_tick`, and `k32_event` pods on those boards.
 
 ### Request block
 

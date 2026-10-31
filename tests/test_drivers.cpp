@@ -15,9 +15,9 @@
 // and the room-monitor example (apps/room-monitor) reaching drivers through
 // Services that select them by label. Each driver also runs loaded as the
 // kubelet loads it with its operand stack painted, to show the stack the
-// runtime sizes from the module holds what its calls use
-// (tests/test_driver_frames.cpp measures the native stack the calls take on a
-// board).
+// runtime sizes from the module holds what its calls use, and a pod's first
+// tick is shown to wait for its k32_init. (tests/test_driver_frames.cpp
+// measures the native stack the calls take on a board.)
 
 #include "pod_test_util.hpp"
 #include "mfrc522_sim.hpp"
@@ -958,6 +958,43 @@ void test_operand_stacks() {
 }
 
 // ---------------------------------------------------------------------------
+// The first tick waits for k32_init: the tick thread can find a pod between
+// its registration and k32_init
+// ---------------------------------------------------------------------------
+void test_init_before_tick() {
+    std::cout << "=== k32_init before the first tick ===" << std::endl;
+    {
+        // Registered as the runtime registers it, k32_init not run yet
+        const std::string pod_id = "default/early";
+        runtime::ContainerConfig cfg;
+        cfg.pod_id = pod_id;
+        cfg.memory_limit_bytes = 3072;
+        cfg.stack_size_bytes = 4096;
+        cfg.stack_from_module = true;
+        std::string err;
+        assert(hal::CapabilityFirewall::instance().register_pod(pod_id,
+            R"({"spec":{"containers":[{"name":"c","resources":{"requests":{"hardware.kube32.io/chip-temp":"1","hardware.kube32.io/ipc":"1"}}}]}})", err));
+        runtime::AppPodHost::instance().set_env(pod_id, {{"DEVICE_NAME", "early"}});
+        runtime::ContainerLifecycleController ctrl(cfg);
+        const std::vector<uint8_t> wasm = image("driver-chip-temp");
+        assert(ctrl.deploy(wasm.data(), wasm.size()));
+        auto& host = runtime::AppPodHost::instance();
+        assert(host.register_pod(pod_id, &ctrl));
+        take_events("device.early");
+        host.tick_due(osal::System::get_uptime_ms() + 1000000);
+        assert(take_events("device.early").empty() && log_count("early", "chip-temp:") == 0);   // not ticked
+        assert(host.init_pod(pod_id) == 0);
+        assert(log_count("early", "chip-temp: the chip's temperature every 10000 ms") == 1);
+        host.tick_due(osal::System::get_uptime_ms() + 1000000);
+        std::vector<Event> ev = take_events("device.early");
+        assert(ev.size() == 1 && has(ev[0].body, "\"device\":\"early\""));
+        host.unregister_pod(pod_id);
+        hal::CapabilityFirewall::instance().unregister_pod(pod_id);
+    }
+    std::cout << "[PASS] k32_init before the first tick" << std::endl;
+}
+
+// ---------------------------------------------------------------------------
 // What each driver takes from a board's pod pool
 // ---------------------------------------------------------------------------
 // The kubelet's estimate with the board's sizes, as a board without PSRAM
@@ -1001,6 +1038,7 @@ int main() {
     test_event_size(*rt);
     test_room_monitor(*rt);
     test_operand_stacks();
+    test_init_before_tick();
     test_pool_estimates();
     hal::CapabilityFirewall::instance().reset();
     std::cout << "[PASS] device drivers" << std::endl;
