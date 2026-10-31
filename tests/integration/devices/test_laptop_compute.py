@@ -6,7 +6,8 @@ worker that joined it and has no parts. Discovery on board-1 finds and
 identifies the BME688, the control plane creates its Device, the driver pod
 runs on board-1 only, and an app pod on the laptop reaches it through the
 Device's Service and through a Service of its own that selects drivers by
-Device labels.
+Device labels. In the other direction, board-1's Ingress controller reaches
+the app on the laptop at the laptop's pod port.
 """
 
 import json
@@ -14,6 +15,7 @@ import os
 import shutil
 import subprocess
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
 
@@ -84,6 +86,7 @@ class TestLaptopCompute(BaseTestCase):
     API_PORT = 16743
     BOARD_POD_PORT = 17710
     LAPTOP_POD_PORT = 17711
+    INGRESS_PORT = 17712
     DEVICE = "bme688-board-1-b0-m70c2-77"
 
     def setUp(self):
@@ -125,6 +128,14 @@ class TestLaptopCompute(BaseTestCase):
         with urllib.request.urlopen(req, timeout=5.0) as resp:
             return json.loads(resp.read().decode())
 
+    def _ingress(self, path: str):
+        """GET `path` through board-1's Ingress controller: the body, None until it answers 200"""
+        try:
+            with urllib.request.urlopen(f"http://127.0.0.1:{self.INGRESS_PORT}{path}", timeout=5.0) as resp:
+                return resp.read().decode()
+        except (urllib.error.URLError, OSError):
+            return None
+
     def test_app_on_laptop_reads_device_on_board(self):
         """The driver runs where the part is wired; an app on a node without GPIO reaches it by Service"""
         board_dir = self._dir("board")
@@ -135,8 +146,8 @@ class TestLaptopCompute(BaseTestCase):
 
         self._start("board-1", [BIN_PATH, "--role", "standalone", "--workers", "", "--node-name", "cp-dev", "--kubelet-name", "board-1",
                                 "--port", str(self.API_PORT), "--ipc-port", "17700", "--pod-port", str(self.BOARD_POD_PORT),
-                                "--data-dir", board_dir, "--sim-i2c", "pahub,bme688@2", "--lease-interval", "1000",
-                                "--reconcile-interval", "500"], board_dir)
+                                "--ingress-port", str(self.INGRESS_PORT), "--data-dir", board_dir, "--sim-i2c", "pahub,bme688@2",
+                                "--lease-interval", "1000", "--reconcile-interval", "500"], board_dir)
         self.wait_for_condition(lambda: self._get("/version") is not None, timeout=10.0, description="API server")
         self._start("laptop", [BIN_PATH, "--role", "worker", "--node-name", "laptop", "--node-id", "1", "--ipc-port", "17701",
                                "--join", f"http://127.0.0.1:{self.API_PORT}", "--pod-port", str(self.LAPTOP_POD_PORT),
@@ -176,9 +187,10 @@ class TestLaptopCompute(BaseTestCase):
         self.assertEqual(r.status_code, 201, r.text)
         # The app, on the laptop
         r = self.api.post("/api/v1/namespaces/default/pods", {
-            "apiVersion": "v1", "kind": "Pod", "metadata": {"name": "app"},
+            "apiVersion": "v1", "kind": "Pod", "metadata": {"name": "app", "labels": {"app": "probe"}},
             "spec": {"nodeSelector": {"kubernetes.io/hostname": "laptop"},
-                     "containers": [{"name": "probe", "image": "wasm://sd/svcprobe",
+                     "containers": [{"name": "probe", "image": "wasm://sd/svcprobe", "ports": [{"name": "http", "containerPort": 7000}],
+                                     "env": [{"name": "HOSTNAME", "value": "app"}],
                                      "resources": {"requests": {"memory": "16Ki"}, "limits": {"memory": "16Ki"}},
                                      "securityContext": {"capabilities": {"add": ["SERVICE_CALL"]}}}]}})
         self.assertEqual(r.status_code, 201, r.text)
@@ -190,6 +202,24 @@ class TestLaptopCompute(BaseTestCase):
             answer = self.wait_for_condition(lambda url=url: (lambda a: a if a.get("rc") == 200 else None)(self._probe(url)),
                                              timeout=15.0, description=f"the app's call to {url}")
             self.assertIn('"driver":"stub"', answer["body"])
+
+        # Board to laptop: a Service for the app and an Ingress on board-1. The
+        # endpoint is the laptop's pod server, not the containerPort
+        r = self.api.post("/api/v1/namespaces/default/services", {
+            "apiVersion": "v1", "kind": "Service", "metadata": {"name": "probe"},
+            "spec": {"selector": {"app": "probe"}, "ports": [{"name": "http", "port": 80, "targetPort": "http"}]}})
+        self.assertEqual(r.status_code, 201, r.text)
+        ep = self.wait_for_condition(lambda: (lambda e: e if e and e.get("subsets") else None)(self._get("/api/v1/namespaces/default/endpoints/probe")),
+                                     timeout=10.0, description="probe endpoints")
+        self.assertEqual([(a["ip"], p["port"]) for s in ep["subsets"] for a in s["addresses"] for p in s["ports"]],
+                         [("127.0.0.1", self.LAPTOP_POD_PORT)])
+        r = self.api.post("/apis/networking.k8s.io/v1/namespaces/default/ingresses", {
+            "apiVersion": "networking.k8s.io/v1", "kind": "Ingress", "metadata": {"name": "probe"},
+            "spec": {"rules": [{"http": {"paths": [{"path": "/hello", "pathType": "Prefix",
+                                                    "backend": {"service": {"name": "probe", "port": {"name": "http"}}}}]}}]}})
+        self.assertEqual(r.status_code, 201, r.text)
+        body = self.wait_for_condition(lambda: self._ingress("/hello"), timeout=15.0, description="the app through board-1's Ingress")
+        self.assertEqual(body, "hello from app\n")
 
         # Whatever happens, the driver never leaves the board with the part
         self.assertEqual(self._get(f"/api/v1/namespaces/default/pods/{self.DEVICE}-driver")["spec"]["nodeName"], "board-1")
