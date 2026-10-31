@@ -100,10 +100,11 @@ jobs:
             python3 tests/integration/runner.py --suite "$suite"
           done
           python3 tests/integration/test_api_client_compat.py
-      - name: Suites that start their own clusters (cluster, federation)
+      - name: Suites that start their own clusters (cluster, federation, devices)
         run: |
           python3 tests/integration/runner.py --suite cluster
           python3 tests/integration/runner.py --suite federation
+          python3 tests/integration/runner.py --suite devices
       - name: Stress scripts (each starts its own simulator)
         run: |
           for script in test_api_chunked_stream_stress test_api_malformed_requests test_api_socket_disconnect test_sim_wasm_sandbox; do

@@ -489,6 +489,20 @@ else()
     target_link_libraries(test_i2c_discovery PRIVATE kube32_core)
     add_test(NAME test_i2c_discovery COMMAND test_i2c_discovery)
 
+    # Shared I2C buses: device grants, multiplexer channels, whole-bus claims against grants
+    add_executable(test_i2c_sharing
+        tests/test_i2c_sharing.cpp
+    )
+    target_link_libraries(test_i2c_sharing PRIVATE kube32_core)
+    add_test(NAME test_i2c_sharing COMMAND test_i2c_sharing)
+
+    # Devices: the API resource, the driver catalog, the Device controller
+    add_executable(test_devices
+        tests/test_devices.cpp
+    )
+    target_link_libraries(test_devices PRIVATE kube32_core)
+    add_test(NAME test_devices COMMAND test_devices)
+
     # The rfid example against a simulated MFRC522; pod tick intervals
     add_executable(test_rfid_app
         tests/test_rfid_app.cpp

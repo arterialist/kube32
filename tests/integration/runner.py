@@ -56,6 +56,9 @@ SUITE_MAPPING = {
     ],
     "federation": [
         "tests.integration.federation.test_upstream_federation",
+    ],
+    "devices": [
+        "tests.integration.devices.test_laptop_compute",
     ]
 }
 
@@ -183,9 +186,9 @@ def main():
     )
     parser.add_argument(
         "--suite",
-        choices=["api", "validation", "resources", "workloads", "cluster", "federation", "all"],
+        choices=["api", "validation", "resources", "workloads", "cluster", "federation", "devices", "all"],
         default="all",
-        help="Test suite to execute ('api', 'validation', 'resources', 'workloads', 'cluster', 'federation', or 'all')"
+        help="Test suite to execute ('api', 'validation', 'resources', 'workloads', 'cluster', 'federation', 'devices', or 'all')"
     )
     parser.add_argument(
         "-v", "--verbose", "--v",
@@ -207,8 +210,8 @@ def main():
         logging.basicConfig(level=logging.INFO, format="%(message)s")
 
     server_url = args.server
-    if args.suite in ("cluster", "federation"):
-        # Cluster and federation tests manage their own multi-node simulated clusters
+    if args.suite in ("cluster", "federation", "devices"):
+        # Cluster, federation and device tests manage their own multi-node simulated clusters
         pass
     else:
         # Check if target server is reachable
@@ -233,7 +236,8 @@ def main():
             SUITE_MAPPING["resources"] +
             SUITE_MAPPING["workloads"] +
             SUITE_MAPPING["cluster"] +
-            SUITE_MAPPING["federation"]
+            SUITE_MAPPING["federation"] +
+            SUITE_MAPPING["devices"]
         )
     else:
         modules_to_run = SUITE_MAPPING.get(args.suite, [])
