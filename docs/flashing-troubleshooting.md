@@ -60,6 +60,7 @@ Profile commands write to the `k32` NVS namespace, return `K32_OK ..., rebooting
 | `K32_CMD:BTALL` | Every task's backtrace for `addr2line`. |
 | `K32_CMD:HEAP` | `K32_HEAP used\|free <=<size> <blocks> <bytes>` lines: internal heap blocks grouped by size. |
 | `K32_CMD:POOL` | `K32_POOL <offset> <size> used\|free` lines list the chunks of the pod pool block's small heap in address order. |
+| `K32_CMD:BENCH:<kernel>:<n>:<runs>` | `K32_BENCH kernel=<kernel> n=<n> runs=<runs> us_min=<µs> us_total=<µs> sum=<checksum>`: runs a benchmark kernel natively (`fib`, `crc32`, `sieve`, `sort`, `mandel`, `json`; see [Benchmarks](benchmarks.md)). `K32_CMD:BENCH:hostcall:<calls>` times that many `esp_timer_get_time()` calls. |
 | `K32_CMD:TCP` | One `K32_TCP` line per lwIP TCP connection with its state, local port, peer, and bytes unsent, unacknowledged, unread by the application, or out of order. |
 | `K32_CMD:ACCESSLOG:on` / `off` | Log HTTP requests on the API server and ingress. |
 | `K32_CMD:SD` | microSD mount state, capacity, and files under `/sd/kube32`. See [storage](storage.md). |

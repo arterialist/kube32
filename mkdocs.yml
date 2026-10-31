@@ -71,6 +71,7 @@ nav:
   - Reference:
       - Kubernetes API coverage: api-reference.md
       - Tools: cli-reference.md
+      - Benchmarks: benchmarks.md
 
 markdown_extensions:
   - admonition

@@ -30,6 +30,22 @@ kube32 is a Kubernetes-compatible control plane and WebAssembly pod runtime for 
 
 See [docs/hardware-spec.md](docs/hardware-spec.md) for pin assignments and memory budgets.
 
+## Performance
+
+Measured on an ESP32-S3 devkit (control plane, 2 MB PSRAM) and an M5Stack Cardputer (worker, no PSRAM), both at 240 MHz. [docs/benchmarks.md](docs/benchmarks.md) has the details and the commands to repeat them.
+
+| Measurement | Result |
+| --- | --- |
+| Compute in a pod against the same C code run natively | 32 to 95 times slower (wasm3 interpreter) |
+| A call from a pod into a host function | about 1.5 µs |
+| A sensor driver pod on the worker | 20 to 25 KB of its 80 KiB pod pool |
+| The worker's platform services | about 65 KB of SRAM |
+| `GET /api/v1/pods` over Wi-Fi | 148 ms median |
+| A pod from `kubectl apply` to `Running` | 2.8 s |
+| `kube32-sim` with a worker on ARM64 Linux, idle | 6.4 MiB, 0.33 % of a core (k3s v1.33.1: 574 to 918 MiB, 2.2 to 3.2 %) |
+
+Pods suit control logic, I/O and glue. Compute-heavy work belongs in native host functions.
+
 ## Quick start
 
 ### Simulator
@@ -109,6 +125,7 @@ Full documentation is published at [https://arterialist.github.io/kube32/](https
 - [Storage and volumes](docs/storage.md)
 - [Peripherals](docs/peripherals.md)
 - [Devices](docs/devices.md)
+- [Benchmarks](docs/benchmarks.md)
 - [Example: Tessera](docs/examples/tessera.md)
 - [Architecture overview](docs/architecture/index.md)
 - [Kubernetes API coverage](docs/api-reference.md)

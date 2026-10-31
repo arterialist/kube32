@@ -4,14 +4,9 @@ All notable changes to this project will be documented in this file. The format 
 
 ## [Unreleased]
 
-### Fixed
-
-- Endpoints, EndpointSlices, Ingress routes, Service calls and service links reach a pod at its node's pod port (`status.daemonEndpoints.kubeletEndpoint.Port`) instead of its `containerPort`, so pods on a `kube32-sim` worker started with its own `--pod-port` are reachable from the boards. NetworkPolicy ports still match the pod's own port.
-- A node that registers again, after a reboot or after rejected heartbeats, keeps its cordon: the registration no longer sets `spec.unschedulable`.
-- A container's environment is kept once per pod instead of twice.
-
 ### Added
 
+- `K32_CMD:BENCH` runs benchmark kernels natively on a node's console, and the bench pod (`apps/bench`, `images/sd/bench.wasm`) runs the same kernels in the sandbox; [docs/benchmarks.md](docs/benchmarks.md) lists the measurements.
 - Kubernetes API server on port 6443 serving Pod, Node, Namespace, Service, Endpoints, EndpointSlice, ConfigMap, Secret, Event, Deployment, DaemonSet, Job, Lease, Ingress, NetworkPolicy, NodeMetrics, PodMetrics, and subject access reviews.
 - Pod egress: `k32_http_call` reaches HTTP hosts outside the cluster by IPv4 address or DNS name, resolving Service names as Kubernetes DNS does; NetworkPolicy egress rules (`ipBlock` with `except`, pod and namespace selectors, numbered, named and ranged ports) restrict Service and outside calls on the calling node; the control plane routes its cluster access point to its station uplink with NAT and offers the uplink's name server.
 - HTTPS for pod egress: `k32_http_call` reaches `https://` hosts and verifies their certificates against the ESP-IDF common CA bundle, including validity dates once SNTP has set the clock. The control plane makes the TLS connections on up to two sessions in PSRAM, directly for its own pods and through the egress gateway (`POST /apis/kube32.io/v1/egress`) for pods on workers. The gateway accepts nodes by the cluster bearer token, or by node address when the cluster has none, and applies the calling pod's NetworkPolicies. New error codes: `K32_ERR_CERT` (`-129`), `K32_ERR_TLS` (`-71`), and `K32_ERR_BUSY` (`-16`). `k32_http_status` returns the status of an answer whose body did not fit the buffer, and `kube32-sim --egress-ca` adds trusted roots.
@@ -53,6 +48,13 @@ All notable changes to this project will be documented in this file. The format 
 
 ### Fixed
 
+- Endpoints, EndpointSlices, Ingress routes, Service calls and service links reach a pod at its node's pod port (`status.daemonEndpoints.kubeletEndpoint.Port`) instead of its `containerPort`, so pods on a `kube32-sim` worker started with its own `--pod-port` are reachable from the boards. NetworkPolicy ports still match the pod's own port.
+- A node that registers again, after a reboot or after rejected heartbeats, keeps its cordon: the registration no longer sets `spec.unschedulable`.
+- A container's environment is kept once per pod instead of twice.
+- `esp32_get_time_us` returns the node's uptime in microseconds; it returned milliseconds multiplied by 1000.
+- The BME688 driver keeps its compensation steps out of line, so its first reading fits the native stack of a board without PSRAM.
+- A request that fails with `503 node is out of memory` logs the error behind it.
+- A native stack overflow trap reports how much stack the call had when it began and how much it had used.
 - Stop the ESP-IDF I2C master driver from logging every failed transfer on a pod's I2C bus. The HAL reports the first three failures and every 100th.
 - Modules that run out of memory while wasm3 grows its function, global, tag, memory, or table arrays now fail to load instead of crashing the node.
 - Pods leave a PSRAM reserve for the system (128 KiB on a control plane, 64 KiB on a worker with PSRAM). Without this reserve, pod code and structures can drop free PSRAM to 16 KiB, causing API requests to fail with 503 and firmware staging to run the control plane out of memory.
