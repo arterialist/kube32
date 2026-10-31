@@ -630,6 +630,23 @@ void test_heartbeat_patch_in_fixed_buffer() {
     std::cout << "[PASS] (" << buf.size() << " bytes, no allocation)" << std::endl;
 }
 
+// Registering again over a Node that survived (after a reboot, or after
+// rejected heartbeats on a node short of memory) patches it with the
+// registration: a cordon set with kubectl cordon stays
+void test_registration_keeps_cordon() {
+    std::cout << "\n[TEST] Registration over a cordoned Node..." << std::endl;
+    NodeStatusReporter reporter("test-node-01", "192.168.4.2");
+    const std::string reg = reporter.build_registration_json(reporter.collect_telemetry());
+    assert(reg.find("unschedulable") == std::string::npos);
+    kube32::models::JsonValue node, patch;
+    std::string err;
+    assert(kube32::models::parse_json(R"({"metadata":{"name":"test-node-01"},"spec":{"unschedulable":true}})", node, err));
+    assert(kube32::models::parse_json(reg, patch, err));
+    kube32::models::apply_patch(node, patch, "application/merge-patch+json");
+    assert(node.get("spec")->get_bool("unschedulable", false));
+    std::cout << "[PASS]" << std::endl;
+}
+
 // =============================================================================
 // MAIN ENTRY POINT
 // =============================================================================
@@ -649,6 +666,7 @@ int main() {
     test_dynamic_trap_exit_codes();
     test_dynamic_node_telemetry();
     test_heartbeat_patch_in_fixed_buffer();
+    test_registration_keeps_cordon();
 
     std::cout << "\n==================================================================" << std::endl;
     std::cout << " ALL KUBELET NODE STATUS TESTS PASSED                          " << std::endl;

@@ -226,7 +226,8 @@ void NodeStatusReporter::append_registration(Out& json, const NodeTelemetry& tel
         json += "}";
     }
     json += "},";
-    json += "\"spec\":{\"unschedulable\":false},";
+    // No spec: registering again over an existing Node (after a reboot or
+    // rejected heartbeats) must not uncordon it
     json += "\"status\":{";
     json += "\"conditions\":[";
     append_ready_condition(json, telemetry);
