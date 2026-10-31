@@ -50,7 +50,6 @@ struct ContainerConfig {
     RestartPolicy restart_policy{RestartPolicy::Always};
     ProbeSpec liveness_probe;
     ProbeSpec readiness_probe;
-    std::vector<std::pair<std::string, std::string>> env; // exposed through k32_env_get
     // wasm3 gas units each host-initiated call may spend (k32_init, k32_handle,
     // k32_tick, k32_event, k32_alloc). 0 turns metering off for this pod: its
     // code compiles without gas checks (faster) and a call cannot be

@@ -87,9 +87,9 @@ bool WasmRuntime::deploy_impl(const std::string& pod_id, const uint8_t* wasm_byt
     // the default at most
     config.stack_from_module = !spec.stack_size_set;
     config.restart_policy = RestartPolicy::Always;
-    config.env = spec.env;
     config.gas_budget_per_call = spec.gas_budget_per_call;
 
+    // k32_env_get reads the pod's environment from here, its only copy
     AppPodHost::instance().set_env(pod_id, spec.env);
     AppPodHost::instance().set_event_topics(pod_id, spec.event_topics);
     AppPodHost::instance().set_tick_interval(pod_id, spec.tick_interval_ms);
