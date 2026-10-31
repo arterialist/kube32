@@ -121,6 +121,7 @@ else()
         src/controller/deployment_controller.cpp
         src/controller/workload_controller.cpp
         src/controller/firmware_rollout_controller.cpp
+        src/controller/device_controller.cpp
         src/ipc/channel.cpp
         src/api/table_serializer.cpp
         src/api/selectors.cpp

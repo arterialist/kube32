@@ -24,10 +24,12 @@
 #include "controller/deployment_controller.hpp"
 #include "controller/workload_controller.hpp"
 #include "controller/firmware_rollout_controller.hpp"
+#include "controller/device_controller.hpp"
 #include "api/firmware_api.hpp"
 #include "hal/firmware_slots.hpp"
 #include "hal/capability_firewall.hpp"
 #include "hal/i2c_discovery.hpp"
+#include "models/device.hpp"
 #include "kubelet/metrics_provider.hpp"
 #include "esp_sntp.h"
 #include "soc/rtc_cntl_reg.h"
@@ -1153,6 +1155,7 @@ void cluster_task(void* pv) {
     std::unique_ptr<kube32::controller::DeploymentController> deployments;
     std::unique_ptr<kube32::controller::WorkloadController> workloads;
     std::unique_ptr<kube32::controller::FirmwareRolloutController> firmware_rollouts;
+    std::unique_ptr<kube32::controller::DeviceController> devices;
     std::unique_ptr<kube32::api::HttpServer> api_server;
     std::unique_ptr<kube32::kubelet::Kubelet> kubelet;
     std::unique_ptr<kube32::app::IngressController> ingress;
@@ -1178,11 +1181,15 @@ void cluster_task(void* pv) {
     s_api_token_set = valid_token(api_token);
     if (s_api_token_set) kubelet_cfg.api_token = api_token;
     kubelet_cfg.node_labels["kube32.io/board"] = ident.has_display ? "cardputer" : "generic";
-    // Devices answering on the board's I2C pins become node labels
+    // Devices answering on the board's I2C pins become node labels, and the
+    // parts identified among them a node annotation for the Device controller
+    static kube32::hal::I2cDiscovery discovery;
     kubelet_cfg.node_label_source = [] {
-        static kube32::hal::I2cDiscovery discovery;
         discovery.scan();
         return discovery.labels();
+    };
+    kubelet_cfg.node_annotation_source = [] {
+        return std::map<std::string, std::string>{{kube32::models::kAnnotationI2cDevices, discovery.annotation()}};
     };
     kubelet_cfg.node_label_prefix = "i2c.kube32.io/";
     // Firmware rollouts: the kubelet downloads the image into the update slot
@@ -1297,6 +1304,12 @@ void cluster_task(void* pv) {
         firmware_rollouts = std::make_unique<kube32::controller::FirmwareRolloutController>(*store, [] {
             return s_firmware_api ? s_firmware_api->staged() : kube32::api::StagedFirmware{};
         });
+        // Devices: driver pods, their Services, Devices from discovery
+        kube32::controller::DeviceControllerConfig dev_cfg;
+        dev_cfg.reconcile_interval_ms = 2000;
+        dev_cfg.stack_in_psram = ident.has_psram;
+        devices = std::make_unique<kube32::controller::DeviceController>(*store, scheduler.get(), dev_cfg);
+        devices->start();
 
         kube32::api::HttpServerOptions http_opts;
         http_opts.host = "0.0.0.0";

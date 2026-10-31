@@ -1,6 +1,7 @@
 #include "osal/socket.hpp"
 #include "hal/sd_card.hpp"
 #include "hal/i2c_discovery.hpp"
+#include "hal/mock_hal.hpp"
 #include "hal/node_storage.hpp"
 #include "storage/flash_log.hpp"
 #include "osal/thread.hpp"
@@ -24,6 +25,8 @@
 #include "api/firmware_api.hpp"
 #include "api/version_info.hpp"
 #include "controller/firmware_rollout_controller.hpp"
+#include "controller/device_controller.hpp"
+#include "models/device.hpp"
 #include "hal/firmware_slots.hpp"
 #include "osal/sha256.hpp"
 #include "kubelet/kube_api_client.hpp"
@@ -87,6 +90,7 @@ struct SimOptions {
     // plane board's PSRAM pod pool. -1: the role's default (1284Ki, the
     // board's reservation, except for workers, which model the Cardputer).
     int64_t psram_bytes{-1};
+    std::string sim_i2c;                   // simulated I2C parts on this process's bus 0 (MockHal::attach_parts)
 };
 
 static void print_sim_usage(std::ostream& out) {
@@ -115,6 +119,9 @@ static void print_sim_usage(std::ostream& out) {
            "  --node-ip <ip>              address nodes report for their pods (default 127.0.0.1)\n"
            "  --psram <size>              PSRAM to model, e.g. 8Mi; 0 models a board without PSRAM\n"
            "  --heap-budget <size>        heap left for pods and system with --psram 0 (default 51Ki)\n"
+           "  --sim-i2c <parts>           simulated I2C parts on bus 0 of this process's node, e.g.\n"
+           "                              pahub,bme688@2,miniscale@3,rfid@4 (part[:0x<addr>][@<PaHub channel>];\n"
+           "                              parts: pahub, bme688, miniscale, rfid)\n"
            "\n"
            "Traffic:\n"
            "  --ingress-port <port>       Ingress controller port (default off)\n"
@@ -173,6 +180,7 @@ static SimOptions parse_sim_args(int argc, char* argv[]) {
         else if (arg == "--egress-ca" && i + 1 < argc) opts.egress_ca = argv[++i];
         else if (arg == "--node-ip" && i + 1 < argc) opts.node_ip = argv[++i];
         else if (arg == "--heap-budget" && i + 1 < argc) opts.heap_budget = static_cast<size_t>(kube32::models::parse_quantity(argv[++i]));
+        else if (arg == "--sim-i2c" && i + 1 < argc) opts.sim_i2c = argv[++i];
         else if (arg == "--psram" && i + 1 < argc) {
             opts.psram_bytes = static_cast<int64_t>(kube32::models::parse_quantity(argv[++i]));
             opts.board_without_psram = (opts.psram_bytes == 0);
@@ -316,6 +324,16 @@ int main(int argc, char* argv[]) {
                   << " KiB interpreter stack, " << (opts.heap_budget / 1024) << " KiB heap (--heap-budget)" << std::endl;
     }
 
+    // Simulated I2C parts on the node's bus: found by discovery, read by drivers
+    if (!opts.sim_i2c.empty()) {
+        std::string why;
+        if (!kube32::hal::MockHal::instance().attach_parts(opts.sim_i2c, why)) {
+            std::cerr << "kube32-sim: --sim-i2c: " << why << std::endl;
+            return 2;
+        }
+        std::cout << "[SIM] simulated I2C parts on bus 0: " << opts.sim_i2c << std::endl;
+    }
+
     // Node storage: the simulated microSD card (the KUBE32_SD_ROOT directory)
     // when set, otherwise --data-dir standing in for internal flash
     if (kube32::hal::node_storage_mount(true, opts.data_dir)) {
@@ -356,10 +374,14 @@ int main(int argc, char* argv[]) {
         kubelet_cfg.heartbeat_interval_ms = opts.lease_interval_ms;
         kubelet_cfg.api_token = opts.token;
         kubelet_cfg.node_labels["kube32.io/board"] = opts.board;
+        kubelet_cfg.node_labels[kube32::models::kLabelSimulator] = "true";
+        static kube32::hal::I2cDiscovery discovery;
         kubelet_cfg.node_label_source = [] {
-            static kube32::hal::I2cDiscovery discovery;
             discovery.scan();
             return discovery.labels();
+        };
+        kubelet_cfg.node_annotation_source = [] {
+            return std::map<std::string, std::string>{{kube32::models::kAnnotationI2cDevices, discovery.annotation()}};
         };
         kubelet_cfg.node_label_prefix = "i2c.kube32.io/";
         kubelet_cfg.kubelet_port = opts.pod_port;
@@ -554,6 +576,12 @@ int main(int argc, char* argv[]) {
     auto cp_slots = sim_slots(opts.data_dir + "/firmware", builtin_firmware);
     kube32::api::FirmwareApi firmware_api(*cp_slots, *store, server->route_handler(), &node_proxy);
     kube32::controller::FirmwareRolloutController firmware_rollouts(*store, [&firmware_api] { return firmware_api.staged(); });
+    // Devices: driver pods and Services, Devices from discovery
+    kube32::controller::DeviceControllerConfig dev_cfg;
+    dev_cfg.reconcile_interval_ms = opts.reconcile_interval_ms;
+    dev_cfg.stack_bytes = 65536;
+    kube32::controller::DeviceController devices(*store, scheduler.get(), dev_cfg);
+    devices.start();
 
     // k32_http_call: Services and NetworkPolicies read from the store; https://
     // calls made here, for this process's pods and through the egress gateway
@@ -624,11 +652,15 @@ int main(int argc, char* argv[]) {
         kubelet_cfg.heartbeat_interval_ms = opts.lease_interval_ms;
         kubelet_cfg.api_token = opts.token;
         kubelet_cfg.node_labels["kube32.io/board"] = opts.board;
+        kubelet_cfg.node_labels[kube32::models::kLabelSimulator] = "true";
         // The simulator's own buses belong to this node, not to the extra workers
+        static kube32::hal::I2cDiscovery discovery;
         kubelet_cfg.node_label_source = [] {
-            static kube32::hal::I2cDiscovery discovery;
             discovery.scan();
             return discovery.labels();
+        };
+        kubelet_cfg.node_annotation_source = [] {
+            return std::map<std::string, std::string>{{kube32::models::kAnnotationI2cDevices, discovery.annotation()}};
         };
         kubelet_cfg.node_label_prefix = "i2c.kube32.io/";
         kubelet_cfg.kubelet_port = pod_server ? opts.pod_port : 0;
@@ -644,6 +676,7 @@ int main(int argc, char* argv[]) {
             wcfg.control_plane = false;
             wcfg.node_labels["kube32.io/board"] = opts.worker_board;
             wcfg.node_label_source = nullptr;
+            wcfg.node_annotation_source = nullptr;
             wcfg.node_label_prefix.clear();
             wcfg.firmware_slots = sim_slots(opts.data_dir + "/firmware-" + worker, builtin_firmware);
             wcfg.firmware.local_staging = false;
@@ -710,6 +743,7 @@ int main(int argc, char* argv[]) {
     for (auto& k : worker_kubelets) k->stop();
     mdns->stop_service_announcement();
     server->stop();
+    devices.stop();
     workloads->stop();
     deployments->stop();
     scheduler->stop();

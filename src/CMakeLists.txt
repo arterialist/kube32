@@ -38,6 +38,7 @@ set(KUBE32_APP_SRCS
     controller/deployment_controller.cpp
     controller/workload_controller.cpp
     controller/firmware_rollout_controller.cpp
+    controller/device_controller.cpp
     hal/capability_firewall.cpp
     hal/mock_hal.cpp
     hal/sd_card.cpp
@@ -156,8 +157,8 @@ set_source_files_properties(${CMAKE_CURRENT_LIST_DIR}/api/version_info.cpp PROPE
 
 # Container environment, log persistence, bus setup and IR channels run once
 # per container start, every few seconds or once per IR frame, firmware
-# rollouts once per update: built for size, they take half the flash -O2
-# gives them.
+# rollouts once per update, the Device controller and I2C discovery every
+# few seconds: built for size, they take half the flash -O2 gives them.
 set_source_files_properties(
     ${CMAKE_CURRENT_LIST_DIR}/kubelet/pod_env.cpp
     ${CMAKE_CURRENT_LIST_DIR}/runtime/pod_log.cpp
@@ -174,4 +175,7 @@ set_source_files_properties(
     ${CMAKE_CURRENT_LIST_DIR}/controller/firmware_rollout_controller.cpp
     ${CMAKE_CURRENT_LIST_DIR}/hal/firmware_slots.cpp
     ${CMAKE_CURRENT_LIST_DIR}/kubelet/firmware_agent.cpp
+    ${CMAKE_CURRENT_LIST_DIR}/controller/device_controller.cpp
+    ${CMAKE_CURRENT_LIST_DIR}/models/device.cpp
+    ${CMAKE_CURRENT_LIST_DIR}/hal/i2c_discovery.cpp
     PROPERTIES COMPILE_OPTIONS "-Os")
