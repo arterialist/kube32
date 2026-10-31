@@ -364,7 +364,7 @@ static const void* raw_esp32_get_time_us(IM3Runtime runtime, IM3ImportContext _c
     (void)runtime;
     (void)_ctx;
     (void)_mem;
-    int64_t time_us = static_cast<int64_t>(osal::System::get_uptime_ms() * 1000ULL);
+    int64_t time_us = static_cast<int64_t>(osal::Thread::get_time_us());
     *reinterpret_cast<int64_t*>(_sp) = time_us;
     return m3Err_none;
 }
@@ -606,7 +606,7 @@ int32_t esp32_uart_read(uint32_t port, uint8_t* buf, uint32_t max_len) {
 }
 
 int64_t esp32_get_time_us() {
-    return static_cast<int64_t>(osal::System::get_uptime_ms() * 1000ULL);
+    return static_cast<int64_t>(osal::Thread::get_time_us());
 }
 
 void esp32_delay_ms(uint32_t ms) {
