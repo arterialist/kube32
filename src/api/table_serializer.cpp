@@ -1,4 +1,5 @@
 #include "api/table_serializer.hpp"
+#include "models/device.hpp"
 #include "osal/thread.hpp"
 
 #include <cstdio>
@@ -607,7 +608,8 @@ static std::string format_label_selector(const models::JsonValue* sel) {
 
 bool TableSerializer::has_generic_table(std::string_view kind) {
     return kind == "Event" || kind == "Namespace" || kind == "Service" || kind == "ConfigMap" || kind == "Secret" || kind == "Lease" ||
-           kind == "Ingress" || kind == "NetworkPolicy" || kind == "Endpoints" || kind == "EndpointSlice" || kind == "FirmwareRollout";
+           kind == "Ingress" || kind == "NetworkPolicy" || kind == "Endpoints" || kind == "EndpointSlice" || kind == "FirmwareRollout" ||
+           kind == "Device";
 }
 
 std::string TableSerializer::build_generic_table_json(std::string_view kind, const std::vector<std::string>& jsons, uint64_t resource_version) {
@@ -640,6 +642,9 @@ std::string TableSerializer::build_generic_table_json(std::string_view kind, con
     } else if (kind == "FirmwareRollout") {
         out += col("NAME", 0) + "," + col("VERSION", 0) + "," + col("IMAGE", 0) + "," + col("PHASE", 0) + "," + col("NODE", 0) + "," +
                col("UPDATED", 0) + "," + col("AGE", 0) + "," + col("MESSAGE", 1);
+    } else if (kind == "Device") {
+        out += col("NAME", 0) + "," + col("DRIVER", 0) + "," + col("NODE", 0) + "," + col("ADDRESS", 0) + "," + col("PHASE", 0) + "," +
+               col("AGE", 0) + "," + col("CHIP", 1) + "," + col("POD", 1) + "," + col("MESSAGE", 1);
     } else {
         out += col("NAME", 0) + "," + col("AGE", 0);
     }
@@ -762,6 +767,27 @@ std::string TableSerializer::build_generic_table_json(std::string_view kind, con
                                            : std::string("0/0");
             cells = {name, field("version"), sha.substr(0, 12), st ? st->get_string("phase", "Pending") : "Pending", field("node"),
                      updated, age, st ? st->get_string("message", "") : ""};
+        } else if (kind == "Device") {
+            // ADDRESS: where the part is wired (i2c0/0x70:2/0x77, gpio 4), <none> for a part inside the chip
+            const models::JsonValue* spec = doc.get("spec");
+            const models::JsonValue* st = doc.get("status");
+            models::DeviceSpec ds;
+            std::string why, address = "<none>";
+            if (models::parse_device_spec(spec, ds, why)) {
+                if (ds.has_i2c) {
+                    address = models::i2c_location_text(ds.i2c);
+                } else if (!ds.pins.empty()) {
+                    address.clear();
+                    for (const auto& p : ds.pins) address += (address.empty() ? "gpio " : ",") + std::to_string(p.second);
+                }
+            }
+            auto field = [&](const char* key, const std::string& fallback) {
+                const std::string v = st ? st->get_string(key, "") : "";
+                return v.empty() ? fallback : v;
+            };
+            const std::string node = field("nodeName", spec ? spec->get_string("nodeName", "") : "");
+            cells = {name, spec ? spec->get_string("driver", "") : "", node.empty() ? "<none>" : node, address, field("phase", "Pending"), age,
+                     field("chip", "<none>"), field("podName", "<none>"), field("message", "")};
         } else if (kind == "Endpoints" || kind == "EndpointSlice") {
             // kubectl's printers: the first three endpoints, then "+ N more..."
             std::vector<std::string> eps;

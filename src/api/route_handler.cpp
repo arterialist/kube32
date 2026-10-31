@@ -6,6 +6,7 @@
 #include "api/watch_hub.hpp"
 #include "api/version_info.hpp"
 #include "models/kube_models.hpp"
+#include "models/device.hpp"
 #include "models/kube_lease.hpp"
 #include "models/tolerations.hpp"
 #include "net/network_policy.hpp"
@@ -601,7 +602,7 @@ RouteMatch RouteHandler::match_route(std::string_view path) {
         return match;
     }
 
-    // 7. kube32.io FirmwareRollouts (cluster-scoped)
+    // 7. kube32.io FirmwareRollouts (cluster-scoped) and Devices (namespaced)
     if (path == "/apis/kube32.io") {
         match.category = RouteCategory::DiscoveryApisKube32Group;
         return match;
@@ -622,6 +623,37 @@ RouteMatch RouteHandler::match_route(std::string_view path) {
             match.category = RouteCategory::FirmwareRolloutItem;
             match.resource_name = rest.substr(1);
             return match;
+        }
+    }
+    if (path == "/apis/kube32.io/v1/devices") {
+        match.category = RouteCategory::DevicesCollection;
+        match.api_group = "kube32.io";
+        return match;
+    }
+    static constexpr std::string_view kKube32NsPrefix = "/apis/kube32.io/v1/namespaces/";
+    if (path.rfind(kKube32NsPrefix, 0) == 0) {
+        std::string_view sub = path.substr(kKube32NsPrefix.size());
+        size_t sl = sub.find('/');
+        if (sl != std::string_view::npos && sl > 0) {
+            match.namespace_name = sub.substr(0, sl);
+            match.api_group = "kube32.io";
+            std::string_view rest = sub.substr(sl + 1);
+            if (rest == "devices") { match.category = RouteCategory::DevicesCollection; return match; }
+            if (rest.rfind("devices/", 0) == 0 && rest.size() > 8) {
+                std::string_view item = rest.substr(8);
+                size_t sl2 = item.find('/');
+                if (sl2 == std::string_view::npos) {
+                    match.category = RouteCategory::DeviceItem;
+                    match.resource_name = item;
+                    return match;
+                }
+                if (item.substr(sl2 + 1) == "status" && sl2 > 0) {
+                    match.category = RouteCategory::DeviceStatus;
+                    match.resource_name = item.substr(0, sl2);
+                    match.subresource = "status";
+                    return match;
+                }
+            }
         }
     }
 
@@ -970,6 +1002,16 @@ HttpResponse RouteHandler::dispatch(const HttpRequest& req, const RouteMatch& ma
             return handle_generic(req, match, info);
         }
 
+        // Validated and defaulted in handle_generic; the Device controller
+        // writes their status
+        case RouteCategory::DevicesCollection:
+        case RouteCategory::DeviceItem:
+        case RouteCategory::DeviceStatus: {
+            ResourceInfo info;
+            resource_info(match.category, info);
+            return handle_generic(req, match, info);
+        }
+
         case RouteCategory::EventsCollection:
         case RouteCategory::EventItem:
             return handle_events(req, match);
@@ -1182,7 +1224,11 @@ HttpResponse RouteHandler::handle_discovery(const HttpRequest& req, RouteCategor
         case RouteCategory::DiscoveryApisKube32V1:
             resp.body = "{\"kind\":\"APIResourceList\",\"apiVersion\":\"v1\",\"groupVersion\":\"kube32.io/v1\",\"resources\":["
                         "{\"name\":\"firmwarerollouts\",\"singularName\":\"firmwarerollout\",\"namespaced\":false,\"kind\":\"FirmwareRollout\","
-                        "\"verbs\":[\"get\",\"list\",\"watch\",\"create\",\"update\",\"patch\",\"delete\"],\"shortNames\":[\"fwr\"]}"
+                        "\"verbs\":[\"get\",\"list\",\"watch\",\"create\",\"update\",\"patch\",\"delete\"],\"shortNames\":[\"fwr\"]},"
+                        "{\"name\":\"devices\",\"singularName\":\"device\",\"namespaced\":true,\"kind\":\"Device\","
+                        "\"verbs\":[\"get\",\"list\",\"watch\",\"create\",\"update\",\"patch\",\"delete\"],\"shortNames\":[\"dev\"]},"
+                        "{\"name\":\"devices/status\",\"singularName\":\"device\",\"namespaced\":true,\"kind\":\"Device\","
+                        "\"verbs\":[\"get\",\"patch\",\"update\"]}"
                         "]}";
             break;
 
@@ -2221,6 +2267,8 @@ bool RouteHandler::resource_info(RouteCategory c, ResourceInfo& out) {
             out = {"NetworkPolicy", "networking.k8s.io/v1", "NetworkPolicyList", "networkpolicies", "/registry/networkpolicies/", true}; return true;
         case RouteCategory::FirmwareRolloutsCollection: case RouteCategory::FirmwareRolloutItem:
             out = {"FirmwareRollout", "kube32.io/v1", "FirmwareRolloutList", "firmwarerollouts", "/registry/firmwarerollouts/", false}; return true;
+        case RouteCategory::DevicesCollection: case RouteCategory::DeviceItem: case RouteCategory::DeviceStatus:
+            out = {"Device", "kube32.io/v1", "DeviceList", "devices", "/registry/devices/", true}; return true;
         default:
             return false;
     }
@@ -2248,6 +2296,7 @@ std::string RouteHandler::openapi_v3_document(const std::string& path) const {
         {"apis/networking.k8s.io/v1", "networking.k8s.io", "v1", "Ingress", "ingresses", true},
         {"apis/networking.k8s.io/v1", "networking.k8s.io", "v1", "NetworkPolicy", "networkpolicies", true},
         {"apis/kube32.io/v1", "kube32.io", "v1", "FirmwareRollout", "firmwarerollouts", false},
+        {"apis/kube32.io/v1", "kube32.io", "v1", "Device", "devices", true},
     };
     if (path == "/openapi/v3") {
         std::string out = "{\"paths\":{";
@@ -2541,6 +2590,15 @@ bool RouteHandler::workload_template_ok(RouteCategory category, const std::strin
     return true;
 }
 
+// A Device's spec checked against the driver catalog (models/device.hpp),
+// then defaulted: false with the field and the problem in `why`
+static bool device_ok(models::JsonValue& doc, std::string& why) {
+    models::DeviceSpec spec;
+    if (!models::parse_device_spec(doc.get("spec"), spec, why)) return false;
+    models::default_device(doc);
+    return true;
+}
+
 // Service defaults kube-apiserver applies: type ClusterIP, sessionAffinity
 // None, single-stack IPv4, and per port protocol TCP and targetPort = port.
 // kube32 assigns no cluster IPs: clients reach pods through Ingress.
@@ -2575,7 +2633,9 @@ HttpResponse RouteHandler::handle_generic(const HttpRequest& req, const RouteMat
                           match.category == RouteCategory::ServiceItem ||
                           match.category == RouteCategory::IngressItem ||
                           match.category == RouteCategory::NetworkPolicyItem ||
-                          match.category == RouteCategory::FirmwareRolloutItem);
+                          match.category == RouteCategory::FirmwareRolloutItem ||
+                          match.category == RouteCategory::DeviceItem ||
+                          match.category == RouteCategory::DeviceStatus);
     std::string ns(match.namespace_name);
     std::string root = info.root;
     std::string prefix = root;
@@ -2610,6 +2670,11 @@ HttpResponse RouteHandler::handle_generic(const HttpRequest& req, const RouteMat
             }
             stamp_new_object(doc, ns, info);
             if (match.category == RouteCategory::ServicesNsCollection) default_service(doc);
+            if (match.category == RouteCategory::DevicesCollection) {
+                std::string why;
+                if (!device_ok(doc, why)) return make_status(422, "Invalid", "Device.kube32.io \"" + name + "\" is invalid: " + why);
+                doc.remove("status");   // the Device controller's
+            }
             if (match.category == RouteCategory::NetworkPoliciesCollection) {
                 std::string why;
                 if (!net::validate_network_policy(doc, why)) {
@@ -2653,6 +2718,7 @@ HttpResponse RouteHandler::handle_generic(const HttpRequest& req, const RouteMat
         return resp;
     }
     if (req.method == HttpMethod::Delete) {
+        if (match.category == RouteCategory::DeviceStatus) return make_status(405, "MethodNotAllowed", "DELETE not allowed on " + req.path);
         if (!exists) return make_status(404, "NotFound", plural + " \"" + name + "\" not found", name, plural);
         store_.remove(key);
         return make_status(200, "Success", plural + " \"" + name + "\" deleted", name, plural);
@@ -2676,6 +2742,17 @@ HttpResponse RouteHandler::handle_generic(const HttpRequest& req, const RouteMat
             carry_server_fields(old_doc, target, true);
         }
         if (match.category == RouteCategory::ServiceItem) default_service(target);
+        // The status subresource writes status alone, the object everything
+        // but status
+        if (match.category == RouteCategory::DeviceStatus) {
+            models::JsonValue only = old_doc;
+            if (const models::JsonValue* st = target.get("status")) only.set("status", *st); else only.remove("status");
+            target = std::move(only);
+        } else if (match.category == RouteCategory::DeviceItem) {
+            if (const models::JsonValue* st = old_doc.get("status")) target.set("status", *st); else target.remove("status");
+            std::string why;
+            if (!device_ok(target, why)) return make_status(422, "Invalid", "Device.kube32.io \"" + name + "\" is invalid: " + why);
+        }
         if (match.category == RouteCategory::NetworkPolicyItem) {
             std::string why;
             if (!net::validate_network_policy(target, why)) {
