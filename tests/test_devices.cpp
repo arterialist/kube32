@@ -270,6 +270,8 @@ void test_controller_lifecycle() {
     const models::JsonValue* spec = p.get("spec");
     assert(spec->get("nodeSelector")->get_string("kubernetes.io/hostname", "") == "node-a" && spec->get_string("nodeName", "").empty());
     assert(spec->get_string("restartPolicy", "") == "Always");
+    // No service links: a driver calls no Service, and every Device adds one
+    assert(spec->get("enableServiceLinks") && !spec->get_bool("enableServiceLinks", true));
     const models::JsonValue& c = spec->get("containers")->arr_val[0];
     assert(c.get_string("image", "") == "wasm://embedded/driver-bme688");
     assert(c.get("ports")->arr_val[0].get_string("name", "") == "http" && c.get("ports")->arr_val[0].get_int("containerPort", 0) == 17000);

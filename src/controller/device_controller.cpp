@@ -589,6 +589,9 @@ std::string DeviceController::pod_json(const DeviceView& d, const NodeView* node
     set_str(sel, kHostnameLabel, d.node);
     set_val(spec, "nodeSelector", std::move(sel));
     set_str(spec, "restartPolicy", "Always");
+    // A driver calls no Service: no environment for every Service of the
+    // namespace (a Device adds one), which a pod keeps for its lifetime
+    spec.set("enableServiceLinks", jbool(false));
     set_val(spec, "containers", std::move(containers));
     models::add_default_tolerations(spec);
 
