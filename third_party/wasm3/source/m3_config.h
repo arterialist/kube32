@@ -152,6 +152,15 @@
 #  define d_m3LogNativeStack                   0       // track the memory usage of the C-stack
 #endif
 
+// Kube32: counts the operation frames a call stands on the native stack
+// (m3_opFrames, m3_opFramesPeak). Without tail calls every operation keeps
+// its frame until its function returns or its loop iterates; tests build the
+// interpreter that way with this on to measure what a call takes on such a
+// target (Xtensa). Requires M3_HAS_TAIL_CALL 0.
+#ifndef d_m3CountOpFrames
+#  define d_m3CountOpFrames                    0
+#endif
+
 #ifndef d_m3LogHeapOps
 #  define d_m3LogHeapOps                       0       // track heap usage
 #endif

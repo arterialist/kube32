@@ -13,14 +13,22 @@
 //   switch     initial state, set, toggle, active low
 //
 // and the room-monitor example (apps/room-monitor) reaching drivers through
-// Services that select them by label.
+// Services that select them by label. Each driver also runs loaded as the
+// kubelet loads it with its operand stack painted, to show the stack the
+// runtime sizes from the module holds what its calls use
+// (tests/test_driver_frames.cpp measures the native stack the calls take on a
+// board).
 
 #include "pod_test_util.hpp"
 #include "mfrc522_sim.hpp"
+#include "device_sims.hpp"
 #include "app/service_client.hpp"
 #include "hal/mock_hal.hpp"
+#include "runtime/container_lifecycle.hpp"
 #include "runtime/k32_app_abi.h"
 #include "runtime/pod_memory_pool.h"
+#include "osal/system.hpp"
+#include "m3_env.h"
 #include "runtime/pod_log.hpp"
 #include "storage/store.hpp"
 
@@ -35,6 +43,9 @@
 
 using namespace kube32;
 using hal::MockHal;
+using k32test::Bme68x;
+using k32test::Calib;
+using k32test::MiniScale;
 
 namespace {
 
@@ -162,93 +173,9 @@ void check_event_is_body(const std::string& name, const std::string& topic) {
 }
 
 // ---------------------------------------------------------------------------
-// Simulated parts
+// What the BME68x datasheet says the readings are (tests/device_sims.hpp has
+// the simulated parts)
 // ---------------------------------------------------------------------------
-// BME68x calibration (bme68x_calib_data)
-struct Calib {
-    int t1 = 26176, t2 = 26383, t3 = 3;
-    int p1 = 36500, p2 = -10379, p3 = 88, p4 = 6713, p5 = -144, p6 = 30, p7 = 34, p8 = -2652, p9 = -2834, p10 = 30;
-    int h1 = 778, h2 = 1012, h3 = 0, h4 = 45, h5 = 20, h6 = 120, h7 = -100;
-    int gh1 = -30, gh2 = -5969, gh3 = 18, res_heat_range = 1, res_heat_val = 46, range_sw_err = -1;
-};
-
-// A BME688 (variant 1) or BME680 (variant 0) on the stub I2C bus: chip and
-// variant id, soft reset, the calibration registers, writes of register and
-// value pairs, and forced mode filling the field registers with the ADC
-// values a test sets (new data after `busy_reads` reads of the status)
-class Bme68x : public hal::MockI2cDevice {
-public:
-    std::mutex m;
-    uint8_t regs[256] = {};
-    uint32_t adc_t = 490000, adc_p = 352000, adc_h = 21000;
-    uint16_t adc_gas = 600;
-    uint8_t gas_range = 10;
-    bool heat_stab = true, absent = false;
-    int forced = 0, busy_reads = 2;
-
-    explicit Bme68x(uint8_t variant, const Calib& c = Calib()) : variant_(variant) {
-        regs[0xD0] = 0x61;
-        regs[0xF0] = variant;
-        auto le = [&](int reg, int v) { regs[reg] = static_cast<uint8_t>(v); regs[reg + 1] = static_cast<uint8_t>(v >> 8); };
-        le(0x8A, c.t2); regs[0x8C] = static_cast<uint8_t>(c.t3);
-        le(0x8E, c.p1); le(0x90, c.p2); regs[0x92] = static_cast<uint8_t>(c.p3); le(0x94, c.p4); le(0x96, c.p5);
-        regs[0x98] = static_cast<uint8_t>(c.p7); regs[0x99] = static_cast<uint8_t>(c.p6); le(0x9C, c.p8); le(0x9E, c.p9);
-        regs[0xA0] = static_cast<uint8_t>(c.p10);
-        regs[0xE1] = static_cast<uint8_t>(c.h2 >> 4); regs[0xE2] = static_cast<uint8_t>((c.h2 & 15) << 4 | (c.h1 & 15));
-        regs[0xE3] = static_cast<uint8_t>(c.h1 >> 4);
-        regs[0xE4] = static_cast<uint8_t>(c.h3); regs[0xE5] = static_cast<uint8_t>(c.h4); regs[0xE6] = static_cast<uint8_t>(c.h5);
-        regs[0xE7] = static_cast<uint8_t>(c.h6); regs[0xE8] = static_cast<uint8_t>(c.h7);
-        le(0xE9, c.t1); le(0xEB, c.gh2); regs[0xED] = static_cast<uint8_t>(c.gh1); regs[0xEE] = static_cast<uint8_t>(c.gh3);
-        regs[0x00] = static_cast<uint8_t>(c.res_heat_val);
-        regs[0x02] = static_cast<uint8_t>(c.res_heat_range << 4 | 0x0A);   // other bits of the register set
-        regs[0x04] = static_cast<uint8_t>(c.range_sw_err << 4 | 0x03);
-    }
-
-    int32_t write(const uint8_t* data, size_t len) override {
-        std::lock_guard<std::mutex> lock(m);
-        if (absent) return hal::HAL_ERR_NODEV;
-        if (len == 0) return 0;
-        reg_ = data[0];
-        if (len >= 2) store(data[0], data[1]);
-        for (size_t i = 2; i + 1 < len; i += 2) store(data[i], data[i + 1]);
-        return static_cast<int32_t>(len);
-    }
-
-    int32_t read(uint8_t* buf, size_t len) override {
-        std::lock_guard<std::mutex> lock(m);
-        if (absent) return hal::HAL_ERR_NODEV;
-        if (reg_ == 0x1D && countdown_ > 0 && --countdown_ == 0) regs[0x1D] = 0x80;   // new_data, gas index 0
-        for (size_t i = 0; i < len; ++i) buf[i] = regs[(reg_ + i) & 0xFF];
-        return static_cast<int32_t>(len);
-    }
-
-private:
-    uint8_t variant_;
-    uint8_t reg_ = 0;
-    int countdown_ = 0;
-
-    void store(uint8_t reg, uint8_t v) {
-        if (reg == 0xE0) {
-            if (v == 0xB6) for (int r = 0x1D; r <= 0x75; ++r) regs[r] = 0;
-            return;
-        }
-        regs[reg] = v;
-        if (reg != 0x74 || (v & 3) != 1) return;
-        forced++;                                          // forced mode: one measurement, then sleep
-        regs[0x74] = static_cast<uint8_t>(v & ~3);
-        regs[0x1F] = static_cast<uint8_t>(adc_p >> 12); regs[0x20] = static_cast<uint8_t>(adc_p >> 4); regs[0x21] = static_cast<uint8_t>((adc_p & 15) << 4);
-        regs[0x22] = static_cast<uint8_t>(adc_t >> 12); regs[0x23] = static_cast<uint8_t>(adc_t >> 4); regs[0x24] = static_cast<uint8_t>((adc_t & 15) << 4);
-        regs[0x25] = static_cast<uint8_t>(adc_h >> 8); regs[0x26] = static_cast<uint8_t>(adc_h);
-        const bool run_gas = (regs[0x71] & 0x30) != 0 && !(regs[0x70] & 0x08);
-        const int g = variant_ == 1 ? 0x2C : 0x2A;
-        regs[g] = static_cast<uint8_t>(adc_gas >> 2);
-        regs[g + 1] = static_cast<uint8_t>((adc_gas & 3) << 6 | (run_gas ? 0x20 : 0) | (run_gas && heat_stab ? 0x10 : 0) | gas_range);
-        regs[0x1D] = 0x20;                                 // measuring
-        countdown_ = busy_reads + 1;
-        if (busy_reads == 0) { regs[0x1D] = 0x80; countdown_ = 0; }
-    }
-};
-
 // The datasheet's floating-point compensation (BME68x Sensor API, FPU build)
 struct Compensated { double t, p, h, gas_high, gas_low; };
 Compensated compensate(const Calib& c, uint32_t adc_t, uint32_t adc_p, uint32_t adc_h, uint16_t adc_gas, uint8_t range) {
@@ -291,48 +218,6 @@ int res_heat(const Calib& c, double target, double ambient) {
     const double v5 = v4 + v3 * ambient;
     return static_cast<int>(3.4 * (v5 * (4.0 / (4.0 + c.res_heat_range)) * (1.0 / (1.0 + c.res_heat_val * 0.002)) - 25));
 }
-
-// The M5Stack Unit Mini Scales (STM32 firmware, protocol v3): raw ADC,
-// weight x 100 from the raw value, the offset and the gap (counts per
-// gram), tare through the offset register, the LED, version and address
-class MiniScale : public hal::MockI2cDevice {
-public:
-    std::mutex m;
-    int32_t raw = 812345, offset = 800000, gap = 50;
-    uint8_t led[3] = {0, 0, 0};
-    bool absent = false;
-    int tares = 0;
-
-    int32_t write(const uint8_t* data, size_t len) override {
-        std::lock_guard<std::mutex> lock(m);
-        if (absent) return hal::HAL_ERR_NODEV;
-        if (len == 0) return 0;
-        reg_ = data[0];
-        if (reg_ == 0x50 && len >= 2 && data[1] == 1) { offset = raw; tares++; }
-        if (reg_ == 0x30) for (size_t i = 1; i < len && i <= 3; ++i) led[i - 1] = data[i];
-        return static_cast<int32_t>(len);
-    }
-
-    int32_t read(uint8_t* buf, size_t len) override {
-        std::lock_guard<std::mutex> lock(m);
-        if (absent) return hal::HAL_ERR_NODEV;
-        uint8_t r[16] = {};
-        auto le32 = [&](int32_t v) { for (int i = 0; i < 4; ++i) r[i] = static_cast<uint8_t>(static_cast<uint32_t>(v) >> (8 * i)); };
-        switch (reg_) {
-            case 0x00: le32(raw); break;
-            case 0x60: le32(static_cast<int32_t>((static_cast<int64_t>(raw) - offset) * 100 / gap)); break;
-            case 0x30: std::memcpy(r, led, 3); break;
-            case 0xFE: r[0] = 2; break;
-            case 0xFF: r[0] = 0x26; break;
-            default: break;
-        }
-        std::memcpy(buf, r, len < sizeof r ? len : sizeof r);
-        return static_cast<int32_t>(len);
-    }
-
-private:
-    uint8_t reg_ = 0;
-};
 
 const std::string kIpc = "\"hardware.kube32.io/ipc\":\"1\"";
 
@@ -926,6 +811,153 @@ void test_room_monitor(runtime::WasmRuntime& rt) {
 }
 
 // ---------------------------------------------------------------------------
+// A driver loaded as the kubelet loads it (memory 3Ki, no kube32.io/wasm-stack:
+// the operand stack is what the module's call chains need), its operand stack
+// painted: what its calls use against what it was given
+// ---------------------------------------------------------------------------
+class StackProbe {
+public:
+    std::string pod_id;
+    runtime::ContainerLifecycleController ctrl;
+
+    StackProbe(const std::string& name, const std::string& driver, const std::string& requests, const Env& env)
+        : pod_id("default/" + name), ctrl(config(pod_id)) {
+        const std::string manifest = "{\"metadata\":{\"name\":\"" + name + "\"},\"spec\":{\"containers\":[{\"name\":\"driver\","
+                                     "\"resources\":{\"requests\":{\"memory\":\"3Ki\"" + (requests.empty() ? "" : "," + requests) + "}}}]}}";
+        std::string err;
+        assert(hal::CapabilityFirewall::instance().register_pod(pod_id, manifest, err));
+        runtime::AppPodHost::instance().set_env(pod_id, env);
+        const std::vector<uint8_t> wasm = image("driver-" + driver);
+        assert(ctrl.deploy(wasm.data(), wasm.size()));
+        rt_ = static_cast<IM3Runtime>(ctrl.m3_runtime_handle());
+        bytes_ = rt_->numStackSlots * sizeof(m3slot_t);
+        assert(bytes_ == ctrl.get_status().stack_bytes);
+        // the stack and the four slots wasm3 allocates past it
+        std::memset(rt_->originStack, kPaint, bytes_ + 4 * sizeof(m3slot_t));
+        assert(runtime::AppPodHost::instance().register_pod(pod_id, &ctrl));
+        assert(runtime::AppPodHost::instance().init_pod(pod_id) == 0);
+    }
+    ~StackProbe() {
+        runtime::AppPodHost::instance().unregister_pod(pod_id);
+        hal::CapabilityFirewall::instance().unregister_pod(pod_id);
+    }
+
+    uint32_t given() const { return bytes_; }
+    // The deepest byte any call has written
+    uint32_t used() const {
+        const uint8_t* stack = static_cast<const uint8_t*>(rt_->originStack);
+        for (uint32_t i = bytes_ + 4 * sizeof(m3slot_t); i > 0; --i) {
+            if (stack[i - 1] != kPaint) return i;
+        }
+        return 0;
+    }
+    int32_t tick(uint32_t now) { return runtime::AppPodHost::instance().tick(pod_id, now); }
+    uint32_t settle(uint32_t now) {
+        for (int i = 0; i < 1000 && tick(now) > 0; ++i) now += 10;
+        return now;
+    }
+
+private:
+    static constexpr uint8_t kPaint = 0xA5;
+    IM3Runtime rt_ = nullptr;
+    uint32_t bytes_ = 0;
+
+    static runtime::ContainerConfig config(const std::string& pod_id) {
+        runtime::ContainerConfig cfg;
+        cfg.pod_id = pod_id;
+        cfg.container_name = pod_id;
+        cfg.memory_limit_bytes = 3072;
+        cfg.stack_size_bytes = 4096;         // what the kubelet passes for a one-page pod without kube32.io/wasm-stack
+        cfg.stack_from_module = true;
+        return cfg;
+    }
+};
+
+void report(const StackProbe& p) {
+    std::cout << "[operand stack] " << p.pod_id << ": given " << p.given() << " bytes, used " << p.used() << std::endl;
+    assert(p.used() <= p.given());
+}
+
+void test_operand_stacks() {
+    std::cout << "=== operand stacks as the kubelet sizes them ===" << std::endl;
+    uint32_t now = 900000;
+    {
+        auto part = std::make_shared<Bme68x>(1);
+        MockHal::instance().register_mock_i2c_device(0, 0x77, part);
+        StackProbe p("stack-bme688", "bme688", "\"esp32.io/i2c-bus-0\":\"1\"," + kIpc, {{"I2C_ADDR", "0x77"}});
+        now = p.settle(now);                                           // first tick: identify and start, then the reading
+        now = p.settle(now + 5000);
+        k32test::call_pod(p.pod_id, "/");
+        k32test::call_pod(p.pod_id, "/describe");
+        k32test::call_pod(p.pod_id, "/", "POST", "{\"action\":\"tare\"}");
+        part->absent = true;
+        now = p.settle(now + 5000);
+        part->absent = false;
+        now = p.settle(now + 5000);
+        report(p);
+    }
+    {
+        auto part = std::make_shared<Bme68x>(0);
+        MockHal::instance().register_mock_i2c_device(0, 0x76, part);
+        StackProbe p("stack-bme680", "bme688", "\"esp32.io/i2c-bus-0\":\"1\"," + kIpc, {{"I2C_ADDR", "0x76"}});
+        now = p.settle(now);
+        report(p);
+    }
+    {
+        auto part = std::make_shared<MiniScale>();
+        MockHal::instance().register_mock_i2c_device(0, 0x26, part);
+        StackProbe p("stack-miniscale", "miniscale", "\"esp32.io/i2c-bus-0\":\"1\"," + kIpc, {{"I2C_ADDR", "0x26"}});
+        p.tick(now += 1000);
+        k32test::call_pod(p.pod_id, "/", "POST", "{\"action\":\"tare\"}");
+        k32test::call_pod(p.pod_id, "/", "POST", "{\"action\":\"led\",\"r\":255,\"g\":16,\"b\":1}");
+        k32test::call_pod(p.pod_id, "/");
+        part->absent = true;
+        p.tick(now += 1000);
+        part->absent = false;
+        p.tick(now += 1000);
+        report(p);
+    }
+    {
+        auto reader = std::make_shared<k32test::Mfrc522>();
+        MockHal::instance().register_mock_i2c_device(0, 0x28, reader);
+        StackProbe p("stack-rfid", "rfid", "\"esp32.io/i2c-bus-0\":\"1\"," + kIpc, {{"I2C_ADDR", "0x28"}});
+        p.tick(now += 200);
+        { std::lock_guard<std::mutex> lock(reader->m); reader->uid = {0x04, 0xa1, 0xb2, 0xc3, 0xd4, 0xe5, 0x80}; }
+        p.tick(now += 200);
+        { std::lock_guard<std::mutex> lock(reader->m); reader->uid.clear(); }
+        for (int i = 0; i < 4; ++i) p.tick(now += 200);
+        k32test::call_pod(p.pod_id, "/");
+        report(p);
+    }
+    {
+        StackProbe p("stack-chip-temp", "chip-temp", "\"hardware.kube32.io/chip-temp\":\"1\"," + kIpc, {});
+        p.tick(now += 10000);
+        k32test::call_pod(p.pod_id, "/");
+        report(p);
+    }
+    {
+        MockHal::instance().gpio_write(12, 1);
+        StackProbe p("stack-button", "button", "\"esp32.io/gpio-12\":\"1\"," + kIpc, {{"PIN_PIN", "12"}});
+        p.tick(now += 50);
+        MockHal::instance().gpio_write(12, 0);
+        now = p.settle(now + 50);
+        p.tick(now += 60000);
+        k32test::call_pod(p.pod_id, "/");
+        report(p);
+    }
+    {
+        StackProbe p("stack-switch", "switch", "\"esp32.io/gpio-13\":\"1\"," + kIpc, {{"PIN_PIN", "13"}});
+        p.tick(now += 30000);
+        k32test::call_pod(p.pod_id, "/", "POST", "{\"action\":\"set\",\"on\":true}");
+        k32test::call_pod(p.pod_id, "/", "POST", "{\"action\":\"toggle\"}");
+        k32test::call_pod(p.pod_id, "/");
+        report(p);
+    }
+    take_events("device.bme688");
+    std::cout << "[PASS] operand stacks as the kubelet sizes them" << std::endl;
+}
+
+// ---------------------------------------------------------------------------
 // What each driver takes from a board's pod pool
 // ---------------------------------------------------------------------------
 // The kubelet's estimate with the board's sizes, as a board without PSRAM
@@ -968,6 +1000,7 @@ int main() {
     test_switch(*rt);
     test_event_size(*rt);
     test_room_monitor(*rt);
+    test_operand_stacks();
     test_pool_estimates();
     hal::CapabilityFirewall::instance().reset();
     std::cout << "[PASS] device drivers" << std::endl;

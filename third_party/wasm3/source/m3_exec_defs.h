@@ -51,6 +51,26 @@ typedef m3ret_t(vectorcall* IM3Operation)(d_m3OpSig, cstr_t i_operationName);
 
 #  define nextOpImpl()              ((IM3Operation)(* _pc))(_pc + 1, d_m3OpArgs, __FUNCTION__)
 #  define jumpOpImpl(PC)            ((IM3Operation)(*  PC))( PC + 1, d_m3OpArgs, __FUNCTION__)
+#elif d_m3CountOpFrames
+#  if M3_HAS_TAIL_CALL
+#    error "d_m3CountOpFrames measures dispatch without tail calls: build with M3_HAS_TAIL_CALL=0"
+#  endif
+typedef m3ret_t(vectorcall* IM3Operation)(d_m3OpSig);
+#  define d_m3Op(NAME)              M3_NO_UBSAN d_m3RetSig op_##NAME (d_m3OpSig)
+
+extern u32 m3_opFrames, m3_opFramesPeak;
+
+// One operation frame more on the native stack while the operation runs
+d_m3RetSig CountedOp (IM3Operation i_operation, d_m3OpSig)
+{
+    if (++m3_opFrames > m3_opFramesPeak) m3_opFramesPeak = m3_opFrames;
+    m3ret_t r = i_operation (_pc, d_m3OpArgs);
+    --m3_opFrames;
+    return r;
+}
+
+#  define nextOpImpl()              CountedOp ((IM3Operation)(* _pc), _pc + 1, d_m3OpArgs)
+#  define jumpOpImpl(PC)            CountedOp ((IM3Operation)(*  PC), (pc_t)(PC) + 1, d_m3OpArgs)
 #else
 typedef m3ret_t(vectorcall* IM3Operation)(d_m3OpSig);
 #  define d_m3Op(NAME)              M3_NO_UBSAN d_m3RetSig op_##NAME (d_m3OpSig)
