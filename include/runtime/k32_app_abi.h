@@ -162,6 +162,12 @@ extern "C" {
 #define K32_RMT_RX_QUEUE_FRAMES     8
 #define K32_RMT_RX_QUEUE_DURATIONS  512
 
+/* Modes for esp32_gpio_set_mode */
+#define K32_GPIO_INPUT          0
+#define K32_GPIO_OUTPUT         1
+#define K32_GPIO_INPUT_PULLUP   2
+#define K32_GPIO_INPUT_PULLDOWN 3
+
 #if defined(__wasm32__)
 #define K32_IMPORT(name) __attribute__((import_module("env"), import_name(name)))
 #define K32_EXPORT(name) __attribute__((export_name(name)))
@@ -296,10 +302,21 @@ K32_IMPORT("esp32_uart_read")  int32_t esp32_uart_read(uint32_t port, void* buf,
 K32_IMPORT("esp32_rmt_send")    int32_t esp32_rmt_send(const uint16_t* durations_us, uint32_t count);   /* count once sent, or error */
 K32_IMPORT("esp32_rmt_receive") int32_t esp32_rmt_receive(uint16_t* out_us, uint32_t cap);              /* durations of the oldest frame, K32_ERR_AGAIN, or error */
 
+/* ---- GPIO, gated by esp32.io/gpio-<N> ----------------------------------- */
+K32_IMPORT("esp32_gpio_set_mode") int32_t esp32_gpio_set_mode(uint32_t pin, uint32_t mode);   /* K32_GPIO_*: 0 or error */
+K32_IMPORT("esp32_gpio_write")    int32_t esp32_gpio_write(uint32_t pin, uint32_t level);     /* 0 or error */
+K32_IMPORT("esp32_gpio_read")     int32_t esp32_gpio_read(uint32_t pin);                      /* level 0 or 1, or error */
+
+/* ---- Chip temperature, gated by hardware.kube32.io/chip-temp ------------
+ * The ESP32-S3's internal sensor (the die, not the room: it reads above
+ * ambient while the radio is busy). Stores milli-degrees Celsius in
+ * *out_milli_c and returns 0, or K32_ERR_PERM, K32_ERR_FAULT, K32_ERR_NODEV,
+ * K32_ERR_IO. */
+K32_IMPORT("esp32_chip_temp_read") int32_t esp32_chip_temp_read(int32_t* out_milli_c);
+
 /* Existing low-level imports (see host_functions.cpp) remain available:
- * esp32_gpio_set_mode, esp32_gpio_write, esp32_gpio_read, esp32_adc_read,
- * esp32_i2c_write, esp32_i2c_read, esp32_uart_write, esp32_uart_read,
- * esp32_rmt_send, esp32_rmt_receive, esp32_get_time_us, esp32_delay_ms, kube32_channel_open/send/recv/close. */
+ * esp32_adc_read, esp32_uart_write, esp32_uart_read, esp32_get_time_us,
+ * esp32_delay_ms, kube32_channel_open/send/recv/close. */
 K32_IMPORT("esp32_delay_ms")      void    esp32_delay_ms(uint32_t ms);
 K32_IMPORT("kube32_channel_open") int32_t kube32_channel_open(const char* name, uint32_t flags);
 K32_IMPORT("kube32_channel_send") int32_t kube32_channel_send(int32_t handle, const void* data, uint32_t len);

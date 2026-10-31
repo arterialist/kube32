@@ -49,6 +49,9 @@ extern "C" {
     pub fn esp32_rmt_send(durations_us: *const u16, count: u32) -> i32;
     pub fn esp32_rmt_receive(out_us: *mut u16, cap: u32) -> i32;
 
+    // The chip's temperature sensor, gated by hardware.kube32.io/chip-temp
+    pub fn esp32_chip_temp_read(out_milli_c: *mut i32) -> i32;
+
     // Low-level imports from host_functions.cpp that app pods use
     pub fn esp32_delay_ms(ms: u32);
     /// `name` must be NUL-terminated: the host reads it with strnlen.
@@ -91,6 +94,7 @@ mod stubs {
     pub unsafe fn k32_fs_remove(path: *const u8, path_len: u32) -> i32 { no_host() }
     pub unsafe fn esp32_rmt_send(durations_us: *const u16, count: u32) -> i32 { no_host() }
     pub unsafe fn esp32_rmt_receive(out_us: *mut u16, cap: u32) -> i32 { no_host() }
+    pub unsafe fn esp32_chip_temp_read(out_milli_c: *mut i32) -> i32 { no_host() }
     pub unsafe fn esp32_delay_ms(ms: u32) { no_host() }
     pub unsafe fn kube32_channel_open(name: *const u8, flags: u32) -> i32 { no_host() }
     pub unsafe fn kube32_channel_send(handle: i32, data: *const u8, len: u32) -> i32 { no_host() }

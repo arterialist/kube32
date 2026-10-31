@@ -67,8 +67,15 @@ public:
     bool rmt_loopback() const;
     static constexpr size_t kRmtTxFramesKept = 16;
 
+    // Chip temperature sensor: a fixed 40.0 C unless a test sets another
+    // reading, or a status the read returns instead (HAL_ERR_IO, say)
+    int32_t chip_temp_read(int32_t& out_milli_c);
+    void set_chip_temp(int32_t milli_c, int32_t status = HAL_OK);
+    static constexpr int32_t kChipTempMilliC = 40000;
+
     // Test Inspection Helpers
     uint32_t get_gpio_write_count(uint32_t pin) const;
+    PinMode get_gpio_mode(uint32_t pin) const;
     void reset();
 
 private:
@@ -82,6 +89,8 @@ private:
     std::array<std::atomic<uint8_t>, 64> pin_modes_;
     std::array<std::atomic<uint32_t>, 64> pin_write_counts_;
     std::array<std::atomic<uint32_t>, 16> adc1_values_;
+    std::atomic<int32_t> chip_temp_milli_c_{kChipTempMilliC};
+    std::atomic<int32_t> chip_temp_status_{HAL_OK};
 
     std::mutex i2c_mutex_;
     std::map<std::pair<uint32_t, uint8_t>, std::shared_ptr<MockI2cDevice>> i2c_devices_;

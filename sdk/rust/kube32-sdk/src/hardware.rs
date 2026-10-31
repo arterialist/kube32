@@ -9,6 +9,7 @@
 //! | `tone`             | `hardware.kube32.io/speaker: "1"`     | `SPEAKER`  |
 //! | `rmt_send`         | `esp32.io/rmt-tx: "1"`                | none       |
 //! | `rmt_receive`      | `esp32.io/rmt-rx: "1"`                | none       |
+//! | `chip_temp_milli_c` | `hardware.kube32.io/chip-temp: "1"`  | `CHIP_TEMP` |
 //!
 //! Colors are RGB565. The display on the reference board is 240 x 135.
 //!
@@ -86,4 +87,12 @@ pub fn rmt_receive(out: &mut [u16]) -> Result<Option<usize>, Error> {
         return Ok(None);
     }
     Error::from_rc(rc).map(|n| Some(n as usize))
+}
+
+/// The ESP32-S3's internal temperature in milli-degrees Celsius. The sensor
+/// measures the die, which runs above the ambient temperature.
+pub fn chip_temp_milli_c() -> Result<i32, Error> {
+    let mut milli_c = 0i32;
+    let rc = unsafe { abi::esp32_chip_temp_read(&mut milli_c) };
+    Error::from_rc(rc).map(|_| milli_c)
 }

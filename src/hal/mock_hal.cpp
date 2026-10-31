@@ -82,6 +82,8 @@ void MockHal::reset() {
     for (size_t i = 0; i < 16; ++i) {
         adc1_values_[i].store(1850); // ~1.5V baseline ADC
     }
+    chip_temp_milli_c_.store(kChipTempMilliC);
+    chip_temp_status_.store(HAL_OK);
 
     {
         std::lock_guard<std::mutex> lock(i2c_mutex_);
@@ -231,6 +233,21 @@ bool MockHal::rmt_loopback() const {
 uint32_t MockHal::get_gpio_write_count(uint32_t pin) const {
     if (pin >= 64) return 0;
     return pin_write_counts_[pin].load();
+}
+
+PinMode MockHal::get_gpio_mode(uint32_t pin) const {
+    return pin < 64 ? static_cast<PinMode>(pin_modes_[pin].load()) : PinMode::Input;
+}
+
+int32_t MockHal::chip_temp_read(int32_t& out_milli_c) {
+    const int32_t status = chip_temp_status_.load();
+    if (status == HAL_OK) out_milli_c = chip_temp_milli_c_.load();
+    return status;
+}
+
+void MockHal::set_chip_temp(int32_t milli_c, int32_t status) {
+    chip_temp_milli_c_.store(milli_c);
+    chip_temp_status_.store(status);
 }
 
 } // namespace kube32::hal

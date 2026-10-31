@@ -98,6 +98,7 @@ LOW_LEVEL_IMPORTS = {
     "esp32_gpio_write": "i(ii)",
     "esp32_gpio_read": "i(i)",
     "esp32_adc_read": "i(i)",
+    "esp32_chip_temp_read": "i(i)",
     "esp32_i2c_write": "i(iiii)",
     "esp32_i2c_read": "i(iiii)",
     "esp32_uart_write": "i(iii)",
@@ -149,6 +150,7 @@ HARDWARE_FOR_IMPORT = {
     "k32_fs_list": "sd",
     "k32_fs_remove": "sd",
     "k32_http_call": "service-call",
+    "esp32_chip_temp_read": "chip-temp",
 }
 HARDWARE = {
     # name: (resource key, securityContext capability) as src/hal/capability_firewall.cpp reads them
@@ -158,8 +160,9 @@ HARDWARE = {
     "ipc": ("hardware.kube32.io/ipc", "CHANNEL_IPC"),
     "sd": ("hardware.kube32.io/sd", "SD"),
     "service-call": (None, "SERVICE_CALL"),   # k32_http_call: a capability only, no resource
+    "chip-temp": ("hardware.kube32.io/chip-temp", "CHIP_TEMP"),
 }
-HARDWARE_ORDER = ("ipc", "display", "keyboard", "speaker", "sd", "service-call")
+HARDWARE_ORDER = ("ipc", "display", "keyboard", "speaker", "sd", "service-call", "chip-temp")
 HARDWARE_ALIASES = {"tft-display": "display", "tft": "display", "channel_ipc": "ipc", "channels": "ipc", "sd-card": "sd",
                     "service_call": "service-call", "http": "service-call"}
 
@@ -793,7 +796,7 @@ def hardware_for_name(text):
     name = text.strip().lower()
     name = HARDWARE_ALIASES.get(name, name)
     if name not in HARDWARE:
-        raise ValueError("unknown hardware '%s' (expected display, keyboard, speaker, ipc, sd, service-call or none)" % text.strip())
+        raise ValueError("unknown hardware '%s' (expected display, keyboard, speaker, ipc, sd, service-call, chip-temp or none)" % text.strip())
     return name
 
 
@@ -1880,7 +1883,7 @@ def build_parser():
     d.add_argument("--namespace", default="default")
     d.add_argument("--memory", default="64Ki", help="resources memory request and limit (default 64Ki)")
     d.add_argument("--psram", help="esp32.io/psram request and limit; the Wasm sandbox is max(memory, psram)")
-    d.add_argument("--hardware", help="comma list of ipc, display, keyboard, speaker, sd, or 'none' (default: inferred from the module's imports)")
+    d.add_argument("--hardware", help="comma list of ipc, display, keyboard, speaker, sd, service-call, chip-temp, or 'none' (default: inferred from the module's imports)")
     d.add_argument("--sd-claim", help="volume claim for the sd hardware (default: the pod name)")
     d.add_argument("--env", action="append", metavar="K=V", help="container environment variable (repeatable)")
     d.add_argument("--image", help="use this wasm:// reference (wasm://sd/<name>, wasm://embedded/<name>:v1) instead of carrying the module inline")

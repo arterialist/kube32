@@ -44,6 +44,7 @@ set(KUBE32_APP_SRCS
     hal/node_storage.cpp
     hal/pod_buses.cpp
     hal/i2c_discovery.cpp
+    hal/chip_temp.cpp
     hal/pod_rmt.cpp
     hal/tft_keyboard_hardware.cpp
     hal/firmware_slots.cpp
@@ -115,6 +116,7 @@ idf_component_register(
         driver
         esp_driver_gpio
         esp_driver_rmt
+        esp_driver_tsens
         esp_lcd
         esp_adc
         esp_driver_spi

@@ -15,6 +15,7 @@
 #include <cstdio>
 #include <cstring>
 
+#include "hal/chip_temp.hpp"
 #include "hal/pod_buses.hpp"
 #include "hal/pod_rmt.hpp"
 #include "runtime/pod_log.hpp"
@@ -155,6 +156,28 @@ static const void* raw_esp32_adc_read(IM3Runtime runtime, IM3ImportContext _ctx,
     *reinterpret_cast<int32_t*>(_sp) = res;
 #endif
 
+    return m3Err_none;
+}
+
+// esp32_chip_temp_read: signature "i(i)" -> returns int32_t, args: (out_offset)
+// Stores the chip's temperature in milli-degrees Celsius (an int32 at
+// out_offset) and returns 0, or a negative error.
+static const void* raw_esp32_chip_temp_read(IM3Runtime runtime, IM3ImportContext _ctx, uint64_t* _sp, void* _mem) {
+    (void)_ctx;
+    uint32_t out_offset = static_cast<uint32_t>(_sp[1]);
+    int32_t& ret = *reinterpret_cast<int32_t*>(_sp);
+
+    if (!hal::CapabilityFirewall::instance().check_permission(get_pod_ref(runtime), hal::PeripheralType::ChipTemp, 0, hal::AccessMode::Read)) {
+        ret = hal::HAL_ERR_PERM;
+        return m3Err_none;
+    }
+    if (static_cast<uint64_t>(out_offset) + sizeof(int32_t) > m3_GetMemorySizeAt(_mem)) {
+        ret = hal::HAL_ERR_FAULT;
+        return m3Err_none;
+    }
+    int32_t milli_c = 0;
+    ret = hal::chip_temp_read(milli_c);
+    if (ret == hal::HAL_OK) std::memcpy(static_cast<uint8_t*>(_mem) + out_offset, &milli_c, sizeof milli_c);
     return m3Err_none;
 }
 
@@ -465,6 +488,7 @@ bool link_host_functions(IM3Module module, const std::string& pod_id) {
     m3_LinkRawFunction(module, "env", "esp32_gpio_write",    "i(ii)",   &raw_esp32_gpio_write);
     m3_LinkRawFunction(module, "env", "esp32_gpio_read",     "i(i)",    &raw_esp32_gpio_read);
     m3_LinkRawFunction(module, "env", "esp32_adc_read",      "i(i)",    &raw_esp32_adc_read);
+    m3_LinkRawFunction(module, "env", "esp32_chip_temp_read", "i(i)",   &raw_esp32_chip_temp_read);
     m3_LinkRawFunction(module, "env", "esp32_i2c_write",     "i(iiii)", &raw_esp32_i2c_write);
     m3_LinkRawFunction(module, "env", "esp32_i2c_read",      "i(iiii)", &raw_esp32_i2c_read);
     m3_LinkRawFunction(module, "env", "esp32_uart_write",    "i(iii)",  &raw_esp32_uart_write);

@@ -139,6 +139,7 @@ else()
         src/hal/node_storage.cpp
         src/hal/pod_buses.cpp
         src/hal/i2c_discovery.cpp
+        src/hal/chip_temp.cpp
         src/hal/pod_rmt.cpp
         src/hal/mock_hal.cpp
         src/hal/firmware_slots.cpp

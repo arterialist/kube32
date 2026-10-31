@@ -32,7 +32,8 @@ enum class PeripheralType : uint8_t {
     SdCard   = 8,   // microSD volume of the pod (hardware.kube32.io/sd)
     ServiceCall = 9, // k32_http_call to Services (securityContext capability SERVICE_CALL)
     RmtTx    = 10,  // RMT (IR) transmit channel (esp32.io/rmt-tx)
-    RmtRx    = 11   // RMT (IR) receive channel (esp32.io/rmt-rx)
+    RmtRx    = 11,  // RMT (IR) receive channel (esp32.io/rmt-rx)
+    ChipTemp = 12   // The chip's temperature sensor (hardware.kube32.io/chip-temp)
 };
 
 enum class AccessMode : uint8_t {
@@ -63,6 +64,7 @@ constexpr uint32_t KUBE32_CAP_SD       = (1U << 4);   // k32_fs_* on the pod's S
 constexpr uint32_t KUBE32_CAP_SERVICE_CALL = (1U << 5);   // k32_http_call
 constexpr uint32_t KUBE32_CAP_RMT_TX   = (1U << 6);   // esp32_rmt_send on the pod's RMT TX channel
 constexpr uint32_t KUBE32_CAP_RMT_RX   = (1U << 7);   // esp32_rmt_receive from the pod's RMT RX channel
+constexpr uint32_t KUBE32_CAP_CHIP_TEMP = (1U << 8);  // esp32_chip_temp_read
 
 // 24-Byte Ultra-Compact Device Grant Representation
 #pragma pack(push, 1)
