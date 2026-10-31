@@ -166,6 +166,11 @@ void test_service_links() {
     assert(build_container_env(pod_manifest("", ""), ctx, env, err));
     assert(value_of(env, "SELF_SERVICE_HOST") == "10.0.0.7" && value_of(env, "SELF_SERVICE_PORT") == "7000");
     assert(api.requested.size() == 1 && api.requested[0] == "/api/v1/namespaces/default/services");
+    // On a node whose pod server listens elsewhere (kube32-sim --pod-port),
+    // the pod's own Service points at that port
+    ctx.node_port = 17000;
+    assert(build_container_env(pod_manifest("", ""), ctx, env, err));
+    assert(value_of(env, "SELF_SERVICE_PORT") == "17000" && value_of(env, "SELF_PORT") == "tcp://10.0.0.7:17000");
     std::cout << "[PASS] test_service_links" << std::endl;
 }
 

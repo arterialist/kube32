@@ -14,6 +14,8 @@
 
 #include <cassert>
 #include <iostream>
+#include <map>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -238,6 +240,57 @@ static void test_endpoints_from_services() {
     std::cout << "[PASS] test_endpoints_from_services" << std::endl;
 }
 
+// Every pod is reached through its node's pod HTTP server: an endpoint has
+// the port the node reports, whatever the targetPort resolves to. Pods on a
+// board (pod port 7000) and on a kube32-sim node (17000) land in separate
+// subsets; a pod on a node that reports no port keeps its target port.
+static void test_endpoints_at_node_pod_ports() {
+    std::cout << "[RUN] test_endpoints_at_node_pod_ports" << std::endl;
+    auto store = ram_store();
+    RouteHandler h(*store);
+    assert(call(h, HttpMethod::Post, "/api/v1/namespaces/default/services",
+                R"({"apiVersion":"v1","kind":"Service","metadata":{"name":"room"},
+                    "spec":{"selector":{"app":"room"},"ports":[{"name":"http","port":80,"targetPort":"http"}]}})").status_code == 201);
+    auto node = [&](const char* name, int port) {
+        const std::string ep = port ? R"(,"daemonEndpoints":{"kubeletEndpoint":{"Port":)" + std::to_string(port) + "}}" : "";
+        store->put(std::string("/registry/nodes/") + name, std::string(R"({"kind":"Node","metadata":{"name":")") + name +
+                   R"("},"status":{"conditions":[{"type":"Ready","status":"True"}])" + ep + "}}", false);
+    };
+    node("board", 7000);
+    node("laptop", 17000);
+    node("old", 0);
+    auto pod = [&](const char* name, const char* node_name, const char* ip) {
+        store->put(std::string("/registry/pods/default/") + name, std::string(R"({"kind":"Pod","metadata":{"name":")") + name +
+                   R"(","namespace":"default","labels":{"app":"room"}},"spec":{"nodeName":")" + node_name +
+                   R"(","containers":[{"name":"c","ports":[{"name":"http","containerPort":7000}]}]},"status":{"phase":"Running","podIP":")" + ip +
+                   R"(","conditions":[{"type":"Ready","status":"True"}]}})", false);
+    };
+    pod("room-board", "board", "10.0.0.5");
+    pod("room-laptop", "laptop", "10.0.0.9");
+    pod("room-old", "old", "10.0.0.7");
+
+    models::JsonValue e = parse(call(h, HttpMethod::Get, "/api/v1/namespaces/default/endpoints/room").body);
+    const auto& subsets = e.get("subsets")->arr_val;
+    assert(subsets.size() == 2);
+    std::map<int64_t, std::vector<std::string>> by_port;
+    for (const auto& sub : subsets) {
+        const auto& ports = sub.get("ports")->arr_val;
+        assert(ports.size() == 1 && ports[0].get_string("name", "") == "http");
+        for (const auto& a : sub.get("addresses")->arr_val) by_port[ports[0].get_int("port", 0)].push_back(a.get_string("ip", ""));
+    }
+    assert(by_port[7000] == (std::vector<std::string>{"10.0.0.5", "10.0.0.7"}));
+    assert(by_port[17000] == (std::vector<std::string>{"10.0.0.9"}));
+
+    models::JsonValue sl = parse(call(h, HttpMethod::Get, "/apis/discovery.k8s.io/v1/namespaces/default/endpointslices", "",
+                                      "labelSelector=kubernetes.io%2Fservice-name%3Droom").body);
+    const auto& slices = sl.get("items")->arr_val;
+    assert(slices.size() == 2);
+    std::set<int64_t> slice_ports;
+    for (const auto& s : slices) slice_ports.insert(s.get("ports")->arr_val[0].get_int("port", 0));
+    assert(slice_ports == (std::set<int64_t>{7000, 17000}));
+    std::cout << "[PASS] test_endpoints_at_node_pod_ports" << std::endl;
+}
+
 static void test_generation_and_deployment_conditions() {
     std::cout << "[RUN] test_generation_and_deployment_conditions" << std::endl;
     auto store = ram_store();
@@ -392,6 +445,7 @@ int main() {
     test_patch_media_types();
     test_events_v1_strict_fields();
     test_endpoints_from_services();
+    test_endpoints_at_node_pod_ports();
     test_generation_and_deployment_conditions();
     test_lease_renew_time_and_backfill();
     test_full_store_refuses_creates();

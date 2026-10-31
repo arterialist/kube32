@@ -280,12 +280,13 @@ void IngressController::rebuild_locked() {
     dirty_->store(false);
     std::shared_ptr<RouteTable> table;
     try {
-        std::vector<std::string> ingresses, services, pods;
+        std::vector<std::string> ingresses, services, pods, nodes;
         opts_.store->list("/registry/ingresses/", ingresses);
         opts_.store->list("/registry/services/", services);
         opts_.store->list("/registry/pods/", pods);
+        opts_.store->list("/registry/nodes/", nodes);
         std::shared_ptr<const RouteTable> previous = routes();
-        table = build_route_table(ingresses, services, pods, previous.get());
+        table = build_route_table(ingresses, services, pods, previous.get(), nodes);
     } catch (const std::exception& e) {
         // Out of memory: keep serving the previous table and retry later
         std::cout << "[INGRESS] routing table rebuild skipped: " << e.what() << std::endl;

@@ -169,11 +169,12 @@ public:
                 return it->second.ok;
             }
         }
-        std::vector<std::string> services, pods;
+        std::vector<std::string> services, pods, nodes;
         store_.list("/registry/services/" + ns + "/", services);
         store_.list("/registry/pods/" + ns + "/", pods);
+        store_.list("/registry/nodes/", nodes);
         CachedTarget t;
-        t.ok = resolve_service_endpoints(ns, name, port, services, pods, t.endpoints, t.why);
+        t.ok = resolve_service_endpoints(ns, name, port, services, pods, t.endpoints, t.why, nodes);
         if (!t.ok) {
             std::string unused;
             t.no_service = !store_.get("/registry/services/" + ns + "/" + name, unused).ok();
@@ -232,7 +233,8 @@ private:
         int code = get_("/api/v1/namespaces/" + ns + "/services/" + name, body);
         if (code == 404) { why = "service " + svc_key + " not found"; no_service = true; return false; }
         if (code != 200) { why = "cannot read service " + svc_key + " (http " + std::to_string(code) + ")"; return false; }
-        std::string port_name;
+        std::string port_name, target_name;
+        int64_t target_number = 0;
         bool found = false;
         size_t nports = 0;
         {
@@ -243,7 +245,22 @@ private:
             if (ports && ports->is_array()) {
                 nports = ports->arr_val.size();
                 for (const auto& p : ports->arr_val) {
-                    if (port == 0 || p.get_int("port", 0) == port) { port_name = p.get_string("name", ""); found = true; break; }
+                    if (port == 0 || p.get_int("port", 0) == port) {
+                        port_name = p.get_string("name", "");
+                        // The pod's own port, for NetworkPolicy: the Endpoints
+                        // carry where its node's pod server answers
+                        const models::JsonValue* tp = p.get("targetPort");
+                        if (!tp || tp->is_null()) target_number = p.get_int("port", 0);
+                        else if (tp->is_number()) target_number = static_cast<int64_t>(tp->num_val);
+                        else if (tp->is_string()) {
+                            char* end = nullptr;
+                            const long v = std::strtol(tp->str_val.c_str(), &end, 10);
+                            if (end && *end == '\0' && !tp->str_val.empty()) target_number = v;
+                            else target_name = tp->str_val;
+                        }
+                        found = true;
+                        break;
+                    }
                 }
             }
         }
@@ -271,6 +288,8 @@ private:
                         ep.pod = ref->get_string("namespace", ns) + "/" + ref->get_string("name", "");
                     }
                     ep.port = static_cast<uint16_t>(target);
+                    if (target_number > 0 && target_number <= 65535) ep.target_port = static_cast<uint16_t>(target_number);
+                    else ep.target_name = target_name;
                     if (!ep.ip.empty()) out.push_back(std::move(ep));
                 }
             }
@@ -756,8 +775,8 @@ int32_t ServiceClient::call_service(const runtime::ServiceCallRequest& req, cons
     }
     if (candidates.empty()) return K32_ERR_LOOP;
 
-    // NetworkPolicy, per backing pod: its address, its target port, and for
-    // selectors and named ports the pod itself
+    // NetworkPolicy, per backing pod: its address, its own port (not its
+    // node's pod server), and for selectors and named ports the pod itself
     if (egress_) {
         EgressScope scope;
         const std::string service = "service " + ns + "/" + t.service;
@@ -768,10 +787,22 @@ int32_t ServiceClient::call_service(const runtime::ServiceCallRequest& req, cons
             for (const IngressEndpoint* e : candidates) {
                 net::EgressTarget target;
                 net::parse_ipv4(e->ip, target.ip);
-                target.port = e->port;
+                target.port = e->target_port;
                 target.pod_namespace = namespace_of(e->pod);
                 net::PeerPod pod;
-                auto peer = [&]() -> const net::PeerPod* { return egress_->peer(e->pod, pod) ? &pod : nullptr; };
+                bool asked = false, known = false;
+                auto peer = [&]() -> const net::PeerPod* {
+                    if (!asked) { known = egress_->peer(e->pod, pod); asked = true; }
+                    return known ? &pod : nullptr;
+                };
+                // A named targetPort, from a worker's Endpoints: the pod's port of that name
+                if (!target.port && !e->target_name.empty()) {
+                    if (const net::PeerPod* p = peer()) {
+                        for (const auto& np : p->ports) {
+                            if (np.first == e->target_name) { target.port = np.second; break; }
+                        }
+                    }
+                }
                 if (net::egress_allowed(scope.selecting, caller_ns, target, peer)) allowed.push_back(e);
             }
             if (allowed.empty()) {

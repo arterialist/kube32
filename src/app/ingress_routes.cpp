@@ -98,6 +98,7 @@ struct ServiceInfo {
 struct PodInfo {
     std::string ns;
     std::string name;
+    std::string node;   // spec.nodeName
     std::string ip;
     std::map<std::string, std::string> labels;
     std::vector<std::pair<std::string, int64_t>> named_ports;   // containerPort names
@@ -171,6 +172,7 @@ bool parse_running_pod(const std::string& json, PodInfo& out) {
         }
     }
     if (const models::JsonValue* spec = doc.get("spec")) {
+        out.node = spec->get_string("nodeName", "");
         if (const models::JsonValue* cs = spec->get("containers"); cs && cs->is_array()) {
             for (const auto& c : cs->arr_val) {
                 const models::JsonValue* ports = c.get("ports");
@@ -220,8 +222,8 @@ bool parse_backend(const models::JsonValue* b, BackendRef& out) {
     return false;
 }
 
-void resolve_service(IngressRoute& route, const std::string& ns, const BackendRef& ref,
-                     const std::vector<ServiceInfo>& services, const std::vector<PodInfo>& pods) {
+void resolve_service(IngressRoute& route, const std::string& ns, const BackendRef& ref, const std::vector<ServiceInfo>& services,
+                     const std::vector<PodInfo>& pods, const std::map<std::string, uint16_t>& node_ports) {
     route.kind = BackendKind::Service;
     route.service = ns + "/" + ref.service_name;
     const ServiceInfo* svc = nullptr;
@@ -254,7 +256,10 @@ void resolve_service(IngressRoute& route, const std::string& ns, const BackendRe
         IngressEndpoint ep;
         ep.pod = pod.ns + "/" + pod.name;
         ep.ip = pod.ip;
-        ep.port = static_cast<uint16_t>(target);
+        ep.target_port = static_cast<uint16_t>(target);
+        // Served by the node's pod HTTP server, at the port the node reports
+        auto np = node_ports.find(pod.node);
+        ep.port = np != node_ports.end() ? np->second : ep.target_port;
         route.endpoints.push_back(std::move(ep));
     }
     if (route.endpoints.empty()) route.unavailable = "no running pod selected by service " + route.service;
@@ -298,7 +303,7 @@ std::string clean_prefix(std::string path) {
 
 bool resolve_service_endpoints(const std::string& ns, const std::string& name, uint16_t port,
                                const std::vector<std::string>& service_jsons, const std::vector<std::string>& pod_jsons,
-                               std::vector<IngressEndpoint>& out, std::string& why) {
+                               std::vector<IngressEndpoint>& out, std::string& why, const std::vector<std::string>& node_jsons) {
     std::vector<ServiceInfo> services;
     for (const auto& j : service_jsons) {
         ServiceInfo s;
@@ -316,7 +321,7 @@ bool resolve_service_endpoints(const std::string& ns, const std::string& name, u
     }
     std::sort(pods.begin(), pods.end(), [](const PodInfo& a, const PodInfo& b) { return a.name < b.name; });
     IngressRoute route;
-    resolve_service(route, ns, ref, services, pods);
+    resolve_service(route, ns, ref, services, pods, models::node_pod_ports(node_jsons));
     out = std::move(route.endpoints);
     why = route.unavailable;
     return !out.empty();
@@ -325,8 +330,10 @@ bool resolve_service_endpoints(const std::string& ns, const std::string& name, u
 std::shared_ptr<RouteTable> build_route_table(const std::vector<std::string>& ingress_jsons,
                                               const std::vector<std::string>& service_jsons,
                                               const std::vector<std::string>& pod_jsons,
-                                              const RouteTable* previous) {
+                                              const RouteTable* previous,
+                                              const std::vector<std::string>& node_jsons) {
     auto table = std::make_shared<RouteTable>();
+    const std::map<std::string, uint16_t> node_ports = models::node_pod_ports(node_jsons);
 
     std::vector<ServiceInfo> services;
     services.reserve(service_jsons.size());
@@ -396,7 +403,7 @@ std::shared_ptr<RouteTable> build_route_table(const std::vector<std::string>& in
                 r.kind = BackendKind::StaticBundle;
                 r.bundle = ref.bundle;
             } else {
-                resolve_service(r, ns, ref, services, pods);
+                resolve_service(r, ns, ref, services, pods, node_ports);
             }
             return r;
         };

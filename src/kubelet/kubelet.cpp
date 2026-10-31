@@ -955,6 +955,7 @@ bool Kubelet::deploy_and_start_pod(const models::KubePod& pod_in, const std::str
         };
         ectx.node_name = config_.node_name;
         ectx.node_ip = config_.node_ip;
+        ectx.node_port = config_.kubelet_port;
         // The control plane's kubelet reaches the API on loopback; pods are
         // given the address the rest of the network uses.
         ectx.api_host = (config_.api_server_host == "127.0.0.1" || config_.api_server_host == "localhost") ? config_.node_ip : config_.api_server_host;

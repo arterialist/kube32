@@ -156,6 +156,14 @@ std::string generate_uid();
 // `uid` is given, that owner).
 bool has_owner(const JsonValue& obj, const std::string& kind, const std::string& uid = "");
 
+// Every pod is reached through its node's pod HTTP server: the port a Node
+// reports in status.daemonEndpoints.kubeletEndpoint.Port, 0 when it reports
+// none. An endpoint of a pod on such a node has that port, whatever the
+// Service's targetPort resolves to.
+uint16_t node_pod_port(const JsonValue& node);
+// Node name -> pod port, for the nodes of `node_jsons` that report one
+std::map<std::string, uint16_t> node_pod_ports(const std::vector<std::string>& node_jsons);
+
 // Converters from JSON AST to typed structs
 KubeNode parse_node_manifest(const std::string& json_str);
 KubePod parse_pod_manifest(const std::string& json_str);

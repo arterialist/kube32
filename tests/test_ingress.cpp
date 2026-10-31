@@ -180,6 +180,45 @@ static void test_route_table() {
     std::cout << "[PASS] test_route_table" << std::endl;
 }
 
+// A pod is reached through its node's pod HTTP server, at the port its Node
+// reports (a kube32-sim worker's --pod-port), not at the containerPort; a
+// pod on a node that reports none keeps its target port
+static void test_routes_at_node_pod_ports() {
+    std::cout << "[RUN] test_routes_at_node_pod_ports" << std::endl;
+    auto on = [](const std::string& pod, const std::string& node) {
+        std::string j = pod;
+        j.replace(j.find("\"spec\":{"), 8, "\"spec\":{\"nodeName\":\"" + node + "\",");
+        return j;
+    };
+    const std::vector<std::string> services = {service_json("room", "\"app\":\"room\"", "[{\"name\":\"http\",\"port\":80,\"targetPort\":\"http\"}]")};
+    const std::vector<std::string> pods = {
+        on(pod_json("room-board", "\"app\":\"room\"", "Running", "10.0.0.5", "[{\"name\":\"http\",\"containerPort\":7000}]"), "board"),
+        on(pod_json("room-laptop", "\"app\":\"room\"", "Running", "10.0.0.9", "[{\"name\":\"http\",\"containerPort\":7000}]"), "laptop"),
+        on(pod_json("room-old", "\"app\":\"room\"", "Running", "10.0.0.7", "[{\"name\":\"http\",\"containerPort\":7001}]"), "old"),
+    };
+    const std::vector<std::string> nodes = {
+        R"({"metadata":{"name":"board"},"status":{"daemonEndpoints":{"kubeletEndpoint":{"Port":7000}}}})",
+        R"({"metadata":{"name":"laptop"},"status":{"daemonEndpoints":{"kubeletEndpoint":{"Port":17000}}}})",
+        R"({"metadata":{"name":"old"},"status":{}})",
+    };
+    const std::vector<std::string> ingresses = {ingress_json("room", "", "{\"rules\":[{\"http\":{\"paths\":[" +
+        path_rule("/kitchen", "Prefix", backend_service("room", "{\"name\":\"http\"}")) + "]}}]}")};
+    auto t = app::build_route_table(ingresses, services, pods, nullptr, nodes);
+    const app::IngressRoute* r = t->match("x", "/kitchen");
+    assert(r && r->endpoints.size() == 3);
+    for (const auto& ep : r->endpoints) {
+        if (ep.pod == "default/room-board") assert(ep.port == 7000);
+        else if (ep.pod == "default/room-laptop") assert(ep.ip == "10.0.0.9" && ep.port == 17000);
+        else assert(ep.pod == "default/room-old" && ep.port == 7001);
+    }
+    // The control plane's service calls resolve the same way
+    std::vector<app::IngressEndpoint> eps;
+    std::string why;
+    assert(app::resolve_service_endpoints("default", "room", 80, services, pods, eps, why, nodes) && eps.size() == 3);
+    for (const auto& ep : eps) assert(ep.pod != "default/room-laptop" || ep.port == 17000);
+    std::cout << "[PASS] test_routes_at_node_pod_ports" << std::endl;
+}
+
 static void test_default_backend_and_errors() {
     std::cout << "[RUN] test_default_backend_and_errors" << std::endl;
     std::vector<std::string> ingresses = {
@@ -400,6 +439,16 @@ static void test_controller_end_to_end() {
     put(*store, "/registry/pods/default/echo-0", pod_json("echo-0", "\"app\":\"echo\"", "Running", "127.0.0.1", "[{\"name\":\"http\",\"containerPort\":7000}]"));
     put(*store, "/registry/services/default/remote", service_json("remote", "\"app\":\"remote\"", "[{\"port\":80,\"targetPort\":" + std::to_string(remote_port) + "}]"));
     put(*store, "/registry/pods/default/remote-0", pod_json("remote-0", "\"app\":\"remote\"", "Running", "127.0.0.1", "[]"));
+    // A pod on a kube32-sim worker whose pod server runs on its own port:
+    // the Service's targetPort says 7000, the node says where it listens
+    put(*store, "/registry/nodes/laptop", "{\"kind\":\"Node\",\"metadata\":{\"name\":\"laptop\"},\"status\":{\"daemonEndpoints\":{\"kubeletEndpoint\":{\"Port\":" +
+                                         std::to_string(remote_port) + "}}}}");
+    put(*store, "/registry/services/default/sim", service_json("sim", "\"app\":\"sim\"", "[{\"name\":\"http\",\"port\":80,\"targetPort\":\"http\"}]"));
+    {
+        std::string sim = pod_json("sim-0", "\"app\":\"sim\"", "Running", "127.0.0.1", "[{\"name\":\"http\",\"containerPort\":7000}]");
+        sim.replace(sim.find("\"spec\":{"), 8, "\"spec\":{\"nodeName\":\"laptop\",");
+        put(*store, "/registry/pods/default/sim-0", sim);
+    }
     put(*store, "/registry/ingresses/default/site",
         ingress_json("site", "\"kube32.io/cluster-telemetry\":\"/api/cluster\"",
                      "{\"rules\":[{\"http\":{\"paths\":[" + path_rule("/", "Prefix", backend_bundle("tessera-web")) + "]}}]}"));
@@ -407,7 +456,8 @@ static void test_controller_end_to_end() {
         ingress_json("echo", "\"kube32.io/event-stream\":\"/echo/events=echo.events,kube32.presence\",\"kube32.io/stats-topic\":\"echo.stats\"",
                      "{\"rules\":[{\"http\":{\"paths\":[" + path_rule("/echo", "Prefix", backend_service("echo", "{\"name\":\"http\"}")) + "," +
                          path_rule("/echo/ui", "Prefix", backend_bundle("echo")) + "," +
-                         path_rule("/remote", "Prefix", backend_service("remote", "{\"number\":80}")) + "]}}]}"));
+                         path_rule("/remote", "Prefix", backend_service("remote", "{\"number\":80}")) + "," +
+                         path_rule("/kitchen", "Prefix", backend_service("sim", "{\"name\":\"http\"}")) + "]}}]}"));
 
     app::IngressControllerOptions io;
     io.store = store.get();
@@ -429,6 +479,10 @@ static void test_controller_end_to_end() {
     r = http(ingress_port, "GET", "/remote/a/b?q=2");
     assert(r.status == 200);
     assert(r.body == "pod=default/remote-0 uri=/remote/a/b?q=2");
+    // Pod on a kube32-sim node: reached at the node's pod port
+    r = http(ingress_port, "GET", "/kitchen");
+    assert(r.status == 200);
+    assert(r.body == "pod=default/sim-0 uri=/kitchen");
 
     // Static bundle: gzip-encoded files keep their encoding
     r = http(ingress_port, "GET", "/", "Accept-Encoding: gzip\r\n");
@@ -561,6 +615,7 @@ int main() {
     osal::Socket::init_networking();
     test_path_and_host_matching();
     test_route_table();
+    test_routes_at_node_pod_ports();
     test_default_backend_and_errors();
     test_bundle_paths();
     test_ingress_api();

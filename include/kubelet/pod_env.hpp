@@ -45,6 +45,7 @@ struct PodEnvContext {
     std::function<int(const std::string& path, const std::function<void(std::string&&)>& on_item)> api_list;
     std::string node_name;
     std::string node_ip;      // this node: the starting pod's IP and hostIP
+    uint16_t node_port{0};    // this node's pod HTTP server, where its own Services reach it; 0 keeps the target port
     std::string api_host;     // the API server as pods address it
     uint16_t api_port{6443};
 };

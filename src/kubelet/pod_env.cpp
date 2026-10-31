@@ -242,7 +242,10 @@ void collect_service_links(const PodEnvContext& ctx, const std::string& ns, cons
             ResolvedPort rp;
             rp.name = p.get_string("name", "");
             rp.protocol = upper(p.get_string("protocol", "TCP"));
-            if (ls.selects_pod) rp.port = target_port(p, own_spec);
+            if (ls.selects_pod) {
+                rp.port = target_port(p, own_spec);
+                if (rp.port > 0 && ctx.node_port) rp.port = ctx.node_port;
+            }
             ls.ports.push_back(std::move(rp));
         }
         others = others || !ls.selects_pod;

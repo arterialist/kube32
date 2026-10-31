@@ -63,7 +63,9 @@ enum class BackendKind : uint8_t { Service, StaticBundle, EventStream, Telemetry
 struct IngressEndpoint {
     std::string pod;          // "<namespace>/<name>", the AppPodHost and X-Kube32-Pod key
     std::string ip;           // status.podIP
-    uint16_t port{0};         // resolved target port
+    uint16_t port{0};         // where it answers: its node's pod port, else the resolved target port
+    uint16_t target_port{0};  // the pod's own port (resolved targetPort), as NetworkPolicy ports name it; 0: see target_name
+    std::string target_name;  // targetPort as a containerPort name, when only the name is known (a worker's Endpoints)
 };
 
 struct IngressRoute {
@@ -112,18 +114,22 @@ public:
 };
 
 // Builds a table from stored JSON objects. Counters of Ingresses present in
-// `previous` are carried over.
+// `previous` are carried over. A pod on one of `node_jsons` that reports its
+// pod port is reached at that port (models::node_pod_port).
 std::shared_ptr<RouteTable> build_route_table(const std::vector<std::string>& ingress_jsons,
                                               const std::vector<std::string>& service_jsons,
                                               const std::vector<std::string>& pod_jsons,
-                                              const RouteTable* previous);
+                                              const RouteTable* previous,
+                                              const std::vector<std::string>& node_jsons = {});
 
 // Endpoints of Service `ns/name` for its port `port` (0: the Service's first
-// port): the Running pods it selects, the target port resolved per pod. False
-// with `why` when the Service, the port or a selected pod is missing.
+// port): the Running pods it selects, the target port resolved per pod and
+// replaced by the node's pod port where `node_jsons` has one. False with
+// `why` when the Service, the port or a selected pod is missing.
 bool resolve_service_endpoints(const std::string& ns, const std::string& name, uint16_t port,
                                const std::vector<std::string>& service_jsons, const std::vector<std::string>& pod_jsons,
-                               std::vector<IngressEndpoint>& out, std::string& why);
+                               std::vector<IngressEndpoint>& out, std::string& why,
+                               const std::vector<std::string>& node_jsons = {});
 
 // Path of a request inside a bundle mounted by `route`: the matched prefix is
 // removed for Prefix routes below "/". Always starts with '/'.

@@ -3155,10 +3155,12 @@ models::JsonValue target_ref(const EndpointPod* p) {
     return ref;
 }
 
-// One Endpoints object, or the EndpointSlices, of a Service. Pods whose
-// named target ports resolve differently land in separate subsets/slices.
-void build_service_endpoints(const models::JsonValue& svc, const std::vector<EndpointPod>& pods, bool slices,
-                             const std::string& rv, std::vector<std::string>& out) {
+// One Endpoints object, or the EndpointSlices, of a Service. A port a pod
+// serves (its targetPort, by number or containerPort name) is reached at its
+// node's pod port when the node reports one. Pods whose ports come out
+// differently land in separate subsets/slices.
+void build_service_endpoints(const models::JsonValue& svc, const std::vector<EndpointPod>& pods, const std::map<std::string, uint16_t>& node_ports,
+                             bool slices, const std::string& rv, std::vector<std::string>& out) {
     const models::JsonValue* meta = svc.get("metadata");
     const models::JsonValue* spec = svc.get("spec");
     if (!meta || !spec) return;
@@ -3177,6 +3179,7 @@ void build_service_endpoints(const models::JsonValue& svc, const std::vector<End
         }
         if (!selected) continue;
         std::vector<ResolvedPort> ports;
+        auto node_port = node_ports.find(pod.node);
         if (const models::JsonValue* sp = spec->get("ports"); sp && sp->is_array()) {
             for (const auto& p : sp->arr_val) {
                 ResolvedPort rp;
@@ -3190,6 +3193,7 @@ void build_service_endpoints(const models::JsonValue& svc, const std::vector<End
                 } else {
                     rp.port = tp ? p.get_int("targetPort", 0) : p.get_int("port", 0);
                 }
+                if (rp.port > 0 && node_port != node_ports.end()) rp.port = node_port->second;
                 if (rp.port > 0) ports.push_back(rp);
             }
         }
@@ -3314,9 +3318,11 @@ HttpResponse RouteHandler::handle_endpoints(const HttpRequest& req, const RouteM
     }
     const std::string ns(match.namespace_name);
     const std::string scope = ns.empty() ? std::string() : ns + "/";
-    std::vector<std::string> svc_jsons, pod_jsons;
+    std::vector<std::string> svc_jsons, pod_jsons, node_jsons;
     store_.list("/registry/services/" + scope, svc_jsons);
     store_.list("/registry/pods/" + scope, pod_jsons);
+    store_.list("/registry/nodes/", node_jsons);
+    const std::map<std::string, uint16_t> node_ports = models::node_pod_ports(node_jsons);
     std::vector<EndpointPod> pods;
     pods.reserve(pod_jsons.size());
     for (const auto& j : pod_jsons) {
@@ -3339,7 +3345,7 @@ HttpResponse RouteHandler::handle_endpoints(const HttpRequest& req, const RouteM
             // A slice is named after its Service, with "-<n>" for extra slices
             if (!(sname == want || (slices && want.rfind(sname + "-", 0) == 0))) continue;
         }
-        build_service_endpoints(svc, pods, slices, rv, objects);
+        build_service_endpoints(svc, pods, node_ports, slices, rv, objects);
     }
 
     if (item) {

@@ -498,6 +498,9 @@ void test_worker_view() {
     store->put("/registry/services/default/web",
                "{\"apiVersion\":\"v1\",\"kind\":\"Service\",\"metadata\":{\"name\":\"web\",\"namespace\":\"default\"},"
                "\"spec\":{\"selector\":{\"app\":\"web\"},\"ports\":[{\"name\":\"http\",\"port\":80,\"targetPort\":\"http\"}]}}", true);
+    // node-b's pod server is on port 2: the Endpoints say 2, policies name web-0's own port, 1
+    store->put("/registry/nodes/node-b", "{\"kind\":\"Node\",\"metadata\":{\"name\":\"node-b\"},"
+               "\"status\":{\"daemonEndpoints\":{\"kubeletEndpoint\":{\"Port\":2}}}}", true);
 
     auto policies = std::make_shared<net::NodeNetworkPolicies>();
     kubelet::KubeletConfig cfg;
@@ -549,6 +552,17 @@ void test_worker_view() {
     k.sync_assigned_pods();
     assert(call(client, "default/client-0", svc) == K32_ERR_IO);
     assert(call(client, "default/client-0", out) == K32_ERR_PERM);
+    // ... and on its port by number: web-0's, not its node's pod server's
+    assert(request(h, api::HttpMethod::Patch, base + "/to-web", R"({"spec":{"egress":[{"to":[{"podSelector":{"matchLabels":{"app":"web"}}}],"ports":[{"port":2}]}]}})",
+                   "application/merge-patch+json").status_code == 200);
+    osal::Thread::sleep_ms(350);
+    k.sync_assigned_pods();
+    assert(call(client, "default/client-0", svc) == K32_ERR_PERM);
+    assert(request(h, api::HttpMethod::Patch, base + "/to-web", R"({"spec":{"egress":[{"to":[{"podSelector":{"matchLabels":{"app":"web"}}}],"ports":[{"port":1}]}]}})",
+                   "application/merge-patch+json").status_code == 200);
+    osal::Thread::sleep_ms(350);
+    k.sync_assigned_pods();
+    assert(call(client, "default/client-0", svc) == K32_ERR_IO);
 
     // An address block for the outside
     assert(request(h, api::HttpMethod::Post, base, policy("loopback", R"({"podSelector":{"matchLabels":{"app":"client"}},"policyTypes":["Egress"],

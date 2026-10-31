@@ -229,8 +229,24 @@ static void test_egress(storage::Store& store, FakeNode& node) {
     assert(json_int(c.body, "rc") == 200 && c.body.find("\"body\":\"hello\"") != std::string::npos);
     assert(client.stats().denied.load() >= 6);
 
+    // k-0 answers at its node's pod port; a policy names the pod's own port
+    // (its "http", 7000), by name or by number, not the node's
+    c = call_pod("default/a-0", "/call?u=http://k/cl");
+    assert(json_int(c.body, "rc") == K32_ERR_PERM);
+    assert(policy_request(api, api::HttpMethod::Post, "to-k", R"({"podSelector":{"matchLabels":{"app":"a"}},"policyTypes":["Egress"],
+        "egress":[{"to":[{"podSelector":{"matchLabels":{"app":"k"}}}],"ports":[{"port":"http"}]}]})") == 201);
+    c = call_pod("default/a-0", "/call?u=http://k/cl");
+    assert(json_int(c.body, "rc") == 200 && c.body.find("\"body\":\"hello\"") != std::string::npos);
+    assert(policy_request(api, api::HttpMethod::Patch, "to-k", R"({"egress":[{"to":[{"podSelector":{"matchLabels":{"app":"k"}}}],"ports":[{"port":7000}]}]})") == 200);
+    c = call_pod("default/a-0", "/call?u=http://k/cl");
+    assert(json_int(c.body, "rc") == 200);
+    assert(policy_request(api, api::HttpMethod::Patch, "to-k", R"({"egress":[{"to":[{"podSelector":{"matchLabels":{"app":"k"}}}],"ports":[{"port":)" +
+                          port + "}]}]}") == 200);
+    c = call_pod("default/a-0", "/call?u=http://k/cl");
+    assert(json_int(c.body, "rc") == K32_ERR_PERM);
+
     // Policies gone: everything allowed again
-    for (const char* name : {"lockdown", "loopback", "to-b", "to-r"}) assert(policy_request(api, api::HttpMethod::Delete, name) == 200);
+    for (const char* name : {"lockdown", "loopback", "to-b", "to-r", "to-k"}) assert(policy_request(api, api::HttpMethod::Delete, name) == 200);
     c = call_pod("default/a-0", "/call?u=" + out + "/cl");
     assert(json_int(c.body, "rc") == 200);
     c = call_pod("default/a-0", "/call?u=http://b/hello");
@@ -245,13 +261,22 @@ int main() {
     FakeNode node;
     assert(node.start());
 
-    // a, b: local pods; svc "a" selects a-0 (self calls); "r": a pod on the fake node
+    // a, b: local pods; svc "a" selects a-0 (self calls); "r": a pod on the fake node;
+    // "k": a pod on node "sim", whose pod server (the fake node) is not on its containerPort
     store->put("/registry/services/default/a", service_json("a", "a", "[{\"name\":\"http\",\"port\":80,\"targetPort\":\"http\"}]"), true);
     store->put("/registry/services/default/b", service_json("b", "b", "[{\"name\":\"http\",\"port\":80,\"targetPort\":7000}]"), true);
     store->put("/registry/services/default/r", service_json("r", "r", "[{\"port\":8080,\"targetPort\":" + std::to_string(node.port) + "}]"), true);
     store->put("/registry/pods/default/a-0", pod_json("a-0", "a", "127.0.0.1"), true);
     store->put("/registry/pods/default/b-0", pod_json("b-0", "b", "127.0.0.1"), true);
     store->put("/registry/pods/default/r-0", pod_json("r-0", "r", "127.0.0.1"), true);
+    store->put("/registry/services/default/k", service_json("k", "k", "[{\"name\":\"http\",\"port\":80,\"targetPort\":\"http\"}]"), true);
+    {
+        std::string k = pod_json("k-0", "k", "127.0.0.1");
+        k.replace(k.find("\"spec\":{"), 8, "\"spec\":{\"nodeName\":\"sim\",");
+        store->put("/registry/pods/default/k-0", k, true);
+        store->put("/registry/nodes/sim", "{\"kind\":\"Node\",\"metadata\":{\"name\":\"sim\"},\"status\":{\"daemonEndpoints\":{\"kubeletEndpoint\":{\"Port\":" +
+                   std::to_string(node.port) + "}}}}", true);
+    }
 
     app::ServiceClient client(app::make_store_service_resolver(*store));
     app::install_service_client(&client);

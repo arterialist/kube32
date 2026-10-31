@@ -206,10 +206,7 @@ std::vector<DeviceController::NodeView> DeviceController::load_nodes() {
                     if (c.get_string("type", "") == "Ready") n.ready = c.get_string("status", "") == "True";
                 }
             }
-            const models::JsonValue* de = st->get("daemonEndpoints");
-            const models::JsonValue* ke = de ? de->get("kubeletEndpoint") : nullptr;
-            const int64_t port = ke ? ke->get_int("Port", 0) : 0;
-            if (port > 0 && port <= 65535) n.pod_port = static_cast<uint16_t>(port);
+            if (const uint16_t port = models::node_pod_port(doc)) n.pod_port = port;
         }
         nodes.push_back(std::move(n));
     }

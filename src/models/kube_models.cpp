@@ -854,6 +854,27 @@ bool has_owner(const JsonValue& obj, const std::string& kind, const std::string&
     return false;
 }
 
+uint16_t node_pod_port(const JsonValue& node) {
+    const JsonValue* st = node.get("status");
+    const JsonValue* de = st ? st->get("daemonEndpoints") : nullptr;
+    const JsonValue* ke = de ? de->get("kubeletEndpoint") : nullptr;
+    const int64_t port = ke ? ke->get_int("Port", 0) : 0;
+    return port > 0 && port <= 65535 ? static_cast<uint16_t>(port) : 0;
+}
+
+std::map<std::string, uint16_t> node_pod_ports(const std::vector<std::string>& node_jsons) {
+    std::map<std::string, uint16_t> out;
+    for (const auto& json : node_jsons) {
+        JsonValue doc;
+        std::string err;
+        if (!parse_json(json, doc, err) || !doc.is_object()) continue;
+        const JsonValue* meta = doc.get("metadata");
+        const uint16_t port = node_pod_port(doc);
+        if (meta && port) out[meta->get_string("name", "")] = port;
+    }
+    return out;
+}
+
 KubePod parse_pod_manifest(const std::string& json_str) {
     KubePod pod;
     JsonValue doc;
