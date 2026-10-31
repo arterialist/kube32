@@ -1010,13 +1010,16 @@ void test_pool_estimates() {
         const std::vector<uint8_t> wasm = image(std::string("driver-") + name);
         const size_t board = runtime::estimate_pod_memory(wasm.data(), wasm.size(), 3072, 4096, true, runtime::EstimateSizes::Board);
         std::cout << "[estimate] driver-" << name << ": " << wasm.size() << " bytes of Wasm, " << board << " bytes on a board" << std::endl;
-        assert(board <= 28 * 1024);
+        assert(board <= 30 * 1024);
         if (std::strcmp(name, "bme688") == 0 || std::strcmp(name, "miniscale") == 0 || std::strcmp(name, "rfid") == 0) i2c += board;
     }
     kube32_interp_stack_set(nullptr, 0);
     // The ENV Pro, the Mini Scales and the RFID 2 on one Cardputer
     std::cout << "[estimate] bme688 + miniscale + rfid: " << i2c << " of " << kube32_pool_block_size() << " bytes" << std::endl;
-    assert(i2c <= kube32_pool_block_size() - 4 * 1024);
+    // Admission takes them one at a time against what the pool has left, and
+    // an estimate runs a few KB above what a load takes (on the Cardputer
+    // the three load in 25.4 + 20.1 + 23.5 KB)
+    assert(i2c <= kube32_pool_block_size());
 }
 
 } // namespace

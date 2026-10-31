@@ -76,6 +76,11 @@
 #define TPH_MS         43                            /* their conversion and wake-up (bme68x_get_meas_dur) */
 
 /* Calibration (bme68x_calib_data) */
+/* wasm3 on the board makes no tail calls: every instruction keeps a native
+ * frame until its function returns, so the compensation steps stay functions
+ * of their own instead of one long inlined tick */
+#define NOINLINE __attribute__((noinline))
+
 static struct {
     int32_t t1, t2, t3, p1, p2, p3, p4, p5, p6, p7, p8, p9, p10, h1, h2, h3, h4, h5, h6, h7;
     int32_t gh1, gh2, gh3, res_heat_range, res_heat_val, range_sw_err;
@@ -96,7 +101,7 @@ static int32_t t_fine, temp_x100, amb_c = 25;
 static uint32_t press_pa, hum_milli, gas_ohms;
 
 /* ---- compensation (Bosch BME68x Sensor API, integer version) --------------- */
-static int32_t calc_temperature(uint32_t temp_adc) {
+static NOINLINE int32_t calc_temperature(uint32_t temp_adc) {
     int64_t var1 = ((int32_t)temp_adc >> 3) - (c.t1 << 1);
     int64_t var2 = (var1 * c.t2) >> 11;
     int64_t var3 = ((var1 >> 1) * (var1 >> 1)) >> 12;
@@ -105,7 +110,7 @@ static int32_t calc_temperature(uint32_t temp_adc) {
     return (int16_t)(((t_fine * 5) + 128) >> 8);
 }
 
-static uint32_t calc_pressure(uint32_t pres_adc) {
+static NOINLINE uint32_t calc_pressure(uint32_t pres_adc) {
     int32_t var1 = (t_fine >> 1) - 64000;
     int32_t var2 = ((((var1 >> 2) * (var1 >> 2)) >> 11) * c.p6) >> 2;
     var2 = var2 + ((var1 * c.p5) << 1);
@@ -123,7 +128,7 @@ static uint32_t calc_pressure(uint32_t pres_adc) {
     return (uint32_t)(p + ((var1 + var2 + var3 + (c.p7 << 7)) >> 4));
 }
 
-static uint32_t calc_humidity(uint16_t hum_adc) {
+static NOINLINE uint32_t calc_humidity(uint16_t hum_adc) {
     int32_t temp_scaled = ((t_fine * 5) + 128) >> 8;
     int32_t var1 = (int32_t)(hum_adc - (c.h1 * 16)) - (((temp_scaled * c.h3) / 100) >> 1);
     int32_t var2 = (c.h2 * (((temp_scaled * c.h4) / 100) + (((temp_scaled * ((temp_scaled * c.h5) / 100)) >> 6) / 100) + (1 << 14))) >> 10;
@@ -136,7 +141,7 @@ static uint32_t calc_humidity(uint16_t hum_adc) {
 }
 
 /* BME680 */
-static uint32_t calc_gas_resistance_low(uint16_t gas_res_adc, uint8_t gas_range) {
+static NOINLINE uint32_t calc_gas_resistance_low(uint16_t gas_res_adc, uint8_t gas_range) {
     static const uint32_t lookup_table1[16] = {
         2147483647u, 2147483647u, 2147483647u, 2147483647u, 2147483647u, 2126008810u, 2147483647u, 2130303777u,
         2147483647u, 2147483647u, 2143188679u, 2136746228u, 2147483647u, 2126008810u, 2147483647u, 2147483647u};
@@ -150,14 +155,14 @@ static uint32_t calc_gas_resistance_low(uint16_t gas_res_adc, uint8_t gas_range)
 }
 
 /* BME688 */
-static uint32_t calc_gas_resistance_high(uint16_t gas_res_adc, uint8_t gas_range) {
+static NOINLINE uint32_t calc_gas_resistance_high(uint16_t gas_res_adc, uint8_t gas_range) {
     uint32_t var1 = 262144u >> gas_range;
     int32_t var2 = (int32_t)gas_res_adc - 512;
     var2 = 4096 + var2 * 3;
     return (10000u * var1) / (uint32_t)var2 * 100;
 }
 
-static uint8_t calc_res_heat(uint32_t temp) {
+static NOINLINE uint8_t calc_res_heat(uint32_t temp) {
     if (temp > 400) temp = 400;
     int32_t var1 = ((amb_c * c.gh3) / 1000) * 256;
     int32_t var2 = (c.gh1 + 784) * (((((c.gh2 + 154009) * (int32_t)temp * 5) / 100) + 3276800) / 10);
@@ -168,7 +173,7 @@ static uint8_t calc_res_heat(uint32_t temp) {
     return (uint8_t)((heatr_res_x100 + 50) / 100);
 }
 
-static uint8_t calc_gas_wait(uint32_t dur) {
+static NOINLINE uint8_t calc_gas_wait(uint32_t dur) {
     uint8_t factor = 0;
     if (dur >= 0xfc0) return 0xff;
     while (dur > 0x3f) {
@@ -180,7 +185,7 @@ static uint8_t calc_gas_wait(uint32_t dur) {
 
 /* ---- the part -------------------------------------------------------------- */
 /* Identifies the chip, resets it and reads its calibration */
-static int32_t identify(uint32_t now) {
+static NOINLINE int32_t identify(uint32_t now) {
     uint8_t b[42];
     int32_t r = reg_read(REG_CHIP_ID, b, 1);
     if (r) return r;
