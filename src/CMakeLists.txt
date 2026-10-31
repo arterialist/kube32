@@ -60,6 +60,7 @@ set(KUBE32_APP_SRCS
     models/kube_lease.cpp
     models/kube_models.cpp
     models/tolerations.cpp
+    models/device.cpp
     net/mdns_discovery.cpp
     net/network_manager.cpp
     net/network_policy.cpp

@@ -26,6 +26,7 @@ enum class PodExecutionPhase {
     CrashLoopBackOff,
     CreateContainerConfigError,   // env references could not be resolved; retried after next_restart_allowed_ms
     InsufficientMemory,           // the node cannot give the pod its memory now; retried after next_restart_allowed_ms
+    BusInUse,                     // its I2C bus is claimed the other way (whole or shared); retried after next_restart_allowed_ms
     Terminating,
     Completed,
     Failed
@@ -87,6 +88,9 @@ struct KubeletConfig {
     // this kubelet (a reboot), its labels with the prefix that are no longer
     // found are removed
     std::string node_label_prefix;
+    // Annotations the node finds on itself (what I2C discovery identified),
+    // read right after node_label_source; changes are patched onto the Node
+    std::function<std::map<std::string, std::string>()> node_annotation_source;
     std::string node_ip{"127.0.0.1"};
     // Port of this node's kubelet endpoint (the pod HTTP server: node storage
     // through the API server's node proxy), 0 when the node runs none
@@ -196,6 +200,12 @@ private:
     // reason in its container status and is admitted again after
     // memory_retry_ms. Status and Event go out when it starts waiting.
     bool wait_for_memory(const std::string& pod_key, LocalPodRecord& rec, const std::string& why, const LocalPodRecord* previous);
+    // The same wait for `phase` (InsufficientMemory, BusInUse), reported with `reason`
+    bool wait_for(const std::string& pod_key, LocalPodRecord& rec, PodExecutionPhase phase, const char* reason, const std::string& why,
+                  const LocalPodRecord* previous);
+    // Patches node_annotation_source's annotations onto the Node when they
+    // changed or were not sent since the node registered
+    void patch_node_annotations();
     void repack_pool(uint64_t now_ms);
     void ship_pod_logs_locked(const std::string& pod_key, LocalPodRecord& rec);
     // Lists the NetworkPolicies of the namespaces new to config_.network_policies,
@@ -224,6 +234,8 @@ private:
     uint64_t last_status_report_ms_{0};
     uint64_t last_label_refresh_ms_{0};
     std::map<std::string, std::string> found_labels_;   // from node_label_source, as on the Node
+    std::map<std::string, std::string> found_annotations_;   // from node_annotation_source
+    bool annotations_sent_{false};                          // found_annotations_ are on the Node
     uint32_t heartbeat_failures_{0};
     // The Node object is written here, allocated at start while the heap is
     // whole: re-registering must work when the heap is fragmented

@@ -71,7 +71,11 @@ static const void* raw_esp32_gpio_set_mode(IM3Runtime runtime, IM3ImportContext 
     uint32_t mode = static_cast<uint32_t>(_sp[2]);
     std::string pod_id = get_pod_id(runtime, _ctx);
 
-    if (!hal::CapabilityFirewall::instance().check_permission(pod_id, hal::PeripheralType::GPIO, pin, hal::AccessMode::Config)) {
+    // An input mode needs the pin's read grant (an input pin, esp32.io/gpio-input-N), output its write grant
+    const bool input = mode == static_cast<uint32_t>(hal::PinMode::Input) || mode == static_cast<uint32_t>(hal::PinMode::InputPullup) ||
+                       mode == static_cast<uint32_t>(hal::PinMode::InputPulldown);
+    if (!hal::CapabilityFirewall::instance().check_permission(pod_id, hal::PeripheralType::GPIO, pin,
+                                                              input ? hal::AccessMode::Read : hal::AccessMode::Config)) {
         *reinterpret_cast<int32_t*>(_sp) = hal::HAL_ERR_PERM;
         return m3Err_none;
     }
@@ -183,7 +187,9 @@ static const void* raw_esp32_chip_temp_read(IM3Runtime runtime, IM3ImportContext
 
 // esp32_i2c_write: signature "i(iiii)" -> returns int32_t, args: (bus, addr, data_offset, len)
 // Bytes written, or a negative error. len 0 probes the address: 0 when a
-// device acknowledges, -19 (ENODEV) when none does.
+// device acknowledges, -19 (ENODEV) when none does. A pod that claims the
+// bus whole reaches every address; a device grant reaches its own address,
+// through its multiplexer channel.
 static const void* raw_esp32_i2c_write(IM3Runtime runtime, IM3ImportContext _ctx, uint64_t* _sp, void* _mem) {
     uint32_t bus         = static_cast<uint32_t>(_sp[1]);
     uint32_t addr        = static_cast<uint32_t>(_sp[2]);
@@ -191,7 +197,9 @@ static const void* raw_esp32_i2c_write(IM3Runtime runtime, IM3ImportContext _ctx
     uint32_t len         = static_cast<uint32_t>(_sp[4]);
     std::string pod_id   = get_pod_id(runtime, _ctx);
 
-    if (!hal::CapabilityFirewall::instance().check_permission(pod_id, hal::PeripheralType::I2C, bus, hal::AccessMode::Write)) {
+    models::I2cLocation device;
+    const hal::I2cAccess access = hal::CapabilityFirewall::instance().check_i2c(pod_id, bus, addr, hal::AccessMode::Write, device);
+    if (access == hal::I2cAccess::Denied) {
         *reinterpret_cast<int32_t*>(_sp) = hal::HAL_ERR_PERM;
         return m3Err_none;
     }
@@ -203,7 +211,9 @@ static const void* raw_esp32_i2c_write(IM3Runtime runtime, IM3ImportContext _ctx
     }
 
     const uint8_t* host_data = static_cast<const uint8_t*>(_mem) + data_offset;
-    *reinterpret_cast<int32_t*>(_sp) = (addr > 0x7f) ? hal::HAL_ERR_INVAL : hal::i2c_bus_write(bus, static_cast<uint8_t>(addr), host_data, len);
+    *reinterpret_cast<int32_t*>(_sp) = addr > 0x7f ? hal::HAL_ERR_INVAL
+                                     : access == hal::I2cAccess::Device ? hal::i2c_device_write(device, host_data, len)
+                                                                        : hal::i2c_bus_write(bus, static_cast<uint8_t>(addr), host_data, len);
     return m3Err_none;
 }
 
@@ -215,7 +225,9 @@ static const void* raw_esp32_i2c_read(IM3Runtime runtime, IM3ImportContext _ctx,
     uint32_t len        = static_cast<uint32_t>(_sp[4]);
     std::string pod_id  = get_pod_id(runtime, _ctx);
 
-    if (!hal::CapabilityFirewall::instance().check_permission(pod_id, hal::PeripheralType::I2C, bus, hal::AccessMode::Read)) {
+    models::I2cLocation device;
+    const hal::I2cAccess access = hal::CapabilityFirewall::instance().check_i2c(pod_id, bus, addr, hal::AccessMode::Read, device);
+    if (access == hal::I2cAccess::Denied) {
         *reinterpret_cast<int32_t*>(_sp) = hal::HAL_ERR_PERM;
         return m3Err_none;
     }
@@ -227,7 +239,9 @@ static const void* raw_esp32_i2c_read(IM3Runtime runtime, IM3ImportContext _ctx,
     }
 
     uint8_t* host_buf = static_cast<uint8_t*>(_mem) + buf_offset;
-    *reinterpret_cast<int32_t*>(_sp) = (addr > 0x7f) ? hal::HAL_ERR_INVAL : hal::i2c_bus_read(bus, static_cast<uint8_t>(addr), host_buf, len);
+    *reinterpret_cast<int32_t*>(_sp) = addr > 0x7f ? hal::HAL_ERR_INVAL
+                                     : access == hal::I2cAccess::Device ? hal::i2c_device_read(device, host_buf, len)
+                                                                        : hal::i2c_bus_read(bus, static_cast<uint8_t>(addr), host_buf, len);
     return m3Err_none;
 }
 

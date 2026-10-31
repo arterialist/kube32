@@ -31,6 +31,8 @@ void CapabilityFirewall::reset() {
     allocated_uart_mask_ = 0;
     lent_i2c_mask_ = 0;
     admissions_ = 0;
+    for (uint8_t& n : i2c_sharers_) n = 0;
+    for (uint8_t& n : i2c_shared_scans_) n = 0;
 }
 
 void CapabilityFirewall::set_board_profile(const BoardProfile& profile) {
@@ -145,7 +147,7 @@ bool CapabilityFirewall::allocate_generic_i2c(uint32_t count, DeviceGrant& grant
 
     for (uint32_t bus = 0; bus < 2 && allocated < count; ++bus) {
         if ((profile_.i2c_bus_mask & (1U << bus)) == 0) continue;
-        if (!i2c_owners_[bus].empty()) continue;
+        if (!i2c_owners_[bus].empty() || i2c_sharers_[bus] > 0 || i2c_shared_scans_[bus] > 0) continue;
         claimed_buses.push_back(bus);
         allocated++;
     }
@@ -190,17 +192,32 @@ bool CapabilityFirewall::allocate_generic_adc(uint32_t count, DeviceGrant& grant
     return true;
 }
 
-bool CapabilityFirewall::register_pod(const std::string& pod_id, const std::string& pod_manifest_json, std::string& out_error) {
+bool CapabilityFirewall::register_pod(const std::string& pod_id, const std::string& pod_manifest_json, std::string& out_error, bool* out_busy) {
     std::vector<BusAssignment> buses;
     std::vector<RmtAssignment> rmt;
+    BusAssignment shared;
+    bool has_shared = false;
+    bool busy = false;
     begin_admission();
     bool ok;
     {
         osal::LockGuard guard(mutex_);
-        ok = register_pod_locked(pod_id, pod_manifest_json, buses, rmt, out_error);
+        ok = register_pod_locked(pod_id, pod_manifest_json, buses, rmt, out_error, busy);
+        auto it = ok ? pod_records_.find(pod_id) : pod_records_.end();
+        if (it != pod_records_.end() && it->second.has_i2c_device) {
+            // A shared bus runs on the board's default pins at the default speed
+            const uint8_t bus = it->second.i2c_device.bus;
+            shared.kind = BusKind::I2c;
+            shared.index = bus;
+            shared.pin_a = static_cast<uint8_t>(profile_.i2c_pins[bus].a);
+            shared.pin_b = static_cast<uint8_t>(profile_.i2c_pins[bus].b);
+            shared.speed = kDefaultI2cHz;
+            has_shared = true;
+        }
     }
     end_admission();
-    return ok && install_drivers(pod_id, buses, rmt, out_error);
+    if (out_busy) *out_busy = busy;
+    return ok && install_drivers(pod_id, buses, rmt, has_shared ? &shared : nullptr, out_error);
 }
 
 void CapabilityFirewall::begin_admission() {
@@ -224,10 +241,19 @@ void CapabilityFirewall::end_admission() {
     if (admissions_ > 0) --admissions_;
 }
 
-bool CapabilityFirewall::lend_i2c_bus(uint8_t bus, BusPins& out_pins) {
+bool CapabilityFirewall::lend_i2c_bus(uint8_t bus, BusPins& out_pins, bool* out_shared) {
     osal::LockGuard guard(mutex_);
     if (bus >= 2 || admissions_ > 0 || (lent_i2c_mask_ & (1U << bus)) != 0) return false;
     if ((profile_.i2c_bus_mask & (1U << bus)) == 0 || !i2c_owners_[bus].empty()) return false;
+    if (i2c_sharers_[bus] > 0 || i2c_shared_scans_[bus] > 0) {
+        // Shared by device grants: lent as it is installed, one scan at a time
+        if (!out_shared || i2c_shared_scans_[bus] > 0) return false;
+        ++i2c_shared_scans_[bus];
+        *out_shared = true;
+        out_pins = profile_.i2c_pins[bus];
+        return true;
+    }
+    if (out_shared) *out_shared = false;
     const BusPins pins = profile_.i2c_pins[bus];
     if (pins.a < 0 || pins.b < 0) return false;
     const uint64_t claimable = claimable_gpio_mask_locked();
@@ -241,20 +267,111 @@ bool CapabilityFirewall::lend_i2c_bus(uint8_t bus, BusPins& out_pins) {
 
 void CapabilityFirewall::return_i2c_bus(uint8_t bus) {
     osal::LockGuard guard(mutex_);
-    if (bus < 2) lent_i2c_mask_ &= static_cast<uint8_t>(~(1U << bus));
+    if (bus >= 2) return;
+    if (i2c_shared_scans_[bus] > 0) {
+        --i2c_shared_scans_[bus];
+        release_shared_i2c_locked(bus);
+        return;
+    }
+    lent_i2c_mask_ &= static_cast<uint8_t>(~(1U << bus));
+}
+
+uint32_t CapabilityFirewall::i2c_sharers(uint8_t bus) const {
+    osal::LockGuard guard(mutex_);
+    return bus < 2 ? i2c_sharers_[bus] : 0;
+}
+
+bool CapabilityFirewall::i2c_device_granted(const models::I2cLocation& loc) const {
+    osal::LockGuard guard(mutex_);
+    for (const auto& kv : pod_records_) {
+        if (kv.second.has_i2c_device && kv.second.i2c_device == loc) return true;
+    }
+    return false;
+}
+
+// The owner of a shared bus's pins, as collisions name it
+static std::string shared_i2c_owner(uint8_t bus) {
+    return "I2C" + std::to_string(bus) + " (shared by device grants)";
+}
+
+void CapabilityFirewall::release_shared_i2c_locked(uint8_t bus) {
+    if (i2c_sharers_[bus] > 0 || i2c_shared_scans_[bus] > 0) return;
+    const std::string owner = shared_i2c_owner(bus);
+    for (size_t pin = 0; pin < gpio_owners_.size(); ++pin) {
+        if (gpio_owners_[pin] != owner) continue;
+        gpio_owners_[pin].clear();
+        allocated_gpio_mask_ &= ~(1ULL << pin);
+    }
+}
+
+bool CapabilityFirewall::claim_i2c_device(const std::string& pod_id, const std::string& annotation, const DeviceGrant& grant,
+                                          models::I2cLocation& out_loc, std::string& out_error, bool& out_busy) {
+    std::string why;
+    if (!models::parse_i2c_device_annotation(annotation, out_loc, why)) {
+        out_error = "Invalid kube32.io/i2c-device \"" + annotation + "\": " + why + " (want \"bus=<n>,addr=0x<hh>[,mux=0x<hh>:<channel>]\")";
+        return false;
+    }
+    const uint8_t bus = out_loc.bus;
+    const std::string n = std::to_string(bus);
+    if ((profile_.i2c_bus_mask & (1U << bus)) == 0) {
+        out_error = "I2C bus " + n + " is not offered by the " + profile_.name + " board";
+        return false;
+    }
+    if (grant.i2c_bus_mask & (1U << bus)) {
+        out_error = "The pod claims I2C bus " + n + " whole (esp32.io/i2c-bus-" + n + ") and a device on it (kube32.io/i2c-device): claim one or the other";
+        return false;
+    }
+    if (!i2c_owners_[bus].empty()) {
+        out_busy = true;
+        out_error = "I2C bus " + n + " is claimed whole by " + i2c_owners_[bus] + " (esp32.io/i2c-bus-" + n +
+                    "): the device grant waits until it is released";
+        return false;
+    }
+    // One driver per part
+    for (const auto& kv : pod_records_) {
+        if (kv.first == pod_id || !kv.second.has_i2c_device || kv.second.i2c_device != out_loc) continue;
+        out_busy = true;
+        out_error = "I2C" + n + " device " + models::i2c_location_text(out_loc) + " is granted to " + kv.first;
+        return false;
+    }
+    if (i2c_sharers_[bus] == 0 && i2c_shared_scans_[bus] == 0) {
+        // The first grant: the bus runs on the board's default pins
+        const BusPins pins = profile_.i2c_pins[bus];
+        if (pins.a < 0 || pins.b < 0) {
+            out_error = "I2C" + n + " has no default pins on the " + profile_.name + " board, and a shared bus runs on the default pins";
+            return false;
+        }
+        const std::string owner = shared_i2c_owner(bus);
+        std::vector<uint32_t> claimed;
+        if (!claim_pin(owner, static_cast<uint32_t>(pins.a), "I2C" + n + " sda", 0, claimed, out_error) ||
+            !claim_pin(owner, static_cast<uint32_t>(pins.b), "I2C" + n + " scl", 0, claimed, out_error)) {
+            for (uint32_t pin : claimed) {
+                gpio_owners_[pin].clear();
+                allocated_gpio_mask_ &= ~(1ULL << pin);
+            }
+            // Held by another pod (a GPIO, a UART on the same pins): free once it goes
+            out_busy = true;
+            return false;
+        }
+    }
+    ++i2c_sharers_[bus];
+    return true;
 }
 
 // Driver installs take milliseconds and touch no firewall state: they run
 // without the lock, so host calls of other pods are not held up.
 bool CapabilityFirewall::install_drivers(const std::string& pod_id, const std::vector<BusAssignment>& buses, const std::vector<RmtAssignment>& rmt,
-                                         std::string& out_error) {
-    if ((buses.empty() || bus_install(pod_id, buses, out_error)) && (rmt.empty() || rmt_install(pod_id, rmt, out_error))) return true;
+                                         const BusAssignment* shared, std::string& out_error) {
+    if ((buses.empty() || bus_install(pod_id, buses, out_error)) && (!shared || i2c_share(pod_id, *shared, out_error)) &&
+        (rmt.empty() || rmt_install(pod_id, rmt, out_error))) {
+        return true;
+    }
     unregister_pod(pod_id);
     return false;
 }
 
 bool CapabilityFirewall::register_pod_locked(const std::string& pod_id, const std::string& pod_manifest_json, std::vector<BusAssignment>& out_buses,
-                                             std::vector<RmtAssignment>& out_rmt, std::string& out_error) {
+                                             std::vector<RmtAssignment>& out_rmt, std::string& out_error, bool& out_busy) {
     if (pod_records_.find(pod_id) != pod_records_.end()) {
         out_error = "Pod already registered in capability firewall: " + pod_id;
         return false;
@@ -275,6 +392,7 @@ bool CapabilityFirewall::register_pod_locked(const std::string& pod_id, const st
     uint32_t generic_uart_count = 0;
     uint32_t generic_adc_count = 0;
     std::map<std::string, std::string> bus_annotations;   // kube32.io/i2c-bus-N, kube32.io/uart-N, kube32.io/rmt-tx, kube32.io/rmt-rx
+    std::string i2c_device_annotation;                    // kube32.io/i2c-device
 
     std::vector<uint32_t> claimed_gpios;
     std::vector<uint32_t> claimed_adcs;
@@ -308,6 +426,7 @@ bool CapabilityFirewall::register_pod_locked(const std::string& pod_id, const st
             if (ipc_ann == "true" || ipc_ann == "1") {
                 grant.capabilities_mask |= KUBE32_CAP_IPC;
             }
+            i2c_device_annotation = annotations->get_string(models::kAnnotationI2cDevice, "");
             for (const auto& kv : annotations->obj_val) {
                 if ((kv.first.rfind("kube32.io/i2c-bus-", 0) == 0 || kv.first.rfind("kube32.io/uart-", 0) == 0 || kv.first == "kube32.io/rmt-tx" ||
                      kv.first == "kube32.io/rmt-rx") &&
@@ -334,8 +453,36 @@ bool CapabilityFirewall::register_pod_locked(const std::string& pod_id, const st
                     const std::string& key = kv.first;
                     std::string val_str = kv.second.is_string() ? kv.second.str_val : std::to_string(static_cast<long long>(kv.second.num_val));
 
+                    // Input pin: "esp32.io/gpio-input-0": "1", read and set up as an input only
+                    if (key.rfind("esp32.io/gpio-input-", 0) == 0 || key.rfind("esp.io/gpio-input-", 0) == 0) {
+                        const size_t prefix_len = (key.rfind("esp32.io/gpio-input-", 0) == 0) ? 20 : 18;
+                        uint32_t pin = 64;
+                        try {
+                            pin = static_cast<uint32_t>(std::stoul(key.substr(prefix_len)));
+                        } catch (...) {}
+                        const uint64_t bit = pin < 64 ? (1ULL << pin) : 0;
+                        if (!bit || ((KUBE32_SAFE_GPIO_MASK | KUBE32_INPUT_GPIO_MASK) & bit) == 0) {
+                            cleanup_claimed();
+                            out_error = "Security Violation: Pin GPIO " + key.substr(prefix_len) + " is reserved or unsafe.";
+                            return false;
+                        }
+                        if ((profile_.reserved_gpio_mask & bit) != 0) {
+                            cleanup_claimed();
+                            out_error = "Security Violation: Pin GPIO " + std::to_string(pin) + " is used by the " + profile_.name + " board.";
+                            return false;
+                        }
+                        if (!gpio_owners_[pin].empty() && gpio_owners_[pin] != pod_id) {
+                            cleanup_claimed();
+                            out_error = "Hardware Collision: GPIO " + std::to_string(pin) + " already claimed by " + gpio_owners_[pin];
+                            return false;
+                        }
+                        grant.gpio_read_mask |= bit;
+                        gpio_owners_[pin] = pod_id;
+                        allocated_gpio_mask_ |= bit;
+                        claimed_gpios.push_back(pin);
+                    }
                     // Specific GPIO Request: "esp32.io/gpio-2": "1" or "esp.io/gpio-2": "1"
-                    if (key.rfind("esp32.io/gpio-", 0) == 0 || key.rfind("esp.io/gpio-", 0) == 0) {
+                    else if (key.rfind("esp32.io/gpio-", 0) == 0 || key.rfind("esp.io/gpio-", 0) == 0) {
                         size_t prefix_len = (key.rfind("esp32.io/gpio-", 0) == 0) ? 14 : 12;
                         uint32_t pin = 0;
                         try {
@@ -429,6 +576,14 @@ bool CapabilityFirewall::register_pod_locked(const std::string& pod_id, const st
                         if ((profile_.i2c_bus_mask & (1U << bus)) == 0) {
                             cleanup_claimed();
                             out_error = "I2C bus " + std::to_string(bus) + " is not offered by the " + profile_.name + " board";
+                            return false;
+                        }
+                        if (i2c_sharers_[bus] > 0 || i2c_shared_scans_[bus] > 0) {
+                            cleanup_claimed();
+                            out_busy = true;
+                            out_error = "I2C bus " + std::to_string(bus) + " is shared by " + std::to_string(i2c_sharers_[bus]) +
+                                        " device grant(s) (kube32.io/i2c-device): the pod claims it whole (esp32.io/i2c-bus-" +
+                                        std::to_string(bus) + ") once they are released";
                             return false;
                         }
                         if (!i2c_owners_[bus].empty() && i2c_owners_[bus] != pod_id) {
@@ -608,6 +763,12 @@ bool CapabilityFirewall::register_pod_locked(const std::string& pod_id, const st
         cleanup_claimed();
         return false;
     }
+    // Last, so nothing after it can fail: the device grant joins its bus
+    models::I2cLocation i2c_device;
+    if (!i2c_device_annotation.empty() && !claim_i2c_device(pod_id, i2c_device_annotation, grant, i2c_device, out_error, out_busy)) {
+        cleanup_claimed();
+        return false;
+    }
 
     PodSecurityRecord record;
     record.pod_id = pod_id;
@@ -618,6 +779,8 @@ bool CapabilityFirewall::register_pod_locked(const std::string& pod_id, const st
     record.card_required = !sd_claim.empty() && (sd_requested || card_volume);
     record.buses = buses;
     record.rmt = rmt;
+    record.has_i2c_device = !i2c_device_annotation.empty();
+    record.i2c_device = i2c_device;
     pod_records_[pod_id] = record;
     out_buses = std::move(buses);
     out_rmt = std::move(rmt);
@@ -656,7 +819,7 @@ bool CapabilityFirewall::grant_capabilities(const std::string& pod_id, const Dev
         ok = grant_capabilities_locked(pod_id, grant, buses, rmt, out_error);
     }
     end_admission();
-    return ok && install_drivers(pod_id, buses, rmt, out_error);
+    return ok && install_drivers(pod_id, buses, rmt, nullptr, out_error);
 }
 
 bool CapabilityFirewall::grant_capabilities_locked(const std::string& pod_id, const DeviceGrant& grant, std::vector<BusAssignment>& out_buses,
@@ -715,7 +878,8 @@ bool CapabilityFirewall::grant_capabilities_locked(const std::string& pod_id, co
     std::vector<uint32_t> claimed_i2cs;
     for (uint32_t b = 0; b < 8; ++b) {
         if ((grant.i2c_bus_mask & (1U << b)) != 0) {
-            if (b >= 2 || (profile_.i2c_bus_mask & (1U << b)) == 0 || (!i2c_owners_[b].empty() && i2c_owners_[b] != pod_id)) {
+            if (b >= 2 || (profile_.i2c_bus_mask & (1U << b)) == 0 || (!i2c_owners_[b].empty() && i2c_owners_[b] != pod_id) ||
+                i2c_sharers_[b] > 0 || i2c_shared_scans_[b] > 0) {
                 for (uint32_t p : claimed_gpios) {
                     gpio_owners_[p].clear();
                     allocated_gpio_mask_ &= ~(1ULL << p);
@@ -1041,6 +1205,12 @@ void CapabilityFirewall::unregister_pod(const std::string& pod_id) {
     bus_release(pod_id);
     rmt_release(pod_id);
     osal::LockGuard guard(mutex_);
+    auto rec = pod_records_.find(pod_id);
+    if (rec != pod_records_.end() && rec->second.has_i2c_device) {
+        const uint8_t bus = rec->second.i2c_device.bus;
+        if (i2c_sharers_[bus] > 0) --i2c_sharers_[bus];
+        release_shared_i2c_locked(bus);
+    }
     pod_records_.erase(pod_id);
     for (size_t i = 0; i < gpio_owners_.size(); ++i) {
         if (gpio_owners_[i] == pod_id) {
@@ -1128,6 +1298,23 @@ bool CapabilityFirewall::check_permission(const std::string& pod_id, PeripheralT
     return permitted;
 }
 
+I2cAccess CapabilityFirewall::check_i2c(const std::string& pod_id, uint32_t bus, uint32_t addr, AccessMode mode, models::I2cLocation& out_device) {
+    osal::LockGuard guard(mutex_);
+    auto it = pod_records_.find(pod_id);
+    if (it != pod_records_.end()) {
+        const PodSecurityRecord& r = it->second;
+        if (r.grant.is_i2c_permitted(bus)) return I2cAccess::Bus;
+        // The granted address only: never the multiplexer, never a neighbour
+        if (r.has_i2c_device && r.i2c_device.bus == bus && r.i2c_device.address == addr) {
+            out_device = r.i2c_device;
+            return I2cAccess::Device;
+        }
+        it->second.violation_count++;
+    }
+    log_violation(pod_id, PeripheralType::I2C, bus, mode, static_cast<int32_t>(addr));
+    return I2cAccess::Denied;
+}
+
 const PodSecurityRecord* CapabilityFirewall::get_pod_security_record(const std::string& pod_id) const {
     osal::LockGuard guard(mutex_);
     auto it = pod_records_.find(pod_id);
@@ -1149,7 +1336,12 @@ uint16_t CapabilityFirewall::get_allocated_adc1_mask() const {
 
 uint8_t CapabilityFirewall::get_allocated_i2c_mask() const {
     osal::LockGuard guard(mutex_);
-    return allocated_i2c_mask_;
+    // A shared bus is not free for a pod to claim whole
+    uint8_t shared = 0;
+    for (uint8_t bus = 0; bus < 2; ++bus) {
+        if (i2c_sharers_[bus] > 0) shared |= static_cast<uint8_t>(1U << bus);
+    }
+    return allocated_i2c_mask_ | shared;
 }
 
 uint8_t CapabilityFirewall::get_allocated_uart_mask() const {
@@ -1157,7 +1349,7 @@ uint8_t CapabilityFirewall::get_allocated_uart_mask() const {
     return allocated_uart_mask_;
 }
 
-void CapabilityFirewall::log_violation(const std::string& pod_id, PeripheralType type, uint32_t target, AccessMode mode) {
+void CapabilityFirewall::log_violation(const std::string& pod_id, PeripheralType type, uint32_t target, AccessMode mode, int32_t address) {
     // A denied hardware access is a real event worth seeing on the console;
     // bounded so a misbehaving pod cannot flood it.
     static int logged = 0;
@@ -1166,7 +1358,9 @@ void CapabilityFirewall::log_violation(const std::string& pod_id, PeripheralType
     static const char* const names[] = {"gpio", "adc", "i2c", "uart", "ipc", "display", "keyboard", "speaker", "sd", "service-call", "rmt-tx", "rmt-rx", "chip-temp"};   // PeripheralType order
     unsigned ti = static_cast<unsigned>(type);
     std::cout << "[FIREWALL] denied " << pod_id << ": " << (ti < sizeof(names) / sizeof(names[0]) ? names[ti] : "peripheral")
-              << " " << target << " " << (mode == AccessMode::Write ? "write" : "read") << std::endl;
+              << " " << target;
+    if (address >= 0) std::cout << " address " << models::hex_byte(static_cast<uint8_t>(address));
+    std::cout << " " << (mode == AccessMode::Write ? "write" : "read") << std::endl;
 }
 
 } // namespace kube32::hal

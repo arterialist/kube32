@@ -309,14 +309,39 @@ void Kubelet::reconcile_node_registration() {
         // The firmware annotations again: a Node that outlived this kubelet
         // may carry ones this boot no longer has
         if (firmware_) firmware_->mark_annotations_dirty();
+        annotations_sent_ = false;
+        patch_node_annotations();
         report_heartbeat();
         last_heartbeat_ms_ = osal::System::get_uptime_ms();
     }
 }
 
+void Kubelet::patch_node_annotations() {
+    if (!config_.node_annotation_source) return;
+    std::map<std::string, std::string> found = config_.node_annotation_source();
+    if (found == found_annotations_ && annotations_sent_) return;
+    if (registered_.load()) {
+        std::string patch = "{\"metadata\":{\"annotations\":{";
+        bool first = true;
+        for (const auto& kv : found) {
+            patch += (first ? "\"" : ",\"") + kv.first + "\":\"" + json_escape(kv.second) + "\"";
+            first = false;
+        }
+        for (const auto& kv : found_annotations_) {
+            if (found.count(kv.first)) continue;
+            patch += (first ? "\"" : ",\"") + kv.first + "\":null";
+            first = false;
+        }
+        patch += "}}}";
+        annotations_sent_ = api_client_->patch_node_status(config_.node_name, patch);   // tried again next round
+    }
+    found_annotations_ = std::move(found);
+}
+
 void Kubelet::refresh_node_labels() {
     last_label_refresh_ms_ = osal::System::get_uptime_ms();
     std::map<std::string, std::string> found = config_.node_label_source();
+    patch_node_annotations();
     if (found == found_labels_) return;
     if (registered_.load()) {
         // JSON merge patch: null removes a label
@@ -557,7 +582,8 @@ void Kubelet::sync_assigned_pods() {
                 if (!rec.uid.empty() && !e.uid.empty() && rec.uid != e.uid) {
                     start = true;   // deleted and created again under the same name
                 } else if ((phase == PodExecutionPhase::CrashLoopBackOff || phase == PodExecutionPhase::CreateContainerConfigError ||
-                            phase == PodExecutionPhase::InsufficientMemory) && now_ms >= rec.next_restart_allowed_ms) {
+                            phase == PodExecutionPhase::InsufficientMemory || phase == PodExecutionPhase::BusInUse) &&
+                           now_ms >= rec.next_restart_allowed_ms) {
                     // A pod waiting for memory is tried again once the room
                     // admission asked for exists; until then the wait goes on
                     // without parsing the pod
@@ -700,10 +726,15 @@ void Kubelet::repack_pool(uint64_t now_ms) {
 }
 
 bool Kubelet::wait_for_memory(const std::string& pod_key, LocalPodRecord& rec, const std::string& why, const LocalPodRecord* previous) {
-    rec.execution_phase = PodExecutionPhase::InsufficientMemory;
+    return wait_for(pod_key, rec, PodExecutionPhase::InsufficientMemory, "InsufficientMemory", why, previous);
+}
+
+bool Kubelet::wait_for(const std::string& pod_key, LocalPodRecord& rec, PodExecutionPhase phase, const char* reason, const std::string& why,
+                       const LocalPodRecord* previous) {
+    rec.execution_phase = phase;
     rec.last_error_message = why;
     rec.next_restart_allowed_ms = osal::System::get_uptime_ms() + config_.memory_retry_ms;
-    if (previous && previous->execution_phase == PodExecutionPhase::InsufficientMemory) {
+    if (previous && previous->execution_phase == phase) {
         // Still no room: the status already says so; the log repeats why once a minute
         const uint64_t now = osal::System::get_uptime_ms();
         rec.last_wait_log_ms = previous->last_wait_log_ms;
@@ -724,9 +755,9 @@ bool Kubelet::wait_for_memory(const std::string& pod_key, LocalPodRecord& rec, c
                                "{\"type\":\"ContainersReady\",\"status\":\"False\",\"reason\":\"ContainersNotReady\"}],"
                                "\"containerStatuses\":[{\"name\":\"" + rec.container_name + "\",\"image\":\"" + rec.image +
                                "\",\"ready\":false,\"started\":false,\"restartCount\":" + std::to_string(rec.restart_count) + ","
-                               "\"state\":{\"waiting\":{\"reason\":\"InsufficientMemory\",\"message\":\"" + json_escape(message) + "\"}}}]}}";
+                               "\"state\":{\"waiting\":{\"reason\":\"" + reason + "\",\"message\":\"" + json_escape(message) + "\"}}}]}}";
     api_client_->patch_pod_status(rec.namespace_name, rec.name, status_patch);
-    record_pod_event(rec, "InsufficientMemory", message, true);
+    record_pod_event(rec, reason, message, true);
     return false;
 }
 
@@ -857,7 +888,17 @@ bool Kubelet::deploy_and_start_pod(const models::KubePod& pod_in, const std::str
     // of memory) may have left the pod's claims behind: they are its own.
     hal::CapabilityFirewall::instance().unregister_pod(pod_key);
     std::string firewall_err;
-    if (!hal::CapabilityFirewall::instance().register_pod(pod_key, manifest_json, firewall_err)) {
+    bool busy = false;
+    if (!hal::CapabilityFirewall::instance().register_pod(pod_key, manifest_json, firewall_err, &busy)) {
+        // An I2C bus claimed whole while the pod shares it (or the other way
+        // round) is free once the other pods go: the pod waits, Pending
+        if (busy) {
+            if (previous) {
+                rec.restart_count = previous->restart_count;
+                rec.restart_due = previous->restart_due || restarting;
+            }
+            return wait_for(pod_key, rec, PodExecutionPhase::BusInUse, "BusInUse", firewall_err, previous);
+        }
         rec.execution_phase = PodExecutionPhase::Failed;
         rec.last_error_message = "Capability Admission Rejected: " + firewall_err;
         active_pods_[pod_key] = rec;
