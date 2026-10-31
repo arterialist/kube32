@@ -15,6 +15,7 @@
 #include "wasm3.h"
 #include "m3_config.h"
 #include "m3_env.h"
+#include "m3_host.h"
 
 #include <iostream>
 #include <algorithm>
@@ -132,6 +133,13 @@ TrapReport describe_trap(const char* trap, const TrapContext& ctx) {
         t.message = "wasm trap: the module's stack of " + std::to_string(ctx.wasm_stack_bytes) +
                     " bytes is exhausted (raise it with the annotation kube32.io/wasm-stack)";
         return t;
+    }
+    if (trap == m3Err_trapStackOverflow && ctx.native_stack_left) {
+        // The native stack the interpreter runs on (an operation frame per
+        // instruction where the compiler makes no tail calls), not the
+        // module's operand stack: say what the call had
+        t.message += " (native stack: " + std::to_string(ctx.native_stack_left) + " bytes when the call began, on " +
+                     (ctx.native_on_interpreter ? "the shared interpreter stack)" : "the calling thread's stack)");
     }
     if (trap == m3Err_trapOutOfBoundsMemoryAccess || trap == m3Err_trapStackOverflow || trap == m3Err_trapTableOutOfBounds ||
         trap == m3Err_trapTableIndexOutOfRange || trap == m3Err_trapTableElementIsNull ||
@@ -718,7 +726,14 @@ int32_t ContainerLifecycleController::call_function(const std::string& fn_name, 
     // Call based on args count (0 or 1..4 arguments supported)
     rt->lastMemoryGrowError = m3Err_none;
     M3Result call_r = m3Err_none;
+    uint64_t native_left = 0;
+    bool on_interpreter = false;
     run_on_interpreter_stack([&]() {
+        // What a native stack overflow trap reports: the stack the call runs on
+        const uint8_t* here = static_cast<const uint8_t*>(__builtin_frame_address(0));
+        const uint8_t* base = static_cast<const uint8_t*>(m3_HostStackBase());
+        native_left = (base && base < here) ? static_cast<uint64_t>(here - base) : 0;
+        on_interpreter = kube32_interp_stack_base_for(here) != nullptr;
         if (argc == 0) {
             call_r = m3_CallV(fn);
         } else if (argc == 1) {
@@ -740,6 +755,8 @@ int32_t ContainerLifecycleController::call_function(const std::string& fn_name, 
         ctx.memory_grow_error = rt->lastMemoryGrowError;
         ctx.memory_limit_bytes = config_.memory_limit_bytes;
         ctx.wasm_stack_bytes = wasm_stack_bytes_;
+        ctx.native_stack_left = native_left;
+        ctx.native_on_interpreter = on_interpreter;
 #if d_m3HasGasMetering
         // AppPodHost arms the per-call budget; an unbounded limit means none
         uint64_t gas_limit = m3_GetResourceLimit(rt, c_m3Limit_GasUnits);

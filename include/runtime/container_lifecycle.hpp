@@ -79,6 +79,8 @@ struct TrapContext {
     uint64_t memory_limit_bytes{0};
     uint64_t gas_budget{0};                  // per-call budget; 0 = unmetered or unbounded
     uint64_t wasm_stack_bytes{0};            // the module's operand stack (kube32.io/wasm-stack)
+    uint64_t native_stack_left{0};           // native stack below the call when it began; 0 = not known
+    bool native_on_interpreter{false};       // ... on the shared interpreter stack
 };
 
 TrapReport describe_trap(const char* trap, const TrapContext& ctx);

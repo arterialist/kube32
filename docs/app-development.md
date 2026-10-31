@@ -103,7 +103,7 @@ Pods support `restartPolicy: Always`, `OnFailure`, and `Never`. Failed or restar
 | `136` | `Error` | Integer division by zero, integer overflow, or invalid conversion (`SIGFPE`) |
 | `137` | `OOMKilled` | Runtime allocation failed, memory limit exceeded, or abort after `memory.grow` was refused at the pod limit |
 | `137` | `Error` | Stopped by the kubelet (`SIGKILL`) |
-| `139` | `Error` | Out-of-bounds memory or table access, stack overflow (`the module's stack of <N> bytes is exhausted (raise it with the annotation kube32.io/wasm-stack)`), null reference, or indirect call type mismatch (`SIGSEGV`) |
+| `139` | `Error` | Out-of-bounds memory or table access, an exhausted operand stack (`the module's stack of <N> bytes is exhausted (raise it with the annotation kube32.io/wasm-stack)`), a native stack overflow (`stack overflow (native stack: <N> bytes when the call began, on the shared interpreter stack)`), null reference, or indirect call type mismatch (`SIGSEGV`) |
 | `152` | `Error` | Call exhausted its `kube32.io/execution-budget` (`SIGXCPU`) |
 
 ---
