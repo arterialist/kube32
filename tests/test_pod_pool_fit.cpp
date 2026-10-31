@@ -157,6 +157,7 @@ int main() {
         kube32_interp_stack_set(interp.data(), interp.size());
         struct Image { const char* name; uint32_t memory; } images[] = {
             {"tessera-db", 8 * 1024}, {"tessera-hud", 1024}, {"rfid", 4 * 1024}, {"irremote", 12 * 1024},
+            {"driver-bme688", 3 * 1024}, {"driver-rfid", 3 * 1024}, {"driver-button", 3 * 1024},
         };
         for (const Image& img : images) {
             const std::vector<uint8_t> wasm = k32test::read_file(std::string(KUBE32_SOURCE_DIR) + "/images/" + img.name + ".wasm");
@@ -190,7 +191,7 @@ int main() {
     {
         std::vector<uint8_t> interp(28 * 1024);
         kube32_interp_stack_set(interp.data(), interp.size());
-        for (const char* name : {"tessera-db", "tessera-hud", "tessera-web", "tessera-api", "rfid", "irremote", "echo", "i2cscan"}) {
+        for (const char* name : {"tessera-db", "tessera-hud", "tessera-web", "tessera-api", "rfid", "irremote", "echo", "i2cscan", "driver-miniscale"}) {
             const std::vector<uint8_t> wasm = k32test::read_file(std::string(KUBE32_SOURCE_DIR) + "/images/" + name + ".wasm");
             assert(!wasm.empty());
             const uint32_t memory = std::strcmp(name, "tessera-api") == 0 ? 1280 * 1024 : 16 * 1024;
