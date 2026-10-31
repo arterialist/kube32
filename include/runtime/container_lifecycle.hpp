@@ -80,6 +80,8 @@ struct TrapContext {
     uint64_t gas_budget{0};                  // per-call budget; 0 = unmetered or unbounded
     uint64_t wasm_stack_bytes{0};            // the module's operand stack (kube32.io/wasm-stack)
     uint64_t native_stack_left{0};           // native stack below the call when it began; 0 = not known
+    int64_t native_used{0};                  // native stack the call had used at a native stack trap
+    int64_t native_limit{0};                 // the trap limit, below the start of the call
     bool native_on_interpreter{false};       // ... on the shared interpreter stack
 };
 

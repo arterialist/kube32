@@ -604,6 +604,8 @@ typedef struct M3Runtime {
     u32            stackSize;
     u32            numStackSlots;
     void*          stackLimit;     // native C-stack low-water mark; Wasm calls trap past it (NULL = unset)
+    void*          stackTrapAt;    // Kube32: stack pointer and limit of the last native stack trap
+    void*          stackTrapLimit;
     IM3Function    lastCalled;     // last function that successfully executed
     IM3Function    entered;        // entry point of the outermost call in flight, or of the last one, trapped or not
     u32            callNesting;    // RunCodeChecked() recursion depth

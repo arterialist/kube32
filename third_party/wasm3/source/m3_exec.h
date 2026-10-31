@@ -120,8 +120,11 @@ d_m3RetSig profileJumpOp (d_m3OpSig, cstr_t i_operationName);
 #  define d_m3CheckNativeStack()                                               \
        do {                                                                    \
            void * _m3Limit = m3MemRuntime (_mem)->stackLimit;                  \
-           if (M3_UNLIKELY (_m3Limit && m3_NativeStackPtr () < _m3Limit))      \
+           if (M3_UNLIKELY (_m3Limit && m3_NativeStackPtr () < _m3Limit)) {    \
+               m3MemRuntime (_mem)->stackTrapAt = m3_NativeStackPtr ();        \
+               m3MemRuntime (_mem)->stackTrapLimit = _m3Limit;                 \
                newTrap (m3Err_trapStackOverflow);                              \
+           }                                                                   \
        } while (0)
 #else
 #  define d_m3CheckNativeStack()           do {} while (0)

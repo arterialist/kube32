@@ -443,7 +443,7 @@ struct Wasm3Sizes {
 
 // The ESP32-S3 build's: 32-bit pointers and slots, PlatformIO's
 // microcontroller configuration of wasm3 (m3_config_platforms.h)
-constexpr Wasm3Sizes kBoardSizes{4, 4, 64, 168, 60, 176, 56, 16, 20, 20, 16, 6168, 64};
+constexpr Wasm3Sizes kBoardSizes{4, 4, 64, 176, 60, 176, 56, 16, 20, 20, 16, 6168, 64};
 
 #if defined(ESP_PLATFORM)
 static_assert(sizeof(code_t) == kBoardSizes.line && sizeof(m3slot_t) == kBoardSizes.slot && sizeof(M3Function) == kBoardSizes.function &&
