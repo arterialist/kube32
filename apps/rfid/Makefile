@@ -13,7 +13,7 @@ LDFLAGS = -flavor wasm --no-entry --export-dynamic --allow-undefined -z stack-si
 
 all: $(OUT)
 
-build/rfid.o: rfid.c ../../include/runtime/k32_app_abi.h
+build/rfid.o: rfid.c mfrc522.h ../../include/runtime/k32_app_abi.h
 	@mkdir -p build
 	$(CLANG) $(CFLAGS) -c rfid.c -o $@
 
