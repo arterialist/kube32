@@ -23,6 +23,7 @@ The firewall reads `resources.requests`, or `resources.limits` when `requests` i
 | `hardware.kube32.io/speaker: "1"` | `SPEAKER`, `AUDIO` | `k32_tone` |
 | `hardware.kube32.io/ipc: "1"` | `CHANNEL_IPC`, `IPC` | `k32_event_emit`, `kube32_channel_*` |
 | `hardware.kube32.io/sd: "1"` | `SD`, `SD_CARD` | `k32_fs_*` in the pod's volume claim ([storage](storage.md)) |
+| `hardware.kube32.io/chip-temp: "1"` | `CHIP_TEMP` | `esp32_chip_temp_read` |
 
 If a requested pin, channel, or bus is reserved or owned by another pod, admission fails with `CapabilityAdmissionFailed`. Ungranted calls at runtime return `K32_ERR_PERM` (`-1`) and log `[FIREWALL] denied <pod>: ...`.
 
@@ -38,6 +39,7 @@ Declared in `include/runtime/k32_app_abi.h` and linked in `src/runtime/host_func
 | `esp32_gpio_write` | `i(ii)` | `int32_t esp32_gpio_write(uint32_t pin, uint32_t value)` | Sets output level (`0` or `1`) on `pin`. Returns `0` or negative error. |
 | `esp32_gpio_read` | `i(i)` | `int32_t esp32_gpio_read(uint32_t pin)` | Returns input level (`0` or `1`) on `pin`, or negative error. |
 | `esp32_adc_read` | `i(i)` | `int32_t esp32_adc_read(uint32_t channel)` | One-shot read on ADC1 `channel` (`0..9`, 12 dB attenuation). Returns raw reading or negative error. |
+| `esp32_chip_temp_read` | `i(i)` | `int32_t esp32_chip_temp_read(int32_t* out_milli_c)` | Stores the ESP32-S3's internal temperature in milli-degrees Celsius and returns `0`, or negative error. The sensor measures the die, which runs above the ambient temperature. The simulator reports 40.0 °C. |
 | `esp32_i2c_write` | `i(iiii)` | `int32_t esp32_i2c_write(uint32_t bus, uint32_t addr, const void* data, uint32_t len)` | Writes `len` bytes to 7-bit `addr` on `bus` (100 ms timeout). Returns bytes written or negative error. |
 | `esp32_i2c_read` | `i(iiii)` | `int32_t esp32_i2c_read(uint32_t bus, uint32_t addr, void* buf, uint32_t len)` | Reads `len` bytes from 7-bit `addr` on `bus` (100 ms timeout). Returns bytes read or negative error. |
 | `esp32_uart_write` | `i(iii)` | `int32_t esp32_uart_write(uint32_t port, const void* data, uint32_t len)` | Writes `len` bytes to UART `port` (`1` or `2`). Returns bytes queued or negative error. |
@@ -264,6 +266,8 @@ kubectl --context kube32 logs -l app=rfid -f
 ```
 
 `examples/webhook.yaml` forwards the `rfid.tag` and `ir.received` topics to an HTTPS endpoint as JSON ([`apps/webhook`](https://github.com/arterialist/kube32/tree/main/apps/webhook)).
+
+The `rfid` [device driver](https://github.com/arterialist/kube32/tree/main/apps/drivers) runs the same reader code.
 
 ## Reserved pins
 

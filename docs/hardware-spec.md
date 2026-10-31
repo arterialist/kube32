@@ -15,8 +15,8 @@ Select the peripheral profile with `K32_CMD:BOARD:cardputer|generic`:
 
 | Profile | Labels | Allocatable peripherals | Default bus pins |
 | --- | --- | --- | --- |
-| `generic` | `kube32.io/board: generic` | 33 GPIO, 10 ADC, 2 I2C, 2 UART | I2C0 on GPIO 8/9, UART1 on GPIO 17/18 |
-| `cardputer` | `kube32.io/board: cardputer` | 11 GPIO, 3 ADC, 1 I2C, 1 UART | I2C0 or UART1 on Grove port GPIO 2/1 |
+| `generic` | `kube32.io/board: generic` | 33 GPIO, 10 ADC, 2 I2C, 2 UART, chip temperature | I2C0 on GPIO 8/9, UART1 on GPIO 17/18 |
+| `cardputer` | `kube32.io/board: cardputer` | 11 GPIO, 3 ADC, 1 I2C, 1 UART, chip temperature | I2C0 or UART1 on Grove port GPIO 2/1 |
 
 Control plane nodes also carry the `node-role.kubernetes.io/control-plane` label, and worker nodes carry `node-role.kubernetes.io/worker`.
 

@@ -43,6 +43,7 @@ All imports belong to the `env` module (`src/runtime/app_pod.cpp`, `src/runtime/
 | Storage | `k32_fs_open/read/write/close/size/list/remove` | `i(iii)`, `i(iii)`, `i(iii)`, `i(i)`, `i(i)`, `i(iiii)`, `i(ii)` | `hardware.kube32.io/sd` (`SD`) and a volume claim | [Storage](storage.md), [storage](storage.md) |
 | Cardputer UI | `k32_display_text`, `k32_display_rect`, `k32_display_bar`, `k32_key_read`, `k32_tone` | `i(iiiiii)`, `i(iiiii)`, `i(iiiiiii)`, `i()`, `i(iii)` | `hardware.kube32.io/tft-display` (`DISPLAY`), `keyboard` (`KEYBOARD`), `speaker` (`SPEAKER`) | [Peripherals](peripherals.md), [Capability firewall](architecture/capability-firewall.md) |
 | ESP32 peripherals | `esp32_gpio_set_mode/write/read`, `esp32_adc_read`, `esp32_i2c_write/read`, `esp32_uart_write/read` | `i(ii)`, `i(ii)`, `i(i)`, `i(i)`, `i(iiii)`, `i(iiii)`, `i(iii)`, `i(iii)` | `esp32.io/*` resources | [Peripherals](peripherals.md), [GPIO and other peripherals](peripherals.md) |
+| Chip temperature | `esp32_chip_temp_read` | `i(i)` | `hardware.kube32.io/chip-temp` (`CHIP_TEMP`) | [Peripherals](peripherals.md) |
 | Infrared (RMT) | `esp32_rmt_send`, `esp32_rmt_receive` | `i(ii)`, `i(ii)` | `esp32.io/rmt-tx`, `esp32.io/rmt-rx` | [Peripherals](peripherals.md#infrared-rmt) |
 
 Calls without the required resource or capability return `K32_ERR_PERM` (`-1`) and log a firewall violation.
@@ -381,7 +382,7 @@ Key flags for `kube32-cli deploy`:
 
 * `--replace`: deletes an existing pod of the same name (`kubectl delete pod <name> --wait=true`) before creating the new one. The kubelet does not restart a running pod when its manifest changes in place.
 * `--memory <qty>` and `--psram <qty>`: set `requests.memory`, `limits.memory`, and `esp32.io/psram`.
-* `--hardware <list>`: comma-separated list of `ipc,display,keyboard,speaker,sd,service-call` or `none` (default: inferred from the module's imports).
+* `--hardware <list>`: comma-separated list of `ipc,display,keyboard,speaker,sd,service-call,chip-temp` or `none` (default: inferred from the module's imports).
 * `--sd-claim <claim>`: volume claim name when `sd` is used (default: pod name).
 * `--image <wasm://...>`: references an SD or embedded image instead of attaching `kube32.io/wasm-base64`.
 * `--dry-run`: prints the generated Pod YAML without calling `kubectl`.
@@ -425,9 +426,9 @@ Rebuild the firmware with `pio run -e esp32s3`, or reconfigure and build the hos
 | `spec.containers[0].env`, `envFrom` | Literal values, `valueFrom` (`configMapKeyRef`, `secretKeyRef`, `fieldRef`), `envFrom` with `prefix`, `$(VAR)` expansion, and `<SVC>_SERVICE_HOST` / `_PORT` links (unless `enableServiceLinks: false`). Missing refs hold the pod in `CreateContainerConfigError`. |
 | `resources.requests.memory`, `limits.memory` | Scheduler heap accounting and Wasm linear memory limit (supports sub-page limits below `64Ki`) |
 | `resources.requests["esp32.io/psram"]` | Places the Wasm sandbox in PSRAM and raises the sandbox size to `max(memory, psram)` |
-| `resources.requests["hardware.kube32.io/*"]` | Grants `ipc`, `tft-display`, `keyboard`, `speaker`, `sd` |
+| `resources.requests["hardware.kube32.io/*"]` | Grants `ipc`, `tft-display`, `keyboard`, `speaker`, `sd`, `chip-temp` |
 | `resources.requests["esp32.io/*"]` | Claims `gpio-<N>`, `gpio`, `adc`, `i2c`, `i2c-bus-<N>`, `uart`, `uart-<N>`, `rmt-tx`, `rmt-rx` |
-| `securityContext.capabilities.add` | Grants `CHANNEL_IPC`, `DISPLAY`, `KEYBOARD`, `SPEAKER`, `SD`, `SERVICE_CALL` |
+| `securityContext.capabilities.add` | Grants `CHANNEL_IPC`, `DISPLAY`, `KEYBOARD`, `SPEAKER`, `SD`, `SERVICE_CALL`, `CHIP_TEMP` |
 | `spec.volumes[].persistentVolumeClaim.claimName` | Mounts `<root>/kube32/volumes/<claim>` on card or internal flash (`kube32.io/sd: {claim: ...}` requires a card) |
 | `ports[].containerPort` | Target port named by Services (`7000` is the node's pod HTTP server port) |
 

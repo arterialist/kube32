@@ -17,3 +17,5 @@ kubectl logs -l app=rfid -f
 | `TAG_DEFAULT` | Message published for any tag without a matching `TAG_<UID>` variable. |
 
 Each tag that enters the field is also published to `rfid.tag` as a lowercase hex UID. `GET` returns `{"reader","address","version","present","seen","polls","empty","errors","bus_errors","last_bus_error","recent"}`. Linear memory is capped at 4 KiB (a 2 KiB stack and 1.7 KiB of data, checked after linking).
+
+The reader code, `mfrc522.h`, is shared with the `rfid` device driver ([`apps/drivers`](../drivers/README.md)).

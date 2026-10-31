@@ -18,6 +18,7 @@ The firewall reads `resources.requests`, or `resources.limits` if `requests` is 
 | `hardware.kube32.io/keyboard: "1"` | `KEYBOARD` | `k32_key_read` |
 | `hardware.kube32.io/speaker: "1"` | `SPEAKER`, `AUDIO` | `k32_tone` |
 | `hardware.kube32.io/sd: "1"` plus volume claim | `SD`, `SD_CARD` | `k32_fs_*` in the pod directory, see [storage](../storage.md) |
+| `hardware.kube32.io/chip-temp: "1"` | `CHIP_TEMP` | `esp32_chip_temp_read` |
 | `esp32.io/gpio-<N>` | None | Pin N read and write, value ignored |
 | `esp32.io/gpio: "<count>"` | None | Free pins, lowest numbers first |
 | `esp32.io/adc1-channel-<0..9>` or `esp32.io/adc: "<count>"` | None | ADC1 channels |

@@ -122,4 +122,4 @@ See [SECURITY.md](SECURITY.md) for the deployment security model and instruction
 
 ## License
 
-Apache License 2.0. See [LICENSE](LICENSE). `third_party/wasm3` is licensed under the MIT License in `third_party/wasm3/LICENSE`.
+Apache License 2.0. See [LICENSE](LICENSE). `third_party/wasm3` is licensed under the MIT License in `third_party/wasm3/LICENSE`. The BME688 compensation in `apps/drivers/bme688` is ported from the Bosch Sensortec BME68x Sensor API under the BSD-3-Clause license; the notice is in its source.
