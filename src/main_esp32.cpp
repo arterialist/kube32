@@ -63,6 +63,7 @@
 #include "runtime/pod_memory_pool.h"
 #include "runtime/pod_log.hpp"
 #include "models/kube_models.hpp"
+#include "bench/bench_kernels.h"
 
 #include <algorithm>
 #include <atomic>
@@ -399,6 +400,49 @@ struct HeapBuckets { uint32_t count[2][7]; uint32_t bytes[2][7]; };
 static HeapBuckets s_heap_buckets;
 static const size_t k_heap_bucket_max[] = {32, 128, 512, 1024, 1700, 4096, SIZE_MAX};
 
+// The kernels the bench pod runs, run natively on the console task, for
+// comparison with the pod's timings
+static void console_bench(Console& con, const std::string& args) {
+    char l[160];
+    int ll;
+    const size_t c1 = args.find(':');
+    const std::string kernel = args.substr(0, c1);
+    const size_t c2 = c1 == std::string::npos ? std::string::npos : args.find(':', c1 + 1);
+    const uint32_t n = c1 == std::string::npos ? 1 : static_cast<uint32_t>(std::strtoul(args.c_str() + c1 + 1, nullptr, 10));
+    const uint32_t runs = c2 == std::string::npos ? 1 : static_cast<uint32_t>(std::strtoul(args.c_str() + c2 + 1, nullptr, 10));
+    if (kernel == "hostcall") {
+        volatile int64_t sink = 0;
+        const int64_t t0 = esp_timer_get_time();
+        for (uint32_t i = 0; i < n; i++) sink = sink + esp_timer_get_time();
+        ll = snprintf(l, sizeof(l), "K32_BENCH hostcall calls=%u us=%lld\n", (unsigned)n, (long long)(esp_timer_get_time() - t0));
+        con.write(l, static_cast<size_t>(ll));
+        return;
+    }
+    const int index = bench_kernel_index(kernel.data(), static_cast<uint32_t>(kernel.size()));
+    if (index < 0) {
+        con.write("K32_ERR bench kernel\n", 21);
+        return;
+    }
+    // The workspace only while the kernel runs
+    std::unique_ptr<uint32_t[]> work(new (std::nothrow) uint32_t[BENCH_WORK_BYTES / 4]);
+    if (!work) {
+        con.write("K32_ERR bench workspace\n", 24);
+        return;
+    }
+    int64_t total = 0, best = INT64_MAX;
+    uint32_t sum = 0;
+    for (uint32_t i = 0; i < (runs ? runs : 1); i++) {
+        const int64_t t0 = esp_timer_get_time();
+        sum = bench_kernel_run(index, n, work.get());
+        const int64_t us = esp_timer_get_time() - t0;
+        total += us;
+        if (us < best) best = us;
+    }
+    ll = snprintf(l, sizeof(l), "K32_BENCH kernel=%s n=%u runs=%u us_min=%lld us_total=%lld sum=%u\n", bench_kernel_name(index), (unsigned)n,
+                  (unsigned)(runs ? runs : 1), (long long)best, (long long)total, (unsigned)sum);
+    con.write(l, static_cast<size_t>(ll));
+}
+
 static void console_heap_histogram(Console& con) {
     std::memset(&s_heap_buckets, 0, sizeof(s_heap_buckets));
     heap_caps_walk(MALLOC_CAP_INTERNAL, [](walker_heap_into_t, walker_block_info_t b, void*) {
@@ -486,6 +530,8 @@ static uint32_t crc32_bytes(const uint8_t* p, size_t n) {
 //   K32_CMD:APPASS                                       -> K32_APPASS <password>
 //   K32_CMD:CERT                                         -> the API server's TLS certificate (PEM)
 //   K32_CMD:FIRMWARE                                     -> the running image and its slot (and what is staged)
+//   K32_CMD:BENCH:<kernel>:<n>:<runs>                    -> the benchmark kernels run natively (docs/benchmarks.md)
+//   K32_CMD:BENCH:hostcall:<calls>                       -> <calls> native esp_timer_get_time calls
 //   K32_CMD:REBOOT
 void console_task(void* arg) {
     auto* ctx = static_cast<std::pair<Console*, NodeIdentity*>*>(arg);
@@ -795,6 +841,8 @@ void console_task(void* arg) {
                 // memory on a board without PSRAM
                 console_heap_histogram(con);
                 con.write("K32_OK heap\n", 12);
+            } else if (line.rfind("K32_CMD:BENCH:", 0) == 0) {
+                console_bench(con, line.substr(14));
             } else if (line == "K32_CMD:POOL") {
                 // The pod pool's small heap, chunk by chunk: where pods' memory lies
                 kube32_pool_chunks([](size_t off, size_t size, int used, void* ctx) {

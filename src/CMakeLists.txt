@@ -22,6 +22,7 @@ set(WASM3_SRCS
 )
 
 set(KUBE32_APP_SRCS
+    bench/bench_kernels.c
     api/http_server.cpp
     api/route_handler.cpp
     api/table_serializer.cpp
