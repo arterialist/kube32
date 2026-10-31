@@ -56,6 +56,7 @@ Discovery endpoints accept `GET` and `HEAD`.
 | `metrics.k8s.io/v1beta1` | NodeMetrics, PodMetrics | | get, list | Kubelet samples, up to 32 pods with a 30 s TTL |
 | `authorization.k8s.io/v1` | SelfSubjectAccessReview, SelfSubjectRulesReview | | create | Always returns allowed |
 | `kube32.io/v1` | FirmwareRollout | `fwr` | get, list, watch, create, update, patch, delete | Cluster-scoped. `spec.sha256` names the staged firmware image. The rollout controller updates nodes one at a time and writes `status`. The API server serves the staged image at `/apis/kube32.io/v1/firmware`. See [Firmware updates](firmware-updates.md#api). |
+| `kube32.io/v1` | Device | `dev` | get, list, watch, create, update, patch, delete; `status` | A part wired to a node. `spec.driver` must be a driver of the catalog; I2C addresses, multiplexer channels and pins are checked and addresses stored as `"0x77"`. Writes to the object keep `status`, writes to `status` change nothing else. The Device controller runs its driver pod and Service and writes `status`. See [Devices](devices.md). |
 
 `POST /apis/kube32.io/v1/egress` is the egress gateway: it makes the `https://` calls of pods on workers, for nodes only. See [Networking](networking.md#egress-gateway).
 
@@ -63,7 +64,7 @@ Discovery endpoints accept `GET` and `HEAD`.
 
 `kubectl` and `k9s` work without extra flags. Supported commands include `get`, `describe`, `apply`, `create`, `delete`, `patch`, `scale`, `logs`, `top`, `events` and `auth can-i`.
 
-When the client sends `Accept: as=Table;v=v1;g=meta.k8s.io`, list and single-object `GET` requests return `meta.k8s.io/v1` Table responses for Pod, Node, Deployment, Event, Namespace, Service, ConfigMap, Secret, Lease, Ingress, Endpoints and EndpointSlice. DaemonSets, Jobs and metrics return plain objects for client-side printing.
+When the client sends `Accept: as=Table;v=v1;g=meta.k8s.io`, list and single-object `GET` requests return `meta.k8s.io/v1` Table responses for Pod, Node, Deployment, Event, Namespace, Service, ConfigMap, Secret, Lease, Ingress, Endpoints, EndpointSlice, FirmwareRollout and Device. DaemonSets, Jobs and metrics return plain objects for client-side printing.
 
 OpenAPI v3 documents advertise `fieldValidation`. When `kubectl` sends `fieldValidation=Strict`, the server rejects unknown top-level and `metadata` fields with `400 BadRequest`:
 

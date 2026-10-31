@@ -59,6 +59,7 @@ nav:
       - Services, Ingress, calls and NetworkPolicy: networking.md
       - Storage and volumes: storage.md
       - Peripherals: peripherals.md
+      - Devices: devices.md
       - "Example: Tessera": examples/tessera.md
   - Architecture:
       - Overview: architecture/index.md

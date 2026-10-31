@@ -14,6 +14,7 @@ kube32 is a Kubernetes-compatible control plane and WebAssembly pod runtime for 
 - Service routing, HTTP Ingress with host and prefix rules, Server-Sent Events streams, embedded static asset bundles via `k32_resp_asset` and `StaticBundle`, and synchronous pod-to-pod HTTP calls via `k32_http_call`.
 - Persistent object store backed by a CRC-checked journal on a raw flash partition or the microSD card, plus `persistentVolumeClaim` pod volumes via `k32_fs_*` and rotated container logs for `kubectl logs --previous`.
 - Peripheral access gated per pod by a capability firewall covering GPIO pins, ADC channels, I2C and UART buses, ST7789 display, key matrix, I2S speaker, and microSD storage.
+- Devices: sensors and switches as API objects. Nodes discover and identify I2C parts, including behind a PaHub multiplexer; the control plane runs each part's driver on the node it is wired to, and apps on any node, a laptop running `kube32-sim` included, read it through a Service.
 - Container lifecycle management with `restartPolicy` set to `Always`, `OnFailure`, or `Never`, exponential CrashLoopBackOff, and distinct exit codes for Wasm traps, gas exhaustion, and `OOMKilled`.
 - Optional bearer-token authentication and automatic self-signed ECDSA P-256 TLS on port 6443.
 - Firmware rollouts through the cluster: one node at a time, SHA-256 checked, with bootloader rollback when an image does not come up healthy.
@@ -107,6 +108,7 @@ Full documentation is published at [https://arterialist.github.io/kube32/](https
 - [Services, Ingress and pod-to-pod calls](docs/networking.md)
 - [Storage and volumes](docs/storage.md)
 - [Peripherals](docs/peripherals.md)
+- [Devices](docs/devices.md)
 - [Example: Tessera](docs/examples/tessera.md)
 - [Architecture overview](docs/architecture/index.md)
 - [Kubernetes API coverage](docs/api-reference.md)

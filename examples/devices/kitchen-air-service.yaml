@@ -1,0 +1,21 @@
+# kitchen-air: every BME688 labelled location=kitchen, whichever node it is
+# wired to. Apps call http://kitchen-air/ with k32_http_call (capability
+# SERVICE_CALL) from any node, a kube32-sim worker on a laptop included; the
+# driver answers with its latest reading:
+#   {"device":"kitchen-env","driver":"bme688","ok":true,"readings":{"temperature_c":21.4,...}}
+#
+# Label a discovered Device to add it:
+#   kubectl label device bme688-<node>-b0-m70c2-77 location=kitchen
+apiVersion: v1
+kind: Service
+metadata:
+  name: kitchen-air
+  namespace: default
+spec:
+  selector:
+    kube32.io/driver: bme688
+    location: kitchen
+  ports:
+    - name: http
+      port: 80
+      targetPort: http       # the driver pod's port on its node

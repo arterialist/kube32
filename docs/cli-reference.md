@@ -33,6 +33,7 @@ Use `kubectl` and k9s to manage the cluster. Use the tools below to run the host
 | `--node-ip <ip>` | `127.0.0.1` | Pod IP address advertised to other nodes; pass a LAN address so physical boards can reach pods on the simulator. |
 | `--psram <size>` | `1284Ki`; workers reserve none | PSRAM pool to model (for example `8Mi`). Passing `0` explicitly models a board without PSRAM (see below). |
 | `--heap-budget <size>` | `51Ki` | General heap available to pods and the system when `--psram 0` is set. |
+| `--sim-i2c <parts>` | none | Simulated I2C parts on bus 0 of this process's node, for example `pahub,bme688@2,miniscale@3,rfid@4`: `<part>[:0x<address>][@<PaHub channel>]` with the parts `pahub`, `bme688`, `miniscale` and `rfid`. Discovery finds them and drivers read them ([Devices](devices.md#compute-on-a-laptop)). |
 | `--ingress-port <port>` | off (`0`) | Ingress controller HTTP port. |
 | `--pod-port <port>` | `7000` | Pod HTTP server port on every node. |
 | `--node-id <id>` | `0` | Node ID for UDP IPC channels. |
@@ -72,6 +73,7 @@ Firmware commands (see [Firmware updates](firmware-updates.md)) reach the API se
 | `firmware status` | Print the staged image, the rollout, and a node table showing version, image, slot, confirmation state, target, and `FirmwareUpdate` condition. |
 | `firmware abort` | Delete the rollout. Nodes that have not switched keep their running firmware. |
 | `firmware info <firmware.bin>` | Print the version and SHA-256 of an image file. |
+| `devices` | List the Devices of a namespace (`-n`, default `default`, or `-A`) with each driver's latest reading, read with `GET /` from the driver pod's node (its pod IP and `http` port, so the node must be reachable from this machine). Flags: `--timeout <s>`, default `3`. |
 
 Exit codes:
 

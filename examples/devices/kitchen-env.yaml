@@ -1,0 +1,47 @@
+# kitchen-env: a BME688 (M5Stack ENV Pro) behind channel 2 of an M5Stack
+# PaHub on the Cardputer's Grove port. The control plane runs its driver on
+# the Cardputer and creates the Service kitchen-env (port 80).
+#
+# Discovery creates a Device for this part on its own
+# (bme688-<node>-b0-m70c2-77); a hand-written Device for the same address
+# takes its place, with a name and labels of your choice.
+#   kubectl apply -f examples/devices/kitchen-env.yaml
+#   kubectl get dev kitchen-env -o wide
+#   kubectl describe dev kitchen-env
+apiVersion: kube32.io/v1
+kind: Device
+metadata:
+  name: kitchen-env
+  namespace: default
+  labels:
+    location: kitchen
+spec:
+  driver: bme688
+  nodeSelector:
+    kube32.io/board: cardputer
+  i2c:
+    bus: 0
+    address: "0x77"
+    mux:
+      address: "0x70"
+      channel: 2
+  intervalMs: 5000
+---
+# The Cardputer's G0 button (GPIO 0, the boot button: read, never driven),
+# published on the channel topic device.g0-button on every press and release
+apiVersion: kube32.io/v1
+kind: Device
+metadata:
+  name: g0-button
+  namespace: default
+  labels:
+    location: desk
+spec:
+  driver: button
+  nodeSelector:
+    kube32.io/board: cardputer
+  pins:
+    pin: 0
+  config:
+    pull: up
+    active: low
