@@ -196,10 +196,10 @@ Every Service of a namespace adds about eight variables to the environment of ea
 A `kube32-sim` worker joins a cluster of boards and runs app pods. Driver pods stay on the boards their parts are wired to:
 
 ```
-kube32-sim --role worker --join http://<control-plane-ip>:6443 --node-ip <laptop-ip> --node-name laptop --pod-port 7000
+kube32-sim --role worker --join http://<control-plane-ip>:6443 --node-ip <laptop-ip> --node-name laptop --pod-port 17000
 ```
 
-`--node-ip` must be an address the boards reach: an app on the laptop calls a driver at its board's address, and drivers and Services reach the laptop's pod server at the laptop's. Nodes of `kube32-sim` carry the label `kube32.io/simulator: "true"`. A Device that selects its node by labels lands on a board when one matches, and on a `kube32-sim` node only when none does.
+`--node-ip` must be an address the boards reach: an app on the laptop calls a driver at its board's address, and drivers and Services reach the laptop's pod server at the laptop's. The pod server's port is the node's own: Endpoints, Ingress routes and Service calls reach a pod on the laptop at the port the laptop reports, whatever its `containerPort`. Nodes of `kube32-sim` carry the label `kube32.io/simulator: "true"`. A Device that selects its node by labels lands on a board when one matches, and on a `kube32-sim` node only when none does.
 
 A Device on a `kube32-sim` node runs its driver against the simulator's stub HAL, which answers for the simulated parts the simulator was started with:
 

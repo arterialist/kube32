@@ -17,26 +17,28 @@ flowchart LR
 
 Each entry in `spec.ports` maps `port` to `targetPort`, which is either a port number or a `containerPort` name from the pod spec. Omitting `targetPort` defaults it to `port`. A pod's `status.podIP` is the IP address of the node running it.
 
+Every pod on a node answers through that node's pod HTTP server, so an endpoint's port is the port the node reports in `status.daemonEndpoints.kubeletEndpoint.Port`: 7000 on a board, `--pod-port` on a `kube32-sim` node. On a node that reports no port, the endpoint's port is the resolved target port.
+
 The API server computes read-only `core/v1` `Endpoints` and `discovery.k8s.io/v1` `EndpointSlice` objects on read from Services and their matching pods:
 
-- `Endpoints` groups addresses into `subsets` by resolved target ports. Pods with the `Ready` condition set to `True` appear in `addresses`, and other selected pods appear in `notReadyAddresses`.
+- `Endpoints` groups addresses into `subsets` by port, so pods on nodes with different pod ports land in separate subsets. Pods with the `Ready` condition set to `True` appear in `addresses`, and other selected pods appear in `notReadyAddresses`.
 - `EndpointSlice` sets `addressType: IPv4`, labels each slice with `kubernetes.io/service-name`, sets `ownerReferences` to the Service, and populates `conditions.ready`, `conditions.serving`, and `conditions.terminating`.
 
 ## Service environment variables
 
 When a pod starts, the kubelet injects environment variables for every Service in the same namespace that has a selector, unless the Service sets `clusterIP: None` or `type: ExternalName`, or the pod spec sets `enableServiceLinks: false`. Every pod also receives `KUBERNETES_SERVICE_HOST` and `KUBERNETES_SERVICE_PORT` for the API server, even when `enableServiceLinks` is `false`.
 
-For a Service named `<svc>` with uppercase underscore prefix `<SVC>`, the host is the first ready address in the Service's `Endpoints`, or the local node IP when the Service selects the starting pod itself. The port is the resolved target port. The kubelet reads the Services and Endpoints of the namespace as two lists and parses them one item at a time:
+For a Service named `<svc>` with uppercase underscore prefix `<SVC>`, the host is the first ready address in the Service's `Endpoints`, or the local node IP when the Service selects the starting pod itself. The port is the endpoint's port: the node's pod port, or the resolved target port on a node that reports none. The kubelet reads the Services and Endpoints of the namespace as two lists and parses them one item at a time:
 
 | Variable | Value |
 | --- | --- |
 | `<SVC>_SERVICE_HOST` | Ready backing pod IP |
-| `<SVC>_SERVICE_PORT` | First resolved target port |
-| `<SVC>_SERVICE_PORT_<NAME>` | Resolved target port for the named Service port |
+| `<SVC>_SERVICE_PORT` | First endpoint port |
+| `<SVC>_SERVICE_PORT_<NAME>` | Endpoint port for the named Service port |
 | `<SVC>_PORT` | `<proto>://<host>:<port>` for the first port |
 | `<SVC>_PORT_<PORT>_<PROTO>` | `<proto>://<host>:<port>` |
 | `<SVC>_PORT_<PORT>_<PROTO>_PROTO` | Lowercase protocol, such as `tcp` |
-| `<SVC>_PORT_<PORT>_<PROTO>_PORT` | Target port number |
+| `<SVC>_PORT_<PORT>_<PROTO>_PORT` | Endpoint port number |
 | `<SVC>_PORT_<PORT>_<PROTO>_ADDR` | Backing pod IP |
 
 Pods read environment variables with `k32_env_get(key, key_len, out, out_cap)`.
@@ -67,7 +69,7 @@ The longest matching path wins, and `Exact` wins ties over `Prefix`. When two In
 A `service` backend references a Service in the same namespace by `port.number` or `port.name`:
 
 - When a selected `Running` pod runs on the control plane, the worker calls its `k32_handle` export in-process without a network hop.
-- When the selected pods run on worker nodes, the controller load-balances across them in round-robin order and proxies the request over HTTP/1.1 keep-alive to the pod's node IP and resolved target port with the header `X-Kube32-Pod: <namespace>/<name>`.
+- When the selected pods run on worker nodes, the controller load-balances across them in round-robin order and proxies the request over HTTP/1.1 keep-alive to the pod's node IP and the node's pod port with the header `X-Kube32-Pod: <namespace>/<name>`.
 - When the Service selects no running pod, the controller returns `503` with `Retry-After: 2`.
 
 ### StaticBundle resource backends
@@ -221,7 +223,7 @@ A refused call returns `K32_ERR_PERM` to the pod, and the control plane logs `[E
 - A rule allows a connection when one of its `to` peers and one of its `ports` match. A rule without `to` matches every destination, a rule without `ports` every port.
 - `ipBlock.cidr`, minus the blocks in `except`, matches the destination address: the address of a host outside the cluster, or the pod IP of a pod behind a Service.
 - `podSelector` and `namespaceSelector` match the pods behind a Service and their namespace; `podSelector` alone matches pods in the policy's namespace. Every namespace carries the label `kubernetes.io/metadata.name: <name>`. Selectors never match hosts outside the cluster.
-- `port` matches the target port of a pod behind a Service or the port of a host, as a number, as a range up to `endPort`, or as the name of a `containerPort` of the target pod. Only `protocol: TCP` matches.
+- `port` matches the target port of a pod behind a Service (the resolved `targetPort`, not the port of its node's pod HTTP server) or the port of a host, as a number, as a range up to `endPort`, or as the name of a `containerPort` of the target pod. Only `protocol: TCP` matches.
 - A call to a Service goes to one of its pods that the policies allow. When they allow none, or deny the host, the call returns `K32_ERR_PERM` and the node logs `[NETPOL] <pod> -> <target> denied: <reason>`, at most once per second.
 
 The API server validates policies as kube-apiserver does, and defaults `spec.policyTypes` (`Ingress`, plus `Egress` when the policy has egress rules) and `protocol: TCP`. `kubectl get netpol` prints the pod selector.

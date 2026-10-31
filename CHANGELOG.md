@@ -6,6 +6,7 @@ All notable changes to this project will be documented in this file. The format 
 
 ### Fixed
 
+- Endpoints, EndpointSlices, Ingress routes, Service calls and service links reach a pod at its node's pod port (`status.daemonEndpoints.kubeletEndpoint.Port`) instead of its `containerPort`, so pods on a `kube32-sim` worker started with its own `--pod-port` are reachable from the boards. NetworkPolicy ports still match the pod's own port.
 - A node that registers again, after a reboot or after rejected heartbeats, keeps its cordon: the registration no longer sets `spec.unschedulable`.
 - A container's environment is kept once per pod instead of twice.
 

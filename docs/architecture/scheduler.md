@@ -96,7 +96,7 @@ One loop in `src/controller/workload_controller.cpp` reconciles DaemonSets and J
 The API server computes read-only `core/v1` Endpoints and `discovery.k8s.io/v1` EndpointSlices on every read from Services and their selected pods:
 
 - Services with a non-empty `spec.selector` match non-terminating pods in the same namespace that have a `podIP`.
-- Named `targetPort` values resolve against container `ports` on each pod. The API server groups pods whose ports resolve to different numbers into separate subsets or slices.
+- Named `targetPort` values resolve against container `ports` on each pod. A pod's endpoint port is its node's pod port when the node reports one in `status.daemonEndpoints.kubeletEndpoint.Port`, and the resolved target port otherwise. The API server groups pods whose ports come out different into separate subsets or slices.
 - Ready `Running` pods populate `addresses`, or `ready` and `serving` in EndpointSlices. Other non-terminating pods populate `notReadyAddresses`.
 
 ## Limitations
