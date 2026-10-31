@@ -12,6 +12,7 @@ kube32-cli: build, check, deploy and ship WebAssembly pods for Kube32.
     kube32-cli firmware push <firmware.bin>   stage a firmware image on the control plane
     kube32-cli firmware rollout              update every node to the staged image, one at a time
     kube32-cli firmware status|abort|info    the rollout and each node's firmware; stop a rollout; read an image file
+    kube32-cli devices                       every Device with the latest reading of its driver
 
 The ABI it checks against is include/runtime/k32_app_abi.h; the import
 signatures are the m3_LinkRawFunction calls in src/runtime/app_pod.cpp and
@@ -40,6 +41,8 @@ import subprocess
 import sys
 import tempfile
 import time
+import urllib.error
+import urllib.request
 
 VERSION = "0.2.0"
 
@@ -1952,7 +1955,67 @@ def build_parser():
     fi.add_argument("file")
     fi.set_defaults(func=cmd_firmware_info)
     fw.set_defaults(func=lambda args: (fw.print_help(), EXIT_USAGE)[1])
+
+    dv = sub.add_parser("devices", help="list Devices with the latest reading of each driver (read from its node's pod server)")
+    dv.add_argument("-n", "--namespace", default="default")
+    dv.add_argument("-A", "--all-namespaces", action="store_true")
+    dv.add_argument("--timeout", type=float, default=3.0, help="seconds to wait for each driver (default 3)")
+    kubectl_flags(dv)
+    dv.set_defaults(func=cmd_devices)
     return p
+
+
+def device_reading(pod, timeout):
+    """The latest reading of a driver pod, from its node's pod server
+    (GET / with X-Kube32-Pod): 'key=value ...', or why there is none."""
+    meta, status = pod.get("metadata", {}), pod.get("status", {}) or {}
+    ip = status.get("podIP") or ""
+    port = 0
+    for c in pod.get("spec", {}).get("containers", []):
+        for p in c.get("ports", []) or []:
+            if p.get("name") == "http":
+                port = p.get("containerPort", 0)
+    if not ip or not port:
+        return "-"
+    req = urllib.request.Request("http://%s:%d/" % (ip, port),
+                                 headers={"X-Kube32-Pod": "%s/%s" % (meta.get("namespace", "default"), meta.get("name", ""))})
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            body = json.loads(resp.read().decode("utf-8", "replace"))
+    except urllib.error.HTTPError as e:
+        try:
+            body = json.loads(e.read().decode("utf-8", "replace"))
+        except ValueError:
+            return "http %d" % e.code
+    except (OSError, ValueError) as e:
+        return "unreachable (%s)" % (getattr(e, "reason", None) or e)
+    if not body.get("ok", False):
+        return "error: %s" % body.get("error", "?")
+    readings = body.get("readings", {}) or {}
+    return " ".join("%s=%s" % (k, v) for k, v in readings.items()) or "-"
+
+
+def cmd_devices(args):
+    """Every Device, with the latest reading of its driver"""
+    path = "/apis/kube32.io/v1/devices" if args.all_namespaces else "/apis/kube32.io/v1/namespaces/%s/devices" % args.namespace
+    try:
+        devices = (api_call(args, "get", path) or {}).get("items", [])
+        rows = []
+        for d in sorted(devices, key=lambda d: (d["metadata"].get("namespace", ""), d["metadata"]["name"])):
+            meta, spec, st = d["metadata"], d.get("spec", {}), d.get("status", {}) or {}
+            reading = "-"
+            if st.get("phase") == "Running" and st.get("podName"):
+                pod = api_call(args, "get", "/api/v1/namespaces/%s/pods/%s" % (meta.get("namespace", "default"), st["podName"])) or {}
+                reading = device_reading(pod, args.timeout)
+            elif st.get("message"):
+                reading = st["message"]
+            rows.append({"ns": meta.get("namespace", ""), "name": meta["name"], "driver": spec.get("driver", ""),
+                         "node": st.get("nodeName") or spec.get("nodeName") or "-", "phase": st.get("phase", "Pending"), "reading": reading})
+    except ApiError as e:
+        return err_exit(str(e), EXIT_KUBECTL)
+    cols = [("NAME", "name"), ("DRIVER", "driver"), ("NODE", "node"), ("PHASE", "phase"), ("READING", "reading")]
+    print_table(rows, ([("NAMESPACE", "ns")] if args.all_namespaces else []) + cols)
+    return EXIT_OK
 
 
 def main(argv=None):

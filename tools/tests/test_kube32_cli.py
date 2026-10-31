@@ -1187,5 +1187,90 @@ class TestFirmware(TempDirCase):
         self.assertIn("no rollout", out)
 
 
+# ---------------------------------------------------------------------------
+# devices
+# ---------------------------------------------------------------------------
+# A kubectl that answers GET --raw from a JSON file of {path: answer}
+FAKE_GET_KUBECTL = textwrap.dedent('''\
+    #!/usr/bin/env python3
+    import json, os, sys
+    answers = json.load(open(os.environ["FAKE_GET_ANSWERS"]))
+    raw = sys.argv[sys.argv.index("--raw") + 1]
+    if raw not in answers:
+        sys.stderr.write("Error from server (NotFound): the server could not find the requested resource\\n")
+        sys.exit(1)
+    print(json.dumps(answers[raw]))
+''')
+
+
+class TestDevices(TempDirCase):
+    def setUp(self):
+        super().setUp()
+        import http.server
+        import threading
+
+        class Driver(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                pod = self.headers.get("X-Kube32-Pod", "")
+                if pod == "default/kitchen-env-driver":
+                    code, body = 200, {"device": "kitchen-env", "ok": True, "readings": {"temperature_c": 21.4, "humidity_pct": 41.0}}
+                else:
+                    code, body = 503, {"device": "scale", "ok": False, "error": "the part does not answer"}
+                data = json.dumps(body).encode()
+                self.send_response(code)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
+
+            def log_message(self, *args):
+                pass
+
+        self.server = http.server.HTTPServer(("127.0.0.1", 0), Driver)
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+        port = self.server.server_address[1]
+        self.kubectl = self.write("kubectl", FAKE_GET_KUBECTL)
+        os.chmod(self.kubectl, os.stat(self.kubectl).st_mode | stat.S_IXUSR)
+
+        def device(name, driver, phase, pod="", message=""):
+            st = {"phase": phase, "nodeName": "cardputer", "message": message}
+            if pod:
+                st["podName"] = pod
+            return {"metadata": {"name": name, "namespace": "default"}, "spec": {"driver": driver, "nodeName": "cardputer"}, "status": st}
+
+        def pod(name):
+            return {"metadata": {"name": name, "namespace": "default"}, "status": {"podIP": "127.0.0.1"},
+                    "spec": {"containers": [{"ports": [{"name": "http", "containerPort": port}]}]}}
+
+        answers = {
+            "/apis/kube32.io/v1/namespaces/default/devices": {"items": [
+                device("kitchen-env", "bme688", "Running", "kitchen-env-driver"),
+                device("scale", "miniscale", "Running", "scale-driver"),
+                device("bme688-cardputer-b0-m70c2-77", "bme688", "Absent", message="node cardputer no longer finds the part at i2c0/0x70:2/0x77"),
+            ]},
+            "/api/v1/namespaces/default/pods/kitchen-env-driver": pod("kitchen-env-driver"),
+            "/api/v1/namespaces/default/pods/scale-driver": pod("scale-driver"),
+        }
+        self.answers = self.write("answers.json", json.dumps(answers))
+
+    def tearDown(self):
+        self.server.shutdown()
+        self.server.server_close()
+        super().tearDown()
+
+    def test_devices_with_readings(self):
+        rc, out, err = run_cli("devices", "--kubectl", self.kubectl, env=dict(os.environ, FAKE_GET_ANSWERS=self.answers))
+        self.assertEqual(rc, 0, err)
+        lines = out.splitlines()
+        self.assertRegex(lines[0], r"^NAME\s+DRIVER\s+NODE\s+PHASE\s+READING$")
+        self.assertRegex(out, r"kitchen-env\s+bme688\s+cardputer\s+Running\s+temperature_c=21.4 humidity_pct=41.0")
+        self.assertRegex(out, r"scale\s+miniscale\s+cardputer\s+Running\s+error: the part does not answer")
+        self.assertRegex(out, r"bme688-cardputer-b0-m70c2-77\s+bme688\s+cardputer\s+Absent\s+node cardputer no longer finds")
+        # An API error (here: no answer for the all-namespaces list) exits 4
+        rc, _, err = run_cli("devices", "-A", "--kubectl", self.kubectl, env=dict(os.environ, FAKE_GET_ANSWERS=self.answers))
+        self.assertEqual(rc, 4)
+        self.assertIn("NotFound", err)
+
+
 if __name__ == "__main__":
     unittest.main()
