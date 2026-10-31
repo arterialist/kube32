@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <cstdio>
+#include <tuple>
 
 #if defined(ESP_PLATFORM)
 #include "driver/gpio.h"
@@ -42,20 +43,6 @@ bool lines_idle(const BusPins&) { return true; }
 // One register of the part at `loc`, through a register pointer write
 bool read_register(const models::I2cLocation& loc, uint8_t reg, uint8_t& out) {
     return i2c_device_write(loc, &reg, 1) == 1 && i2c_device_read(loc, &out, 1) == 1;
-}
-
-// A PCA9548A keeps the control byte written to it: 0x01 and 0x80 read back,
-// and 0x00 (written last) deselects every channel
-bool is_multiplexer(const models::I2cLocation& loc) {
-    for (uint8_t mask : {static_cast<uint8_t>(0x01), static_cast<uint8_t>(0x80), static_cast<uint8_t>(0x00)}) {
-        uint8_t back = 0xFF;
-        if (i2c_device_write(loc, &mask, 1) != 1 || i2c_device_read(loc, &back, 1) != 1 || back != mask) {
-            const uint8_t off = 0;
-            if (mask != 0) i2c_device_write(loc, &off, 1);
-            return false;
-        }
-    }
-    return true;
 }
 
 // The catalog part at `loc`, by its driver's register reads: chip and driver
@@ -126,7 +113,7 @@ bool scan_bus(uint8_t bus, const std::vector<models::DiscoveredPart>& known, std
     for (uint8_t addr : direct) {
         if (addr < models::kMuxFirstAddress || addr > models::kMuxLastAddress) continue;
         models::DiscoveredPart p = take(models::I2cLocation{bus, addr, 0, 0});
-        if (p.driver.empty() && is_multiplexer(p.where)) {
+        if (p.driver.empty() && i2c_mux_test(bus, addr)) {
             muxes.push_back(addr);
             p.chip = "PCA9548A";
         }
@@ -192,6 +179,23 @@ bool I2cDiscovery::scan() {
             direct.clear();
             found.clear();
         }
+        // A part the last scan found and this one does not stays one more
+        // scan: a transfer that fails once (a reader that misses its
+        // address for a moment, a scan that gave up) does not take its
+        // Device's driver away
+        std::vector<models::I2cLocation> missing;
+        for (const auto& p : parts_[bus]) {
+            const bool seen = std::any_of(found.begin(), found.end(), [&](const models::DiscoveredPart& f) { return f.where == p.where; });
+            const bool missed_before = std::find(missing_[bus].begin(), missing_[bus].end(), p.where) != missing_[bus].end();
+            if (seen || missed_before) continue;
+            found.push_back(p);
+            missing.push_back(p.where);
+        }
+        missing_[bus] = std::move(missing);
+        // The bus's own parts first, then by multiplexer, channel and address
+        std::sort(found.begin(), found.end(), [](const models::DiscoveredPart& a, const models::DiscoveredPart& b) {
+            return std::tie(a.where.mux, a.where.channel, a.where.address) < std::tie(b.where.mux, b.where.channel, b.where.address);
+        });
         auto same = [](const std::vector<models::DiscoveredPart>& a, const std::vector<models::DiscoveredPart>& b) {
             if (a.size() != b.size()) return false;
             for (size_t i = 0; i < a.size(); ++i) {

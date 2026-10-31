@@ -76,6 +76,11 @@ int32_t i2c_device_write(const models::I2cLocation& loc, const uint8_t* data, si
 int32_t i2c_device_read(const models::I2cLocation& loc, uint8_t* buf, size_t len);
 // Deselects every multiplexer the bus has switched
 void i2c_deselect(uint32_t bus);
+// True when the part at `addr` on the bus itself keeps a PCA9548A control
+// byte written to it (0x01, 0x80, then 0x00, read back each time), tested
+// under the bus lock so that no other user's transfer switches it in
+// between. A multiplexer is left with every channel off.
+bool i2c_mux_test(uint32_t bus, uint8_t addr);
 int32_t uart_port_write(uint32_t port, const uint8_t* data, size_t len);
 int32_t uart_port_read(uint32_t port, uint8_t* buf, size_t max_len, uint32_t timeout_ms);
 

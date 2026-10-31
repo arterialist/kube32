@@ -383,6 +383,36 @@ int32_t i2c_device_write(const models::I2cLocation& loc, const uint8_t* data, si
     return raw_write(s, loc.bus, loc.address, data, len);
 }
 
+bool i2c_mux_test(uint32_t bus, uint8_t addr) {
+    if (bus >= 2 || addr < models::kMuxFirstAddress || addr > models::kMuxLastAddress) return false;
+    I2cSlot& s = s_i2c[bus];
+    std::lock_guard<std::mutex> lock(s.mutex);
+    if (!s.state.installed || select_route(s, bus, models::I2cLocation{static_cast<uint8_t>(bus), addr, 0, 0}) < 0) return false;
+    const unsigned n = addr - models::kMuxFirstAddress;
+    const uint8_t bit = static_cast<uint8_t>(1u << n);
+    bool mux = true;
+    for (uint8_t mask : {static_cast<uint8_t>(0x01), static_cast<uint8_t>(0x80), static_cast<uint8_t>(0x00)}) {
+        uint8_t back = 0xFF;
+        if (raw_write(s, bus, addr, &mask, 1) != 1 || raw_read(s, bus, addr, &back, 1) != 1 || back != mask) {
+            mux = false;
+            break;
+        }
+    }
+    if (!mux) {
+        // Not a multiplexer (or one that failed the test): forgotten, with
+        // its register pointer back at 0
+        const uint8_t off = 0;
+        raw_write(s, bus, addr, &off, 1);
+        s.muxes &= static_cast<uint8_t>(~bit);
+        s.mux_known &= static_cast<uint8_t>(~bit);
+        return false;
+    }
+    s.muxes |= bit;
+    s.mux_known |= bit;
+    s.mux_mask[n] = 0;
+    return true;
+}
+
 void i2c_deselect(uint32_t bus) {
     if (bus >= 2) return;
     I2cSlot& s = s_i2c[bus];

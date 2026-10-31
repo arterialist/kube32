@@ -30,7 +30,9 @@
 //     nodeSelector: { i2c.kube32.io/0x28: bus-0 }
 //
 // annotation() is the node annotation kube32.io/i2c-devices: every part
-// found, with its multiplexer channel and what it was identified as.
+// found, with its multiplexer channel and what it was identified as. A part
+// leaves it (and a part behind a multiplexer its label) after two scans in
+// a row that miss it; the labels of parts on a bus itself follow each scan.
 
 #include "models/device.hpp"
 
@@ -58,6 +60,7 @@ public:
 private:
     std::vector<uint8_t> found_[2];
     std::vector<models::DiscoveredPart> parts_[2];
+    std::vector<models::I2cLocation> missing_[2];   // parts kept although the last scan missed them
 };
 
 } // namespace kube32::hal

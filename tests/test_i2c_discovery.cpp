@@ -221,7 +221,9 @@ void test_multiplexer_scan() {
 
     // Unplugged from its channel: gone from the report and the labels; a
     // BME680 (variant 0) plugged in its place is not a catalog part
+    // (kept through the first scan that misses it, gone after the second)
     rig.hub->detach(2, 0x77);
+    assert(!d.scan() && part_at(d.parts(), {0, 0x77, 0x70, 2}) && d.labels().count("i2c.kube32.io/0x77"));
     assert(d.scan() && !part_at(d.parts(), {0, 0x77, 0x70, 2}) && !d.labels().count("i2c.kube32.io/0x77"));
     auto bme680 = std::make_shared<MockBme688>();
     bme680->set_reg(0xF0, 0x00);
@@ -267,6 +269,33 @@ void test_scan_of_a_shared_bus() {
     // The pod's transfers still find their channel after the scan
     uint8_t reg = 0xD0, v = 0;
     assert(i2c_device_write({0, 0x77, 0x70, 2}, &reg, 1) == 1 && i2c_device_read({0, 0x77, 0x70, 2}, &v, 1) == 1 && v == 0x61);
+
+    // Drivers switching the PaHub between their channels all the time: the
+    // multiplexer test is not fooled by a channel switched in between, and
+    // every scan finds every part
+    const std::string scale = R"({"metadata":{"name":"scale","namespace":"default","annotations":{"kube32.io/i2c-device":"bus=0,addr=0x26,mux=0x70:3"}},
+        "spec":{"containers":[{"name":"c","resources":{"requests":{"memory":"8Ki"}}}]}})";
+    assert(fw.register_pod("default/scale", scale, err));
+    std::atomic<bool> stop{false};
+    std::thread drivers([&] {
+        uint8_t v = 0;
+        while (!stop.load()) {
+            uint8_t r = 0xD0;
+            i2c_device_write({0, 0x77, 0x70, 2}, &r, 1);
+            i2c_device_read({0, 0x77, 0x70, 2}, &v, 1);
+            r = 0xFF;
+            i2c_device_write({0, 0x26, 0x70, 3}, &r, 1);
+            i2c_device_read({0, 0x26, 0x70, 3}, &v, 1);
+        }
+    });
+    for (int i = 0; i < 30; ++i) {
+        d.scan();
+        assert(part_at(d.parts(), {0, 0x77, 0x70, 2}) && part_at(d.parts(), {0, 0x26, 0x70, 3}) && part_at(d.parts(), {0, 0x28, 0x70, 4}));
+        assert(part_at(d.parts(), {0, 0x70, 0, 0})->chip == "PCA9548A");
+    }
+    stop = true;
+    drivers.join();
+    fw.unregister_pod("default/scale");
 
     // The last grant goes during a scan's lend: the bus is removed once the scan returns it
     bool shared = false;
