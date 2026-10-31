@@ -4,6 +4,11 @@ All notable changes to this project will be documented in this file. The format 
 
 ## [Unreleased]
 
+### Fixed
+
+- A node that registers again, after a reboot or after rejected heartbeats, keeps its cordon: the registration no longer sets `spec.unschedulable`.
+- A container's environment is kept once per pod instead of twice.
+
 ### Added
 
 - Kubernetes API server on port 6443 serving Pod, Node, Namespace, Service, Endpoints, EndpointSlice, ConfigMap, Secret, Event, Deployment, DaemonSet, Job, Lease, Ingress, NetworkPolicy, NodeMetrics, PodMetrics, and subject access reviews.

@@ -42,7 +42,7 @@ Before a pod starts, the kubelet estimates the memory it needs to load from the 
 | Fits once other pods free their memory | `Pending`, container waiting with reason `InsufficientMemory`; admitted again every 5 s | `InsufficientMemory` (Warning), once |
 | Larger than the node can give with no other pod running | `Failed` with reason `OutOfmemory`, as the Kubernetes kubelet rejects a pod that does not fit | `OutOfmemory` (Warning) |
 
-A pod that passes admission but runs out of memory while it loads also waits with `InsufficientMemory` instead of crash looping. A pod deleted and created again under the same name replaces the old container even when the kubelet did not see the deletion.
+A pod that passes admission but runs out of memory while it loads also waits with `InsufficientMemory` instead of crash looping. On a board without PSRAM the kubelet starts at most one pod per sync pass (2 s), since a pass holds the manifest and parsed form of every pod it starts: pods due at once, such as after a reboot, start one after the other. A pod deleted and created again under the same name replaces the old container even when the kubelet did not see the deletion.
 
 ## Threads
 

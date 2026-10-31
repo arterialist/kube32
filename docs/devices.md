@@ -81,7 +81,7 @@ The Device controller (`src/controller/device_controller.cpp`) runs on the contr
 - Pod `<device>-driver` in the Device's namespace, pinned to the Device's node with a `kubernetes.io/hostname` node selector. It never runs anywhere else.
 - Service `<device>`, port `80` to the pod's `http` port, selecting `kube32.io/device: <device>`.
 
-The driver pod carries the Device's labels plus `kube32.io/device: <device>` and `kube32.io/driver: <driver>`, `restartPolicy: Always`, the `CHANNEL_IPC` capability and `hardware.kube32.io/ipc`, the driver's memory as request and limit, and a container port `http` set to the node's pod port (`status.daemonEndpoints.kubeletEndpoint.Port`, 7000 on boards). Its environment:
+The driver pod carries the Device's labels plus `kube32.io/device: <device>` and `kube32.io/driver: <driver>`, `restartPolicy: Always`, `enableServiceLinks: false` (a driver calls no Service, and every Device adds one to the namespace), the `CHANNEL_IPC` capability and `hardware.kube32.io/ipc`, the driver's memory as request and limit, and a container port `http` set to the node's pod port (`status.daemonEndpoints.kubeletEndpoint.Port`, 7000 on boards). Its environment:
 
 | Variable | Value |
 | --- | --- |
@@ -144,7 +144,7 @@ A bus that a pod claims whole (`esp32.io/i2c-bus-<n>`) is not scanned, and the n
 
 For each identified catalog part that no Device covers yet (same node, bus, multiplexer channel and address), the control plane creates a Device in the `default` namespace named `<driver>-<node>-b<bus>[-m<mux>c<channel>]-<address>`, for example `bme688-cardputer-b0-m70c2-77`, cut to 63 characters with a hash when longer. It carries the labels `kube32.io/discovered: "true"` and `kube32.io/driver: <driver>`. Labels added later with `kubectl label` stay. A hand-written Device for the same part keeps discovery from creating a second one.
 
-When the node's report no longer lists a discovered part, its Device turns `Absent`: the driver pod is deleted, while the Device, its labels and its Service stay. When the part answers again, the driver comes back. A discovered Device deleted while its part is attached is created again by the next pass.
+A part that one scan misses stays in the report for another scan, so a transfer that fails once does not take a driver away. When the node's report no longer lists a discovered part (two scans in a row, about 20 seconds), its Device turns `Absent`: the driver pod is deleted, while the Device, its labels and its Service stay. When the part answers again, the driver comes back. A discovered Device deleted while its part is attached is created again by the next pass.
 
 ## Shared I2C buses
 
@@ -189,6 +189,8 @@ int32_t status = k32_http_call("GET", 3, "http://kitchen-air/", 19, 0, 0, 0, 0, 
 
 The Device's own Service works the same way (`http://kitchen-env/`). An app that subscribes to `device.<device>` with `kube32.io/event-topics` receives every reading as it is taken.
 
+Every Service of a namespace adds about eight variables to the environment of each pod that starts there, and a Device adds a Service. An app that reaches Devices by name sets `enableServiceLinks: false`; on a board without PSRAM each variable takes about 100 bytes of the internal heap for as long as the pod runs.
+
 ## Compute on a laptop
 
 A `kube32-sim` worker joins a cluster of boards and runs app pods. Driver pods stay on the boards their parts are wired to:
@@ -219,7 +221,7 @@ kube32-sim --sim-i2c pahub,bme688@2,miniscale@3,rfid@4
 | Where | Cost |
 | --- | --- |
 | Each driver pod | Its 3 KiB of linear memory, its module's compiled code and the runtime's per-pod structures, as any pod: 16 to 28 KiB of a board's pod pool. A BME688, a Mini Scales unit and an RFID 2 reader take about 77 KiB of the Cardputer's 80 KiB pool. The firewall keeps 6 bytes for a grant |
-| A node with shared buses | One I2C driver per bus for all grants, with up to four device handles; discovery keeps about 50 bytes per part found |
+| A node with shared buses | One I2C driver per bus for all grants, with up to four device handles; discovery keeps about 50 bytes per part found, and the node annotation about 70 bytes per part |
 | Control plane | The Device controller's thread (12 KiB stack, in PSRAM), a pass every 2 seconds; a Device, its pod and its Service take about 2.5 KiB of the object store |
 
 ## Limitations

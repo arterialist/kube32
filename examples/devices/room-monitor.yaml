@@ -70,6 +70,7 @@ spec:
       labels:
         app: room-monitor
     spec:
+      enableServiceLinks: false              # reaches the Devices by name: no variables for every Service here
       containers:
         - name: room-monitor
           image: wasm://embedded/room-monitor
