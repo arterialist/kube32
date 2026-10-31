@@ -1,0 +1,123 @@
+# room-monitor: one page for a room's sensors, found by label. The app knows
+# two Service names; each Service selects the driver pods of the Devices with
+# a driver and a location label, so the app finds its parts wherever they are
+# wired, and runs on any node: the same board, another one, or a simulator
+# worker without GPIO.
+#
+# The Devices: label the ones discovery created (kubectl get devices),
+#
+#   kubectl --context kube32 label device <bme688 device> location=kitchen
+#   kubectl --context kube32 label device <miniscale device> location=kitchen
+#
+# or write them, for parts discovery does not see:
+#
+#   apiVersion: kube32.io/v1
+#   kind: Device
+#   metadata: {name: kitchen-env, labels: {location: kitchen}}
+#   spec:
+#     driver: bme688
+#     nodeName: <node>
+#     i2c: {bus: 0, address: "0x77", mux: {address: "0x70", channel: 0}}   # an ENV Pro on a PaHub
+#
+# Then:
+#
+#   kubectl --context kube32 apply -f examples/devices/room-monitor.yaml
+#   curl -s http://<control plane>/kitchen                    both devices' readings as JSON
+#   open http://<control plane>/kitchen/view                  the same as a page
+#   curl -s -X POST http://<control plane>/kitchen/tare       zero the scale
+#
+# Moving a part to another board changes nothing here.
+apiVersion: v1
+kind: Service
+metadata:
+  name: kitchen-env
+  namespace: default
+spec:
+  selector:
+    kube32.io/driver: bme688
+    location: kitchen
+  ports:
+    - name: http
+      port: 80
+      targetPort: 7000
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: kitchen-scale
+  namespace: default
+spec:
+  selector:
+    kube32.io/driver: miniscale
+    location: kitchen
+  ports:
+    - name: http
+      port: 80
+      targetPort: 7000
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: room-monitor
+  namespace: default
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: room-monitor
+  template:
+    metadata:
+      labels:
+        app: room-monitor
+    spec:
+      containers:
+        - name: room-monitor
+          image: wasm://embedded/room-monitor
+          ports:
+            - containerPort: 7000
+              name: http
+          env:
+            - name: ROOM
+              value: kitchen
+            - name: ENV_URL
+              value: http://kitchen-env
+            - name: SCALE_URL
+              value: http://kitchen-scale
+          resources:
+            requests:
+              memory: 4Ki                    # linear memory: 0.5 KiB stack, 3.3 KiB data
+            limits:
+              memory: 4Ki
+          securityContext:
+            capabilities:
+              add: ["SERVICE_CALL"]          # k32_http_call to the Services above
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: room-monitor
+  namespace: default
+spec:
+  selector:
+    app: room-monitor
+  ports:
+    - name: http
+      port: 80
+      targetPort: 7000
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: room-monitor
+  namespace: default
+spec:
+  rules:
+    - http:
+        paths:
+          - path: /kitchen
+            pathType: Prefix
+            backend:
+              service:
+                name: room-monitor
+                port:
+                  number: 80
