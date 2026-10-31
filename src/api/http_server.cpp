@@ -771,6 +771,7 @@ size_t HttpServer::serve_one(Worker& w, osal::Socket& sock, const std::string& c
                 resp = route_handler_->handle_request(req, arena, &sock);
                 arena.reset();
             } catch (const std::exception& e) {
+                printf("[HTTP] %s %.*s failed: %s\n", http_method_str(req.method), (int)(req.path.size() > 60 ? 60 : req.path.size()), req.path.data(), e.what());
                 resp = RouteHandler::make_status(503, "ServiceUnavailable", "node is out of memory");
                 metrics_.errors.fetch_add(1, std::memory_order_relaxed);
             }
