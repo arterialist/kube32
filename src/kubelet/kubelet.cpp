@@ -596,7 +596,7 @@ void Kubelet::sync_assigned_pods() {
                 }
             }
         }
-        if (start) {
+        if (start && (config_.max_starts_per_sync == 0 || starts.size() < config_.max_starts_per_sync)) {
             starts.push_back(PodStart{e.pod ? *e.pod : models::parse_pod_manifest(std::string(e.manifest)), std::string(e.manifest)});
         }
     });

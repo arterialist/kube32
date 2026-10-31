@@ -235,6 +235,36 @@ void test_kubelet_differential_pod_sync() {
     std::cout << "[PASS] test_kubelet_differential_pod_sync" << std::endl;
 }
 
+// max_starts_per_sync: a board without PSRAM starts one pod per pass, the
+// others on the next passes
+void test_kubelet_starts_per_sync() {
+    KubeletConfig cfg;
+    cfg.node_name = "test-node-01";
+    cfg.max_starts_per_sync = 1;
+    auto wasm_rt = kube32::runtime::create_wasm_runtime();
+    auto mock_client = std::make_unique<MockKubeClient>();
+    MockKubeClient* client_ref = mock_client.get();
+    for (const char* name : {"a", "b", "c"}) {
+        KubePod pod;
+        pod.name = name;
+        pod.namespace_name = "default";
+        pod.node_name = "test-node-01";
+        client_ref->mock_pods.emplace_back(pod, std::string(R"({"metadata":{"name":")") + name +
+            R"(","namespace":"default"},"spec":{"nodeName":"test-node-01","containers":[{"name":"c","image":"wasm://sensor"}]}})");
+    }
+    Kubelet kubelet(cfg, *wasm_rt, std::move(mock_client));
+    for (size_t pass = 1; pass <= 3; ++pass) {
+        kubelet.sync_assigned_pods();
+        assert(kubelet.get_active_pod_keys().size() == pass);
+    }
+    kubelet.sync_assigned_pods();
+    assert(kubelet.get_active_pod_keys().size() == 3);
+    client_ref->mock_pods.clear();
+    kubelet.sync_assigned_pods();
+    assert(kubelet.get_active_pod_keys().empty());
+    std::cout << "[PASS] test_kubelet_starts_per_sync" << std::endl;
+}
+
 // The pod is deleted and created again under the same name before this node
 // saw the deletion: the old container stops and the new pod starts
 void test_kubelet_recreated_pod_replaces_old() {
@@ -628,6 +658,7 @@ int main() {
     test_kubelet_mock_registration_and_heartbeat();
     test_kubelet_differential_pod_sync();
     test_kubelet_recreated_pod_replaces_old();
+    test_kubelet_starts_per_sync();
     test_kubelet_thread_lifecycle();
     test_kubelet_capability_admission_rejection();
     test_kubelet_dynamic_trap_status_reporting();

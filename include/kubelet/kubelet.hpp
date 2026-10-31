@@ -113,6 +113,11 @@ struct KubeletConfig {
     // A pod the node has no memory for yet waits (Pending, InsufficientMemory)
     // and is admitted again after this long
     uint32_t memory_retry_ms{5000};
+    // Pods a sync pass starts at most (0: all that are due). Each start holds
+    // the pod's manifest and its parsed form until the pass ends; on a board
+    // without PSRAM one at a time keeps that peak small, the rest start on
+    // the next passes.
+    uint32_t max_starts_per_sync{0};
     // Workers enforce NetworkPolicy egress on their pods' calls with this
     // view (null: none kept here). Each pod sync records the labels of the
     // node's pods and loads the policies of a namespace new to the node;

@@ -1174,6 +1174,8 @@ void cluster_task(void* pv) {
     // Without PSRAM a large API answer (a list of pods carrying modules
     // inline) would take the heap the node runs on: refused instead
     kubelet_cfg.api_max_body = ident.has_psram ? 0 : 16 * 1024;
+    // Without PSRAM pods start one per sync pass: a pass holds what it starts
+    kubelet_cfg.max_starts_per_sync = ident.has_psram ? 0 : 1;
     kubelet_cfg.control_plane = ident.is_control_plane;
     kubelet_cfg.core_affinity = 1;
     // K32_CMD:TOKEN: the API server checks it, every kubelet sends it

@@ -385,6 +385,8 @@ int main(int argc, char* argv[]) {
         };
         kubelet_cfg.node_label_prefix = "i2c.kube32.io/";
         kubelet_cfg.kubelet_port = opts.pod_port;
+        // As a board without PSRAM starts its pods: one per sync pass
+        if (opts.board_without_psram) kubelet_cfg.max_starts_per_sync = 1;
         auto worker_slots = sim_slots(opts.data_dir + "/firmware", sim_firmware(argv[0]));
         kubelet_cfg.firmware_slots = worker_slots;
 
