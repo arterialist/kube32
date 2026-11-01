@@ -183,8 +183,12 @@ class ClusterHarness:
         return node
 
     def kill_node(self, name: str):
-        if name in self.nodes:
-            self.nodes[name].terminate()
+        """A node that fails: SIGKILL, so a worker does not leave the cluster first (SIGTERM drains it)"""
+        node = self.nodes.get(name)
+        if node and node.is_alive():
+            node.process.kill()
+            node.process.wait(timeout=2.0)
+            node.process = None
 
     def restart_node(self, name: str, cp_node: SimulatedNode, lease_interval_ms: int = 1000) -> SimulatedNode:
         if name in self.nodes:
