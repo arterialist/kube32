@@ -11,7 +11,7 @@ This page gives what kube32 costs on its boards. It compares the Wasm sandbox wi
 | Memory | 512 KB SRAM, 2 MB quad PSRAM at 80 MHz | 512 KB SRAM, no PSRAM |
 | Role | API server, store, controllers, kubelet | kubelet, three device drivers |
 
-The firmware uses ESP-IDF 5.5.3 and the `-O2` build option (`CONFIG_COMPILER_OPTIMIZATION_PERF`). The image is 3,303,200 bytes in a 3,407,872-byte app slot, with 55,252 bytes of static RAM. The pods are freestanding C. Clang compiles them to Wasm with `-Oz`, and the kube32 wasm3 interpreter runs them. Both boards and the client, a laptop, use the same 2.4 GHz Wi-Fi network.
+The firmware uses ESP-IDF 5.5.3 and the `-O2` build option (`CONFIG_COMPILER_OPTIMIZATION_PERF`). The controllers, the scheduler, the object store, the kubelet and most of the API server use `-Os`. The image is 3,178,256 bytes in a 3,407,872-byte app slot, with 55,372 bytes of static RAM. The pods are freestanding C. Clang compiles them to Wasm with `-Oz`, and the kube32 wasm3 interpreter runs them. Both boards and the client, a laptop, use the same 2.4 GHz Wi-Fi network.
 
 ## Wasm against native code
 
@@ -119,11 +119,11 @@ This table gives the busy share of the two cores over 60 s. The values come from
 
 | Node | Busy | Largest users |
 | --- | ---: | --- |
-| devkit, control plane with one Deployment and three Devices | 20.8 % | Deployment controller 10.0 % of a core, TCP/IP 7.1 %, Wi-Fi 6.4 %, Device controller 4.3 % |
+| devkit, control plane with two pods and three Devices | 8.5 % | TCP/IP 4.0 % of a core, Wi-Fi 3.0 %, node lifecycle 2.1 %, the two API workers 1.8 % and 1.7 % |
 | Cardputer, three drivers | 18.7 % | Wi-Fi 11.2 %, pod ticks 11.1 % (rfid polls five times a second), TCP/IP 7.1 % |
 | Cardputer, no pods | 8.1 % | Wi-Fi 6.5 %, TCP/IP 4.1 %, kubelet 1.5 % |
 
-The controllers run a pass when an object that they read changes, and every 30 s without a change; the scheduler every 5 minutes. On each pass, they read the objects that they manage. Node heartbeats, Leases and Events cause no passes, and a pod that does not fit is tried again only after a change, so an idle control plane spends little time in them.
+The controllers run a pass when an object that they read changes, and every 30 s without a change. The scheduler runs one every 5 minutes without a change. On each pass, they read the objects that they manage. Node heartbeats, Leases and Events cause no passes, and a pod that does not fit is tried again only after a change, so an idle control plane spends little time in them.
 
 ## Latency
 
