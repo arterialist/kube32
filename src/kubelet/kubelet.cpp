@@ -8,6 +8,9 @@
 #include "runtime/image_registry.hpp"
 #include "runtime/wasm_runtime.hpp"
 #include "runtime/pod_log.hpp"
+#include "runtime/app_pod.hpp"
+#include "runtime/pod_snapshot.hpp"
+#include "app/pod_checkpoint_api.hpp"
 #include "runtime/pod_memory_pool.h"
 #include "models/kube_models.hpp"
 #include "models/kube_lease.hpp"
@@ -1099,6 +1102,15 @@ bool Kubelet::deploy_and_start_pod(const models::KubePod& pod_in, const std::str
     spec.env = std::move(container_env);
     spec.asset_bundle = asset_bundle;
     spec.asset_directory = asset_directory;
+    spec.container_name = rec.container_name;
+    spec.migration_blockers = runtime::static_migration_blockers(manifest_json);
+    // kube32.io/restore-from: the container starts from that Checkpoint's
+    // snapshot (docs/migration.md), streamed from the control plane straight
+    // into its memory. A container that restarts later starts fresh.
+    if (auto it = pod.annotations.find("kube32.io/restore-from"); it != pod.annotations.end() && !it->second.empty() && !restarting) {
+        rec.restored_from = it->second;
+        spec.restore_from = app::checkpoint_data_stream(*api_client_, pod.namespace_name, it->second);
+    }
     // kube32.io/execution-budget: wasm3 gas units per call, or "off" for an
     // unmetered (faster, uninterruptible) pod. Default: metered.
     {
@@ -1151,6 +1163,15 @@ bool Kubelet::deploy_and_start_pod(const models::KubePod& pod_in, const std::str
     bool deployed = inline_bytes.empty()
         ? runtime_.deploy_workload_ex(pod_key, image_bytes, image_len, spec, deploy_err)
         : runtime_.deploy_workload_owned(pod_key, std::move(inline_bytes), spec, deploy_err);
+    if (!deployed && runtime::deploy_error_is_restore(deploy_err)) {
+        // The control plane falls back (restores elsewhere, or starts the pod
+        // fresh): a container that cannot restore is not restarted here
+        std::cout << "[KUBELET] " << pod_key << ": " << deploy_err << std::endl;
+        hal::CapabilityFirewall::instance().unregister_pod(pod_key);
+        LocalPodRecord& stored = (active_pods_[pod_key] = rec);
+        handle_pod_failure(stored, deploy_err, 128, "RestoreError");
+        return false;
+    }
     if (!deployed && runtime::deploy_error_is_out_of_memory(deploy_err)) {
         hal::CapabilityFirewall::instance().unregister_pod(pod_key);
         if (previous) {
@@ -1183,7 +1204,8 @@ bool Kubelet::deploy_and_start_pod(const models::KubePod& pod_in, const std::str
     }
     std::cout << "[KUBELET] " << pod_key << ": running image " << image_key << " (" << image_len
               << " bytes, limit " << rec.memory_limit_bytes / 1024 << " KiB)" << std::endl;
-    record_pod_event(rec, "Started", "Started container " + rec.container_name, false);
+    record_pod_event(rec, "Started", "Started container " + rec.container_name +
+                                     (rec.restored_from.empty() ? std::string() : " from checkpoint " + rec.restored_from), false);
 
     rec.execution_phase = PodExecutionPhase::Running;
     rec.started_at_ms = osal::System::get_uptime_ms();
@@ -1389,6 +1411,15 @@ void Kubelet::monitor_and_report_pod_statuses() {
                 handle_container_exit(pod_key, rec, cs.exit_code,
                                       cs.exit_code == 0 ? "Completed" : (cs.termination_reason.empty() ? "Error" : cs.termination_reason),
                                       cs.exit_message);
+            } else if (const bool frozen = runtime::AppPodHost::instance().is_frozen(pod_key); frozen != rec.frozen) {
+                // Frozen for a checkpoint (or a move): not Ready, so Services
+                // stop sending it requests; Ready again once thawed
+                const char* st = frozen ? "False\",\"reason\":\"ContainersNotReady\",\"message\":\"container frozen for a checkpoint" : "True";
+                char patch[400];
+                snprintf(patch, sizeof(patch), "{\"status\":{\"conditions\":[{\"type\":\"PodScheduled\",\"status\":\"True\"},"
+                         "{\"type\":\"Initialized\",\"status\":\"True\"},{\"type\":\"ContainersReady\",\"status\":\"%s\"},"
+                         "{\"type\":\"Ready\",\"status\":\"%s\"}]}}", st, st);
+                if (api_client_->patch_pod_status(rec.namespace_name, rec.name, patch)) rec.frozen = frozen;
             }
         }
         ship_pod_logs_locked(pod_key, rec);

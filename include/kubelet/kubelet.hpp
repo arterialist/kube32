@@ -68,6 +68,8 @@ struct LocalPodRecord {
     bool has_cpu_sample{false};
     uint64_t last_cpu_busy_us{0};
     uint64_t last_cpu_wall_us{0};
+    bool frozen{false};                      // reported not Ready while frozen for a checkpoint
+    std::string restored_from;               // the Checkpoint the container started from
 };
 
 struct KubeletConfig {

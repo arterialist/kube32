@@ -93,6 +93,10 @@ enum class RouteCategory {
     DevicesCollection,
     DeviceItem,
     DeviceStatus,
+    // kube32.io/v1 Checkpoints; their data is served by api/checkpoint_api.hpp
+    CheckpointsCollection,
+    CheckpointItem,
+    CheckpointStatus,
     // /healthz, /livez, /readyz
     Health,
     NotFound

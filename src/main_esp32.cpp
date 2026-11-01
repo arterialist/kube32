@@ -48,6 +48,8 @@
 #include "app/service_client.hpp"
 #include "app/egress_gateway.hpp"
 #include "app/node_storage_api.hpp"
+#include "app/pod_checkpoint_api.hpp"
+#include "api/checkpoint_api.hpp"
 #include "app/console_relay.hpp"
 #include "api/node_proxy.hpp"
 #include "kubelet/kube_api_client.hpp"
@@ -1403,6 +1405,7 @@ void cluster_task(void* pv) {
         static std::unique_ptr<kube32::api::NodeProxyHandler> node_proxy;
         node_proxy = std::make_unique<kube32::api::NodeProxyHandler>(*store, api_server->route_handler(), ident.name,
             [](kube32::api::HttpConnection& conn, std::string_view path) {
+                if (kube32::app::is_pod_checkpoint_path(path)) return kube32::app::serve_pod_checkpoint(conn, path, std::string());
                 if (!kube32::app::is_node_storage_path(path)) return false;
                 return kube32::app::serve_node_storage(conn, path, std::string(), 8u * 1024 * 1024);
             });
@@ -1410,7 +1413,10 @@ void cluster_task(void* pv) {
         // The staged firmware image (/apis/kube32.io/v1/firmware); everything
         // else goes on to the node proxy
         static std::unique_ptr<kube32::api::FirmwareApi> firmware_api;
-        firmware_api = std::make_unique<kube32::api::FirmwareApi>(*s_firmware_slots, *store, api_server->route_handler(), node_proxy.get());
+        // Checkpoint data (/apis/kube32.io/v1/.../checkpoints/<name>/data), in PSRAM
+        static std::unique_ptr<kube32::api::CheckpointApi> checkpoint_api;
+        checkpoint_api = std::make_unique<kube32::api::CheckpointApi>(*store, api_server->route_handler(), 256 * 1024, node_proxy.get());
+        firmware_api = std::make_unique<kube32::api::FirmwareApi>(*s_firmware_slots, *store, api_server->route_handler(), checkpoint_api.get());
         s_firmware_api = firmware_api.get();
 
         // k32_http_call: Services and NetworkPolicies read from the store.

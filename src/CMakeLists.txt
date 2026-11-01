@@ -35,6 +35,7 @@ set(KUBE32_APP_SRCS
     api/node_proxy.cpp
     api/protobuf_body.cpp
     api/firmware_api.cpp
+    api/checkpoint_api.cpp
     controller/node_lifecycle_controller.cpp
     controller/deployment_controller.cpp
     controller/workload_controller.cpp
@@ -93,6 +94,7 @@ set(KUBE32_APP_SRCS
     app/egress_policy.cpp
     app/egress_gateway.cpp
     app/node_storage_api.cpp
+    app/pod_checkpoint_api.cpp
     app/console_relay.cpp
     embedded/embedded_blobs_esp.cpp
     scheduler/scheduler.cpp
@@ -162,7 +164,8 @@ set_source_files_properties(${CMAKE_CURRENT_LIST_DIR}/api/version_info.cpp PROPE
 # Container environment, log persistence, bus setup and IR channels run once
 # per container start, every few seconds or once per IR frame, firmware
 # rollouts once per update, the Device controller and I2C discovery every
-# few seconds: built for size, they take half the flash -O2 gives them.
+# few seconds, snapshots and Checkpoint data once per move: built for size,
+# they take half the flash -O2 gives them.
 set_source_files_properties(
     ${CMAKE_CURRENT_LIST_DIR}/kubelet/pod_env.cpp
     ${CMAKE_CURRENT_LIST_DIR}/runtime/pod_log.cpp
@@ -182,4 +185,8 @@ set_source_files_properties(
     ${CMAKE_CURRENT_LIST_DIR}/controller/device_controller.cpp
     ${CMAKE_CURRENT_LIST_DIR}/models/device.cpp
     ${CMAKE_CURRENT_LIST_DIR}/hal/i2c_discovery.cpp
+    ${CMAKE_CURRENT_LIST_DIR}/runtime/pod_snapshot.cpp
+    ${CMAKE_CURRENT_LIST_DIR}/runtime/app_pod_migration.cpp
+    ${CMAKE_CURRENT_LIST_DIR}/app/pod_checkpoint_api.cpp
+    ${CMAKE_CURRENT_LIST_DIR}/api/checkpoint_api.cpp
     PROPERTIES COMPILE_OPTIONS "-Os")

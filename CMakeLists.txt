@@ -148,6 +148,7 @@ else()
         src/api/node_proxy.cpp
         src/api/protobuf_body.cpp
         src/api/firmware_api.cpp
+        src/api/checkpoint_api.cpp
         src/scheduler/scheduler.cpp
         src/hal/capability_firewall.cpp
         src/hal/sd_card.cpp
@@ -176,6 +177,7 @@ else()
         src/app/egress_policy.cpp
         src/app/egress_gateway.cpp
         src/app/node_storage_api.cpp
+        src/app/pod_checkpoint_api.cpp
         src/app/console_relay.cpp
         src/kubelet/node_status_reporter.cpp
         src/kubelet/metrics_provider.cpp

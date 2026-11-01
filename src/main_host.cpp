@@ -21,6 +21,8 @@
 #include "app/service_client.hpp"
 #include "app/egress_gateway.hpp"
 #include "app/node_storage_api.hpp"
+#include "app/pod_checkpoint_api.hpp"
+#include "api/checkpoint_api.hpp"
 #include "api/node_proxy.hpp"
 #include "api/firmware_api.hpp"
 #include "api/version_info.hpp"
@@ -578,6 +580,7 @@ int main(int argc, char* argv[]) {
     const std::string local_node = (opts.role == "standalone") ? opts.kubelet_name : opts.node_name;
     kube32::api::NodeProxyHandler node_proxy(*store, server->route_handler(), local_node,
         [](kube32::api::HttpConnection& conn, std::string_view path) {
+            if (kube32::app::is_pod_checkpoint_path(path)) return kube32::app::serve_pod_checkpoint(conn, path, std::string());
             if (!kube32::app::is_node_storage_path(path)) return false;
             return kube32::app::serve_node_storage(conn, path, std::string(), 64u * 1024 * 1024);
         });
@@ -587,7 +590,9 @@ int main(int argc, char* argv[]) {
     // file under --data-dir), the controller runs in the loop below
     const kube32::hal::FirmwareInfo builtin_firmware = sim_firmware(argv[0]);
     auto cp_slots = sim_slots(opts.data_dir + "/firmware", builtin_firmware);
-    kube32::api::FirmwareApi firmware_api(*cp_slots, *store, server->route_handler(), &node_proxy);
+    // Checkpoint data (/apis/kube32.io/v1/.../checkpoints/<name>/data), in memory
+    kube32::api::CheckpointApi checkpoint_api(*store, server->route_handler(), 16u * 1024 * 1024, &node_proxy);
+    kube32::api::FirmwareApi firmware_api(*cp_slots, *store, server->route_handler(), &checkpoint_api);
     kube32::controller::FirmwareRolloutController firmware_rollouts(*store, [&firmware_api] { return firmware_api.staged(); });
     // Devices: driver pods and Services, Devices from discovery
     kube32::controller::DeviceControllerConfig dev_cfg;

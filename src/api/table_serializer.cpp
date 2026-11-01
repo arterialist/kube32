@@ -609,7 +609,7 @@ static std::string format_label_selector(const models::JsonValue* sel) {
 bool TableSerializer::has_generic_table(std::string_view kind) {
     return kind == "Event" || kind == "Namespace" || kind == "Service" || kind == "ConfigMap" || kind == "Secret" || kind == "Lease" ||
            kind == "Ingress" || kind == "NetworkPolicy" || kind == "Endpoints" || kind == "EndpointSlice" || kind == "FirmwareRollout" ||
-           kind == "Device";
+           kind == "Device" || kind == "Checkpoint";
 }
 
 std::string TableSerializer::build_generic_table_json(std::string_view kind, const std::vector<std::string>& jsons, uint64_t resource_version) {
@@ -645,6 +645,9 @@ std::string TableSerializer::build_generic_table_json(std::string_view kind, con
     } else if (kind == "Device") {
         out += col("NAME", 0) + "," + col("DRIVER", 0) + "," + col("NODE", 0) + "," + col("ADDRESS", 0) + "," + col("PHASE", 0) + "," +
                col("AGE", 0) + "," + col("CHIP", 1) + "," + col("POD", 1) + "," + col("MESSAGE", 1);
+    } else if (kind == "Checkpoint") {
+        out += col("NAME", 0) + "," + col("POD", 0) + "," + col("ACTION", 0) + "," + col("PHASE", 0) + "," + col("NODE", 0) + "," +
+               col("SIZE", 0) + "," + col("AGE", 0) + "," + col("TARGET", 1) + "," + col("NEW POD", 1) + "," + col("MESSAGE", 1);
     } else {
         out += col("NAME", 0) + "," + col("AGE", 0);
     }
@@ -788,6 +791,19 @@ std::string TableSerializer::build_generic_table_json(std::string_view kind, con
             const std::string node = field("nodeName", spec ? spec->get_string("nodeName", "") : "");
             cells = {name, spec ? spec->get_string("driver", "") : "", node.empty() ? "<none>" : node, address, field("phase", "Pending"), age,
                      field("chip", "<none>"), field("podName", "<none>"), field("message", "")};
+        } else if (kind == "Checkpoint") {
+            const models::JsonValue* spec = doc.get("spec");
+            const models::JsonValue* st = doc.get("status");
+            auto field = [&](const char* key, const char* fallback) {
+                const std::string v = st ? st->get_string(key, "") : "";
+                return v.empty() ? std::string(fallback) : v;
+            };
+            // SIZE in KiB, as kubectl prints quantities
+            const int64_t bytes = st ? st->get_int("sizeBytes", 0) : 0;
+            const std::string size = bytes > 0 ? std::to_string((bytes + 1023) / 1024) + "Ki" : "<none>";
+            cells = {name, spec ? spec->get_string("podName", "") : "", spec ? spec->get_string("action", "Save") : "Save",
+                     field("phase", "Pending"), field("nodeName", "<none>"), size, age, field("targetNode", "<none>"),
+                     field("newPodName", "<none>"), field("message", "")};
         } else if (kind == "Endpoints" || kind == "EndpointSlice") {
             // kubectl's printers: the first three endpoints, then "+ N more..."
             std::vector<std::string> eps;
