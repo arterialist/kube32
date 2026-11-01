@@ -11,9 +11,11 @@
 #include "models/tolerations.hpp"
 #include "net/network_policy.hpp"
 #include "runtime/pod_log.hpp"
+#include "storage/persist_policy.hpp"
 #include "api/protobuf_body.hpp"
 #include "osal/socket.hpp"
 #include "osal/system.hpp"
+#include "osal/thread.hpp"
 
 #include <algorithm>
 #include <cctype>
@@ -89,6 +91,23 @@ void carry_server_fields(const models::JsonValue& old_doc, models::JsonValue& do
     }
 }
 bool page_truncated() { return t_request && !t_request->continue_token.empty(); }
+
+// A read-modify-write of a stored object writes only if the object is still
+// at the version it read: when another write came between (the kubelet's
+// status update and kubectl delete, a heartbeat and an annotation patch), it
+// reads and modifies the newer object again, as kube-apiserver retries an
+// update on a conflict. Neither change is lost.
+constexpr int kUpdateAttempts = 64;
+
+storage::Status put_if_unchanged(storage::Store& store, const std::string& key, const std::string& json, uint64_t version) {
+    return store.put_extended(key, json, true, storage::persist_class(key) != storage::PersistClass::Ephemeral, version, nullptr);
+}
+
+bool retry_update(const storage::Status& s, int attempt) {
+    if (s.code != storage::StatusCode::VersionConflict || attempt + 1 >= kUpdateAttempts) return false;
+    osal::Thread::yield();
+    return true;
+}
 
 // Objects whose writes may carry inline images: Pods and the workloads that
 // hold a pod template (status and scale subresources do not)
@@ -1480,17 +1499,24 @@ HttpResponse RouteHandler::handle_nodes(const HttpRequest& req, const RouteMatch
         if (!models::parse_json(req.body, patch_doc, err)) {
             return make_status(400, "BadRequest", "Failed to parse request body: " + err);
         }
-        std::string existing_json;
-        if (!store_.get(key, existing_json).ok()) {
-            return make_status(404, "NotFound", "nodes \"" + name + "\" not found", name, "nodes");
+        std::string updated_json;
+        for (int attempt = 0;; ++attempt) {
+            std::string existing_json;
+            uint64_t version = 0;
+            if (!store_.get_extended(key, existing_json, &version).ok()) {
+                return make_status(404, "NotFound", "nodes \"" + name + "\" not found", name, "nodes");
+            }
+            models::JsonValue target_doc;
+            if (!models::parse_json(existing_json, target_doc, err)) {
+                return make_status(500, "InternalError", "Failed to parse existing resource");
+            }
+            models::apply_patch(target_doc, patch_doc, req.content_type);
+            updated_json = target_doc.to_string();
+            storage::Status ps = put_if_unchanged(store_, key, updated_json, version);
+            if (retry_update(ps, attempt)) continue;
+            if (!ps.ok()) return store_failure(ps, "nodes", name);
+            break;
         }
-        models::JsonValue target_doc;
-        if (!models::parse_json(existing_json, target_doc, err)) {
-            return make_status(500, "InternalError", "Failed to parse existing resource");
-        }
-        models::apply_patch(target_doc, patch_doc, req.content_type);
-        std::string updated_json = target_doc.to_string();
-        if (storage::Status ps = store_.put(key, updated_json, true); !ps.ok()) return store_failure(ps, "nodes", name);
 
         HttpResponse resp;
         resp.status_code = 200;
@@ -1780,31 +1806,38 @@ HttpResponse RouteHandler::handle_pods(const HttpRequest& req, const RouteMatch&
             return make_status(400, "BadRequest", "Failed to parse request body: " + err);
         }
 
-        std::string existing_json;
-        if (!store_.get(key, existing_json).ok()) {
-            return make_status(404, "NotFound", "pods \"" + name + "\" not found", name, "pods");
+        std::string updated_json;
+        for (int attempt = 0;; ++attempt) {
+            std::string existing_json;
+            uint64_t version = 0;
+            if (!store_.get_extended(key, existing_json, &version).ok()) {
+                return make_status(404, "NotFound", "pods \"" + name + "\" not found", name, "pods");
+            }
+            models::JsonValue target_doc;
+            if (!models::parse_json(existing_json, target_doc, err)) {
+                return make_status(500, "InternalError", "Failed to parse existing resource");
+            }
+            models::apply_patch(target_doc, patch_doc, req.content_type);
+            if (match.category != RouteCategory::PodStatus) {
+                if (models::JsonValue* pspec = target_doc.get_mut("spec"); pspec && pspec->is_object()) models::add_default_tolerations(*pspec);
+            }
+            updated_json = target_doc.to_string();
+            storage::Status ps = put_if_unchanged(store_, key, updated_json, version);
+            if (retry_update(ps, attempt)) continue;
+            if (!ps.ok()) return store_failure(ps, "pods", name);
+            break;
         }
-
-        models::JsonValue target_doc;
-        if (!models::parse_json(existing_json, target_doc, err)) {
-            return make_status(500, "InternalError", "Failed to parse existing resource");
-        }
-        models::apply_patch(target_doc, patch_doc, req.content_type);
-        if (match.category != RouteCategory::PodStatus) {
-            if (models::JsonValue* pspec = target_doc.get_mut("spec"); pspec && pspec->is_object()) models::add_default_tolerations(*pspec);
-        }
-        std::string updated_json = target_doc.to_string();
-        if (storage::Status ps = store_.put(key, updated_json, true); !ps.ok()) return store_failure(ps, "pods", name);
 
         HttpResponse resp;
         resp.status_code = 200;
         resp.content_type = "application/json";
-        resp.body = updated_json;
+        resp.body = std::move(updated_json);
         return resp;
     }
 
     std::string existing_json;
-    storage::Status get_s = store_.get(key, existing_json);
+    uint64_t existing_version = 0;
+    storage::Status get_s = store_.get_extended(key, existing_json, &existing_version);
     if (!get_s.ok()) {
         return make_status(404, "NotFound", "pods \"" + name + "\" not found", name, "pods");
     }
@@ -1842,27 +1875,36 @@ HttpResponse RouteHandler::handle_pods(const HttpRequest& req, const RouteMatch&
                 has_grace = true;
             }
         }
-        models::JsonValue pdoc;
-        std::string perr;
-        std::string node_name;
-        bool terminating = false;
-        if (models::parse_json(existing_json, pdoc, perr) && pdoc.is_object()) {
-            const models::JsonValue* spec = pdoc.get("spec");
-            node_name = spec ? spec->get_string("nodeName", "") : "";
-            const models::JsonValue* meta = pdoc.get("metadata");
-            terminating = meta && !meta->get_string("deletionTimestamp", "").empty();
-        }
         const std::string now = models::now_rfc3339();
-        if (grace > 0 && !node_name.empty() && node_name != "<none>" && !terminating && !now.empty()) {
+        for (int attempt = 0;; ++attempt) {
+            models::JsonValue pdoc;
+            std::string perr;
+            std::string node_name;
+            bool terminating = false;
+            if (models::parse_json(existing_json, pdoc, perr) && pdoc.is_object()) {
+                const models::JsonValue* spec = pdoc.get("spec");
+                node_name = spec ? spec->get_string("nodeName", "") : "";
+                const models::JsonValue* meta = pdoc.get("metadata");
+                terminating = meta && !meta->get_string("deletionTimestamp", "").empty();
+            }
+            if (grace == 0 || node_name.empty() || node_name == "<none>" || terminating || now.empty()) break;
             models::JsonValue* meta = pdoc.get_mut("metadata");
             meta->set("deletionTimestamp", jstr(now));
             meta->set("deletionGracePeriodSeconds", jnum(static_cast<double>(grace)));
             std::string updated = pdoc.to_string();
-            if (storage::Status ps = store_.put(key, updated, true); !ps.ok()) return store_failure(ps, "pods", name);
+            storage::Status ps = put_if_unchanged(store_, key, updated, existing_version);
+            if (retry_update(ps, attempt)) {
+                // Written meanwhile (a status update): mark the newer pod
+                if (!store_.get_extended(key, existing_json, &existing_version).ok()) {
+                    return make_status(404, "NotFound", "pods \"" + name + "\" not found", name, "pods");
+                }
+                continue;
+            }
+            if (!ps.ok()) return store_failure(ps, "pods", name);
             HttpResponse resp;
             resp.status_code = 200;
             resp.content_type = "application/json";
-            resp.body = updated;
+            resp.body = std::move(updated);
             return resp;
         }
         store_.remove(key);
