@@ -92,7 +92,7 @@ You can upload, list, read, or delete files on any node's storage over the API n
 
 ## Host simulator differences
 
-- `--role standalone` (the default) runs the API server, controllers, and simulated kubelets (`--kubelet-name`, default `esp32-node-01`, and `--workers`, default `esp32-node-02`) in one process. Nodes report host OS, CPU, and memory figures, plus a host memory block set by `--psram` (default `1284Ki` on the control plane, `0` on workers).
+- `--role standalone` (the default) runs the API server, controllers, and simulated kubelets (`--kubelet-name`, default `esp32-node-01`, and `--workers`, default `esp32-node-02`) in one process. Nodes report host OS and CPU figures, a host memory block set by `--psram` (default `1284Ki` on the control plane, `0` on workers), and the memory that `--psram` and `--heap-budget` model ([CLI reference](../cli-reference.md#modeling-boards-with-psram)).
 - The Ingress controller is disabled by default; pass `--ingress-port <port>` to enable it. All simulated nodes run the pod HTTP server on `--pod-port` (default `7000`).
 - Pods are ticked once a second, never every 10 ms. Per-pod in-RAM log rings are 16 KiB.
 - Event channels use UDP only on `--ipc-port` (default `7400` plus `--node-id`).

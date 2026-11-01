@@ -85,6 +85,7 @@ struct SimOptions {
     // shared interpreter stack and this much heap left for pods and the
     // system (a Cardputer has about 51 KiB at idle)
     size_t heap_budget{51 * 1024};
+    bool heap_budget_set{false};           // --heap-budget given: with --psram it models the board's PSRAM besides the block
     bool board_without_psram{false};       // --psram 0 given
     // Stand-in for PSRAM: a block of host memory reserved like the control
     // plane board's PSRAM pod pool. -1: the role's default (1284Ki, the
@@ -118,7 +119,8 @@ static void print_sim_usage(std::ostream& out) {
            "  --worker-board <board>      kube32.io/board label of in-process workers (default cardputer)\n"
            "  --node-ip <ip>              address nodes report for their pods (default 127.0.0.1)\n"
            "  --psram <size>              PSRAM to model, e.g. 8Mi; 0 models a board without PSRAM\n"
-           "  --heap-budget <size>        heap left for pods and system with --psram 0 (default 51Ki)\n"
+           "  --heap-budget <size>        heap left for pods and system with --psram 0 (default 51Ki); with\n"
+           "                              --psram, the PSRAM besides the pool block (default: not modelled)\n"
            "  --sim-i2c <parts>           simulated I2C parts on bus 0 of this process's node, e.g.\n"
            "                              pahub,bme688@2,miniscale@3,rfid@4 (part[:0x<addr>][@<PaHub channel>];\n"
            "                              parts: pahub, bme688, miniscale, rfid)\n"
@@ -179,7 +181,10 @@ static SimOptions parse_sim_args(int argc, char* argv[]) {
         else if (arg == "--tls") opts.tls = true;
         else if (arg == "--egress-ca" && i + 1 < argc) opts.egress_ca = argv[++i];
         else if (arg == "--node-ip" && i + 1 < argc) opts.node_ip = argv[++i];
-        else if (arg == "--heap-budget" && i + 1 < argc) opts.heap_budget = static_cast<size_t>(kube32::models::parse_quantity(argv[++i]));
+        else if (arg == "--heap-budget" && i + 1 < argc) {
+            opts.heap_budget = static_cast<size_t>(kube32::models::parse_quantity(argv[++i]));
+            opts.heap_budget_set = true;
+        }
         else if (arg == "--sim-i2c" && i + 1 < argc) opts.sim_i2c = argv[++i];
         else if (arg == "--psram" && i + 1 < argc) {
             opts.psram_bytes = static_cast<int64_t>(kube32::models::parse_quantity(argv[++i]));
@@ -311,6 +316,12 @@ int main(int argc, char* argv[]) {
     if (opts.psram_bytes > 0) {
         kube32_pool_reserve_external(static_cast<size_t>(opts.psram_bytes));
         std::cout << "[SIM] PSRAM stand-in: " << (kube32_pool_block_size() / 1024) << " KiB of host memory (--psram)" << std::endl;
+        // The board's PSRAM besides the block, which pods' code, structures
+        // and smaller memories come from
+        if (opts.heap_budget_set) {
+            kube32_pool_set_heap_budget(opts.heap_budget);
+            std::cout << "[SIM] PSRAM besides the block: " << (opts.heap_budget / 1024) << " KiB (--heap-budget)" << std::endl;
+        }
     } else if (opts.board_without_psram) {
         // A board without PSRAM, as main_esp32.cpp sets it up: the 80 KiB pod
         // pool, the 28 KiB interpreter stack, and pods limited to the heap the

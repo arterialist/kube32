@@ -53,6 +53,7 @@ SUITE_MAPPING = {
         "tests.integration.cluster.test_self_healing",
         "tests.integration.cluster.test_channel_ipc",
         "tests.integration.cluster.test_reboot_recovery",
+        "tests.integration.cluster.test_example_placement",
     ],
     "federation": [
         "tests.integration.federation.test_upstream_federation",

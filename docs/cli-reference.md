@@ -32,7 +32,7 @@ Use `kubectl` and k9s to manage the cluster. Use the tools below to run the host
 | `--worker-board <board>` | `cardputer` | `kube32.io/board` label for in-process workers. |
 | `--node-ip <ip>` | `127.0.0.1` | Pod IP address advertised to other nodes; pass a LAN address so physical boards can reach pods on the simulator. |
 | `--psram <size>` | `1284Ki`; workers reserve none | PSRAM pool to model (for example `8Mi`). Passing `0` explicitly models a board without PSRAM (see below). |
-| `--heap-budget <size>` | `51Ki` | General heap available to pods and the system when `--psram 0` is set. |
+| `--heap-budget <size>` | `51Ki` | General heap available to pods and the system when `--psram 0` is set. With `--psram`, the board's PSRAM besides the pool block (not modelled unless set). |
 | `--sim-i2c <parts>` | none | Simulated I2C parts on bus 0 of this process's node, for example `pahub,bme688@2,miniscale@3,rfid@4`. The format is `<part>[:0x<address>][@<PaHub channel>]`, and the parts are `pahub`, `bme688`, `miniscale` and `rfid`. Discovery finds them and drivers read them ([Devices](devices.md#compute-on-a-laptop)). |
 | `--ingress-port <port>` | off (`0`) | Ingress controller HTTP port. |
 | `--pod-port <port>` | `7000` | Pod HTTP server port on every node. |
@@ -47,7 +47,11 @@ Use `kubectl` and k9s to manage the cluster. Use the tools below to run the host
 
 ### Modeling boards without PSRAM
 
-`--psram 0` models a board without PSRAM and reports no `esp32.io/psram` capacity. Pods share an 80 KiB pool block and one 28 KiB interpreter stack. The kubelet admits a pod against the free part of the pool block plus `--heap-budget`, default `51Ki`, minus the 24 KiB system reserve, and caps pod allocations in the general heap at the heap budget minus that reserve. The board itself admits pods on the pool block alone, while the simulator also counts the heap budget because its 64-bit `wasm3` structures are larger than the board's. Node allocatable memory equals the heap budget plus the pool block. Without `--psram`, `standalone` and `control-plane` nodes behave as PSRAM boards.
+`--psram 0` models a board without PSRAM and reports no `esp32.io/psram` capacity. Pods share an 80 KiB pool block and one 28 KiB interpreter stack. The kubelet admits a pod against the free part of the pool block plus `--heap-budget`, default `51Ki`, minus the 24 KiB system reserve, and caps pod allocations in the general heap at the heap budget minus that reserve. The board itself admits pods on the pool block alone, while the simulator also counts the heap budget because its 64-bit `wasm3` structures are larger than the board's. Node allocatable memory is that room: the free part of the pool block plus the heap budget above the reserve. Without `--psram`, `standalone` and `control-plane` nodes behave as PSRAM boards.
+
+### Modeling boards with PSRAM
+
+`--psram <size>` reserves the PSRAM pool block, and nodes report it as `esp32.io/psram`. With `--heap-budget`, the simulator also models the board's PSRAM besides the block: pods' code, runtime structures and smaller linear memories take from it, and the node reports it above a 16 KiB reserve as allocatable `memory`, and with the block's free part as allocatable `esp32.io/psram`. For example, `--psram 1284Ki --heap-budget 320Ki` gives 304 KiB of allocatable memory. Without `--heap-budget`, the host's memory is not modelled and nodes report 1 GiB of allocatable memory.
 
 The simulator is a 64-bit host build where `wasm3` runtime structures are about 2.3x larger than on the 32-bit ESP32-S3. A pod set that fits on a `--psram 0` simulator fits on the board, while the reverse is not guaranteed.
 
