@@ -14,7 +14,7 @@ kube32 is a Kubernetes-compatible control plane and WebAssembly pod runtime for 
 - Service routing, HTTP Ingress with host and prefix rules, Server-Sent Events streams, embedded static asset bundles via `k32_resp_asset` and `StaticBundle`, and synchronous pod-to-pod HTTP calls via `k32_http_call`.
 - Persistent object store backed by a CRC-checked journal on a raw flash partition or the microSD card, plus `persistentVolumeClaim` pod volumes via `k32_fs_*` and rotated container logs for `kubectl logs --previous`.
 - Peripheral access gated per pod by a capability firewall covering GPIO pins, ADC channels, I2C and UART buses, ST7789 display, key matrix, I2S speaker, and microSD storage.
-- Devices: sensors and switches as API objects. Nodes discover and identify I2C parts, including behind a PaHub multiplexer; the control plane runs each part's driver on the node it is wired to, and apps on any node, a laptop running `kube32-sim` included, read it through a Service.
+- Devices: sensors and switches as API objects. Nodes find and identify I2C parts, also behind a PaHub multiplexer. The control plane runs each part's driver on the node that has the part. Apps on any node read the part through a Service, also from a laptop that runs `kube32-sim`.
 - Container lifecycle management with `restartPolicy` set to `Always`, `OnFailure`, or `Never`, exponential CrashLoopBackOff, and distinct exit codes for Wasm traps, gas exhaustion, and `OOMKilled`.
 - Optional bearer-token authentication and automatic self-signed ECDSA P-256 TLS on port 6443.
 - Firmware rollouts through the cluster: one node at a time, SHA-256 checked, with bootloader rollback when an image does not come up healthy.
@@ -44,7 +44,7 @@ Measured on an ESP32-S3 devkit (control plane, 2 MB PSRAM) and an M5Stack Cardpu
 | A pod from `kubectl apply` to `Running` | 2.8 s |
 | `kube32-sim` with a worker on ARM64 Linux, idle | 6.4 MiB, 0.33 % of a core (k3s v1.33.1: 574 to 918 MiB, 2.2 to 3.2 %) |
 
-Pods suit control logic, I/O and glue. Compute-heavy work belongs in native host functions.
+Use pods for control logic, I/O and glue code. Put heavy computation in native host functions.
 
 ## Quick start
 
@@ -141,4 +141,4 @@ See [SECURITY.md](SECURITY.md) for the deployment security model and instruction
 
 ## License
 
-Apache License 2.0. See [LICENSE](LICENSE). `third_party/wasm3` is licensed under the MIT License in `third_party/wasm3/LICENSE`. The BME688 compensation in `apps/drivers/bme688` is ported from the Bosch Sensortec BME68x Sensor API under the BSD-3-Clause license; the notice is in its source.
+Apache License 2.0. See [LICENSE](LICENSE). `third_party/wasm3` is licensed under the MIT License in `third_party/wasm3/LICENSE`. The BME688 compensation in `apps/drivers/bme688` comes from the Bosch Sensortec BME68x Sensor API under the BSD-3-Clause license. The notice is in its source file.

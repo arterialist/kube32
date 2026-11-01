@@ -1,6 +1,6 @@
 # Benchmarks
 
-Measurements of what kube32 costs on the boards it runs on: the Wasm sandbox against native code, the memory a pod and the platform take, the control plane's CPU and latency, and the host simulator next to k3s. Every number on this page was measured on the hardware named here; the commands to repeat them are at the end.
+This page gives what kube32 costs on its boards. It compares the Wasm sandbox with native code. It gives the memory that a pod and the platform use, and the CPU load and latency of the control plane. It also compares the host simulator with k3s. The Setup section names the hardware. The commands that repeat the measurements are at the end of the page.
 
 ## Setup
 
@@ -11,19 +11,41 @@ Measurements of what kube32 costs on the boards it runs on: the Wasm sandbox aga
 | Memory | 512 KB SRAM, 2 MB quad PSRAM at 80 MHz | 512 KB SRAM, no PSRAM |
 | Role | API server, store, controllers, kubelet | kubelet, three device drivers |
 
-Firmware: ESP-IDF 5.5.3, built with `-O2` (`CONFIG_COMPILER_OPTIMIZATION_PERF`), 3,303,200 bytes in a 3,407,872-byte app slot, 55,252 bytes of static RAM. Pods: freestanding C compiled with clang `-Oz` to Wasm, run by kube32's wasm3 interpreter. Both boards were on the same 2.4 GHz Wi-Fi network as the client, a laptop.
+The firmware uses ESP-IDF 5.5.3 and the `-O2` build option (`CONFIG_COMPILER_OPTIMIZATION_PERF`). The image is 3,303,200 bytes in a 3,407,872-byte app slot, with 55,252 bytes of static RAM. The pods are freestanding C. Clang compiles them to Wasm with `-Oz`, and the kube32 wasm3 interpreter runs them. Both boards and the client, a laptop, use the same 2.4 GHz Wi-Fi network.
 
 ## Wasm against native code
 
-The same C source, `src/bench/bench_kernels.c`, is built into the firmware and into the bench pod (`apps/bench`). The firmware runs a kernel natively on the console task (`K32_CMD:BENCH`); the pod runs it in its sandbox and times it with the node's microsecond clock. Each time is the fastest of five runs; both sides return the same checksum for every kernel. "Metered" is a pod with the default execution budget (gas accounting on); "unmetered" sets `kube32.io/execution-budget: "off"`.
+The firmware and the bench pod (`apps/bench`) contain the same C source, `src/bench/bench_kernels.c`. The firmware runs a kernel natively on the console task (`K32_CMD:BENCH`). The pod runs the same kernel in its sandbox and times it with the node's microsecond clock. Each time is the fastest of five runs. For each kernel, the two sides return the same checksum.
 
-TABLES
+A metered pod has the default execution budget, so gas accounting is on. An unmetered pod sets `kube32.io/execution-budget: "off"`.
 
-- A pod runs compute 32 to 95 times slower than native code on the ESP32-S3. Gas metering adds up to about 45 % on top.
-- Where the pod's memory lives makes little difference: the Cardputer runs pods from internal SRAM, the devkit from PSRAM, and the ratios are about the same.
-- The interpreter is the cost. GCC for the ESP32-S3 makes no tail calls, so wasm3 dispatches every Wasm instruction with a native call and return instead of a jump.
+### Cardputer
 
-What this means for pods: a pod is the right place for control logic, protocol handling and glue, not for number crunching. Work that needs native speed belongs in a host function, which a pod calls for about 1.5 µs:
+| Kernel | Native | Pod, metered | Pod, unmetered |
+| --- | ---: | ---: | ---: |
+| fib: recursive Fibonacci, n = 15 (calls) | 76 µs | 4,194 µs (55x) | 2,974 µs (39x) |
+| crc32: bitwise CRC-32 of 4 KiB (byte loads, shifts) | 880 µs | 74,191 µs (84x) | 51,672 µs (59x) |
+| sieve: sieve of Eratosthenes below 4096 (byte stores) | 458 µs | 21,630 µs (47x) | 14,826 µs (32x) |
+| sort: heapsort of 1024 words (compares, swaps) | 1,057 µs | 86,463 µs (82x) | 71,573 µs (68x) |
+| mandel: 32 x 32 Mandelbrot, 64 iterations (float) | 2,622 µs | 123,495 µs (47x) | 103,922 µs (40x) |
+| json: 200 small JSON records (text) | 1,394 µs | 71,198 µs (51x) | 50,600 µs (36x) |
+
+### devkit
+
+| Kernel | Native | Pod, metered | Pod, unmetered |
+| --- | ---: | ---: | ---: |
+| fib: recursive Fibonacci, n = 15 (calls) | 60 µs | 4,085 µs (68x) | 3,560 µs (59x) |
+| crc32: bitwise CRC-32 of 4 KiB (byte loads, shifts) | 890 µs | 84,411 µs (95x) | 72,342 µs (81x) |
+| sieve: sieve of Eratosthenes below 4096 (byte stores) | 456 µs | 15,903 µs (35x) | 16,332 µs (36x) |
+| sort: heapsort of 1024 words (compares, swaps) | 1,057 µs | 86,001 µs (81x) | 84,988 µs (80x) |
+| mandel: 32 x 32 Mandelbrot, 64 iterations (float) | 2,962 µs | 124,576 µs (42x) | 115,538 µs (39x) |
+| json: 200 small JSON records (text) | 1,752 µs | 71,822 µs (41x) | 64,361 µs (37x) |
+
+- On the ESP32-S3, a pod runs compute 32 to 95 times slower than native code. Gas metering adds up to about 45 %.
+- The location of the pod's memory changes little. The Cardputer runs pods from internal SRAM and the devkit runs them from PSRAM, but the ratios are about the same.
+- The interpreter causes the cost. GCC for the ESP32-S3 makes no tail calls. Thus wasm3 dispatches each Wasm instruction with a native call and return, not with a jump.
+
+Use a pod for control logic, protocol handling and glue code. Do not use a pod for heavy computation. Put work that needs native speed in a host function. A call from a pod to a host function costs about 1.5 µs:
 
 | | Cardputer | devkit |
 | --- | ---: | ---: |
@@ -31,33 +53,37 @@ What this means for pods: a pod is the right place for control logic, protocol h
 | `k32_time_ms()` from an unmetered pod (the same call through the sandbox) | 2.44 µs | 2.64 µs |
 | Cost of crossing the sandbox | 1.45 µs | 1.66 µs |
 
-The drivers follow this split: a driver reads registers over I2C and does its arithmetic in Wasm, while the I2C transfers, the bus lock and the multiplexer run natively.
+The device drivers use this split. A driver reads registers over I2C and calculates the readings in Wasm. The I2C transfers, the bus lock and the multiplexer run natively.
 
 ### Native stack
 
-Because every executed instruction keeps a native frame (48 to 64 bytes) until its function returns, a long straight run of instructions in one function takes native stack in proportion to its length. The shared interpreter stack is 28 KiB on a board without PSRAM, of which about 21.9 KB is available to a call; a call that needs more traps with `stack overflow` and reports how much it used. Two things measured on the Cardputer:
+Each instruction that wasm3 executes keeps a native frame of 48 to 64 bytes until its function returns. Thus a long sequence of instructions in one function uses native stack in proportion to its length.
 
-- The bench pod built with `-O2`, where clang inlines the query parsing and output helpers into one function, used 23.2 KB for a request that runs `fib(1)` and trapped; the same source built with `-Oz` and its helpers kept out of line answers every request.
-- The BME688 driver's first reading, with its compensation formulas inlined into `k32_tick`, used 22 KB; with each compensation step a function of its own it runs well inside the limit.
+On a board without PSRAM, the shared interpreter stack is 28 KiB. A call can use about 21.9 KB of it. A call that needs more traps with `stack overflow`, and the trap message tells how much stack the call used. These two cases occurred on the Cardputer:
 
-Pods for boards without PSRAM should be built with `-Oz` and keep long computations in functions of their own.
+- Clang `-O2` puts the query parsing and output helpers of the bench pod into one function. A request that runs `fib(1)` then used 23.2 KB and trapped. With `-Oz` and the helpers kept as separate functions, the same source answers every request.
+- The BME688 driver with its compensation formulas inside `k32_tick` used 22 KB for its first reading. With each compensation step in a separate function, the driver stays well inside the limit.
+
+For a board without PSRAM, build pods with `-Oz` and put long computations in separate functions.
 
 ## Memory
 
 ### A pod
 
-| Pod | Linear memory | Taken on the Cardputer (pod pool) | Taken on the devkit |
+| Pod | Linear memory | Used on the Cardputer (pod pool) | Used on the devkit |
 | --- | ---: | ---: | ---: |
 | bme688 driver | 3 KiB | 25,400 bytes | |
 | miniscale driver | 3 KiB | 20,072 bytes | |
 | rfid driver | 3 KiB | 23,536 bytes | |
 | bench | 24 KiB | 42,976 bytes | 55 to 59 KB of PSRAM, 1 KB of SRAM |
 
-What a pod takes is its linear memory, its compiled code (about three bytes per byte of Wasm code), its value stack and the interpreter's structures. On a board without PSRAM it all comes from an 80 KiB pod pool reserved at boot, beside about 1.5 KB of kubelet and runtime bookkeeping in the general heap; the Cardputer runs the three drivers above together with 12.9 KB of the pool to spare.
+A pod uses memory for its linear memory, its compiled code, its value stack and the interpreter's structures. The compiled code is about three bytes for each byte of Wasm code.
+
+On a board without PSRAM, all of this memory comes from an 80 KiB pod pool that the node reserves at boot. The kubelet and the runtime also keep about 1.5 KB for each pod in the general heap. The Cardputer runs the three drivers above together, with 12.9 KB of the pool free.
 
 ### The platform
 
-Free memory at each stage of boot:
+Free memory in bytes at each stage of boot:
 
 | Stage | Cardputer (SRAM) | devkit (SRAM) | devkit (PSRAM) |
 | --- | ---: | ---: | ---: |
@@ -66,23 +92,25 @@ Free memory at each stage of boot:
 | Cluster services up | 59,396 | 10,531 to 74,935 | 434,128 |
 | Steady, with the workloads above | 22,700 to 26,000 | 18,071 | 311,332 |
 
-On the worker, the kubelet, the pod HTTP server, event delivery and discovery take about 65 KB of SRAM; the 80 KiB pool and the 28 KiB interpreter stack are reserved before that. On the control plane, the API server, object store, controllers and their buffers take about 235 KB of PSRAM. The devkit's SRAM figure at "cluster services up" varies between boots with what the API server is serving at that moment.
+On the worker, the kubelet, the pod HTTP server, event delivery and discovery use about 65 KB of SRAM. The node reserves the 80 KiB pool and the 28 KiB interpreter stack before these services start.
+
+On the control plane, the API server, the object store, the controllers and their buffers use about 235 KB of PSRAM. The devkit's SRAM value at "cluster services up" changes from boot to boot. It depends on the requests that the API server is serving at that time.
 
 ## CPU
 
-Share of the two cores busy over 60 s, from FreeRTOS run-time counters (`K32_CMD:TASKS`):
+This table gives the busy share of the two cores over 60 s. The values come from the FreeRTOS run-time counters (`K32_CMD:TASKS`).
 
-| Node | Busy | Largest consumers |
+| Node | Busy | Largest users |
 | --- | ---: | --- |
 | devkit, control plane with one Deployment and three Devices | 20.8 % | Deployment controller 10.0 % of a core, TCP/IP 7.1 %, Wi-Fi 6.4 %, Device controller 4.3 % |
 | Cardputer, three drivers | 18.7 % | Wi-Fi 11.2 %, pod ticks 11.1 % (rfid polls five times a second), TCP/IP 7.1 % |
 | Cardputer, no pods | 8.1 % | Wi-Fi 6.5 %, TCP/IP 4.1 %, kubelet 1.5 % |
 
-The Deployment and Device controllers reconcile on a timer (every 1 s and 2 s) by reading the objects they manage; that polling is most of the control plane's idle load.
+The Deployment controller reconciles every 1 s and the Device controller every 2 s. On each pass, they read the objects that they manage. This polling causes most of the control plane's idle load.
 
 ## Latency
 
-Over Wi-Fi from a laptop on the same network, median (90th percentile) of 15 to 30 requests:
+A laptop on the same Wi-Fi network sent 15 to 30 requests of each type. The table gives the median, with the 90th percentile in brackets.
 
 | Request | Time |
 | --- | ---: |
@@ -95,7 +123,9 @@ Over Wi-Fi from a laptop on the same network, median (90th percentile) of 15 to 
 
 ## On a computer: kube32-sim and k3s
 
-`kube32-sim` is the same control plane, kubelet and runtime built for macOS or Linux. Measured in ARM64 Linux containers (Ubuntu 24.04, 4 CPUs each) on an Apple M3 Pro, after three minutes idle, then with ten pods; memory is the summed resident set of the container's processes, with the cgroup's figure in brackets; CPU is the share of one core over 60 s:
+`kube32-sim` is the same control plane, kubelet and runtime, built for macOS or Linux. These measurements used ARM64 Linux containers (Ubuntu 24.04, 4 CPUs each) on an Apple M3 Pro. Each cluster stayed idle for three minutes before the first measurement. The second measurement ran with ten pods.
+
+The memory value is the sum of the resident sets of the container's processes. The value in brackets is the cgroup's value. The CPU value is the share of one core over 60 s.
 
 | | Memory | CPU |
 | --- | ---: | ---: |
@@ -105,20 +135,29 @@ Over Wi-Fi from a laptop on the same network, median (90th percentile) of 15 to 
 | k3s v1.33.1, without Traefik, ServiceLB, metrics-server, local storage, Helm controller | 574 MiB (407 MiB) | 2.17 % |
 | the same k3s with ten pause containers | 764 MiB (506 MiB) | 2.29 % |
 
-The two are not the same thing: k3s runs containers through containerd and implements all of Kubernetes, while kube32 runs Wasm modules in one process and implements the subset in [the API reference](api-reference.md). The comparison shows what a Kubernetes-style control plane costs when it is built for kilobytes; natively on macOS the simulator idles at 9.6 MiB and 0.17 % of a core.
+The two systems do different work. k3s runs containers through containerd and implements all of Kubernetes. kube32 runs Wasm modules in one process and implements the subset in [the API reference](api-reference.md). The comparison shows the cost of a Kubernetes-style control plane that kube32 builds for kilobytes of memory. Natively on macOS, the simulator idles at 9.6 MiB and 0.17 % of a core.
 
 ## Repeating the measurements
 
-Native kernels, on a node's serial console:
+To run the native kernels, send these commands on a node's serial console:
 
 ```
 K32_CMD:BENCH:crc32:4:5         -> K32_BENCH kernel=crc32 n=4 runs=5 us_min=... us_total=... sum=...
 K32_CMD:BENCH:hostcall:100000   -> K32_BENCH hostcall calls=100000 us=...
 ```
 
-Kernels: `fib` (n = depth), `crc32` (n = KiB), `sieve` (n = limit, at most 4096), `sort` (n = words, at most 1024), `mandel` (n = grid side), `json` (n = records).
+The kernels and their sizes:
 
-The same kernels in a pod:
+| Kernel | n |
+| --- | --- |
+| `fib` | recursion depth |
+| `crc32` | KiB of data |
+| `sieve` | upper limit, at most 4096 |
+| `sort` | words, at most 1024 |
+| `mandel` | side of the grid |
+| `json` | records |
+
+To run the same kernels in a pod:
 
 ```sh
 make -C apps/bench
@@ -127,4 +166,10 @@ curl -H 'X-Kube32-Pod: default/bench' 'http://<node address>:7000/run?k=crc32&n=
 curl -H 'X-Kube32-Pod: default/bench' 'http://<node address>:7000/hostcall?n=100000'
 ```
 
-For an unmetered pod, add `--dry-run`, put `kube32.io/execution-budget: "off"` in the pod's annotations, and apply the manifest with kubectl. CPU shares come from two `K32_CMD:TASKS` listings taken 60 s apart (`run_ms` per task).
+For an unmetered pod, do these steps:
+
+1. Add `--dry-run` to the `kube32-cli deploy` command and keep the manifest that it prints.
+2. Add `kube32.io/execution-budget: "off"` to the pod's annotations.
+3. Apply the manifest with kubectl.
+
+To get the CPU shares, take two `K32_CMD:TASKS` listings 60 s apart and compare the `run_ms` value of each task.

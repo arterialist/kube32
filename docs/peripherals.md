@@ -9,12 +9,12 @@ The firewall reads `resources.requests`, or `resources.limits` when `requests` i
 | Resource | `securityContext.capabilities.add` | Grants |
 | --- | --- | --- |
 | `esp32.io/gpio-<N>: "1"` | None | Read, write, and configure GPIO pin `N` |
-| `esp32.io/gpio-input-<N>: "1"` | None | Read GPIO pin `N` and configure it as an input (with or without a pull), never drive it. GPIO `0`, the boot button, may be claimed this way |
+| `esp32.io/gpio-input-<N>: "1"` | None | Read GPIO pin `N` and set it as an input, with or without a pull. The pod cannot drive the pin. A pod can claim GPIO `0`, the boot button, in this way |
 | `esp32.io/gpio: "<count>"` | None | `<count>` free claimable GPIO pins, lowest numbers first |
 | `esp32.io/adc1-channel-<0..9>: "1"` | None | Read ADC1 channel `0..9` (samples GPIO `channel + 1`) |
 | `esp32.io/adc: "<count>"` | None | `<count>` free claimable ADC1 channels |
 | `esp32.io/i2c-bus-<0\|1>: "1"` | None | I2C controller `0` or `1` and its SDA/SCL pins |
-| Annotation `kube32.io/i2c-device: "bus=<n>,addr=0x<hh>[,mux=0x<hh>:<channel>]"` | None | One address on I2C bus `n`, shared with other pods' grants, behind a PCA9548A channel when `mux` is set ([shared I2C buses](devices.md#shared-i2c-buses)) |
+| Annotation `kube32.io/i2c-device: "bus=<n>,addr=0x<hh>[,mux=0x<hh>:<channel>]"` | None | One address on I2C bus `n`. Other pods' grants share the bus. With `mux`, the address is behind a PCA9548A channel ([shared I2C buses](devices.md#shared-i2c-buses)) |
 | `esp32.io/i2c: "<count>"` | None | `<count>` free I2C controllers |
 | `esp32.io/uart-<1\|2>: "1"` | None | UART port `1` or `2` and its TX/RX pins |
 | `esp32.io/uart: "<count>"` | None | `<count>` free UART ports |
@@ -41,7 +41,7 @@ Declared in `include/runtime/k32_app_abi.h` and linked in `src/runtime/host_func
 | `esp32_gpio_write` | `i(ii)` | `int32_t esp32_gpio_write(uint32_t pin, uint32_t value)` | Sets output level (`0` or `1`) on `pin`. Returns `0` or negative error. |
 | `esp32_gpio_read` | `i(i)` | `int32_t esp32_gpio_read(uint32_t pin)` | Returns input level (`0` or `1`) on `pin`, or negative error. |
 | `esp32_adc_read` | `i(i)` | `int32_t esp32_adc_read(uint32_t channel)` | One-shot read on ADC1 `channel` (`0..9`, 12 dB attenuation). Returns raw reading or negative error. |
-| `esp32_chip_temp_read` | `i(i)` | `int32_t esp32_chip_temp_read(int32_t* out_milli_c)` | Stores the ESP32-S3's internal temperature in milli-degrees Celsius and returns `0`, or negative error. The sensor measures the die, which runs above the ambient temperature. The simulator reports 40.0 °C. |
+| `esp32_chip_temp_read` | `i(i)` | `int32_t esp32_chip_temp_read(int32_t* out_milli_c)` | Stores the ESP32-S3's internal temperature in milli-degrees Celsius and returns `0`, or a negative error. The sensor measures the die, which is warmer than the air around it. The simulator reports 40.0 °C. |
 | `esp32_i2c_write` | `i(iiii)` | `int32_t esp32_i2c_write(uint32_t bus, uint32_t addr, const void* data, uint32_t len)` | Writes `len` bytes to 7-bit `addr` on `bus` (100 ms timeout). Returns bytes written or negative error. |
 | `esp32_i2c_read` | `i(iiii)` | `int32_t esp32_i2c_read(uint32_t bus, uint32_t addr, void* buf, uint32_t len)` | Reads `len` bytes from 7-bit `addr` on `bus` (100 ms timeout). Returns bytes read or negative error. |
 | `esp32_uart_write` | `i(iii)` | `int32_t esp32_uart_write(uint32_t port, const void* data, uint32_t len)` | Writes `len` bytes to UART `port` (`1` or `2`). Returns bytes queued or negative error. |
@@ -125,7 +125,7 @@ Calling `esp32_i2c_write(bus, addr, ptr, 0)` with `len` set to `0` probes `addr`
 
 ### Device discovery
 
-Each node probes its board's default I2C pins (I2C0 on GPIO 8/9 on a devkit, I2C0 on the Grove port GPIO 2/1 on the Cardputer) before it registers and every 10 seconds after (`src/hal/i2c_discovery.cpp`). Each address that acknowledges a zero-length write becomes a node label, so a pod can select the node with that device attached. Behind a PCA9548A multiplexer, such as the M5Stack PaHub, each channel is scanned on its own, and parts of the driver catalog are identified and become [Devices](devices.md#discovery):
+Each node probes the default I2C pins of its board (`src/hal/i2c_discovery.cpp`). These pins are I2C0 on GPIO 8/9 on a devkit and I2C0 on the Grove port, GPIO 2/1, on the Cardputer. The node probes before it registers, and then every 10 seconds. Each address that acknowledges a zero-length write becomes a node label. Thus a pod can select the node that has the device. Behind a PCA9548A multiplexer, for example the M5Stack PaHub, the scan probes each channel separately. It identifies the parts of the driver catalog, and these parts become [Devices](devices.md#discovery):
 
 | Label | Value |
 | --- | --- |
@@ -141,7 +141,7 @@ spec:
 kubectl --context kube32 get nodes -L i2c.kube32.io/0x28
 ```
 
-* A scan runs only when no pod claims the controller whole or holds its pins. While a pod holds a bus, the node keeps the labels from the last scan. Pod admission waits while a scan holds a free bus (a few hundred milliseconds with a multiplexer). A bus shared by device grants is scanned beside the pods that share it.
+* A scan runs only when no pod claims the whole controller or holds its pins. While a pod holds a bus, the node keeps the labels from the last scan. While a scan holds a free bus, pod admission waits. With a multiplexer, this takes a few hundred milliseconds. The node scans a bus that device grants share while the pods that share it run.
 * If the bus lines read low with internal pull-ups enabled, something other than an idle I2C bus drives them. The node skips the scan and reports no devices on that bus.
 * The kubelet patches label changes onto its Node: it adds labels for detected devices and removes labels for devices that stop answering. When a node re-registers after a reboot, it removes `i2c.kube32.io/` labels it no longer finds.
 * As in Kubernetes, removing a label does not evict a running pod.
@@ -275,7 +275,7 @@ The `rfid` [device driver](https://github.com/arterialist/kube32/tree/main/apps/
 
 The ESP32-S3 provides GPIO 0 to 21 and 26 to 48. The firewall blocks claims on reserved pins (`include/hal/capability_firewall.hpp`):
 
-* Every board (`KUBE32_RESERVED_GPIO_MASK`) reserves GPIO `0` for boot strapping, `19` and `20` for native USB, `26` to `32` for SPI flash and quad PSRAM, and `43` and `44` for the UART0 console. The `cardputer` profile offers GPIO `44` to RMT TX channels for its IR LED. GPIO `0` may be claimed as an input pin (`esp32.io/gpio-input-0`) to read the boot button.
+* Every board (`KUBE32_RESERVED_GPIO_MASK`) reserves GPIO `0` for boot strapping, `19` and `20` for native USB, `26` to `32` for SPI flash and quad PSRAM, and `43` and `44` for the UART0 console. The `cardputer` profile offers GPIO `44` to RMT TX channels for its IR LED. A pod can claim GPIO `0` as an input pin (`esp32.io/gpio-input-0`) to read the boot button.
 * The `cardputer` profile also reserves LCD SPI pins `33` to `38`, I2S speaker pins `41` to `43`, keyboard matrix pins `3` to `9`, `11`, `13`, and `15`, and microSD SPI pins `12`, `14`, `39`, and `40`.
 
 An ADC1 channel `N` from `0` to `9` is claimable only when its pad, GPIO `N + 1`, is claimable by the board profile.
