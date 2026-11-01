@@ -41,6 +41,7 @@ set(KUBE32_APP_SRCS
     controller/workload_controller.cpp
     controller/firmware_rollout_controller.cpp
     controller/device_controller.cpp
+    controller/checkpoint_controller.cpp
     controller/reconcile_trigger.cpp
     hal/capability_firewall.cpp
     hal/mock_hal.cpp
@@ -180,6 +181,7 @@ set_source_files_properties(
     ${CMAKE_CURRENT_LIST_DIR}/hal/firmware_slots.cpp
     ${CMAKE_CURRENT_LIST_DIR}/kubelet/firmware_agent.cpp
     ${CMAKE_CURRENT_LIST_DIR}/controller/device_controller.cpp
+    ${CMAKE_CURRENT_LIST_DIR}/controller/checkpoint_controller.cpp
     ${CMAKE_CURRENT_LIST_DIR}/models/migration.cpp
     ${CMAKE_CURRENT_LIST_DIR}/models/device.cpp
     ${CMAKE_CURRENT_LIST_DIR}/hal/i2c_discovery.cpp

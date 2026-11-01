@@ -15,7 +15,9 @@
 // that taint, once the matching toleration's tolerationSeconds have passed
 // since the taint was added, and never when that toleration has no
 // tolerationSeconds. The API server gives pods 300 s; DaemonSet pods are not
-// evicted. A renewal clears both taints and the pods that are still bound
+// evicted. An evicted pod with a Saved periodic checkpoint gets the
+// annotation kube32.io/restore-from naming the latest one, so the node it is
+// bound to next restores it (controller/checkpoint_controller.hpp). A renewal clears both taints and the pods that are still bound
 // stay; the kubelet's next status update restores Ready. Other NoExecute
 // taints are not acted on: the scheduler does not filter on taints.
 //

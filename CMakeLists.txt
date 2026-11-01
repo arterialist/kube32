@@ -135,6 +135,7 @@ else()
         src/controller/workload_controller.cpp
         src/controller/firmware_rollout_controller.cpp
         src/controller/device_controller.cpp
+        src/controller/checkpoint_controller.cpp
         src/controller/reconcile_trigger.cpp
         src/ipc/channel.cpp
         src/api/table_serializer.cpp
@@ -529,6 +530,11 @@ else()
     )
     target_link_libraries(test_devices PRIVATE kube32_core)
     add_test(NAME test_devices COMMAND test_devices)
+
+    # Checkpoints and moves: the Checkpoint controller, the eviction API, the policies
+    add_executable(test_checkpoint_controller tests/test_checkpoint_controller.cpp)
+    target_link_libraries(test_checkpoint_controller PRIVATE kube32_core)
+    add_test(NAME test_checkpoint_controller COMMAND test_checkpoint_controller)
 
     # The wasm3 operations each bench kernel executes (docs/benchmarks.md):
     # bench_ops <apps/bench/build/ops.wasm>

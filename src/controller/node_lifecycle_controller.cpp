@@ -1,4 +1,6 @@
 #include "controller/node_lifecycle_controller.hpp"
+#include "controller/checkpoint_controller.hpp"
+#include "models/migration.hpp"
 #include "models/kube_models.hpp"
 #include "models/tolerations.hpp"
 #include "osal/system.hpp"
@@ -396,7 +398,18 @@ void NodeLifecycleController::evict_pods(const std::map<std::string, uint64_t>& 
         const std::string phase = st ? st->get_string("phase", "") : "";
         if (phase == "Succeeded" || phase == "Failed") continue;
 
-        // Back to the scheduler: unbound, Pending, marked as evicted
+        // Back to the scheduler: unbound, Pending, marked as evicted. A pod
+        // with a periodic checkpoint is restored from the latest one.
+        const std::string pod_name = meta ? meta->get_string("name", "") : "";
+        std::string checkpoint;
+        if (latest_periodic_checkpoint(store_, meta ? meta->get_string("namespace", "default") : "default", pod_name, checkpoint)) {
+            if (models::JsonValue* m = doc.get_mut("metadata")) {
+                models::JsonValue ann = m->get("annotations") && m->get("annotations")->is_object() ? *m->get("annotations") : models::JsonValue{};
+                ann.type = models::JsonType::Object;
+                ann.set(models::kAnnotationRestoreFrom, jstr(checkpoint));
+                m->set("annotations", std::move(ann));
+            }
+        }
         models::JsonValue* mutable_spec = doc.get_mut("spec");
         if (mutable_spec) mutable_spec->set("nodeName", jstr(""));
         models::JsonValue* mutable_status = doc.get_mut("status");
@@ -436,7 +449,7 @@ void NodeLifecycleController::evict_pods(const std::map<std::string, uint64_t>& 
         ev.message = "Pod evicted from node " + node_name + ": node lease expired and " +
                      (tolerated_s > 0 ? "the pod's " + std::to_string(tolerated_s) + " s toleration of " + kUnreachableTaint + ":NoExecute ran out"
                                       : "the pod does not tolerate " + std::string(kUnreachableTaint) + ":NoExecute") +
-                     ", pending rescheduling";
+                     ", pending rescheduling" + (checkpoint.empty() ? std::string() : "; it restores from checkpoint " + checkpoint);
         ev.warning = true;
         ev.component = "node-controller";
         events_.record(ev);

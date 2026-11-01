@@ -25,6 +25,7 @@
 #include "controller/workload_controller.hpp"
 #include "controller/firmware_rollout_controller.hpp"
 #include "controller/device_controller.hpp"
+#include "controller/checkpoint_controller.hpp"
 #include "api/firmware_api.hpp"
 #include "hal/firmware_slots.hpp"
 #include "hal/capability_firewall.hpp"
@@ -1204,6 +1205,7 @@ void cluster_task(void* pv) {
     std::unique_ptr<kube32::controller::WorkloadController> workloads;
     std::unique_ptr<kube32::controller::FirmwareRolloutController> firmware_rollouts;
     std::unique_ptr<kube32::controller::DeviceController> devices;
+    std::unique_ptr<kube32::controller::CheckpointController> checkpoints;
     std::unique_ptr<kube32::api::HttpServer> api_server;
     std::unique_ptr<kube32::kubelet::Kubelet> kubelet;
     std::unique_ptr<kube32::app::IngressController> ingress;
@@ -1360,6 +1362,13 @@ void cluster_task(void* pv) {
         dev_cfg.stack_in_psram = ident.has_psram;
         devices = std::make_unique<kube32::controller::DeviceController>(*store, scheduler.get(), dev_cfg);
         devices->start();
+        // Checkpoints and moves of pods: snapshots go from the kubelets to
+        // this node's API server (checkpoint data), freezes wait 10 s at most
+        kube32::controller::CheckpointControllerConfig ck_cfg;
+        ck_cfg.stack_in_psram = ident.has_psram;
+        if (s_api_token_set) ck_cfg.token = api_token;
+        checkpoints = std::make_unique<kube32::controller::CheckpointController>(*store, scheduler.get(), ck_cfg);
+        checkpoints->start();
 
         kube32::api::HttpServerOptions http_opts;
         http_opts.host = "0.0.0.0";

@@ -26,6 +26,7 @@
 #include "api/version_info.hpp"
 #include "controller/firmware_rollout_controller.hpp"
 #include "controller/device_controller.hpp"
+#include "controller/checkpoint_controller.hpp"
 #include "models/device.hpp"
 #include "hal/firmware_slots.hpp"
 #include "osal/sha256.hpp"
@@ -595,6 +596,15 @@ int main(int argc, char* argv[]) {
     dev_cfg.stack_bytes = 65536;
     kube32::controller::DeviceController devices(*store, scheduler.get(), dev_cfg);
     devices.start();
+    // Checkpoints and moves of pods: snapshots go from the kubelets to this
+    // API server's checkpoint data
+    kube32::controller::CheckpointControllerConfig ck_cfg;
+    ck_cfg.reconcile_interval_ms = opts.reconcile_interval_ms;
+    ck_cfg.stack_bytes = 65536;
+    ck_cfg.api_port = opts.port;
+    ck_cfg.token = opts.token;
+    kube32::controller::CheckpointController checkpoints(*store, scheduler.get(), ck_cfg);
+    checkpoints.start();
 
     // k32_http_call: Services and NetworkPolicies read from the store; https://
     // calls made here, for this process's pods and through the egress gateway
@@ -756,6 +766,7 @@ int main(int argc, char* argv[]) {
     for (auto& k : worker_kubelets) k->stop();
     mdns->stop_service_announcement();
     server->stop();
+    checkpoints.stop();
     devices.stop();
     workloads->stop();
     deployments->stop();
