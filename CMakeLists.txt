@@ -93,14 +93,16 @@ else()
     target_compile_definitions(wasm3 PUBLIC d_m3CodePageAlignSize=4096 d_m3MaxFunctionStackHeight=1024 d_m3HasExceptionHandling=0 d_m3HasTypedRefs=0 d_m3HasStackSwitching=0 d_m3HasSnapshots=0 d_m3RecordBacktraces=0 d_m3ParseNameSection=0 d_m3MaxDuplicateFunctionImpl=1)
 
     # The interpreter as the boards' Xtensa compiler builds it, without tail
-    # calls (an operation keeps its native frame until its function returns),
-    # with the boards' constant table and its operation frames counted: what
-    # a pod's call stands on a board's native stack (tests/test_driver_frames.cpp)
+    # calls (an operation keeps its native frame until its function returns)
+    # and without preloading the next operation, with the boards' constant
+    # table and its operation frames counted: what a pod's call stands on a
+    # board's native stack (tests/test_driver_frames.cpp), and how many
+    # operations it runs (tools/bench_ops.cpp)
     add_library(wasm3_opframes STATIC ${WASM3_SRCS})
     target_include_directories(wasm3_opframes PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/third_party/wasm3/source)
     target_compile_definitions(wasm3_opframes PUBLIC d_m3CodePageAlignSize=4096 d_m3MaxFunctionStackHeight=1024 d_m3HasExceptionHandling=0 d_m3HasTypedRefs=0 d_m3HasStackSwitching=0 d_m3HasSnapshots=0 d_m3RecordBacktraces=0 d_m3ParseNameSection=0 d_m3MaxDuplicateFunctionImpl=1
                                d_m3MaxConstantTableSize=64 d_m3HasMultiMemory=0 d_m3HasMemory64=0 d_m3HasAtomics=0 d_m3VerboseErrorMessages=0
-                               M3_HAS_TAIL_CALL=0 d_m3CountOpFrames=1)
+                               M3_HAS_TAIL_CALL=0 d_m3CountOpFrames=1 d_m3PreloadNextOp=0)
 
     # Core Library: OSAL, Memory Architecture, Storage Engine, API Server, Scheduler, HAL, Runtime, Kubelet
     set(KUBE32_CORE_SRCS
@@ -512,6 +514,11 @@ else()
     )
     target_link_libraries(test_devices PRIVATE kube32_core)
     add_test(NAME test_devices COMMAND test_devices)
+
+    # The wasm3 operations each bench kernel executes (docs/benchmarks.md):
+    # bench_ops <apps/bench/build/ops.wasm>
+    add_executable(bench_ops tools/bench_ops.cpp src/runtime/pod_memory_pool.cpp)
+    target_link_libraries(bench_ops PRIVATE wasm3_opframes)
 
     # The native stack the device drivers' calls take on a board without tail calls
     add_executable(test_driver_frames tests/test_driver_frames.cpp src/runtime/pod_memory_pool.cpp)

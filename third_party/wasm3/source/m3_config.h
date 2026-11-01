@@ -153,10 +153,12 @@
 #endif
 
 // Kube32: counts the operation frames a call stands on the native stack
-// (m3_opFrames, m3_opFramesPeak). Without tail calls every operation keeps
-// its frame until its function returns or its loop iterates; tests build the
-// interpreter that way with this on to measure what a call takes on such a
-// target (Xtensa). Requires M3_HAS_TAIL_CALL 0.
+// (m3_opFrames, m3_opFramesPeak) and the operations dispatched (m3_opCount).
+// Without tail calls every operation keeps its frame until its function
+// returns or its loop iterates; tests build the interpreter that way with
+// this on to measure what a call takes on such a target (Xtensa). Requires
+// M3_HAS_TAIL_CALL 0, and d_m3PreloadNextOp 0 as on Xtensa, where every
+// operation dispatches the next through the counted path.
 #ifndef d_m3CountOpFrames
 #  define d_m3CountOpFrames                    0
 #endif
