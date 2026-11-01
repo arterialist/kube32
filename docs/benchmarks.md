@@ -42,8 +42,25 @@ A metered pod has the default execution budget, so gas accounting is on. An unme
 | json: 200 small JSON records (text) | 1,752 µs | 71,822 µs (41x) | 64,361 µs (37x) |
 
 - On the ESP32-S3, a pod runs compute 32 to 95 times slower than native code. Gas metering adds up to about 45 %.
-- The location of the pod's memory changes little. The Cardputer runs pods from internal SRAM and the devkit runs them from PSRAM, but the ratios are about the same.
-- The interpreter causes the cost. GCC for the ESP32-S3 makes no tail calls. Thus wasm3 dispatches each Wasm instruction with a native call and return, not with a jump.
+- The interpreter causes the cost. GCC for the ESP32-S3 makes no tail calls. Thus wasm3 dispatches each operation with a native call and return, not with a jump.
+
+### Why the ratio changes from kernel to kernel
+
+A ratio is the interpreter's cost of the work divided by the native cost of the same work. Both costs change with the type of work. `tools/bench_ops.cpp` counts the wasm3 operations that each kernel executes, with the interpreter built as the boards build it. The counts and the unmetered times on the Cardputer give these costs at 240 MHz:
+
+| Kernel | wasm3 operations | Interpreter, cycles per operation | Native, cycles for the same work | Ratio | Operations by type |
+| --- | ---: | ---: | ---: | ---: | --- |
+| sieve | 88,736 | 40 | 1.24 | 32x | 44 % integer, 39 % branch, 17 % byte store |
+| json | 263,343 | 46 | 1.27 | 36x | 43 % integer, 26 % branch, 15 % memory |
+| fib | 13,827 | 52 | 1.32 | 39x | 29 % integer, 29 % branch, 21 % call |
+| mandel | 314,810 | 79 | 2.00 | 40x | 63 % float, 22 % branch |
+| crc32 | 341,043 | 36 | 0.62 | 59x | 63 % integer, 25 % branch |
+| sort | 272,512 | 63 | 0.93 | 68x | 43 % integer, 21 % memory, 19 % branch |
+
+- An integer operation costs the interpreter 36 to 46 cycles. A float operation also canonicalizes NaN values, and a memory access checks the pod's memory limit. Thus kernels with many of these operations cost 63 to 79 cycles for each operation.
+- The native cost changes more. GCC compiles the CRC-32 bit loop into about 0.6 cycles of work for each wasm3 operation, so crc32 has a large ratio. Float multiplications and divisions are slow in native code too, so mandel has a smaller ratio than its interpreter cost suggests.
+- A gas check (`op_UseGas`) costs 46 to 77 cycles on the Cardputer. Metering adds one check for each straight sequence of code. It adds 41 to 46 % to fib, crc32, sieve and json, which have short sequences of cheap operations. It adds about 20 % to sort and mandel.
+- The devkit runs pods from PSRAM and uses 44 to 88 cycles for each operation, 10 to 40 % more than the Cardputer. Thus its ratios are higher for the integer kernels (crc32 81x, sort 80x).
 
 Use a pod for control logic, protocol handling and glue code. Do not use a pod for heavy computation. Put work that needs native speed in a host function. A call from a pod to a host function costs about 1.5 µs:
 
@@ -164,6 +181,14 @@ make -C apps/bench
 tools/kube32-cli deploy images/sd/bench.wasm --name bench --node <node> --memory 24Ki --hardware none
 curl -H 'X-Kube32-Pod: default/bench' 'http://<node address>:7000/run?k=crc32&n=4&r=5'
 curl -H 'X-Kube32-Pod: default/bench' 'http://<node address>:7000/hostcall?n=100000'
+```
+
+To count the wasm3 operations that each kernel executes, on the host:
+
+```sh
+make -C apps/bench ops
+cmake --build build --target bench_ops
+build/bench_ops apps/bench/build/ops.wasm
 ```
 
 For an unmetered pod, do these steps:

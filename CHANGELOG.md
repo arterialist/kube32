@@ -6,6 +6,7 @@ All notable changes to this project will be documented in this file. The format 
 
 ### Added
 
+- `bench_ops` (`tools/bench_ops.cpp`) counts the wasm3 operations that each bench kernel executes, with the interpreter built as the boards build it. [docs/benchmarks.md](docs/benchmarks.md) uses the counts to explain why the ratio to native code changes from kernel to kernel.
 - `K32_CMD:BENCH` runs benchmark kernels natively on a node's console. The bench pod (`apps/bench`, `images/sd/bench.wasm`) runs the same kernels in the sandbox. [docs/benchmarks.md](docs/benchmarks.md) lists the measurements.
 - Kubernetes API server on port 6443 serving Pod, Node, Namespace, Service, Endpoints, EndpointSlice, ConfigMap, Secret, Event, Deployment, DaemonSet, Job, Lease, Ingress, NetworkPolicy, NodeMetrics, PodMetrics, and subject access reviews.
 - Pod egress: `k32_http_call` reaches HTTP hosts outside the cluster by IPv4 address or DNS name, resolving Service names as Kubernetes DNS does; NetworkPolicy egress rules (`ipBlock` with `except`, pod and namespace selectors, numbered, named and ranged ports) restrict Service and outside calls on the calling node; the control plane routes its cluster access point to its station uplink with NAT and offers the uplink's name server.
@@ -48,6 +49,7 @@ All notable changes to this project will be documented in this file. The format 
 
 ### Fixed
 
+- `test_driver_frames` counts operation frames with the boards' dispatch. On an ARM64 host, wasm3 preloaded the next operation and dispatched it outside the counter, so the test reported fewer frames than a call uses on an ESP32-S3.
 - Endpoints, EndpointSlices, Ingress routes, Service calls and service links reach a pod at its node's pod port (`status.daemonEndpoints.kubeletEndpoint.Port`), not at its `containerPort`. Thus the boards can reach pods on a `kube32-sim` worker that runs with its own `--pod-port`. NetworkPolicy ports still match the pod's own port.
 - A node keeps its cordon when it registers again after a reboot or after rejected heartbeats. The registration does not set `spec.unschedulable`.
 - A container's environment is kept once per pod instead of twice.
