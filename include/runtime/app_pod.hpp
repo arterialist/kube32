@@ -10,6 +10,7 @@
 // annotation (from any node); pods that export k32_tick get a 1 Hz callback.
 
 #include "runtime/container_lifecycle.hpp"
+#include "runtime/pod_snapshot.hpp"
 #include "osal/mutex.hpp"
 #include "osal/condition_variable.hpp"
 
@@ -141,6 +142,22 @@ const AppPlatformHooks& app_platform_hooks();
 void link_app_host_functions(IM3Module module, const std::string& pod_id);
 // Forgets the pod link_app_host_functions recorded for a runtime about to be freed.
 void unlink_app_host_functions(IM3Runtime runtime);
+// What a restored pod's clock is ahead of the node's uptime (k32_time_ms,
+// esp32_get_time_us, the k32_tick argument): 0 for a pod that started here.
+int64_t pod_clock_offset_ms(const void* m3_runtime);
+void set_pod_clock_offset(const void* m3_runtime, int64_t offset_ms);
+
+// The bytes of a snapshot handed to `feed` in order (false from it stops the
+// stream); returns true when the stream ended whole, else false with `why`.
+using SnapshotStream = std::function<bool(mem::FunctionRef<bool(const uint8_t*, size_t)> feed, std::string& why)>;
+
+// A frozen pod's snapshot, as AppPodHost::snapshot took it
+struct SnapshotSummary {
+    size_t bytes{0};
+    uint8_t digest[32]{};       // the trailer
+    uint8_t image_sha[32]{};
+    uint64_t pod_time_ms{0};
+};
 
 struct AppPodStats {
     uint64_t requests{0};
@@ -215,6 +232,38 @@ public:
     // Diagnostics: the request currently executing (empty when idle) and its age
     std::string in_flight(uint32_t& out_age_ms) const;
 
+    // Migration (docs/migration.md) ---------------------------------------
+    // The pod's container name and what in its spec keeps it from moving
+    // (static_migration_blockers); set before the module loads, kept until
+    // the pod is unregistered. add_migration_blocker adds one found later
+    // (the module's entry point).
+    void set_migration_info(const std::string& pod_id, const DeploySpec& spec);
+    // Notes the module's entry point (_start, app_main, main) as a blocker
+    void note_entry_point(const std::string& pod_id, ContainerLifecycleController& ctrl);
+    // False when no pod of that id was deployed here
+    bool container_name(const std::string& pod_id, std::string& out) const;
+    // Every reason the pod cannot move now: the static ones and its open files
+    std::vector<std::string> migration_blockers(const std::string& pod_id) const;
+    // Stops handing the pod requests, ticks and events once the call it is in
+    // returns: requests get 503 with Retry-After: 1, events are held (at most
+    // kMaxHeldEvents, the rest dropped and counted). Returns 0, -2 for no
+    // such request pod, -1 when a call was still running after `timeout_ms`
+    // (`why` names it; the pod is not frozen). A frozen pod freezes again at once.
+    int freeze(const std::string& pod_id, uint32_t timeout_ms, std::string& why);
+    // Resumes a frozen pod: the held events are delivered first. False when
+    // the pod is not frozen.
+    bool thaw(const std::string& pod_id);
+    bool is_frozen(const std::string& pod_id) const;
+    // Writes the K32S snapshot of a frozen pod through `out` (see
+    // write_snapshot); the same frozen pod gives the same bytes every time.
+    bool snapshot(const std::string& pod_id, SnapshotWrite out, SnapshotSummary& summary, std::string& why);
+    // Writes the snapshot `stream` delivers into a pod registered moments
+    // ago, instead of k32_init: memory, globals and tables, then its clock,
+    // channels and held events, then the export k32_restored once. Returns
+    // 0; -1 when the snapshot could not be restored (`why` starts with
+    // kRestoreErrorPrefix); -2 when k32_restored returned non-zero (`why`).
+    int restore_pod(const std::string& pod_id, const SnapshotStream& stream, std::string& why);
+
 private:
     AppPodHost() = default;
     struct Entry {
@@ -229,7 +278,25 @@ private:
         uint64_t next_tick_ms{0};
         AppPodStats stats;
         std::unique_ptr<osal::Mutex> call_mutex; // serializes host-initiated calls per pod
+        const char* busy_fn{nullptr};            // the export running now
+        uint64_t busy_since_ms{0};
+        bool frozen{false};
+        uint64_t frozen_pod_time_ms{0};          // the pod's clock when it froze
+        uint64_t frozen_unix_ms{0};              // the wall clock then (0: unset)
+        int64_t clock_offset_ms{0};
+        std::vector<HeldEvent> held;             // events that arrived while frozen
+        uint32_t held_dropped{0};
     };
+    struct MigrationInfo {
+        std::string container;
+        std::vector<std::string> blockers;
+    };
+    std::map<std::string, MigrationInfo> migration_;
+    void set_busy(const std::string& pod_id, const char* fn);
+    // Puts events back at the front of the event queue, in order
+    void requeue_events(const std::string& pod_id, std::vector<HeldEvent>&& events);
+    // An export called with a fresh budget, named while it runs (freeze timeouts)
+    int32_t call_export(const std::string& pod_id, ContainerLifecycleController* ctrl, const char* fn);
     mutable osal::Mutex mutex_;
     std::map<std::string, Entry> pods_;
     std::map<std::string, std::vector<std::pair<std::string, std::string>>> env_;

@@ -85,6 +85,8 @@ set(KUBE32_APP_SRCS
     runtime/pod_fs.cpp
     runtime/pod_memory_pool.cpp
     runtime/pod_assets.cpp
+    runtime/pod_snapshot.cpp
+    runtime/app_pod_migration.cpp
     app/ingress_controller.cpp
     app/ingress_routes.cpp
     app/pod_server.cpp

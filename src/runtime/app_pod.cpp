@@ -8,12 +8,14 @@
 #include "ipc/channel.hpp"
 #include "osal/system.hpp"
 #include "osal/thread.hpp"
+#include "runtime/pod_fs.hpp"
 
 #include "wasm3.h"
 #include "m3_env.h"
 #include "m3_host.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cctype>
 #include <cstring>
 #include <cstdio>
@@ -178,6 +180,28 @@ static const std::string& pod_for(IM3Runtime rt, IM3ImportContext) {
     return it != s_pod_by_runtime.end() ? it->second : kUnknown;
 }
 
+// Clocks of restored pods, by wasm3 runtime. Empty unless a pod was
+// restored here, and then a few entries: a pod that started here reads the
+// node's clock without taking the lock.
+static std::mutex s_clock_mutex;
+static std::vector<std::pair<const void*, int64_t>> s_clock_offsets;
+static std::atomic<size_t> s_clock_count{0};
+
+int64_t pod_clock_offset_ms(const void* rt) {
+    if (s_clock_count.load(std::memory_order_acquire) == 0) return 0;
+    std::lock_guard<std::mutex> lock(s_clock_mutex);
+    for (const auto& c : s_clock_offsets) if (c.first == rt) return c.second;
+    return 0;
+}
+
+void set_pod_clock_offset(const void* rt, int64_t offset) {
+    std::lock_guard<std::mutex> lock(s_clock_mutex);
+    auto it = std::find_if(s_clock_offsets.begin(), s_clock_offsets.end(), [rt](const std::pair<const void*, int64_t>& c) { return c.first == rt; });
+    if (it != s_clock_offsets.end()) s_clock_offsets.erase(it);
+    if (offset != 0) s_clock_offsets.emplace_back(rt, offset);
+    s_clock_count.store(s_clock_offsets.size(), std::memory_order_release);
+}
+
 static bool guest_range_ok(void* mem, uint32_t off, uint32_t len) {
     size_t size = m3_GetMemorySizeAt(mem);
     return static_cast<uint64_t>(off) + len <= size;
@@ -288,8 +312,8 @@ static const void* raw_event_emit(IM3Runtime rt, IM3ImportContext ictx, uint64_t
     return m3Err_none;
 }
 
-static const void* raw_time_ms(IM3Runtime, IM3ImportContext, uint64_t* sp, void*) {
-    *reinterpret_cast<int64_t*>(sp) = static_cast<int64_t>(osal::System::get_uptime_ms());
+static const void* raw_time_ms(IM3Runtime rt, IM3ImportContext, uint64_t* sp, void*) {
+    *reinterpret_cast<int64_t*>(sp) = static_cast<int64_t>(osal::System::get_uptime_ms()) + pod_clock_offset_ms(rt);
     return m3Err_none;
 }
 
@@ -610,6 +634,7 @@ static const void* raw_fs_remove(IM3Runtime rt, IM3ImportContext ictx, uint64_t*
 }
 
 void unlink_app_host_functions(IM3Runtime runtime) {
+    if (s_clock_count.load(std::memory_order_acquire)) set_pod_clock_offset(runtime, 0);
     std::lock_guard<std::mutex> lock(s_ctx_mutex);
     s_pod_by_runtime.erase(runtime);
     s_http_status_by_runtime.erase(runtime);
@@ -850,6 +875,7 @@ void AppPodHost::unregister_pod(const std::string& pod_id) {
         assets_.erase(pod_id);
         event_topics_.erase(pod_id);
         tick_intervals_.erase(pod_id);
+        migration_.erase(pod_id);
         sync_topic_subscriptions_locked();
     }
     if (hold) {
@@ -927,9 +953,7 @@ int32_t AppPodHost::init_pod(const std::string& pod_id) {
     }
     if (!has_init) return 0;
     osal::LockGuard call_guard(*cm);
-    arm_call_budget(ctrl);
-    int32_t init_rc = ctrl->call_function(K32_EXPORT_INIT);
-    note_call_cost(ctrl, K32_EXPORT_INIT);
+    int32_t init_rc = call_export(pod_id, ctrl, K32_EXPORT_INIT);
     if (init_rc == 0) {
         osal::LockGuard guard(mutex_);
         if (Entry* e = find_locked(pod_id)) {
@@ -948,6 +972,8 @@ int32_t AppPodHost::call_with_block(Entry& e, const std::string& pod_id, const c
     if (!e.has_alloc) return -1;
 
     uint32_t total = static_cast<uint32_t>(len + topic.size());
+    set_busy(pod_id, fn);
+    struct Idle { AppPodHost* h; const std::string& id; ~Idle() { h->set_busy(id, nullptr); } } idle{this, pod_id};
     arm_call_budget(ctrl);
     int32_t ptr = ctrl->call_function(K32_EXPORT_ALLOC, {static_cast<int32_t>(total + 1)});
     arm_call_budget(ctrl);   // the entry point itself gets a full budget too
@@ -1045,6 +1071,16 @@ static void send_error(AppResponseSink& sink, int status, const char* body) {
     sink.end();
 }
 
+// A frozen pod (a checkpoint or a move in progress) asks the client to retry
+static int32_t send_frozen(AppResponseSink& sink) {
+    static const char kBody[] = "{\"error\":\"unavailable\",\"message\":\"the pod is frozen for a checkpoint\"}";
+    sink.begin(503, "application/json");
+    sink.header("Retry-After", "1");
+    sink.write(reinterpret_cast<const uint8_t*>(kBody), sizeof(kBody) - 1);
+    sink.end();
+    return 503;
+}
+
 int32_t AppPodHost::dispatch(const std::string& pod_id, const AppRequest& req, AppResponseSink& sink, uint32_t wait_ms, bool nested) {
     Entry* e = nullptr;
     osal::Mutex* cm = nullptr;
@@ -1053,6 +1089,7 @@ int32_t AppPodHost::dispatch(const std::string& pod_id, const AppRequest& req, A
         osal::LockGuard guard(mutex_);
         e = find_locked(pod_id);
         if (!e || !e->has_handle) return nested ? K32_ERR_NOENT : -2;
+        if (e->frozen) return send_frozen(sink);
         cm = e->call_mutex.get();
         // A pod of this node earlier in the chain waits in a service call on
         // the node's one interpreter stack: this call could only run once
@@ -1102,11 +1139,12 @@ int32_t AppPodHost::dispatch(const std::string& pod_id, const AppRequest& req, A
         if (wait_ms == 0) cm->lock();
         else if (!cm->try_lock(wait_ms)) return K32_ERR_TIMEOUT;
         struct Unlock { osal::Mutex* m; ~Unlock() { m->unlock(); } } call_guard{cm};
-        // Entry may have been unregistered while we waited
+        // Entry may have been unregistered (or frozen) while we waited
         {
             osal::LockGuard guard(mutex_);
             e = find_locked(pod_id);
             if (!e) return nested ? K32_ERR_NOENT : -2;
+            if (e->frozen) return send_frozen(sink);
         }
         status = call_with_block(*e, pod_id, K32_EXPORT_HANDLE, std::string_view(), reinterpret_cast<const uint8_t*>(block.data()), block.size(), &sink, &req);
     }
@@ -1144,9 +1182,19 @@ int32_t AppPodHost::tick(const std::string& pod_id, uint32_t uptime_ms) {
     int32_t rc;
     {
         osal::LockGuard call_guard(*cm);
+        int64_t offset = 0;
+        {
+            osal::LockGuard guard(mutex_);
+            Entry* e = find_locked(pod_id);
+            if (!e || e->frozen) return 0;
+            offset = e->clock_offset_ms;
+            e->busy_fn = K32_EXPORT_TICK;
+            e->busy_since_ms = osal::System::get_uptime_ms();
+        }
         arm_call_budget(ctrl);
-        rc = ctrl->call_function(K32_EXPORT_TICK, {static_cast<int32_t>(uptime_ms)});
+        rc = ctrl->call_function(K32_EXPORT_TICK, {static_cast<int32_t>(static_cast<int64_t>(uptime_ms) + offset)});
         note_call_cost(ctrl, K32_EXPORT_TICK);
+        set_busy(pod_id, nullptr);
     }
     uint32_t us = static_cast<uint32_t>(osal::Thread::get_time_us() - t0);
     {
@@ -1171,7 +1219,7 @@ uint32_t AppPodHost::tick_due(uint64_t now_ms, uint32_t max_wait_ms) {
     {
         osal::LockGuard guard(mutex_);
         for (const auto& kv : pods_) {
-            if (!kv.second.has_tick || !kv.second.ticking || kv.second.next_tick_ms > now_ms) continue;
+            if (!kv.second.has_tick || !kv.second.ticking || kv.second.frozen || kv.second.next_tick_ms > now_ms) continue;
             if (n < due.size()) due[n].assign(kv.first);
             else due.push_back(kv.first);
             ++n;
@@ -1187,7 +1235,7 @@ uint32_t AppPodHost::tick_due(uint64_t now_ms, uint32_t max_wait_ms) {
     uint64_t wait = max_wait_ms;
     osal::LockGuard guard(mutex_);
     for (const auto& kv : pods_) {
-        if (!kv.second.has_tick || !kv.second.ticking) continue;
+        if (!kv.second.has_tick || !kv.second.ticking || kv.second.frozen) continue;
         const uint64_t next = kv.second.next_tick_ms;
         wait = std::min<uint64_t>(wait, next > now_ms ? next - now_ms : 0);
     }
@@ -1197,13 +1245,23 @@ uint32_t AppPodHost::tick_due(uint64_t now_ms, uint32_t max_wait_ms) {
 int32_t AppPodHost::event(const std::string& pod_id, std::string_view topic, const uint8_t* data, size_t len) {
     Entry* e = nullptr;
     osal::Mutex* cm = nullptr;
+    if (topic.empty() || len > K32_MAX_EVENT_BYTES) return K32_ERR_INVAL;
+    // A frozen pod holds the event; it is delivered after a thaw or a restore
+    auto hold = [&](Entry& f) {
+        if (f.held.size() >= kMaxHeldEvents) {
+            if (f.held_dropped++ < 4) printf("[POD] %s: frozen with %u events held, dropping one\n", pod_id.c_str(), (unsigned)f.held.size());
+            return 0;
+        }
+        f.held.push_back(HeldEvent{std::string(topic), std::string(reinterpret_cast<const char*>(data), len)});
+        return 0;
+    };
     {
         osal::LockGuard guard(mutex_);
         e = find_locked(pod_id);
         if (!e || !e->has_event) return -2;
+        if (e->frozen) return hold(*e);
         cm = e->call_mutex.get();
     }
-    if (topic.empty() || len > K32_MAX_EVENT_BYTES) return K32_ERR_INVAL;
     uint64_t t0 = osal::Thread::get_time_us();
     int32_t rc;
     {
@@ -1212,6 +1270,7 @@ int32_t AppPodHost::event(const std::string& pod_id, std::string_view topic, con
             osal::LockGuard guard(mutex_);
             e = find_locked(pod_id);
             if (!e) return -2;
+            if (e->frozen) return hold(*e);
         }
         rc = call_with_block(*e, pod_id, K32_EXPORT_EVENT, topic, data, len, nullptr);
     }
@@ -1222,6 +1281,26 @@ int32_t AppPodHost::event(const std::string& pod_id, std::string_view topic, con
         if (e2) e2->stats.total_us += us;
     }
     return rc;
+}
+
+// -----------------------------------------------------------------------------
+// Migration
+// -----------------------------------------------------------------------------
+int32_t AppPodHost::call_export(const std::string& pod_id, ContainerLifecycleController* ctrl, const char* fn) {
+    set_busy(pod_id, fn);
+    arm_call_budget(ctrl);
+    const int32_t rc = ctrl->call_function(fn);
+    note_call_cost(ctrl, fn);
+    set_busy(pod_id, nullptr);
+    return rc;
+}
+
+void AppPodHost::set_busy(const std::string& pod_id, const char* fn) {
+    osal::LockGuard guard(mutex_);
+    if (Entry* e = find_locked(pod_id)) {
+        e->busy_fn = fn;
+        if (fn) e->busy_since_ms = osal::System::get_uptime_ms();
+    }
 }
 
 } // namespace kube32::runtime

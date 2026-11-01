@@ -398,8 +398,30 @@ bool ChannelManager::is_initialized() const {
 
 int32_t ChannelManager::open(const std::string& pod_id, const std::string& channel_uri, uint32_t flags) {
     osal::LockGuard guard(mutex_);
-    int32_t hid = next_handle_++;
+    return open_locked(pod_id, channel_uri, flags, next_handle_++);
+}
 
+int32_t ChannelManager::open_as(const std::string& pod_id, const std::string& channel_uri, uint32_t flags, int32_t handle) {
+    osal::LockGuard guard(mutex_);
+    if (handle <= 0 || handles_.count({pod_id, handle})) return IPC_ERR_INVAL;
+    if (handle >= next_handle_) next_handle_ = handle + 1;
+    return open_locked(pod_id, channel_uri, flags, handle);
+}
+
+std::vector<std::pair<int32_t, std::string>> ChannelManager::handles_of(const std::string& pod_id) const {
+    osal::LockGuard guard(mutex_);
+    std::vector<std::pair<int32_t, std::string>> out;
+    for (auto it = handles_.lower_bound({pod_id, 0}); it != handles_.end() && it->first.first == pod_id; ++it) {
+        out.emplace_back(it->first.second, it->second.channel_uri);
+    }
+    return out;
+}
+
+void ChannelManager::close_all(const std::string& pod_id) {
+    for (const auto& h : handles_of(pod_id)) close(pod_id, h.first);
+}
+
+int32_t ChannelManager::open_locked(const std::string& pod_id, const std::string& channel_uri, uint32_t flags, int32_t hid) {
     ChannelHandle ch;
     ch.handle_id = hid;
     ch.pod_id = pod_id;
@@ -419,7 +441,7 @@ int32_t ChannelManager::open(const std::string& pod_id, const std::string& chann
         VirtualChannelRoutingTable::instance().register_local_channel(pod_id, channel_uri, ch.in_ring);
     }
 
-    handles_[hid] = ch;
+    handles_[{pod_id, hid}] = ch;
     return hid;
 }
 
@@ -429,8 +451,8 @@ int32_t ChannelManager::send(const std::string& pod_id, int32_t handle, const ui
     uint32_t channel_hash = 0;
     {
         osal::LockGuard guard(mutex_);
-        auto it = handles_.find(handle);
-        if (it == handles_.end() || it->second.pod_id != pod_id) {
+        auto it = handles_.find({pod_id, handle});
+        if (it == handles_.end()) {
             return IPC_ERR_BADF;
         }
         channel_hash = it->second.channel_hash;
@@ -734,8 +756,8 @@ int32_t ChannelManager::recv(const std::string& pod_id, int32_t handle, uint8_t*
     std::shared_ptr<RingBuffer> ring;
     {
         osal::LockGuard guard(mutex_);
-        auto it = handles_.find(handle);
-        if (it == handles_.end() || it->second.pod_id != pod_id) {
+        auto it = handles_.find({pod_id, handle});
+        if (it == handles_.end()) {
             return IPC_ERR_BADF;
         }
         ring = it->second.in_ring;
@@ -746,8 +768,8 @@ int32_t ChannelManager::recv(const std::string& pod_id, int32_t handle, uint8_t*
 
 int32_t ChannelManager::close(const std::string& pod_id, int32_t handle) {
     osal::LockGuard guard(mutex_);
-    auto it = handles_.find(handle);
-    if (it == handles_.end() || it->second.pod_id != pod_id) {
+    auto it = handles_.find({pod_id, handle});
+    if (it == handles_.end()) {
         return IPC_ERR_BADF;
     }
     std::string uri = it->second.channel_uri;

@@ -6,6 +6,9 @@
 #include <memory>
 #include <vector>
 #include <map>
+#include <functional>
+
+#include "mem/function_ref.hpp"
 
 struct M3Module;
 
@@ -46,6 +49,14 @@ struct DeploySpec {
     // (images/web/<name>/) or a directory on node storage
     std::string asset_bundle;
     std::string asset_directory;
+    // Migration (docs/migration.md): the container's name and what in the
+    // pod's spec keeps it from moving (static_migration_blockers)
+    std::string container_name;
+    std::vector<std::string> migration_blockers;
+    // Start from a snapshot (kube32.io/restore-from) instead of k32_init:
+    // called once the module is instantiated, it hands the snapshot's bytes
+    // to `feed` as they arrive and returns true when the stream ended whole
+    std::function<bool(mem::FunctionRef<bool(const uint8_t*, size_t)> feed, std::string& why)> restore_from;
 };
 
 // Abstract Runtime Interface conforming to PROJECT.md § 4.3
@@ -138,5 +149,15 @@ uint32_t module_stack_need_bytes(const M3Module* module);
 // Whether a deploy error is the node running out of memory while the module
 // loaded, rather than a fault of the module.
 bool deploy_error_is_out_of_memory(const std::string& error);
+
+// A deploy from a snapshot (DeploySpec::restore_from) that failed in the
+// restore itself starts its error with this
+constexpr const char* kRestoreErrorPrefix = "cannot restore the snapshot: ";
+bool deploy_error_is_restore(const std::string& error);
+
+// The entry point a module exports ("_start", "app_main", "main"), read from
+// its export section; null for a request pod
+const char* module_entry_point(const uint8_t* wasm, size_t len);
+
 
 } // namespace kube32::runtime

@@ -15,6 +15,7 @@
 #include <mutex>
 #include <string>
 #include <string_view>
+#include <vector>
 #include <sys/types.h>
 
 namespace kube32::runtime {
@@ -35,6 +36,8 @@ public:
     // Closes whatever the pod left open (container stop, restart, deploy).
     void release_pod(const std::string& pod_id);
     uint32_t open_count(const std::string& pod_id) const;
+    // The pod's open descriptors and the path each was opened with
+    std::vector<std::pair<int32_t, std::string>> open_files(const std::string& pod_id) const;
 
     // Checks a guest path: relative, no "..", no empty or "." components,
     // only [A-Za-z0-9._-] characters, at most K32_FS_MAX_PATH bytes. On
@@ -51,6 +54,7 @@ private:
         int host_fd{-1};
         bool readable{false};
         bool writable{false};
+        std::string path;   // as the pod opened it
     };
     struct Table {
         Slot slots[4];

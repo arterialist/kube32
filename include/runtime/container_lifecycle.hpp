@@ -153,7 +153,10 @@ public:
     bool find_export_locked(const char* fn_name) const;   // mutex_ held by caller
     uint8_t* guest_memory(size_t& out_size) const;
     void* m3_runtime_handle() const { return m3_runtime_; }
+    void* m3_module_handle() const { return m3_module_; }
     const ContainerConfig& config() const { return config_; }
+    // SHA-256 of the module's bytes, computed on first use
+    void image_sha256(uint8_t out[32]);
 
 private:
     static void worker_thread_entry(void* arg);
@@ -178,6 +181,8 @@ private:
     void* m3_runtime_{nullptr};
     void* m3_module_{nullptr};
     uint32_t wasm_stack_bytes_{0};          // the operand stack the module has (set by deploy)
+    uint8_t image_sha_[32]{};
+    bool image_sha_known_{false};
 
     // A stack sized from the module: what it has while the module loads
     // (constant expressions), and what it gets above its computed need

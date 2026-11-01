@@ -168,6 +168,8 @@ else()
         src/runtime/pod_fs.cpp
         src/runtime/pod_memory_pool.cpp
         src/runtime/pod_assets.cpp
+        src/runtime/pod_snapshot.cpp
+        src/runtime/app_pod_migration.cpp
         src/app/ingress_controller.cpp
         src/app/ingress_routes.cpp
         src/app/pod_server.cpp
