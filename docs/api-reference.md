@@ -67,7 +67,7 @@ Discovery endpoints accept `GET` and `HEAD`.
 
 | Annotation | Set by | Value |
 | --- | --- | --- |
-| `kube32.io/interp-mops` | Kubelet, once at boot | The interpreter's speed: millions of wasm3 operations per second on a fixed integer kernel, timed on the stack and memory the node gives pods, e.g. `"5.52"` |
+| `kube32.io/interp-mops` | Kubelet, once at boot | The interpreter's speed: millions of wasm3 operations per second on a fixed integer kernel, timed on the stack and memory the node gives pods, e.g. `"6.88"` on a Cardputer |
 
 ## kubectl and k9s
 

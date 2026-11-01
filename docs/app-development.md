@@ -126,10 +126,11 @@ Environment, event topics, tick interval, bundle files and limits come from the 
 On the new node the runtime calls the optional export `k32_restored` once, instead of `k32_init`:
 
 ```c
+static char host[32];         /* in linear memory: it moves with the pod */
+static int32_t host_len;
+
 K32_EXPORT("k32_restored") int32_t k32_restored(void) {
-    char host[32];
-    hostname_len = k32_env_get("HOSTNAME", 8, host, sizeof host);   /* the pod may have a new name */
-    next_report_ms = k32_time_ms();                                  /* the clock continues */
+    host_len = k32_env_get("HOSTNAME", 8, host, sizeof host);   /* the new pod may have another name */
     return 0;
 }
 ```
