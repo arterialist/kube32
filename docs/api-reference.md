@@ -39,7 +39,7 @@ Discovery endpoints accept `GET` and `HEAD`.
 | Group | Kind | Short | Verbs and subresources | Notes |
 | --- | --- | --- | --- | --- |
 | core `v1` | Pod | `po` | get, list, watch, create, update, patch, delete; `status`, `log`, `binding` | Graceful deletion when bound to a node, 30 s by default or `gracePeriodSeconds`. `DELETE` returns the `Pod` for bound pods and a `Status` for unbound pods. Create, update and non-status patch add 300 s `NoExecute` tolerations for `node.kubernetes.io/not-ready` and `node.kubernetes.io/unreachable` unless already tolerated |
-| core `v1` | Node | `no` | get, list, watch, create, update, patch, delete; `status`, `proxy` | Registered by kubelets. `/api/v1/nodes/<node>/proxy/storage/<path>` supports `GET`, `PUT` and `DELETE`; `PUT` accepts chunked or `Content-Length` bodies up to 8 MiB by default, writes `<path>.part` and renames it into place |
+| core `v1` | Node | `no` | get, list, watch, create, update, patch, delete; `status`, `proxy` | Registered by kubelets. `/api/v1/nodes/<node>/proxy/storage/<path>` supports `GET`, `PUT` and `DELETE`; `PUT` accepts chunked or `Content-Length` bodies up to 8 MiB by default, writes `<path>.part` and renames it into place. `POST .../proxy/checkpoint/<ns>/<pod>/<container>` and `POST .../proxy/thaw/<ns>/<pod>/<container>` take and resume pod checkpoints ([Pod migration](migration.md#kubelet-endpoints)) |
 | core `v1` | Namespace | `ns` | get, list, watch, create, update, patch, delete | Seeded at boot: `default`, `kube-system`, `kube-public`, `kube-node-lease`, `kube32-cluster` |
 | core `v1` | Service | `svc` | get, list, watch, create, update, patch, delete | Selects Running pods for Ingress, `k32_http_call` and environment variables |
 | core `v1` | Endpoints | `ep` | get, list | Read-only. Computed on read from Services and their pods |
@@ -57,10 +57,17 @@ Discovery endpoints accept `GET` and `HEAD`.
 | `authorization.k8s.io/v1` | SelfSubjectAccessReview, SelfSubjectRulesReview | | create | Always returns allowed |
 | `kube32.io/v1` | FirmwareRollout | `fwr` | get, list, watch, create, update, patch, delete | Cluster-scoped. `spec.sha256` names the staged firmware image. The rollout controller updates nodes one at a time and writes `status`. The API server serves the staged image at `/apis/kube32.io/v1/firmware`. See [Firmware updates](firmware-updates.md#api). |
 | `kube32.io/v1` | Device | `dev` | get, list, watch, create, update, patch, delete; `status` | A part wired to a node. `spec.driver` must be a driver of the catalog. The API server checks I2C addresses, multiplexer channels and pins, and stores addresses as `"0x77"`. A write to the object keeps `status`. A write to `status` changes nothing else. The Device controller runs the driver pod and Service and writes `status`. See [Devices](devices.md). |
+| `kube32.io/v1` | Checkpoint | `ckpt` | get, list, watch, create, update, patch, delete; `status`, `data` | A pod's snapshot. `spec.podName` is required and `spec.action` is `Save` or `Move`. A write to the object keeps `status`. `GET` and `PUT` of `checkpoints/<name>/data` read and store the snapshot (`application/octet-stream`), kept in memory outside the object store. See [Pod migration](migration.md#checkpoint-objects-and-data). |
 
 `POST /apis/kube32.io/v1/egress` is the egress gateway: it makes the `https://` calls of pods on workers, for nodes only. See [Networking](networking.md#egress-gateway).
 
 `GET /apis/kube32.io/v1/images/<sha256>` returns a module that a Pod or pod template carried inline (`application/wasm`, with `Content-Length`). A Pod, Deployment, DaemonSet or Job written with the annotation `kube32.io/wasm-base64` is stored with `kube32.io/wasm-sha256` and `kube32.io/wasm-size` in its place, and the module is stored under the digest. See [Writing app pods](app-development.md#inline-image-kube32-cli-deploy).
+
+## Node annotations
+
+| Annotation | Set by | Value |
+| --- | --- | --- |
+| `kube32.io/interp-mops` | Kubelet, once at boot | The interpreter's speed: millions of wasm3 operations per second on a fixed integer kernel, timed on the stack and memory the node gives pods, e.g. `"6.88"` on a Cardputer |
 
 ## kubectl and k9s
 

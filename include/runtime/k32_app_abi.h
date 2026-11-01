@@ -47,6 +47,12 @@ extern "C" {
 #define K32_EXPORT_HANDLE  "k32_handle"  /* int32 k32_handle(uint32 ptr, uint32 len)    */
 #define K32_EXPORT_TICK    "k32_tick"    /* int32 k32_tick(uint32 uptime_ms)  optional  */
 #define K32_EXPORT_EVENT   "k32_event"   /* int32 k32_event(uint32 topic_ptr, uint32 topic_len, uint32 ptr, uint32 len) optional */
+#define K32_EXPORT_RESTORED "k32_restored" /* int32 k32_restored(void)                optional  */
+
+/* k32_restored runs once, in place of k32_init, when the pod starts from a
+ * snapshot taken on another node (docs/migration.md): memory, globals and
+ * k32_time_ms continue from the snapshot. A pod refreshes what depends on
+ * the node there; a non-zero result fails the container like k32_init. */
 
 /* k32_event receives every message published on the channel topics listed in
  * the pod's annotation kube32.io/event-topics (comma separated), from any

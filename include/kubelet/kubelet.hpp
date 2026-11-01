@@ -68,6 +68,8 @@ struct LocalPodRecord {
     bool has_cpu_sample{false};
     uint64_t last_cpu_busy_us{0};
     uint64_t last_cpu_wall_us{0};
+    bool frozen{false};                      // reported not Ready while frozen for a checkpoint
+    std::string restored_from;               // the Checkpoint the container started from
 };
 
 struct KubeletConfig {
@@ -91,6 +93,8 @@ struct KubeletConfig {
     // Annotations the node finds on itself (what I2C discovery identified),
     // read right after node_label_source; changes are patched onto the Node
     std::function<std::map<std::string, std::string>()> node_annotation_source;
+    // Annotations set once on the Node besides those (kube32.io/interp-mops)
+    std::map<std::string, std::string> node_annotations;
     std::string node_ip{"127.0.0.1"};
     // Port of this node's kubelet endpoint (the pod HTTP server: node storage
     // through the API server's node proxy), 0 when the node runs none

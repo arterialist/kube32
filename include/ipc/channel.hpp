@@ -232,8 +232,17 @@ public:
     // ESP-NOW receive callback entry: copies the frame for the dispatcher thread.
     void enqueue_raw_frame(const uint8_t* src_mac, const uint8_t* frame, size_t len);
 
-    // Workload API primitives
+    // Workload API primitives. Handles are numbered per node; a handle names
+    // a channel only together with the pod that opened it.
     int32_t open(const std::string& pod_id, const std::string& channel_uri, uint32_t flags);
+    // Opens `channel_uri` for the pod under the handle number `handle` (a
+    // restored pod gets back the handles it had). Fails with IPC_ERR_INVAL
+    // when the pod already holds that handle.
+    int32_t open_as(const std::string& pod_id, const std::string& channel_uri, uint32_t flags, int32_t handle);
+    // The pod's open handles and the channel each names, by handle number
+    std::vector<std::pair<int32_t, std::string>> handles_of(const std::string& pod_id) const;
+    // Closes every handle the pod holds (its container stopped)
+    void close_all(const std::string& pod_id);
     int32_t send(const std::string& pod_id, int32_t handle, const uint8_t* data, size_t len);
     int32_t recv(const std::string& pod_id, int32_t handle, uint8_t* out_buf, size_t max_len, uint32_t timeout_ms);
     int32_t close(const std::string& pod_id, int32_t handle);
@@ -258,9 +267,10 @@ private:
     ChannelManager();
     ~ChannelManager();
 
-    osal::Mutex mutex_;
+    mutable osal::Mutex mutex_;
     int32_t next_handle_{1};
-    std::map<int32_t, ChannelHandle> handles_;
+    std::map<std::pair<std::string, int32_t>, ChannelHandle> handles_;   // by (pod, handle)
+    int32_t open_locked(const std::string& pod_id, const std::string& channel_uri, uint32_t flags, int32_t hid);
     std::unique_ptr<IChannelTransport> transport_;
     std::atomic<uint16_t> seq_generator_{1};
     ChannelStats stats_;

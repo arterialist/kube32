@@ -124,6 +124,7 @@ int32_t PodFs::open(const std::string& pod_id, std::string_view path, uint32_t f
     t.slots[slot].host_fd = fd;
     t.slots[slot].readable = (acc != K32_FS_O_WRONLY);
     t.slots[slot].writable = (acc != K32_FS_O_RDONLY);
+    t.slots[slot].path = rel;
     return slot;
 }
 
@@ -296,6 +297,17 @@ uint32_t PodFs::open_count(const std::string& pod_id) const {
     uint32_t n = 0;
     for (const auto& s : it->second.slots) if (s.host_fd >= 0) n++;
     return n;
+}
+
+std::vector<std::pair<int32_t, std::string>> PodFs::open_files(const std::string& pod_id) const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    std::vector<std::pair<int32_t, std::string>> out;
+    auto it = tables_.find(pod_id);
+    if (it == tables_.end()) return out;
+    for (int32_t i = 0; i < K32_FS_MAX_FDS; ++i) {
+        if (it->second.slots[i].host_fd >= 0) out.emplace_back(i, it->second.slots[i].path);
+    }
+    return out;
 }
 
 } // namespace kube32::runtime

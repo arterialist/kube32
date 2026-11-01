@@ -1,5 +1,6 @@
 #include "runtime/host_functions.hpp"
 #include "runtime/container_lifecycle.hpp"
+#include "runtime/app_pod.hpp"
 #include "hal/capability_firewall.hpp"
 #include "hal/mock_hal.hpp"
 #include "osal/system.hpp"
@@ -361,10 +362,9 @@ static const void* raw_esp32_rmt_receive(IM3Runtime runtime, IM3ImportContext _c
 
 // esp32_get_time_us: signature "I()" -> returns int64_t
 static const void* raw_esp32_get_time_us(IM3Runtime runtime, IM3ImportContext _ctx, uint64_t* _sp, void* _mem) {
-    (void)runtime;
     (void)_ctx;
     (void)_mem;
-    int64_t time_us = static_cast<int64_t>(osal::Thread::get_time_us());
+    int64_t time_us = static_cast<int64_t>(osal::Thread::get_time_us()) + pod_clock_offset_ms(runtime) * 1000;
     *reinterpret_cast<int64_t*>(_sp) = time_us;
     return m3Err_none;
 }
