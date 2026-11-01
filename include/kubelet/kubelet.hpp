@@ -157,6 +157,7 @@ public:
     // Core reconciler loops (invoked sequentially by the main task loop)
     void reconcile_node_registration();
     void refresh_node_ip();
+    bool node_address_reported_{false};   // status.addresses written since start
     void refresh_node_labels();
     void drop_stale_node_labels();
     void report_heartbeat();

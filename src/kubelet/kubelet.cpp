@@ -405,12 +405,23 @@ void Kubelet::drop_stale_node_labels() {
 }
 
 void Kubelet::refresh_node_ip() {
-    if (!config_.node_ip_provider) return;
-    std::string ip = config_.node_ip_provider();
-    if (ip.empty() || ip == "0.0.0.0" || ip == config_.node_ip) return;
-    config_.node_ip = ip;
-    status_reporter_->set_node_ip(ip);
-    std::cout << "[KUBELET] node address is now " << ip << std::endl;
+    if (config_.node_ip_provider) {
+        std::string ip = config_.node_ip_provider();
+        if (!ip.empty() && ip != "0.0.0.0" && ip != config_.node_ip) {
+            config_.node_ip = ip;
+            status_reporter_->set_node_ip(ip);
+            node_address_reported_ = false;
+            std::cout << "[KUBELET] node address is now " << ip << std::endl;
+        }
+    }
+    // Heartbeats carry no addresses, and registering over an existing Node
+    // can keep the old ones: write the address once after a start and after
+    // each change, so that clients that dial the node reach this board
+    if (node_address_reported_ || config_.node_ip.empty() || config_.node_ip == "0.0.0.0") return;
+    std::string patch = "{\"status\":{\"addresses\":[{\"type\":\"InternalIP\",\"address\":\"";
+    patch += config_.node_ip;
+    patch += "\"}]}}";
+    node_address_reported_ = api_client_->patch_node_status(config_.node_name, patch);
 }
 
 void Kubelet::report_heartbeat() {
