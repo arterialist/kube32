@@ -64,6 +64,7 @@ void WatchHub::stop() {
     }
     streams_.clear();
     replay_.clear();
+    replay_bytes_ = 0;
 }
 
 bool WatchHub::has_capacity() const {
@@ -134,25 +135,45 @@ std::string WatchHub::expired_status(uint64_t resource_version) {
 }
 
 // Runs on the thread that mutated the store (API worker, controller, kubelet).
-// Only queues; never touches a socket.
+// Only queues; never touches a socket. It does not throw: the change is in
+// the store already, so an event that cannot be queued for lack of memory
+// makes the streams that wanted it start over (410, the client relists)
+// rather than miss it.
 void WatchHub::on_store_event(const storage::WatchEvent& ev) {
-    auto qe = std::make_shared<const QueuedEvent>(QueuedEvent{ev.type, ev.key, ev.json, ev.resource_version});
+    EventPtr qe;
+    try {
+        qe = std::make_shared<const QueuedEvent>(QueuedEvent{ev.type, ev.key, ev.json, ev.resource_version});
+    } catch (const std::bad_alloc&) {
+    }
     osal::LockGuard guard(mutex_);
-    if (options_.replay_ring > 0) {
-        if (replay_.size() >= options_.replay_ring) {
+    bool ring_kept = false;
+    if (qe && options_.replay_ring > 0) {
+        try {
+            replay_.push_back(qe);
+            replay_bytes_ += qe->json.size();
+            ring_kept = true;
+        } catch (const std::bad_alloc&) {
+        }
+        while (!replay_.empty() && (replay_.size() > options_.replay_ring || (replay_bytes_ > options_.replay_ring_bytes && replay_.size() > 1))) {
             oldest_evicted_version_ = replay_.front()->version;
+            replay_bytes_ -= replay_.front()->json.size();
             replay_.pop_front();
         }
-        replay_.push_back(qe);
     }
+    // A resourceVersion watch from before this event cannot be served from the ring
+    if (!ring_kept && ev.resource_version > oldest_evicted_version_) oldest_evicted_version_ = ev.resource_version;
     for (auto& s : streams_) {
         if (s->is_log) continue;
         if (ev.key.compare(0, s->watch.prefix.size(), s->watch.prefix) != 0) continue;
-        if (s->queue.size() >= options_.queue_depth) {
+        if (!qe || s->queue.size() >= options_.queue_depth) {
             s->overflow = true;
             continue;
         }
-        s->queue.push_back(qe);
+        try {
+            s->queue.push_back(qe);
+        } catch (const std::bad_alloc&) {
+            s->overflow = true;
+        }
     }
 }
 
@@ -169,9 +190,20 @@ bool WatchHub::send_frame(Stream& s, const std::string& payload) {
     return true;
 }
 
+// One chunk {"type":"<type>","object":<object>}\n, sent in pieces: the
+// object is not copied for each stream
 bool WatchHub::send_watch_event(Stream& s, const char* type, const std::string& object_json) {
     if (s.watch.wrap) return send_frame(s, frame(type, s.watch.wrap(object_json)));
-    return send_frame(s, frame(type, object_json));
+    char head[64];
+    const size_t type_len = std::strlen(type);
+    const size_t payload = 20 + type_len + object_json.size() + 2;   // {"type":"","object": and }\n
+    const int n = snprintf(head, sizeof(head), "%zx\r\n{\"type\":\"%s\",\"object\":", payload, type);
+    if (n <= 0 || static_cast<size_t>(n) >= sizeof(head)) return false;
+    if (!s.sock.send_all(head, static_cast<size_t>(n))) return false;
+    if (!s.sock.send_all(object_json.data(), object_json.size())) return false;
+    if (!s.sock.send_all("}\n\r\n", 4)) return false;
+    frames_sent_.fetch_add(1, std::memory_order_relaxed);
+    return true;
 }
 
 void WatchHub::finish(Stream& s) {
@@ -274,51 +306,80 @@ bool WatchHub::poll_log(Stream& s, uint64_t now_ms) {
     return true;
 }
 
+// One pass over one stream: false when it ends
+bool WatchHub::serve(Stream& s, uint64_t now, std::vector<EventPtr>& pending, bool overflowed) {
+    if (s.is_log) return poll_log(s, now);
+    bool alive = true;
+    if (!s.primed) {
+        s.primed = true;
+        alive = prime(s);
+    }
+    if (alive && overflowed) {
+        send_frame(s, frame("ERROR", expired_status(s.watch.since_version)));
+        alive = false;
+    }
+    if (alive && !pending.empty()) alive = flush(s, pending);
+    if (alive && s.watch.bookmarks && now >= s.next_bookmark_ms) {
+        s.next_bookmark_ms = now + options_.bookmark_interval_ms;
+        std::string obj = "{\"kind\":\"" + s.watch.kind + "\",\"apiVersion\":\"" + s.watch.api_version +
+                          "\",\"metadata\":{\"resourceVersion\":\"" + std::to_string(store_.current_version()) + "\"}}";
+        alive = send_frame(s, frame("BOOKMARK", obj));
+    }
+    return alive;
+}
+
 void WatchHub::run() {
     while (running_.load()) {
         uint64_t now = osal::System::get_uptime_ms();
 
         // Snapshot the stream pointers and their pending events under the lock;
         // socket I/O happens outside it so store writers never wait on a client.
+        // Out of memory, a stream whose events cannot be taken is told to
+        // start over (410) rather than miss them.
         std::vector<Stream*> active;
         std::vector<std::vector<EventPtr>> pending;
         std::vector<bool> overflowed;
+        bool reserved = true;
         {
             osal::LockGuard guard(mutex_);
-            active.reserve(streams_.size());
-            for (auto& s : streams_) {
-                active.push_back(s.get());
-                std::vector<EventPtr> batch(s->queue.begin(), s->queue.end());
-                s->queue.clear();
-                pending.push_back(std::move(batch));
-                overflowed.push_back(s->overflow);
-                s->overflow = false;
+            try {
+                active.reserve(streams_.size());
+                pending.reserve(streams_.size());
+                overflowed.reserve(streams_.size());
+            } catch (const std::bad_alloc&) {
+                reserved = false;
             }
+            for (size_t i = 0; reserved && i < streams_.size(); ++i) {
+                Stream& s = *streams_[i];
+                std::vector<EventPtr> batch;
+                try {
+                    batch.assign(s.queue.begin(), s.queue.end());
+                    s.queue.clear();
+                } catch (const std::bad_alloc&) {
+                    s.overflow = true;
+                }
+                active.push_back(&s);
+                pending.push_back(std::move(batch));
+                overflowed.push_back(s.overflow);
+                s.overflow = false;
+            }
+        }
+        if (!reserved) {
+            osal::Thread::sleep_ms(options_.poll_interval_ms);
+            continue;
         }
 
         std::vector<Stream*> closed;
         for (size_t i = 0; i < active.size(); ++i) {
             Stream& s = *active[i];
-            bool alive = true;
-            if (s.is_log) {
-                alive = poll_log(s, now);
-            } else {
-                if (!s.primed) {
-                    s.primed = true;
-                    alive = prime(s);
-                }
-                if (alive && overflowed[i]) {
-                    send_frame(s, frame("ERROR", expired_status(s.watch.since_version)));
-                    alive = false;
-                }
-                if (alive && !pending[i].empty()) alive = flush(s, pending[i]);
-                if (alive && s.watch.bookmarks && now >= s.next_bookmark_ms) {
-                    s.next_bookmark_ms = now + options_.bookmark_interval_ms;
-                    std::string obj = "{\"kind\":\"" + s.watch.kind + "\",\"apiVersion\":\"" + s.watch.api_version +
-                                      "\",\"metadata\":{\"resourceVersion\":\"" + std::to_string(store_.current_version()) + "\"}}";
-                    alive = send_frame(s, frame("BOOKMARK", obj));
-                }
+            bool alive = false;
+            try {
+                alive = serve(s, now, pending[i], overflowed[i]);
+            } catch (const std::exception& e) {
+                // Out of memory: the stream ends and its client watches again
+                std::cout << "[API] watch stream ended: " << e.what() << std::endl;
             }
+            pending[i].clear();
             if (alive && now >= s.deadline_ms) alive = false;   // client re-watches, as with kube-apiserver timeouts
             if (!alive) closed.push_back(&s);
         }

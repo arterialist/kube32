@@ -368,7 +368,7 @@ The kubelet resolves `spec.containers[0].image` in this order:
 
 1. `wasm://sd/<name>[:<tag>]` reads `<card>/kube32/images/<name>[-<tag>].wasm` (up to 256 KiB without PSRAM, 2 MiB with PSRAM).
 2. Any other image reference is looked up in the firmware's embedded registry by its key (the last path component before `:`).
-3. Otherwise, the kubelet decodes `metadata.annotations["kube32.io/wasm-base64"]`.
+3. Otherwise, a pod with `kube32.io/wasm-sha256` gets the module the API server keeps under that digest (an inline image, below), from `GET /apis/kube32.io/v1/images/<sha256>`. The kubelet checks the bytes against the digest.
 
 ### Inline image (`kube32-cli deploy`)
 
@@ -379,6 +379,17 @@ $ tools/kube32-cli deploy sdk/rust/examples/counter/build/counter.wasm --node es
 pod/counter created
 deployed default/counter: 6,400 bytes inline, 64Ki linear memory, hardware: ipc
 ```
+
+The API server keeps the module apart from the Pod. It decodes `kube32.io/wasm-base64` as the request arrives, stores the module in the object store under its SHA-256, and stores the Pod with `kube32.io/wasm-sha256` and `kube32.io/wasm-size` in place of the annotation:
+
+```
+$ kubectl get pod counter -o jsonpath='{.metadata.annotations}'
+{"kube32.io/wasm-sha256":"3f1c...","kube32.io/wasm-size":"6400"}
+```
+
+Thus the Pod object stays small in lists, watches and the controllers' passes, whatever the module's size. The same applies to the pod template of a Deployment, DaemonSet or Job, whose pods all share one stored module. Manifests with `kube32.io/wasm-base64` work with `kubectl create`, `apply`, `replace` and `patch`. In `kubectl.kubernetes.io/last-applied-configuration`, the module is replaced by `sha256:<digest>`, so each `kubectl apply` sends the module again and finds it stored. A value that is not base64 is refused with `422 Invalid`. The module is deleted with the last object that refers to it.
+
+With a flash journal, the module's bytes stay on flash and take no RAM. They count against the journal's capacity (about 480 KB on a board without a card).
 
 Key flags for `kube32-cli deploy`:
 
@@ -438,8 +449,8 @@ Rebuild the firmware with `pio run -e esp32s3`, or reconfigure and build the hos
 
 | Annotation | Target | Meaning |
 | --- | --- | --- |
-| `kube32.io/wasm-base64` | Pod | Base64-encoded `.wasm` module used when the image is not on SD or embedded |
-| `kube32.io/wasm-sha256`, `kube32.io/wasm-size` | Pod | Module digest and byte size recorded by `kube32-cli deploy` |
+| `kube32.io/wasm-base64` | Pod, pod template | Base64-encoded `.wasm` module used when the image is not on SD or embedded. The API server stores the module and replaces this annotation with the two below |
+| `kube32.io/wasm-sha256`, `kube32.io/wasm-size` | Pod, pod template | Module digest and byte size. For an inline image the API server sets them, and the kubelet reads the module by the digest |
 | `kube32.io/execution-budget` | Pod | Per-call wasm3 gas limit (`<units>` or `"off"`, default `4000000000`) |
 | `kube32.io/wasm-stack` | Pod | Per-pod wasm3 value stack size (`512` to `64Ki`; default: what the module's calls need, at most `4Ki` for pods up to `64Ki` of linear memory) |
 | `kube32.io/event-topics` | Pod | Comma-separated channel topics delivered to the pod's `k32_event` export |

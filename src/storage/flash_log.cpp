@@ -661,6 +661,30 @@ bool FlashLog::has_key(const std::string& key) const {
     return e && e->type == static_cast<uint8_t>(RecordType::Put);
 }
 
+bool FlashLog::read_value(const std::string& key, std::string& out) {
+    std::lock_guard<std::recursive_mutex> lock(mutex_);
+    const IndexEntry* e = find(hash_key(key));
+    if (!e || e->type != static_cast<uint8_t>(RecordType::Put)) return false;
+    RecordType type;
+    std::string stored_key;
+    uint64_t revision = 0;
+    size_t total = 0;
+    uint32_t end_seq = 0;
+    size_t end_off = 0;
+    if (!read_record_at(static_cast<uint32_t>(e->pos / sector_), static_cast<size_t>(e->pos % sector_), type, stored_key, out,
+                        revision, total, end_seq, end_off)) {
+        out.clear();
+        return false;
+    }
+    return type == RecordType::Put && stored_key == key;
+}
+
+size_t FlashLog::record_bytes(const std::string& key) const {
+    std::lock_guard<std::recursive_mutex> lock(mutex_);
+    const IndexEntry* e = find(hash_key(key));
+    return (e && e->type == static_cast<uint8_t>(RecordType::Put)) ? e->bytes : 0;
+}
+
 FlashLogStats FlashLog::stats() const {
     std::lock_guard<std::recursive_mutex> lock(mutex_);
     FlashLogStats s = counters_;

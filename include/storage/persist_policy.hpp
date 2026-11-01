@@ -11,13 +11,21 @@
 //              churn is written at most once per deferred interval.
 //   Immediate  Everything else: written within the flush delay (one second),
 //              several changes to one key in that window coalesce.
+//   FlashOnly  Keys under /blobs/: large values written once and read
+//              rarely (the pieces of inline images, api/inline_images.hpp).
+//              Written like Immediate keys; once the flash journal holds a
+//              value it leaves RAM and reads come from the journal. Without
+//              a journal the value stays in RAM.
 
 #include <cstdint>
 #include <string>
 
 namespace kube32::storage {
 
-enum class PersistClass { Ephemeral, Immediate, Deferred };
+enum class PersistClass { Ephemeral, Immediate, Deferred, FlashOnly };
+
+// Prefix of the FlashOnly keys
+constexpr const char* kFlashOnlyPrefix = "/blobs/";
 
 PersistClass persist_class(const std::string& key);
 
