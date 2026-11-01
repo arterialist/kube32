@@ -42,6 +42,8 @@
 
 #include <algorithm>
 #include <csignal>
+#include <thread>
+#include <unistd.h>
 #include <fstream>
 #include <iterator>
 #include <cstdlib>
@@ -51,10 +53,93 @@
 #include <vector>
 
 static std::atomic<bool> g_sim_running{true};
+static std::atomic<int> g_signals{0};
 
+// The first SIGINT or SIGTERM stops the process (a worker leaves the
+// cluster first), a second one exits at once
 static void signal_handler(int sig) {
     (void)sig;
+    if (g_signals.fetch_add(1) >= 1) _exit(130);
     g_sim_running.store(false);
+}
+
+// One request to the API server whose answer is only its status
+static int api_call(const std::string& host, uint16_t port, const std::string& token, const char* method, const std::string& path,
+                    const std::string& body, const char* content_type) {
+    kube32::osal::Socket s;
+    if (!s.create(kube32::osal::SocketType::Tcp) || !s.connect(host.c_str(), port, 3000)) return 0;
+    s.set_timeout(10000, 10000);
+    std::string req = std::string(method) + " " + path + " HTTP/1.1\r\nHost: " + host + "\r\nConnection: close\r\nContent-Type: " + content_type +
+                      "\r\nContent-Length: " + std::to_string(body.size()) + "\r\n";
+    if (!token.empty()) req += "Authorization: Bearer " + token + "\r\n";
+    req += "\r\n" + body;
+    if (!s.send_all(req.data(), req.size())) return 0;
+    char buf[64];
+    const ssize_t n = s.recv(buf, sizeof(buf) - 1);
+    if (n < 12) return 0;
+    buf[n] = '\0';
+    return std::atoi(buf + 9);
+}
+
+// The pods bound to `node` that a drain moves or evicts: all but DaemonSet pods
+static std::vector<std::pair<std::string, std::string>> node_pods(kube32::kubelet::HttpKubeClient& api, const std::string& node, bool& ok) {
+    std::vector<std::pair<std::string, std::string>> out;
+    const int status = api.list_items("/api/v1/pods?fieldSelector=spec.nodeName%3D" + node, [&](std::string&& item) {
+        kube32::models::JsonValue doc;
+        std::string err;
+        if (!kube32::models::parse_json(item, doc, err)) return;
+        const kube32::models::JsonValue* meta = doc.get("metadata");
+        if (!meta) return;
+        if (const kube32::models::JsonValue* owners = meta->get("ownerReferences"); owners && owners->is_array()) {
+            for (const auto& o : owners->arr_val) {
+                if (o.get_string("kind", "") == "DaemonSet") return;
+            }
+        }
+        out.emplace_back(meta->get_string("namespace", "default"), meta->get_string("name", ""));
+    });
+    ok = status == 200;
+    return out;
+}
+
+// A worker leaving the cluster: it cordons its Node, asks the control plane
+// to evict its pods (movable pods move with their state), and waits up to
+// 20 s for them to go. The Node carries kube32.io/left until the worker
+// starts again and makes it schedulable.
+static void leave_cluster(const std::string& host, uint16_t port, const std::string& token, const std::string& node) {
+    kube32::kubelet::HttpKubeClient api(host, port);
+    api.set_bearer_token(token);
+    const int cordoned = api_call(host, port, token, "PATCH", "/api/v1/nodes/" + node,
+                                  "{\"spec\":{\"unschedulable\":true},\"metadata\":{\"annotations\":{\"kube32.io/left\":\"true\"}}}",
+                                  "application/merge-patch+json");
+    if (cordoned != 200) {
+        std::cout << "[LEAVE] cannot cordon " << node << " (HTTP " << cordoned << "); leaving as it is" << std::endl;
+        return;
+    }
+    bool listed = false;
+    const auto pods = node_pods(api, node, listed);
+    std::cout << "[LEAVE] " << node << " cordoned; evicting " << pods.size() << " pod(s)" << std::endl;
+    for (const auto& p : pods) {
+        const std::string body = "{\"apiVersion\":\"policy/v1\",\"kind\":\"Eviction\",\"metadata\":{\"name\":\"" + p.second +
+                                 "\",\"namespace\":\"" + p.first + "\"}}";
+        const int st = api_call(host, port, token, "POST", "/api/v1/namespaces/" + p.first + "/pods/" + p.second + "/eviction", body,
+                                "application/json");
+        if (st == 404 || st == 405) {
+            std::cout << "[LEAVE] the control plane does not evict pods (HTTP " << st << "); leaving after the cordon" << std::endl;
+            return;
+        }
+        std::cout << "[LEAVE] eviction of " << p.first << "/" << p.second << ": HTTP " << st << std::endl;
+    }
+    const uint64_t deadline = kube32::osal::System::get_uptime_ms() + 20000;
+    while (kube32::osal::System::get_uptime_ms() < deadline) {
+        bool ok = false;
+        const size_t left = node_pods(api, node, ok).size();
+        if (ok && left == 0) {
+            std::cout << "[LEAVE] every pod left " << node << std::endl;
+            return;
+        }
+        kube32::osal::Thread::sleep_ms(500);
+    }
+    std::cout << "[LEAVE] pods still on " << node << " after 20 s; leaving" << std::endl;
 }
 
 struct SimOptions {
@@ -429,6 +514,25 @@ int main(int argc, char* argv[]) {
             std::cerr << "[FATAL] Failed to start Kubelet worker agent." << std::endl;
             return 1;
         }
+        // Back after a graceful leave: schedulable again, once the Node is
+        // seen without kube32.io/left (the control plane may still write
+        // back the Node it last saw while the node was away)
+        uint64_t next_left_check = 0;
+        bool left_checked = false;
+        auto rejoin = [&] {
+            const uint64_t now = kube32::osal::System::get_uptime_ms();
+            if (left_checked || now < next_left_check) return;
+            next_left_check = now + 2000;
+            std::string left;
+            const int st = api_client->get_node_annotation(opts.node_name, "kube32.io/left", left);
+            if (st == 200 && left.empty()) {
+                left_checked = true;
+            } else if (st == 200 && api_call(master_host, master_port, opts.token, "PATCH", "/api/v1/nodes/" + opts.node_name,
+                                             "{\"spec\":{\"unschedulable\":null},\"metadata\":{\"annotations\":{\"kube32.io/left\":null}}}",
+                                             "application/merge-patch+json") == 200) {
+                std::cout << "[SIM] " << opts.node_name << " is schedulable again" << std::endl;
+            }
+        };
 
         std::cout << "[READY] Kubelet worker agent running for " << opts.node_name
                   << " -> connected to http://" << master_host << ":" << master_port << std::endl;
@@ -444,13 +548,30 @@ int main(int argc, char* argv[]) {
         // As on the boards: a pod is ticked once per kube32.io/tick-interval;
         // one whose k32_tick returns >0 has work left and is ticked again
         // after 10 ms.
-        while (g_sim_running.load()) {
+        auto tick = [] {
             const uint32_t wait = kube32::runtime::AppPodHost::instance().tick_due(kube32::osal::System::get_uptime_ms(), 250);
             kube32::osal::Thread::sleep_ms(std::max<uint32_t>(wait, 10));
+        };
+        bool rebooting = false;
+        while (g_sim_running.load()) {
+            tick();
+            rejoin();
             if (worker_slots->reboot_requested()) {
                 std::cout << "[SIM] " << opts.node_name << " switched firmware slots: start kube32-sim again to boot it" << std::endl;
+                rebooting = true;
                 break;
             }
+        }
+        // A signal: the worker leaves the cluster while its kubelet and pod
+        // server still serve the moves
+        if (!rebooting) {
+            std::atomic<bool> left{false};
+            std::thread leave([&] {
+                leave_cluster(master_host, master_port, opts.token, opts.node_name);
+                left.store(true);
+            });
+            while (!left.load()) tick();
+            leave.join();
         }
 
         std::cout << "\n[SHUTDOWN] Stopping Kubelet worker agent..." << std::endl;
