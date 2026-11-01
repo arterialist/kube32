@@ -1272,5 +1272,89 @@ class TestDevices(TempDirCase):
         self.assertIn("NotFound", err)
 
 
+# A kubectl that keeps Checkpoints and moves each one a phase further at
+# every read, as the Checkpoint controller would; it logs its arguments
+FAKE_CHECKPOINT_KUBECTL = textwrap.dedent("""\
+    #!/usr/bin/env python3
+    import json, os, sys
+    path = os.environ["FAKE_CK_STATE"]
+    with open(os.environ["FAKE_CK_LOG"], "a") as f:
+        f.write(json.dumps(sys.argv[1:]) + "\\n")
+    state = json.load(open(path)) if os.path.exists(path) else {}
+    raw = sys.argv[sys.argv.index("--raw") + 1]
+    if "create" in sys.argv:
+        obj = json.load(open(sys.argv[sys.argv.index("-f") + 1]))
+        obj["metadata"]["resourceVersion"] = str(len(state) + 1)
+        obj["status"] = {"phase": "Pending"}
+        state[obj["metadata"]["name"]] = obj
+    elif raw.endswith("/checkpoints"):
+        print(json.dumps({"items": list(state.values())}))
+        sys.exit(0)
+    else:
+        obj = state[raw.rsplit("/", 1)[1]]
+        spec, st = obj["spec"], obj["status"]
+        if spec["podName"] == "drv":
+            obj["status"] = {"phase": "Failed", "message": "the pod cannot move", "blockers": ["grant esp32.io/gpio-2"]}
+        elif st["phase"] == "Pending":
+            obj["status"] = {"phase": "Saving", "nodeName": "cardputer"}
+        elif spec["action"] == "Save":
+            obj["status"] = {"phase": "Saved", "nodeName": "cardputer", "sizeBytes": 1234}
+        elif st["phase"] == "Saving":
+            obj["status"] = {"phase": "Moving", "nodeName": "cardputer", "targetNode": spec.get("target", {}).get("nodeName", "devkit")}
+        else:
+            obj["status"] = dict(st, phase="Completed", message="moved from node cardputer to node devkit in 2.4 s")
+    json.dump(state, open(path, "w"))
+    print(json.dumps(obj))
+""")
+
+
+class TestCheckpoints(TempDirCase):
+    def setUp(self):
+        super().setUp()
+        self.kubectl = self.write("kubectl", FAKE_CHECKPOINT_KUBECTL)
+        os.chmod(self.kubectl, os.stat(self.kubectl).st_mode | stat.S_IXUSR)
+        self.log = os.path.join(self.tmp, "log")
+        self.env = dict(os.environ, FAKE_CK_STATE=os.path.join(self.tmp, "state.json"), FAKE_CK_LOG=self.log)
+
+    def calls(self):
+        with open(self.log) as f:
+            return [json.loads(line) for line in f]
+
+    def test_move_waits_for_the_result(self):
+        rc, out, err = run_cli("move", "echo", "--to", "devkit", "--context", "lab", "--server", "http://127.0.0.1:1",
+                               "--kubectl", self.kubectl, env=self.env)
+        self.assertEqual(rc, 0, err)
+        self.assertIn("moved from node cardputer to node devkit in 2.4 s", out)
+        create = self.calls()[0]
+        self.assertEqual(create[:4], ["--context", "lab", "--server", "http://127.0.0.1:1"])
+        self.assertIn("/apis/kube32.io/v1/namespaces/default/checkpoints", create)
+        with open(self.env["FAKE_CK_STATE"]) as f:
+            state = json.load(f)
+        (obj,) = state.values()
+        self.assertEqual(obj["spec"], {"podName": "echo", "action": "Move", "target": {"nodeName": "devkit"}})
+        self.assertTrue(obj["metadata"]["name"].startswith("echo-"))
+        for call in self.calls():
+            self.assertEqual(call[:4], ["--context", "lab", "--server", "http://127.0.0.1:1"])
+
+    def test_checkpoint_and_list(self):
+        rc, out, err = run_cli("checkpoint", "echo", "-n", "default", "--kubeconfig", "/nonexistent/kc", "--kubectl", self.kubectl, env=self.env)
+        self.assertEqual(rc, 0, err)
+        self.assertIn("saved 1234 bytes from node cardputer", out)
+        self.assertEqual(self.calls()[0][:2], ["--kubeconfig", "/nonexistent/kc"])
+        rc, out, err = run_cli("checkpoints", "--kubectl", self.kubectl, env=self.env)
+        self.assertEqual(rc, 0, err)
+        lines = out.splitlines()
+        self.assertRegex(lines[0], r"^NAME\s+POD\s+ACTION\s+PHASE\s+NODE\s+TARGET\s+SIZE\s+TRIGGER\s+MESSAGE$")
+        self.assertRegex(lines[1], r"^echo-\w+\s+echo\s+Save\s+Saved\s+cardputer\s+-\s+1,234\s+-$")
+
+    def test_refused_move_names_the_blockers(self):
+        rc, out, err = run_cli("move", "drv", "--kubectl", self.kubectl, env=self.env)
+        self.assertEqual(rc, 7)
+        self.assertIn("the pod cannot move", err)
+        self.assertIn("grant esp32.io/gpio-2", err)
+        rc, _, err = run_cli("move", "Bad_Name", "--kubectl", self.kubectl, env=self.env)
+        self.assertEqual(rc, 2)
+
+
 if __name__ == "__main__":
     unittest.main()

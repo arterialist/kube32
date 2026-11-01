@@ -13,6 +13,9 @@ kube32-cli: build, check, deploy and ship WebAssembly pods for Kube32.
     kube32-cli firmware rollout              update every node to the staged image, one at a time
     kube32-cli firmware status|abort|info    the rollout and each node's firmware; stop a rollout; read an image file
     kube32-cli devices                       every Device with the latest reading of its driver
+    kube32-cli checkpoint <pod>              save a running pod's state in a Checkpoint
+    kube32-cli move <pod> [--to <node>]      move a running pod to another node with its state
+    kube32-cli checkpoints                   list Checkpoints
 
 The ABI it checks against is include/runtime/k32_app_abi.h; the import
 signatures are the m3_LinkRawFunction calls in src/runtime/app_pod.cpp and
@@ -27,6 +30,7 @@ Exit codes:
     4  kubectl failed
     5  deploy: the pod already exists and --replace was not given; firmware rollout: one is in progress
     6  firmware rollout: the rollout failed or did not finish in time
+    7  checkpoint, move: it failed or did not finish in time
 """
 import argparse
 import base64
@@ -53,6 +57,7 @@ EXIT_CHECK = 3
 EXIT_KUBECTL = 4
 EXIT_EXISTS = 5
 EXIT_ROLLOUT = 6
+EXIT_MOVE = 7
 
 TOOLS_DIR = os.path.dirname(os.path.abspath(__file__))
 REPO_ROOT = os.path.dirname(TOOLS_DIR)
@@ -1858,7 +1863,7 @@ def build_parser():
     p = argparse.ArgumentParser(prog="kube32-cli", description="Build, check, deploy and ship Kube32 WebAssembly pods.",
                                 epilog="exit codes: 0 ok, 1 input/toolchain problem, 2 usage, 3 ABI check failed, 4 kubectl failed, "
                                        "5 deploy: pod exists (pass --replace), firmware rollout: one is in progress, "
-                                       "6 firmware rollout failed")
+                                       "6 firmware rollout failed, 7 checkpoint or move failed")
     p.add_argument("--version", action="version", version="kube32-cli " + VERSION)
     sub = p.add_subparsers(dest="command")
 
@@ -1962,6 +1967,27 @@ def build_parser():
     dv.add_argument("--timeout", type=float, default=3.0, help="seconds to wait for each driver (default 3)")
     kubectl_flags(dv)
     dv.set_defaults(func=cmd_devices)
+
+    def checkpoint_flags(sp, timeout):
+        sp.add_argument("pod")
+        sp.add_argument("-n", "--namespace", default="default")
+        sp.add_argument("-c", "--container", help="the container (default: the pod's only one)")
+        sp.add_argument("--no-wait", action="store_true", help="create the Checkpoint and return")
+        sp.add_argument("--timeout", type=float, default=timeout, help="seconds to wait for the result (default %d)" % timeout)
+        kubectl_flags(sp)
+
+    ck = sub.add_parser("checkpoint", help="save a running pod's state in a Checkpoint (the pod keeps running)")
+    checkpoint_flags(ck, 60)
+    ck.set_defaults(func=cmd_checkpoint, action="Save")
+    mv = sub.add_parser("move", help="move a running pod to another node with its state")
+    checkpoint_flags(mv, 120)
+    mv.add_argument("--to", help="the node (default: the one the scheduler picks)")
+    mv.set_defaults(func=cmd_checkpoint, action="Move")
+    cl = sub.add_parser("checkpoints", help="list Checkpoints")
+    cl.add_argument("-n", "--namespace", default="default")
+    cl.add_argument("-A", "--all-namespaces", action="store_true")
+    kubectl_flags(cl)
+    cl.set_defaults(func=cmd_checkpoints)
     return p
 
 
@@ -2014,6 +2040,76 @@ def cmd_devices(args):
     except ApiError as e:
         return err_exit(str(e), EXIT_KUBECTL)
     cols = [("NAME", "name"), ("DRIVER", "driver"), ("NODE", "node"), ("PHASE", "phase"), ("READING", "reading")]
+    print_table(rows, ([("NAMESPACE", "ns")] if args.all_namespaces else []) + cols)
+    return EXIT_OK
+
+
+CHECKPOINTS_PATH = "/apis/kube32.io/v1/namespaces/%s/checkpoints"
+
+
+def cmd_checkpoint(args):
+    """checkpoint and move: a Checkpoint with action Save or Move, then its result"""
+    if not _NAME_RE.match(args.pod):
+        return err_exit("invalid pod name '%s'" % args.pod, EXIT_USAGE)
+    name = "%s-%s" % (args.pod[:56], os.urandom(3).hex()[:5])
+    spec = {"podName": args.pod, "action": args.action}
+    if args.container:
+        spec["containerName"] = args.container
+    if getattr(args, "to", None):
+        spec["target"] = {"nodeName": args.to}
+    manifest = {"apiVersion": "kube32.io/v1", "kind": "Checkpoint", "metadata": {"name": name, "namespace": args.namespace}, "spec": spec}
+    path = CHECKPOINTS_PATH % args.namespace
+    try:
+        api_call(args, "create", path, json.dumps(manifest).encode())
+    except ApiError as e:
+        return err_exit(str(e), EXIT_KUBECTL)
+    print("checkpoint %s: %s of pod %s" % (name, "move" if args.action == "Move" else "save", args.pod))
+    if args.no_wait:
+        print("follow it with: kube32-cli checkpoints, kubectl get checkpoint %s, kubectl get events" % name)
+        return EXIT_OK
+    done = ("Completed", "Failed") if args.action == "Move" else ("Saved", "Failed")
+    last = None
+    deadline = time.time() + args.timeout
+    while time.time() < deadline:
+        time.sleep(0.5)
+        try:
+            st = (api_call(args, "get", "%s/%s" % (path, name)) or {}).get("status", {}) or {}
+        except ApiError as e:
+            return err_exit(str(e), EXIT_KUBECTL)
+        phase = st.get("phase", "Pending")
+        if phase != last and phase not in done:
+            print("  %s" % phase, flush=True)
+            last = phase
+        if phase == "Failed":
+            blockers = st.get("blockers") or []
+            return err_exit("%s%s" % (st.get("message", "failed"), "".join("\n  " + b for b in blockers)), EXIT_MOVE)
+        if phase == "Saved":
+            print("saved %s bytes from node %s" % (st.get("sizeBytes", "?"), st.get("nodeName", "?")))
+            return EXIT_OK
+        if phase == "Completed":
+            print(st.get("message") or "moved to node %s" % st.get("targetNode", "?"))
+            return EXIT_OK
+    return err_exit("checkpoint %s did not finish within %d s (kube32-cli checkpoints)" % (name, args.timeout), EXIT_MOVE)
+
+
+def cmd_checkpoints(args):
+    """Every Checkpoint, oldest first"""
+    path = "/apis/kube32.io/v1/checkpoints" if args.all_namespaces else CHECKPOINTS_PATH % args.namespace
+    try:
+        items = (api_call(args, "get", path) or {}).get("items", [])
+    except ApiError as e:
+        return err_exit(str(e), EXIT_KUBECTL)
+    rows = []
+    for c in sorted(items, key=lambda c: int(c["metadata"].get("resourceVersion", "0") or 0)):
+        meta, spec, st = c["metadata"], c.get("spec", {}), c.get("status", {}) or {}
+        size = st.get("sizeBytes")
+        rows.append({"ns": meta.get("namespace", ""), "name": meta["name"], "pod": spec.get("podName", ""), "action": spec.get("action", "Save"),
+                     "phase": st.get("phase", "Pending"), "node": st.get("nodeName", "-"), "target": st.get("targetNode", "-"),
+                     "size": fmt_bytes(size) if size is not None else "-",
+                     "trigger": (meta.get("labels") or {}).get("kube32.io/trigger", "-"),
+                     "message": st.get("message", "") + "".join("; " + b for b in st.get("blockers") or [])})
+    cols = [("NAME", "name"), ("POD", "pod"), ("ACTION", "action"), ("PHASE", "phase"), ("NODE", "node"), ("TARGET", "target"),
+            ("SIZE", "size"), ("TRIGGER", "trigger"), ("MESSAGE", "message")]
     print_table(rows, ([("NAMESPACE", "ns")] if args.all_namespaces else []) + cols)
     return EXIT_OK
 
