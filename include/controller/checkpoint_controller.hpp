@@ -86,6 +86,9 @@ struct CheckpointControllerConfig {
     std::string api_host{"127.0.0.1"};
     uint16_t api_port{6443};
     std::string token;
+    // The node this controller runs on: its kubelet is called at 127.0.0.1,
+    // because a board does not reach itself at its own Wi-Fi address
+    std::string local_node;
     uint32_t freeze_timeout_ms{10000};       // ?timeoutMs= of the kubelet call
     uint32_t move_deadline_ms{60000};        // the replacement runs within this, or the move rolls back
     uint32_t keep_ms{3600000};               // finished Save, Move and Failed checkpoints are kept this long

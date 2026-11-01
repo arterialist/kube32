@@ -1378,6 +1378,7 @@ void cluster_task(void* pv) {
         kube32::controller::CheckpointControllerConfig ck_cfg;
         ck_cfg.stack_in_psram = ident.has_psram;
         if (s_api_token_set) ck_cfg.token = api_token;
+        ck_cfg.local_node = ident.name;
         checkpoints = std::make_unique<kube32::controller::CheckpointController>(*store, scheduler.get(), ck_cfg);
         checkpoints->start();
 

@@ -1,4 +1,5 @@
 #include "controller/checkpoint_controller.hpp"
+#include "osal/thread.hpp"
 #include "kubelet/kube_api_client.hpp"
 #include "models/kube_models.hpp"
 #include "models/migration.hpp"
@@ -435,7 +436,14 @@ void CheckpointController::begin(Ckpt& ck, Pods& pods, const std::vector<Node>& 
     ck.phase = "Saving";
 
     const uint64_t t0 = osal::System::get_uptime_ms();
-    const Snapshot s = take_snapshot(*src, ck, container, move);
+    Snapshot s = take_snapshot(*src, ck, container, move);
+    // A board's first connection after a quiet spell can go unanswered (its
+    // Wi-Fi sleeps between beacons). A checkpoint of a frozen pod gives the
+    // same bytes again, so try twice more when nothing came back at all.
+    for (int i = 0; i < 2 && !s.ok && s.bytes == 0 && s.blockers.empty() && s.error.rfind("no answer", 0) == 0; ++i) {
+        osal::Thread::sleep_ms(1000);
+        s = take_snapshot(*src, ck, container, move);
+    }
     const std::string took = seconds(osal::System::get_uptime_ms() - t0);
     if (!s.ok) {
         if (s.maybe_frozen) thaw(src, ck.ns, ck.pod, container);
@@ -688,7 +696,7 @@ void CheckpointController::retention(Pods& pods, const std::vector<Ckpt>& cks, u
 
 CheckpointController::Snapshot CheckpointController::take_snapshot(const Node& node, const Ckpt& ck, const std::string& container, bool frozen) {
     Snapshot s;
-    kubelet::HttpKubeClient kubelet(node.ip, node.port);
+    kubelet::HttpKubeClient kubelet(node.name == config_.local_node ? std::string("127.0.0.1") : node.ip, node.port);
     kubelet.set_bearer_token(config_.token);
     kubelet.set_timeout_ms(config_.freeze_timeout_ms + 20000);
     const std::string path = str_cat({"/checkpoint/", ck.ns, "/", ck.pod, "/", container, "?leave=", frozen ? "frozen" : "running", "&timeoutMs=",
@@ -751,7 +759,7 @@ CheckpointController::Snapshot CheckpointController::take_snapshot(const Node& n
 
 bool CheckpointController::thaw(const Node* node, const std::string& ns, const std::string& pod, const std::string& container) {
     if (!node || !node->port || node->ip.empty() || container.empty()) return false;
-    kubelet::HttpKubeClient kubelet(node->ip, node->port);
+    kubelet::HttpKubeClient kubelet(node->name == config_.local_node ? std::string("127.0.0.1") : node->ip, node->port);
     kubelet.set_bearer_token(config_.token);
     auto head = [](int, std::string_view) { return true; };
     auto data = [](const char*, size_t) { return true; };
