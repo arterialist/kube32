@@ -702,50 +702,90 @@ size_t HttpServer::serve_one(Worker& w, osal::Socket& sock, const std::string& c
     if (!stream_body && req.content_length > options_.max_body_size) { send_status_only(sock, 413, http_reason_phrase(413)); metrics_.errors.fetch_add(1); return static_cast<size_t>(-1); }
 
     size_t body_in_buf = have - header_bytes;
+    // A request the body cannot be read for is answered with a Status and
+    // the connection closes: the rest of the body is still on the wire
+    auto refuse_body = [&](int status, const char* reason, const std::string& why) {
+        HttpConnection c(sock, req, buf, cap);
+        c.set_close();
+        HttpResponse r = RouteHandler::make_status(status, reason, why);
+        c.send_simple(r.status_code, r.content_type, r.body);
+        metrics_.errors.fetch_add(1, std::memory_order_relaxed);
+        return static_cast<size_t>(-1);
+    };
+    // Inline images in a Pod or workload body go to the image store as they
+    // arrive (api/inline_images.hpp); the body keeps their digests
+    std::unique_ptr<InlineImageFilter> filter;
+    size_t body_read = 0;
+    auto add_body = [&](const char* data, size_t n) {
+        body_read += n;
+        if (!filter) {
+            req.body.append(data, n);
+            return true;
+        }
+        return filter->feed(data, n, req.body);
+    };
+    auto filter_failed = [&]() {
+        const int st = filter->status();
+        return refuse_body(st, st == 422 ? "Invalid" : st == 400 ? "BadRequest" : "InternalError", filter->error());
+    };
     // A chunked body for the router (kubectl create --raw -f <file> sends
     // one) is decoded here, up to max_body_size. What follows it in the
     // buffer cannot be told apart from it: the connection closes after.
     const bool chunked_read = req.chunked_body && !stream_body;
-    if (chunked_read) {
-        std::memmove(buf, buf + header_bytes, body_in_buf);
-        HttpConnection reader(sock, req, buf, cap);
-        reader.set_body_stream(body_in_buf, 0, true);
-        while (reader.body_remaining() > 0) {
-            const long n = reader.read_body(buf, cap);
-            if (n < 0) { send_status_only(sock, 400, "Bad Request"); metrics_.errors.fetch_add(1); return static_cast<size_t>(-1); }
-            if (req.body.size() + static_cast<size_t>(n) > options_.max_body_size) {
-                send_status_only(sock, 413, http_reason_phrase(413));
-                metrics_.errors.fetch_add(1);
-                return static_cast<size_t>(-1);
+    size_t take = 0;
+    size_t leftover = 0;
+    try {
+        if (!stream_body && route_handler_ && (req.content_length > 0 || req.chunked_body)) filter = route_handler_->body_filter(req);
+        if (chunked_read) {
+            std::memmove(buf, buf + header_bytes, body_in_buf);
+            HttpConnection reader(sock, req, buf, cap);
+            reader.set_body_stream(body_in_buf, 0, true);
+            while (reader.body_remaining() > 0) {
+                const long n = reader.read_body(buf, cap);
+                if (n < 0) { send_status_only(sock, 400, "Bad Request"); metrics_.errors.fetch_add(1); return static_cast<size_t>(-1); }
+                if (body_read + static_cast<size_t>(n) > options_.max_body_size) {
+                    send_status_only(sock, 413, http_reason_phrase(413));
+                    metrics_.errors.fetch_add(1);
+                    return static_cast<size_t>(-1);
+                }
+                if (!add_body(buf, static_cast<size_t>(n))) return filter_failed();
             }
-            req.body.append(buf, static_cast<size_t>(n));
+            req.keep_alive = false;
+            body_in_buf = 0;
         }
-        req.content_length = req.body.size();
-        req.keep_alive = false;
-        body_in_buf = 0;
-    }
-    // A chunked body's length is unknown: whatever came with the head is its start
-    size_t take = req.chunked_body ? body_in_buf : std::min(body_in_buf, req.content_length);
-    size_t leftover = body_in_buf - take;
-    if (stream_body) {
-        // The handler reads the body; what came with the head moves to the
-        // front of the buffer for read_body(). A pipelined request after it
-        // is not kept: the connection closes after this one.
-        std::memmove(buf, buf + header_bytes, take);
-    } else if (!chunked_read) {
-        req.body.assign(buf + header_bytes, take);
-        while (req.body.size() < req.content_length) {
-            size_t needed = std::min(cap, req.content_length - req.body.size());
-            ssize_t r = sock.recv(buf, needed);
-            if (r <= 0) return static_cast<size_t>(-1);
-            req.body.append(buf, static_cast<size_t>(r));
+        // A chunked body's length is unknown: whatever came with the head is its start
+        take = req.chunked_body ? body_in_buf : std::min(body_in_buf, req.content_length);
+        leftover = body_in_buf - take;
+        if (stream_body) {
+            // The handler reads the body; what came with the head moves to the
+            // front of the buffer for read_body(). A pipelined request after it
+            // is not kept: the connection closes after this one.
+            std::memmove(buf, buf + header_bytes, take);
+        } else if (!chunked_read) {
+            if (!filter) req.body.reserve(req.content_length);
+            if (!add_body(buf + header_bytes, take)) return filter_failed();
+            // The body's start is copied: what follows it in the buffer is
+            // moved to the front before anything overwrites it
+            if (leftover > 0 && take == req.content_length) {
+                std::memmove(buf, buf + header_bytes + take, leftover);
+            } else {
+                leftover = 0;
+            }
+            while (body_read < req.content_length) {
+                size_t needed = std::min(cap, req.content_length - body_read);
+                ssize_t r = sock.recv(buf, needed);
+                if (r <= 0) return static_cast<size_t>(-1);
+                if (!add_body(buf, static_cast<size_t>(r))) return filter_failed();
+            }
         }
+        if (filter && !filter->finish()) return filter_failed();
+    } catch (const std::bad_alloc&) {
+        filter.reset();
+        return refuse_body(503, "ServiceUnavailable", "node is out of memory: the request body could not be read");
     }
-    if (!stream_body && leftover > 0 && take == req.content_length) {
-        std::memmove(buf, buf + header_bytes + take, leftover);
-    } else {
-        leftover = 0;
-    }
+    if (filter || chunked_read) req.content_length = req.body.size();
+    filter.reset();
+    if (stream_body || chunked_read) leftover = 0;
     req.client_ip = client_ip;
 
     // The client gave up while the request waited in the queue: answering it

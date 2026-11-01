@@ -90,6 +90,33 @@ void carry_server_fields(const models::JsonValue& old_doc, models::JsonValue& do
 }
 bool page_truncated() { return t_request && !t_request->continue_token.empty(); }
 
+// Objects whose writes may carry inline images: Pods and the workloads that
+// hold a pod template (status and scale subresources do not)
+bool carries_pod_template(RouteCategory c) {
+    switch (c) {
+        case RouteCategory::PodsNsCollection:
+        case RouteCategory::PodItem:
+        case RouteCategory::DeploymentsNsCollection:
+        case RouteCategory::DeploymentItem:
+        case RouteCategory::DaemonSetsNsCollection:
+        case RouteCategory::DaemonSetItem:
+        case RouteCategory::JobsNsCollection:
+        case RouteCategory::JobItem:
+            return true;
+        default:
+            return false;
+    }
+}
+
+const char* status_reason(int code) {
+    switch (code) {
+        case 400: return "BadRequest";
+        case 404: return "NotFound";
+        case 422: return "Invalid";
+        default: return "InternalError";
+    }
+}
+
 // Lists are streamed straight to the socket (no full copy in RAM) on plain
 // connections when the page is complete. A TLS connection is kept alive
 // between requests, so it gets a Content-Length response instead.
@@ -203,8 +230,10 @@ std::string list_order_key(const std::string& json) {
 
 RouteHandler::RouteHandler(storage::Store& store, scheduler::Scheduler* scheduler)
     : dry_run_view_(std::make_unique<DryRunView>(store)), store_(*dry_run_view_), scheduler_(scheduler),
-      events_(*dry_run_view_, 64), metrics_(30000, 32) {
+      events_(*dry_run_view_, 64), metrics_(30000, 32), images_(std::make_unique<InlineImages>(store)) {
     seed_namespaces();
+    // Objects stored with their module inline give it to the image store
+    images_->migrate();
 }
 
 RouteMatch RouteHandler::match_route(std::string_view path) {
@@ -625,6 +654,14 @@ RouteMatch RouteHandler::match_route(std::string_view path) {
             return match;
         }
     }
+    static constexpr std::string_view kImagesPrefix = "/apis/kube32.io/v1/images/";
+    if (path.rfind(kImagesPrefix, 0) == 0 && path.size() > kImagesPrefix.size() &&
+        path.find('/', kImagesPrefix.size()) == std::string_view::npos) {
+        match.category = RouteCategory::WasmImage;
+        match.api_group = "kube32.io";
+        match.resource_name = path.substr(kImagesPrefix.size());
+        return match;
+    }
     if (path == "/apis/kube32.io/v1/devices") {
         match.category = RouteCategory::DevicesCollection;
         match.api_group = "kube32.io";
@@ -831,6 +868,22 @@ HttpResponse RouteHandler::handle_request(const HttpRequest& req, mem::Monotonic
         }
     }
 
+    // Inline images go to the image store and the object keeps their digest
+    // (api/inline_images.hpp). A body the HTTP server read has been through
+    // the filter already: it carries references only.
+    const bool writes = req.method == HttpMethod::Post || req.method == HttpMethod::Put || req.method == HttpMethod::Patch;
+    if (writes && carries_pod_template(match.category) &&
+        (InlineImages::mentions_image(effective->body) || InlineImages::carries_module(effective->body))) {
+        std::string admitted, why;
+        int status = 0;
+        if (!images_->admit(effective->body, scope.state.dry_run, admitted, status, why)) {
+            return make_status(status, status_reason(status), why);
+        }
+        if (effective != &converted) converted = req;
+        converted.body = std::move(admitted);
+        effective = &converted;
+    }
+
     HttpResponse resp = dispatch(*effective, match, arena, client_sock);
 
     // A change is in the journal before the client hears it was made, so a
@@ -843,6 +896,8 @@ HttpResponse RouteHandler::handle_request(const HttpRequest& req, mem::Monotonic
         if (!durable.ok()) {
             return make_status(500, "InternalError", "the change could not be written to the object store journal: " + durable.message);
         }
+        // An image the deleted object was the last to refer to goes with it
+        if (req.method == HttpMethod::Delete && carries_pod_template(match.category)) images_->collect_garbage();
     }
 
     // A list cut short by ?limit carries the token for the next page
@@ -1067,6 +1122,9 @@ HttpResponse RouteHandler::dispatch(const HttpRequest& req, const RouteMatch& ma
         case RouteCategory::EndpointSlicesCollection:
         case RouteCategory::EndpointSliceItem:
             return handle_endpoints(req, match);
+
+        case RouteCategory::WasmImage:
+            return handle_image(req, match, client_sock);
 
         case RouteCategory::NotFound:
         default:
@@ -3446,6 +3504,52 @@ HttpResponse RouteHandler::handle_metrics(const HttpRequest& req, const RouteMat
         default:
             return make_status(404, "NotFound", "Endpoint not found: " + req.path);
     }
+}
+
+// =============================================================================
+// Inline images: the body filter of the HTTP server, and the modules kubelets read
+// =============================================================================
+std::unique_ptr<InlineImageFilter> RouteHandler::body_filter(const HttpRequest& req) const {
+    if (req.method != HttpMethod::Post && req.method != HttpMethod::Put && req.method != HttpMethod::Patch) return nullptr;
+    if (req.content_type.rfind("application/vnd.kubernetes.protobuf", 0) == 0) return nullptr;
+    if (!carries_pod_template(match_route(req.path).category) || !authenticated(req)) return nullptr;
+    std::string dry;
+    const bool dry_run = query_param(req.query_string, "dryRun", dry) && dry == "All";
+    return std::make_unique<InlineImageFilter>(*images_, !dry_run);
+}
+
+HttpResponse RouteHandler::handle_image(const HttpRequest& req, const RouteMatch& match, osal::Socket* client_sock) {
+    if (req.method != HttpMethod::Get && req.method != HttpMethod::Head) {
+        return make_status(405, "MethodNotAllowed", std::string(http_method_str(req.method)) + " not allowed on " + req.path);
+    }
+    const std::string digest(match.resource_name);
+    InlineImages::Image img;
+    if (!images_->lookup(digest, img)) {
+        return make_status(404, "NotFound", "image sha256:" + digest + " not found", digest, "images");
+    }
+    HttpResponse resp;
+    resp.status_code = 200;
+    resp.content_type = "application/wasm";
+    if (req.method == HttpMethod::Head) return resp;
+    std::string why;
+    if (client_sock && client_sock->is_valid()) {
+        // Streamed piece by piece: the module is never held whole
+        char head[160];
+        const int n = snprintf(head, sizeof head, "HTTP/1.1 200 OK\r\nContent-Type: application/wasm\r\nContent-Length: %zu\r\nConnection: close\r\n\r\n",
+                               img.size);
+        if (client_sock->send_all(head, static_cast<size_t>(n))) {
+            if (!images_->read(digest, [&](const char* data, size_t len) { return client_sock->send_all(data, len); }, why)) {
+                std::cout << "[API] image sha256:" << digest.substr(0, 12) << " cut short: " << why << std::endl;
+            }
+        }
+        resp.is_chunked = true;
+        return resp;
+    }
+    resp.body.reserve(img.size);
+    if (!images_->read(digest, [&](const char* data, size_t len) { resp.body.append(data, len); return true; }, why)) {
+        return make_status(500, "InternalError", why, digest, "images");
+    }
+    return resp;
 }
 
 } // namespace kube32::api
