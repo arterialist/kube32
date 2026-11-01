@@ -36,6 +36,7 @@ set(KUBE32_APP_SRCS
     api/protobuf_body.cpp
     api/firmware_api.cpp
     api/checkpoint_api.cpp
+    api/inline_images.cpp
     controller/node_lifecycle_controller.cpp
     controller/deployment_controller.cpp
     controller/workload_controller.cpp

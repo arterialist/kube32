@@ -143,6 +143,11 @@ public:
     // (an identical value is already on flash).
     bool has_value(const std::string& key, uint64_t fingerprint) const;
     bool has_key(const std::string& key) const;
+    // The value of the key's latest record, read back from the region. False
+    // when that record is not a put or cannot be read.
+    bool read_value(const std::string& key, std::string& out);
+    // Bytes the key's latest put takes in the region, 0 without one.
+    size_t record_bytes(const std::string& key) const;
 
     FlashLogStats stats() const;
     size_t live_bytes() const { std::lock_guard<std::recursive_mutex> lock(mutex_); return live_bytes_; }

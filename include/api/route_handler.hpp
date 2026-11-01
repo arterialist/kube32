@@ -2,6 +2,7 @@
 
 #include "api/http_types.hpp"
 #include "api/event_recorder.hpp"
+#include "api/inline_images.hpp"
 #include "api/metrics_registry.hpp"
 #include "storage/store.hpp"
 #include "mem/monotonic_arena.hpp"
@@ -97,6 +98,9 @@ enum class RouteCategory {
     CheckpointsCollection,
     CheckpointItem,
     CheckpointStatus,
+    // /apis/kube32.io/v1/images/<sha256>: a module pods carried inline
+    // (api/inline_images.hpp)
+    WasmImage,
     // /healthz, /livez, /readyz
     Health,
     NotFound
@@ -140,6 +144,11 @@ public:
     WatchHub* watch_hub() const { return watch_hub_; }
     EventRecorder& events() { return events_; }
     MetricsRegistry& metrics() { return metrics_; }
+    InlineImages& inline_images() { return *images_; }
+    // The filter a request body passes through as the server reads it, so
+    // the inline images of a Pod or workload never sit in the body whole;
+    // nullptr for bodies taken as they are
+    std::unique_ptr<InlineImageFilter> body_filter(const HttpRequest& req) const;
 
     // Resource description for a route category; false for discovery/subresources.
     static bool resource_info(RouteCategory category, ResourceInfo& out);
@@ -167,6 +176,7 @@ private:
     WatchHub* watch_hub_{nullptr};
     EventRecorder events_;
     MetricsRegistry metrics_;
+    std::unique_ptr<InlineImages> images_;
 
     std::string openapi_v3_document(const std::string& path) const;
     bool strict_fields_ok(RouteCategory category, std::string_view api_group, const std::string& body, std::string& out_unknown) const;
@@ -183,6 +193,7 @@ private:
     HttpResponse handle_events(const HttpRequest& req, const RouteMatch& match);
     HttpResponse handle_pod_log(const HttpRequest& req, const RouteMatch& match, osal::Socket* client_sock);
     HttpResponse handle_metrics(const HttpRequest& req, const RouteMatch& match);
+    HttpResponse handle_image(const HttpRequest& req, const RouteMatch& match, osal::Socket* client_sock);
 
     // Endpoint dispatchers
     HttpResponse handle_discovery(const HttpRequest& req, RouteCategory category);

@@ -17,7 +17,7 @@ The kubelet resolves `spec.containers[0].image` in order:
 
 1. `wasm://sd/<name>[:<tag>]` reads `<card>/kube32/images/<name>[-<tag>].wasm` from the [storage](../storage.md).
 2. `wasm://embedded/<name>` or any other reference matches `images/*.wasm` in the embedded firmware registry by the last path component before `:` and parses modules in place from flash.
-3. The `kube32.io/wasm-base64` pod annotation, written by `tools/kube32-cli deploy`.
+3. An inline image: the module the API server took out of the `kube32.io/wasm-base64` annotation (written by `tools/kube32-cli deploy`) and keeps under the pod's `kube32.io/wasm-sha256`. The kubelet reads it from `GET /apis/kube32.io/v1/images/<sha256>` into one allocation of the module's size and checks it against the digest. See [Writing app pods](../app-development.md#inline-image-kube32-cli-deploy).
 
 Unresolved images or images too large for node memory fail the pod with `ErrImagePull`.
 

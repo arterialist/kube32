@@ -7,8 +7,11 @@
 #include "mem/monotonic_arena.hpp"
 #include "models/kube_models.hpp"
 
+#include <atomic>
 #include <cassert>
+#include <chrono>
 #include <iostream>
+#include <thread>
 #include <vector>
 #include <string>
 
@@ -342,6 +345,68 @@ void test_status_reason_phrases() {
     std::cout << "[PASS] test_status_reason_phrases" << std::endl;
 }
 
+// Writers that update one object at the same time (a kubelet's status
+// updates, a heartbeat, kubectl patch and delete) all keep their change: an
+// update that lost a race to another is applied again to the newer object.
+void test_concurrent_updates_keep_every_change() {
+    std::cout << "[RUN] test_concurrent_updates_keep_every_change" << std::endl;
+    StoreOptions opts;
+    opts.enable_flash_persistence = false;
+    auto store = create_radix_store(opts);
+    RouteHandler handler(*store);
+    auto request = [&](HttpMethod method, const std::string& path, const std::string& body, const std::string& ct) {
+        HttpRequest r;
+        r.method = method;
+        r.path = path;
+        r.body = body;
+        r.content_type = ct;
+        MonotonicArena arena;
+        return handler.handle_request(r, arena);
+    };
+    store->put("/registry/nodes/n1", "{\"kind\":\"Node\",\"metadata\":{\"name\":\"n1\"},\"status\":{}}", true);
+    assert(request(HttpMethod::Post, "/api/v1/namespaces/default/pods",
+                   "{\"kind\":\"Pod\",\"metadata\":{\"name\":\"p\"},\"spec\":{\"nodeName\":\"n1\",\"containers\":[{\"name\":\"c\"}]}}",
+                   "application/json").status_code == 201);
+    constexpr int kWriters = 4, kEach = 30;
+    std::vector<std::thread> writers;
+    for (int w = 0; w < kWriters; ++w) {
+        writers.emplace_back([&, w]() {
+            for (int i = 0; i < kEach; ++i) {
+                const std::string k = "w" + std::to_string(w) + "-" + std::to_string(i);
+                const std::string patch = "{\"metadata\":{\"annotations\":{\"" + k + "\":\"v\"}}}";
+                assert(request(HttpMethod::Patch, "/api/v1/nodes/n1", patch, "application/merge-patch+json").status_code == 200);
+                assert(request(HttpMethod::Patch, "/api/v1/namespaces/default/pods/p", patch, "application/strategic-merge-patch+json").status_code == 200);
+            }
+        });
+    }
+    for (auto& t : writers) t.join();
+    for (const char* key : {"/registry/nodes/n1", "/registry/pods/default/p"}) {
+        std::string json;
+        assert(store->get(key, json).ok());
+        models::JsonValue doc;
+        std::string err;
+        assert(models::parse_json(json, doc, err));
+        const models::JsonValue* ann = doc.get("metadata")->get("annotations");
+        assert(ann && ann->obj_val.size() == static_cast<size_t>(kWriters * kEach));
+    }
+    // kubectl delete while the kubelet reports status: the pod stays terminating
+    std::atomic<bool> stop{false};
+    std::thread kubelet([&]() {
+        for (int i = 0; !stop.load(); ++i) {
+            request(HttpMethod::Patch, "/api/v1/namespaces/default/pods/p/status",
+                    "{\"status\":{\"phase\":\"Running\",\"podIP\":\"10.0.0." + std::to_string(i % 200) + "\"}}", "application/merge-patch+json");
+        }
+    });
+    assert(request(HttpMethod::Delete, "/api/v1/namespaces/default/pods/p", "", "").status_code == 200);
+    for (int i = 0; i < 50; ++i) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    stop.store(true);
+    kubelet.join();
+    std::string json;
+    assert(store->get("/registry/pods/default/p", json).ok());
+    assert(json.find("\"deletionTimestamp\"") != std::string::npos);
+    std::cout << "[PASS] test_concurrent_updates_keep_every_change" << std::endl;
+}
+
 int main() {
     std::cout << "=== Running Kube32 API Server & Router Unit Tests ===" << std::endl;
     test_status_reason_phrases();
@@ -351,6 +416,7 @@ int main() {
     test_chunked_stream_writer_framing();
     test_table_serialization_columns();
     test_json_recursion_depth_limit();
+    test_concurrent_updates_keep_every_change();
     std::cout << "=== All API Server Tests Passed Successfully ===" << std::endl;
     return 0;
 }

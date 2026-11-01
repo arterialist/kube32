@@ -165,64 +165,116 @@ static void escape_json_string(std::string_view s, std::string& out) {
     out.push_back('"');
 }
 
-std::string JsonValue::to_string(bool pretty, int indent_level) const {
-    std::string out;
-    std::string indent = pretty ? std::string(indent_level * 2, ' ') : "";
-    std::string next_indent = pretty ? std::string((indent_level + 1) * 2, ' ') : "";
-    std::string nl = pretty ? "\n" : "";
-    std::string space = pretty ? " " : "";
+// Bytes escape_json_string() appends for `s`
+static size_t escaped_size(std::string_view s) {
+    size_t n = 2;
+    for (char c : s) {
+        switch (c) {
+            case '"': case '\\': case '\b': case '\f': case '\n': case '\r': case '\t': n += 2; break;
+            default: n += static_cast<unsigned char>(c) < 0x20 ? 6 : 1; break;
+        }
+    }
+    return n;
+}
 
-    switch (type) {
+static size_t format_number(double v, char* buf, size_t cap) {
+    int n;
+    if (v == static_cast<int64_t>(v)) {
+        n = snprintf(buf, cap, "%lld", static_cast<long long>(v));
+    } else {
+        n = snprintf(buf, cap, "%.6g", v);
+    }
+    return n > 0 ? static_cast<size_t>(n) : 0;
+}
+
+// The text is written into one string, sized first: a document costs one
+// allocation, not one per member and level
+static size_t serialized_size(const JsonValue& v, bool pretty, int level) {
+    switch (v.type) {
+        case JsonType::Null: return 4;
+        case JsonType::Boolean: return v.bool_val ? 4 : 5;
+        case JsonType::Number: {
+            char buf[64];
+            return format_number(v.num_val, buf, sizeof(buf));
+        }
+        case JsonType::String: return escaped_size(v.str_val);
+        case JsonType::Array: {
+            if (v.arr_val.empty()) return 2;
+            size_t n = 2 + (v.arr_val.size() - 1);
+            if (pretty) n += 1 + v.arr_val.size() * (1 + (level + 1) * 2) + level * 2;
+            for (const auto& item : v.arr_val) n += serialized_size(item, pretty, level + 1);
+            return n;
+        }
+        case JsonType::Object: {
+            if (v.obj_val.empty()) return 2;
+            size_t n = 2 + (v.obj_val.size() - 1) + v.obj_val.size();
+            if (pretty) n += 1 + v.obj_val.size() * (2 + (level + 1) * 2) + level * 2;
+            for (const auto& kv : v.obj_val) n += escaped_size(kv.first) + serialized_size(kv.second, pretty, level + 1);
+            return n;
+        }
+    }
+    return 0;
+}
+
+static void write_json(const JsonValue& v, std::string& out, bool pretty, int level) {
+    auto indent = [&](int l) { if (pretty) out.append(static_cast<size_t>(l) * 2, ' '); };
+    switch (v.type) {
         case JsonType::Null:
-            out = "null";
+            out += "null";
             break;
         case JsonType::Boolean:
-            out = bool_val ? "true" : "false";
+            out += v.bool_val ? "true" : "false";
             break;
         case JsonType::Number: {
             char buf[64];
-            if (num_val == static_cast<int64_t>(num_val)) {
-                snprintf(buf, sizeof(buf), "%lld", static_cast<long long>(num_val));
-            } else {
-                snprintf(buf, sizeof(buf), "%.6g", num_val);
-            }
-            out = buf;
+            out.append(buf, format_number(v.num_val, buf, sizeof(buf)));
             break;
         }
         case JsonType::String:
-            escape_json_string(str_val, out);
+            escape_json_string(v.str_val, out);
             break;
-        case JsonType::Array: {
-            if (arr_val.empty()) {
-                out = "[]";
-            } else {
-                out = "[" + nl;
-                for (size_t i = 0; i < arr_val.size(); ++i) {
-                    out += next_indent + arr_val[i].to_string(pretty, indent_level + 1);
-                    if (i + 1 < arr_val.size()) out += ",";
-                    out += nl;
-                }
-                out += indent + "]";
+        case JsonType::Array:
+            if (v.arr_val.empty()) {
+                out += "[]";
+                break;
             }
-            break;
-        }
-        case JsonType::Object: {
-            if (obj_val.empty()) {
-                out = "{}";
-            } else {
-                out = "{" + nl;
-                for (size_t i = 0; i < obj_val.size(); ++i) {
-                    out += next_indent;
-                    escape_json_string(obj_val[i].first, out);
-                    out += ":" + space + obj_val[i].second.to_string(pretty, indent_level + 1);
-                    if (i + 1 < obj_val.size()) out += ",";
-                    out += nl;
-                }
-                out += indent + "}";
+            out += '[';
+            if (pretty) out += '\n';
+            for (size_t i = 0; i < v.arr_val.size(); ++i) {
+                indent(level + 1);
+                write_json(v.arr_val[i], out, pretty, level + 1);
+                if (i + 1 < v.arr_val.size()) out += ',';
+                if (pretty) out += '\n';
             }
+            indent(level);
+            out += ']';
             break;
-        }
+        case JsonType::Object:
+            if (v.obj_val.empty()) {
+                out += "{}";
+                break;
+            }
+            out += '{';
+            if (pretty) out += '\n';
+            for (size_t i = 0; i < v.obj_val.size(); ++i) {
+                indent(level + 1);
+                escape_json_string(v.obj_val[i].first, out);
+                out += ':';
+                if (pretty) out += ' ';
+                write_json(v.obj_val[i].second, out, pretty, level + 1);
+                if (i + 1 < v.obj_val.size()) out += ',';
+                if (pretty) out += '\n';
+            }
+            indent(level);
+            out += '}';
+            break;
     }
+}
+
+std::string JsonValue::to_string(bool pretty, int indent_level) const {
+    std::string out;
+    out.reserve(serialized_size(*this, pretty, indent_level));
+    write_json(*this, out, pretty, indent_level);
     return out;
 }
 
@@ -406,6 +458,29 @@ private:
         get(); // consume opening '"'
         val.type = JsonType::String;
         val.str_val.clear();
+
+        // The text decodes to at most its raw length: the string is
+        // allocated once, at that size, not grown a character at a time
+        size_t end = pos_;
+        bool escapes = false;
+        bool control = false;
+        while (end < input_.size() && input_[end] != '"') {
+            if (input_[end] == '\\') {
+                escapes = true;
+                end += 2;
+                continue;
+            }
+            if (static_cast<unsigned char>(input_[end]) < 0x20) control = true;
+            ++end;
+        }
+        if (end < input_.size() && !control) {
+            if (!escapes) {
+                val.str_val.assign(input_.data() + pos_, end - pos_);
+                pos_ = end + 1;
+                return true;
+            }
+            val.str_val.reserve(end - pos_);
+        }
 
         while (pos_ < input_.size()) {
             char c = get();

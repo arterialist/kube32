@@ -1,4 +1,5 @@
 #include "kubelet/kube_api_client.hpp"
+#include "osal/sha256.hpp"
 #include "osal/socket.hpp"
 #include "osal/system.hpp"
 #include "models/kube_models.hpp"
@@ -784,6 +785,49 @@ bool HttpKubeClient::get_pod_image(const std::string& ns, const std::string& nam
     if (!ex.found() || out.empty()) {
         why = "pod " + ns + "/" + name + " has no kube32.io/wasm-base64 annotation";
         out.clear();
+        return false;
+    }
+    return true;
+}
+
+bool HttpKubeClient::get_image(const std::string& sha256, std::vector<uint8_t>& out, std::string& why) {
+    out.clear();
+    if (!osal::Sha256::valid_hex(sha256)) {
+        why = "kube32.io/wasm-sha256 \"" + sha256 + "\" is not a SHA-256";
+        return false;
+    }
+    PathBuf path;
+    path.add("/apis/kube32.io/v1/images/").add(sha256);
+    osal::Sha256 sha;
+    long content_length = -1;
+    bool reserved = false;
+    int status = 0;
+    try {
+        status = stream_request("GET", path.view(), std::string_view(), [&](const char* data, size_t len) {
+            if (!reserved) {
+                reserved = true;
+                if (content_length > 0) out.reserve(static_cast<size_t>(content_length));
+            }
+            sha.update(data, len);
+            out.insert(out.end(), reinterpret_cast<const uint8_t*>(data), reinterpret_cast<const uint8_t*>(data) + len);
+            return true;
+        }, &content_length);
+    } catch (const std::bad_alloc&) {
+        why = "not enough memory for image sha256:" + sha256.substr(0, 12) + " (" + std::to_string(content_length) + " bytes)";
+        std::vector<uint8_t>().swap(out);
+        return false;
+    }
+    if (status != 200) {
+        why = "image sha256:" + sha256.substr(0, 12) + ": http " + std::to_string(status);
+        std::vector<uint8_t>().swap(out);
+        return false;
+    }
+    const std::string got = osal::Sha256::hex(sha.finish());
+    std::string want = sha256;
+    for (char& c : want) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    if (got != want || (content_length >= 0 && out.size() != static_cast<size_t>(content_length))) {
+        why = "image sha256:" + sha256.substr(0, 12) + ": the bytes read (" + std::to_string(out.size()) + ") do not match the digest";
+        std::vector<uint8_t>().swap(out);
         return false;
     }
     return true;

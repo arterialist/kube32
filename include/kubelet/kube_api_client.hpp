@@ -62,6 +62,13 @@ public:
         why = "not supported by this client";
         return false;
     }
+    // Module bytes of an inline image the API server keeps apart from its
+    // pod (kube32.io/wasm-sha256, api/inline_images.hpp), checked against
+    // the digest.
+    virtual bool get_image(const std::string& /*sha256*/, std::vector<uint8_t>& /*out*/, std::string& why) {
+        why = "not supported by this client";
+        return false;
+    }
     // GET whose body reaches `on_data` as it arrives (false from it ends the
     // read). Returns the HTTP status, 0 when unreachable or cut short; the
     // body length is in `out_length` when the server sent one (else -1).
@@ -99,6 +106,8 @@ public:
     // JSON tree of it is never held.
     int list_items(const std::string& path, const std::function<void(std::string&&)>& on_item) override;
     bool get_pod_image(const std::string& ns, const std::string& name, std::vector<uint8_t>& out, std::string& why) override;
+    // Read into one allocation of the module's size (Content-Length)
+    bool get_image(const std::string& sha256, std::vector<uint8_t>& out, std::string& why) override;
     int stream_get(const std::string& path, mem::FunctionRef<bool(const char*, size_t)> on_data, long* out_length = nullptr) override;
     // Scans the Node as it streams in: nothing but the value is kept
     int get_node_annotation(const std::string& node, std::string_view key, std::string& out) override;

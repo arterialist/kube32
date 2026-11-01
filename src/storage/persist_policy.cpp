@@ -9,6 +9,7 @@ PersistClass persist_class(const std::string& key) {
         return PersistClass::Ephemeral;
     }
     if (key.rfind("/registry/nodes/", 0) == 0) return PersistClass::Deferred;
+    if (key.rfind(kFlashOnlyPrefix, 0) == 0) return PersistClass::FlashOnly;
     return PersistClass::Immediate;
 }
 

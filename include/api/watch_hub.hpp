@@ -28,6 +28,7 @@ struct WatchHubOptions {
     size_t max_streams{8};            // watches + log follows; beyond it the handler answers 429
     size_t queue_depth{16};           // events buffered per watch before it is told to relist (410)
     size_t replay_ring{32};           // recent events kept for resourceVersion=N watches
+    size_t replay_ring_bytes{64 * 1024};  // and the most their objects may take together
     uint32_t bookmark_interval_ms{30000};
     uint32_t default_timeout_s{1800}; // kube-apiserver's upper bound when the client sends none
     uint32_t poll_interval_ms{250};
@@ -112,6 +113,7 @@ private:
     bool flush(Stream& s, std::vector<EventPtr>& batch);
     bool send_frame(Stream& s, const std::string& payload);
     bool send_watch_event(Stream& s, const char* type, const std::string& object_json);
+    bool serve(Stream& s, uint64_t now, std::vector<EventPtr>& pending, bool overflowed);
     bool poll_log(Stream& s, uint64_t now_ms);
     void finish(Stream& s);
 
@@ -120,6 +122,7 @@ private:
     mutable osal::Mutex mutex_;
     std::vector<std::unique_ptr<Stream>> streams_;
     std::deque<EventPtr> replay_;
+    size_t replay_bytes_{0};
     uint64_t oldest_evicted_version_{0};
     uint32_t store_watch_id_{0};
     std::unique_ptr<osal::Thread> thread_;

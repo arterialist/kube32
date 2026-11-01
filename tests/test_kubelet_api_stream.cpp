@@ -115,7 +115,18 @@ int main() {
     osal::Socket::init_networking();
     auto store = storage::create_radix_store(storage::StoreOptions{"/tmp/kube32_test_kubelet_api_stream", false});
 
-    // Three pods on n1 with 96 KiB inline images, one on another node
+    api::HttpServerOptions o;
+    o.port = 18692;
+    o.workers = 2;
+    o.worker_stack_bytes = 262144;
+    o.watch_streams = 0;
+    api::HttpServer server(o, *store);
+    assert(server.start());
+
+    // Three pods on n1 with 96 KiB inline images, one on another node. The
+    // API server stores a module apart from its pod (api/inline_images.hpp)
+    // and moves those of pods stored before at its start; these are written
+    // to the store behind it, as pods that still carry their module.
     std::vector<std::vector<uint8_t>> images;
     for (int i = 0; i < 3; ++i) {
         std::vector<uint8_t> img(96 * 1024);
@@ -124,14 +135,6 @@ int main() {
         assert(store->put("/registry/pods/default/p" + std::to_string(i), pod_json("p" + std::to_string(i), "n1", b64(img)), true).ok());
     }
     assert(store->put("/registry/pods/default/other", pod_json("other", "n2", b64(images[0])), true).ok());
-
-    api::HttpServerOptions o;
-    o.port = 18692;
-    o.workers = 2;
-    o.worker_stack_bytes = 262144;
-    o.watch_streams = 0;
-    api::HttpServer server(o, *store);
-    assert(server.start());
 
     kubelet::HttpKubeClient client("127.0.0.1", o.port);
     client.set_node_filter("n1");
