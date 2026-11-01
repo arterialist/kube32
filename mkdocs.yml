@@ -60,6 +60,7 @@ nav:
       - Storage and volumes: storage.md
       - Peripherals: peripherals.md
       - Devices: devices.md
+      - Pod migration: migration.md
       - "Example: Tessera": examples/tessera.md
   - Architecture:
       - Overview: architecture/index.md

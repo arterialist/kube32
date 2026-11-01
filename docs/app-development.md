@@ -8,7 +8,7 @@ A pod is a WebAssembly module that the node runs in its wasm3 interpreter. It co
 
 | Kind | Exports | Execution model |
 | --- | --- | --- |
-| Request pod | `k32_alloc`, `k32_handle`; optionally `k32_init`, `k32_tick`, `k32_event` | HTTP workers call `k32_handle` once per request. A timer calls `k32_tick`. Channel events arrive in `k32_event`. |
+| Request pod | `k32_alloc`, `k32_handle`; optionally `k32_init`, `k32_tick`, `k32_event`, `k32_restored` | HTTP workers call `k32_handle` once per request. A timer calls `k32_tick`. Channel events arrive in `k32_event`. |
 | Entry-point pod | `_start`, `app_main`, or `main` | Runs on the pod's own thread (requires a board with PSRAM). Loops on its own and exits when the function returns. |
 
 A module can export both. The runtime looks up entry points in the order `_start`, `app_main`, `main`. `k32_init` runs once when the container starts, and a non-zero return fails the pod with `StartError` (`k32_init returned <n>`). The simulator and boards call `k32_tick` once per second. While `k32_tick` returns a positive value, they call it every 10 ms. The first tick comes after `k32_init` returns. On boards without PSRAM, all pod calls share one interpreter stack, and entry-point pods cannot start. On those boards, use pods with `k32_handle`, `k32_tick` and `k32_event`.
@@ -98,7 +98,8 @@ Pods support `restartPolicy: Always`, `OnFailure`, and `Never`. Failed or restar
 | Exit code | Reason | Cause |
 | --- | --- | --- |
 | Return value of `app_main` / `main` (`0` for `_start`) | `Completed` (when `0`) or `Error` | Entry point returned |
-| `128` | `StartError` | Container failed to deploy or start (bad Wasm, `k32_init` non-zero, no thread stack) |
+| `128` | `StartError` | Container failed to deploy or start (bad Wasm, `k32_init` or `k32_restored` non-zero, no thread stack) |
+| `128` | `RestoreError` | The pod's snapshot (`kube32.io/restore-from`) could not be restored. The pod is `Failed` and is not restarted |
 | `132` | `Error` | Unsupported instruction (`SIGILL`) |
 | `134` | `Error` | `unreachable` or abort (`SIGABRT`) |
 | `135` | `Error` | Unaligned atomic operation (`SIGBUS`) |
@@ -109,6 +110,46 @@ Pods support `restartPolicy: Always`, `OnFailure`, and `Never`. Failed or restar
 | `152` | `Error` | Call exhausted its `kube32.io/execution-budget` (`SIGXCPU`) |
 
 ---
+
+### Moving to another node
+
+A request pod can move to another node and continue there with its state ([Pod migration](migration.md)). The move happens between two calls, after the call in progress returns. These parts of the pod move with it:
+
+* linear memory, its size included, and every mutable global,
+* tables, also entries set with `table.set` or added with `table.grow`,
+* the clock: `k32_time_ms`, `esp32_get_time_us` and the `k32_tick` argument continue from their value at the snapshot,
+* channels opened with `kube32_channel_open`, under the same handles,
+* events that arrived while the pod was frozen.
+
+Environment, event topics, tick interval, bundle files and limits come from the pod spec, as at any start. Messages queued in an open channel and the state of `k32_random` do not move.
+
+On the new node the runtime calls the optional export `k32_restored` once, instead of `k32_init`:
+
+```c
+K32_EXPORT("k32_restored") int32_t k32_restored(void) {
+    char host[32];
+    hostname_len = k32_env_get("HOSTNAME", 8, host, sizeof host);   /* the pod may have a new name */
+    next_report_ms = k32_time_ms();                                  /* the clock continues */
+    return 0;
+}
+```
+
+Refresh there what depends on the node. A non-zero result fails the container with `StartError`, as from `k32_init`.
+
+The node refuses to move a pod in these cases, and names each one:
+
+| The pod | Blocker |
+| --- | --- |
+| exports `_start`, `app_main` or `main` | `entry point _start runs on its own thread` |
+| requests or limits `hardware.kube32.io/*` (other than `ipc`) or `esp32.io/*` | `grant esp32.io/gpio-4` |
+| adds `DISPLAY`, `KEYBOARD`, `SPEAKER`, `SD` or `CHIP_TEMP` in `securityContext.capabilities` | `grant capability DISPLAY` |
+| has the annotation `kube32.io/i2c-device` | `grant kube32.io/i2c-device` |
+| mounts a `persistentVolumeClaim` or `kube32.io/sd` volume | `volume claim notes on node storage` |
+| has the annotation `kube32.io/migration: Never` | `annotation kube32.io/migration: Never` |
+| keeps a `k32_fs` file open between calls | `open file notes.txt (descriptor 0)` |
+| is in a call that does not return within the timeout | `call k32_handle still running after 10000 ms` |
+
+To write a pod that moves, keep its state in linear memory and globals, close files before a call returns, and leave hardware to a driver pod that it reaches through a Service or channel events.
 
 ## Rust
 
@@ -444,6 +485,7 @@ Rebuild the firmware with `pio run -e esp32s3`, or reconfigure and build the hos
 | `kube32.io/wasm-stack` | Pod | Per-pod wasm3 value stack size (`512` to `64Ki`; default: what the module's calls need, at most `4Ki` for pods up to `64Ki` of linear memory) |
 | `kube32.io/event-topics` | Pod | Comma-separated channel topics delivered to the pod's `k32_event` export |
 | `kube32.io/tick-interval` | Pod | Period of the pod's `k32_tick`: `"250ms"`, `"2s"`, or an integer in milliseconds, from 50 ms to 1 h (default 1 s) |
+| `kube32.io/restore-from` | Pod | A Checkpoint in the pod's namespace: the container starts from its snapshot instead of `k32_init` ([Pod migration](migration.md#kubelet-endpoints)) |
 | `kube32.io/i2c-bus-<N>` | Pod | Bus pins and speed, e.g. `"sda=8,scl=9,hz=100000"` |
 | `kube32.io/uart-<N>` | Pod | UART pins and baud rate, e.g. `"tx=17,rx=18,baud=115200"` |
 | `kube32.io/rmt-tx` | Pod | IR transmit pin and carrier, e.g. `"pin=2,carrier=38000,duty=33"` (`carrier=0`: no carrier) |
