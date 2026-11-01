@@ -1,8 +1,11 @@
 #include "scheduler/scheduler.hpp"
 #include "storage/store.hpp"
 #include "models/kube_models.hpp"
+#include "osal/system.hpp"
+#include "osal/thread.hpp"
 
 #include <cassert>
+#include <functional>
 #include <iostream>
 #include <string>
 #include <vector>
@@ -301,6 +304,97 @@ void test_allocatable_accounting_and_failure_message() {
     std::cout << "[PASS] test_allocatable_accounting_and_failure_message" << std::endl;
 }
 
+// The loop tries a pod that does not fit again after a change that can make
+// it fit, not while nothing changes: Node heartbeats that move nothing the
+// filters read, and its own unchanged verdict, are no change. Attempts after
+// changes wait for the pod's back-off. A cordon lifted binds the pod once its back-off ends.
+static uint64_t failed_attempts(Store& store, const std::string& pod) {
+    std::vector<std::string> events;
+    store.list("/registry/events/", events);
+    uint64_t n = 0;
+    for (const auto& e : events) {
+        kube32::models::JsonValue doc;
+        std::string err;
+        if (!kube32::models::parse_json(e, doc, err) || doc.get_string("reason", "") != "FailedScheduling") continue;
+        if (doc.get("involvedObject")->get_string("name", "") == pod) n += static_cast<uint64_t>(doc.get_int("count", 1));
+    }
+    return n;
+}
+
+static bool eventually(const std::function<bool()>& cond, uint32_t ms = 2000) {
+    const uint64_t end = kube32::osal::System::get_uptime_ms() + ms;
+    while (kube32::osal::System::get_uptime_ms() < end) {
+        if (cond()) return true;
+        kube32::osal::Thread::sleep_ms(5);
+    }
+    return cond();
+}
+
+void test_retries_on_changes() {
+    std::cout << "[RUN] test_retries_on_changes" << std::endl;
+    StoreOptions opts;
+    opts.enable_flash_persistence = false;
+    auto store = create_radix_store(opts);
+    auto node = [](const std::string& spec, const std::string& message) {
+        return "{\"kind\":\"Node\",\"metadata\":{\"name\":\"node-a\",\"labels\":{\"kubernetes.io/hostname\":\"node-a\"}},\"spec\":" + spec +
+               ",\"status\":{\"conditions\":[{\"type\":\"Ready\",\"status\":\"True\",\"message\":\"" + message +
+               "\"},{\"type\":\"MemoryPressure\",\"status\":\"False\"}],\"allocatable\":{\"memory\":\"240Ki\"}}}";
+    };
+    store->put("/registry/nodes/node-a", node("{\"unschedulable\":true}", "up"), true);
+    SchedulerConfig cfg;
+    cfg.reconcile_interval_ms = 50;
+    cfg.resync_interval_ms = 60000;
+    cfg.backoff_initial_ms = 100;
+    cfg.backoff_max_ms = 400;
+    auto sched = create_scheduler(*store, cfg);
+    assert(sched->start());
+    const std::string key = "/registry/pods/default/waiting";
+    store->put(key, "{\"kind\":\"Pod\",\"metadata\":{\"name\":\"waiting\",\"namespace\":\"default\"},"
+                    "\"spec\":{\"containers\":[{\"name\":\"c\",\"resources\":{\"requests\":{\"memory\":\"32Ki\"}}}]},"
+                    "\"status\":{\"phase\":\"Pending\"}}", true);
+    assert(eventually([&] {
+        std::string json;
+        store->get(key, json);
+        return json.find("\"reason\":\"Unschedulable\"") != std::string::npos;
+    }));
+
+    // Nothing changes: no attempt and no write, heartbeats included
+    kube32::osal::Thread::sleep_ms(300);
+    const uint64_t attempts = failed_attempts(*store, "waiting");
+    std::string before;
+    uint64_t version = 0, after_version = 0;
+    store->get_extended(key, before, &version);
+    for (int i = 0; i < 10; ++i) {
+        store->put("/registry/nodes/node-a", node("{\"unschedulable\":true}", "heartbeat " + std::to_string(i)), true);
+        kube32::osal::Thread::sleep_ms(50);
+    }
+    kube32::osal::Thread::sleep_ms(500);
+    assert(failed_attempts(*store, "waiting") == attempts);
+    store->get_extended(key, before, &after_version);
+    assert(after_version == version);
+
+    // Changes keep coming: attempts wait for the back-off (100, 200, 400 ms)
+    for (int i = 0; i < 20; ++i) {
+        store->put("/registry/pods/default/other-" + std::to_string(i), "{\"kind\":\"Pod\",\"metadata\":{\"name\":\"o\"},\"spec\":{\"nodeName\":\"node-a\"}}", true);
+        kube32::osal::Thread::sleep_ms(50);
+    }
+    const uint64_t during = failed_attempts(*store, "waiting") - attempts;
+    std::cout << "  " << during << " attempts in 1 s of changes" << std::endl;
+    assert(during >= 1 && during <= 5);
+
+    // The cordon lifted: bound once the back-off ends
+    const uint64_t t0 = kube32::osal::System::get_uptime_ms();
+    store->put("/registry/nodes/node-a", node("{}", "up"), true);
+    assert(eventually([&] {
+        std::string json;
+        store->get(key, json);
+        return json.find("\"nodeName\":\"node-a\"") != std::string::npos;
+    }));
+    std::cout << "  bound " << kube32::osal::System::get_uptime_ms() - t0 << " ms after the uncordon" << std::endl;
+    sched->stop();
+    std::cout << "[PASS] test_retries_on_changes" << std::endl;
+}
+
 int main() {
     std::cout << "=== Running Kube32 Autonomous Scheduler Unit Tests ===" << std::endl;
     test_quantity_parser();
@@ -308,6 +402,7 @@ int main() {
     test_scheduler_atomic_binding();
     test_deleted_node_reconciliation();
     test_allocatable_accounting_and_failure_message();
+    test_retries_on_changes();
     std::cout << "=== All Scheduler Tests Passed Successfully ===" << std::endl;
     return 0;
 }

@@ -474,6 +474,11 @@ else()
     target_link_libraries(test_kubelet_node_status PRIVATE kube32_core)
     add_test(NAME test_kubelet_node_status COMMAND test_kubelet_node_status)
 
+    # When the controllers run a pass: store changes, timers, the resync
+    add_executable(test_reconcile_loops tests/test_reconcile_loops.cpp)
+    target_link_libraries(test_reconcile_loops PRIVATE kube32_core)
+    add_test(NAME test_reconcile_loops COMMAND test_reconcile_loops)
+
     # Node memory as the kubelet admits pods: a board with PSRAM and one
     # without (one pod pool per process)
     add_executable(test_node_memory tests/test_node_memory.cpp)
