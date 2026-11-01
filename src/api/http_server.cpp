@@ -450,50 +450,57 @@ void HttpServer::run_acceptor() {
             while (wake_sock_.recvfrom(drain, sizeof(drain), nullptr, nullptr) > 0) {}
         }
 
-        // Idle connections that became readable (next request) or expired
-        uint64_t now = osal::System::get_uptime_ms();
-        std::vector<QueuedConn> resumed;
-        {
-            osal::LockGuard guard(idle_mutex_);
-            for (size_t i = 0; i < idle_.size();) {
-                if (FD_ISSET(idle_[i].sock.native_handle(), &rfds)) {
-                    resumed.push_back({std::move(idle_[i].sock), idle_[i].ip, true});
-                    idle_.erase(idle_.begin() + static_cast<long>(i));
-                } else if (now >= idle_[i].deadline_ms) {
-                    idle_.erase(idle_.begin() + static_cast<long>(i));
-                } else {
-                    ++i;
+        // Out of memory here drops the connections at hand, not the acceptor
+        try {
+            // Idle connections that became readable (next request) or expired
+            uint64_t now = osal::System::get_uptime_ms();
+            std::vector<QueuedConn> resumed;
+            {
+                osal::LockGuard guard(idle_mutex_);
+                for (size_t i = 0; i < idle_.size();) {
+                    if (FD_ISSET(idle_[i].sock.native_handle(), &rfds)) {
+                        resumed.push_back({std::move(idle_[i].sock), idle_[i].ip, true});
+                        idle_.erase(idle_.begin() + static_cast<long>(i));
+                    } else if (now >= idle_[i].deadline_ms) {
+                        idle_.erase(idle_.begin() + static_cast<long>(i));
+                    } else {
+                        ++i;
+                    }
                 }
             }
-        }
-        if (!resumed.empty()) {
-            osal::LockGuard guard(queue_mutex_);
-            for (auto& r : resumed) queue_.push_back(std::move(r));
-            queue_cv_.notify_all();
-        }
+            if (!resumed.empty()) {
+                osal::LockGuard guard(queue_mutex_);
+                for (auto& r : resumed) queue_.push_back(std::move(r));
+                queue_cv_.notify_all();
+            }
 
-        if (FD_ISSET(listen_fd, &rfds)) {
-            std::string client_ip;
-            osal::Socket client = listen_sock_.accept(&client_ip);
-            if (!client.is_valid()) {
-                // Usually EMFILE/ENFILE: lwIP's socket table is full and the
-                // peer's SYN is being dropped. Say so, a few times per boot.
-                static int logged = 0;
-                if (logged < 8) { logged++; printf("[HTTP] %s accept failed: errno %d (%s)\n", options_.name, errno, strerror(errno)); }
-                continue;
+            if (FD_ISSET(listen_fd, &rfds)) {
+                std::string client_ip;
+                osal::Socket client = listen_sock_.accept(&client_ip);
+                if (!client.is_valid()) {
+                    // Usually EMFILE/ENFILE: lwIP's socket table is full and the
+                    // peer's SYN is being dropped. Say so, a few times per boot.
+                    static int logged = 0;
+                    if (logged < 8) { logged++; printf("[HTTP] %s accept failed: errno %d (%s)\n", options_.name, errno, strerror(errno)); }
+                    continue;
+                }
+                metrics_.connections.fetch_add(1, std::memory_order_relaxed);
+                client.set_tcp_nodelay(true);   // responses are written in large coalesced chunks
+                osal::LockGuard guard(queue_mutex_);
+                if (queue_.size() >= options_.accept_queue_depth) {
+                    const char* busy = "HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nRetry-After: 1\r\nConnection: close\r\n\r\n";
+                    client.send_all(busy, std::strlen(busy));
+                    client.close();
+                    metrics_.errors.fetch_add(1, std::memory_order_relaxed);
+                    continue;
+                }
+                queue_.push_back({std::move(client), client_ip, false});
+                queue_cv_.notify_one();
             }
-            metrics_.connections.fetch_add(1, std::memory_order_relaxed);
-            client.set_tcp_nodelay(true);   // responses are written in large coalesced chunks
-            osal::LockGuard guard(queue_mutex_);
-            if (queue_.size() >= options_.accept_queue_depth) {
-                const char* busy = "HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nRetry-After: 1\r\nConnection: close\r\n\r\n";
-                client.send_all(busy, std::strlen(busy));
-                client.close();
-                metrics_.errors.fetch_add(1, std::memory_order_relaxed);
-                continue;
-            }
-            queue_.push_back({std::move(client), client_ip, false});
-            queue_cv_.notify_one();
+        } catch (const std::exception& e) {
+            metrics_.errors.fetch_add(1, std::memory_order_relaxed);
+            printf("[HTTP] %s accept pass failed: %s\n", options_.name, e.what());
+            osal::Thread::sleep_ms(5);
         }
     }
 }
@@ -529,7 +536,14 @@ void HttpServer::run_worker(Worker& w) {
             }
         }
         metrics_.active.fetch_add(1, std::memory_order_relaxed);
-        serve_connection(w, std::move(sock), qc.ip);
+        try {
+            serve_connection(w, std::move(sock), qc.ip);
+        } catch (const std::exception& e) {
+            // Out of memory outside a handler (the request head, the
+            // connection's bookkeeping): the connection goes, the worker stays
+            metrics_.errors.fetch_add(1, std::memory_order_relaxed);
+            printf("[HTTP] %s connection dropped: %s\n", options_.name, e.what());
+        }
         metrics_.active.fetch_sub(1, std::memory_order_relaxed);
         osal::Thread::yield();
     }
