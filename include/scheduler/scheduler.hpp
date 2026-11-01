@@ -176,6 +176,14 @@ public:
     // Synchronously evaluates and mutates pod manifest in-place before initial store insertion
     virtual ScheduleResult schedule_pod_manifest(std::string& in_out_pod_json) = 0;
 
+    // The node a binding of the pod would choose, never `exclude_node`
+    // (empty: none excluded). Nothing is written and no event is recorded.
+    virtual ScheduleResult pick_node(const std::string& pod_json, const std::string& exclude_node) {
+        (void)pod_json;
+        (void)exclude_node;
+        return {};
+    }
+
     // One pass of the loop: binds unbound pods (and pods whose node was
     // deleted) that are due: never tried, changed since their last attempt,
     // or past their back-off

@@ -586,6 +586,12 @@ public:
         return evaluate_and_bind_manifest(in_out_pod_json);
     }
 
+    ScheduleResult pick_node(const std::string& pod_json, const std::string& exclude_node) override {
+        osal::LockGuard guard(mutex_);
+        std::string copy = pod_json;
+        return evaluate_and_bind_manifest(copy, "", exclude_node, true);
+    }
+
     ScheduleResult schedule_pod(const std::string& pod_name, const std::string& pod_namespace) override {
         return schedule_key("/registry/pods/" + pod_namespace + "/" + pod_name, nullptr);
     }
@@ -726,7 +732,9 @@ private:
         }
     }
 
-    ScheduleResult evaluate_and_bind_manifest(std::string& in_out_pod_json, const std::string& exclude_pod_key = "") {
+    // `dry`: the choice only, the manifest is left as it is and no event recorded
+    ScheduleResult evaluate_and_bind_manifest(std::string& in_out_pod_json, const std::string& exclude_pod_key = "",
+                                              const std::string& exclude_node = "", bool dry = false) {
         models::JsonValue pod_doc;
         std::string err;
         if (!models::parse_json(in_out_pod_json, pod_doc, err) || !pod_doc.is_object()) {
@@ -768,6 +776,7 @@ private:
             const models::JsonValue* meta = n_doc.get("metadata");
             std::string nname = meta ? meta->get_string("name", "") : "";
             if (nname.empty()) { reasons["node(s) could not be read"]++; continue; }
+            if (nname == exclude_node) { reasons["node(s) were the node the pod leaves"]++; continue; }
 
             ResourceSpec node_alloc = extract_node_allocatable(n_json);
             const ResourceSpec& node_used = used_by_node[nname];
@@ -820,6 +829,7 @@ private:
                 for (size_t k = 0; k < parts.size(); ++k) message += (k ? ", " : "") + parts[k];
                 message += ".";
             }
+            if (dry) return {false, "", message};
             models::JsonValue* spec = pod_doc.get_mut("spec");
             if (spec) spec->set("nodeName", models::JsonValue{models::JsonType::String, false, 0, "", {}, {}});
 
@@ -884,6 +894,7 @@ private:
         });
 
         const Candidate& winner = qualified.front();
+        if (dry) return {true, winner.name, ""};
 
         // Mutate spec.nodeName
         models::JsonValue* spec = pod_doc.get_mut("spec");
