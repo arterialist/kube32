@@ -164,8 +164,9 @@ set_source_files_properties(${CMAKE_CURRENT_LIST_DIR}/api/version_info.cpp PROPE
 # Container environment, log persistence, bus setup and IR channels run once
 # per container start, every few seconds or once per IR frame, firmware
 # rollouts once per update, the Device controller and I2C discovery every
-# few seconds, snapshots and Checkpoint data once per move: built for size,
-# they take half the flash -O2 gives them.
+# few seconds, the kubelet's passes and the module loader once a second or
+# once per container start, snapshots and Checkpoint data once per move:
+# built for size, they take half the flash -O2 gives them.
 set_source_files_properties(
     ${CMAKE_CURRENT_LIST_DIR}/kubelet/pod_env.cpp
     ${CMAKE_CURRENT_LIST_DIR}/runtime/pod_log.cpp
@@ -189,4 +190,6 @@ set_source_files_properties(
     ${CMAKE_CURRENT_LIST_DIR}/runtime/app_pod_migration.cpp
     ${CMAKE_CURRENT_LIST_DIR}/app/pod_checkpoint_api.cpp
     ${CMAKE_CURRENT_LIST_DIR}/api/checkpoint_api.cpp
+    ${CMAKE_CURRENT_LIST_DIR}/kubelet/kubelet.cpp
+    ${CMAKE_CURRENT_LIST_DIR}/runtime/wasm_runtime.cpp
     PROPERTIES COMPILE_OPTIONS "-Os")
