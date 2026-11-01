@@ -548,6 +548,15 @@ else()
     target_link_libraries(test_interp_kernel PRIVATE wasm3_opframes)
     add_test(NAME test_interp_kernel COMMAND test_interp_kernel)
 
+    # Pod snapshots: freeze, snapshot, restore, blockers, the kubelet
+    # endpoints, Checkpoint data on the API server, a snapshot from a board
+    add_executable(test_pod_snapshot
+        tests/test_pod_snapshot.cpp
+    )
+    target_link_libraries(test_pod_snapshot PRIVATE kube32_core)
+    target_compile_definitions(test_pod_snapshot PRIVATE KUBE32_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}")
+    add_test(NAME test_pod_snapshot COMMAND test_pod_snapshot)
+
     # The rfid example against a simulated MFRC522; pod tick intervals
     add_executable(test_rfid_app
         tests/test_rfid_app.cpp
