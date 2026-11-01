@@ -99,7 +99,7 @@ Pods support `restartPolicy: Always`, `OnFailure`, and `Never`. Failed or restar
 | --- | --- | --- |
 | Return value of `app_main` / `main` (`0` for `_start`) | `Completed` (when `0`) or `Error` | Entry point returned |
 | `128` | `StartError` | Container failed to deploy or start (bad Wasm, `k32_init` or `k32_restored` non-zero, no thread stack) |
-| `128` | `RestoreError` | The pod's snapshot (`kube32.io/restore-from`) could not be restored. The pod is `Failed` and is not restarted |
+| `128` | `RestoreError` | The pod's snapshot (`kube32.io/restore-from`) could not be restored. The pod is `Failed` and the kubelet does not restart it. The Checkpoint controller puts a moved pod back on its source node and replaces any other pod, which then starts afresh ([Pod migration](migration.md#moves)) |
 | `132` | `Error` | Unsupported instruction (`SIGILL`) |
 | `134` | `Error` | `unreachable` or abort (`SIGABRT`) |
 | `135` | `Error` | Unaligned atomic operation (`SIGBUS`) |
