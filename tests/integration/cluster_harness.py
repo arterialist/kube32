@@ -146,7 +146,8 @@ class ClusterHarness:
         name: str,
         node_id: int,
         cp_node: SimulatedNode,
-        lease_interval_ms: int = 1000
+        lease_interval_ms: int = 1000,
+        pod_port: int = 0
     ) -> SimulatedNode:
         data_dir = f"/tmp/k32_cluster_test_{name}_{os.getpid()}_{int(time.time()*1000)%10000}"
         self.temp_dirs.append(data_dir)
@@ -167,9 +168,13 @@ class ClusterHarness:
             "--data-dir", data_dir,
             "--lease-interval", str(lease_interval_ms)
         ]
+        # Workers on one host each need their own pod HTTP server port
+        if pod_port:
+            cmd += ["--pod-port", str(pod_port)]
 
         proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         node = SimulatedNode("worker", name, node_id, api_port, ipc_port, data_dir)
+        node.pod_port = pod_port or 7000
         node.process = proc
         self.nodes[name] = node
 
@@ -197,6 +202,8 @@ class ClusterHarness:
                 "--data-dir", old.data_dir,
                 "--lease-interval", str(lease_interval_ms)
             ]
+            if getattr(old, "pod_port", 7000) != 7000:
+                cmd += ["--pod-port", str(old.pod_port)]
             proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
             old.process = proc
             self._wait_for_worker_registered(cp_node.api_url, name, timeout=6.0)

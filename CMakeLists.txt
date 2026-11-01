@@ -150,6 +150,7 @@ else()
         src/api/node_proxy.cpp
         src/api/protobuf_body.cpp
         src/api/firmware_api.cpp
+        src/api/checkpoint_api.cpp
         src/api/inline_images.cpp
         src/scheduler/scheduler.cpp
         src/hal/capability_firewall.cpp
@@ -170,6 +171,8 @@ else()
         src/runtime/pod_fs.cpp
         src/runtime/pod_memory_pool.cpp
         src/runtime/pod_assets.cpp
+        src/runtime/pod_snapshot.cpp
+        src/runtime/app_pod_migration.cpp
         src/app/ingress_controller.cpp
         src/app/ingress_routes.cpp
         src/app/pod_server.cpp
@@ -177,6 +180,7 @@ else()
         src/app/egress_policy.cpp
         src/app/egress_gateway.cpp
         src/app/node_storage_api.cpp
+        src/app/pod_checkpoint_api.cpp
         src/app/console_relay.cpp
         src/kubelet/node_status_reporter.cpp
         src/kubelet/metrics_provider.cpp
@@ -546,6 +550,20 @@ else()
     target_link_libraries(test_driver_frames PRIVATE wasm3_opframes)
     target_compile_definitions(test_driver_frames PRIVATE KUBE32_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}")
     add_test(NAME test_driver_frames COMMAND test_driver_frames)
+
+    # The wasm3 operations of the interpreter speed kernel (kube32.io/interp-mops)
+    add_executable(test_interp_kernel tests/test_interp_kernel.cpp src/runtime/pod_memory_pool.cpp)
+    target_link_libraries(test_interp_kernel PRIVATE wasm3_opframes)
+    add_test(NAME test_interp_kernel COMMAND test_interp_kernel)
+
+    # Pod snapshots: freeze, snapshot, restore, blockers, the kubelet
+    # endpoints, Checkpoint data on the API server, a snapshot from a board
+    add_executable(test_pod_snapshot
+        tests/test_pod_snapshot.cpp
+    )
+    target_link_libraries(test_pod_snapshot PRIVATE kube32_core)
+    target_compile_definitions(test_pod_snapshot PRIVATE KUBE32_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}")
+    add_test(NAME test_pod_snapshot COMMAND test_pod_snapshot)
 
     # The rfid example against a simulated MFRC522; pod tick intervals
     add_executable(test_rfid_app

@@ -11,7 +11,9 @@
 //
 // It is also the node's kubelet endpoint (Node status.daemonEndpoints): a
 // request without X-Kube32-Pod for /storage/... reaches the node's storage
-// (app/node_storage_api.hpp), which the API server's node proxy forwards to.
+// (app/node_storage_api.hpp), one for /checkpoint/... or /thaw/... a pod's
+// snapshot (app/pod_checkpoint_api.hpp); the API server's node proxy
+// forwards to both.
 
 #include "api/http_server.hpp"
 #include "runtime/app_pod.hpp"
