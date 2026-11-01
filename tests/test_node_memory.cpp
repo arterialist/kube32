@@ -137,7 +137,9 @@ void test_psram_node() {
     void* linear = kube32_pool_alloc(1280 * 1024 + 4096);
     assert(structures && linear);
     const kubelet::NodeTelemetry during = reporter.collect_telemetry();
-    assert(during.memory_allocatable_bytes <= memory - 40 * 1024 && during.memory_allocatable_bytes + 48 * 1024 >= memory);
+    // At least the 40 KiB taken; the host allocator may round the block up
+    // (macOS rounds large blocks to its pages), so allow up to 64 KiB
+    assert(during.memory_allocatable_bytes <= memory - 40 * 1024 && during.memory_allocatable_bytes + 64 * 1024 >= memory);
     assert(during.free_psram_bytes == during.memory_allocatable_bytes + (block - (1280 * 1024 + 4096)));
     kube32_pool_free(linear);
     kube32_rt_free(structures);
