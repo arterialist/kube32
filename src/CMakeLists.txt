@@ -134,6 +134,15 @@ idf_component_register(
         bootloader_support
 )
 
+# Control plane, object store and kubelet code runs on requests and changes,
+# not per Wasm instruction: compile it for size. The interpreter, runtime,
+# HAL and IPC keep -O2.
+set(KUBE32_SIZE_SRCS ${KUBE32_APP_SRCS})
+list(FILTER KUBE32_SIZE_SRCS INCLUDE REGEX "^(api|controller|scheduler|storage|kubelet)/|^main_esp32\\.cpp$")
+# Every request parses and writes JSON and Tables: keep those at -O2.
+list(FILTER KUBE32_SIZE_SRCS EXCLUDE REGEX "^api/(http_server|table_serializer|protobuf_body)\\.cpp$")
+set_source_files_properties(${KUBE32_SIZE_SRCS} PROPERTIES COMPILE_OPTIONS "-Os")
+
 # Build identity for GET /version (commit, tree state, build time); see
 # cmake/kube32_build_info.cmake. Regenerated when a source file or the git
 # checkout changes.
