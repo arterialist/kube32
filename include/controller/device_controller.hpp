@@ -36,10 +36,14 @@
 // the Device and its Service stay until the part answers again.
 //
 // Pods and Services whose Device is gone are deleted. start() runs a pass
-// every reconcile_interval_ms on a thread of its own; reconcile() is one
-// pass (tests call it directly).
+// on a thread of its own after a Device, a driver pod, a Service or what the
+// controller reads of a Node (labels, the discovery report, Ready, the pod
+// port) changes, at most every reconcile_interval_ms, when a failed driver
+// pod is due to be replaced, and every resync_interval_ms without a change;
+// reconcile() is one pass (tests call it directly).
 
 #include "api/event_recorder.hpp"
+#include "controller/reconcile_trigger.hpp"
 #include "models/device.hpp"
 #include "scheduler/scheduler.hpp"
 #include "osal/thread.hpp"
@@ -55,7 +59,8 @@
 namespace kube32::controller {
 
 struct DeviceControllerConfig {
-    uint32_t reconcile_interval_ms{2000};
+    uint32_t reconcile_interval_ms{2000};   // shortest time between two passes
+    uint32_t resync_interval_ms{30000};     // a pass at least this often
     size_t stack_bytes{12288};
     bool stack_in_psram{false};
     int core_affinity{-1};
@@ -77,6 +82,8 @@ public:
 
     // One pass. `now_ms` is the monotonic clock (0: read it).
     void reconcile(uint64_t now_ms = 0);
+    // Passes run so far
+    uint64_t passes() const { return passes_.load(); }
 
 private:
     struct NodeView {
@@ -102,7 +109,7 @@ private:
 
     std::vector<NodeView> load_nodes();
     void discover(const std::vector<NodeView>& nodes, std::vector<std::string>& keys, std::vector<std::string>& jsons);
-    void reconcile_device(const std::string& key, const std::string& json, const std::vector<NodeView>& nodes,
+    void reconcile_device(const std::string& key, const models::JsonValue& doc, const std::vector<NodeView>& nodes,
                           std::map<std::string, PodView>& pods, uint64_t now);
     std::string place(const models::DeviceSpec& spec, const std::string& current, const std::vector<NodeView>& nodes) const;
     // The driver pod for `d` on `node`; `out_hash` is what it was made from
@@ -124,8 +131,10 @@ private:
         uint64_t delay_ms{0};
     };
     std::map<std::string, Retry> retries_;
+    ReconcileTrigger trigger_;
     std::unique_ptr<osal::Thread> thread_;
     std::atomic<bool> running_{false};
+    std::atomic<uint64_t> passes_{0};
 };
 
 } // namespace kube32::controller

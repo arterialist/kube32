@@ -67,7 +67,20 @@ static bool labels_match(const models::JsonValue* selector, const models::JsonVa
 }
 
 WorkloadController::WorkloadController(storage::Store& store, scheduler::Scheduler* scheduler, WorkloadControllerConfig cfg)
-    : store_(store), scheduler_(scheduler), cfg_(cfg), events_(store, 64) {}
+    : store_(store), scheduler_(scheduler), cfg_(cfg), events_(store, 64),
+      trigger_(store, ReconcileTriggerConfig{cfg.reconcile_interval_ms, cfg.resync_interval_ms}) {
+    trigger_.watch("/registry/daemonsets/");
+    trigger_.watch("/registry/jobs/");
+    trigger_.watch("/registry/pods/", [](const storage::WatchEvent& ev) {
+        return ev.json.find("\"DaemonSet\"") != std::string::npos || ev.json.find("\"Job\"") != std::string::npos;
+    });
+    // Which nodes a DaemonSet runs on: their names and labels
+    trigger_.watch_fields("/registry/nodes/", [](const models::JsonValue& node) {
+        const models::JsonValue* meta = node.get("metadata");
+        const models::JsonValue* labels = meta ? meta->get("labels") : nullptr;
+        return ReconcileTrigger::hash({labels ? labels->to_string() : std::string()});
+    });
+}
 
 WorkloadController::~WorkloadController() {
     stop();
@@ -93,6 +106,7 @@ bool WorkloadController::start() {
 void WorkloadController::stop() {
     if (!running_.load()) return;
     running_.store(false);
+    trigger_.interrupt();
     if (thread_ && thread_->is_joinable()) {
         thread_->join();
         thread_.reset();
@@ -106,12 +120,12 @@ void WorkloadController::task_entry(void* arg) {
 void WorkloadController::run_loop() {
     while (running_.load()) {
         try {
-            reconcile();
+            if (trigger_.due(osal::System::get_uptime_ms())) reconcile();
         } catch (const std::exception& e) {
             std::cout << "[WORKLOAD] pass skipped: " << e.what() << std::endl;
         }
         osal::System::feed_watchdog();
-        osal::Thread::sleep_ms(cfg_.reconcile_interval_ms);
+        trigger_.wait(osal::System::get_uptime_ms(), cfg_.resync_interval_ms);
     }
 }
 
@@ -222,6 +236,7 @@ std::string WorkloadController::create_pod(const std::string& owner_kind, const 
 }
 
 void WorkloadController::reconcile() {
+    passes_.fetch_add(1);
     std::vector<std::string> pod_jsons, pod_keys;
     store_.list_extended("/registry/pods/", pod_jsons, &pod_keys);
     std::vector<PodView> pods;

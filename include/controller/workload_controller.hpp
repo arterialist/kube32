@@ -20,10 +20,15 @@
 //
 // Status is computed from the pods that exist. Pods whose owner is gone are
 // deleted.
+//
+// start() runs a pass after a DaemonSet, a Job, a pod one of them owns or a
+// Node's labels change, at most every reconcile_interval_ms, and every
+// resync_interval_ms without a change.
 
 #include "storage/store.hpp"
 #include "scheduler/scheduler.hpp"
 #include "api/event_recorder.hpp"
+#include "controller/reconcile_trigger.hpp"
 #include "osal/thread.hpp"
 
 #include <atomic>
@@ -34,7 +39,8 @@
 namespace kube32::controller {
 
 struct WorkloadControllerConfig {
-    uint32_t reconcile_interval_ms{1000};
+    uint32_t reconcile_interval_ms{1000};   // shortest time between two passes
+    uint32_t resync_interval_ms{30000};     // a pass at least this often
     size_t stack_bytes{16384};
     bool stack_in_psram{false};
     int core_affinity{-1};
@@ -51,6 +57,8 @@ public:
 
     // One pass over every DaemonSet and Job (public for tests).
     void reconcile();
+    // Passes run so far
+    uint64_t passes() const { return passes_.load(); }
 
 private:
     struct PodView;
@@ -70,8 +78,10 @@ private:
     scheduler::Scheduler* scheduler_;
     WorkloadControllerConfig cfg_;
     api::EventRecorder events_;
+    ReconcileTrigger trigger_;
     std::unique_ptr<osal::Thread> thread_;
     std::atomic<bool> running_{false};
+    std::atomic<uint64_t> passes_{0};
 };
 
 } // namespace kube32::controller

@@ -14,8 +14,25 @@ static models::JsonValue jstr(const std::string& v) { return models::JsonValue{m
 static models::JsonValue jnum(double v) { return models::JsonValue{models::JsonType::Number, false, v, "", {}, {}}; }
 static models::JsonValue jbool(bool v) { return models::JsonValue{models::JsonType::Boolean, v, 0, "", {}, {}}; }
 
+// One pod a Deployment owns, as a pass needs it, parsed once per pass
+struct DeploymentController::PodView {
+    std::string key;
+    std::string json;
+    std::string ns;
+    std::string owner_uid;
+    std::string hash;          // pod-template-hash label
+    bool terminating{false};
+    bool ready{false};
+};
+
 DeploymentController::DeploymentController(storage::Store& store, scheduler::Scheduler* scheduler, DeploymentControllerConfig cfg)
-    : store_(store), scheduler_(scheduler), cfg_(cfg), events_(store, 64) {}
+    : store_(store), scheduler_(scheduler), cfg_(cfg), events_(store, 64),
+      trigger_(store, ReconcileTriggerConfig{cfg.reconcile_interval_ms, cfg.resync_interval_ms}) {
+    trigger_.watch("/registry/deployments/");
+    // Pods with a Deployment owner reference, or that had one (a deleted pod
+    // arrives as it was)
+    trigger_.watch("/registry/pods/", [](const storage::WatchEvent& ev) { return ev.json.find("\"Deployment\"") != std::string::npos; });
+}
 
 DeploymentController::~DeploymentController() {
     stop();
@@ -41,6 +58,7 @@ bool DeploymentController::start() {
 void DeploymentController::stop() {
     if (!running_.load()) return;
     running_.store(false);
+    trigger_.interrupt();
     if (thread_ && thread_->is_joinable()) {
         thread_->join();
         thread_.reset();
@@ -54,12 +72,12 @@ void DeploymentController::task_entry(void* arg) {
 void DeploymentController::run_loop() {
     while (running_.load()) {
         try {
-            reconcile();
+            if (trigger_.due(osal::System::get_uptime_ms())) reconcile();
         } catch (const std::exception& e) {
             std::cout << "[DEPLOY] pass skipped: " << e.what() << std::endl;
         }
         osal::System::feed_watchdog();
-        osal::Thread::sleep_ms(cfg_.reconcile_interval_ms);
+        trigger_.wait(osal::System::get_uptime_ms(), cfg_.resync_interval_ms);
     }
 }
 
@@ -117,15 +135,38 @@ void DeploymentController::delete_pod(const std::string& pod_key, const std::str
 }
 
 void DeploymentController::reconcile() {
+    passes_.fetch_add(1);
     std::vector<std::string> dep_jsons;
     std::vector<std::string> dep_keys;
     store_.list_extended("/registry/deployments/", dep_jsons, &dep_keys);
 
-    std::vector<std::string> pod_jsons;
-    std::vector<std::string> pod_keys;
-    store_.list_extended("/registry/pods/", pod_jsons, &pod_keys);
+    // The pods Deployments own, each parsed once
+    std::vector<PodView> pods;
+    {
+        std::vector<std::string> pod_jsons;
+        std::vector<std::string> pod_keys;
+        store_.list_extended("/registry/pods/", pod_jsons, &pod_keys);
+        for (size_t i = 0; i < pod_jsons.size(); ++i) {
+            if (pod_jsons[i].find("\"Deployment\"") == std::string::npos) continue;
+            models::JsonValue p;
+            std::string err;
+            if (!models::parse_json(pod_jsons[i], p, err) || !p.is_object()) continue;
+            PodView v;
+            v.owner_uid = owner_uid_of(p);
+            if (v.owner_uid.empty()) continue;
+            const models::JsonValue* pm = p.get("metadata");
+            const models::JsonValue* labels = pm ? pm->get("labels") : nullptr;
+            v.key = pod_keys[i];
+            v.ns = pm ? pm->get_string("namespace", "default") : "default";
+            v.terminating = pm && !pm->get_string("deletionTimestamp", "").empty();
+            v.ready = pod_is_ready(p);
+            v.hash = labels ? labels->get_string("pod-template-hash", "") : "";
+            v.json = std::move(pod_jsons[i]);
+            pods.push_back(std::move(v));
+        }
+    }
 
-    std::vector<std::string> uids;
+    std::set<std::string> live;
     for (size_t i = 0; i < dep_jsons.size(); ++i) {
         osal::Thread::yield();
         models::JsonValue d;
@@ -133,35 +174,17 @@ void DeploymentController::reconcile() {
         if (!models::parse_json(dep_jsons[i], d, err) || !d.is_object()) continue;
         const models::JsonValue* meta = d.get("metadata");
         std::string uid = meta ? meta->get_string("uid", "") : "";
-        if (!uid.empty()) uids.push_back(uid);
-        reconcile_one(dep_keys[i], dep_jsons[i], pod_jsons, pod_keys);
+        if (!uid.empty()) live.insert(uid);
+        reconcile_one(dep_keys[i], d, pods);
     }
-    collect_garbage(uids);
-}
 
-void DeploymentController::collect_garbage(const std::vector<std::string>& deployment_uids) {
-    std::vector<std::string> pod_jsons;
-    std::vector<std::string> pod_keys;
-    store_.list_extended("/registry/pods/", pod_jsons, &pod_keys);
-    std::set<std::string> live(deployment_uids.begin(), deployment_uids.end());
-    for (size_t i = 0; i < pod_jsons.size(); ++i) {
-        models::JsonValue p;
-        std::string err;
-        if (!models::parse_json(pod_jsons[i], p, err) || !p.is_object()) continue;
-        std::string owner = owner_uid_of(p);
-        if (owner.empty() || live.count(owner)) continue;
-        const models::JsonValue* meta = p.get("metadata");
-        if (meta && !meta->get_string("deletionTimestamp", "").empty()) continue;
-        delete_pod(pod_keys[i], pod_jsons[i]);
+    // Pods whose Deployment is gone go with it
+    for (const auto& p : pods) {
+        if (!p.terminating && !live.count(p.owner_uid)) delete_pod(p.key, p.json);
     }
 }
 
-void DeploymentController::reconcile_one(const std::string& key, const std::string& json,
-                                         const std::vector<std::string>& all_pod_jsons,
-                                         const std::vector<std::string>& all_pod_keys) {
-    models::JsonValue dep;
-    std::string err;
-    if (!models::parse_json(json, dep, err) || !dep.is_object()) return;
+void DeploymentController::reconcile_one(const std::string& key, models::JsonValue& dep, const std::vector<PodView>& pods) {
     const models::JsonValue* meta = dep.get("metadata");
     const models::JsonValue* spec = dep.get("spec");
     if (!meta || !spec || !spec->is_object()) return;
@@ -176,30 +199,17 @@ void DeploymentController::reconcile_one(const std::string& key, const std::stri
     std::string hash = template_hash(tmpl->to_string());
 
     // Owned pods in this namespace
-    struct Owned { std::string key; std::string json; bool terminating; bool ready; bool current; };
-    std::vector<Owned> owned;
-    for (size_t i = 0; i < all_pod_jsons.size(); ++i) {
-        if (all_pod_keys[i].compare(0, 16 + ns.size(), "/registry/pods/" + ns + "/") != 0) continue;
-        models::JsonValue p;
-        if (!models::parse_json(all_pod_jsons[i], p, err) || !p.is_object()) continue;
-        if (owner_uid_of(p) != uid) continue;
-        const models::JsonValue* pm = p.get("metadata");
-        const models::JsonValue* labels = pm ? pm->get("labels") : nullptr;
-        Owned o;
-        o.key = all_pod_keys[i];
-        o.json = all_pod_jsons[i];
-        o.terminating = pm && !pm->get_string("deletionTimestamp", "").empty();
-        o.ready = pod_is_ready(p);
-        o.current = labels && labels->get_string("pod-template-hash", "") == hash;
-        owned.push_back(std::move(o));
+    std::vector<const PodView*> owned;
+    for (const auto& p : pods) {
+        if (p.owner_uid == uid && p.ns == ns) owned.push_back(&p);
     }
 
     int64_t active = 0, ready = 0, updated = 0;
-    for (const auto& o : owned) {
-        if (o.terminating) continue;
+    for (const PodView* o : owned) {
+        if (o->terminating) continue;
         ++active;
-        if (o.ready) ++ready;
-        if (o.current) ++updated;
+        if (o->ready) ++ready;
+        if (o->hash == hash) ++updated;
     }
 
     // Scale up: create missing pods from the template
@@ -270,15 +280,15 @@ void DeploymentController::reconcile_one(const std::string& key, const std::stri
 
     // Scale down: drop surplus (not-ready and stale first, then newest)
     if (active > desired) {
-        std::vector<Owned*> candidates;
-        for (auto& o : owned) if (!o.terminating) candidates.push_back(&o);
-        std::stable_sort(candidates.begin(), candidates.end(), [](const Owned* a, const Owned* b) {
+        std::vector<const PodView*> candidates;
+        for (const PodView* o : owned) if (!o->terminating) candidates.push_back(o);
+        std::stable_sort(candidates.begin(), candidates.end(), [&hash](const PodView* a, const PodView* b) {
             if (a->ready != b->ready) return !a->ready;
-            if (a->current != b->current) return !a->current;
+            if ((a->hash == hash) != (b->hash == hash)) return a->hash != hash;
             return a->key > b->key;
         });
         for (int64_t n = active; n > desired && !candidates.empty(); --n) {
-            Owned* victim = candidates.front();
+            const PodView* victim = candidates.front();
             candidates.erase(candidates.begin());
             delete_pod(victim->key, victim->json);
             size_t slash = victim->key.rfind('/');
@@ -295,9 +305,9 @@ void DeploymentController::reconcile_one(const std::string& key, const std::stri
         }
     } else if (updated < active) {
         // Rolling update: replace one stale pod per pass once the set is full
-        for (auto& o : owned) {
-            if (o.terminating || o.current) continue;
-            delete_pod(o.key, o.json);
+        for (const PodView* o : owned) {
+            if (o->terminating || o->hash == hash) continue;
+            delete_pod(o->key, o->json);
             break;
         }
     }
@@ -374,8 +384,12 @@ void DeploymentController::reconcile_one(const std::string& key, const std::stri
     std::string new_status = status.to_string();
     std::string old_status = (prev && prev->is_object()) ? prev->to_string() : "";
     if (new_status != old_status) {
+        // Over the version read: a spec written meanwhile (kubectl scale) is
+        // kept, and its change makes the next pass due
+        const std::string rv = meta->get_string("resourceVersion", "");
+        const uint64_t version = rv.empty() ? 0 : std::strtoull(rv.c_str(), nullptr, 10);
         dep.set("status", std::move(status));
-        store_.put(key, dep.to_string(), true);
+        store_.put_extended(key, dep.to_string(), true, true, version, nullptr);
     }
 }
 

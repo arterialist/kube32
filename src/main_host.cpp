@@ -136,7 +136,7 @@ static void print_sim_usage(std::ostream& out) {
            "  --lease-interval <ms>       node heartbeat interval (default 5000)\n"
            "  --not-ready-timeout <ms>    NotReady after this without a heartbeat (default 15000)\n"
            "  --eviction-timeout <ms>     taint a node NoExecute after this long without a heartbeat (default 30000)\n"
-           "  --reconcile-interval <ms>   controller loop interval (default 1000)\n"
+           "  --reconcile-interval <ms>   shortest time between controller passes (default 1000)\n"
            "\n"
            "  -h, --help                  show this help\n";
 }

@@ -138,7 +138,31 @@ struct DeviceController::DeviceView {
 };
 
 DeviceController::DeviceController(storage::Store& store, scheduler::Scheduler* scheduler, DeviceControllerConfig config)
-    : store_(store), scheduler_(scheduler), config_(std::move(config)), events_(store, 64) {}
+    : store_(store), scheduler_(scheduler), config_(std::move(config)), events_(store, 64),
+      trigger_(store, ReconcileTriggerConfig{config_.reconcile_interval_ms, config_.resync_interval_ms}) {
+    trigger_.watch(kDevicePrefix);
+    trigger_.watch(kServicePrefix);
+    trigger_.watch(kPodPrefix, [](const storage::WatchEvent& ev) {
+        const std::string& k = ev.key;
+        return k.size() >= 8 && k.compare(k.size() - 7, 7, kPodSuffix) == 0;
+    });
+    // What load_nodes reads of a Node
+    trigger_.watch_fields(kNodePrefix, [](const models::JsonValue& node) {
+        const models::JsonValue* meta = node.get("metadata");
+        const models::JsonValue* labels = meta ? meta->get("labels") : nullptr;
+        const models::JsonValue* ann = meta ? meta->get("annotations") : nullptr;
+        std::string ready;
+        if (const models::JsonValue* st = node.get("status")) {
+            if (const models::JsonValue* conds = st->get("conditions"); conds && conds->is_array()) {
+                for (const auto& c : conds->arr_val) {
+                    if (c.get_string("type", "") == "Ready") ready = c.get_string("status", "");
+                }
+            }
+        }
+        return ReconcileTrigger::hash({labels ? labels->to_string() : std::string(), ann ? ann->get_string(models::kAnnotationI2cDevices, "") : std::string(),
+                                       ready, std::to_string(models::node_pod_port(node))});
+    });
+}
 
 DeviceController::~DeviceController() {
     stop();
@@ -158,12 +182,12 @@ bool DeviceController::start() {
         auto* self = static_cast<DeviceController*>(arg);
         while (self->running_.load()) {
             try {
-                self->reconcile();
+                if (self->trigger_.due(osal::System::get_uptime_ms())) self->reconcile();
             } catch (const std::exception& e) {
                 printf("[DEVICE] pass skipped: %s\n", e.what());
             }
             osal::System::feed_watchdog();
-            osal::Thread::sleep_ms(self->config_.reconcile_interval_ms);
+            self->trigger_.wait(osal::System::get_uptime_ms(), self->config_.resync_interval_ms);
         }
     }, this, tc);
     if (!ok) running_.store(false);
@@ -173,6 +197,7 @@ bool DeviceController::start() {
 void DeviceController::stop() {
     if (!running_.load()) return;
     running_.store(false);
+    trigger_.interrupt();
     if (thread_ && thread_->is_joinable()) thread_->join();
     thread_.reset();
 }
@@ -216,6 +241,7 @@ std::vector<DeviceController::NodeView> DeviceController::load_nodes() {
 
 void DeviceController::reconcile(uint64_t now) {
     if (now == 0) now = osal::System::get_uptime_ms();
+    passes_.fetch_add(1);
     const std::vector<NodeView> nodes = load_nodes();
     std::vector<std::string> jsons, keys;
     store_.list_extended(kDevicePrefix, jsons, &keys);
@@ -257,7 +283,7 @@ void DeviceController::reconcile(uint64_t now) {
         if (!models::parse_json(jsons[i], doc, err) || !doc.is_object()) continue;
         const models::JsonValue* meta = doc.get("metadata");
         if (meta) live.insert(meta->get_string("uid", ""));
-        reconcile_device(keys[i], jsons[i], nodes, pods, now);
+        reconcile_device(keys[i], doc, nodes, pods, now);
     }
 
     // Pods and Services whose Device is gone go with it
@@ -280,30 +306,40 @@ void DeviceController::reconcile(uint64_t now) {
 }
 
 void DeviceController::discover(const std::vector<NodeView>& nodes, std::vector<std::string>& keys, std::vector<std::string>& jsons) {
+    // The I2C parts the Devices name, each Device parsed once
+    struct Part {
+        size_t index;
+        bool auto_made;
+        std::string node;
+        models::I2cLocation where;
+    };
+    std::vector<Part> parts;
+    for (size_t i = 0; i < jsons.size(); ++i) {
+        models::JsonValue doc;
+        std::string err, why;
+        models::DeviceSpec spec;
+        if (!models::parse_json(jsons[i], doc, err) || !models::parse_device_spec(doc.get("spec"), spec, why) || !spec.has_i2c) continue;
+        const models::JsonValue* meta = doc.get("metadata");
+        const models::JsonValue* labels = meta ? meta->get("labels") : nullptr;
+        const models::JsonValue* st = doc.get("status");
+        parts.push_back(Part{i, labels && labels->get_string(models::kLabelDiscovered, "") == "true",
+                             !spec.node_name.empty() ? spec.node_name : (st ? st->get_string("nodeName", "") : ""), spec.i2c});
+    }
     // What the Devices cover: (node, I2C location), hand-written ones first
     std::vector<std::pair<std::string, models::I2cLocation>> covered;
     std::vector<size_t> replaced;   // indexes of discovered Devices a hand-written one replaces
     for (int pass = 0; pass < 2; ++pass) {
-        for (size_t i = 0; i < jsons.size(); ++i) {
-            models::JsonValue doc;
-            std::string err, why;
-            models::DeviceSpec spec;
-            if (!models::parse_json(jsons[i], doc, err) || !models::parse_device_spec(doc.get("spec"), spec, why) || !spec.has_i2c) continue;
-            const models::JsonValue* meta = doc.get("metadata");
-            const models::JsonValue* labels = meta ? meta->get("labels") : nullptr;
-            const bool auto_made = labels && labels->get_string(models::kLabelDiscovered, "") == "true";
-            if (auto_made != (pass == 1)) continue;
-            const models::JsonValue* st = doc.get("status");
-            const std::string node = !spec.node_name.empty() ? spec.node_name : (st ? st->get_string("nodeName", "") : "");
-            const bool known = std::any_of(covered.begin(), covered.end(), [&](const auto& c) { return c.first == node && c.second == spec.i2c; });
+        for (const auto& p : parts) {
+            if (p.auto_made != (pass == 1)) continue;
+            const bool known = std::any_of(covered.begin(), covered.end(), [&](const auto& c) { return c.first == p.node && c.second == p.where; });
             // A hand-written Device takes the place of the one discovery made for its part
-            if (auto_made && known) {
-                store_.remove(keys[i]);
-                printf("[DEVICE] %s: replaced by a Device written for the same part\n", keys[i].c_str());
-                replaced.push_back(i);
+            if (p.auto_made && known) {
+                store_.remove(keys[p.index]);
+                printf("[DEVICE] %s: replaced by a Device written for the same part\n", keys[p.index].c_str());
+                replaced.push_back(p.index);
                 continue;
             }
-            covered.emplace_back(node, spec.i2c);
+            covered.emplace_back(p.node, p.where);
         }
     }
     for (auto it = replaced.rbegin(); it != replaced.rend(); ++it) {
@@ -385,11 +421,9 @@ std::string DeviceController::place(const models::DeviceSpec& spec, const std::s
     return std::string();
 }
 
-void DeviceController::reconcile_device(const std::string& key, const std::string& json, const std::vector<NodeView>& nodes,
+void DeviceController::reconcile_device(const std::string& key, const models::JsonValue& doc, const std::vector<NodeView>& nodes,
                                         std::map<std::string, PodView>& pods, uint64_t now) {
-    models::JsonValue doc;
     std::string err;
-    if (!models::parse_json(json, doc, err) || !doc.is_object()) return;
     const models::JsonValue* meta = doc.get("metadata");
     if (!meta) return;
     DeviceView d;
@@ -503,6 +537,8 @@ void DeviceController::reconcile_device(const std::string& key, const std::strin
             event(d, "Replacing", "replacing failed driver pod " + pod_name, true);
             r.since = 0;
             r.delay_ms = std::min<uint64_t>(r.delay_ms * 2, config_.failed_retry_max_ms);
+        } else {
+            trigger_.wake_at(r.since + r.delay_ms);
         }
         finish("Failed", pod->message.empty() ? "driver pod " + pod_name + " failed" : pod->message);
         return;

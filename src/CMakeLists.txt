@@ -40,6 +40,7 @@ set(KUBE32_APP_SRCS
     controller/workload_controller.cpp
     controller/firmware_rollout_controller.cpp
     controller/device_controller.cpp
+    controller/reconcile_trigger.cpp
     hal/capability_firewall.cpp
     hal/mock_hal.cpp
     hal/sd_card.cpp

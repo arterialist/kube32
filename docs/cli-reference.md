@@ -42,7 +42,7 @@ Use `kubectl` and k9s to manage the cluster. Use the tools below to run the host
 | `--lease-interval <ms>` | `5000` | Node heartbeat interval in milliseconds. |
 | `--not-ready-timeout <ms>` | `15000` | Mark a node `NotReady` after this many milliseconds without a heartbeat. |
 | `--eviction-timeout <ms>` | `30000` | Add `node.kubernetes.io/unreachable:NoExecute` after this many milliseconds without a heartbeat; pods are evicted once their matching `tolerationSeconds` (default `300` s) elapses. |
-| `--reconcile-interval <ms>` | `1000` | Controller and scheduler loop interval in milliseconds. |
+| `--reconcile-interval <ms>` | `1000` | Shortest time between two passes of a controller or the scheduler, in milliseconds. They run a pass after a change and every 30 s without one. |
 | `-h`, `--help` | | Print all options with defaults and exit `0`. |
 
 ### Modeling boards without PSRAM
