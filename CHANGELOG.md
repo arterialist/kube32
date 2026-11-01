@@ -6,6 +6,11 @@ All notable changes to this project will be documented in this file. The format 
 
 ### Added
 
+- Pod migration ([docs/migration.md](docs/migration.md)). The Checkpoint controller carries out `kube32.io/v1` Checkpoints: `Save` stores a running pod's state, `Move` replaces the pod on another node, where it restores with the same name and owners. A Deployment counts one pod throughout. A failed restore puts the pod back on its source node from the same checkpoint. Spec blockers (hardware grants, node storage volumes, DaemonSet pods, `kube32.io/migration: Never`) and the node's are refused and named.
+- `POST /api/v1/namespaces/<ns>/pods/<name>/eviction` (`policy/v1` Eviction): `kubectl drain` moves the pods that can move and deletes the others. `kubectl cordon` and `uncordon` work as in Kubernetes.
+- Migration policies in the `kube32.io/migration` annotation: `OnDrain` (default), `Never` and `Auto`, which moves pods off nodes under memory pressure and, with `kube32.io/placement: fastest`, to nodes at least twice as fast by `kube32.io/interp-mops`. `kube32.io/checkpoint-interval` saves a pod periodically, and a pod on a lost node restores on another node from its latest periodic checkpoint.
+- `kube32-cli checkpoint`, `move` and `checkpoints`.
+
 - `bench_ops` (`tools/bench_ops.cpp`) counts the wasm3 operations that each bench kernel executes, with the interpreter built as the boards build it. [docs/benchmarks.md](docs/benchmarks.md) uses the counts to explain why the ratio to native code changes from kernel to kernel.
 - `K32_CMD:BENCH` runs benchmark kernels natively on a node's console. The bench pod (`apps/bench`, `images/sd/bench.wasm`) runs the same kernels in the sandbox. [docs/benchmarks.md](docs/benchmarks.md) lists the measurements.
 - Kubernetes API server on port 6443 serving Pod, Node, Namespace, Service, Endpoints, EndpointSlice, ConfigMap, Secret, Event, Deployment, DaemonSet, Job, Lease, Ingress, NetworkPolicy, NodeMetrics, PodMetrics, and subject access reviews.

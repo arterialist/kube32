@@ -38,7 +38,7 @@ Discovery endpoints accept `GET` and `HEAD`.
 
 | Group | Kind | Short | Verbs and subresources | Notes |
 | --- | --- | --- | --- | --- |
-| core `v1` | Pod | `po` | get, list, watch, create, update, patch, delete; `status`, `log`, `binding` | Graceful deletion when bound to a node, 30 s by default or `gracePeriodSeconds`. `DELETE` returns the `Pod` for bound pods and a `Status` for unbound pods. Create, update and non-status patch add 300 s `NoExecute` tolerations for `node.kubernetes.io/not-ready` and `node.kubernetes.io/unreachable` unless already tolerated |
+| core `v1` | Pod | `po` | get, list, watch, create, update, patch, delete; `status`, `log`, `binding`, `eviction` | Graceful deletion when bound to a node, 30 s by default or `gracePeriodSeconds`. `DELETE` returns the `Pod` for bound pods and a `Status` for unbound pods. Create, update and non-status patch add 300 s `NoExecute` tolerations for `node.kubernetes.io/not-ready` and `node.kubernetes.io/unreachable` unless already tolerated. See [Eviction](#eviction) |
 | core `v1` | Node | `no` | get, list, watch, create, update, patch, delete; `status`, `proxy` | Registered by kubelets. `/api/v1/nodes/<node>/proxy/storage/<path>` supports `GET`, `PUT` and `DELETE`; `PUT` accepts chunked or `Content-Length` bodies up to 8 MiB by default, writes `<path>.part` and renames it into place |
 | core `v1` | Namespace | `ns` | get, list, watch, create, update, patch, delete | Seeded at boot: `default`, `kube-system`, `kube-public`, `kube-node-lease`, `kube32-cluster` |
 | core `v1` | Service | `svc` | get, list, watch, create, update, patch, delete | Selects Running pods for Ingress, `k32_http_call` and environment variables |
@@ -58,13 +58,55 @@ Discovery endpoints accept `GET` and `HEAD`.
 | `kube32.io/v1` | FirmwareRollout | `fwr` | get, list, watch, create, update, patch, delete | Cluster-scoped. `spec.sha256` names the staged firmware image. The rollout controller updates nodes one at a time and writes `status`. The API server serves the staged image at `/apis/kube32.io/v1/firmware`. See [Firmware updates](firmware-updates.md#api). |
 | `kube32.io/v1` | Device | `dev` | get, list, watch, create, update, patch, delete; `status` | A part wired to a node. `spec.driver` must be a driver of the catalog. The API server checks I2C addresses, multiplexer channels and pins, and stores addresses as `"0x77"`. A write to the object keeps `status`. A write to `status` changes nothing else. The Device controller runs the driver pod and Service and writes `status`. See [Devices](devices.md). |
 
+## Eviction
+
+`POST /api/v1/namespaces/<ns>/pods/<name>/eviction` takes a `policy/v1` `Eviction` and answers `201` with a `Status`. Discovery lists the subresource, so `kubectl drain` uses it.
+
+- A running pod that can move gets a `Move` Checkpoint with the label `kube32.io/trigger: eviction`. The Checkpoint controller moves the pod to another node. The replacement keeps the pod's name and has a new uid. A second eviction of the same pod finds the move under way and answers `201` again.
+- A pod that cannot move is deleted as `DELETE` deletes it, with `deleteOptions.gracePeriodSeconds` when the body gives one. A pod cannot move when its spec holds a blocker, when its policy is `Never`, or when it is not running.
+- When a move the eviction asked for fails before the replacement, the pod is deleted.
+- `404` for an unknown pod. There are no PodDisruptionBudgets, so the answer is never `429`.
+
+See [Pod migration](migration.md#drain-and-evictions).
+
+## Checkpoint status
+
+The Checkpoint controller writes `status` of each `kube32.io/v1` Checkpoint:
+
+| Field | Meaning |
+| --- | --- |
+| `phase` | `Pending`, `Saving`, `Saved` (Save), `Moving`, `Completed` (Move) or `Failed` |
+| `nodeName` | The node the pod ran on when the snapshot was taken |
+| `targetNode` | Move: the node the replacement runs on |
+| `newPodName` | Move: the replacement's name, the pod's own |
+| `imageSha256` | SHA-256 of the pod's module |
+| `snapshotSha256` | SHA-256 the node reported for the snapshot |
+| `sizeBytes` | Size of the checkpoint's data |
+| `podTimeMs` | The pod's clock (`k32_time_ms`) at the snapshot |
+| `takenAt`, `finishedAt` | Wall-clock times, when the control plane has a clock |
+| `message` | What happened, or why the checkpoint failed |
+| `blockers` | Why the pod cannot move, one line each |
+
+See [Pod migration](migration.md) for the phases and the retention of Checkpoints.
+
+## Annotations
+
+| Annotation | On | Meaning |
+| --- | --- | --- |
+| `kube32.io/migration` | Pod | `OnDrain` (default), `Never` or `Auto`. See [Policies](migration.md#policies) |
+| `kube32.io/placement` | Pod | `fastest`: with `Auto`, run on the fastest node, by `kube32.io/interp-mops` |
+| `kube32.io/checkpoint-interval` | Pod | Save the pod's state at this interval (`"60s"`, `"5m"`), 10 s at the least |
+| `kube32.io/restore-from` | Pod | The Checkpoint the kubelet restores the pod from. The Checkpoint controller and the node lifecycle controller set it and remove it once the pod runs |
+| `kube32.io/interp-mops` | Node | Interpreter speed the node measured at boot, millions of wasm3 operations per second |
+| `kube32.io/trigger` (label) | Checkpoint | What created it: `periodic`, `eviction`, `memory-pressure` or `placement` |
+
 `POST /apis/kube32.io/v1/egress` is the egress gateway: it makes the `https://` calls of pods on workers, for nodes only. See [Networking](networking.md#egress-gateway).
 
 `GET /apis/kube32.io/v1/images/<sha256>` returns a module that a Pod or pod template carried inline (`application/wasm`, with `Content-Length`). A Pod, Deployment, DaemonSet or Job written with the annotation `kube32.io/wasm-base64` is stored with `kube32.io/wasm-sha256` and `kube32.io/wasm-size` in its place, and the module is stored under the digest. See [Writing app pods](app-development.md#inline-image-kube32-cli-deploy).
 
 ## kubectl and k9s
 
-`kubectl` and `k9s` work without extra flags. Supported commands include `get`, `describe`, `apply`, `create`, `delete`, `patch`, `scale`, `logs`, `top`, `events` and `auth can-i`.
+`kubectl` and `k9s` work without extra flags. Supported commands include `get`, `describe`, `apply`, `create`, `delete`, `patch`, `scale`, `logs`, `top`, `events`, `cordon`, `uncordon`, `drain` and `auth can-i`.
 
 The client can send `Accept: as=Table;v=v1;g=meta.k8s.io`. List and single-object `GET` requests then return `meta.k8s.io/v1` Table responses for Pod, Node, Deployment, Event, Namespace, Service, ConfigMap, Secret, Lease, Ingress, Endpoints, EndpointSlice, FirmwareRollout and Device. DaemonSets, Jobs and metrics return plain objects for client-side printing.
 
@@ -104,7 +146,7 @@ Write requests honour `dryRun=All` in the query string or in a `DeleteOptions` r
 - There is no RBAC; authenticated callers have full access to all resources.
 - `Endpoints` and `EndpointSlice` are read-only and do not support `watch`.
 - Deployments manage Pods directly without `ReplicaSet` objects.
-- `deletecollection`, `exec`, `attach`, `portforward` and `eviction` are not supported.
+- `deletecollection`, `exec`, `attach` and `portforward` are not supported.
 - `fieldValidation=Strict` checks top-level and `metadata` fields only, so unknown fields nested inside `spec` are accepted.
 - Paginated lists with `limit` and `continue` read from the current store state without a snapshot.
 - Request bodies are capped at 2 MiB, chunked request bodies return `411` (except node proxy storage uploads), and headers larger than the 4 KiB board receive buffer return `431`.

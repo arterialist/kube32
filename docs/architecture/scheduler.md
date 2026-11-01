@@ -1,13 +1,14 @@
 # Scheduler and controllers
 
-Four control loops run on the control plane next to the API server:
+Five control loops run on the control plane next to the API server:
 
 - `src/scheduler/scheduler.cpp`
 - `src/controller/node_lifecycle_controller.cpp`
 - `src/controller/deployment_controller.cpp`
 - `src/controller/workload_controller.cpp`
+- `src/controller/checkpoint_controller.cpp`
 
-The Deployment, DaemonSet and Job, and Device controllers watch the object store, as Kubernetes controllers watch the API server. A controller runs a pass when an object that it reads changes, when a wait that it set ends, and every 30 s without a change, which repairs what a missed change would leave. Changes to Node objects count only when they touch a field that the controller reads, so node heartbeats cause no passes. Passes are at least 1 s apart (2 s for the Device controller), or `--reconcile-interval` on the simulator.
+The Deployment, DaemonSet and Job, Device and Checkpoint controllers watch the object store, as Kubernetes controllers watch the API server. A controller runs a pass when an object that it reads changes, when a wait that it set ends, and every 30 s without a change, which repairs what a missed change would leave. Changes to Node objects count only when they touch a field that the controller reads, so node heartbeats cause no passes. Passes are at least 1 s apart (2 s for the Device controller), or `--reconcile-interval` on the simulator.
 
 ## Scheduler
 
@@ -106,6 +107,10 @@ One loop in `src/controller/workload_controller.cpp` reconciles DaemonSets and J
 - Starts pods from the template until `completions`, defaulting to 1, reach `Succeeded`, running at most `parallelism`, defaulting to 1, active pods at a time, then sets the `Complete` condition.
 - Counts `Failed` pods against `backoffLimit`, which defaults to 6. When exceeded, the controller deletes active pods and sets the `Failed` condition with reason `BackoffLimitExceeded`.
 - Rejects Jobs whose pod template `restartPolicy` is not `Never` or `OnFailure`. Containers restarted in place under `OnFailure` do not count as pod failures.
+
+## Checkpoint controller
+
+The controller carries out `kube32.io/v1` Checkpoints, applies the migration policies of pods and keeps the retention of Checkpoints ([Pod migration](../migration.md)). It runs a pass after a Checkpoint changes, after a pod with a `kube32.io/migration`, `kube32.io/checkpoint-interval` or `kube32.io/restore-from` annotation changes, and after a Node changes a condition, `spec.unschedulable` or `kube32.io/interp-mops`. Move deadlines, checkpoint intervals, cooldowns and expiries are waits it sets. A pass takes at most one snapshot, because the kubelet call blocks it. It asks the scheduler for a move's target without binding anything, and the node lifecycle controller asks it for the latest periodic checkpoint of each pod it evicts.
 
 ## Endpoints and EndpointSlices
 

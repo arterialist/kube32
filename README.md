@@ -15,6 +15,7 @@ kube32 is a Kubernetes-compatible control plane and WebAssembly pod runtime for 
 - Persistent object store backed by a CRC-checked journal on a raw flash partition or the microSD card, plus `persistentVolumeClaim` pod volumes via `k32_fs_*` and rotated container logs for `kubectl logs --previous`.
 - Peripheral access gated per pod by a capability firewall covering GPIO pins, ADC channels, I2C and UART buses, ST7789 display, key matrix, I2S speaker, and microSD storage.
 - Devices: sensors and switches as API objects. Nodes find and identify I2C parts, also behind a PaHub multiplexer. The control plane runs each part's driver on the node that has the part. Apps on any node read the part through a Service, also from a laptop that runs `kube32-sim`.
+- Pod migration: a running pod moves to another node with its memory and clock, on `kube32-cli move`, `kubectl drain`, memory pressure or a faster node, and restores from a periodic checkpoint when its node is lost. See [docs/migration.md](docs/migration.md).
 - Container lifecycle management with `restartPolicy` set to `Always`, `OnFailure`, or `Never`, exponential CrashLoopBackOff, and distinct exit codes for Wasm traps, gas exhaustion, and `OOMKilled`.
 - Optional bearer-token authentication and automatic self-signed ECDSA P-256 TLS on port 6443.
 - Firmware rollouts through the cluster: one node at a time, SHA-256 checked, with bootloader rollback when an image does not come up healthy.
@@ -125,6 +126,7 @@ Full documentation is published at [https://arterialist.github.io/kube32/](https
 - [Storage and volumes](docs/storage.md)
 - [Peripherals](docs/peripherals.md)
 - [Devices](docs/devices.md)
+- [Pod migration](docs/migration.md)
 - [Benchmarks](docs/benchmarks.md)
 - [Example: Tessera](docs/examples/tessera.md)
 - [Architecture overview](docs/architecture/index.md)

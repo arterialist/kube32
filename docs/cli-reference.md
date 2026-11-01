@@ -5,7 +5,7 @@ Use `kubectl` and k9s to manage the cluster. Use the tools below to run the host
 | Tool | Purpose |
 | --- | --- |
 | `build/kube32-sim` | Run control-plane and worker nodes as host processes |
-| `tools/kube32-cli` | Build, check, deploy, embed, and push Wasm pods and node storage files |
+| `tools/kube32-cli` | Build, check, deploy, embed, and push Wasm pods and node storage files, checkpoint and move pods |
 | `scripts/flash.sh` | Build and flash firmware to an ESP32-S3 board |
 | `tools/kube32_serial_gateway.py` | Forward local HTTP ports to a board over USB serial |
 | `tools/tessera_loadtest.py` | Run concurrent HTTP load tests against a Tessera ingress |
@@ -79,6 +79,14 @@ Firmware commands (see [Firmware updates](firmware-updates.md)) reach the API se
 | `firmware info <firmware.bin>` | Print the version and SHA-256 of an image file. |
 | `devices` | List the Devices of a namespace (`-n`, default `default`, or `-A`) with the latest reading of each driver. The command reads it with `GET /` from the driver pod's node, at its pod IP and `http` port. Thus this machine must be able to reach the node. Flags: `--timeout <s>`, default `3`. |
 
+Pod migration commands (see [Pod migration](migration.md)) create and read Checkpoints through `kubectl --raw` (kubeconfig credentials apply) and accept `--context`, `--kubeconfig`, `--server`, and `--kubectl`:
+
+| Command | Description |
+| --- | --- |
+| `checkpoint <pod>` | Create a `Save` Checkpoint named `<pod>-<suffix>` and wait until it is `Saved` or `Failed`. Prints the size and the node. The pod keeps running. Flags: `-n <ns>`, default `default`, `-c <container>`, `--no-wait`, `--timeout <s>`, default `60`. |
+| `move <pod> [--to <node>]` | Create a `Move` Checkpoint and wait until it is `Completed` or `Failed`. Without `--to` the scheduler picks the node. Prints the move's message, or the reason and each blocker. Flags: `-n <ns>`, `-c <container>`, `--no-wait`, `--timeout <s>`, default `120`. |
+| `checkpoints` | List the Checkpoints of a namespace (`-n`, default `default`, or `-A`), oldest first: name, pod, action, phase, node, target, size, trigger and message. |
+
 Exit codes:
 
 | Code | Meaning |
@@ -90,6 +98,7 @@ Exit codes:
 | 4 | `kubectl` failed |
 | 5 | Pod already exists during `deploy` (pass `--replace`), or a firmware rollout is in progress during `firmware rollout` |
 | 6 | The firmware rollout failed or did not finish within `--timeout` |
+| 7 | A checkpoint or move failed or did not finish within `--timeout` |
 
 ## flash.sh
 
