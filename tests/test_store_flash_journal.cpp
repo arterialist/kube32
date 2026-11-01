@@ -664,6 +664,93 @@ static void test_unpersisted_write_keeps_key_in_journal() {
     std::cout << "[PASS] test_unpersisted_write_keeps_key_in_journal" << std::endl;
 }
 
+// Keys under /blobs/ (PersistClass::FlashOnly) leave RAM once the journal
+// holds them: reads come back from flash, survive a restart and reclamation,
+// and count against the journal's capacity like any object.
+static void test_flash_only_values_leave_ram() {
+    std::cout << "[RUN] test_flash_only_values_leave_ram" << std::endl;
+    RamFlashRegion flash(64 * 4096);
+    std::string blob(8192, '\0');
+    for (size_t i = 0; i < blob.size(); ++i) blob[i] = static_cast<char>(i * 31 + 7);
+    // Stored as given: a value with a metadata object gets no resourceVersion
+    const std::string text = std::string("{\"metadata\":{\"name\":\"opaque\"}}") + blob.substr(0, 100);
+    size_t live_before = 0;
+    {
+        StoreOptions o = log_options(flash);
+        o.flush_delay_ms = 3600 * 1000;   // nothing reaches flash before commit()
+        auto store = create_radix_store(o);
+        assert(store->recover().ok());
+        assert(persist_class("/blobs/abc/0") == PersistClass::FlashOnly);
+        assert(store->put_extended("/blobs/abc/0", blob, false, true).ok());
+        assert(store->put_extended("/blobs/abc/1", text, false, true).ok());
+        assert(store->put("/registry/pods/default/web", pod_json("web", "v1"), false).ok());
+        std::string got;
+        // Before the journal has it, the value is read from RAM
+        flash.set_read_error(true);
+        assert(store->get("/blobs/abc/0", got).ok() && got == blob);
+        flash.set_read_error(false);
+        assert(store->commit().ok());
+        // Then from flash: a read error shows it, and other keys stay in RAM
+        flash.set_read_error(true);
+        assert(store->get("/blobs/abc/0", got).code == StatusCode::InternalError);
+        assert(store->get("/registry/pods/default/web", got).ok());
+        flash.set_read_error(false);
+        assert(store->get("/blobs/abc/0", got).ok() && got == blob);
+        assert(store->get("/blobs/abc/1", got).ok() && got == text);
+        std::vector<std::string> values, keys;
+        store->list_extended("/blobs/", values, &keys);
+        assert(keys.size() == 2 && values[0].empty() && values[1].empty());
+        PersistenceStats ps;
+        assert(store->persistence_stats(ps));
+        live_before = ps.live_bytes;
+        // A removed value leaves the journal; one written again is in RAM until committed
+        assert(store->remove("/blobs/abc/1").ok());
+        assert(store->put_extended("/blobs/abc/0", blob + "x", true, true).ok());
+        flash.set_read_error(true);
+        assert(store->get("/blobs/abc/0", got).ok() && got == blob + "x");
+        flash.set_read_error(false);
+        assert(store->commit().ok());
+        assert(store->get("/blobs/abc/1", got).code == StatusCode::NotFound);
+    }
+    {
+        // Recovered from flash without reading the values into RAM
+        auto store = create_radix_store(log_options(flash));
+        assert(store->recover().ok());
+        std::string got;
+        assert(store->get("/blobs/abc/0", got).ok() && got == blob + "x");
+        assert(store->get("/blobs/abc/1", got).code == StatusCode::NotFound);
+        flash.set_read_error(true);
+        assert(store->get("/blobs/abc/0", got).code == StatusCode::InternalError);
+        flash.set_read_error(false);
+        // Reclamation moves the records; they stay readable
+        for (int i = 0; i < 400; ++i) {
+            assert(store->put("/registry/configmaps/default/churn", pod_json("churn", std::string(900, 'c') + std::to_string(i)), true).ok());
+            assert(store->flush(false).ok());
+        }
+        PersistenceStats ps;
+        assert(store->persistence_stats(ps));
+        assert(ps.records_moved > 0 && ps.live_bytes < live_before + 4096);
+        assert(store->get("/blobs/abc/0", got).ok() && got == blob + "x");
+        // Removing it frees its journal bytes
+        assert(store->remove("/blobs/abc/0").ok());
+        assert(store->flush(true).ok());
+        PersistenceStats after;
+        assert(store->persistence_stats(after));
+        assert(after.live_bytes + 8192 < ps.live_bytes);
+    }
+    // Without a journal the value stays in RAM
+    {
+        StoreOptions o;
+        o.enable_flash_persistence = false;
+        auto store = create_radix_store(o);
+        assert(store->put_extended("/blobs/x/0", blob, false, true).ok());
+        assert(store->commit().ok());
+        std::string got;
+        assert(store->get("/blobs/x/0", got).ok() && got == blob);
+    }
+    std::cout << "[PASS] test_flash_only_values_leave_ram" << std::endl;
+}
+
 // A write or delete that runs out of memory leaves the store as it was: no
 // change without its flush and its watch event
 static void test_out_of_memory_writes_change_nothing() {
@@ -708,6 +795,7 @@ static void test_out_of_memory_writes_change_nothing() {
 }
 
 int main() {
+    test_flash_only_values_leave_ram();
     test_out_of_memory_writes_change_nothing();
     test_store_survives_restart();
     test_writes_coalesce_and_unchanged_values_skip();

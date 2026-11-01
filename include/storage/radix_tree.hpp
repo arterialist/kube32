@@ -14,6 +14,7 @@ struct RadixNode {
     uint64_t resource_version{0};
     bool is_leaf{false};
     bool is_ephemeral{false};
+    bool on_flash{false};   // the value was released: only the flash journal holds it
     std::vector<std::unique_ptr<RadixNode>> children;
 
     explicit RadixNode(std::string p = "") : prefix(std::move(p)) {}
@@ -35,10 +36,13 @@ public:
     bool put(const std::string& key, std::string value, uint64_t version,
              bool ephemeral, bool overwrite, bool* out_is_new = nullptr);
     bool get(const std::string& key, std::string& out_value, 
-             uint64_t* out_version = nullptr, bool* out_is_ephemeral = nullptr) const;
+             uint64_t* out_version = nullptr, bool* out_is_ephemeral = nullptr, bool* out_on_flash = nullptr) const;
     // What get() would report, without copying the value
     bool stat(const std::string& key, size_t* out_value_bytes, uint64_t* out_version = nullptr,
-              bool* out_is_ephemeral = nullptr) const;
+              bool* out_is_ephemeral = nullptr, bool* out_on_flash = nullptr) const;
+    // Frees the value of `key` if it is still at `version` and marks it
+    // on_flash. False when the key moved on or is gone.
+    bool release_value(const std::string& key, uint64_t version);
     bool remove(const std::string& key, std::string* out_deleted_value = nullptr, 
                 uint64_t* out_deleted_version = nullptr);
     void list(const std::string& prefix, std::vector<std::string>& out_values, 

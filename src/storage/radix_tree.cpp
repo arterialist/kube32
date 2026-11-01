@@ -32,6 +32,7 @@ bool RadixTree::insert_recursive(RadixNode* current, const std::string& key,
         node.value = std::move(value);
         node.resource_version = version;
         node.is_ephemeral = ephemeral;
+        node.on_flash = false;
     };
     for (auto& child : current->children) {
         if (child->prefix.empty()) continue;
@@ -64,10 +65,12 @@ bool RadixTree::insert_recursive(RadixNode* current, const std::string& key,
                 split_node->resource_version = child->resource_version;
                 split_node->is_leaf = child->is_leaf;
                 split_node->is_ephemeral = child->is_ephemeral;
+                split_node->on_flash = child->on_flash;
                 split_node->children = std::move(child->children);
 
                 child->prefix = std::move(head);
                 child->is_leaf = false;
+                child->on_flash = false;
                 child->value.clear();
                 kids.push_back(std::move(split_node));
                 if (out_is_new) *out_is_new = true;
@@ -110,24 +113,34 @@ const RadixNode* RadixTree::find_node(const RadixNode* current, const std::strin
 }
 
 bool RadixTree::get(const std::string& key, std::string& out_value, 
-                    uint64_t* out_version, bool* out_is_ephemeral) const {
+                    uint64_t* out_version, bool* out_is_ephemeral, bool* out_on_flash) const {
     const RadixNode* node = find_node(root_.get(), key);
     if (node && node->is_leaf) {
         out_value = node->value;
         if (out_version) *out_version = node->resource_version;
         if (out_is_ephemeral) *out_is_ephemeral = node->is_ephemeral;
+        if (out_on_flash) *out_on_flash = node->on_flash;
         return true;
     }
     return false;
 }
 
 bool RadixTree::stat(const std::string& key, size_t* out_value_bytes, uint64_t* out_version,
-                     bool* out_is_ephemeral) const {
+                     bool* out_is_ephemeral, bool* out_on_flash) const {
     const RadixNode* node = find_node(root_.get(), key);
     if (!node || !node->is_leaf) return false;
     if (out_value_bytes) *out_value_bytes = node->value.size();
     if (out_version) *out_version = node->resource_version;
     if (out_is_ephemeral) *out_is_ephemeral = node->is_ephemeral;
+    if (out_on_flash) *out_on_flash = node->on_flash;
+    return true;
+}
+
+bool RadixTree::release_value(const std::string& key, uint64_t version) {
+    RadixNode* node = const_cast<RadixNode*>(find_node(root_.get(), key));
+    if (!node || !node->is_leaf || node->resource_version != version) return false;
+    std::string().swap(node->value);
+    node->on_flash = true;
     return true;
 }
 
@@ -217,6 +230,7 @@ bool RadixTree::remove_recursive(RadixNode* current, const std::string& key,
                     if (out_val) *out_val = std::move(child->value);
                     if (out_ver) *out_ver = child->resource_version;
                     child->is_leaf = false;
+                    child->on_flash = false;
                     child->value.clear();
 
                     if (child->children.empty()) {
@@ -260,6 +274,7 @@ void RadixTree::merge_node_with_child(RadixNode* node, size_t child_idx) {
     node->resource_version = child->resource_version;
     node->is_leaf = child->is_leaf;
     node->is_ephemeral = child->is_ephemeral;
+    node->on_flash = child->on_flash;
     node->children = std::move(child->children);
 }
 
