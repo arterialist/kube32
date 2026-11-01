@@ -58,6 +58,7 @@
 
 #include "api/event_recorder.hpp"
 #include "controller/reconcile_trigger.hpp"
+#include "mem/function_ref.hpp"
 #include "osal/thread.hpp"
 #include "scheduler/scheduler.hpp"
 #include "storage/store.hpp"
@@ -65,9 +66,11 @@
 #include <atomic>
 #include <cstdint>
 #include <functional>
+#include <initializer_list>
 #include <map>
 #include <memory>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace kube32::controller {
@@ -112,22 +115,33 @@ private:
     struct Snapshot;
 
     std::vector<Node> load_nodes();
+    static const Node* node(const std::vector<Node>& nodes, const std::string& name);
+    // A checkpoint of pod `ns/pod` under way (`started_only`: Saving or Moving)
+    static bool busy(const std::vector<Ckpt>& cks, const std::string& ns, const std::string& pod, bool started_only);
+    static std::string container_of(const Ckpt& ck, const models::JsonValue& pod);
     void begin(Ckpt& ck, Pods& pods, const std::vector<Node>& nodes, uint64_t now);
     void watch_move(Ckpt& ck, Pods& pods, const std::vector<Node>& nodes, uint64_t now);
     void fail(Ckpt& ck, const std::string& message, const std::vector<std::string>& blockers = {});
+    // fail(), and for a move the eviction API asked for, the eviction
+    void give_up(Ckpt& ck, const std::string& message, const std::vector<std::string>& blockers = {});
     void finish_restores(Pods& pods, const std::vector<Ckpt>& cks);
     void policies(Pods& pods, const std::vector<Node>& nodes, const std::vector<Ckpt>& cks, uint64_t now);
     void retention(Pods& pods, const std::vector<Ckpt>& cks, uint64_t now);
     std::string pick_target(const Ckpt& ck, const models::JsonValue& pod, const std::vector<Node>& nodes, std::string& why);
-    Snapshot take_snapshot(const Node& node, const Ckpt& ck, const std::string& pod, const std::string& container, bool frozen);
+    // The pod's state from its kubelet into the checkpoint's data: POST
+    // /checkpoint on the node, its answer streamed on to PUT .../data on the
+    // API server. The one place the bytes pass through.
+    Snapshot take_snapshot(const Node& node, const Ckpt& ck, const std::string& container, bool frozen);
     bool thaw(const Node* node, const std::string& ns, const std::string& pod, const std::string& container);
+    bool edit(const std::string& key, mem::FunctionRef<bool(models::JsonValue&)> change);
     // Replaces the pod at `key` (uid `uid`): a new uid, bound to `node` (or
     // unbound), restored from checkpoint `restore_from`
     bool rebind(const std::string& key, const std::string& node, const std::string& restore_from, const std::string& uid, std::string* new_uid);
     bool strip_restore(const std::string& key);
-    bool update_status(const std::string& key, const models::JsonValue& fields);
-    void create(const std::string& ns, const std::string& pod, const std::string& action, const std::string& target,
-                const std::string& trigger);
+    // Sets the non-empty strings, the numbers and the blockers in the status
+    bool update_status(const std::string& key, std::initializer_list<std::pair<const char*, std::string_view>> strs,
+                       std::initializer_list<std::pair<const char*, double>> nums = {}, const std::vector<std::string>* blockers = nullptr);
+    void create(const std::string& ns, const std::string& pod, const char* action, const std::string& target, const char* trigger);
     void pod_event(const std::string& ns, const std::string& name, const std::string& uid, const char* reason, const std::string& message,
                    bool warning);
     uint64_t wall_ms() const;

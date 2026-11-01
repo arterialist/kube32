@@ -6,6 +6,7 @@
 #include <memory>
 #include <cstdint>
 #include <string_view>
+#include <initializer_list>
 
 namespace kube32::models {
 
@@ -151,6 +152,9 @@ uint64_t age_seconds_since(std::string_view rfc3339_timestamp);
 constexpr uint64_t AGE_UNKNOWN = ~0ULL;
 // RFC 4122 v4 layout from platform entropy; identifiers for metadata.uid.
 std::string generate_uid();
+// The parts joined in one allocation: one call where operator+ chains
+// expand at every site
+std::string str_cat(std::initializer_list<std::string_view> parts);
 
 // True when metadata.ownerReferences names an owner of `kind` (and, when
 // `uid` is given, that owner).

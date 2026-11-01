@@ -7,8 +7,6 @@ namespace kube32::models {
 
 namespace {
 
-JsonValue jstr(const std::string& v) { return JsonValue{JsonType::String, false, 0, v, {}, {}}; }
-
 std::string annotation(const JsonValue& obj, const char* key) {
     const JsonValue* meta = obj.get("metadata");
     const JsonValue* ann = meta ? meta->get("annotations") : nullptr;
@@ -84,40 +82,13 @@ uint64_t parse_duration_ms(const std::string& text) {
 
 std::string checkpoint_json(const std::string& ns, const std::string& name, const std::string& pod, const std::string& action,
                             const std::string& target_node, const std::string& trigger) {
-    JsonValue meta;
-    meta.type = JsonType::Object;
-    meta.set("name", jstr(name));
-    meta.set("namespace", jstr(ns));
-    meta.set("uid", jstr(generate_uid()));
+    // Names are DNS labels: nothing in them needs escaping
     const std::string now = now_rfc3339();
-    if (!now.empty()) meta.set("creationTimestamp", jstr(now));
-    if (!trigger.empty()) {
-        JsonValue labels;
-        labels.type = JsonType::Object;
-        labels.set(kLabelTrigger, jstr(trigger));
-        meta.set("labels", std::move(labels));
-    }
-    JsonValue spec;
-    spec.type = JsonType::Object;
-    spec.set("podName", jstr(pod));
-    spec.set("action", jstr(action));
-    if (!target_node.empty()) {
-        JsonValue target;
-        target.type = JsonType::Object;
-        target.set("nodeName", jstr(target_node));
-        spec.set("target", std::move(target));
-    }
-    JsonValue status;
-    status.type = JsonType::Object;
-    status.set("phase", jstr("Pending"));
-    JsonValue doc;
-    doc.type = JsonType::Object;
-    doc.set("apiVersion", jstr("kube32.io/v1"));
-    doc.set("kind", jstr("Checkpoint"));
-    doc.set("metadata", std::move(meta));
-    doc.set("spec", std::move(spec));
-    doc.set("status", std::move(status));
-    return doc.to_string();
+    return str_cat({R"({"apiVersion":"kube32.io/v1","kind":"Checkpoint","metadata":{"name":")", name, R"(","namespace":")", ns, R"(","uid":")",
+                    generate_uid(), "\"", now.empty() ? "" : R"(,"creationTimestamp":")", now, now.empty() ? "" : "\"",
+                    trigger.empty() ? "" : R"(,"labels":{"kube32.io/trigger":")", trigger, trigger.empty() ? "" : "\"}",
+                    R"(},"spec":{"podName":")", pod, R"(","action":")", action, "\"", target_node.empty() ? "" : R"(,"target":{"nodeName":")",
+                    target_node, target_node.empty() ? "" : "\"}", R"(},"status":{"phase":"Pending"}})"});
 }
 
 } // namespace kube32::models

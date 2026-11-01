@@ -1102,7 +1102,7 @@ HttpResponse RouteHandler::dispatch(const HttpRequest& req, const RouteMatch& ma
             return handle_pod_log(req, match, client_sock);
 
         case RouteCategory::PodEviction:
-            return handle_pod_eviction(req, match, arena);
+            return handle_pod_eviction(req, match);
 
         case RouteCategory::MetricsNodes:
         case RouteCategory::MetricsNodeItem:
@@ -1875,9 +1875,6 @@ HttpResponse RouteHandler::handle_pods(const HttpRequest& req, const RouteMatch&
         }
         return resp;
     } else if (req.method == HttpMethod::Delete) {
-        // Graceful deletion, as kube-apiserver does it: a pod bound to a node
-        // gets metadata.deletionTimestamp and the kubelet finalizes it once the
-        // container has stopped (grace period 0 or an unbound pod: removed now).
         uint64_t grace = 30;
         bool has_grace = query_uint(req.query_string, "gracePeriodSeconds", grace);
         if (!has_grace && !req.body.empty()) {
@@ -1888,47 +1885,55 @@ HttpResponse RouteHandler::handle_pods(const HttpRequest& req, const RouteMatch&
                 has_grace = true;
             }
         }
-        const std::string now = models::now_rfc3339();
-        for (int attempt = 0;; ++attempt) {
-            models::JsonValue pdoc;
-            std::string perr;
-            std::string node_name;
-            bool terminating = false;
-            if (models::parse_json(existing_json, pdoc, perr) && pdoc.is_object()) {
-                const models::JsonValue* spec = pdoc.get("spec");
-                node_name = spec ? spec->get_string("nodeName", "") : "";
-                const models::JsonValue* meta = pdoc.get("metadata");
-                terminating = meta && !meta->get_string("deletionTimestamp", "").empty();
-            }
-            if (grace == 0 || node_name.empty() || node_name == "<none>" || terminating || now.empty()) break;
-            models::JsonValue* meta = pdoc.get_mut("metadata");
-            meta->set("deletionTimestamp", jstr(now));
-            meta->set("deletionGracePeriodSeconds", jnum(static_cast<double>(grace)));
-            std::string updated = pdoc.to_string();
-            storage::Status ps = put_if_unchanged(store_, key, updated, existing_version);
-            if (retry_update(ps, attempt)) {
-                // Written meanwhile (a status update): mark the newer pod
-                if (!store_.get_extended(key, existing_json, &existing_version).ok()) {
-                    return make_status(404, "NotFound", "pods \"" + name + "\" not found", name, "pods");
-                }
-                continue;
-            }
-            if (!ps.ok()) return store_failure(ps, "pods", name);
-            HttpResponse resp;
-            resp.status_code = 200;
-            resp.content_type = "application/json";
-            resp.body = std::move(updated);
-            return resp;
-        }
-        store_.remove(key);
-        if (!dry_run()) metrics_.forget_pod(ns, name);
-        // The log mirror stays readable for followers draining the last lines;
-        // the store evicts it by LRU. Its files go with the pod.
-        if (!dry_run()) runtime::PodLogStore::apiserver().remove_persisted(ns + "/" + name);
-        return make_status(200, "Success", "pods \"" + name + "\" deleted");
+        return delete_pod(ns, name, key, std::move(existing_json), existing_version, grace);
     }
 
     return make_status(405, "MethodNotAllowed", std::string(http_method_str(req.method)) + " not allowed on " + req.path);
+}
+
+// Graceful deletion, as kube-apiserver does it: a pod bound to a node gets
+// metadata.deletionTimestamp and the kubelet finalizes it once the container
+// has stopped (grace period 0 or an unbound pod: removed now)
+HttpResponse RouteHandler::delete_pod(const std::string& ns, const std::string& name, const std::string& key, std::string existing_json,
+                                      uint64_t existing_version, uint64_t grace) {
+    const std::string now = models::now_rfc3339();
+    for (int attempt = 0;; ++attempt) {
+        models::JsonValue pdoc;
+        std::string perr;
+        std::string node_name;
+        bool terminating = false;
+        if (models::parse_json(existing_json, pdoc, perr) && pdoc.is_object()) {
+            const models::JsonValue* spec = pdoc.get("spec");
+            node_name = spec ? spec->get_string("nodeName", "") : "";
+            const models::JsonValue* meta = pdoc.get("metadata");
+            terminating = meta && !meta->get_string("deletionTimestamp", "").empty();
+        }
+        if (grace == 0 || node_name.empty() || node_name == "<none>" || terminating || now.empty()) break;
+        models::JsonValue* meta = pdoc.get_mut("metadata");
+        meta->set("deletionTimestamp", jstr(now));
+        meta->set("deletionGracePeriodSeconds", jnum(static_cast<double>(grace)));
+        std::string updated = pdoc.to_string();
+        storage::Status ps = put_if_unchanged(store_, key, updated, existing_version);
+        if (retry_update(ps, attempt)) {
+            // Written meanwhile (a status update): mark the newer pod
+            if (!store_.get_extended(key, existing_json, &existing_version).ok()) {
+                return make_status(404, "NotFound", "pods \"" + name + "\" not found", name, "pods");
+            }
+            continue;
+        }
+        if (!ps.ok()) return store_failure(ps, "pods", name);
+        HttpResponse resp;
+        resp.status_code = 200;
+        resp.content_type = "application/json";
+        resp.body = std::move(updated);
+        return resp;
+    }
+    store_.remove(key);
+    if (!dry_run()) metrics_.forget_pod(ns, name);
+    // The log mirror stays readable for followers draining the last lines;
+    // the store evicts it by LRU. Its files go with the pod.
+    if (!dry_run()) runtime::PodLogStore::apiserver().remove_persisted(ns + "/" + name);
+    return make_status(200, "Success", "pods \"" + name + "\" deleted");
 }
 
 HttpResponse RouteHandler::handle_deployments(const HttpRequest& req, const RouteMatch& match, mem::MonotonicArena& arena, osal::Socket* client_sock) {
@@ -3422,61 +3427,40 @@ void build_service_endpoints(const models::JsonValue& svc, const std::vector<End
 // (docs/migration.md): the Checkpoint controller takes it to another node,
 // where it has a new uid, which is what kubectl drain waits for. Any other
 // pod is deleted as DELETE deletes it, with the Eviction's grace period.
-HttpResponse RouteHandler::handle_pod_eviction(const HttpRequest& req, const RouteMatch& match, mem::MonotonicArena& arena) {
-    if (req.method != HttpMethod::Post) {
-        return make_status(405, "MethodNotAllowed", std::string(http_method_str(req.method)) + " not allowed on " + req.path);
-    }
+HttpResponse RouteHandler::handle_pod_eviction(const HttpRequest& req, const RouteMatch& match) {
     const std::string ns = match.namespace_name.empty() ? "default" : std::string(match.namespace_name);
     const std::string name(match.resource_name);
-    std::string json;
-    if (!store_.get("/registry/pods/" + ns + "/" + name, json).ok()) {
-        return make_status(404, "NotFound", "pods \"" + name + "\" not found", name, "pods");
+    const std::string key = models::str_cat({"/registry/pods/", ns, "/", name});
+    std::string json, err;
+    uint64_t version = 0;
+    if (req.method != HttpMethod::Post) return make_status(405, "MethodNotAllowed", "only POST creates an Eviction");
+    if (!store_.get_extended(key, json, &version).ok()) {
+        return make_status(404, "NotFound", models::str_cat({"pods \"", name, "\" not found"}), name, "pods");
     }
     models::JsonValue pod;
-    std::string err;
     models::parse_json(json, pod, err);
-    const models::JsonValue* spec = pod.get("spec");
     const models::JsonValue* meta = pod.get("metadata");
     const models::JsonValue* st = pod.get("status");
-    const bool running = spec && meta && st && !spec->get_string("nodeName", "").empty() && st->get_string("phase", "") == "Running" &&
-                         meta->get_string("deletionTimestamp", "").empty();
-    if (running && models::migration_blockers(pod).empty()) {
-        // A pod with a move under way is being evicted already
-        const std::string prefix = std::string(models::kCheckpointPrefix) + ns + "/";
-        std::vector<std::string> checkpoints;
-        store_.list(prefix, checkpoints);
-        bool moving = false;
-        for (const auto& c : checkpoints) {
-            models::JsonValue ck;
-            if (!models::parse_json(c, ck, err)) continue;
-            const models::JsonValue* cs = ck.get("spec");
-            const models::JsonValue* cst = ck.get("status");
-            const std::string phase = cst ? cst->get_string("phase", "") : "";
-            moving |= cs && cs->get_string("podName", "") == name && cs->get_string("action", "") == "Move" &&
-                      (phase.empty() || phase == "Pending" || phase == "Saving" || phase == "Moving");
+    const models::JsonValue* spec = pod.get("spec");
+    if (meta && st && spec && !spec->get_string("nodeName", "").empty() && st->get_string("phase", "") == "Running" &&
+        meta->get_string("deletionTimestamp", "").empty() && models::migration_blockers(pod).empty()) {
+        // One Move per pod object, named after its uid: evicting it again finds the Move
+        std::string id;
+        for (char c : meta->get_string("uid", "")) {
+            if (std::isalnum(static_cast<unsigned char>(c)) && id.size() < 5) id += static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
         }
-        const std::string ck = name + "-" + models::generate_uid().substr(0, 5);
-        if (!moving && !dry_run()) {
-            storage::Status ps = store_.put(prefix + ck, models::checkpoint_json(ns, ck, name, "Move", "", "eviction"), false);
-            if (!ps.ok()) return store_failure(ps, "checkpoints", ck);
-        }
-        return make_status(201, "", "pods \"" + name + "\" moving to another node");
+        const std::string ck = models::str_cat({name, "-", id});
+        const storage::Status ps = dry_run() ? storage::Status::Ok()
+            : store_.put(models::str_cat({models::kCheckpointPrefix, ns, "/", ck}), models::checkpoint_json(ns, ck, name, "Move", "", "eviction"), false);
+        if (!ps.ok() && ps.code != storage::StatusCode::AlreadyExists) return store_failure(ps, "checkpoints", ck);
+        return make_status(201, "", models::str_cat({"pods \"", name, "\" moves to another node"}));
     }
-    HttpRequest del = req;
-    del.method = HttpMethod::Delete;
-    del.body.clear();
-    del.query_string.clear();
     models::JsonValue eviction;
-    if (!req.body.empty() && req.content_type.rfind("application/json", 0) == 0 && models::parse_json(req.body, eviction, err)) {
-        const models::JsonValue* opts = eviction.get("deleteOptions");
-        if (opts && opts->get("gracePeriodSeconds")) del.query_string = "gracePeriodSeconds=" + std::to_string(opts->get_int("gracePeriodSeconds", 30));
-    }
-    RouteMatch item = match;
-    item.category = RouteCategory::PodItem;
-    item.subresource = "";
-    HttpResponse resp = handle_pods(del, item, arena, nullptr);
-    if (resp.status_code != 200) return resp;
-    return make_status(201, "", "pods \"" + name + "\" evicted");
+    const models::JsonValue* opts = req.content_type.rfind("application/json", 0) == 0 && models::parse_json(req.body, eviction, err)
+                                        ? eviction.get("deleteOptions") : nullptr;
+    const uint64_t grace = opts && opts->get("gracePeriodSeconds") ? static_cast<uint64_t>(opts->get_int("gracePeriodSeconds", 30)) : 30;
+    HttpResponse resp = delete_pod(ns, name, key, std::move(json), version, grace);
+    return resp.status_code == 200 ? make_status(201, "", models::str_cat({"pods \"", name, "\" evicted"})) : resp;
 }
 
 HttpResponse RouteHandler::handle_endpoints(const HttpRequest& req, const RouteMatch& match) {

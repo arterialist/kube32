@@ -1240,6 +1240,15 @@ uint64_t age_seconds_since(std::string_view ts) {
     return now >= created ? (now - created) / 1000ULL : 0;
 }
 
+std::string str_cat(std::initializer_list<std::string_view> parts) {
+    size_t n = 0;
+    for (const auto& p : parts) n += p.size();
+    std::string out;
+    out.reserve(n);
+    for (const auto& p : parts) out.append(p.data(), p.size());
+    return out;
+}
+
 std::string generate_uid() {
     uint32_t words[4];
 #if defined(ESP_PLATFORM)
