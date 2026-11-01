@@ -60,6 +60,8 @@ Discovery endpoints accept `GET` and `HEAD`.
 
 `POST /apis/kube32.io/v1/egress` is the egress gateway: it makes the `https://` calls of pods on workers, for nodes only. See [Networking](networking.md#egress-gateway).
 
+`GET /apis/kube32.io/v1/images/<sha256>` returns a module that a Pod or pod template carried inline (`application/wasm`, with `Content-Length`). A Pod, Deployment, DaemonSet or Job written with the annotation `kube32.io/wasm-base64` is stored with `kube32.io/wasm-sha256` and `kube32.io/wasm-size` in its place, and the module is stored under the digest. See [Writing app pods](app-development.md#inline-image-kube32-cli-deploy).
+
 ## kubectl and k9s
 
 `kubectl` and `k9s` work without extra flags. Supported commands include `get`, `describe`, `apply`, `create`, `delete`, `patch`, `scale`, `logs`, `top`, `events` and `auth can-i`.
@@ -89,7 +91,7 @@ Write requests honour `dryRun=All` in the query string or in a `DeleteOptions` r
 | --- | --- |
 | Concurrent streams | 8 on a board with PSRAM, 4 without, 16 on the simulator; `429 TooManyRequests` past the limit |
 | Queue per stream | 16 events; overflow sends `410 Expired` and closes the stream |
-| Replay ring for `resourceVersion=N` | 32 events; older versions get `410 Expired` |
+| Replay ring for `resourceVersion=N` | 32 events, at most 64 KiB of objects; older versions get `410 Expired` |
 | Bookmarks | every 30 s with `allowWatchBookmarks=true` |
 | `sendInitialEvents=true` | initial `ADDED` events followed by a `BOOKMARK` annotated `k8s.io/initial-events-end` |
 | Stream lifetime | 1800 s, or `timeoutSeconds` |
