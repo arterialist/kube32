@@ -209,7 +209,8 @@ std::string_view header_value(std::string_view head, std::string_view name) {
 // stack and the body reaches `on_data` as it arrives: an exchange takes
 // nothing from the heap (lwIP's own buffers aside).
 int HttpKubeClient::stream_request(const char* method, std::string_view path, std::string_view body,
-                                   mem::FunctionRef<bool(const char*, size_t)> on_data, long* out_content_length) {
+                                   mem::FunctionRef<bool(const char*, size_t)> on_data, long* out_content_length,
+                                   mem::FunctionRef<bool(int, std::string_view)>* on_head) {
     if (out_content_length) *out_content_length = -1;
     if (path.empty()) return 0;
     char buf[1024];
@@ -223,7 +224,7 @@ int HttpKubeClient::stream_request(const char* method, std::string_view path, st
 
     osal::Socket sock;
     if (!sock.create(osal::SocketType::Tcp)) return 0;
-    sock.set_timeout(3000, 3000);
+    sock.set_timeout(timeout_ms_, timeout_ms_);
     // Head and body leave as two writes; without Nagle the body does not
     // wait for the server to acknowledge the head
     sock.set_tcp_nodelay(true);
@@ -284,6 +285,7 @@ int HttpKubeClient::stream_request(const char* method, std::string_view path, st
         status = std::atoi(buf + sp + 1);
         if (status <= 0) return 0;
         chunked = is_chunked_transfer_encoding(head.substr(0, end));
+        if (on_head && !(*on_head)(status, head.substr(0, end))) return status;
         if (out_content_length) {
             const std::string_view cl = header_value(head.substr(0, end + 2), "content-length");
             if (!cl.empty()) *out_content_length = std::strtol(cl.data(), nullptr, 10);   // ends at the "\r"

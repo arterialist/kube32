@@ -121,6 +121,17 @@ public:
     // Largest response body get() and the status calls keep (0: no limit); a
     // larger one fails (status 0) instead of exhausting a small heap.
     void set_max_body(size_t bytes) { max_body_ = bytes; }
+    // How long a connect, a send or a wait for the answer may take (default 3 s)
+    void set_timeout_ms(uint32_t ms) { timeout_ms_ = ms; }
+    // One request of any method: the response head (status line and
+    // headers) reaches `on_head` with the status, then the body reaches
+    // `on_data` as it arrives; false from either ends the exchange. Returns
+    // the status, 0 when the server could not be reached or the response was
+    // malformed.
+    int request(const char* method, std::string_view path, std::string_view body,
+                mem::FunctionRef<bool(int, std::string_view)> on_head, mem::FunctionRef<bool(const char*, size_t)> on_data) {
+        return stream_request(method, path, body, on_data, nullptr, &on_head);
+    }
 
 
     // Helper functions for HTTP response chunk decoding
@@ -141,13 +152,15 @@ private:
     // from it ends the exchange). Returns the status, 0 when the server could
     // not be reached or the response was malformed.
     int stream_request(const char* method, std::string_view path, std::string_view body,
-                       mem::FunctionRef<bool(const char*, size_t)> on_data, long* out_content_length = nullptr);
+                       mem::FunctionRef<bool(const char*, size_t)> on_data, long* out_content_length = nullptr,
+                       mem::FunctionRef<bool(int, std::string_view)>* on_head = nullptr);
 
     std::string host_;
     uint16_t port_;
     std::string node_filter_;
     std::string token_;
     size_t max_body_{0};
+    uint32_t timeout_ms_{3000};
 };
 
 } // namespace kube32::kubelet
