@@ -59,10 +59,12 @@ typedef m3ret_t(vectorcall* IM3Operation)(d_m3OpSig);
 #  define d_m3Op(NAME)              M3_NO_UBSAN d_m3RetSig op_##NAME (d_m3OpSig)
 
 extern u32 m3_opFrames, m3_opFramesPeak;
+extern u64 m3_opCount;     // operations dispatched since start
 
 // One operation frame more on the native stack while the operation runs
 d_m3RetSig CountedOp (IM3Operation i_operation, d_m3OpSig)
 {
+    ++m3_opCount;
     if (++m3_opFrames > m3_opFramesPeak) m3_opFramesPeak = m3_opFrames;
     m3ret_t r = i_operation (_pc, d_m3OpArgs);
     --m3_opFrames;

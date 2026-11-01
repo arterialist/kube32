@@ -24,7 +24,14 @@ $(OUT): build/bench.o build/bench_kernels.o
 	$(RUST_LLD) $(LDFLAGS) -o $@ build/bench.o build/bench_kernels.o
 	@ls -la $@
 
+# The kernels alone, for tools/bench_ops.cpp (build/bench_ops counts the
+# wasm3 operations each kernel executes)
+ops: build/ops.wasm
+
+build/ops.wasm: build/ops.o build/bench_kernels.o
+	$(RUST_LLD) -flavor wasm --no-entry --stack-first -z stack-size=4096 --initial-memory=65536 --max-memory=65536 -o $@ build/ops.o build/bench_kernels.o
+
 clean:
 	rm -rf build $(OUT)
 
-.PHONY: all clean
+.PHONY: all ops clean

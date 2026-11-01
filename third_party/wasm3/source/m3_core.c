@@ -422,6 +422,7 @@ void* m3_NativeStackLimit (void* i_stackPtr, size_t i_budget)
 
 #if d_m3CountOpFrames
 u32 m3_opFrames, m3_opFramesPeak;
+u64 m3_opCount;
 #endif
 
 #if d_m3LogNativeStack
