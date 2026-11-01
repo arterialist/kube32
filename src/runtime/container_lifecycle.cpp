@@ -11,6 +11,7 @@
 #include "runtime/pod_fs.hpp"
 #include "osal/system.hpp"
 #include "osal/socket.hpp"
+#include "osal/sha256.hpp"
 
 #include "wasm3.h"
 #include "m3_config.h"
@@ -18,6 +19,7 @@
 #include "m3_host.h"
 
 #include <iostream>
+#include <cstring>
 #include <algorithm>
 #include <mutex>
 #if defined(ESP_PLATFORM)
@@ -347,6 +349,7 @@ bool ContainerLifecycleController::deploy(const uint8_t* wasm_bytes, size_t len)
     }
 
     m3_module_ = module;
+    image_sha_known_ = false;
 
     // Link standard Kube32 host functions and the application ABI imports
     link_host_functions(module, config_.pod_id);
@@ -786,6 +789,16 @@ int32_t ContainerLifecycleController::call_function(const std::string& fn_name, 
         return ret_val;
     }
     return 0;
+}
+
+void ContainerLifecycleController::image_sha256(uint8_t out[32]) {
+    osal::LockGuard guard(mutex_);
+    if (!image_sha_known_) {
+        const osal::Sha256::Digest d = osal::Sha256::of(wasm_view_, wasm_view_len_);
+        std::memcpy(image_sha_, d.data(), 32);
+        image_sha_known_ = true;
+    }
+    std::memcpy(out, image_sha_, 32);
 }
 
 bool ContainerLifecycleController::has_export(const char* fn_name) const {

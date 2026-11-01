@@ -5,6 +5,7 @@
 #include "runtime/container_lifecycle.hpp"
 #include "runtime/app_pod.hpp"
 #include "runtime/pod_fs.hpp"
+#include "ipc/channel.hpp"
 #include "runtime/k32_app_abi.h"
 #include "runtime/pod_memory_pool.h"
 #include "osal/mutex.hpp"
@@ -15,6 +16,7 @@
 #include "m3_function.h"
 
 #include <algorithm>
+#include <cstring>
 #include <iostream>
 #include <map>
 #include <vector>
@@ -91,6 +93,7 @@ bool WasmRuntime::deploy_impl(const std::string& pod_id, const uint8_t* wasm_byt
 
     // k32_env_get reads the pod's environment from here, its only copy
     AppPodHost::instance().set_env(pod_id, spec.env);
+    AppPodHost::instance().set_migration_info(pod_id, spec);
     AppPodHost::instance().set_event_topics(pod_id, spec.event_topics);
     AppPodHost::instance().set_tick_interval(pod_id, spec.tick_interval_ms);
     AppPodHost::instance().set_assets(pod_id, AppAssetSource{spec.asset_bundle, spec.asset_directory});
@@ -114,8 +117,13 @@ bool WasmRuntime::deploy_impl(const std::string& pod_id, const uint8_t* wasm_byt
     impl_->containers[pod_id] = std::move(controller);
 
     const uint64_t t_init = osal::Thread::get_time_us();
-    if (AppPodHost::instance().register_pod(pod_id, raw)) {
-        int32_t init_rc = AppPodHost::instance().init_pod(pod_id);
+    // An entry point runs on its own thread, which no snapshot captures
+    AppPodHost::instance().note_entry_point(pod_id, *raw);
+    const bool registered = AppPodHost::instance().register_pod(pod_id, raw);
+    if (registered || spec.restore_from) {
+        std::string why;
+        const int32_t init_rc = spec.restore_from ? AppPodHost::instance().restore_pod(pod_id, spec.restore_from, why)
+                                                  : AppPodHost::instance().init_pod(pod_id);
         const uint64_t t_done = osal::Thread::get_time_us();
         // An internal pool block holds the pods of a board without PSRAM:
         // what this one took of it, and what is left
@@ -126,19 +134,22 @@ bool WasmRuntime::deploy_impl(const std::string& pod_id, const uint8_t* wasm_byt
             snprintf(pool, sizeof(pool), ", pod pool %ld bytes (%u free, largest %u)", (long)pool_before - (long)pool_after,
                      (unsigned)pool_after, (unsigned)kube32_pool_largest_free());
         }
+        const char* start_step = spec.restore_from ? "restore" : "k32_init";
+        const unsigned start_ms = (unsigned)((t_done - t_init) / 1000);
 #if defined(ESP_PLATFORM)
-        printf("[POD] %s: %u bytes wasm, load+compile %u ms, k32_init %u ms (rc=%d), memory internal %+d KB psram %+d KB%s\n",
-               pod_id.c_str(), (unsigned)len, (unsigned)((t_init - t_load) / 1000), (unsigned)((t_done - t_init) / 1000), (int)init_rc,
+        printf("[POD] %s: %u bytes wasm, load+compile %u ms, %s %u ms (rc=%d), memory internal %+d KB psram %+d KB%s\n",
+               pod_id.c_str(), (unsigned)len, (unsigned)((t_init - t_load) / 1000), start_step, start_ms, (int)init_rc,
                (int)((long)heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT) - (long)internal_before) / 1024,
                (int)((long)heap_caps_get_free_size(MALLOC_CAP_SPIRAM) - (long)psram_before) / 1024, pool);
 #else
-        printf("[POD] %s: %u bytes wasm, load+compile %u ms, k32_init %u ms (rc=%d)%s\n",
-               pod_id.c_str(), (unsigned)len, (unsigned)((t_init - t_load) / 1000), (unsigned)((t_done - t_init) / 1000), (int)init_rc, pool);
+        printf("[POD] %s: %u bytes wasm, load+compile %u ms, %s %u ms (rc=%d)%s\n",
+               pod_id.c_str(), (unsigned)len, (unsigned)((t_init - t_load) / 1000), start_step, start_ms, (int)init_rc, pool);
 #endif
         if (init_rc != 0) {
-            out_error = "k32_init returned " + std::to_string(init_rc);
+            out_error = spec.restore_from ? why : "k32_init returned " + std::to_string(init_rc);
             AppPodHost::instance().unregister_pod(pod_id);
             PodFs::instance().release_pod(pod_id);
+            ipc::ChannelManager::instance().close_all(pod_id);
             auto it = impl_->containers.find(pod_id);
             if (it != impl_->containers.end()) {
                 std::unique_ptr<ContainerLifecycleController> dead = std::move(it->second);
@@ -190,6 +201,7 @@ bool WasmRuntime::terminate(const std::string& pod_id) {
     }
     AppPodHost::instance().unregister_pod(pod_id);
     PodFs::instance().release_pod(pod_id);
+    ipc::ChannelManager::instance().close_all(pod_id);
     {
         osal::LockGuard guard(impl_->mutex);
         auto it = impl_->containers.find(pod_id);
@@ -600,6 +612,37 @@ uint32_t module_stack_need_bytes(const M3Module* module) {
     if (most == 0) return 0;
     // op_Entry requires the frame to end below the stack's end: one slot more
     return (most + 1) * static_cast<uint32_t>(sizeof(m3slot_t));
+}
+
+bool deploy_error_is_restore(const std::string& error) {
+    return error.rfind(kRestoreErrorPrefix, 0) == 0;
+}
+
+const char* module_entry_point(const uint8_t* wasm, size_t len) {
+    if (!wasm || len <= 8) return nullptr;
+    BodyReader r{wasm + 8, wasm + len};
+    while (r.ok && r.p < r.end) {
+        const uint8_t id = r.byte();
+        const uint32_t size = r.u32();
+        if (!r.ok || size > static_cast<size_t>(r.end - r.p)) return nullptr;
+        if (id != 7) { r.p += size; continue; }
+        BodyReader s{r.p, r.p + size};
+        const uint32_t count = s.u32();
+        const char* found = nullptr;
+        for (uint32_t i = 0; i < count && s.ok; ++i) {
+            const uint32_t n = s.u32();
+            const char* name = reinterpret_cast<const char*>(s.p);
+            s.skip(n);
+            const uint8_t kind = s.byte();
+            s.u32();
+            if (!s.ok || kind != 0) continue;
+            for (const char* ep : {"_start", "app_main", "main"}) {
+                if (std::strlen(ep) == n && std::memcmp(ep, name, n) == 0 && (!found || std::strcmp(ep, "_start") == 0)) found = ep;
+            }
+        }
+        return found;
+    }
+    return nullptr;
 }
 
 bool deploy_error_is_out_of_memory(const std::string& error) {
