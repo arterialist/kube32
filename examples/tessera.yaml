@@ -116,8 +116,8 @@ spec:
               value: "1793059200000"
           resources:
             requests:
-              memory: 16Ki                 # internal SRAM for the pod's own structures (about 4 KiB)
-              esp32.io/psram: 1280Ki       # Wasm linear memory lives in external PSRAM
+              memory: 16Ki                 # the pod's code and structures (about 4 KiB)
+              esp32.io/psram: 1280Ki       # Wasm linear memory in the PSRAM pool block
               hardware.kube32.io/ipc: "1"
             limits:
               memory: 16Ki

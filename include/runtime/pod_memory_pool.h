@@ -69,11 +69,24 @@ size_t kube32_pool_psram_reserve(void);
 void  kube32_pool_set_heap_budget(size_t bytes);
 size_t kube32_pool_heap_budget(void);
 /* Bytes a pod whose linear memory is `memory_bytes` could be given now: the
- * pool block's free part, the general heap above the system reserve (on
- * the board, not with an internal pool block) and PSRAM above its
+ * pool block's free part (an external block only for a linear memory it
+ * takes, see kube32_pool_alloc), the general heap above the system reserve
+ * (on the board, not with an internal pool block) and PSRAM above its
  * reserve. *out_capacity (optional) adds what pods
  * hold already: what the pod could be given with no other pod running. */
 size_t kube32_pool_pod_room(size_t memory_bytes, size_t* out_capacity);
+/* What the Node offers pods (status.allocatable), counted as the kubelet
+ * admits them and fixed while no pod loads or goes:
+ *   *out_memory: memory for a pod's module, structures and linear memory.
+ *     Without PSRAM the pool block's free part; with PSRAM the PSRAM above
+ *     its reserve, as much as was free the first time this was asked, less
+ *     what pods hold now (the system's own growth after that point comes out
+ *     of the reserve). The host models a board with a heap budget (the
+ *     budget above the system reserve, and the pool block's free part
+ *     without PSRAM); without one it gives pods up to 1 GiB.
+ *   *out_psram: PSRAM pods can be given, the pool block's free part
+ *     included (0 without PSRAM). */
+void kube32_pool_node_room(size_t* out_memory, size_t* out_psram);
 /* General allocator for the interpreter: external RAM first when present,
  * internal otherwise. Keeps code pages and runtime structures out of the
  * 300 KB internal heap that Wi-Fi and lwIP need. */

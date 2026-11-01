@@ -67,7 +67,7 @@ void test_node_status_reporter() {
     NodeStatusReporter reporter("esp32-node-test", "192.168.4.2");
     NodeTelemetry t = reporter.collect_telemetry();
     // Host figures: the machine's memory and cores, no PSRAM
-    assert(t.total_heap_bytes > 0 && t.free_heap_bytes > 0);
+    assert(t.total_heap_bytes > 0 && t.free_heap_bytes > 0 && t.memory_capacity_bytes > 0 && t.memory_allocatable_bytes > 0);
     assert(t.cpu_cores == std::thread::hardware_concurrency());
     assert(t.total_psram_bytes == 0);
     {
@@ -76,7 +76,7 @@ void test_node_status_reporter() {
         assert(host_reg.find("\"cpu\":\"" + std::to_string(t.cpu_cores) + "\"") != std::string::npos);
         assert(host_reg.find("\"kubernetes.io/arch\":\"xtensa\"") == std::string::npos);
     }
-    t.total_heap_bytes = 320 * 1024;
+    t.memory_capacity_bytes = 320 * 1024;
 
     std::string reg = reporter.build_registration_json(t);
     assert(reg.find("\"kind\":\"Node\"") != std::string::npos);
@@ -94,7 +94,7 @@ void test_node_status_reporter() {
     // Dynamic telemetry propagation assertions
     NodeTelemetry dynamic_t = t;
     dynamic_t.allocatable_gpio_count = 11;
-    dynamic_t.free_heap_bytes = 180 * 1024;
+    dynamic_t.memory_allocatable_bytes = 180 * 1024;
     dynamic_t.allocatable_i2c_count = 1;
 
     std::string reg_dyn = reporter.build_registration_json(dynamic_t);

@@ -13,11 +13,13 @@ namespace kube32::kubelet {
 // profile; 0 means the node does not have (or cannot measure) the resource,
 // and the resource is then left out of the Node object.
 struct NodeTelemetry {
-    size_t total_heap_bytes{0};      // capacity.memory
-    size_t free_heap_bytes{0};       // allocatable.memory: free heap plus the pod pool
+    size_t total_heap_bytes{0};      // internal heap
+    size_t free_heap_bytes{0};       // free internal heap and pod pool: the MemoryPressure condition
     size_t min_free_heap_bytes{0};
-    size_t free_psram_bytes{0};
-    size_t total_psram_bytes{0};
+    size_t memory_capacity_bytes{0};     // capacity.memory: the board's RAM, PSRAM included
+    size_t memory_allocatable_bytes{0};  // allocatable.memory: what pods can be given (kube32_pool_node_room)
+    size_t free_psram_bytes{0};      // allocatable esp32.io/psram: PSRAM pods can be given, the pool block included
+    size_t total_psram_bytes{0};     // capacity esp32.io/psram
     uint32_t cpu_cores{0};
     uint32_t cpu_freq_mhz{0};
     uint64_t uptime_ms{0};

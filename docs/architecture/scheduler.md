@@ -24,7 +24,14 @@ Candidate nodes must pass each filter in order:
 
 Quantities follow Kubernetes: `Ki`, `Mi`, `Gi` are binary, `k`, `M`, `G` decimal, and `m` is milli. Unrecognized suffixes count as 0.
 
-Allocatable resources come from `status.allocatable` or `capacity`. The kubelet measures free heap, free PSRAM, and unclaimed pins, so running pods are already included in the reported figures. The scheduler subtracts requests only for bound pods the report does not include yet: `Pending` pods, containers waiting to restart, and pods modified after the node's last status write.
+Allocatable resources come from `status.allocatable` or `capacity`. The kubelet reports what pods can still be given, counted the way its [memory admission](wasm-runtime.md#memory-admission) counts it, and unclaimed pins, so running pods are already included in the reported figures:
+
+| Node | Allocatable `memory` | Allocatable `esp32.io/psram` |
+| --- | --- | --- |
+| Board with PSRAM | PSRAM above the system reserve, as much as was free when the kubelet first reported, less what pods hold | `memory` plus the free part of the PSRAM pool block |
+| Board without PSRAM | Free part of the 80 KiB pool block | not reported |
+
+The figures change only when pods load or stop. Capacity `memory` is the board's internal RAM plus its PSRAM. The scheduler subtracts requests only for bound pods the report does not include yet: `Pending` pods, containers waiting to restart, and pods modified after the node's last status write.
 
 The scheduler ignores `hardware.kube32.io/*` resources, `esp32.io/gpio-<N>` pin claims, taints, affinity, and topology. The kubelet [capability firewall](capability-firewall.md) validates hardware and pin claims at admission.
 

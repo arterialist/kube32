@@ -206,11 +206,15 @@ size_t kube32_pool_stack_size(void) { return s_stack_size; }
 size_t kube32_pool_stack_available(void) { return (s_stack && !s_stack_in_use.load()) ? s_stack_size : 0; }
 size_t kube32_pool_block_size(void) { return s_block_size; }
 
+// The block is sized for the node's largest pod: a request under half of it
+// is served by the general allocator so a small pod started first does not
+// take the block from the pod it was reserved for.
+static bool block_takes(size_t bytes) {
+    return s_block && bytes >= k_threshold && bytes >= s_block_size / 2 && bytes <= s_block_size;
+}
+
 void* kube32_pool_alloc(size_t bytes) {
-    // The block is sized for the node's largest pod: a request under half of
-    // it is served by the general allocator so a small pod started first does
-    // not take the block from the pod it was reserved for.
-    if (!s_block || bytes < k_threshold || bytes < s_block_size / 2 || bytes > s_block_size) return nullptr;
+    if (!block_takes(bytes)) return nullptr;
     std::lock_guard<std::mutex> lock(s_sub_mutex);
     if (s_in_use.load()) return nullptr;
     if (s_sub_active) {
@@ -324,13 +328,67 @@ size_t kube32_pool_pod_room(size_t memory_bytes, size_t* out_capacity) {
     // The block is not part of the heap figures above. An internal block is
     // shared by small pods; an external one serves one large linear memory.
     size_t pool_held = 0;
-    if (s_block && (!s_external || memory_bytes >= k_threshold)) {
+    if (s_block && (!s_external || block_takes(memory_bytes))) {
         const size_t pool_free = kube32_pool_available(nullptr);
         room += pool_free;
         pool_held = s_block_size - pool_free;
     }
     if (out_capacity) *out_capacity = room + pool_held + s_general_bytes.load() + s_psram_bytes.load();
     return room;
+}
+
+// PSRAM pods may take besides the pool block: as much as was free above the
+// reserve the first time a node's figures were asked for (the system's use
+// then included), less what pods hold now
+static size_t psram_room(size_t free_now, size_t held) {
+    static std::mutex mutex;
+    static bool measured = false;
+    static size_t budget = 0;
+    {
+        std::lock_guard<std::mutex> lock(mutex);
+        if (!measured) {
+            const size_t base = free_now + held;
+            budget = base > s_psram_reserve.load() ? base - s_psram_reserve.load() : 0;
+            measured = true;
+        }
+    }
+    return budget > held ? budget - held : 0;
+}
+
+void kube32_pool_node_room(size_t* out_memory, size_t* out_psram) {
+    size_t memory = 0, psram = 0;
+    const size_t block_free = s_block ? kube32_pool_available(nullptr) : 0;
+#if defined(ESP_PLATFORM)
+    if (heap_caps_get_total_size(MALLOC_CAP_SPIRAM) > 0) {
+        memory = psram_room(heap_caps_get_free_size(MALLOC_CAP_SPIRAM), s_psram_bytes.load());
+        psram = memory + (s_external ? block_free : 0);
+    } else if (s_block) {
+        memory = block_free;
+    } else {
+        const size_t internal = heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+        memory = internal > system_reserve() ? internal - system_reserve() : 0;
+    }
+#else
+    // The simulator's boards: its PSRAM is the block (--psram) and, with a
+    // heap budget, the PSRAM besides it that pods' allocations come from;
+    // without PSRAM the block and the budget, as kube32_pool_pod_room counts
+    // them. The host's memory itself is not modelled.
+    const size_t general = s_general_bytes.load();
+    if (s_external && s_heap_budget) {
+        memory = psram_room(s_heap_budget > general ? s_heap_budget - general : 0, general);
+        psram = memory + block_free;
+    } else if (s_heap_budget) {
+        const size_t used = general + system_reserve();
+        memory = (s_heap_budget > used ? s_heap_budget - used : 0) + block_free;
+    } else {
+        const size_t host = static_cast<size_t>(1) << 30;
+        memory = host > general ? host - general : 0;
+        if (s_external) psram = block_free;
+        else memory += block_free;
+    }
+#endif
+    if (out_memory) *out_memory = memory;
+    if (out_psram) *out_psram = psram;
 }
 
 static bool in_psram(const void* p) {

@@ -46,23 +46,27 @@ NodeTelemetry NodeStatusReporter::collect_telemetry() const {
     t.total_heap_bytes = osal::System::get_total_heap_bytes();
     t.free_heap_bytes = osal::System::get_free_heap_bytes();
     t.min_free_heap_bytes = osal::System::get_min_free_heap_bytes();
-    t.free_psram_bytes = osal::System::get_free_psram_bytes();
     t.total_psram_bytes = osal::System::get_total_psram_bytes();
-    // Memory parked in the pod pool at boot is free for scheduling purposes
+    // What pods can be given, counted as the kubelet admits them: the pool
+    // block without PSRAM, PSRAM with it
+    kube32_pool_node_room(&t.memory_allocatable_bytes, &t.free_psram_bytes);
+    t.memory_capacity_bytes = t.total_heap_bytes + t.total_psram_bytes;
     int pool_external = 0;
-    size_t pool_free = kube32_pool_available(&pool_external);
+    const size_t pool_free = kube32_pool_available(&pool_external);
 #if !defined(ESP_PLATFORM)
     // The simulator's PSRAM is the external pool block it reserved
     // (kube32-sim --psram); the host itself has none.
     if (pool_external) t.total_psram_bytes = kube32_pool_block_size();
-    // A modelled board heap (kube32-sim --psram 0): what pods leave of it
+    t.memory_capacity_bytes = t.total_heap_bytes;
+    // A modelled board heap (kube32-sim --heap-budget): what pods leave of it
     if (const size_t budget = kube32_pool_heap_budget()) {
         const size_t used = kube32_pool_general_bytes();
         t.total_heap_bytes = budget;
         t.free_heap_bytes = used < budget ? budget - used : 0;
+        t.memory_capacity_bytes = budget + (pool_external ? 0 : kube32_pool_block_size());
     }
 #endif
-    if (pool_external) t.free_psram_bytes += pool_free; else t.free_heap_bytes += pool_free;
+    if (!pool_external) t.free_heap_bytes += pool_free;
     t.free_heap_bytes += kube32_pool_stack_available();
     t.cpu_cores = osal::System::get_cpu_cores();
     t.cpu_freq_mhz = osal::System::get_cpu_freq_mhz();
@@ -125,7 +129,7 @@ static void append_resources(Out& json, const NodeTelemetry& t, bool capacity) {
         append_bytes_quantity(json, bytes);
         json += "\"";
     };
-    if (t.total_heap_bytes > 0) kib("memory", capacity ? t.total_heap_bytes : t.free_heap_bytes);
+    if (t.memory_capacity_bytes > 0) kib("memory", capacity ? t.memory_capacity_bytes : t.memory_allocatable_bytes);
     if (t.cpu_cores > 0) count("cpu", t.cpu_cores);
     if (t.total_gpio_count > 0) {
         const uint64_t v = capacity ? t.total_gpio_count : t.allocatable_gpio_count;

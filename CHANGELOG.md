@@ -49,6 +49,7 @@ All notable changes to this project will be documented in this file. The format 
 
 ### Fixed
 
+- A node with PSRAM advertises the PSRAM that pods can be given as its allocatable `memory`, not its free internal heap, so pods that request more than a few KiB, such as `examples/echo.yaml`, schedule on the control plane. Allocatable `memory` and `esp32.io/psram` count what the kubelet admits pods against and change only when pods load or stop, and the kubelet counts the PSRAM pool block only for a linear memory that the block takes.
 - `test_driver_frames` counts operation frames with the boards' dispatch. On an ARM64 host, wasm3 preloaded the next operation and dispatched it outside the counter, so the test reported fewer frames than a call uses on an ESP32-S3.
 - Endpoints, EndpointSlices, Ingress routes, Service calls and service links reach a pod at its node's pod port (`status.daemonEndpoints.kubeletEndpoint.Port`), not at its `containerPort`. Thus the boards can reach pods on a `kube32-sim` worker that runs with its own `--pod-port`. NetworkPolicy ports still match the pod's own port.
 - A node keeps its cordon when it registers again after a reboot or after rejected heartbeats. The registration does not set `spec.unschedulable`.

@@ -473,6 +473,13 @@ else()
     target_link_libraries(test_kubelet_node_status PRIVATE kube32_core)
     add_test(NAME test_kubelet_node_status COMMAND test_kubelet_node_status)
 
+    # Node memory as the kubelet admits pods: a board with PSRAM and one
+    # without (one pod pool per process)
+    add_executable(test_node_memory tests/test_node_memory.cpp)
+    target_link_libraries(test_node_memory PRIVATE kube32_core)
+    add_test(NAME test_node_memory_psram COMMAND test_node_memory psram)
+    add_test(NAME test_node_memory_internal COMMAND test_node_memory internal)
+
     # 25. Pipeline memory pooling, K32C wire fuzzing, watchdog and yield behaviour
     add_executable(test_ipc_pipeline
         tests/test_ipc_pipeline.cpp
