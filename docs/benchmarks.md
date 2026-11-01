@@ -123,7 +123,7 @@ This table gives the busy share of the two cores over 60 s. The values come from
 | Cardputer, three drivers | 18.7 % | Wi-Fi 11.2 %, pod ticks 11.1 % (rfid polls five times a second), TCP/IP 7.1 % |
 | Cardputer, no pods | 8.1 % | Wi-Fi 6.5 %, TCP/IP 4.1 %, kubelet 1.5 % |
 
-The Deployment controller reconciles every 1 s and the Device controller every 2 s. On each pass, they read the objects that they manage. This polling causes most of the control plane's idle load.
+The controllers run a pass when an object that they read changes, and every 30 s without a change; the scheduler every 5 minutes. On each pass, they read the objects that they manage. Node heartbeats, Leases and Events cause no passes, and a pod that does not fit is tried again only after a change, so an idle control plane spends little time in them.
 
 ## Latency
 

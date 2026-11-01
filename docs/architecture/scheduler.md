@@ -7,9 +7,18 @@ Four control loops run on the control plane next to the API server:
 - `src/controller/deployment_controller.cpp`
 - `src/controller/workload_controller.cpp`
 
+The Deployment, DaemonSet and Job, and Device controllers watch the object store, as Kubernetes controllers watch the API server. A controller runs a pass when an object that it reads changes, when a wait that it set ends, and every 30 s without a change, which repairs what a missed change would leave. Changes to Node objects count only when they touch a field that the controller reads, so node heartbeats cause no passes. Passes are at least 1 s apart (2 s for the Device controller), or `--reconcile-interval` on the simulator.
+
 ## Scheduler
 
-The scheduler binds pods created without `spec.nodeName` during the create request. A reconcile loop retries unbound pods every 3 s on hardware and every 1 s on the simulator via `--reconcile-interval`. Pods created with `nodeName` set skip the scheduler.
+The scheduler binds pods created without `spec.nodeName` during the create request. Pods created with `nodeName` set skip the scheduler. A loop binds the other unbound pods, and pods whose node was deleted, as kube-scheduler's queue does:
+
+- It tries a pod that it has not tried yet, or one that changed since its last attempt, at its next pass.
+- It tries a pod that did not fit again after a change that can make it fit: a pod created, changed or deleted, or a Node whose labels, spec, `Ready` condition or resources change. Node heartbeats that change nothing else are not such a change.
+- After each attempt that fails, a pod waits for its back-off before the next one: 1 s, doubled per attempt up to 10 s.
+- Without a change, it tries every pod that does not fit every 5 minutes.
+
+Passes are at least 3 s apart on hardware and `--reconcile-interval` apart on the simulator. An attempt that ends with the same verdict leaves the pod unchanged and records a `FailedScheduling` event.
 
 ### Filters
 
@@ -72,7 +81,7 @@ Eviction clears `spec.nodeName`, sets phase to `Pending` with reason `Evicted`, 
 
 ## Deployment controller
 
-The controller reconciles each Deployment every 1 s against pods carrying its owner reference:
+The controller reconciles Deployments against the pods that carry their owner reference, after a Deployment or one of those pods changes:
 
 - Creates missing pods from the template with a `pod-template-hash` label.
 - Deletes surplus pods, removing not-ready and stale pods first, and deletes pods whose owner Deployment is deleted.
@@ -83,7 +92,7 @@ kube32 does not create ReplicaSet objects.
 
 ## DaemonSet and Job controller
 
-One loop in `src/controller/workload_controller.cpp` reconciles DaemonSets and Jobs every 1 s. Pods carry an owner reference to their DaemonSet or Job and are deleted when the owner is deleted.
+One loop in `src/controller/workload_controller.cpp` reconciles DaemonSets and Jobs after a DaemonSet, a Job, a pod that they own, or the labels of a Node change. Pods carry an owner reference to their DaemonSet or Job and are deleted when the owner is deleted.
 
 ### DaemonSet
 

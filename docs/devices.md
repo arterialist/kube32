@@ -266,7 +266,7 @@ kube32-sim --sim-i2c pahub,bme688@2,miniscale@3,rfid@4
 | --- | --- |
 | Each driver pod | Like any pod: its 3 KiB of linear memory, its module's compiled code and the runtime's structures for the pod. The admission estimate is 16 to 29 KiB of a board's pod pool. On the Cardputer, a BME688, a Mini Scales unit and an RFID 2 reader use 69 KB together (25.4 + 20.1 + 23.5 KB). The pool has 80 KiB. The firewall keeps 6 bytes for each grant |
 | A node with shared buses | One I2C driver for each bus, with up to four device handles for all grants. Discovery keeps about 50 bytes for each part that it finds. The node annotation uses about 70 bytes for each part |
-| Control plane | The Device controller's thread (12 KiB stack in PSRAM), which makes a pass every 2 seconds. A Device, its pod and its Service use about 2.5 KiB of the object store |
+| Control plane | The Device controller's thread (12 KiB stack in PSRAM). It makes a pass when a Device, a driver pod, a Service, or what it reads of a Node changes, at most every 2 seconds, and every 30 s without a change. A Device, its pod and its Service use about 2.5 KiB of the object store |
 
 ## Limitations
 

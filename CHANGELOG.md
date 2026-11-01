@@ -44,6 +44,7 @@ All notable changes to this project will be documented in this file. The format 
 
 ### Changed
 
+- The Deployment, DaemonSet and Job, and Device controllers and the scheduler run a pass when an object that they read changes, when a wait that they set ends, and every 30 s (the scheduler every 5 minutes) without a change, instead of every 1 to 3 s. Node heartbeats, Leases and Events cause no passes. The scheduler tries a pod that does not fit again after a change that can make it fit, with a back-off of 1 s doubled up to 10 s, and leaves the pod unchanged when the verdict is the same. A Deployment pass parses each pod once, and a scheduler attempt lists the pods once for all nodes.
 - Pods use less of the pod pool on boards without PSRAM. Without `kube32.io/wasm-stack`, the wasm3 value stack sizes to what the module's call chains need, up to the 4 KiB or 16 KiB default. The shared interpreter stack lends the compiler its scratch space while a module loads. Function constants follow their code on its code pages, and code pages shrink to fit the pool block's free pieces. Metering skips zero-cost charges, and the loader drops function names from the name section.
 - Memory admission estimates a pod's size from its module's sections and call chains using wasm3's ESP32-S3 structure sizes in both the simulator and the board. The `[POD]` load line reports the bytes a pod took from the pool block, the block's free bytes, and its largest free piece.
 
