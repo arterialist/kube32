@@ -6,7 +6,7 @@ All notable changes to this project will be documented in this file. The format 
 
 ### Added
 
-- Pod migration ([docs/migration.md](docs/migration.md)). The Checkpoint controller carries out `kube32.io/v1` Checkpoints: `Save` stores a running pod's state, `Move` replaces the pod on another node, where it restores with the same name and owners. A Deployment counts one pod throughout. A failed restore puts the pod back on its source node from the same checkpoint. Spec blockers (hardware grants, node storage volumes, DaemonSet pods, `kube32.io/migration: Never`) and the node's are refused and named.
+- Pod migration ([docs/migration.md](docs/migration.md)). The Checkpoint controller carries out `kube32.io/v1` Checkpoints: `Save` stores a running pod's state, `Move` replaces the pod on another node, where it restores with the same name and owners. A Deployment counts one pod throughout. A failed restore puts the pod back on its source node from the same checkpoint. Blockers (hardware grants, node storage volumes, entry points, open files, `kube32.io/migration: Never`) are refused and named.
 - `POST /api/v1/namespaces/<ns>/pods/<name>/eviction` (`policy/v1` Eviction): `kubectl drain` moves the pods that can move and deletes the others. `kubectl cordon` and `uncordon` work as in Kubernetes.
 - Migration policies in the `kube32.io/migration` annotation: `OnDrain` (default), `Never` and `Auto`, which moves pods off nodes under memory pressure and, with `kube32.io/placement: fastest`, to nodes at least twice as fast by `kube32.io/interp-mops`. `kube32.io/checkpoint-interval` saves a pod periodically, and a pod on a lost node restores on another node from its latest periodic checkpoint.
 - `kube32-cli checkpoint`, `move` and `checkpoints`.
