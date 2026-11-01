@@ -373,7 +373,7 @@ else()
     # drivers and the room-monitor example (pods: apps/svcprobe, apps/webhook,
     # apps/drivers, apps/room-monitor)
     foreach(t test_service_calls test_https_egress test_webhook_app test_pod_assets test_pod_memory_caps test_pod_pool_fit test_kubelet_api_stream test_node_storage
-              test_drivers test_inline_images)
+              test_drivers test_api_memory test_inline_images)
         add_executable(${t} tests/${t}.cpp)
         target_link_libraries(${t} PRIVATE kube32_core)
         target_compile_definitions(${t} PRIVATE KUBE32_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}")
