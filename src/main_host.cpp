@@ -357,6 +357,11 @@ int main(int argc, char* argv[]) {
         std::cout << "[STORAGE] none: " << kube32::hal::node_storage_info().error << std::endl;
     }
 
+    // The interpreter's speed on this host (Node annotation kube32.io/interp-mops)
+    char interp_mops[16];
+    snprintf(interp_mops, sizeof(interp_mops), "%.2f", kube32::runtime::measure_interp_mops());
+    std::cout << "[SIM] interpreter: " << interp_mops << " million wasm3 operations/s" << std::endl;
+
     if (opts.role == "worker") {
         // WORKER ROLE
         std::string master_host = "127.0.0.1";
@@ -397,6 +402,7 @@ int main(int argc, char* argv[]) {
             return std::map<std::string, std::string>{{kube32::models::kAnnotationI2cDevices, discovery.annotation()}};
         };
         kubelet_cfg.node_label_prefix = "i2c.kube32.io/";
+        kubelet_cfg.node_annotations["kube32.io/interp-mops"] = interp_mops;
         kubelet_cfg.kubelet_port = opts.pod_port;
         // As a board without PSRAM starts its pods: one per sync pass
         if (opts.board_without_psram) kubelet_cfg.max_starts_per_sync = 1;
@@ -681,6 +687,7 @@ int main(int argc, char* argv[]) {
             return std::map<std::string, std::string>{{kube32::models::kAnnotationI2cDevices, discovery.annotation()}};
         };
         kubelet_cfg.node_label_prefix = "i2c.kube32.io/";
+        kubelet_cfg.node_annotations["kube32.io/interp-mops"] = interp_mops;
         kubelet_cfg.kubelet_port = pod_server ? opts.pod_port : 0;
         kubelet_cfg.firmware_slots = cp_slots;
         kubelet_cfg.firmware.local_staging = true;

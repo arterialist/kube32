@@ -1244,6 +1244,15 @@ void cluster_task(void* pv) {
         return std::map<std::string, std::string>{{kube32::models::kAnnotationI2cDevices, discovery.annotation()}};
     };
     kubelet_cfg.node_label_prefix = "i2c.kube32.io/";
+    // The interpreter's speed, timed once on the stack and memory pods use
+    {
+        const uint64_t t0 = kube32::osal::System::get_uptime_ms();
+        char mops[16];
+        snprintf(mops, sizeof(mops), "%.2f", kube32::runtime::measure_interp_mops());
+        kubelet_cfg.node_annotations["kube32.io/interp-mops"] = mops;
+        printf("[KUBELET] interpreter: %s million wasm3 operations/s (measured in %u ms)\n", mops,
+               (unsigned)(kube32::osal::System::get_uptime_ms() - t0));
+    }
     // Firmware rollouts: the kubelet downloads the image into the update slot
     // in ranges, or on the control plane boots the slot it was staged in;
     // before the restart the control plane writes out its store journal

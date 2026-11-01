@@ -264,6 +264,9 @@ void Kubelet::run_loop() {
 
                 if (config_.node_label_source && now - last_label_refresh_ms_ >= config_.node_label_refresh_ms) {
                     refresh_node_labels();
+                } else if (!config_.node_label_source && !annotations_sent_ && now - last_label_refresh_ms_ >= config_.node_label_refresh_ms) {
+                    last_label_refresh_ms_ = now;
+                    patch_node_annotations();   // the annotations patch at registration failed
                 }
             }
             // Runs unregistered too: an image that cannot reach the API
@@ -320,8 +323,10 @@ void Kubelet::reconcile_node_registration() {
 }
 
 void Kubelet::patch_node_annotations() {
-    if (!config_.node_annotation_source) return;
-    std::map<std::string, std::string> found = config_.node_annotation_source();
+    if (!config_.node_annotation_source && config_.node_annotations.empty()) return;
+    std::map<std::string, std::string> found;
+    if (config_.node_annotation_source) found = config_.node_annotation_source();
+    found.insert(config_.node_annotations.begin(), config_.node_annotations.end());
     if (found == found_annotations_ && annotations_sent_) return;
     if (registered_.load()) {
         std::string patch = "{\"metadata\":{\"annotations\":{";

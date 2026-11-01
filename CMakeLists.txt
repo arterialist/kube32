@@ -543,6 +543,11 @@ else()
     target_compile_definitions(test_driver_frames PRIVATE KUBE32_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}")
     add_test(NAME test_driver_frames COMMAND test_driver_frames)
 
+    # The wasm3 operations of the interpreter speed kernel (kube32.io/interp-mops)
+    add_executable(test_interp_kernel tests/test_interp_kernel.cpp src/runtime/pod_memory_pool.cpp)
+    target_link_libraries(test_interp_kernel PRIVATE wasm3_opframes)
+    add_test(NAME test_interp_kernel COMMAND test_interp_kernel)
+
     # The rfid example against a simulated MFRC522; pod tick intervals
     add_executable(test_rfid_app
         tests/test_rfid_app.cpp

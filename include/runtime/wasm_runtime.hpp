@@ -159,5 +159,10 @@ bool deploy_error_is_restore(const std::string& error);
 // its export section; null for a request pod
 const char* module_entry_point(const uint8_t* wasm, size_t len);
 
+// The interpreter's speed on this node: millions of wasm3 operations per
+// second on a small fixed integer kernel (kInterpKernelOps operations per
+// run), measured on the stack and memory pods use. Takes about 20 ms on a
+// board.
+double measure_interp_mops();
 
 } // namespace kube32::runtime
