@@ -853,6 +853,9 @@ bool Kubelet::deploy_and_start_pod(const models::KubePod& pod_in, const std::str
             module_len = img->len;
         } else if (auto ann = pod.annotations.find("kube32.io/wasm-base64"); ann != pod.annotations.end()) {
             module_len = ann->second.size() / 4 * 3;   // empty in pod lists: then only the rest is estimated
+        } else if (auto size = pod.annotations.find("kube32.io/wasm-size");
+                   size != pod.annotations.end() && pod.annotations.count("kube32.io/wasm-sha256")) {
+            module_len = static_cast<size_t>(models::parse_quantity(size->second));   // in the control plane's image store
         }
         const size_t need = runtime::estimate_pod_memory(module, module_len, rec.memory_limit_bytes, wasm_stack, !wasm_stack_set);
         size_t capacity = 0;
@@ -983,7 +986,8 @@ bool Kubelet::deploy_and_start_pod(const models::KubePod& pod_in, const std::str
     }
 
     // Resolve the container image: the card for wasm://sd/..., else the
-    // embedded registry, else the inline annotation
+    // embedded registry, else the control plane's copy of an inline image
+    // (kube32.io/wasm-sha256), else the inline annotation itself
     const uint8_t* image_bytes = nullptr;
     size_t image_len = 0;
     std::vector<uint8_t> inline_bytes;   // heap image the runtime takes over
@@ -1027,6 +1031,24 @@ bool Kubelet::deploy_and_start_pod(const models::KubePod& pod_in, const std::str
             image_bytes = img->data;
             image_len = img->len;
             asset_bundle = img->name;
+        } else if (auto digest = pod.annotations.find("kube32.io/wasm-sha256");
+                   digest != pod.annotations.end() && !pod.annotations.count("kube32.io/wasm-base64")) {
+            // An inline image the API server keeps apart from the pod
+            // (api/inline_images.hpp): read by its digest
+            std::string why;
+            const uint64_t t_pull = osal::System::get_uptime_ms();
+            if (api_client_->get_image(digest->second, inline_bytes, why)) {
+                image_bytes = inline_bytes.data();
+                image_len = inline_bytes.size();
+                image_source = "control plane";
+                record_pod_event(rec, "Pulled", "Successfully pulled image \"" + pod.image + "\" in " +
+                                                std::to_string(osal::System::get_uptime_ms() - t_pull) + "ms (" + std::to_string(image_len) +
+                                                " bytes, control plane, sha256:" + digest->second.substr(0, 12) + ")", false);
+                std::cout << "[KUBELET] " << pod_key << ": image sha256:" << digest->second.substr(0, 12) << ", " << image_len << " bytes" << std::endl;
+            } else {
+                std::cout << "[KUBELET] " << pod_key << ": image sha256:" << digest->second.substr(0, 12) << ": " << why << std::endl;
+                image_error = why;
+            }
         } else {
             auto ann = pod.annotations.find("kube32.io/wasm-base64");
             if (ann != pod.annotations.end()) {
@@ -1086,7 +1108,7 @@ bool Kubelet::deploy_and_start_pod(const models::KubePod& pod_in, const std::str
         record_pod_event(rec, "Failed", "Failed to pull image \"" + pod.image + "\": " + why, true);
         return fail_pod("ErrImagePull", "image " + pod.image + ": " + json_escape(why), 1);
     }
-    if (image_source != "sd card") {
+    if (image_source != "sd card" && image_source != "control plane") {
         record_pod_event(rec, "Pulled", "Container image \"" + pod.image + "\" already present on machine (" +
                                         std::to_string(image_len) + " bytes, " + image_source + ")", false);
     }
