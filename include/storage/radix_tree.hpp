@@ -30,10 +30,15 @@ public:
     RadixTree(RadixTree&&) noexcept = default;
     RadixTree& operator=(RadixTree&&) noexcept = default;
 
-    bool put(const std::string& key, const std::string& value, uint64_t version, 
+    // A put or remove that runs out of memory throws std::bad_alloc and
+    // leaves the tree as it was.
+    bool put(const std::string& key, std::string value, uint64_t version,
              bool ephemeral, bool overwrite, bool* out_is_new = nullptr);
     bool get(const std::string& key, std::string& out_value, 
              uint64_t* out_version = nullptr, bool* out_is_ephemeral = nullptr) const;
+    // What get() would report, without copying the value
+    bool stat(const std::string& key, size_t* out_value_bytes, uint64_t* out_version = nullptr,
+              bool* out_is_ephemeral = nullptr) const;
     bool remove(const std::string& key, std::string* out_deleted_value = nullptr, 
                 uint64_t* out_deleted_version = nullptr);
     void list(const std::string& prefix, std::vector<std::string>& out_values, 
@@ -50,7 +55,7 @@ private:
 
     static size_t common_prefix_len(const std::string& a, const std::string& b);
     bool insert_recursive(RadixNode* current, const std::string& key, 
-                          const std::string& value, uint64_t version, 
+                          std::string& value, uint64_t version, 
                           bool ephemeral, bool overwrite, bool* out_is_new);
     const RadixNode* find_node(const RadixNode* current, const std::string& key) const;
     void collect_all(const RadixNode* node, const std::string& current_path, 

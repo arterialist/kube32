@@ -1,6 +1,7 @@
 #include "storage/radix_tree.hpp"
 #include "osal/thread.hpp"
 #include <algorithm>
+#include <new>
 #include <utility>
 
 namespace kube32::storage {
@@ -15,15 +16,23 @@ size_t RadixTree::common_prefix_len(const std::string& a, const std::string& b) 
     return len;
 }
 
-bool RadixTree::put(const std::string& key, const std::string& value, uint64_t version, 
+bool RadixTree::put(const std::string& key, std::string value, uint64_t version, 
                     bool ephemeral, bool overwrite, bool* out_is_new) {
     if (key.empty()) return false;
     return insert_recursive(root_.get(), key, value, version, ephemeral, overwrite, out_is_new);
 }
 
+// Every allocation of an insert happens before the tree changes, so a
+// bad_alloc leaves it whole. The value is moved in, not copied.
 bool RadixTree::insert_recursive(RadixNode* current, const std::string& key, 
-                                 const std::string& value, uint64_t version, 
+                                 std::string& value, uint64_t version, 
                                  bool ephemeral, bool overwrite, bool* out_is_new) {
+    auto set_leaf = [&](RadixNode& node) {
+        node.is_leaf = true;
+        node.value = std::move(value);
+        node.resource_version = version;
+        node.is_ephemeral = ephemeral;
+    };
     for (auto& child : current->children) {
         if (child->prefix.empty()) continue;
         if (child->prefix[0] == key[0]) {
@@ -36,10 +45,7 @@ bool RadixTree::insert_recursive(RadixNode* current, const std::string& key,
                     } else {
                         if (out_is_new) *out_is_new = true;
                     }
-                    child->is_leaf = true;
-                    child->value = value;
-                    child->resource_version = version;
-                    child->is_ephemeral = ephemeral;
+                    set_leaf(*child);
                     return true;
                 } else {
                     return insert_recursive(child.get(), key.substr(cpl), value, 
@@ -48,45 +54,40 @@ bool RadixTree::insert_recursive(RadixNode* current, const std::string& key,
             } else {
                 // Split edge
                 auto split_node = std::make_unique<RadixNode>(child->prefix.substr(cpl));
+                std::string head = child->prefix.substr(0, cpl);
+                std::unique_ptr<RadixNode> new_child;
+                if (cpl != key.size()) new_child = std::make_unique<RadixNode>(key.substr(cpl));
+                std::vector<std::unique_ptr<RadixNode>> kids;
+                kids.reserve(2);
+
                 split_node->value = std::move(child->value);
                 split_node->resource_version = child->resource_version;
                 split_node->is_leaf = child->is_leaf;
                 split_node->is_ephemeral = child->is_ephemeral;
                 split_node->children = std::move(child->children);
 
-                child->prefix = child->prefix.substr(0, cpl);
+                child->prefix = std::move(head);
                 child->is_leaf = false;
                 child->value.clear();
-                child->children.clear();
-                child->children.push_back(std::move(split_node));
-
-                if (cpl == key.size()) {
-                    if (out_is_new) *out_is_new = true;
-                    child->is_leaf = true;
-                    child->value = value;
-                    child->resource_version = version;
-                    child->is_ephemeral = ephemeral;
+                kids.push_back(std::move(split_node));
+                if (out_is_new) *out_is_new = true;
+                if (new_child) {
+                    set_leaf(*new_child);
+                    kids.push_back(std::move(new_child));
                 } else {
-                    if (out_is_new) *out_is_new = true;
-                    auto new_child = std::make_unique<RadixNode>(key.substr(cpl));
-                    new_child->is_leaf = true;
-                    new_child->value = value;
-                    new_child->resource_version = version;
-                    new_child->is_ephemeral = ephemeral;
-                    child->children.push_back(std::move(new_child));
+                    set_leaf(*child);
                 }
+                child->children = std::move(kids);
                 return true;
             }
         }
     }
 
-    if (out_is_new) *out_is_new = true;
+    // push_back leaves the children as they were when it cannot grow them
     auto new_node = std::make_unique<RadixNode>(key);
-    new_node->is_leaf = true;
-    new_node->value = value;
-    new_node->resource_version = version;
-    new_node->is_ephemeral = ephemeral;
+    set_leaf(*new_node);
     current->children.push_back(std::move(new_node));
+    if (out_is_new) *out_is_new = true;
     return true;
 }
 
@@ -118,6 +119,16 @@ bool RadixTree::get(const std::string& key, std::string& out_value,
         return true;
     }
     return false;
+}
+
+bool RadixTree::stat(const std::string& key, size_t* out_value_bytes, uint64_t* out_version,
+                     bool* out_is_ephemeral) const {
+    const RadixNode* node = find_node(root_.get(), key);
+    if (!node || !node->is_leaf) return false;
+    if (out_value_bytes) *out_value_bytes = node->value.size();
+    if (out_version) *out_version = node->resource_version;
+    if (out_is_ephemeral) *out_is_ephemeral = node->is_ephemeral;
+    return true;
 }
 
 void RadixTree::collect_all(const RadixNode* node, const std::string& current_path, 
@@ -234,9 +245,17 @@ bool RadixTree::remove_recursive(RadixNode* current, const std::string& key,
     return false;
 }
 
+// Compaction after a remove. Out of memory it is skipped: a node with a
+// single child is still a valid tree.
 void RadixTree::merge_node_with_child(RadixNode* node, size_t child_idx) {
+    std::string merged;
+    try {
+        merged = node->prefix + node->children[child_idx]->prefix;
+    } catch (const std::bad_alloc&) {
+        return;
+    }
     auto child = std::move(node->children[child_idx]);
-    node->prefix += child->prefix;
+    node->prefix = std::move(merged);
     node->value = std::move(child->value);
     node->resource_version = child->resource_version;
     node->is_leaf = child->is_leaf;

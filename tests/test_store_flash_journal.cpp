@@ -664,7 +664,51 @@ static void test_unpersisted_write_keeps_key_in_journal() {
     std::cout << "[PASS] test_unpersisted_write_keeps_key_in_journal" << std::endl;
 }
 
+// A write or delete that runs out of memory leaves the store as it was: no
+// change without its flush and its watch event
+static void test_out_of_memory_writes_change_nothing() {
+    std::cout << "[RUN] test_out_of_memory_writes_change_nothing" << std::endl;
+    RamFlashRegion flash(64 * 4096);
+    auto store = create_radix_store(log_options(flash));
+    assert(store->recover().ok());
+    std::vector<std::string> seen;
+    bool fail = false;
+    store->watch("/registry/", [&](const WatchEvent& ev) { seen.push_back(ev.key); });
+    // A watcher whose callback cannot be copied while `fail` is set: the
+    // copy the store makes before a change runs out of memory
+    struct Thrower {
+        bool* fail;
+        explicit Thrower(bool* f) : fail(f) {}
+        Thrower(const Thrower& o) : fail(o.fail) { if (*fail) throw std::bad_alloc(); }
+        void operator()(const WatchEvent&) const {}
+    };
+    store->watch("/registry/", Thrower(&fail));
+    assert(store->put("/registry/pods/default/a", pod_json("a", "1"), false).ok());
+    const uint64_t v0 = store->current_version();
+    fail = true;
+    bool threw = false;
+    try { store->put("/registry/pods/default/b", pod_json("b", "1"), false); } catch (const std::bad_alloc&) { threw = true; }
+    assert(threw);
+    threw = false;
+    try { store->remove("/registry/pods/default/a"); } catch (const std::bad_alloc&) { threw = true; }
+    assert(threw);
+    fail = false;
+    std::string got;
+    assert(store->get("/registry/pods/default/b", got).code == StatusCode::NotFound);
+    assert(store->get("/registry/pods/default/a", got).ok());
+    assert(store->current_version() == v0);
+    assert(seen.size() == 1);
+    // The journal holds what the store holds
+    assert(store->flush(true).ok());
+    auto again = create_radix_store(log_options(flash));
+    assert(again->recover().ok());
+    assert(again->get("/registry/pods/default/a", got).ok());
+    assert(again->get("/registry/pods/default/b", got).code == StatusCode::NotFound);
+    std::cout << "[PASS] test_out_of_memory_writes_change_nothing" << std::endl;
+}
+
 int main() {
+    test_out_of_memory_writes_change_nothing();
     test_store_survives_restart();
     test_writes_coalesce_and_unchanged_values_skip();
     test_node_heartbeats_are_deferred();
