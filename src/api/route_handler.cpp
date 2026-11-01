@@ -8,6 +8,7 @@
 #include "models/kube_models.hpp"
 #include "models/device.hpp"
 #include "models/kube_lease.hpp"
+#include "models/migration.hpp"
 #include "models/tolerations.hpp"
 #include "net/network_policy.hpp"
 #include "runtime/pod_log.hpp"
@@ -529,6 +530,11 @@ RouteMatch RouteHandler::match_route(std::string_view path) {
                     match.resource_name = pod_rest.substr(0, slash2);
                     match.subresource = "log";
                     return match;
+                } else if (pod_rest.substr(slash2 + 1) == "eviction") {
+                    match.category = RouteCategory::PodEviction;
+                    match.resource_name = pod_rest.substr(0, slash2);
+                    match.subresource = "eviction";
+                    return match;
                 }
             }
         }
@@ -971,7 +977,9 @@ HttpResponse RouteHandler::dispatch(const HttpRequest& req, const RouteMatch& ma
     // them as protobuf on every view and does not retry, and the answer does
     // not depend on the body (always allowed).
     bool protobuf_body = !req.body.empty() && req.content_type.rfind("application/vnd.kubernetes.protobuf", 0) == 0;
-    bool body_free_review = (match.category == RouteCategory::SelfSubjectAccessReviews || match.category == RouteCategory::SelfSubjectRulesReviews);
+    // An Eviction's body adds nothing to the path but a grace period
+    bool body_free_review = (match.category == RouteCategory::SelfSubjectAccessReviews || match.category == RouteCategory::SelfSubjectRulesReviews ||
+                             match.category == RouteCategory::PodEviction);
     if (protobuf_body && !body_free_review) {
         std::string json, why;
         protobuf_body_to_json(req.body, json, why);
@@ -1092,6 +1100,9 @@ HttpResponse RouteHandler::dispatch(const HttpRequest& req, const RouteMatch& ma
 
         case RouteCategory::PodLog:
             return handle_pod_log(req, match, client_sock);
+
+        case RouteCategory::PodEviction:
+            return handle_pod_eviction(req, match, arena);
 
         case RouteCategory::MetricsNodes:
         case RouteCategory::MetricsNodeItem:
@@ -1238,6 +1249,8 @@ HttpResponse RouteHandler::handle_discovery(const HttpRequest& req, RouteCategor
                         "\"verbs\":[\"get\",\"list\",\"watch\",\"create\",\"update\",\"patch\",\"delete\"],\"shortNames\":[\"svc\"],\"categories\":[\"all\"]},"
                         "{\"name\":\"pods/log\",\"singularName\":\"pod\",\"namespaced\":true,\"kind\":\"Pod\","
                         "\"verbs\":[\"get\"]},"
+                        "{\"name\":\"pods/eviction\",\"singularName\":\"pod\",\"namespaced\":true,\"group\":\"policy\",\"version\":\"v1\","
+                        "\"kind\":\"Eviction\",\"verbs\":[\"create\"]},"
                         "{\"name\":\"namespaces\",\"singularName\":\"namespace\",\"namespaced\":false,\"kind\":\"Namespace\","
                         "\"verbs\":[\"get\",\"list\",\"watch\",\"create\",\"delete\"],\"shortNames\":[\"ns\"]},"
                         "{\"name\":\"events\",\"singularName\":\"event\",\"namespaced\":true,\"kind\":\"Event\","
@@ -3403,6 +3416,68 @@ void build_service_endpoints(const models::JsonValue& svc, const std::vector<End
 }
 
 } // namespace
+
+// policy/v1 Eviction (kubectl drain). A running pod that can move, by its
+// spec and its kube32.io/migration policy, gets a Move Checkpoint
+// (docs/migration.md): the Checkpoint controller takes it to another node,
+// where it has a new uid, which is what kubectl drain waits for. Any other
+// pod is deleted as DELETE deletes it, with the Eviction's grace period.
+HttpResponse RouteHandler::handle_pod_eviction(const HttpRequest& req, const RouteMatch& match, mem::MonotonicArena& arena) {
+    if (req.method != HttpMethod::Post) {
+        return make_status(405, "MethodNotAllowed", std::string(http_method_str(req.method)) + " not allowed on " + req.path);
+    }
+    const std::string ns = match.namespace_name.empty() ? "default" : std::string(match.namespace_name);
+    const std::string name(match.resource_name);
+    std::string json;
+    if (!store_.get("/registry/pods/" + ns + "/" + name, json).ok()) {
+        return make_status(404, "NotFound", "pods \"" + name + "\" not found", name, "pods");
+    }
+    models::JsonValue pod;
+    std::string err;
+    models::parse_json(json, pod, err);
+    const models::JsonValue* spec = pod.get("spec");
+    const models::JsonValue* meta = pod.get("metadata");
+    const models::JsonValue* st = pod.get("status");
+    const bool running = spec && meta && st && !spec->get_string("nodeName", "").empty() && st->get_string("phase", "") == "Running" &&
+                         meta->get_string("deletionTimestamp", "").empty();
+    if (running && models::migration_blockers(pod).empty()) {
+        // A pod with a move under way is being evicted already
+        const std::string prefix = std::string(models::kCheckpointPrefix) + ns + "/";
+        std::vector<std::string> checkpoints;
+        store_.list(prefix, checkpoints);
+        bool moving = false;
+        for (const auto& c : checkpoints) {
+            models::JsonValue ck;
+            if (!models::parse_json(c, ck, err)) continue;
+            const models::JsonValue* cs = ck.get("spec");
+            const models::JsonValue* cst = ck.get("status");
+            const std::string phase = cst ? cst->get_string("phase", "") : "";
+            moving |= cs && cs->get_string("podName", "") == name && cs->get_string("action", "") == "Move" &&
+                      (phase.empty() || phase == "Pending" || phase == "Saving" || phase == "Moving");
+        }
+        const std::string ck = name + "-" + models::generate_uid().substr(0, 5);
+        if (!moving && !dry_run()) {
+            storage::Status ps = store_.put(prefix + ck, models::checkpoint_json(ns, ck, name, "Move", "", "eviction"), false);
+            if (!ps.ok()) return store_failure(ps, "checkpoints", ck);
+        }
+        return make_status(201, "", "pods \"" + name + "\" moving to another node");
+    }
+    HttpRequest del = req;
+    del.method = HttpMethod::Delete;
+    del.body.clear();
+    del.query_string.clear();
+    models::JsonValue eviction;
+    if (!req.body.empty() && req.content_type.rfind("application/json", 0) == 0 && models::parse_json(req.body, eviction, err)) {
+        const models::JsonValue* opts = eviction.get("deleteOptions");
+        if (opts && opts->get("gracePeriodSeconds")) del.query_string = "gracePeriodSeconds=" + std::to_string(opts->get_int("gracePeriodSeconds", 30));
+    }
+    RouteMatch item = match;
+    item.category = RouteCategory::PodItem;
+    item.subresource = "";
+    HttpResponse resp = handle_pods(del, item, arena, nullptr);
+    if (resp.status_code != 200) return resp;
+    return make_status(201, "", "pods \"" + name + "\" evicted");
+}
 
 HttpResponse RouteHandler::handle_endpoints(const HttpRequest& req, const RouteMatch& match) {
     const bool slices = (match.category == RouteCategory::EndpointSlicesCollection || match.category == RouteCategory::EndpointSliceItem);

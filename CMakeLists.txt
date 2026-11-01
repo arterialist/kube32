@@ -126,6 +126,7 @@ else()
         src/models/kube_lease.cpp
         src/models/tolerations.cpp
         src/models/device.cpp
+        src/models/migration.cpp
         src/net/network_manager.cpp
         src/net/mdns_discovery.cpp
         src/net/network_policy.cpp

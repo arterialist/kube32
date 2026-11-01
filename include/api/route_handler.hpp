@@ -68,6 +68,7 @@ enum class RouteCategory {
     SecretsCollection,
     SecretItem,
     PodLog,
+    PodEviction,
     MetricsNodes,
     MetricsNodeItem,
     MetricsPods,
@@ -188,6 +189,7 @@ private:
     HttpResponse handle_generic(const HttpRequest& req, const RouteMatch& match, const ResourceInfo& info);
     HttpResponse handle_events(const HttpRequest& req, const RouteMatch& match);
     HttpResponse handle_pod_log(const HttpRequest& req, const RouteMatch& match, osal::Socket* client_sock);
+    HttpResponse handle_pod_eviction(const HttpRequest& req, const RouteMatch& match, mem::MonotonicArena& arena);
     HttpResponse handle_metrics(const HttpRequest& req, const RouteMatch& match);
     HttpResponse handle_image(const HttpRequest& req, const RouteMatch& match, osal::Socket* client_sock);
 

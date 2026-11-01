@@ -65,6 +65,7 @@ set(KUBE32_APP_SRCS
     models/kube_models.cpp
     models/tolerations.cpp
     models/device.cpp
+    models/migration.cpp
     net/mdns_discovery.cpp
     net/network_manager.cpp
     net/network_policy.cpp
@@ -179,6 +180,7 @@ set_source_files_properties(
     ${CMAKE_CURRENT_LIST_DIR}/hal/firmware_slots.cpp
     ${CMAKE_CURRENT_LIST_DIR}/kubelet/firmware_agent.cpp
     ${CMAKE_CURRENT_LIST_DIR}/controller/device_controller.cpp
+    ${CMAKE_CURRENT_LIST_DIR}/models/migration.cpp
     ${CMAKE_CURRENT_LIST_DIR}/models/device.cpp
     ${CMAKE_CURRENT_LIST_DIR}/hal/i2c_discovery.cpp
     PROPERTIES COMPILE_OPTIONS "-Os")
