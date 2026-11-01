@@ -37,7 +37,16 @@ enum class ScoringStrategy {
 
 struct SchedulerConfig {
     ScoringStrategy strategy{ScoringStrategy::LeastAllocated};
+    // The loop runs a pass after a pod changes or a Node changes what the
+    // filters read, at most every reconcile_interval_ms, and every
+    // resync_interval_ms without a change (kube-scheduler's 5 minutes: an
+    // attempt costs about 0.3 s on the board). A pod that does not fit is
+    // tried again after such a change once its back-off is over:
+    // backoff_initial_ms, doubled per attempt up to backoff_max_ms.
     uint32_t reconcile_interval_ms{1000};
+    uint32_t resync_interval_ms{300000};
+    uint32_t backoff_initial_ms{1000};
+    uint32_t backoff_max_ms{10000};
     uint32_t node_heartbeat_timeout_ms{30000};
     float weight_memory{1.0f};
     float weight_gpio{0.5f};
@@ -167,7 +176,9 @@ public:
     // Synchronously evaluates and mutates pod manifest in-place before initial store insertion
     virtual ScheduleResult schedule_pod_manifest(std::string& in_out_pod_json) = 0;
 
-    // Background loop: re-evaluates Pending pods and evicts orphaned pods from dead nodes
+    // One pass of the loop: binds unbound pods (and pods whose node was
+    // deleted) that are due: never tried, changed since their last attempt,
+    // or past their back-off
     virtual void reconcile_cluster() = 0;
 
     virtual void add_predicate(std::shared_ptr<Predicate> predicate) = 0;

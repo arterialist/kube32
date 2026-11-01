@@ -1,6 +1,8 @@
 #include "scheduler/scheduler.hpp"
 #include "api/event_recorder.hpp"
+#include "controller/reconcile_trigger.hpp"
 #include "models/kube_models.hpp"
+#include "osal/system.hpp"
 #include "osal/thread.hpp"
 
 #include <algorithm>
@@ -174,25 +176,18 @@ static bool container_running(const models::JsonValue* status) {
     return true;
 }
 
-// The node's allocatable figures are measured by its kubelet (free heap,
-// free PSRAM, unclaimed pins), so pods it was already running when it last
-// reported are inside them. What the scheduler still has to subtract are the
-// requests of pods bound to the node that the report cannot include yet:
-// pods its kubelet has not started (Pending), containers waiting to restart,
-// and pods that started after the node's last status write (the store's
-// resourceVersion is one global counter, so a pod written after the node
-// is newer than its report).
-ResourceSpec calculate_node_allocated_resources(storage::Store& store, const std::string& node_name, const std::string& exclude_pod_key) {
-    ResourceSpec allocated;
-    uint64_t node_rv = 0;
-    {
-        std::string node_json;
-        models::JsonValue node_doc;
-        std::string err;
-        if (store.get("/registry/nodes/" + node_name, node_json).ok() && models::parse_json(node_json, node_doc, err)) {
-            node_rv = resource_version_of(node_doc);
-        }
-    }
+// The node's allocatable figures are measured by its kubelet (what pods can
+// still be given, unclaimed pins), so pods it was already running when it
+// last reported are inside them. What the scheduler still has to subtract
+// are the requests of pods bound to the node that the report cannot include
+// yet: pods its kubelet has not started (Pending), containers waiting to
+// restart, and pods that started after the node's last status write (the
+// store's resourceVersion is one global counter, so a pod written after the
+// node is newer than its report). One list of the pods serves every node in
+// `node_versions` (name -> the resourceVersion of its last status write).
+static std::map<std::string, ResourceSpec> allocated_by_node(storage::Store& store, const std::map<std::string, uint64_t>& node_versions,
+                                                             const std::string& exclude_pod_key) {
+    std::map<std::string, ResourceSpec> allocated;
     std::vector<std::string> pod_jsons;
     std::vector<std::string> pod_keys;
     store.list_extended("/registry/pods/", pod_jsons, &pod_keys);
@@ -209,8 +204,9 @@ ResourceSpec calculate_node_allocated_resources(storage::Store& store, const std
         const models::JsonValue* spec = doc.get("spec");
         if (!spec || !spec->is_object()) continue;
 
-        std::string assigned_node = spec->get_string("nodeName", "");
-        if (assigned_node != node_name) continue;
+        auto node = node_versions.find(spec->get_string("nodeName", ""));
+        if (node == node_versions.end()) continue;
+        const uint64_t node_rv = node->second;
 
         const models::JsonValue* status = doc.get("status");
         std::string phase = status ? status->get_string("phase", "") : "";
@@ -219,17 +215,31 @@ ResourceSpec calculate_node_allocated_resources(storage::Store& store, const std
         if (reflected) continue;
 
         ResourceSpec req = extract_pod_resource_requests(pod_jsons[i]);
-        allocated.memory_bytes += req.memory_bytes;
-        allocated.gpio_pins += req.gpio_pins;
-        allocated.i2c_buses += req.i2c_buses;
-        allocated.uart_ports += req.uart_ports;
-        allocated.rmt_tx_channels += req.rmt_tx_channels;
-        allocated.rmt_rx_channels += req.rmt_rx_channels;
-        allocated.adc_channels += req.adc_channels;
-        allocated.psram_bytes += req.psram_bytes;
+        ResourceSpec& used = allocated[node->first];
+        used.memory_bytes += req.memory_bytes;
+        used.gpio_pins += req.gpio_pins;
+        used.i2c_buses += req.i2c_buses;
+        used.uart_ports += req.uart_ports;
+        used.rmt_tx_channels += req.rmt_tx_channels;
+        used.rmt_rx_channels += req.rmt_rx_channels;
+        used.adc_channels += req.adc_channels;
+        used.psram_bytes += req.psram_bytes;
     }
 
     return allocated;
+}
+
+ResourceSpec calculate_node_allocated_resources(storage::Store& store, const std::string& node_name, const std::string& exclude_pod_key) {
+    uint64_t node_rv = 0;
+    {
+        std::string node_json;
+        models::JsonValue node_doc;
+        std::string err;
+        if (store.get("/registry/nodes/" + node_name, node_json).ok() && models::parse_json(node_json, node_doc, err)) {
+            node_rv = resource_version_of(node_doc);
+        }
+    }
+    return allocated_by_node(store, {{node_name, node_rv}}, exclude_pod_key)[node_name];
 }
 
 // =============================================================================
@@ -479,10 +489,32 @@ int64_t BestFitScorer::score(const std::string&,
 // Scheduler Implementation
 // =============================================================================
 
+// What the filters read of a Node: its labels, spec (cordon, taints),
+// Ready condition and allocatable resources
+static uint64_t node_fingerprint(const models::JsonValue& node) {
+    const models::JsonValue* meta = node.get("metadata");
+    const models::JsonValue* labels = meta ? meta->get("labels") : nullptr;
+    const models::JsonValue* spec = node.get("spec");
+    const models::JsonValue* status = node.get("status");
+    const models::JsonValue* allocatable = status ? status->get("allocatable") : nullptr;
+    std::string ready;
+    const models::JsonValue* conds = status ? status->get("conditions") : nullptr;
+    if (conds && conds->is_array()) {
+        for (const auto& c : conds->arr_val) {
+            if (c.get_string("type", "") == "Ready") ready = c.get_string("status", "");
+        }
+    }
+    return controller::ReconcileTrigger::hash({labels ? labels->to_string() : std::string(), spec ? spec->to_string() : std::string(), ready,
+                                               allocatable ? allocatable->to_string() : std::string()});
+}
+
 class SchedulerImpl : public Scheduler {
 public:
     SchedulerImpl(storage::Store& store, SchedulerConfig config)
-        : store_(store), config_(config) {
+        : store_(store), config_(config),
+          trigger_(store, controller::ReconcileTriggerConfig{config.reconcile_interval_ms, config.resync_interval_ms}) {
+        trigger_.watch("/registry/pods/");
+        trigger_.watch_fields("/registry/nodes/", node_fingerprint);
         // Default filters, in kube-scheduler's order: node state, placement
         // (name, selector), then resources. The first one a node fails is
         // its reason in the FailedScheduling message.
@@ -528,6 +560,7 @@ public:
     void stop() override {
         if (!running_.load()) return;
         running_.store(false);
+        trigger_.interrupt();
         if (reconcile_thread_) {
             reconcile_thread_->join();
             reconcile_thread_.reset();
@@ -554,7 +587,12 @@ public:
     }
 
     ScheduleResult schedule_pod(const std::string& pod_name, const std::string& pod_namespace) override {
-        std::string pod_key = "/registry/pods/" + pod_namespace + "/" + pod_name;
+        return schedule_key("/registry/pods/" + pod_namespace + "/" + pod_name, nullptr);
+    }
+
+    // Binds the stored pod, or writes why it does not fit when that changed.
+    // `read_version` (optional): the pod's version the attempt started from.
+    ScheduleResult schedule_key(const std::string& pod_key, uint64_t* read_version) {
         std::string pod_json;
         uint64_t version = 0;
 
@@ -567,8 +605,12 @@ public:
                 if (!s.ok()) {
                     return {false, "", "Pod not found in store: " + pod_key};
                 }
+                if (read_version) *read_version = version;
+                const std::string stored = pod_json;
 
                 result = evaluate_and_bind_manifest(pod_json, pod_key);
+                // Still unschedulable for the same reasons: nothing to write
+                if (!result.scheduled && pod_json == stored) return result;
 
                 uint64_t next_ver = 0;
                 put_s = store_.put_extended(pod_key, pod_json, true, true, version, &next_ver);
@@ -587,41 +629,45 @@ public:
     }
 
     void reconcile_cluster() override {
-        // 1. Check for ready nodes in cluster registry
-        std::vector<std::string> node_jsons;
-        store_.list("/registry/nodes/", node_jsons);
+        pass(osal::System::get_uptime_ms(), true);
+    }
 
-        std::set<std::string> ready_nodes;
-        std::set<std::string> existing_nodes;
-        for (const auto& n_json : node_jsons) {
-            osal::Thread::yield();
-            models::JsonValue doc;
-            std::string err;
-            if (!models::parse_json(n_json, doc, err) || !doc.is_object()) continue;
+private:
+    // A pod that did not fit when last tried
+    struct Attempt {
+        uint64_t version{0};   // its resourceVersion then
+        uint64_t changes{0};   // changes_ then
+        uint64_t next_ms{0};   // when its back-off ends
+        uint32_t delay_ms{0};
+    };
 
-            const models::JsonValue* meta = doc.get("metadata");
-            std::string nname = meta ? meta->get_string("name", "") : "";
-            if (nname.empty()) continue;
-
-            existing_nodes.insert(nname);
-
-            const models::JsonValue* status = doc.get("status");
-            const models::JsonValue* conds = status ? status->get("conditions") : nullptr;
-            if (conds && conds->is_array()) {
-                for (const auto& c : conds->arr_val) {
-                    if (c.is_object() && c.get_string("type") == "Ready" && c.get_string("status") == "True") {
-                        ready_nodes.insert(nname);
-                        break;
-                    }
-                }
-            }
+    // Whether the pod at `key` (resourceVersion `version`) is tried in this
+    // pass: never tried, changed since, or past its back-off after a change
+    // in the cluster (or at a resync)
+    bool attempt_due(const std::string& key, uint64_t version, uint64_t now, bool resync) {
+        auto it = attempts_.find(key);
+        if (it == attempts_.end() || it->second.version != version) return true;
+        const Attempt& a = it->second;
+        if (now < a.next_ms) {
+            if (changes_ > a.changes) trigger_.wake_at(a.next_ms);
+            return false;
         }
+        return changes_ > a.changes || resync;
+    }
+
+    void pass(uint64_t now, bool resync) {
+        // 1. Nodes in the cluster registry
+        std::vector<std::string> node_jsons, node_keys;
+        store_.list_extended("/registry/nodes/", node_jsons, &node_keys);
+        std::set<std::string> existing_nodes;
+        for (const auto& k : node_keys) existing_nodes.insert(k.substr(std::string("/registry/nodes/").size()));
 
         // 2. Scan all pods in store
         std::vector<std::string> pod_jsons;
         std::vector<std::string> pod_keys;
         store_.list_extended("/registry/pods/", pod_jsons, &pod_keys);
 
+        std::set<std::string> waiting;   // pods tried and still unbound
         for (size_t i = 0; i < pod_jsons.size(); ++i) {
             osal::Thread::yield();
             models::JsonValue doc;
@@ -630,12 +676,7 @@ public:
 
             const models::JsonValue* spec = doc.get("spec");
             std::string assigned_node = spec ? spec->get_string("nodeName", "") : "";
-            const models::JsonValue* status = doc.get("status");
-            std::string phase = status ? status->get_string("phase", "") : "";
-
             const models::JsonValue* meta = doc.get("metadata");
-            std::string pod_name = meta ? meta->get_string("name", "") : "";
-            std::string pod_ns = meta ? meta->get_string("namespace", "default") : "default";
 
             const models::JsonValue* labels = meta ? meta->get("labels") : nullptr;
             // DaemonSet pods belong to their node; the DaemonSet controller
@@ -644,33 +685,44 @@ public:
             if (is_daemon && !assigned_node.empty() && assigned_node != "<none>") continue;
             if (meta && !meta->get_string("deletionTimestamp", "").empty()) continue; // being torn down
 
-            // Only consider a node "missing" if it was deleted from /registry/nodes/
-            bool node_deleted = (!assigned_node.empty() && assigned_node != "<none>" && existing_nodes.count(assigned_node) == 0);
-
-            if (node_deleted) {
-                // Node was deleted from cluster: evict and re-schedule!
-                schedule_pod(pod_name, pod_ns);
-            } else if (assigned_node.empty() || assigned_node == "<none>") {
-                // Unbound pod (new, or evicted by NodeLifecycleController). A bound
-                // pod stays Pending until its kubelet starts it; it is not re-evaluated.
-                (void)phase;
-                schedule_pod(pod_name, pod_ns);
+            // Unbound (new, or evicted by NodeLifecycleController), or bound to a
+            // node deleted from /registry/nodes/: evict and re-schedule. A bound
+            // pod stays Pending until its kubelet starts it; it is not re-evaluated.
+            const bool unbound = assigned_node.empty() || assigned_node == "<none>";
+            if (!unbound && existing_nodes.count(assigned_node)) continue;
+            const std::string& key = pod_keys[i];
+            if (!attempt_due(key, resource_version_of(doc), now, resync)) {
+                waiting.insert(key);
+                continue;
             }
+            uint64_t version = 0;
+            const ScheduleResult r = schedule_key(key, &version);
+            if (r.scheduled || version == 0) continue;
+            Attempt& a = attempts_[key];
+            a.delay_ms = a.delay_ms ? std::min(a.delay_ms * 2, config_.backoff_max_ms) : config_.backoff_initial_ms;
+            a.version = version;
+            a.changes = changes_;
+            a.next_ms = now + a.delay_ms;
+            waiting.insert(key);
+        }
+        // Pods bound or gone since
+        for (auto it = attempts_.begin(); it != attempts_.end();) {
+            it = waiting.count(it->first) ? std::next(it) : attempts_.erase(it);
         }
     }
 
-private:
     void run_reconcile_loop() {
         while (running_.load()) {
-            osal::Thread::sleep_ms(config_.reconcile_interval_ms);
-            if (!running_.load()) break;
             // An allocation failure while parsing objects must not take the
             // node down; the next pass retries once memory is back.
             try {
-                reconcile_cluster();
+                const uint32_t why = trigger_.due(osal::System::get_uptime_ms());
+                if (why & controller::ReconcileTrigger::kChange) ++changes_;
+                if (why) pass(osal::System::get_uptime_ms(), (why & controller::ReconcileTrigger::kResync) != 0);
             } catch (const std::exception& e) {
                 std::cout << "[SCHED] reconcile skipped: " << e.what() << std::endl;
             }
+            trigger_.wait(osal::System::get_uptime_ms(), config_.resync_interval_ms);
         }
     }
 
@@ -697,15 +749,28 @@ private:
         std::vector<Candidate> qualified;
         std::map<std::string, size_t> reasons;   // why nodes were filtered out, with counts
 
-        for (const auto& n_json : node_jsons) {
-            models::JsonValue n_doc;
-            if (!models::parse_json(n_json, n_doc, err) || !n_doc.is_object()) { reasons["node(s) could not be read"]++; continue; }
+        // What the pods bound to each node take that its report does not
+        // include yet: one list of the pods for all nodes
+        std::vector<models::JsonValue> n_docs(node_jsons.size());
+        std::map<std::string, uint64_t> node_versions;
+        for (size_t i = 0; i < node_jsons.size(); ++i) {
+            if (!models::parse_json(node_jsons[i], n_docs[i], err) || !n_docs[i].is_object()) continue;
+            const models::JsonValue* meta = n_docs[i].get("metadata");
+            const std::string nname = meta ? meta->get_string("name", "") : "";
+            if (!nname.empty()) node_versions[nname] = resource_version_of(n_docs[i]);
+        }
+        std::map<std::string, ResourceSpec> used_by_node = allocated_by_node(store_, node_versions, exclude_pod_key);
+
+        for (size_t i = 0; i < node_jsons.size(); ++i) {
+            const std::string& n_json = node_jsons[i];
+            const models::JsonValue& n_doc = n_docs[i];
+            if (!n_doc.is_object()) { reasons["node(s) could not be read"]++; continue; }
             const models::JsonValue* meta = n_doc.get("metadata");
             std::string nname = meta ? meta->get_string("name", "") : "";
             if (nname.empty()) { reasons["node(s) could not be read"]++; continue; }
 
             ResourceSpec node_alloc = extract_node_allocatable(n_json);
-            ResourceSpec node_used = calculate_node_allocated_resources(store_, nname, exclude_pod_key);
+            const ResourceSpec& node_used = used_by_node[nname];
 
             bool passes = true;
             std::string reason;
@@ -880,6 +945,9 @@ private:
     std::vector<std::pair<std::shared_ptr<Scorer>, float>> scorers_;
     std::unique_ptr<osal::Thread> reconcile_thread_;
     std::atomic<bool> running_{false};
+    controller::ReconcileTrigger trigger_;
+    std::map<std::string, Attempt> attempts_;   // unbound pods that did not fit (loop thread)
+    uint64_t changes_{0};                       // passes a change made due (loop thread)
 };
 
 std::unique_ptr<Scheduler> create_scheduler(storage::Store& store, SchedulerConfig config) {
