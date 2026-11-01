@@ -1,7 +1,7 @@
 #pragma once
 
-// Pod migration (docs/migration.md): the annotations that steer it, what in a
-// pod spec keeps a pod from moving, and the Checkpoint objects
+// Pod migration (docs/migration.md): the annotations that steer it and the
+// Checkpoint objects
 // (kube32.io/v1, /registry/checkpoints/<namespace>/<name>) that the eviction
 // API and the Checkpoint controller create.
 
@@ -28,14 +28,6 @@ constexpr const char* kCheckpointPrefix = "/registry/checkpoints/";
 enum class MigrationPolicy { OnDrain, Never, Auto };
 
 MigrationPolicy migration_policy(const JsonValue& pod);
-
-// What in the pod's spec keeps it from moving, one short line each: grants
-// of hardware (hardware.kube32.io/* other than ipc, esp32.io/* other than
-// psram, kube32.io/i2c-device, device capabilities), volumes on node
-// storage, a DaemonSet owner, and with `for_move` the annotation
-// kube32.io/migration: Never. The node adds what only it knows (an entry
-// point, an open file, a call that does not return).
-std::vector<std::string> migration_blockers(const JsonValue& pod, bool for_move = true);
 
 // "60s", "2m", "1h", "500ms" or milliseconds; 0 when it is none of these
 uint64_t parse_duration_ms(const std::string& text);

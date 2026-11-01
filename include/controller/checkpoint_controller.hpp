@@ -119,12 +119,15 @@ private:
     // A checkpoint of pod `ns/pod` under way (`started_only`: Saving or Moving)
     static bool busy(const std::vector<Ckpt>& cks, const std::string& ns, const std::string& pod, bool started_only);
     static std::string container_of(const Ckpt& ck, const models::JsonValue& pod);
+    // What keeps the pod from moving: runtime::static_migration_blockers, and
+    // the entry point of an embedded module
+    static std::vector<std::string> blockers(const std::string& json, const models::JsonValue& pod);
     void begin(Ckpt& ck, Pods& pods, const std::vector<Node>& nodes, uint64_t now);
     void watch_move(Ckpt& ck, Pods& pods, const std::vector<Node>& nodes, uint64_t now);
     void fail(Ckpt& ck, const std::string& message, const std::vector<std::string>& blockers = {});
     // fail(), and for a move the eviction API asked for, the eviction
     void give_up(Ckpt& ck, const std::string& message, const std::vector<std::string>& blockers = {});
-    void finish_restores(Pods& pods, const std::vector<Ckpt>& cks);
+    void finish_restores(Pods& pods, const std::vector<Node>& nodes, const std::vector<Ckpt>& cks);
     void policies(Pods& pods, const std::vector<Node>& nodes, const std::vector<Ckpt>& cks, uint64_t now);
     void retention(Pods& pods, const std::vector<Ckpt>& cks, uint64_t now);
     std::string pick_target(const Ckpt& ck, const models::JsonValue& pod, const std::vector<Node>& nodes, std::string& why);
@@ -135,12 +138,12 @@ private:
     bool thaw(const Node* node, const std::string& ns, const std::string& pod, const std::string& container);
     bool edit(const std::string& key, mem::FunctionRef<bool(models::JsonValue&)> change);
     // Replaces the pod at `key` (uid `uid`): a new uid, bound to `node` (or
-    // unbound), restored from checkpoint `restore_from`
+    // unbound), restored from checkpoint `restore_from` (empty: started afresh)
     bool rebind(const std::string& key, const std::string& node, const std::string& restore_from, const std::string& uid, std::string* new_uid);
     bool strip_restore(const std::string& key);
-    // Sets the non-empty strings, the numbers and the blockers in the status
+    // Sets the non-empty strings and the blockers in the status
     bool update_status(const std::string& key, std::initializer_list<std::pair<const char*, std::string_view>> strs,
-                       std::initializer_list<std::pair<const char*, double>> nums = {}, const std::vector<std::string>* blockers = nullptr);
+                       const std::vector<std::string>* blockers = nullptr);
     void create(const std::string& ns, const std::string& pod, const char* action, const std::string& target, const char* trigger);
     void pod_event(const std::string& ns, const std::string& name, const std::string& uid, const char* reason, const std::string& message,
                    bool warning);

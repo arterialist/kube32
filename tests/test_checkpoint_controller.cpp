@@ -12,10 +12,12 @@
 #include "controller/checkpoint_controller.hpp"
 #include "controller/deployment_controller.hpp"
 #include "controller/node_lifecycle_controller.hpp"
+#include "embedded/embedded_blobs.hpp"
 #include "mem/monotonic_arena.hpp"
 #include "models/kube_models.hpp"
 #include "models/migration.hpp"
 #include "osal/socket.hpp"
+#include "runtime/image_registry.hpp"
 #include "scheduler/scheduler.hpp"
 #include "storage/store.hpp"
 
@@ -253,12 +255,9 @@ void test_save() {
     CHECK(has(reqs, "PUT /apis/kube32.io/v1/namespaces/default/checkpoints/s1/data"));
     CHECK(g_node->data["s1"] == g_node->checkpoint_body);
     const JsonValue st = *c.ck("s1").get("status");
+    // The data API writes the snapshot's facts (sizeBytes, snapshotSha256, ...)
     CHECK(st.get_string("phase", "") == "Saved");
     CHECK(st.get_string("nodeName", "") == "node-a");
-    CHECK(st.get_int("sizeBytes", 0) == static_cast<int64_t>(g_node->checkpoint_body.size()));
-    CHECK(st.get_string("imageSha256", "") == std::string(64, 'a'));
-    CHECK(st.get_string("snapshotSha256", "") == std::string(64, 'b'));
-    CHECK(st.get_int("podTimeMs", 0) == 4242);
     CHECK(!st.get_string("takenAt", "").empty());
     // The pod is where it was, the same object
     CHECK(node_of(c.pod("echo")) == "node-a" && uid_of(c.pod("echo")) == "uid-echo");
@@ -419,6 +418,15 @@ void test_blockers() {
     JsonValue held = c.ck("b1");
     const JsonValue* b = held.get("status")->get("blockers");
     CHECK(b && b->arr_val.size() == 1 && b->arr_val[0].str_val == "grant esp32.io/gpio-2");
+    // An embedded module with an entry point
+    c.put("/registry/pods/default/main", R"({"kind":"Pod","metadata":{"name":"main","namespace":"default","uid":"uid-main"},)"
+                                         R"("spec":{"nodeName":"node-a","containers":[{"name":"app","image":"wasm://embedded/i2cscan"}]},)" + kRunning + "}");
+    c.checkpoint("b0", "main", "Move");
+    c.pass();
+    held = c.ck("b0");
+    b = held.get("status")->get("blockers");
+    CHECK(c.phase("b0") == "Failed" && b && b->arr_val.size() == 1 && b->arr_val[0].str_val.rfind("entry point ", 0) == 0);
+    CHECK(!has(g_node->take(), "POST /checkpoint/"));
     // From the node: an open file
     c.put("/registry/pods/default/echo", pod_json("echo", "node-a"));
     g_node->checkpoint_status = 409;
@@ -433,14 +441,14 @@ void test_blockers() {
     b = held.get("status")->get("blockers");
     CHECK(b && b->arr_val.size() == 1 && b->arr_val[0].str_val == "open file notes.txt (descriptor 3)");
     CHECK(node_of(c.pod("echo")) == "node-a");
-    // Never: moves refused, a Save allowed
+    // Never: neither moved nor saved
     c.put("/registry/pods/default/keep", pod_json("keep", "node-a", R"("kube32.io/migration":"Never")"));
     c.checkpoint("b3", "keep", "Move");
     c.pass();
     CHECK(c.phase("b3") == "Failed");
     c.checkpoint("b4", "keep", "Save");
     c.pass();
-    CHECK(c.phase("b4") == "Saved");
+    CHECK(c.phase("b4") == "Failed");
     std::cout << "[PASS] Blockers from the spec and from the node: refused and named, the pod stays" << std::endl;
 }
 
@@ -484,7 +492,7 @@ void test_interrupted_saving() {
 void test_eviction_api() {
     Cluster c({node_json("node-a"), node_json("node-b")});
     c.put("/registry/pods/default/echo", pod_json("echo", "node-a"));
-    c.put("/registry/pods/default/drv", pod_json("drv", "node-a", "", R"("memory":"16Ki","hardware.kube32.io/tft":"1")"));
+    c.put("/registry/pods/default/drv", pod_json("drv", "node-a", "", R"("memory":"16Ki","esp32.io/gpio-4":"1")"));
     c.put("/registry/pods/default/keep", pod_json("keep", "node-a", R"("kube32.io/migration":"Never")"));
     CHECK(c.call(api::HttpMethod::Post, "/api/v1/namespaces/default/pods/nope/eviction").status_code == 404);
     CHECK(c.call(api::HttpMethod::Get, "/api/v1/namespaces/default/pods/echo/eviction").status_code == 405);
@@ -606,11 +614,15 @@ void test_restore_after_node_loss() {
 void test_restore_failure_starts_afresh() {
     Cluster c({node_json("node-a"), node_json("node-b")});
     c.put("/registry/pods/default/echo", pod_json("echo", "node-b", R"("kube32.io/restore-from":"gone")"));
-    c.report("echo", R"({"phase":"Running","containerStatuses":[{"name":"app","state":{"waiting":{"reason":"RestoreError","message":"no such checkpoint"}}}]})");
+    // As the kubelet ends it: Failed, terminated with RestoreError, not restarted
+    c.report("echo", R"({"phase":"Failed","containerStatuses":[{"name":"app","state":{"terminated":{"reason":"RestoreError","message":"no data"}}}]})");
     c.pass();
-    CHECK(c.annotation(c.pod("echo"), models::kAnnotationRestoreFrom).empty());
+    const JsonValue p = c.pod("echo");
+    CHECK(c.annotation(p, models::kAnnotationRestoreFrom).empty());
+    CHECK(uid_of(p) != "uid-echo" && node_of(p) == "node-b");
+    CHECK(p.get("status")->get_string("phase", "") == "Pending");
     CHECK(c.event("MoveFailed", "starts afresh"));
-    std::cout << "[PASS] A restore that fails outside a move: the annotation goes, the container starts afresh" << std::endl;
+    std::cout << "[PASS] A restore that fails outside a move: the pod is replaced without the annotation and starts afresh" << std::endl;
 }
 
 void test_memory_pressure() {
@@ -676,15 +688,14 @@ void test_policy_parsing() {
     CHECK(models::parse_duration_ms("60s") == 60000 && models::parse_duration_ms("2m") == 120000 && models::parse_duration_ms("1h") == 3600000);
     CHECK(models::parse_duration_ms("500ms") == 500 && models::parse_duration_ms("750") == 750 && models::parse_duration_ms("x") == 0);
     CHECK(models::parse_duration_ms("5d") == 0);
-    JsonValue p = parse(pod_json("p", "n", R"("kube32.io/i2c-device":"0:0x77")", R"("memory":"16Ki","esp32.io/psram":"64Ki","hardware.kube32.io/ipc":"1")"));
-    auto b = models::migration_blockers(p);
-    CHECK(b.size() == 1 && b[0] == "grant kube32.io/i2c-device");
-    p = parse(R"({"metadata":{"name":"p","ownerReferences":[{"kind":"DaemonSet","name":"ds"}]},"spec":{"volumes":[{"name":"data","persistentVolumeClaim":{"claimName":"notes"}}],)"
-              R"("containers":[{"name":"a","securityContext":{"capabilities":{"add":["CHANNEL_IPC","DISPLAY"]}}}]}})");
-    b = models::migration_blockers(p);
-    CHECK(b.size() == 3);
     CHECK(models::migration_policy(parse(pod_json("p", "n"))) == models::MigrationPolicy::OnDrain);
-    std::cout << "[PASS] Durations, policies and blockers read from a pod spec" << std::endl;
+    CHECK(models::migration_policy(parse(pod_json("p", "n", R"("kube32.io/migration":"Auto")"))) == models::MigrationPolicy::Auto);
+    CHECK(models::migration_policy(parse(pod_json("p", "n", R"("kube32.io/migration":"Never")"))) == models::MigrationPolicy::Never);
+    const JsonValue ck = parse(models::checkpoint_json("ns", "c1", "pod", "Move", "node-b", "eviction"));
+    CHECK(ck.get("spec")->get("target")->get_string("nodeName", "") == "node-b");
+    CHECK(ck.get("metadata")->get("labels")->get_string(models::kLabelTrigger, "") == "eviction");
+    CHECK(ck.get("status")->get_string("phase", "") == "Pending");
+    std::cout << "[PASS] Durations, policies and Checkpoint objects" << std::endl;
 }
 
 // On its own thread: no pass while nothing it reads changes (heartbeats,
@@ -725,6 +736,9 @@ void test_event_driven() {
 } // namespace
 
 int main() {
+    size_t n = 0;
+    const runtime::EmbeddedImage* imgs = embedded::images(n);
+    runtime::ImageRegistry::instance().add_all(imgs, n);
     FakeNode node;
     node.start();
     g_node = &node;

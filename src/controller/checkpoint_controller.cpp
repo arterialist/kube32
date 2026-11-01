@@ -3,6 +3,9 @@
 #include "models/kube_models.hpp"
 #include "models/migration.hpp"
 #include "osal/socket.hpp"
+#include "runtime/image_registry.hpp"
+#include "runtime/pod_snapshot.hpp"
+#include "runtime/wasm_runtime.hpp"
 #include "osal/system.hpp"
 
 #include <algorithm>
@@ -114,30 +117,23 @@ std::string message_of(const std::string& text) {
     return text.substr(0, 200);
 }
 
-// A PUT whose body is written as it arrives: Content-Length when the length
-// is known, chunked otherwise
+// A PUT whose body of `length` bytes is written as it arrives
 class Upload {
 public:
     bool begin(const std::string& host, uint16_t port, const std::string& token, const std::string& path, long length) {
-        chunked_ = length < 0;
-        const std::string head = str_cat({"PUT ", path, " HTTP/1.1\r\nHost: ", host, "\r\nContent-Type: application/octet-stream\r\n",
-                                          chunked_ ? "Transfer-Encoding: chunked" : "Content-Length: ", chunked_ ? "" : std::to_string(length),
-                                          "\r\n", token.empty() ? "" : "Authorization: Bearer ", token, token.empty() ? "" : "\r\n",
-                                          "Connection: close\r\n\r\n"});
+        const std::string head = str_cat({"PUT ", path, " HTTP/1.1\r\nHost: ", host, "\r\nContent-Type: application/octet-stream\r\nContent-Length: ",
+                                          std::to_string(length), "\r\n", token.empty() ? "" : "Authorization: Bearer ", token,
+                                          token.empty() ? "" : "\r\n", "Connection: close\r\n\r\n"});
         ok_ = sock_.create(osal::SocketType::Tcp) && sock_.set_timeout(15000, 15000) && sock_.connect(host.c_str(), port) &&
               sock_.send_all(head.data(), head.size());
         return ok_;
     }
     bool write(const char* p, size_t n) {
-        if (!ok_ || n == 0) return ok_;
-        char line[20];
-        const int l = snprintf(line, sizeof(line), "%zx\r\n", n);
-        ok_ = (!chunked_ || sock_.send_all(line, static_cast<size_t>(l))) && sock_.send_all(p, n) && (!chunked_ || sock_.send_all("\r\n", 2));
+        ok_ = ok_ && sock_.send_all(p, n);
         return ok_;
     }
     // The answer's status (0 without one), its body's start in `text`
     int finish(std::string& text) {
-        if (chunked_ && ok_) sock_.send_all("0\r\n\r\n", 5);
         std::string in;
         char buf[256];
         for (ssize_t n; in.size() < 1024 && (n = sock_.recv(buf, sizeof(buf))) > 0;) in.append(buf, static_cast<size_t>(n));
@@ -149,7 +145,6 @@ public:
 
 private:
     osal::Socket sock_;
-    bool chunked_{false};
     bool ok_{false};
 };
 
@@ -185,13 +180,18 @@ struct CheckpointController::Pods {
         }
         return d.is_object() ? &d : nullptr;
     }
+    size_t find(const std::string& key) const {
+        if (std::find(touched.begin(), touched.end(), key) != touched.end()) return keys.size();
+        return static_cast<size_t>(std::find(keys.begin(), keys.end(), key) - keys.begin());
+    }
     // The pod at `key`, null when it is gone or was written in this pass
     const JsonValue* get(const std::string& key) {
-        if (std::find(touched.begin(), touched.end(), key) != touched.end()) return nullptr;
-        for (size_t i = 0; i < keys.size(); ++i) {
-            if (keys[i] == key) return at(i);
-        }
-        return nullptr;
+        const size_t i = find(key);
+        return i < keys.size() ? at(i) : nullptr;
+    }
+    const std::string* json(const std::string& key) {
+        const size_t i = find(key);
+        return i < keys.size() ? &jsons[i] : nullptr;
     }
 };
 
@@ -199,7 +199,7 @@ struct CheckpointController::Snapshot {
     bool ok{false};
     bool maybe_frozen{false};   // the node may hold the pod frozen still
     uint64_t bytes{0};
-    std::string image_sha256, snapshot_sha256, pod_time_ms, error;
+    std::string error;
     std::vector<std::string> blockers;
 };
 
@@ -345,7 +345,7 @@ void CheckpointController::reconcile(uint64_t now) {
         if (ck.action == "Move" && pod) thaw(node(nodes, ck.node), ck.ns, ck.pod, container_of(ck, *pod));
         fail(ck, "interrupted: the control plane restarted while the snapshot was taken");
     }
-    finish_restores(pods, cks);
+    finish_restores(pods, nodes, cks);
     policies(pods, nodes, cks, now);
     retention(pods, cks, now);
 
@@ -358,6 +358,16 @@ void CheckpointController::reconcile(uint64_t now) {
         if (!next || (next_periodic && !periodic) || (next_periodic == periodic && ck.version < next->version)) next = &ck;
     }
     if (next) begin(*next, pods, nodes, now);
+}
+
+std::vector<std::string> CheckpointController::blockers(const std::string& json, const JsonValue& pod) {
+    std::vector<std::string> out = runtime::static_migration_blockers(json);
+    const JsonValue* spec = pod.get("spec");
+    const JsonValue* cs = spec ? spec->get("containers") : nullptr;
+    const runtime::EmbeddedImage* img = cs && cs->is_array() && !cs->arr_val.empty()
+        ? runtime::ImageRegistry::instance().resolve(cs->arr_val[0].get_string("image", "")) : nullptr;
+    if (const char* entry = img ? runtime::module_entry_point(img->data, img->len) : nullptr) out.push_back(str_cat({"entry point ", entry, " runs on its own thread"}));
+    return out;
 }
 
 bool CheckpointController::busy(const std::vector<Ckpt>& cks, const std::string& ns, const std::string& pod, bool started_only) {
@@ -375,7 +385,7 @@ std::string CheckpointController::container_of(const Ckpt& ck, const JsonValue& 
 }
 
 void CheckpointController::fail(Ckpt& ck, const std::string& message, const std::vector<std::string>& blockers) {
-    update_status(ck.key, {{"phase", "Failed"}, {"message", message}, {"finishedAt", now_text(wall_ms())}}, {}, &blockers);
+    update_status(ck.key, {{"phase", "Failed"}, {"message", message}, {"finishedAt", now_text(wall_ms())}}, &blockers);
     ck.phase = "Failed";
     printf("[CKPT] %s/%s failed: %s\n", ck.ns.c_str(), ck.name.c_str(), message.c_str());
 }
@@ -415,8 +425,8 @@ void CheckpointController::begin(Ckpt& ck, Pods& pods, const std::vector<Node>& 
     }
     const std::string container = container_of(ck, *pod);
     if (container.empty()) return give_up(ck, str_cat({"pod ", ck.pod, " has several containers: set spec.containerName"}));
-    const std::vector<std::string> blockers = models::migration_blockers(*pod, move);
-    if (!blockers.empty()) return give_up(ck, move ? "the pod cannot move" : "the pod cannot be checkpointed", blockers);
+    const std::vector<std::string> found = blockers(*pods.json(pod_key), *pod);
+    if (!found.empty()) return give_up(ck, move ? "the pod cannot move" : "the pod cannot be checkpointed", found);
     std::string target, why;
     if (move && (target = pick_target(ck, *pod, nodes, why)).empty()) return give_up(ck, "no node fits: " + why);
     const Node* src = node(nodes, source);
@@ -434,12 +444,10 @@ void CheckpointController::begin(Ckpt& ck, Pods& pods, const std::vector<Node>& 
         pod_event(ck.ns, ck.pod, uid, move ? "MoveFailed" : "CheckpointFailed", text, true);
         return give_up(ck, s.error, s.blockers);
     }
+    // The data upload wrote sizeBytes, snapshotSha256, imageSha256 and podTimeMs
     const std::string taken = now_text(wall_ms()), size = std::to_string(s.bytes);
-    const std::initializer_list<std::pair<const char*, double>> nums = {
-        {"sizeBytes", static_cast<double>(s.bytes)}, {"podTimeMs", static_cast<double>(std::strtoull(s.pod_time_ms.c_str(), nullptr, 10))}};
     if (!move) {
-        update_status(ck.key, {{"phase", "Saved"}, {"imageSha256", s.image_sha256}, {"snapshotSha256", s.snapshot_sha256}, {"takenAt", taken},
-                               {"finishedAt", taken}}, nums);
+        update_status(ck.key, {{"phase", "Saved"}, {"takenAt", taken}, {"finishedAt", taken}});
         ck.phase = "Saved";
         pod_event(ck.ns, ck.pod, uid, "Checkpointed", str_cat({"Saved checkpoint ", ck.name, " on node ", source, ": ", size, " bytes in ", took}), false);
         return;
@@ -453,8 +461,7 @@ void CheckpointController::begin(Ckpt& ck, Pods& pods, const std::vector<Node>& 
     }
     pods.touched.push_back(pod_key);
     moving_since_[ck.uid] = now;
-    update_status(ck.key, {{"phase", "Moving"}, {"imageSha256", s.image_sha256}, {"snapshotSha256", s.snapshot_sha256}, {"takenAt", taken},
-                           {"newPodName", ck.pod}, {"message", "restoring on node " + target}}, nums);
+    update_status(ck.key, {{"phase", "Moving"}, {"takenAt", taken}, {"newPodName", ck.pod}, {"message", "restoring on node " + target}});
     ck.phase = "Moving";
     pod_event(ck.ns, ck.pod, new_uid, "Moving",
               str_cat({"Moving from node ", source, " to node ", target, " with checkpoint ", ck.name, " (", size, " bytes, taken in ", took, ")"}), false);
@@ -497,7 +504,7 @@ void CheckpointController::watch_move(Ckpt& ck, Pods& pods, const std::vector<No
     pod_event(ck.ns, ck.pod, rebound ? new_uid : uid, "MoveFailed", str_cat({"Checkpoint ", ck.name, ": ", message}), true);
 }
 
-void CheckpointController::finish_restores(Pods& pods, const std::vector<Ckpt>& cks) {
+void CheckpointController::finish_restores(Pods& pods, const std::vector<Node>& nodes, const std::vector<Ckpt>& cks) {
     const uint64_t wall = wall_ms();
     for (size_t i = 0; i < pods.jsons.size(); ++i) {
         if (pods.jsons[i].find(models::kAnnotationRestoreFrom) == std::string::npos) continue;
@@ -524,8 +531,14 @@ void CheckpointController::finish_restores(Pods& pods, const std::vector<Ckpt>& 
                 age = str_cat({", taken ", seconds(osal::System::get_uptime_ms() - seen->second), " ago"});
             }
             pod_event(ns, name, uid, "Restored", str_cat({"Restored from checkpoint ", from, age, " on node ", field(*pod, "spec", "nodeName")}), false);
-        } else if (const std::string why = restore_failure(*pod); !why.empty() && strip_restore(pods.keys[i])) {
-            pod_event(ns, name, uid, "MoveFailed", str_cat({"Restore from checkpoint ", from, " failed (", why, "): the container starts afresh"}), true);
+        } else if (const std::string why = restore_failure(*pod); !why.empty()) {
+            // The kubelet does not restart it: a replacement without the annotation starts afresh
+            const Node* at = node(nodes, field(*pod, "spec", "nodeName"));
+            const std::string message = str_cat({"Restore from checkpoint ", from, " failed (", why, "): the pod starts afresh"});
+            std::string new_uid;
+            if (rebind(pods.keys[i], at && at->ready ? at->name : std::string(), std::string(), uid, &new_uid)) {
+                pod_event(ns, name, new_uid, "MoveFailed", message, true);
+            }
         }
     }
 }
@@ -584,7 +597,7 @@ void CheckpointController::policies(Pods& pods, const std::vector<Node>& nodes, 
         const std::string& at = field(*pod, "spec", "nodeName");
         const std::string key = str_cat({ns, "/", name});
         const models::MigrationPolicy policy = models::migration_policy(*pod);
-        if (busy(cks, ns, name, false) || policy == models::MigrationPolicy::Never || !models::migration_blockers(*pod, false).empty()) continue;
+        if (busy(cks, ns, name, false) || policy == models::MigrationPolicy::Never || !blockers(j, *pod).empty()) continue;
         const uint64_t interval = models::parse_duration_ms(annotation(*pod, models::kAnnotationCheckpointInterval));
         if (const uint64_t every = std::max<uint64_t>(interval, config_.min_interval_ms); interval) {
             auto last = last_periodic_.find(key);
@@ -688,11 +701,12 @@ CheckpointController::Snapshot CheckpointController::take_snapshot(const Node& n
         [&](int st, std::string_view head) {
             code = st;
             if (st != 200) return true;
-            s.image_sha256 = header(head, "X-Kube32-Image-Sha256");
-            s.snapshot_sha256 = header(head, "X-Kube32-Snapshot-Sha256");
-            s.pod_time_ms = header(head, "X-Kube32-Pod-Time-Ms");
             const std::string cl = header(head, "Content-Length");
-            if (!cl.empty()) length = std::strtol(cl.c_str(), nullptr, 10);
+            length = cl.empty() ? -1 : std::strtol(cl.c_str(), nullptr, 10);
+            if (length < 0) {
+                s.error = "the kubelet sent the snapshot without a Content-Length";
+                return false;
+            }
             if (up.begin(config_.api_host, config_.api_port, config_.token,
                          str_cat({"/apis/kube32.io/v1/namespaces/", ck.ns, "/checkpoints/", ck.name, "/data"}), length)) {
                 return true;
@@ -713,7 +727,7 @@ CheckpointController::Snapshot CheckpointController::take_snapshot(const Node& n
         std::string answer;
         const int put = s.error.empty() ? up.finish(answer) : 0;
         if (!s.error.empty()) return s;
-        if (length >= 0 && s.bytes != static_cast<uint64_t>(length)) {
+        if (s.bytes != static_cast<uint64_t>(length)) {
             s.error = str_cat({"the snapshot ended after ", std::to_string(s.bytes), " of ", std::to_string(length), " bytes"});
         } else if (put < 200 || put >= 300) {
             s.error = str_cat({"the API server did not store the checkpoint data (", put ? str_cat({"HTTP ", std::to_string(put), ": ", message_of(answer)}) : "no answer", ")"});
@@ -728,6 +742,7 @@ CheckpointController::Snapshot CheckpointController::take_snapshot(const Node& n
     const JsonValue* b = body.is_object() ? body.get("blockers") : nullptr;
     for (size_t i = 0; b && b->is_array() && i < b->arr_val.size(); ++i) s.blockers.push_back(b->arr_val[i].str_val);
     s.error = status == 409   ? std::string("the pod cannot move")
+              : status == 504 ? std::string("the pod could not be frozen in time")
               : status == 404 ? str_cat({"node ", node.name, " does not run container ", container, " of pod ", ck.pod})
               : status == 0   ? "no answer from the kubelet of node " + node.name
                               : str_cat({"the kubelet of node ", node.name, " answered HTTP ", std::to_string(status), message.empty() ? "" : ": ", message});
@@ -767,7 +782,8 @@ bool CheckpointController::rebind(const std::string& key, const std::string& nod
         set_str(meta, "uid", *new_uid);
         const std::string now = models::now_rfc3339();
         if (!now.empty()) set_str(meta, "creationTimestamp", now);
-        set_str(child(meta, "annotations"), models::kAnnotationRestoreFrom, restore_from);
+        if (restore_from.empty()) child(meta, "annotations").remove(models::kAnnotationRestoreFrom);
+        else set_str(child(meta, "annotations"), models::kAnnotationRestoreFrom, restore_from);
         set_str(child(doc, "spec"), "nodeName", node);
         // Pending, as the scheduler leaves a pod it bound
         std::string err;
@@ -783,13 +799,12 @@ bool CheckpointController::strip_restore(const std::string& key) {
 }
 
 bool CheckpointController::update_status(const std::string& key, std::initializer_list<std::pair<const char*, std::string_view>> strs,
-                                         std::initializer_list<std::pair<const char*, double>> nums, const std::vector<std::string>* list) {
+                                         const std::vector<std::string>* list) {
     return edit(key, [&](JsonValue& doc) {
         JsonValue& st = child(doc, "status");
         for (const auto& kv : strs) {
             if (!kv.second.empty()) set_str(st, kv.first, kv.second);
         }
-        for (const auto& kv : nums) st.set(kv.first, JsonValue{models::JsonType::Number, false, kv.second, "", {}, {}});
         if (list && !list->empty()) {
             JsonValue arr;
             arr.type = models::JsonType::Array;

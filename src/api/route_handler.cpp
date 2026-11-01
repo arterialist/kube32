@@ -12,6 +12,7 @@
 #include "models/tolerations.hpp"
 #include "net/network_policy.hpp"
 #include "runtime/pod_log.hpp"
+#include "runtime/pod_snapshot.hpp"
 #include "storage/persist_policy.hpp"
 #include "api/protobuf_body.hpp"
 #include "osal/socket.hpp"
@@ -3490,7 +3491,7 @@ HttpResponse RouteHandler::handle_pod_eviction(const HttpRequest& req, const Rou
     const models::JsonValue* st = pod.get("status");
     const models::JsonValue* spec = pod.get("spec");
     if (meta && st && spec && !spec->get_string("nodeName", "").empty() && st->get_string("phase", "") == "Running" &&
-        meta->get_string("deletionTimestamp", "").empty() && models::migration_blockers(pod).empty()) {
+        meta->get_string("deletionTimestamp", "").empty() && runtime::static_migration_blockers(json).empty()) {
         // One Move per pod object, named after its uid: evicting it again finds the Move
         std::string id;
         for (char c : meta->get_string("uid", "")) {
