@@ -94,6 +94,10 @@ enum class RouteCategory {
     DevicesCollection,
     DeviceItem,
     DeviceStatus,
+    // kube32.io/v1 Checkpoints; their data is served by api/checkpoint_api.hpp
+    CheckpointsCollection,
+    CheckpointItem,
+    CheckpointStatus,
     // /apis/kube32.io/v1/images/<sha256>: a module pods carried inline
     // (api/inline_images.hpp)
     WasmImage,

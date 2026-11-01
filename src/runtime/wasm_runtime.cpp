@@ -8,6 +8,7 @@
 #include "ipc/channel.hpp"
 #include "runtime/k32_app_abi.h"
 #include "runtime/pod_memory_pool.h"
+#include "runtime/interp_kernel.hpp"
 #include "osal/mutex.hpp"
 
 #include "wasm3.h"
@@ -612,6 +613,43 @@ uint32_t module_stack_need_bytes(const M3Module* module) {
     if (most == 0) return 0;
     // op_Entry requires the frame to end below the stack's end: one slot more
     return (most + 1) * static_cast<uint32_t>(sizeof(m3slot_t));
+}
+
+double measure_interp_mops() {
+    IM3Environment env = m3_NewEnvironment();
+    if (!env) return 0;
+    IM3Runtime rt = m3_NewRuntime(env, 1024, nullptr);
+    IM3Module mod = nullptr;
+    IM3Function fn = nullptr;
+    double mops = 0;
+    if (rt && !m3_ParseModule(env, &mod, kInterpKernel, sizeof(kInterpKernel))) {
+        if (m3_LoadModule(rt, mod)) {
+            m3_FreeModule(mod);
+        } else if (!m3_FindFunction(&fn, rt, "run")) {
+            // Timed where pods run: on the shared interpreter stack when there is one
+            auto timed = [&](uint32_t n) {
+                uint64_t us = 0;
+                run_on_interpreter_stack([&]() {
+                    const uint64_t t0 = osal::Thread::get_time_us();
+                    m3_CallV(fn, n);
+                    us = osal::Thread::get_time_us() - t0;
+                });
+                return us;
+            };
+            timed(100);   // compiles the kernel
+            uint32_t n = 1000;
+            uint64_t us = timed(n);
+            // About 20 ms of work, whatever the node's speed
+            if (us < 20000) {
+                n = static_cast<uint32_t>(std::min<uint64_t>(20000ull * n / (us ? us : 1), 100000000ull));
+                us = timed(n);
+            }
+            if (us > 0) mops = static_cast<double>(n) * kInterpKernelOpsPerIteration / static_cast<double>(us);
+        }
+    }
+    if (rt) m3_FreeRuntime(rt);
+    m3_FreeEnvironment(env);
+    return mops;
 }
 
 bool deploy_error_is_restore(const std::string& error) {
