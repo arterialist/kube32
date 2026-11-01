@@ -2,8 +2,8 @@
 // its K32S snapshot, and a restore into a new instance of the same module
 // that continues where the first one stopped. Covers globals, tables,
 // memory.grow, memory caps below one page, the clock, held events,
-// channels, refused snapshots, every blocker, the kubelet endpoints and the
-// Checkpoint data on the API server.
+// channels, refused snapshots, every blocker, the kubelet endpoints, the
+// Checkpoint data on the API server, and a snapshot taken on an ESP32-S3.
 
 #include "pod_test_util.hpp"
 #include "api/checkpoint_api.hpp"
@@ -412,6 +412,30 @@ int main() {
         assert(k32test::http(ao.port, "DELETE", base + "/two").status == 200);
         assert(data.count() == 1 && data.used_bytes() == body.size());
         apiserver.stop();
+    }
+
+    // --- A snapshot taken on an ESP32-S3 board restores here ---
+    // tests/data/snapshot-probe-esp32s3.k32s: the probe on a Cardputer (no
+    // PSRAM, memory limit 8Ki, IPC granted) after GET /setup and two GET
+    // /count, taken through the kubelet endpoint with leave=running
+    {
+        const std::vector<uint8_t> board = k32test::read_file(std::string(KUBE32_SOURCE_DIR) + "/tests/data/snapshot-probe-esp32s3.k32s");
+        assert(!board.empty());
+        runtime::SnapshotHeader h;
+        std::string why;
+        assert(runtime::parse_snapshot_header(board.data(), board.size(), h, why));
+        std::cout << "[board] " << board.size() << " bytes, " << h.memory_bytes << " bytes of memory, " << h.sections << " sections, pod time "
+                  << h.pod_time_ms << " ms" << std::endl;
+        assert(h.version == 1 && h.memory_pages == 1 && h.memory_bytes == 8 * 1024 && h.unix_ms > 0);
+        assert(restore(*rt, "default/snapshot-probe", wasm, board, 8 * 1024).empty());
+        // The board's state: globals, tables and channel from setup, three requests
+        assert(call(*rt, "default/snapshot-probe", "check") == kStateNoGrow);
+        assert(count_of("default/snapshot-probe") == "4");
+        assert(call(*rt, "default/snapshot-probe", "time") >= static_cast<int32_t>(h.pod_time_ms));
+        const int32_t handle = call(*rt, "default/snapshot-probe", "peek", {12});
+        auto open = ipc::ChannelManager::instance().handles_of("default/snapshot-probe");
+        assert(handle > 0 && open.size() == 1 && open[0].first == handle && open[0].second == "pod://snapshot-probe/in");
+        assert(rt->terminate("default/snapshot-probe"));
     }
 
     ipc::ChannelManager::instance().shutdown();
