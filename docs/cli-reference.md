@@ -4,16 +4,15 @@ Use `kubectl` and k9s to manage the cluster. Use the tools below to run the host
 
 | Tool | Purpose |
 | --- | --- |
-| `build/kube32-sim` | Run control-plane and worker nodes as host processes |
-| `tools/kube32-cli` | Build, check, deploy, embed, and push Wasm pods and node storage files, checkpoint and move pods |
-| `scripts/flash.sh` | Build and flash firmware to an ESP32-S3 board |
-| `tools/kube32_serial_gateway.py` | Forward local HTTP ports to a board over USB serial |
+| `kube32` | Flash boards, open their serial console, run the simulator, create, build, check, deploy, embed, and push Wasm pods and node storage files, roll out firmware, checkpoint and move pods ([Install](install.md)) |
+| `kube32-sim` | Run control-plane and worker nodes as host processes |
+| `scripts/flash.sh` | Build and flash firmware to an ESP32-S3 board from a checkout |
 | `tools/tessera_loadtest.py` | Run concurrent HTTP load tests against a Tessera ingress |
 | `tools/embed_assets.py`, `tools/pio_embed.py` | Generate embedded Wasm image and web asset tables |
 
 ## kube32-sim
 
-`build/kube32-sim` runs Kube32 nodes on the host. With no flags, one process runs the control plane, its kubelet, and one in-process worker. It ticks pods whose `k32_tick` returns `> 0` every 10 ms and others at 1 Hz, matching the boards. Unknown flags exit with code 2 and the usage text.
+`kube32-sim` runs Kube32 nodes on the host. [`kube32 sim`](#board-and-simulator-commands) runs it, and a CMake build writes it to `build/kube32-sim`. With no flags, one process runs the control plane, its kubelet, and one in-process worker. It ticks pods whose `k32_tick` returns `> 0` every 10 ms and others at 1 Hz, matching the boards. Unknown flags exit with code 2 and the usage text.
 
 | Flag | Default | Description |
 | --- | --- | --- |
@@ -57,16 +56,31 @@ Use `kubectl` and k9s to manage the cluster. Use the tools below to run the host
 
 The simulator is a 64-bit host build where `wasm3` runtime structures are about 2.3x larger than on the 32-bit ESP32-S3. A pod set that fits on a `--psram 0` simulator fits on the board, while the reverse is not guaranteed.
 
-## kube32-cli
+## kube32
 
-`tools/kube32-cli` requires Python 3 with the standard library. See [Writing app pods](app-development.md) for usage walkthroughs.
+`uv tool install kube32` installs the `kube32` command, also under the name `kube32-cli` ([Install](install.md)). In a checkout of the repository, `tools/kube32-cli` runs the same commands from `python/src` with Python 3.9 or newer; the board commands there need `pyserial` and `esptool`. See [Writing app pods](app-development.md) for usage walkthroughs.
+
+### Board and simulator commands
 
 | Command | Description |
 | --- | --- |
-| `build <dir>` | Compile a C, Rust, or AssemblyScript directory to `.wasm` and check it. Flags: `--lang c\|c-make\|rust\|assemblyscript`, `--name <name>`, `-o <path>`, `--artifact <path>`, `--memory <qty>`, default `64Ki`, `--stack <qty>`, default `16Ki`, `--target <triple>`, default `wasm32-unknown-unknown`, `-v`. |
+| `flash` | Write the firmware of a release to an ESP32-S3 board over USB: `kube32-firmware-esp32s3-<version>.bin` of the installed `kube32`'s release, or of `--version X.Y.Z`, downloaded once, checked against its `.sha256` file, and written at `0x0` with esptool at 921600 baud, then at 460800 when that fails. Then prints the serial console commands that set the board up and offers to open the console. Flags: `--port <port>` (default `KUBE32_SERIAL_PORT`, or the one board connected: USB vendor ID `0x303a` for native USB, `0x1a86` for CH340), `--version X.Y.Z`, `--file <image>` (a merged image instead of a release), `--baud <rate>`, `--console`, `--no-console`. See [Flashing](flashing-troubleshooting.md#flashing). |
+| `console` | Open a board's serial console at 115200 baud without resetting the board: print what the board writes and send each line typed, such as `K32_CMD:STATUS`. Reopens the port when the board restarts. `Ctrl-C` quits. Flag: `--port <port>`. |
+| `gateway` | Serve a board's API server and ingress on local ports over its USB console. Flags: `--port <port>`, `--map <local>:<device>`. See [kube32 gateway](#kube32-gateway). |
+| `sim [<args>...]` | Run `kube32-sim` with the arguments `kube32` does not take: `kube32-sim` from `PATH`, else the release's `kube32-sim-<version>-<macos\|linux>-<arm64\|x86_64>.tar.gz`, downloaded once and checked against its `.sha256` file. `kube32 sim -- --help` prints the simulator's options. Flags: `--version X.Y.Z` (run that release, also when `kube32-sim` is on `PATH`), `--docker` (run `ghcr.io/arterialist/kube32-sim:<version>` with the API server, ingress and pod ports of the arguments published on `127.0.0.1`). Passes `Ctrl-C` and `SIGTERM` to the simulator and exits with its exit code. |
+| `version` | Print the version of `kube32`, and the cluster's `/version` read with `kubectl` when it answers. Flags: `--client`, `--context`, `--kubeconfig`, `--server`, `--kubectl`. |
+
+`flash` and `sim` cache downloads in `~/Library/Caches/kube32` on macOS and `$XDG_CACHE_HOME/kube32` (default `~/.cache/kube32`) on Linux, or in `KUBE32_CACHE_DIR`. `KUBE32_RELEASES_URL` replaces `https://github.com/arterialist/kube32/releases/download`. A development build of `kube32` matches no release: pass `--version X.Y.Z`, `--file` to `flash`, or put `kube32-sim` on `PATH` for `sim`.
+
+### App commands
+
+| Command | Description |
+| --- | --- |
+| `new <dir> --lang c\|rust` | Create an app project in the new directory `<dir>`, whose name names the app, the module and the crate. C: a `Makefile` that compiles every `.c` file with `clang --target=wasm32 -Oz` and links `build/<name>.wasm` with `wasm-ld` or `rust-lld`, a request pod in `main.c`, and the ABI header in `include/runtime/k32_app_abi.h`. Rust: a `cdylib` crate with the counter example in `src/lib.rs`, depending on `kube32-sdk` of the same release, and `.cargo/config.toml` with the link flags. Flags: `--lang`, default `c`, `--sdk-path <dir>` (Rust: depend on the `kube32-sdk` crate in `<dir>`). A development build depends on the SDK in the Git repository. |
+| `build [<dir>]` | Compile a C, Rust, or AssemblyScript directory, default the current one, to `.wasm` and check it. Runs `make` for a directory with a `Makefile` and `cargo build --release --target <triple>` for a crate. Flags: `--lang c\|c-make\|rust\|assemblyscript`, `--name <name>`, `-o <path>`, `--artifact <path>`, `--memory <qty>`, default `64Ki`, `--stack <qty>`, default `16Ki`, `--target <triple>`, default `wasm32-unknown-unknown`, `-v`. |
 | `check <file>` | Validate a `.wasm` module against the app ABI and the wasm3 opcode set. Flag: `--memory <qty>`. |
 | `deploy <file>` | Create a Pod via `kubectl create`, carrying the module in `kube32.io/wasm-base64` unless `--image` is set. The API server stores the module apart from the Pod, which keeps `kube32.io/wasm-sha256`. Flags: `--name <name>`, `--node <node>`, `--namespace <ns>`, default `default`, `--memory <qty>`, default `64Ki`, `--psram <qty>`, `--hardware <list>`, `--sd-claim <claim>`, `--env K=V`, `--image <wasm://...>`, `--port <port>`, default `7000`, `--replace`, `--timeout <sec>`, default `60`, `--dry-run`, `--context`, `--kubeconfig`, `--server`, `--kubectl`. |
-| `embed <file>` | Copy a checked module to `images/<name>.wasm` for `wasm://embedded/<name>:v1`. Flags: `--name <name>`, `--force`, `--images-dir <dir>`. |
+| `embed <file>` | Copy a checked module to `images/<name>.wasm` of the kube32 checkout that contains the current directory, for `wasm://embedded/<name>:v1` in the next firmware or simulator build. Flags: `--name <name>`, `--force`, `--images-dir <dir>`. |
 | `sd-push <file> (--to <mount point> \| --node <node>)` | Copy a checked module to `kube32/images/<name>[-<tag>].wasm` for `wasm://sd/<name>[:<tag>]`, either to a locally mounted card with `--to <dir>` or over the network to a node's storage with `--node <node>`. Flags: `--to <dir>`, `--node <node>`, `--name <name>`, `--tag <tag>`, `--context`, `--kubeconfig`, `--server`, `--kubectl`. |
 | `push <file\|dir> --node <node> [--path <path>]` | Upload a file or directory tree over the network to `<storage-root>/kube32/<path>` via `kubectl replace --raw /api/v1/nodes/<node>/proxy/storage/<path>` (kubeconfig credentials apply). Default `--path` is `images/<filename>` for a file or `images` for a directory, uploading files recursively to `<path>/<relative-path>`. Prints one line per file plus a directory total, stops at the first error, and exits `1` if a directory is empty. Flags: `--node <node>`, `--path <path>`, `--context`, `--kubeconfig`, `--server`, `--kubectl`. |
 
@@ -104,7 +118,7 @@ Exit codes:
 
 ## flash.sh
 
-Build if needed and flash one board over serial, see [Flashing](flashing-troubleshooting.md):
+Build if needed and flash one board over serial from a checkout, see [Flashing](flashing-troubleshooting.md):
 
 ```
 scripts/flash.sh <serial port> [baud]
@@ -116,13 +130,15 @@ scripts/flash.sh <serial port> [baud]
 - Writes the bootloader at `0x0`, the partition table at `0x8000`, an erased `otadata`, and the firmware into the first app slot, at the offsets in `partitions.csv`.
 - Writes 256-byte paced blocks on CH340 bridges, vendor ID `0x1a86`. Uses `KUBE32_FLASH_BEFORE`, default `default-reset`, and `KUBE32_FLASH_AFTER`, default `hard-reset` on CH340 and `watchdog-reset` on native USB.
 
-## kube32_serial_gateway.py
+## kube32 gateway
 
-Requires `pyserial`. Listens on local TCP ports and relays each connection to a board as a stream over the USB console. See [HTTP over the console](flashing-troubleshooting.md#http-over-the-console). Streams run concurrently, so watches, `kubectl logs -f`, k9s, and Server-Sent Events run alongside other requests.
+Listens on local TCP ports and relays each connection to a board as a stream over the USB console. See [HTTP over the console](flashing-troubleshooting.md#http-over-the-console). Streams run concurrently, so watches, `kubectl logs -f`, k9s, and Server-Sent Events run alongside other requests.
 
 ```
-python3 tools/kube32_serial_gateway.py [--port <serial port>] [--map <local>:<device>]...
+kube32 gateway [--port <serial port>] [--map <local>:<device>]...
 ```
+
+In a checkout, `tools/kube32_serial_gateway.py` runs it from the source tree with `pyserial` installed.
 
 - Without `--port`, the gateway reads `KUBE32_SERIAL_PORT`, or queries each native USB-Serial/JTAG device (vendor ID `0x303a`) and CH340 bridge (vendor ID `0x1a86`) for its role and selects the control plane.
 - Default port mappings are `6443:6443` for the API server and `8080:80` for the ingress, on `127.0.0.1`.

@@ -68,7 +68,7 @@ This writes segment files to `apps/tessera/build/card/kube32/volumes/tessera-db/
 Copy `apps/tessera/build/card/kube32` to the root of the Cardputer microSD card, or upload the directory over the network to the running worker node (28 files, about 880 KB):
 
 ```sh
-tools/kube32-cli push apps/tessera/build/card/kube32/volumes/tessera-db --node <worker-node> --path volumes/tessera-db
+kube32 push apps/tessera/build/card/kube32/volumes/tessera-db --node <worker-node> --path volumes/tessera-db
 ```
 
 On the host simulator, point `KUBE32_SD_ROOT` at `apps/tessera/build/card` before starting `kube32-sim`. To run the worker in a separate simulator process (or attach a physical Cardputer worker), pass `--workers ""` on the control-plane simulator so it starts without an in-process worker. Like the boards, the simulator ticks pods that return a positive value from `k32_tick` every 10 ms and other pods at 1 Hz.

@@ -163,7 +163,7 @@ Each node keeps an in-RAM log ring per pod (2 KiB on boards with PSRAM, 1 KiB wi
 
 ## Uploading files
 
-You can copy `.wasm` images to a mounted microSD card on your host with `tools/kube32-cli sd-push <file.wasm> --to /Volumes/<card>` (or over the network with `--node <node>`), or manage files on a running node over the network.
+You can copy `.wasm` images to a mounted microSD card on your host with `kube32 sd-push <file.wasm> --to /Volumes/<card>` (or over the network with `--node <node>`), or manage files on a running node over the network.
 
 The API server exposes each node's `<root>/kube32/` directory through the node proxy subresource at `/api/v1/nodes/<node>/proxy/storage/<path>`:
 
@@ -171,10 +171,10 @@ The API server exposes each node's `<root>/kube32/` directory through the node p
 * `GET` streams a file (`application/octet-stream`) or lists a directory as JSON.
 * `DELETE` removes a file or an empty directory.
 
-Use `tools/kube32-cli push` to upload a file or directory tree to `<root>/kube32/<path>` via `kubectl replace --raw` (`--path` defaults to `images/`; directories upload recursively and stop at the first error):
+Use `kube32 push` to upload a file or directory tree to `<root>/kube32/<path>` via `kubectl replace --raw` (`--path` defaults to `images/`; directories upload recursively and stop at the first error):
 
 ```
-tools/kube32-cli push <file|dir> --node <node> [--path <path>]
+kube32 push <file|dir> --node <node> [--path <path>]
 ```
 
 ## Limitations

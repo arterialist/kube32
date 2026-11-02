@@ -32,7 +32,7 @@ The host forwards `Cookie`, `Content-Type`, `X-Request-Id`, and `X-Forwarded-For
 
 ## Host ABI
 
-All imports belong to the `env` module (`src/runtime/app_pod.cpp`, `src/runtime/host_functions.cpp`). `kube32-cli check` rejects unknown imports or signatures.
+All imports belong to the `env` module (`src/runtime/app_pod.cpp`, `src/runtime/host_functions.cpp`). `kube32 check` rejects unknown imports or signatures.
 
 | Group | Imports | Signatures | Needs | Details |
 | --- | --- | --- | --- | --- |
@@ -83,7 +83,7 @@ A memory limit below `64Ki` (such as `2Ki`, `4Ki`, or `16Ki`) caps the backing a
 
 At boot, boards with PSRAM reserve one 1284 KiB pool block and one shared 64 KiB interpreter stack in PSRAM. Boards without PSRAM reserve an 80 KiB pool block for pods and one shared 28 KiB interpreter stack at boot. `app_main` (entry-point) pods require a board with PSRAM. On both board types, all pod calls run one at a time on the shared stack. Every pod allocation (wasm3 runtime, compiled code, linear memory) comes from the pool block first. When the block is full, a board without PSRAM falls back to the general heap and leaves 24 KiB of it for the system. A board with PSRAM falls back to PSRAM and leaves a system reserve of 128 KiB on a control plane and 64 KiB on a worker. It never gives pods internal RAM. A linear memory of at least half the block takes the block's start whole, and other allocations fill the block from its end down. While a pod with such a memory loads, its runtime goes outside the block. Node allocatable `memory` is what pods can be given with no pod running: the block, plus on a board with PSRAM the PSRAM above the reserve. On a board with PSRAM, allocatable `esp32.io/psram` is the same figure. The scheduler counts each pod's requests plus its Pod Overhead, the runtime's memory beyond the linear memory, and a pod without a memory request as one 64 KiB page. The kubelet rejects any pod whose estimate does not fit and names the reserves in the message. `kubectl top pod` reports every byte a pod holds ([memory figures](hardware-spec.md#node-and-pod-memory-figures)).
 
-The wasm3 value stack holds the frames of the calls in flight. By default, the runtime sizes it from the compiled module's heaviest call chain, with indirect calls reaching every function of their type. It is at most 4 KiB for pods with up to 64 KiB of linear memory and 16 KiB for larger pods. A module that recurses gets that maximum. Set `metadata.annotations["kube32.io/wasm-stack"]` (`512` to `64Ki`) to set the per-pod wasm3 value stack size instead. Exhausting the stack traps with exit code `139` and the message `the module's stack of <N> bytes is exhausted (raise it with the annotation kube32.io/wasm-stack)`. The shadow stack for C and Rust locals lives inside linear memory (`-z stack-size`, 16 KiB by default in `kube32-cli build`).
+The wasm3 value stack holds the frames of the calls in flight. By default, the runtime sizes it from the compiled module's heaviest call chain, with indirect calls reaching every function of their type. It is at most 4 KiB for pods with up to 64 KiB of linear memory and 16 KiB for larger pods. A module that recurses gets that maximum. Set `metadata.annotations["kube32.io/wasm-stack"]` (`512` to `64Ki`) to set the per-pod wasm3 value stack size instead. Exhausting the stack traps with exit code `139` and the message `the module's stack of <N> bytes is exhausted (raise it with the annotation kube32.io/wasm-stack)`. The shadow stack for C and Rust locals lives inside linear memory (`-z stack-size`, 16 KiB by default in `kube32 build`).
 
 wasm3 on the ESP32-S3 also uses the native stack. The compiler makes no tail calls. Thus each Wasm instruction that a call executes keeps a native frame of 48 to 64 bytes until its function returns. On a board without PSRAM, a call gets about 21.9 KB of the 28 KiB interpreter stack. A long sequence of instructions in one function can use all of it. The call then traps with `stack overflow (native stack: ...)`. Build pods with `-Oz`, not `-O2`, because `-O2` puts helpers inside their callers. Put long computations in separate functions (`__attribute__((noinline))` in C). [Benchmarks](benchmarks.md#native-stack) has two measured cases.
 
@@ -151,6 +151,25 @@ The node refuses to move a pod in these cases, and names each one:
 | is in a call that does not return within the timeout | `call k32_handle still running after 10000 ms` |
 
 To write a pod that moves, keep its state in linear memory and globals, close files before a call returns, and leave hardware to a driver pod that it reaches through a Service or channel events.
+
+---
+
+## Starting a project
+
+`kube32 new` creates an app project in a new directory, ready for `kube32 build`:
+
+```
+$ kube32 new hello --lang c
+created hello (C): Makefile, main.c, include/runtime/k32_app_abi.h, .gitignore
+next: kube32 build hello
+      kube32 deploy hello/build/hello.wasm
+```
+
+The `Makefile` of a C project compiles every `.c` file with `clang --target=wasm32 -Oz` against its copy of `runtime/k32_app_abi.h` in `include/`, and links `build/<name>.wasm` with `wasm-ld`, or with `rust-lld` from a Rust toolchain. `make MEMORY=131072 STACK=32768` changes the linear memory and the shadow stack. `main.c` is a request pod that answers each request with its request line.
+
+`kube32 new <dir> --lang rust` creates a crate with the [counter example](#request-pod) in `src/lib.rs`, a dependency on the `kube32-sdk` crate of the same release, and the link flags for `cargo build --release --target wasm32-unknown-unknown` in `.cargo/config.toml`. `--sdk-path <dir>` makes it depend on a local `kube32-sdk` crate instead.
+
+---
 
 ## Rust
 
@@ -245,10 +264,10 @@ kube32_main!(main_loop);
 
 ### Building Rust pods
 
-Install the target with `rustup target add wasm32-unknown-unknown` and build with `kube32-cli build`:
+Install the target with `rustup target add wasm32-unknown-unknown` and build with `kube32 build`:
 
 ```
-$ tools/kube32-cli build sdk/rust/examples/counter
+$ kube32 build sdk/rust/examples/counter
 building <repo>/sdk/rust/examples/counter (rust)
 sdk/rust/examples/counter/build/counter.wasm: 6,400 bytes (code 5,289, data 691)
 kind: request pod (k32_handle)
@@ -303,7 +322,7 @@ K32_EXPORT("k32_handle") int32_t k32_handle(uint32_t ptr, uint32_t len) {
 }
 ```
 
-`kube32-cli build` compiles `.c` files with `clang --target=wasm32 -O2 -nostdlib -ffreestanding -fno-exceptions -mcpu=mvp -msign-ext -mbulk-memory` and links them with `rust-lld` or `wasm-ld`. If the directory contains a `Makefile`, `kube32-cli build` runs `make -C <dir>` (pass `--artifact <path>` when the output `.wasm` cannot be inferred from `make -n -B`). See `apps/echo`, `apps/sdnote`, `apps/i2cscan`, `apps/irremote`, and `apps/tessera` for complete C pods.
+`kube32 build` compiles `.c` files with `clang --target=wasm32 -O2 -nostdlib -ffreestanding -fno-exceptions -mcpu=mvp -msign-ext -mbulk-memory` and links them with `rust-lld` or `wasm-ld`. If the directory contains a `Makefile`, `kube32 build` runs `make -C <dir>` (pass `--artifact <path>` when the output `.wasm` cannot be inferred from `make -n -B`). See `apps/echo`, `apps/sdnote`, `apps/i2cscan`, `apps/irremote`, and `apps/tessera` for complete C pods.
 
 ---
 
@@ -370,13 +389,13 @@ export function k32_handle(ptr: u32, len: u32): i32 {
 }
 ```
 
-`kube32-cli build` invokes `asc` with `--runtime stub --noAssert --use abort= -O3z` so `abort` compiles to a trap instead of importing `env.abort`.
+`kube32 build` invokes `asc` with `--runtime stub --noAssert --use abort= -O3z` so `abort` compiles to a trap instead of importing `env.abort`.
 
 ---
 
 ## Checking a module
 
-`kube32-cli check` validates a `.wasm` binary against the runtime:
+`kube32 check` validates a `.wasm` binary against the runtime:
 
 * Imports must be functions from `env` with signatures the host links.
 * Exports (`k32_init`, `k32_alloc`, `k32_handle`, `k32_tick`, `k32_event`, `_start`, `app_main`, `main`) must match the host's signatures, and `k32_handle` or `k32_event` requires `k32_alloc`.
@@ -384,7 +403,7 @@ export function k32_handle(ptr: u32, len: u32): i32 {
 * Instructions must belong to the opcode set enabled in this wasm3 build.
 
 ```
-$ tools/kube32-cli check images/tessera-core.wasm --memory 64Ki
+$ kube32 check images/tessera-core.wasm --memory 64Ki
 images/tessera-core.wasm: 76,228 bytes (code 64,133, data 9,313)
 kind: request pod (k32_handle)
 exports (6): k32_alloc, k32_event, k32_handle, k32_init, k32_tick, memory [memory]
@@ -400,7 +419,7 @@ FAILED (1 error)
 | --- | --- |
 | sign extension, saturating float-to-int, bulk memory, reference types, tail calls, multi-value, extended constant expressions, wide arithmetic, atomics, multiple memories | SIMD (`0xFD`, `v128`), exception handling (`throw`, `throw_ref`, `try_table`, tag sections), typed function references (`call_ref`, `return_call_ref`, `br_on_null`), GC types, 64-bit memory 0, imported memories and tables |
 
-Exit codes of `kube32-cli`: `0` ok, `1` input or toolchain error, `2` usage error, `3` ABI check failed, `4` `kubectl` failed, `5` pod already exists on `deploy`.
+Exit codes of `kube32`: `0` ok, `1` input or toolchain error, `2` usage error, `3` ABI check failed, `4` `kubectl` failed, `5` pod already exists on `deploy`.
 
 ---
 
@@ -412,12 +431,12 @@ The kubelet resolves `spec.containers[0].image` in this order:
 2. Any other image reference is looked up in the firmware's embedded registry by its key (the last path component before `:`).
 3. Otherwise, a pod with `kube32.io/wasm-sha256` gets the module the API server keeps under that digest (an inline image, below), from `GET /apis/kube32.io/v1/images/<sha256>`. The kubelet checks the bytes against the digest.
 
-### Inline image (`kube32-cli deploy`)
+### Inline image (`kube32 deploy`)
 
-`kube32-cli deploy` checks the module, embeds it in `kube32.io/wasm-base64`, and creates the Pod with `kubectl create`:
+`kube32 deploy` checks the module, embeds it in `kube32.io/wasm-base64`, and creates the Pod with `kubectl create`:
 
 ```
-$ tools/kube32-cli deploy sdk/rust/examples/counter/build/counter.wasm --node esp32-node-01 --env GREETING=hello
+$ kube32 deploy sdk/rust/examples/counter/build/counter.wasm --node esp32-node-01 --env GREETING=hello
 pod/counter created
 deployed default/counter: 6,400 bytes inline, 64Ki linear memory, hardware: ipc
 ```
@@ -433,7 +452,7 @@ Thus the Pod object stays small in lists, watches and the controllers' passes, w
 
 With a flash journal, the module's bytes stay on flash and take no RAM. They count against the journal's capacity (about 480 KB on a board without a card).
 
-Key flags for `kube32-cli deploy`:
+Key flags for `kube32 deploy`:
 
 * `--replace`: deletes an existing pod of the same name (`kubectl delete pod <name> --wait=true`) before creating the new one. The kubelet does not restart a running pod when its manifest changes in place.
 * `--memory <qty>` and `--psram <qty>`: set `requests.memory`, `limits.memory`, and `esp32.io/psram`.
@@ -442,25 +461,25 @@ Key flags for `kube32-cli deploy`:
 * `--image <wasm://...>`: references an SD or embedded image instead of attaching `kube32.io/wasm-base64`.
 * `--dry-run`: prints the generated Pod YAML without calling `kubectl`.
 
-### SD card image (`kube32-cli sd-push` / `push`)
+### SD card image (`kube32 sd-push` / `push`)
 
-Copy a module onto a mounted card with `sd-push`, or upload it over the network through the node proxy (`/api/v1/nodes/<node>/proxy/storage/<path>`) with `kube32-cli push`:
+Copy a module onto a mounted card with `sd-push`, or upload it over the network through the node proxy (`/api/v1/nodes/<node>/proxy/storage/<path>`) with `kube32 push`:
 
 ```
-$ tools/kube32-cli sd-push sdk/rust/examples/notes/build/notes.wasm --to $SIM/sdcard
+$ kube32 sd-push sdk/rust/examples/notes/build/notes.wasm --to $SIM/sdcard
 copied $SIM/sdcard/kube32/images/notes.wasm (4,500 bytes)
 image: wasm://sd/notes
-$ tools/kube32-cli deploy sdk/rust/examples/notes/build/notes.wasm --image wasm://sd/notes --node esp32-node-02
+$ kube32 deploy sdk/rust/examples/notes/build/notes.wasm --image wasm://sd/notes --node esp32-node-02
 ```
 
 See [Storage and volumes](storage.md) for volume and image layout.
 
-### Embedded image (`kube32-cli embed`)
+### Embedded image (`kube32 embed`)
 
 Copy a checked module into `images/<name>.wasm` for the next firmware or simulator build:
 
 ```
-$ tools/kube32-cli embed sdk/rust/examples/counter/build/counter.wasm
+$ kube32 embed sdk/rust/examples/counter/build/counter.wasm
 embedded <repo>/images/counter.wasm (6,400 bytes)
 image: wasm://embedded/counter:v1
 ```
@@ -518,7 +537,7 @@ $ export SIM=/some/scratch/dir
 $ KUBE32_SD_ROOT=$SIM/sdcard ./build/kube32-sim --role standalone --port 16443 --ingress-port 18080 --pod-port 17000 --ipc-port 17400 --data-dir $SIM/data
 ```
 
-Point `kubectl` at `http://127.0.0.1:16443` and apply a Pod, Service, and Ingress (such as `examples/echo.yaml`), or deploy a module with `kube32-cli deploy`. Reach request pods in two ways:
+Point `kubectl` at `http://127.0.0.1:16443` and apply a Pod, Service, and Ingress (such as `examples/echo.yaml`), or deploy a module with `kube32 deploy`. Reach request pods in two ways:
 
 * Directly through the pod HTTP server (`--pod-port 17000`) with the `X-Kube32-Pod: <namespace>/<name>` header:
 

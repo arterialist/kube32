@@ -88,7 +88,7 @@ Each board mounts one node storage root: `/sd` when a microSD card is inserted, 
 | `logs/<ns>_<pod>/<container>.log` | Container logs (capped at 32 KiB, rotated to `.log.1` on restart, and served by `kubectl logs --previous`). Deleted when the pod is deleted. |
 | `images/<name>.wasm` | Wasm binaries loaded via `wasm://sd/<name>` (microSD only) and optional static assets under `images/<name>/` served by `k32_resp_asset`. |
 
-You can upload, list, read, or delete files on any node's storage over the API node proxy subresource `/api/v1/nodes/<node>/proxy/storage/<path>` or with `tools/kube32-cli push <file> --node <node> --path <path>`.
+You can upload, list, read, or delete files on any node's storage over the API node proxy subresource `/api/v1/nodes/<node>/proxy/storage/<path>` or with `kube32 push <file> --node <node> --path <path>`.
 
 ## Host simulator differences
 

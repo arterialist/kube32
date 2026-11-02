@@ -40,10 +40,10 @@ Write pods to move: keep state in linear memory and globals, close files between
 
 ## Moves
 
-Move a pod with `kube32-cli`:
+Move a pod with `kube32`:
 
 ```
-kube32-cli move echo --to devkit
+kube32 move echo --to devkit
 ```
 
 or create a Checkpoint:
@@ -91,7 +91,7 @@ The controller records each decision as an event on the pod:
 | `MoveFailed` | A move was refused or rolled back, or a restore failed |
 | `Restored` | A pod restored outside a move runs: after a node loss or a rollback. The message gives the checkpoint's age |
 
-`kube32-cli checkpoint <pod>` saves a pod's state without moving it. The pod keeps running.
+`kube32 checkpoint <pod>` saves a pod's state without moving it. The pod keeps running.
 
 ## Drain and evictions
 

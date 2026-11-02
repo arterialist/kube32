@@ -10,6 +10,7 @@ Install the required toolchains for the components you work on:
 | ESP32-S3 firmware | PlatformIO Core 6.1, `espressif32 @ 6.13.0`, ESP-IDF 5.5.3 |
 | WebAssembly apps | `clang` with `wasm32` target support, `rust-lld` |
 | Rust SDK | Rust via `rustup` with target `wasm32-unknown-unknown` |
+| `kube32` command (`python/`) | Python 3.9 or newer; `uv` to build and install the package |
 
 Add the WebAssembly target to your Rust toolchain:
 
@@ -56,6 +57,17 @@ Build the Rust SDK and example modules:
 cd sdk/rust && cargo build --release --target wasm32-unknown-unknown --locked
 ```
 
+### The kube32 command
+
+The `kube32` command is the Python package in `python/` (`python/src/kube32`). `tools/kube32-cli` runs it from the source tree. Build the sdist and the wheel, or install the checkout as the `kube32` tool:
+
+```bash
+uv build python
+uv tool install --force ./python
+```
+
+The wheel carries `include/runtime/k32_app_abi.h` and the counter example's `src/lib.rs`, which `python/hatch_build.py` copies at build time.
+
 ### Documentation
 
 Build the documentation site with strict link checking:
@@ -75,9 +87,12 @@ ctest --test-dir build --output-on-failure
 # Tessera native tests (db, api, web)
 make -C apps/tessera test
 
-# kube32-cli unit tests
+# kube32 command tests, from the source tree (pyserial runs the gateway and console tests)
 python3 -m pytest tools/tests
 python3 -m unittest discover -s tools/tests -v
+
+# the same tests against an installed kube32 package
+KUBE32_TEST_INSTALLED=1 "$(uv tool dir)/kube32/bin/python" -m unittest discover -s tools/tests -v
 
 # Rust SDK unit tests and ABI checks
 cd sdk/rust && cargo test -p kube32-sdk --locked
@@ -147,7 +162,7 @@ type(scope[,scope]): concise description in lowercase with no trailing period
 ## Pull request checklist
 
 - [ ] Host simulator builds and all `ctest` programs pass.
-- [ ] `make -C apps/tessera test`, `kube32-cli` tests, and `cargo test -p kube32-sdk` pass.
+- [ ] `make -C apps/tessera test`, the `tools/tests` suite, and `cargo test -p kube32-sdk` pass.
 - [ ] `pio run -e esp32s3` succeeds when C++ or embedded image files change.
 - [ ] Rebuilt binaries in `images/` are included if pod or web sources changed.
 - [ ] PR description states whether the change was tested on the host simulator, ESP32-S3 boards, or both.

@@ -17,7 +17,7 @@ The kubelet resolves `spec.containers[0].image` in order:
 
 1. `wasm://sd/<name>[:<tag>]` reads `<card>/kube32/images/<name>[-<tag>].wasm` from the [storage](../storage.md).
 2. `wasm://embedded/<name>` or any other reference matches `images/*.wasm` in the embedded firmware registry by the last path component before `:` and parses modules in place from flash.
-3. An inline image: the module the API server took out of the `kube32.io/wasm-base64` annotation (written by `tools/kube32-cli deploy`) and keeps under the pod's `kube32.io/wasm-sha256`. The kubelet reads it from `GET /apis/kube32.io/v1/images/<sha256>` into one allocation of the module's size and checks it against the digest. See [Writing app pods](../app-development.md#inline-image-kube32-cli-deploy).
+3. An inline image: the module the API server took out of the `kube32.io/wasm-base64` annotation (written by `kube32 deploy`) and keeps under the pod's `kube32.io/wasm-sha256`. The kubelet reads it from `GET /apis/kube32.io/v1/images/<sha256>` into one allocation of the module's size and checks it against the digest. See [Writing app pods](../app-development.md#inline-image-kube32-cli-deploy).
 
 Unresolved images or images too large for node memory fail the pod with `ErrImagePull`.
 
@@ -104,7 +104,7 @@ Every module links two function groups in the `env` module:
 - `src/runtime/app_pod.cpp` links `k32_resp_begin`, `k32_resp_header`, `k32_resp_write`, `k32_resp_end`, `k32_resp_asset`, `k32_http_call`, `k32_http_status`, `k32_event_emit`, `k32_time_ms`, `k32_unix_time_ms`, `k32_log`, `k32_random`, `k32_env_get`, `k32_mem_stats`, `k32_display_text`, `k32_display_rect`, `k32_display_bar`, `k32_key_read`, `k32_tone`, and `k32_fs_open`/`read`/`write`/`close`/`size`/`list`/`remove`.
 - `src/runtime/host_functions.cpp` links `esp32_gpio_set_mode`, `esp32_gpio_write`, `esp32_gpio_read`, `esp32_adc_read`, `esp32_chip_temp_read`, `esp32_i2c_write`, `esp32_i2c_read`, `esp32_uart_write`, `esp32_uart_read`, `esp32_rmt_send`, `esp32_rmt_receive`, `esp32_get_time_us`, `esp32_delay_ms`, and `kube32_channel_open`/`send`/`recv`/`close`.
 
-The [capability firewall](capability-firewall.md) gates hardware, storage, IPC, and `SERVICE_CALL` requests. Run `tools/kube32-cli check` to validate module imports and memory against the ABI.
+The [capability firewall](capability-firewall.md) gates hardware, storage, IPC, and `SERVICE_CALL` requests. Run `kube32 check` to validate module imports and memory against the ABI.
 
 ## Limitations
 

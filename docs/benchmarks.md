@@ -178,7 +178,7 @@ To run the same kernels in a pod:
 
 ```sh
 make -C apps/bench
-tools/kube32-cli deploy images/sd/bench.wasm --name bench --node <node> --memory 24Ki --hardware none
+kube32 deploy images/sd/bench.wasm --name bench --node <node> --memory 24Ki --hardware none
 curl -H 'X-Kube32-Pod: default/bench' 'http://<node address>:7000/run?k=crc32&n=4&r=5'
 curl -H 'X-Kube32-Pod: default/bench' 'http://<node address>:7000/hostcall?n=100000'
 ```
@@ -193,7 +193,7 @@ build/bench_ops apps/bench/build/ops.wasm
 
 For an unmetered pod, do these steps:
 
-1. Add `--dry-run` to the `kube32-cli deploy` command and keep the manifest that it prints.
+1. Add `--dry-run` to the `kube32 deploy` command and keep the manifest that it prints.
 2. Add `kube32.io/execution-budget: "off"` to the pod's annotations.
 3. Apply the manifest with kubectl.
 

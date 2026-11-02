@@ -49,6 +49,7 @@ extra_javascript:
 nav:
   - Overview: index.md
   - Getting started:
+      - Install: install.md
       - Quick start: quickstart.md
       - Hardware: hardware-spec.md
       - Flashing and the serial console: flashing-troubleshooting.md

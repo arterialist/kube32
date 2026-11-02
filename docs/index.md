@@ -14,6 +14,7 @@ flowchart LR
 
 | Topic | Page |
 | --- | --- |
+| Install the `kube32` command with uv | [Install](install.md) |
 | Run the simulator or boot a two-board cluster | [Quick start](quickstart.md) |
 | Supported boards, memory layout, and pin capacities | [Hardware specification](hardware-spec.md) |
 | Flash firmware and configure nodes over USB serial | [Flashing and the serial console](flashing-troubleshooting.md) |
@@ -26,5 +27,5 @@ flowchart LR
 | Four-pod issue tracker running across a devkit and Cardputer | [Tessera example](examples/tessera.md) |
 | Control plane, kubelet, and runtime internals | [Architecture overview](architecture/index.md) |
 | Supported Kubernetes API resources, subresources, and semantics | [Kubernetes API reference](api-reference.md) |
-| `kube32-cli`, `kube32-sim`, and serial console commands | [CLI and serial reference](cli-reference.md) |
+| `kube32`, `kube32-sim`, and serial console commands | [CLI and serial reference](cli-reference.md) |
 

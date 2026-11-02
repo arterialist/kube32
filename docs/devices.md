@@ -140,7 +140,7 @@ An `OnDemand` Device has a driver pod only while it is in use. A Device without 
 - A call to a Service that selects the driver pod, from any node: `k32_http_call` to the Device's Service or to an app's own Service that selects drivers by label, and a request to an Ingress rule with such a Service as its backend.
 - A pod that subscribes to `device.<device>` (`kube32.io/event-topics`), on any node, while it is neither terminating nor `Succeeded` or `Failed`. Its subscription counts as a use on each controller pass.
 - A client of an Ingress event stream (`kube32.io/event-stream`) that carries `device.<device>`, for a Device in the Ingress's namespace.
-- `kube32-cli devices`, which reads the Devices it lists.
+- `kube32 devices`, which reads the Devices it lists.
 - `POST /apis/kube32.io/v1/namespaces/<ns>/devices/<device>/activate`, the `activate` subresource. It answers `200` with a `Status`, or `404` for a Device that does not exist. `kubectl create --raw <path> -f <file with {}>` sends it.
 
 The control plane keeps the time of the last use of each Device in memory. It stores nothing, so a use writes nothing to the journal on flash and starts no watch event. The Device controller deletes the driver pod `idleSeconds` after the last use, gracefully, and sets the phase to `Idle`. A driver pod that runs when the control plane starts gets a full `idleSeconds` before it goes.

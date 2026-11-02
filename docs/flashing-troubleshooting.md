@@ -2,6 +2,20 @@
 
 ## Flashing
 
+`kube32 flash` writes the firmware of a release to one board:
+
+```
+kube32 flash [--port <serial port>] [--version X.Y.Z]
+```
+
+- Downloads `kube32-firmware-esp32s3-<version>.bin` from the GitHub release of the installed `kube32`, or of `--version`, checks it against the `.sha256` file next to it, and keeps it in the cache directory ([Install](install.md#releases-and-versions)).
+- Uses `--port`, else `KUBE32_SERIAL_PORT`, else the one connected port with USB vendor ID `0x303a` (native USB-Serial/JTAG) or `0x1a86` (CH340). With several boards connected, pass `--port`.
+- Writes the merged image (bootloader, partition table, and firmware) at `0x0` with esptool at 921600 baud, and again at 460800 baud when that fails. `--baud` sets one rate. Writes paced blocks on CH340 bridges and resets the board as `scripts/flash.sh` does (below), reading the same `KUBE32_FLASH_BEFORE` and `KUBE32_FLASH_AFTER`.
+- `--file <image>` writes a local merged image instead of a release.
+- Prints the console commands that set the board up, and offers to open `kube32 console`.
+
+### Flashing a build from source
+
 Build once, then flash one board at a time:
 
 ```
@@ -18,13 +32,15 @@ bash scripts/flash.sh <serial port> 921600
 
 To enter ROM download mode from the serial console when USB auto-reset fails, send `K32_CMD:BOOTLOADER`, then flash with `KUBE32_FLASH_BEFORE=no-reset`.
 
-Flash a board running the single-app partition table once with a current build to move it to the A/B layout; see [Firmware updates](firmware-updates.md#moving-a-board-to-this-layout). After that, update boards through the cluster with `kube32-cli firmware push` and `kube32-cli firmware rollout`.
+Flash a board running the single-app partition table once with a current build to move it to the A/B layout; see [Firmware updates](firmware-updates.md#moving-a-board-to-this-layout). After that, update boards through the cluster with `kube32 firmware push` and `kube32 firmware rollout`.
 
 ## Serial console
 
+`kube32 console [--port <serial port>]` opens a board's console without resetting the board. It prints what the board writes and sends each line typed.
+
 The firmware listens for newline-terminated commands up to 512 characters on USB serial at 115200 baud. Generic boards listen on both native USB-Serial/JTAG and UART0, answering on the port that received the command. The Cardputer profile listens on USB only.
 
-After any reset other than power-on (such as a reboot, a panic, or a firmware update), the board disconnects from the USB bus for 100 ms before starting its console. This causes the host to re-enumerate the port, and programs holding the port, including `tools/kube32_serial_gateway.py`, reopen it. The board blocks on whichever console port received the last bytes and only polls the other port, so a request streaming in over USB loses no bytes while UART0 is idle.
+After any reset other than power-on (such as a reboot, a panic, or a firmware update), the board disconnects from the USB bus for 100 ms before starting its console. This causes the host to re-enumerate the port, and programs holding the port, including `kube32 gateway`, reopen it. The board blocks on whichever console port received the last bytes and only polls the other port, so a request streaming in over USB loses no bytes while UART0 is idle.
 
 Opening the USB port on a Cardputer or the CH340 port on a devkit resets the board. Wait for the boot log to finish before sending commands.
 
@@ -70,7 +86,7 @@ Profile commands write to the `k32` NVS namespace, return `K32_OK ..., rebooting
 
 ### HTTP over the console
 
-`tools/kube32_serial_gateway.py` carries HTTP over the console in streams (`include/app/console_relay.hpp`). Host lines end with `\n` only. Board frames start with the byte `0x1e` and the board writes each frame as a single unit. Log output can surround a frame, but it never splits one. CRCs use CRC-32 (zlib) in hexadecimal.
+`kube32 gateway` carries HTTP over the console in streams (`include/app/console_relay.hpp`). Host lines end with `\n` only. Board frames start with the byte `0x1e` and the board writes each frame as a single unit. Log output can surround a frame, but it never splits one. CRCs use CRC-32 (zlib) in hexadecimal.
 
 | From | Frame | Effect |
 | --- | --- | --- |
@@ -85,7 +101,7 @@ A board with PSRAM runs up to 10 streams at once. A board without PSRAM runs up 
 
 `K32_HTTP <port> <length> [<crc32>]\n<request>` sends a single request. The board returns `K32_RESP <length>\n<raw response>` when the response finishes, or `K32_ERR crc` on a CRC mismatch. The board caps responses at 256 KiB.
 
-Opening a native USB-Serial/JTAG or CH340 port with RTS high and DTR low resets the board. Clear RTS before DTR, as `tools/kube32_serial_gateway.py` does.
+Opening a native USB-Serial/JTAG or CH340 port with RTS high and DTR low resets the board. Clear RTS before DTR, as `kube32 gateway` does.
 
 ## Troubleshooting
 

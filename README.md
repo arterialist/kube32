@@ -15,12 +15,12 @@ kube32 is a Kubernetes-compatible control plane and WebAssembly pod runtime for 
 - Persistent object store backed by a CRC-checked journal on a raw flash partition or the microSD card, plus `persistentVolumeClaim` pod volumes via `k32_fs_*` and rotated container logs for `kubectl logs --previous`.
 - Peripheral access gated per pod by a capability firewall covering GPIO pins, ADC channels, I2C and UART buses, ST7789 display, key matrix, I2S speaker, and microSD storage.
 - Devices: sensors and switches as API objects. Nodes find and identify I2C parts, also behind a PaHub multiplexer. The control plane runs each part's driver on the node that has the part. Apps on any node read the part through a Service, also from a laptop that runs `kube32-sim`.
-- Pod migration: a running pod moves to another node with its memory and clock, on `kube32-cli move`, `kubectl drain`, memory pressure or a faster node, and restores from a periodic checkpoint when its node is lost. See [docs/migration.md](docs/migration.md).
+- Pod migration: a running pod moves to another node with its memory and clock, on `kube32 move`, `kubectl drain`, memory pressure or a faster node, and restores from a periodic checkpoint when its node is lost. See [docs/migration.md](docs/migration.md).
 - Container lifecycle management with `restartPolicy` set to `Always`, `OnFailure`, or `Never`, exponential CrashLoopBackOff, and distinct exit codes for Wasm traps, gas exhaustion, and `OOMKilled`.
 - Optional bearer-token authentication and automatic self-signed ECDSA P-256 TLS on port 6443.
 - Firmware rollouts through the cluster: one node at a time, SHA-256 checked, with bootloader rollback when an image does not come up healthy.
 - Pub/sub events via `k32_event_emit` and `kube32.io/event-topics`, bridged across nodes over ESP-NOW and UDP port 7400.
-- Multi-node host simulator `kube32-sim` and `kube32-cli` for building, checking, and deploying pods over the network or to node storage.
+- Multi-node host simulator `kube32-sim`, and the `kube32` command for flashing boards, running the simulator, and creating, building, checking, and deploying pods over the network or to node storage.
 
 ## Hardware
 
@@ -49,36 +49,48 @@ Use pods for control logic, I/O and glue code. Put heavy computation in native h
 
 ## Quick start
 
-### Simulator
-
-Build and start a two-node cluster on macOS or Linux:
+Install the `kube32` command with [uv](https://docs.astral.sh/uv/) ([Install](docs/install.md)). It flashes boards, runs the simulator, and builds and deploys pods. `kubectl` manages the cluster.
 
 ```sh
-cmake -S . -B build && cmake --build build -j8
-./build/kube32-sim --ingress-port 8080 --pod-port 17000
+uv tool install kube32
 ```
 
-In a second terminal, configure `kubectl` and deploy the echo example:
+### Simulator
+
+Start a two-node cluster on macOS or Linux:
 
 ```sh
-export KUBECONFIG=$PWD/build/kubeconfig
+kube32 sim --ingress-port 8080 --pod-port 17000
+```
+
+In a second terminal, configure `kubectl`:
+
+```sh
 kubectl config set-cluster kube32-sim --server=http://127.0.0.1:6443
 kubectl config set-context kube32-sim --cluster=kube32-sim
 kubectl config use-context kube32-sim
 kubectl get nodes
-kubectl apply -f examples/echo.yaml
+```
+
+Create an app, build it, deploy it, and call it through the pod port:
+
+```sh
+kube32 new hello --lang c
+kube32 build hello
+kube32 deploy hello/build/hello.wasm
+curl -H 'X-Kube32-Pod: default/hello' http://127.0.0.1:17000/
 ```
 
 ### Boards
 
-Build and flash the firmware to each board with PlatformIO:
+Flash each board over USB, then open its serial console:
 
 ```sh
-pio run -e esp32s3
-bash scripts/flash.sh <serial-port> 921600
+kube32 flash
+kube32 console
 ```
 
-Open the serial console at 115200 baud and provision Wi-Fi and the board profile:
+Provision Wi-Fi and the board profile on the console:
 
 ```text
 K32_CMD:BOARD:cardputer          # Cardputer worker only
@@ -87,17 +99,28 @@ K32_CMD:AP:off                   # control plane
 K32_CMD:API:<control-plane-ip>   # worker
 ```
 
-Point `kubectl` at the control plane IP and apply a manifest:
+Point `kubectl` at the control plane IP:
 
 ```sh
 kubectl config set-cluster kube32 --server=http://<control-plane-ip>:6443
 kubectl config set-context kube32 --cluster=kube32
 kubectl config use-context kube32
 kubectl get nodes
-kubectl apply -f examples/echo.yaml
 ```
 
 See [docs/quickstart.md](docs/quickstart.md) for full setup instructions and TLS configuration.
+
+### From source
+
+Build the simulator with CMake and the firmware with PlatformIO:
+
+```sh
+cmake -S . -B build && cmake --build build -j8
+./build/kube32-sim --ingress-port 8080 --pod-port 17000
+pio run -e esp32s3 && bash scripts/flash.sh <serial-port> 921600
+```
+
+In a checkout, `tools/kube32-cli` runs the `kube32` commands. See [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## Example: Tessera
 
@@ -107,7 +130,7 @@ Generate the sample dataset, upload it to the worker's microSD card, and deploy:
 
 ```sh
 make -C apps/tessera dataset
-tools/kube32-cli push apps/tessera/build/card/kube32/volumes/tessera-db --node <worker-node> --path volumes/tessera-db
+kube32 push apps/tessera/build/card/kube32/volumes/tessera-db --node <worker-node> --path volumes/tessera-db
 kubectl apply -f examples/tessera.yaml
 ```
 
@@ -117,6 +140,7 @@ Open `http://<control-plane-ip>/` or `http://127.0.0.1:8080/` on the simulator, 
 
 Full documentation is published at [https://arterialist.github.io/kube32/](https://arterialist.github.io/kube32/).
 
+- [Install](docs/install.md)
 - [Quick start](docs/quickstart.md)
 - [Hardware specification](docs/hardware-spec.md)
 - [Flashing and the serial console](docs/flashing-troubleshooting.md)
