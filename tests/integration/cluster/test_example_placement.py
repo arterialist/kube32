@@ -4,9 +4,10 @@ Two kube32-sim processes: "devkit" runs the control plane and its kubelet
 with the memory of a board with PSRAM (the 1284 KiB pool block and 448 KiB of
 PSRAM besides it), "cardputer" is a worker modelled as a board without PSRAM
 (the 80 KiB pool block and a 51 KiB heap). The nodes advertise the memory
-their kubelets admit pods against, the figures stay put between heartbeats,
-and kubectl apply of the examples binds every pod to the node its manifest
-selects, while the oversized example stays Pending.
+their kubelets can ever give pods, the figures stay put while pods start,
+kubectl apply of the examples binds every pod to the node its manifest
+selects, while the oversized example stays Pending, and the node's
+kube32.io/memory-free annotation follows what the running pods take.
 """
 
 import os
@@ -78,6 +79,11 @@ class TestExamplePlacement(BaseTestCase):
         return {(list_, k): kib(v) for list_ in ("capacity", "allocatable") for k, v in status.get(list_, {}).items()
                 if k in ("memory", "esp32.io/psram")}
 
+    def _memory_free(self, node: str) -> int:
+        """KiB the node can give pods now (its kube32.io/memory-free annotation)"""
+        annotations = self._get(f"/api/v1/nodes/{node}")["metadata"].get("annotations", {})
+        return int(annotations.get("kube32.io/memory-free", "0")) // KIB
+
     def _pod_node(self, prefix: str) -> str:
         pods = self._get("/api/v1/namespaces/default/pods")["items"]
         names = [p for p in pods if p["metadata"]["name"] == prefix or p["metadata"]["name"].startswith(prefix + "-")]
@@ -98,18 +104,20 @@ class TestExamplePlacement(BaseTestCase):
             self.wait_for_condition(lambda name=name: (node_ready_condition(self.api.base_url, name) or {}).get("status") == "True",
                                     timeout=15.0, description=f"{name} Ready")
 
-        # The pool block and the PSRAM above its 16 KiB reserve, and the block
-        # a linear memory can take whole for esp32.io/psram; without PSRAM the
-        # pool block and the heap above the 24 KiB reserve
+        # The pool block and the PSRAM above its 16 KiB reserve, for memory and
+        # for esp32.io/psram alike (a pod's memory is all PSRAM there); without
+        # PSRAM the pool block and the heap above the 24 KiB reserve
         devkit = self._memory("devkit")
         self.assertEqual(devkit[("allocatable", "memory")], 1284 + 448 - 16, f"devkit: {devkit}")
-        self.assertEqual(devkit[("allocatable", "esp32.io/psram")], 1284, f"devkit: {devkit}")
+        self.assertEqual(devkit[("allocatable", "esp32.io/psram")], 1284 + 448 - 16, f"devkit: {devkit}")
+        self.assertEqual(devkit[("capacity", "esp32.io/psram")], 1284 + 448, f"devkit: {devkit}")
         self.assertTrue(devkit[("capacity", "memory")] >= devkit[("allocatable", "memory")], f"devkit: {devkit}")
+        self.assertEqual(self._memory_free("devkit"), 1284 + 448 - 16)
         cardputer = self._memory("cardputer")
         self.assertEqual(cardputer[("allocatable", "memory")], 80 + 51 - 24, f"cardputer: {cardputer}")
         self.assertEqual(cardputer[("capacity", "memory")], 80 + 51, f"cardputer: {cardputer}")
         self.assertFalse(("allocatable", "esp32.io/psram") in cardputer, f"cardputer: {cardputer}")
-        # Heartbeats keep the figures while no pod loads or goes
+        # Heartbeats keep the figures
         time.sleep(2.5)
         self.assertEqual(self._memory("devkit"), devkit)
         self.assertEqual(self._memory("cardputer"), cardputer)
@@ -132,6 +140,10 @@ class TestExamplePlacement(BaseTestCase):
         # The kubelet admits what the scheduler bound: echo runs on the control plane
         self.wait_for_condition(lambda: (self._get("/api/v1/namespaces/default/pods/echo") or {}).get("status", {}).get("phase") == "Running",
                                 timeout=20.0, description="echo Running")
+        # Allocatable stays while pods run; what is free now goes down
+        self.assertEqual(self._memory("devkit"), devkit)
+        self.wait_for_condition(lambda: self._memory_free("devkit") < 1284 + 448 - 16, timeout=10.0,
+                                description="devkit memory-free below allocatable")
 
         oversized = self._get("/api/v1/namespaces/default/pods/oversized-pod")
         self.assertEqual(oversized["spec"].get("nodeName", ""), "")
