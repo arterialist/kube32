@@ -45,11 +45,13 @@ extra_css:
 extra_javascript:
   - https://unpkg.com/mermaid@10/dist/mermaid.min.js
   - javascripts/mermaid.js
+  - javascripts/esp-web-tools.js
 
 nav:
   - Overview: index.md
   - Getting started:
       - Quick start: quickstart.md
+      - Install from the browser: flash.md
       - Hardware: hardware-spec.md
       - Flashing and the serial console: flashing-troubleshooting.md
       - Firmware updates: firmware-updates.md
@@ -72,6 +74,7 @@ nav:
   - Reference:
       - Kubernetes API coverage: api-reference.md
       - Tools: cli-reference.md
+      - Releases: releases.md
       - Benchmarks: benchmarks.md
 
 markdown_extensions:

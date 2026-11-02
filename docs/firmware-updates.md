@@ -101,11 +101,13 @@ The `FirmwareUpdate` condition is `True` during an active update (reasons `Waiti
 
 ## Image identity
 
-The SHA-256 of the entire `firmware.bin` file identifies an image, matching the output of `shasum -a 256 firmware.bin`. Each node computes the SHA-256 of its running image at boot. The build embeds the version string after the `kube32-version:` marker. This value comes from `$KUBE32_VERSION` if set at build time, or from `git describe --tags --always --dirty` otherwise. `kube32-cli firmware info <firmware.bin>` prints both values.
+The SHA-256 of the entire `firmware.bin` file identifies an image, matching the output of `shasum -a 256 firmware.bin`. Each node computes the SHA-256 of its running image at boot. The build embeds the version string after the `kube32-version:` marker. This value comes from `$KUBE32_VERSION` if set at build time, or from `git describe --tags --always --dirty` otherwise, without the `v` of a release tag: a build of tag `v0.4.0` reports `0.4.0`. `kube32-cli firmware info <firmware.bin>` prints both values.
 
 ```
-KUBE32_VERSION=v0.4.0-rc1 pio run -e esp32s3
+KUBE32_VERSION=0.4.0-rc1 pio run -e esp32s3
 ```
+
+Each [release](releases.md) publishes the application image as `kube32-firmware-esp32s3-<version>-app.bin` with its SHA-256, ready for `kube32-cli firmware push`.
 
 ## API
 

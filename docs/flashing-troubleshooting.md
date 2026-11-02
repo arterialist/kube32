@@ -2,7 +2,7 @@
 
 ## Flashing
 
-Build once, then flash one board at a time:
+The [browser installer](flash.md) installs a release without a build. To flash a local build, build once, then flash one board at a time:
 
 ```
 pio run -e esp32s3
@@ -86,6 +86,17 @@ A board with PSRAM runs up to 10 streams at once. A board without PSRAM runs up 
 `K32_HTTP <port> <length> [<crc32>]\n<request>` sends a single request. The board returns `K32_RESP <length>\n<raw response>` when the response finishes, or `K32_ERR crc` on a CRC mismatch. The board caps responses at 256 KiB.
 
 Opening a native USB-Serial/JTAG or CH340 port with RTS high and DTR low resets the board. Clear RTS before DTR, as `tools/kube32_serial_gateway.py` does.
+
+### Improv Wi-Fi
+
+The console also speaks the [Improv Wi-Fi serial protocol](https://www.improv-wifi.com/serial/), which the [browser installer](flash.md) uses. A packet starts a line with `IMPROV`. The board answers:
+
+| Request | Answer |
+| --- | --- |
+| Current state | `Provisioned` with the API server URL when the station holds an address on the network the board has credentials for, `Ready` otherwise |
+| Device information | `kube32`, the firmware version, `ESP32-S3` and the node name |
+| Wi-Fi networks | One result per network name in range |
+| Wi-Fi settings | Joins the network next to the cluster access point for up to 20 seconds. On success it answers `Provisioned` with `http://<ip>:6443` on a control plane (no URL on a worker), stores the credentials as `K32_CMD:WIFI` does, and reboots 3 seconds later. Otherwise it answers `Unable to connect` and returns to its previous network. |
 
 ## Troubleshooting
 

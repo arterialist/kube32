@@ -47,6 +47,20 @@ Measured on an ESP32-S3 devkit (control plane, 2 MB PSRAM) and an M5Stack Cardpu
 
 Use pods for control logic, I/O and glue code. Put heavy computation in native host functions.
 
+## Install
+
+- **Boards**: install the latest release from the browser at [arterialist.github.io/kube32/flash](https://arterialist.github.io/kube32/flash/), which also sets up the board's Wi-Fi.
+- **Simulator**: run the container image, then point `kubectl` at `http://127.0.0.1:6443`:
+
+  ```sh
+  docker run --rm -p 6443:6443 -p 8080:8080 ghcr.io/arterialist/kube32-sim
+  ```
+
+  Each [release](https://github.com/arterialist/kube32/releases) also has `kube32-sim` for macOS and Linux.
+- **SDKs**: `cargo add kube32-sdk` for Rust pods, and the `kube32-c-sdk` archive of each release for C pods.
+
+See [docs/releases.md](docs/releases.md) for every release asset.
+
 ## Quick start
 
 ### Simulator
@@ -118,6 +132,7 @@ Open `http://<control-plane-ip>/` or `http://127.0.0.1:8080/` on the simulator, 
 Full documentation is published at [https://arterialist.github.io/kube32/](https://arterialist.github.io/kube32/).
 
 - [Quick start](docs/quickstart.md)
+- [Install from the browser](docs/flash.md)
 - [Hardware specification](docs/hardware-spec.md)
 - [Flashing and the serial console](docs/flashing-troubleshooting.md)
 - [Writing app pods](docs/app-development.md)
@@ -132,6 +147,7 @@ Full documentation is published at [https://arterialist.github.io/kube32/](https
 - [Architecture overview](docs/architecture/index.md)
 - [Kubernetes API coverage](docs/api-reference.md)
 - [CLI and tools reference](docs/cli-reference.md)
+- [Releases](docs/releases.md)
 
 ## Contributing
 

@@ -4,7 +4,13 @@ Run Kube32 on the host simulator or on a two-board ESP32-S3 cluster.
 
 ## Host simulator
 
-Requirements:
+The container image runs the latest release with no build. It serves the API on port 6443 and the Ingress on port 8080; configure `kubectl` as below:
+
+```sh
+docker run --rm -p 6443:6443 -p 8080:8080 ghcr.io/arterialist/kube32-sim
+```
+
+To build the simulator from source instead, you need:
 
 - CMake 3.16 or newer
 - C++17 compiler, Apple Clang or GCC
@@ -89,7 +95,7 @@ bash scripts/flash.sh <control-plane-port> 921600
 bash scripts/flash.sh <worker-port> 921600
 ```
 
-See [Flashing and the serial console](flashing-troubleshooting.md#flashing) for port and driver details.
+See [Flashing and the serial console](flashing-troubleshooting.md#flashing) for port and driver details. The [browser installer](flash.md) writes the latest release instead, with no build, and sets up each board's Wi-Fi.
 
 ### 2. Provision over the serial console
 
