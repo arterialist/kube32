@@ -19,24 +19,28 @@ uint64_t parse_quantity(const std::string& val) {
     return models::parse_quantity(val);
 }
 
+// A pod without a memory request or limit: the one 64 KiB page of linear
+// memory the kubelet gives it. The runtime's own memory is its overhead.
+static constexpr uint64_t kDefaultPodMemoryBytes = 64 * 1024;
+
 ResourceSpec extract_pod_resource_requests(const std::string& pod_json) {
     ResourceSpec spec;
     models::JsonValue doc;
     std::string err;
     if (!models::parse_json(pod_json, doc, err) || !doc.is_object()) {
-        spec.memory_bytes = 16 * 1024;
+        spec.memory_bytes = kDefaultPodMemoryBytes;
         return spec;
     }
 
     const models::JsonValue* spec_val = doc.get("spec");
     if (!spec_val || !spec_val->is_object()) {
-        spec.memory_bytes = 16 * 1024;
+        spec.memory_bytes = kDefaultPodMemoryBytes;
         return spec;
     }
 
     const models::JsonValue* containers = spec_val->get("containers");
     if (!containers || !containers->is_array()) {
-        spec.memory_bytes = 16 * 1024;
+        spec.memory_bytes = kDefaultPodMemoryBytes;
         return spec;
     }
 
@@ -109,7 +113,7 @@ ResourceSpec extract_pod_resource_requests(const std::string& pod_json) {
         if (!rmt_rx_str.empty()) total_rmt_rx += static_cast<uint32_t>(parse_quantity(rmt_rx_str));
     }
 
-    spec.memory_bytes = (total_mem > 0) ? total_mem : (16 * 1024);
+    spec.memory_bytes = (total_mem > 0) ? total_mem : kDefaultPodMemoryBytes;
     // Pod Overhead: what the runtime takes beyond the containers' requests
     // (set at admission), counted as Kubernetes' scheduler counts it
     if (const models::JsonValue* overhead = spec_val->get("overhead"); overhead && overhead->is_object()) {
@@ -181,15 +185,18 @@ static bool container_running(const models::JsonValue* status) {
     return true;
 }
 
-// The node's allocatable figures are measured by its kubelet (what pods can
-// still be given, unclaimed pins), so pods it was already running when it
-// last reported are inside them. What the scheduler still has to subtract
-// are the requests of pods bound to the node that the report cannot include
-// yet: pods its kubelet has not started (Pending), containers waiting to
-// restart, and pods that started after the node's last status write (the
-// store's resourceVersion is one global counter, so a pod written after the
-// node is newer than its report). One list of the pods serves every node in
-// `node_versions` (name -> the resourceVersion of its last status write).
+// What the pods bound to each node in `node_versions` (name -> the
+// resourceVersion of its last status write) take of its allocatable
+// figures; one list of the pods serves every node.
+//   Memory and PSRAM: allocatable is fixed (what pods can be given with no
+//   pod running), so every bound pod that has not terminated counts, with
+//   its requests and its Pod Overhead, as Kubernetes' scheduler counts them.
+//   Pins, buses and channels: the kubelet reports what is unclaimed, so pods
+//   it was already running when it last reported are inside the figure.
+//   What the scheduler still subtracts are pods its kubelet has not started
+//   (Pending), containers waiting to restart, and pods that started after
+//   the node's last status write (the store's resourceVersion is one global
+//   counter, so a pod written after the node is newer than its report).
 static std::map<std::string, ResourceSpec> allocated_by_node(storage::Store& store, const std::map<std::string, uint64_t>& node_versions,
                                                              const std::string& exclude_pod_key) {
     std::map<std::string, ResourceSpec> allocated;
@@ -215,20 +222,22 @@ static std::map<std::string, ResourceSpec> allocated_by_node(storage::Store& sto
 
         const models::JsonValue* status = doc.get("status");
         std::string phase = status ? status->get_string("phase", "") : "";
-        if (phase != "Running" && phase != "Pending") continue;
-        const bool reflected = phase == "Running" && container_running(status) && node_rv > 0 && resource_version_of(doc) < node_rv;
-        if (reflected) continue;
+        if (phase == "Succeeded" || phase == "Failed") continue;
 
         ResourceSpec req = extract_pod_resource_requests(pod_jsons[i]);
         ResourceSpec& used = allocated[node->first];
         used.memory_bytes += req.memory_bytes;
+        used.psram_bytes += req.psram_bytes;
+
+        if (phase != "Running" && phase != "Pending") continue;
+        const bool reflected = phase == "Running" && container_running(status) && node_rv > 0 && resource_version_of(doc) < node_rv;
+        if (reflected) continue;
         used.gpio_pins += req.gpio_pins;
         used.i2c_buses += req.i2c_buses;
         used.uart_ports += req.uart_ports;
         used.rmt_tx_channels += req.rmt_tx_channels;
         used.rmt_rx_channels += req.rmt_rx_channels;
         used.adc_channels += req.adc_channels;
-        used.psram_bytes += req.psram_bytes;
     }
 
     return allocated;
@@ -762,8 +771,8 @@ private:
         std::vector<Candidate> qualified;
         std::map<std::string, size_t> reasons;   // why nodes were filtered out, with counts
 
-        // What the pods bound to each node take that its report does not
-        // include yet: one list of the pods for all nodes
+        // What the pods bound to each node take of its allocatable figures
+        // (allocated_by_node): one list of the pods for all nodes
         std::vector<models::JsonValue> n_docs(node_jsons.size());
         std::map<std::string, uint64_t> node_versions;
         for (size_t i = 0; i < node_jsons.size(); ++i) {

@@ -1,4 +1,7 @@
 #include "scheduler/scheduler.hpp"
+#include "embedded/embedded_blobs.hpp"
+#include "runtime/image_registry.hpp"
+#include "runtime/wasm_runtime.hpp"
 #include "storage/store.hpp"
 #include "models/kube_models.hpp"
 #include "osal/system.hpp"
@@ -232,9 +235,10 @@ void test_deleted_node_reconciliation() {
     std::cout << "[PASS] test_deleted_node_reconciliation" << std::endl;
 }
 
-// Allocatable memory is the free heap the node measured. Pods its kubelet was
-// running when it reported are inside that figure and are not subtracted
-// again; bound pods it has not started are.
+// Allocatable memory is what the node's pods can be given with no pod
+// running, a fixed figure: every bound pod that has not terminated counts
+// against it with its requests and its Pod Overhead, whether its kubelet has
+// started it or not, and whenever the node last reported.
 void test_allocatable_accounting_and_failure_message() {
     std::cout << "[RUN] test_allocatable_accounting_and_failure_message" << std::endl;
     StoreOptions opts;
@@ -243,17 +247,18 @@ void test_allocatable_accounting_and_failure_message() {
 
     const std::string running_pod =
         "{\"kind\":\"Pod\",\"metadata\":{\"name\":\"hud\",\"namespace\":\"default\"},"
-        "\"spec\":{\"nodeName\":\"node-a\",\"containers\":[{\"name\":\"c\",\"resources\":{\"requests\":{\"memory\":\"64Ki\"}}}]},"
+        "\"spec\":{\"nodeName\":\"node-a\",\"overhead\":{\"memory\":\"20Ki\"},"
+        "\"containers\":[{\"name\":\"c\",\"resources\":{\"requests\":{\"memory\":\"64Ki\"}}}]},"
         "\"status\":{\"phase\":\"Running\",\"containerStatuses\":[{\"name\":\"c\",\"state\":{\"running\":{}}}]}}";
     store->put("/registry/pods/default/hud", running_pod, true);
-    // The node reports after the pod started: 100Ki free with the pod running
+    // The node reports after the pod started: allocatable does not move
     const std::string node_a = "{\"kind\":\"Node\",\"metadata\":{\"name\":\"node-a\",\"labels\":{\"board\":\"cardputer\"}},"
                                "\"status\":{\"conditions\":[{\"type\":\"Ready\",\"status\":\"True\"}],"
-                               "\"allocatable\":{\"memory\":\"100Ki\"}}}";
+                               "\"allocatable\":{\"memory\":\"200Ki\"}}}";
     store->put("/registry/nodes/node-a", node_a, true);
 
     ResourceSpec used = calculate_node_allocated_resources(*store, "node-a");
-    assert(used.memory_bytes == 0);   // the running pod is inside the 100Ki
+    assert(used.memory_bytes == (64 + 20) * 1024);   // the running pod and its overhead
 
     auto sched = create_scheduler(*store);
     std::string fits = "{\"kind\":\"Pod\",\"metadata\":{\"name\":\"fits\",\"namespace\":\"default\"},"
@@ -263,16 +268,25 @@ void test_allocatable_accounting_and_failure_message() {
     store->put("/registry/pods/default/fits", fits, true);   // bound, not started
 
     used = calculate_node_allocated_resources(*store, "node-a");
-    assert(used.memory_bytes == 90 * 1024);   // not in the node's figure yet
-
-    // A pod that changed after the node's last report is counted too
-    store->put("/registry/pods/default/hud", running_pod, true);
-    used = calculate_node_allocated_resources(*store, "node-a");
-    assert(used.memory_bytes == (90 + 64) * 1024);
-    // ... until the node reports again
+    assert(used.memory_bytes == (64 + 20 + 90) * 1024);
+    // The node reporting again changes nothing
     store->put("/registry/nodes/node-a", node_a, true);
-    used = calculate_node_allocated_resources(*store, "node-a");
-    assert(used.memory_bytes == 90 * 1024);
+    store->put("/registry/pods/default/hud", running_pod, true);
+    store->put("/registry/nodes/node-a", node_a, true);
+    assert(calculate_node_allocated_resources(*store, "node-a").memory_bytes == (64 + 20 + 90) * 1024);
+    // 26Ki left: a pod with 20Ki of requests and 8Ki of overhead does not fit
+    std::string over = "{\"kind\":\"Pod\",\"metadata\":{\"name\":\"over\",\"namespace\":\"default\"},"
+                       "\"spec\":{\"overhead\":{\"memory\":\"8Ki\"},\"containers\":[{\"name\":\"c\",\"resources\":{\"requests\":{\"memory\":\"20Ki\"}}}]}}";
+    assert(!sched->schedule_pod_manifest(over).scheduled);
+    // A pod that terminated holds nothing: then it fits
+    std::string done = running_pod;
+    done.replace(done.find("\"phase\":\"Running\""), 17, "\"phase\":\"Succeeded\"");
+    store->put("/registry/pods/default/hud", done, true);
+    assert(calculate_node_allocated_resources(*store, "node-a").memory_bytes == 90 * 1024);
+    r = sched->schedule_pod_manifest(over);
+    assert(r.scheduled && r.target_node == "node-a");
+    store->remove("/registry/pods/default/over");
+    store->put("/registry/pods/default/hud", running_pod, true);
 
     // Nothing fits: the message counts each reason, kube-scheduler style
     const std::string node_b = "{\"kind\":\"Node\",\"metadata\":{\"name\":\"node-b\",\"labels\":{\"board\":\"devkit\"}},"
@@ -373,9 +387,11 @@ void test_retries_on_changes() {
     store->get_extended(key, before, &after_version);
     assert(after_version == version);
 
-    // Changes keep coming: attempts wait for the back-off (100, 200, 400 ms)
+    // Changes keep coming: attempts wait for the back-off (100, 200, 400 ms).
+    // The pods have completed: they take nothing from the node
     for (int i = 0; i < 20; ++i) {
-        store->put("/registry/pods/default/other-" + std::to_string(i), "{\"kind\":\"Pod\",\"metadata\":{\"name\":\"o\"},\"spec\":{\"nodeName\":\"node-a\"}}", true);
+        store->put("/registry/pods/default/other-" + std::to_string(i),
+                   "{\"kind\":\"Pod\",\"metadata\":{\"name\":\"o\"},\"spec\":{\"nodeName\":\"node-a\"},\"status\":{\"phase\":\"Succeeded\"}}", true);
         kube32::osal::Thread::sleep_ms(50);
     }
     const uint64_t during = failed_attempts(*store, "waiting") - attempts;
@@ -395,6 +411,119 @@ void test_retries_on_changes() {
     std::cout << "[PASS] test_retries_on_changes" << std::endl;
 }
 
+// Pod Overhead admission (runtime::set_pod_overhead): spec.overhead.memory
+// is the kubelet's estimate of the pod beyond its linear memory, rounded up
+// to whole KiB, with the linear memory taken as the kubelet takes it
+void test_pod_overhead() {
+    std::cout << "[RUN] test_pod_overhead" << std::endl;
+    size_t n = 0;
+    const kube32::runtime::EmbeddedImage* imgs = kube32::embedded::images(n);
+    kube32::runtime::ImageRegistry::instance().add_all(imgs, n);
+    const kube32::runtime::EmbeddedImage* echo = kube32::runtime::ImageRegistry::instance().resolve("wasm://embedded/echo");
+    const kube32::runtime::EmbeddedImage* api = kube32::runtime::ImageRegistry::instance().resolve("wasm://embedded/tessera-api");
+    assert(echo && api);
+    auto parse = [](const std::string& json) {
+        kube32::models::JsonValue doc;
+        std::string err;
+        bool ok = kube32::models::parse_json(json, doc, err);
+        assert(ok);
+        return doc;
+    };
+    auto kib_up = [](size_t bytes) { return (bytes + 1023) / 1024 * 1024; };
+    auto overhead_of = [](const kube32::models::JsonValue& pod) {
+        const kube32::models::JsonValue* o = pod.get("spec")->get("overhead");
+        return o ? parse_quantity(o->get_string("memory", "")) : 0;
+    };
+
+    // No memory request or limit: one 64 KiB page, the operand stack sized
+    // from the module (4 KiB at most)
+    kube32::models::JsonValue pod = parse(R"({"metadata":{"name":"e"},"spec":{"containers":[{"name":"c","image":"wasm://embedded/echo"}]}})");
+    size_t linear = 0;
+    size_t need = kube32::runtime::estimate_pod_memory(echo->data, echo->len, 64 * 1024, 4 * 1024, true, kube32::runtime::EstimateSizes::Board, &linear);
+    assert(linear == 64 * 1024);
+    size_t got = kube32::runtime::set_pod_overhead(pod);
+    assert(got == kib_up(need - linear) && overhead_of(pod) == got);
+    // ... which the scheduler counts with the page the kubelet gives the pod
+    assert(extract_pod_resource_requests(pod.to_string()).memory_bytes == 64 * 1024 + got);
+
+    // A limit under a page: the limit is the linear memory; the request is
+    // what the scheduler counts, the overhead on top
+    pod = parse(R"({"metadata":{"name":"e"},"spec":{"containers":[{"name":"c","image":"wasm://embedded/echo",)"
+                R"("resources":{"requests":{"memory":"3Ki"},"limits":{"memory":"3Ki"}}}]}})");
+    need = kube32::runtime::estimate_pod_memory(echo->data, echo->len, 3 * 1024, 4 * 1024, true, kube32::runtime::EstimateSizes::Board, &linear);
+    assert(linear == 3 * 1024);
+    got = kube32::runtime::set_pod_overhead(pod);
+    assert(got == kib_up(need - linear) && overhead_of(pod) == got);
+    assert(extract_pod_resource_requests(pod.to_string()).memory_bytes == 3 * 1024 + got);
+
+    // An esp32.io/psram request sizes the linear memory (the module's
+    // initial pages count); the overhead is the rest, kube32.io/wasm-stack
+    // sets the stack
+    pod = parse(R"({"metadata":{"name":"a","annotations":{"kube32.io/wasm-stack":"8Ki"}},"spec":{"containers":[{"name":"c",)"
+                R"("image":"wasm://embedded/tessera-api","resources":{"requests":{"memory":"16Ki","esp32.io/psram":"1280Ki"}}}]}})");
+    need = kube32::runtime::estimate_pod_memory(api->data, api->len, 1280 * 1024, 8 * 1024, false, kube32::runtime::EstimateSizes::Board, &linear);
+    got = kube32::runtime::set_pod_overhead(pod);
+    assert(got == kib_up(need - linear) && got > 0);
+    ResourceSpec req = extract_pod_resource_requests(pod.to_string());
+    assert(req.memory_bytes == 16 * 1024 + got && req.psram_bytes == 1280 * 1024);
+
+    // An image in the control plane's image store: estimated from its size
+    pod = parse(R"({"metadata":{"name":"s","annotations":{"kube32.io/wasm-size":"20000","kube32.io/wasm-sha256":"ab"}},)"
+                R"("spec":{"containers":[{"name":"c","image":"registry.local/s:1"}]}})");
+    need = kube32::runtime::estimate_pod_memory(nullptr, 20000, 64 * 1024, 4 * 1024, true, kube32::runtime::EstimateSizes::Board, &linear);
+    assert(kube32::runtime::set_pod_overhead(pod) == kib_up(need - linear));
+
+    // An image this node cannot see (a worker's card): no overhead, and a
+    // stale one is taken away
+    pod = parse(R"({"metadata":{"name":"x"},"spec":{"overhead":{"memory":"99Ki"},"containers":[{"name":"c","image":"sd://x:1"}]}})");
+    assert(kube32::runtime::set_pod_overhead(pod) == 0 && !pod.get("spec")->get("overhead"));
+    assert(extract_pod_resource_requests(pod.to_string()).memory_bytes == 64 * 1024);
+    std::cout << "[PASS] test_pod_overhead" << std::endl;
+}
+
+// The scheduler's memory per node: requests and overhead of every bound pod
+// that has not terminated, against the node's fixed allocatable figure, for
+// memory and for esp32.io/psram alike
+void test_bound_pods_and_overhead_fill_a_node() {
+    std::cout << "[RUN] test_bound_pods_and_overhead_fill_a_node" << std::endl;
+    StoreOptions opts;
+    opts.enable_flash_persistence = false;
+    auto store = create_radix_store(opts);
+    store->put("/registry/nodes/devkit",
+               "{\"kind\":\"Node\",\"metadata\":{\"name\":\"devkit\"},\"status\":{\"conditions\":[{\"type\":\"Ready\",\"status\":\"True\"}],"
+               "\"allocatable\":{\"memory\":\"1600Ki\",\"esp32.io/psram\":\"1600Ki\"}}}",
+               true);
+    auto pod = [](const std::string& name, const std::string& phase, const std::string& requests, const std::string& overhead) {
+        return "{\"kind\":\"Pod\",\"metadata\":{\"name\":\"" + name + "\",\"namespace\":\"default\"},\"spec\":{\"nodeName\":\"devkit\"," +
+               (overhead.empty() ? std::string() : "\"overhead\":{\"memory\":\"" + overhead + "\"},") +
+               "\"containers\":[{\"name\":\"c\",\"resources\":{\"requests\":" + requests + "}}]}" +
+               (phase.empty() ? std::string() : ",\"status\":{\"phase\":\"" + phase + "\"}") + "}";
+    };
+    store->put("/registry/pods/default/api", pod("api", "Running", R"({"memory":"16Ki","esp32.io/psram":"1280Ki"})", "40Ki"), true);
+    store->put("/registry/pods/default/web", pod("web", "Pending", R"({"memory":"4Ki"})", "12Ki"), true);
+    store->put("/registry/pods/default/new", pod("new", "", R"({})", "10Ki"), true);       // bound, no status yet
+    store->put("/registry/pods/default/gone", pod("gone", "Failed", R"({"memory":"900Ki"})", "10Ki"), true);
+    store->put("/registry/pods/default/lost", pod("lost", "Unknown", R"({"memory":"8Ki"})", ""), true);
+    const ResourceSpec used = calculate_node_allocated_resources(*store, "devkit");
+    assert(used.memory_bytes == (16 + 40 + 4 + 12 + 64 + 10 + 8) * 1024);
+    assert(used.psram_bytes == 1280 * 1024);
+
+    // 1446Ki of memory left and 320Ki of PSRAM
+    auto sched = create_scheduler(*store);
+    auto try_pod = [&](const std::string& requests, const std::string& overhead) {
+        std::string json = "{\"kind\":\"Pod\",\"metadata\":{\"name\":\"t\",\"namespace\":\"default\"},\"spec\":{" +
+                           (overhead.empty() ? std::string() : "\"overhead\":{\"memory\":\"" + overhead + "\"},") +
+                           "\"containers\":[{\"name\":\"c\",\"resources\":{\"requests\":" + requests + "}}]}}";
+        ScheduleResult r = sched->pick_node(json, "");
+        return r.scheduled ? std::string("devkit") : r.failure_reason;
+    };
+    assert(try_pod(R"({"memory":"1406Ki"})", "40Ki") == "devkit");
+    assert(try_pod(R"({"memory":"1407Ki"})", "40Ki") == "0/1 nodes are available: 1 Insufficient memory.");
+    assert(try_pod(R"({"memory":"1Ki","esp32.io/psram":"320Ki"})", "") == "devkit");
+    assert(try_pod(R"({"memory":"1Ki","esp32.io/psram":"321Ki"})", "") == "0/1 nodes are available: 1 Insufficient esp32.io/psram.");
+    std::cout << "[PASS] test_bound_pods_and_overhead_fill_a_node" << std::endl;
+}
+
 int main() {
     std::cout << "=== Running Kube32 Autonomous Scheduler Unit Tests ===" << std::endl;
     test_quantity_parser();
@@ -402,6 +531,8 @@ int main() {
     test_scheduler_atomic_binding();
     test_deleted_node_reconciliation();
     test_allocatable_accounting_and_failure_message();
+    test_pod_overhead();
+    test_bound_pods_and_overhead_fill_a_node();
     test_retries_on_changes();
     std::cout << "=== All Scheduler Tests Passed Successfully ===" << std::endl;
     return 0;
