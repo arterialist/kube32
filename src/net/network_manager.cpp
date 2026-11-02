@@ -72,9 +72,16 @@ public:
     // Stations keep trying to rejoin the cluster AP forever; the AP may boot
     // after us or reboot while we run.
     static void wifi_event(void* arg, esp_event_base_t base, int32_t id, void* data) {
-        (void)base; (void)data;
+        (void)base;
         auto* self = static_cast<EspNetworkManager*>(arg);
         if (id == WIFI_EVENT_STA_DISCONNECTED && self->mode_ != NetworkMode::SoftAP) {
+            // The reason, once per change: 201 no AP with that name in range,
+            // 15 or 204 a wrong password, 2 or 4 the AP dropped this station
+            const auto* ev = static_cast<const wifi_event_sta_disconnected_t*>(data);
+            if (ev && ev->reason != self->last_disconnect_reason_) {
+                self->last_disconnect_reason_ = ev->reason;
+                printf("[NET] station not connected: reason %u, rssi %d\n", (unsigned)ev->reason, (int)ev->rssi);
+            }
             self->sta_has_ip_ = false;
             self->uplink_down();
             vTaskDelay(pdMS_TO_TICKS(1000));
@@ -100,6 +107,7 @@ public:
         auto* self = static_cast<EspNetworkManager*>(arg);
         auto* ev = static_cast<ip_event_got_ip_t*>(data);
         self->sta_has_ip_ = true;
+        self->last_disconnect_reason_ = 0;
         if (heap_caps_get_total_size(MALLOC_CAP_SPIRAM) == 0 && self->sta_netif_) {
             // Without PSRAM the heap soon holds no 1.6 KB block, and a full
             // size Wi-Fi frame can then be neither sent nor received: TCP
@@ -331,7 +339,11 @@ public:
     std::string get_ip_address() const override {
         if (!connected_) return "0.0.0.0";
         esp_netif_ip_info_t ip_info;
-        esp_netif_t* netif = (mode_ == NetworkMode::SoftAP || mode_ == NetworkMode::StationAndSoftAP) ? ap_netif_ : sta_netif_;
+        // With both interfaces, the uplink's address once it has one: the
+        // address hosts on that network and its workers reach
+        esp_netif_t* netif = mode_ == NetworkMode::SoftAP ? ap_netif_
+                           : mode_ == NetworkMode::StationAndSoftAP ? (sta_has_ip_ ? sta_netif_ : ap_netif_)
+                           : sta_netif_;
         if (netif && esp_netif_get_ip_info(netif, &ip_info) == ESP_OK) {
             char buf[32];
             snprintf(buf, sizeof(buf), IPSTR, IP2STR(&ip_info.ip));
@@ -354,6 +366,7 @@ private:
     esp_netif_t* sta_netif_{nullptr};
     esp_netif_t* ap_netif_{nullptr};
     NetworkMode mode_{NetworkMode::Disconnected};
+    uint8_t last_disconnect_reason_{0};
     bool connected_{false};
     volatile bool sta_has_ip_{false};
     volatile bool roam_scan_{false};

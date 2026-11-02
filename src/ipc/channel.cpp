@@ -690,6 +690,15 @@ void ChannelManager::send_hello() {
     std::memcpy(payload, &local_node_id_, 4);
     size_t name_len = std::min<size_t>(local_node_name_.size(), sizeof(payload) - 4);
     std::memcpy(payload + 4, local_node_name_.data(), name_len);
+    {
+        osal::LockGuard guard(peer_mutex_);
+        if (!announced_api_.empty() && 4 + name_len + 5 + announced_api_.size() <= sizeof(payload)) {
+            payload[4 + name_len] = 0;
+            std::memcpy(payload + 5 + name_len, "api=", 4);
+            std::memcpy(payload + 9 + name_len, announced_api_.data(), announced_api_.size());
+            name_len += 5 + announced_api_.size();   // sent as one block after the id
+        }
+    }
     uint32_t hash = fnv1a_32(K32C_HELLO_TOPIC, std::strlen(K32C_HELLO_TOPIC));
     uint32_t sender = fnv1a_32(local_node_name_);
 #if defined(KUBE32_TARGET_ESP32)
@@ -710,6 +719,21 @@ void ChannelManager::send_hello() {
     for (const auto& ep : seeds) {
         send_frames_to(ep, hash, sender, 0, payload, 4 + name_len, K32C_FLAG_PING);
     }
+}
+
+void ChannelManager::set_announced_api(const std::string& address) {
+    osal::LockGuard guard(peer_mutex_);
+    announced_api_ = address;
+}
+
+std::string ChannelManager::announced_api() const {
+    osal::LockGuard guard(peer_mutex_);
+    const PeerInfo* latest = nullptr;
+    for (const auto& kv : peers_) {
+        if (kv.second.api_address.empty()) continue;
+        if (!latest || kv.second.last_seen_ms > latest->last_seen_ms) latest = &kv.second;
+    }
+    return latest ? latest->api_address : std::string();
 }
 
 void ChannelManager::add_seed_peer(const std::string& ip, uint16_t port) {
@@ -735,7 +759,14 @@ void ChannelManager::handle_hello(const K32CHeader* hdr, const uint8_t* payload,
     stats_.hello_rx.fetch_add(1, std::memory_order_relaxed);
     PeerInfo info;
     info.node_id = node_id;
-    info.node_name.assign(reinterpret_cast<const char*>(payload + 4), len - 4);
+    const char* text = reinterpret_cast<const char*>(payload + 4);
+    const size_t text_len = len - 4;
+    const void* nul = std::memchr(text, 0, text_len);
+    const size_t name_len = nul ? static_cast<size_t>(static_cast<const char*>(nul) - text) : text_len;
+    info.node_name.assign(text, name_len);
+    if (nul && text_len - name_len > 5 && std::memcmp(text + name_len + 1, "api=", 4) == 0) {
+        info.api_address.assign(text + name_len + 5, text_len - name_len - 5);
+    }
     if (source) info.endpoint = *source;
     info.endpoint.node_id = node_id;
     if (info.endpoint.udp_port == 0) info.endpoint.udp_port = 7400;

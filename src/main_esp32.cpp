@@ -1118,8 +1118,8 @@ void cluster_task(void* pv) {
     wifi_cfg.password = ap_password;
     std::string uplink_ssid, uplink_pass;
     // Stored Wi-Fi credentials put the node on an existing network instead of
-    // the cluster access point. A worker on an external network also needs the
-    // control plane address (K32_CMD:API:<host>).
+    // the cluster access point. A worker there dials K32_CMD:API:<host>, and
+    // follows the address the control plane announces when that one is silent.
     bool uplink = read_nvs_wifi(uplink_ssid, uplink_pass);
     std::string api_host = read_nvs_str("api");
     if (api_host.empty()) api_host = "192.168.4.1";
@@ -1690,6 +1690,21 @@ void cluster_task(void* pv) {
                 restarts = 0;
             }
             const uint64_t heard = std::max(kubelet->last_sync_ok_ms(), quiet_since);
+            // A control plane that announces another address than the one
+            // this worker dials (it joined another network, or its DHCP
+            // lease changed): store that address and start again with it
+            const std::string announced = kube32::ipc::ChannelManager::instance().announced_api();
+            if (now - heard > 30000 && !announced.empty() && announced != api_host) {
+                nvs_handle_t h;
+                if (nvs_open("k32", NVS_READWRITE, &h) == ESP_OK) {
+                    nvs_set_str(h, "api", announced.c_str());
+                    nvs_commit(h);
+                    nvs_close(h);
+                }
+                printf("[NET] no answer from %s; the control plane announces %s, restarting with it\n", api_host.c_str(), announced.c_str());
+                fflush(stdout);
+                esp_restart();
+            }
             if (now - heard > 60000 && !rejoined && net_mgr->station_has_ip()) {
                 printf("[NET] no answer from the control plane for %u s on a connected link, joining the access point again\n",
                        (unsigned)((now - heard) / 1000));
@@ -1706,6 +1721,24 @@ void cluster_task(void* pv) {
                 printf("[NET] no answer from the control plane for %u s, restarting Wi-Fi\n", (unsigned)((now - heard) / 1000));
                 net_mgr->restart_radio();
                 quiet_since = now;
+            }
+        }
+        if (ident.is_control_plane && uplink && iter % 10 == 0) {
+            // Workers on this network learn the API server's address from HELLO
+            kube32::ipc::ChannelManager::instance().set_announced_api(net_mgr->station_has_ip() ? net_mgr->get_ip_address() : std::string());
+            // A control plane whose station has had no address for a minute
+            // restarts its Wi-Fi driver, at most once a minute: a join can
+            // stall in "connecting" with no event that would retry it.
+            static uint64_t addressless_since = 0;
+            const uint64_t now = kube32::osal::System::get_uptime_ms();
+            if (net_mgr->station_has_ip()) {
+                addressless_since = 0;
+            } else if (addressless_since == 0) {
+                addressless_since = now;
+            } else if (now - addressless_since > 60000) {
+                printf("[NET] station without an address for %u s, restarting Wi-Fi\n", (unsigned)((now - addressless_since) / 1000));
+                net_mgr->restart_radio();
+                addressless_since = now;
             }
         }
         if (iter % 30 == 0) log_memory("steady state");

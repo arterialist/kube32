@@ -196,6 +196,9 @@ struct PeerInfo {
     NodeEndpoint endpoint;
     uint64_t last_seen_ms{0};
     uint32_t hello_count{0};
+    // The API server address a control plane announces in its HELLO
+    // ("" from a worker)
+    std::string api_address;
 };
 
 constexpr const char* K32C_HELLO_TOPIC = "k32.hello";
@@ -225,6 +228,11 @@ public:
     // Starts the periodic HELLO announcement and the dispatcher thread.
     bool start_background(uint32_t hello_interval_ms = 3000, size_t dispatcher_stack_bytes = 8192, bool stack_in_psram = false);
     void send_hello();
+    // A control plane announces where its API server answers: HELLO carries
+    // the name, a NUL and "api=<address>". "" stops the announcement.
+    void set_announced_api(const std::string& address);
+    // The address the most recently heard control plane announces, or ""
+    std::string announced_api() const;
     // Peers reachable over IP that cannot be found by ESP-NOW broadcast (nodes
     // on another access point of the same network): HELLO is sent to them
     // unicast until they answer and become regular peers.
@@ -297,6 +305,7 @@ private:
     std::vector<NodeEndpoint> seed_peers_;   // guarded by peer_mutex_
     uint32_t local_node_id_{0};
     std::string local_node_name_;
+    std::string announced_api_;   // guarded by peer_mutex_: what this node announces
 
     // Host subscribers and dispatcher
     struct Subscription {

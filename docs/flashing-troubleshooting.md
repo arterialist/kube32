@@ -35,7 +35,7 @@ Profile commands write to the `k32` NVS namespace, return `K32_OK ..., rebooting
 | Command | Effect |
 | --- | --- |
 | `K32_CMD:WIFI:<ssid>:<password>` | Join a 2.4 GHz network as a station. The station picks the strongest access point with that name and roams to one at least 10 dB stronger when signal drops below -70 dBm. The SSID cannot contain `:`. `K32_CMD:WIFI:` erases credentials. |
-| `K32_CMD:API:<host>` | Set the control plane address for a worker, default `192.168.4.1`. `auto` erases it. |
+| `K32_CMD:API:<host>` | Set the control plane address for a worker, default `192.168.4.1`. `auto` erases it. A worker that gets no answer there switches to the address the control plane announces over ESP-NOW. |
 | `K32_CMD:AP:off` | Disable the `Kube32-Cluster` access point on the control plane. `on` erases the setting. |
 | `K32_CMD:APPASS:<password>` | Set the `Kube32-Cluster` access point password (8 to 63 printable characters) on the control plane and on each worker that joins the access point. An empty value erases the password, and the control plane generates a replacement on its next boot. |
 | `K32_CMD:APPASS` | Print the stored access point password as `K32_APPASS <password>`. |
@@ -95,6 +95,7 @@ Opening a native USB-Serial/JTAG or CH340 port with RTS high and DTR low resets 
 | Board stays in download mode after flashing | Press the reset button or flash with `scripts/flash.sh`. |
 | Garbled console output on the CH340 port | Set the baud rate to 115200 or use the native USB port. |
 | Worker never registers | Check `[WORKER] kubelet -> http://<host>:6443` in the boot log and set the control plane address with `K32_CMD:API:<host>`. |
+| `[NET] station not connected: reason 201` | No access point with the stored name is in range. Reason 15 or 204 is a wrong password. Store other credentials with `K32_CMD:WIFI:<ssid>:<password>`. |
 | Control plane logs `http://192.168.4.1:6443` while joined to a station network | Disable the softAP with `K32_CMD:AP:off`. |
 | Worker logs `[NET] no password for the cluster access point` | Read the password on the control plane with `K32_CMD:APPASS` and set it on the worker with `K32_CMD:APPASS:<password>`. |
 | Keypad events do not reach the control plane across different access points | Verify the worker node object has an `InternalIP` for UDP transport. |

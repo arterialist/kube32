@@ -237,9 +237,12 @@ void NodeStatusReporter::append_registration(Out& json, const NodeTelemetry& tel
     append_ready_condition(json, telemetry);
     append_firmware_condition(json, telemetry);
     json += "],";
-    json += "\"addresses\":[{\"type\":\"InternalIP\",\"address\":\"";
-    json += node_ip_;
-    json += "\"}],";
+    // No address until the board has one: 0.0.0.0 is nobody's address
+    if (!node_ip_.empty() && node_ip_ != "0.0.0.0") {
+        json += "\"addresses\":[{\"type\":\"InternalIP\",\"address\":\"";
+        json += node_ip_;
+        json += "\"}],";
+    }
     if (kubelet_port_) {
         json += "\"daemonEndpoints\":{\"kubeletEndpoint\":{\"Port\":";
         append_uint(json, kubelet_port_);
