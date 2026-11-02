@@ -1,4 +1,4 @@
-"""Tests for tools/kube32_serial_gateway.py against a fake board on a pty.
+"""Tests for the serial gateway (kube32 gateway, tools/kube32_serial_gateway.py) against a fake board on a pty.
 
 Run from the repository root:
 
@@ -8,7 +8,7 @@ The fake board speaks the console relay protocol (include/app/console_relay.hpp)
 on the master side of a pseudo-terminal; the gateway opens the slave side as
 its serial port and serves HTTP on a local port.
 """
-import importlib.util
+import importlib
 import os
 import socket
 import threading
@@ -16,8 +16,7 @@ import time
 import unittest
 import zlib
 
-TESTS_DIR = os.path.dirname(os.path.abspath(__file__))
-GATEWAY = os.path.join(os.path.dirname(TESTS_DIR), "kube32_serial_gateway.py")
+import kube32_under_test  # noqa: F401  (puts the kube32 package under test on sys.path)
 
 try:
     import serial  # noqa: F401
@@ -27,10 +26,7 @@ except ImportError:
 
 
 def load_gateway():
-    spec = importlib.util.spec_from_file_location("kube32_serial_gateway", GATEWAY)
-    mod = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(mod)
-    return mod
+    return importlib.import_module("kube32.gateway")
 
 
 HELLO_BODY = b"hello from the board\n" * 200   # spans several frames

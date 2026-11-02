@@ -1,34 +1,33 @@
-"""Tests for tools/kube32-cli.
+"""Tests for the kube32 command line (tools/kube32-cli, the kube32 package's CLI).
 
 Run from the repository root:
 
     python3 -m unittest discover -s tools/tests -v
 
-Fixtures are the modules in images/ (images/echo.wasm is tracked; the others
-are used when present) plus small modules assembled here byte by byte. The
-deploy tests run against a fake kubectl that records its arguments; the
-build tests that need clang, rust-lld, make or cargo skip themselves when the
-tool is missing.
+KUBE32_TEST_INSTALLED=1 runs them against the installed package instead of
+python/src (kube32_under_test.py). Fixtures are the modules in images/
+(images/echo.wasm is tracked; the others are used when present) plus small
+modules assembled here byte by byte. The deploy tests run against a fake
+kubectl that records its arguments; the build tests that need clang,
+rust-lld, make or cargo skip themselves when the tool is missing.
 """
 import base64
 import glob
 import hashlib
-import importlib.machinery
-import importlib.util
 import json
 import os
 import re
 import shutil
 import stat
 import subprocess
-import sys
 import tempfile
 import textwrap
 import unittest
 
-TESTS_DIR = os.path.dirname(os.path.abspath(__file__))
-REPO = os.path.dirname(os.path.dirname(TESTS_DIR))
-CLI = os.path.join(REPO, "tools", "kube32-cli")
+from kube32_under_test import REPO, cli_command
+
+from kube32 import build as kbuild, common, firmware, wasm
+
 ECHO = os.path.join(REPO, "images", "echo.wasm")
 ECHO_SIZE = "{:,}".format(os.path.getsize(ECHO))
 TESSERA_API = os.path.join(REPO, "images", "tessera-api.wasm")
@@ -37,19 +36,8 @@ I2CSCAN = os.path.join(REPO, "images", "i2cscan.wasm")
 SDNOTE = os.path.join(REPO, "images", "sd", "sdnote.wasm")
 
 
-def load_cli():
-    loader = importlib.machinery.SourceFileLoader("kube32_cli", CLI)
-    spec = importlib.util.spec_from_loader("kube32_cli", loader)
-    mod = importlib.util.module_from_spec(spec)
-    loader.exec_module(mod)
-    return mod
-
-
-cli = load_cli()
-
-
 def run_cli(*args, env=None, cwd=None):
-    proc = subprocess.run([sys.executable, CLI] + [str(a) for a in args], stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+    proc = subprocess.run(cli_command() + [str(a) for a in args], stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                           text=True, env=env, cwd=cwd or REPO)
     return proc.returncode, proc.stdout, proc.stderr
 
@@ -156,27 +144,27 @@ class TempDirCase(unittest.TestCase):
 # ---------------------------------------------------------------------------
 class TestUnits(unittest.TestCase):
     def test_parse(self):
-        self.assertEqual(cli.parse_quantity("64Ki"), 65536)
-        self.assertEqual(cli.parse_quantity("1280Ki"), 1310720)
-        self.assertEqual(cli.parse_quantity("2Mi"), 2 * 1024 * 1024)
-        self.assertEqual(cli.parse_quantity("65536"), 65536)
-        self.assertEqual(cli.parse_quantity("64K"), 64000)
+        self.assertEqual(common.parse_quantity("64Ki"), 65536)
+        self.assertEqual(common.parse_quantity("1280Ki"), 1310720)
+        self.assertEqual(common.parse_quantity("2Mi"), 2 * 1024 * 1024)
+        self.assertEqual(common.parse_quantity("65536"), 65536)
+        self.assertEqual(common.parse_quantity("64K"), 64000)
         with self.assertRaises(ValueError):
-            cli.parse_quantity("lots")
+            common.parse_quantity("lots")
 
     def test_format(self):
-        self.assertEqual(cli.format_quantity(65536), "64Ki")
-        self.assertEqual(cli.format_quantity(2 * 1024 * 1024), "2Mi")
-        self.assertEqual(cli.format_quantity(1000), "1000")
+        self.assertEqual(common.format_quantity(65536), "64Ki")
+        self.assertEqual(common.format_quantity(2 * 1024 * 1024), "2Mi")
+        self.assertEqual(common.format_quantity(1000), "1000")
 
     def test_abi_tables_match_the_header(self):
         # Every import the header declares is in the table, and nothing else.
         with open(os.path.join(REPO, "include", "runtime", "k32_app_abi.h")) as f:
             header = f.read()
         declared = set(re.findall(r'K32_IMPORT\("([a-z0-9_]+)"\)', header))
-        tabled = set(cli.KNOWN_IMPORTS)
+        tabled = set(wasm.KNOWN_IMPORTS)
         self.assertEqual(declared - tabled, set())
-        self.assertEqual(tabled - declared - set(cli.PERIPHERAL_IMPORTS) - {"esp32_get_time_us"}, set())
+        self.assertEqual(tabled - declared - set(wasm.PERIPHERAL_IMPORTS) - {"esp32_get_time_us"}, set())
 
     def test_abi_signatures_match_the_host(self):
         # The signatures are the ones the host links with m3_LinkRawFunction.
@@ -185,7 +173,7 @@ class TestUnits(unittest.TestCase):
             with open(os.path.join(REPO, src)) as f:
                 for n, sig in re.findall(r'm3_LinkRawFunction\(module, "env", "([a-z0-9_]+)",\s*"([^"]+)"', f.read()):
                     linked[n] = sig
-        self.assertEqual(linked, cli.KNOWN_IMPORTS)
+        self.assertEqual(linked, wasm.KNOWN_IMPORTS)
 
 
 # ---------------------------------------------------------------------------
@@ -234,8 +222,8 @@ class TestCheckFixtures(unittest.TestCase):
     @unittest.skipUnless(os.path.isfile(TESSERA_API), "images/tessera-api.wasm not built")
     def test_memory_limit(self):
         with open(TESSERA_API, "rb") as f:
-            initial = cli.parse_module(f.read()).memories[0][0]
-        need = cli.format_quantity(initial * 65536)
+            initial = wasm.parse_module(f.read()).memories[0][0]
+        need = common.format_quantity(initial * 65536)
         rc, out, _ = run_cli("check", TESSERA_API, "--memory", "64Ki")
         self.assertEqual(rc, 3)
         self.assertIn("error: memory: the module declares %s (%d pages) of linear memory but the limit is 64Ki" % (need, initial), out)
@@ -559,7 +547,7 @@ class TestDeploy(TempDirCase):
     @unittest.skipUnless(os.path.isfile(TESSERA_API), "images/tessera-api.wasm not built")
     def test_memory_too_small_and_psram(self):
         with open(TESSERA_API, "rb") as f:
-            need = cli.format_quantity(cli.parse_module(f.read()).memories[0][0] * 65536)
+            need = common.format_quantity(wasm.parse_module(f.read()).memories[0][0] * 65536)
         rc, out, err = run_cli("deploy", TESSERA_API, "--name", "api", "--dry-run")
         self.assertEqual(rc, 3)
         self.assertIn("but the limit is 64Ki", out)
@@ -710,7 +698,7 @@ class TestSdPush(TempDirCase):
 # ---------------------------------------------------------------------------
 def have_c_toolchain():
     clang = shutil.which(os.environ.get("CLANG", "clang"))
-    if not clang or not cli.find_rust_lld():
+    if not clang or not kbuild.find_rust_lld():
         return False
     proc = subprocess.run([clang, "--target=wasm32", "-x", "c", "-c", "-", "-o", os.devnull], input="int x;", text=True,
                           stdout=subprocess.PIPE, stderr=subprocess.PIPE)
@@ -718,7 +706,7 @@ def have_c_toolchain():
 
 
 def have_rust_wasm():
-    env = cli.cargo_env()
+    env = kbuild.cargo_env()
     rustup = shutil.which("rustup", path=env["PATH"])
     if not rustup or not shutil.which("cargo", path=env["PATH"]):
         return False
@@ -767,7 +755,7 @@ class TestBuild(TempDirCase):
             for n, body in files.items():
                 with open(os.path.join(d, n), "w") as f:
                     f.write(body)
-            self.assertEqual(cli.detect_language(d), lang, files)
+            self.assertEqual(kbuild.detect_language(d), lang, files)
 
     def test_assemblyscript_without_compiler(self):
         app = os.path.join(self.tmp, "as-app")
@@ -802,7 +790,7 @@ class TestBuild(TempDirCase):
 
     @unittest.skipUnless(have_c_toolchain() and shutil.which("make"), "make, clang (wasm32) and rust-lld are needed")
     def test_makefile_project_writing_outside_its_directory(self):
-        lld = cli.find_rust_lld()
+        lld = kbuild.find_rust_lld()
         self.write("proj/app/hello.c", HELLO_C)
         self.write("proj/app/Makefile", textwrap.dedent('''\
             CLANG ?= clang
@@ -833,7 +821,7 @@ class TestBuild(TempDirCase):
         self.assertIn("exports (8): k32_alloc, k32_event, k32_handle, k32_init, k32_tick", out)
         self.assertIn("hardware: ipc", out)
         with open(out_path, "rb") as f:
-            res = cli.check_module(out_path, f.read())
+            res = wasm.check_module(out_path, f.read())
         self.assertTrue(res.ok)
         self.assertLess(res.module.size, 8192)
 
@@ -1052,7 +1040,7 @@ class TestFirmware(TempDirCase):
     def test_image_info(self):
         img = firmware_image("v1.2.3-4-gabcdef0")
         p = self.write("fw.bin", img)
-        version, sha = cli.firmware_image_info(img)
+        version, sha = firmware.firmware_image_info(img)
         self.assertEqual(version, "v1.2.3-4-gabcdef0")
         self.assertEqual(sha, hashlib.sha256(img).hexdigest())
         rc, out, _ = run_cli("firmware", "info", p)
@@ -1061,7 +1049,7 @@ class TestFirmware(TempDirCase):
         self.assertIn(sha, out)
         # Not an image; an image whose appended SHA-256 does not match
         with self.assertRaises(ValueError):
-            cli.firmware_image_info(b"\x00" * 100)
+            firmware.firmware_image_info(b"\x00" * 100)
         bad = bytearray(img)
         bad[5000] ^= 1
         rc, _, err = run_cli("firmware", "info", self.write("bad.bin", bytes(bad)))

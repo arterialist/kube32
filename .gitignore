@@ -24,3 +24,6 @@ src/embedded/embedded_files.cmake
 
 # agent scratch notes, never part of the release
 .agents/
+
+# Python package builds (uv build python)
+dist/
