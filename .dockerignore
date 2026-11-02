@@ -1,0 +1,22 @@
+# The simulator builds from CMakeLists.txt, cmake/, src/, include/,
+# third_party/, images/, tests/ and tools/: everything else stays out of the
+# build context.
+.git
+.github
+.pio
+.venv
+.agents
+.claude
+build
+site
+docs
+examples
+federation
+scripts
+sdk
+apps
+**/__pycache__
+**/.DS_Store
+src/embedded/embedded_blobs_esp.cpp
+src/embedded/embedded_files.cmake
+dist
