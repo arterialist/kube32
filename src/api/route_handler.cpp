@@ -252,7 +252,7 @@ std::string list_order_key(const std::string& json) {
 
 RouteHandler::RouteHandler(storage::Store& store, scheduler::Scheduler* scheduler)
     : dry_run_view_(std::make_unique<DryRunView>(store)), store_(*dry_run_view_), scheduler_(scheduler),
-      events_(*dry_run_view_, 64), metrics_(30000, 32), images_(std::make_unique<InlineImages>(store)) {
+      events_(*dry_run_view_, 64), metrics_(30000), images_(std::make_unique<InlineImages>(store)) {
     seed_namespaces();
     // Objects stored with their module inline give it to the image store
     images_->migrate();

@@ -193,7 +193,7 @@ void test_events() {
 
 void test_metrics_registry() {
     std::cout << "[RUN] test_metrics_registry" << std::endl;
-    api::MetricsRegistry reg(1000, 2);
+    api::MetricsRegistry reg(1000);
     std::string err;
     assert(!reg.ingest("{\"usage\":{}}", err));
     assert(reg.ingest("{\"node\":\"n1\",\"window_ms\":5000,\"timestamp\":\"2026-10-28T10:00:00Z\",\"usage\":{\"memory_bytes\":180224},"
@@ -210,11 +210,24 @@ void test_metrics_registry() {
     std::string pj = api::MetricsRegistry::pod_metrics_json(p);
     assert(pj.find("\"memory\":\"71667\"") != std::string::npos);
     assert(pj.find("\"cpu\"") == std::string::npos);
+    // Every pod of every node is kept: 40 pods on a second node, more than
+    // one push of a board holds, all served
+    std::string many = "{\"node\":\"n2\",\"window_ms\":5000,\"usage\":{},\"pods\":[";
+    for (int i = 0; i < 40; ++i) {
+        many += (i ? ",{" : "{") + std::string("\"namespace\":\"default\",\"name\":\"q") + std::to_string(i) +
+                "\",\"containers\":[{\"name\":\"c\",\"memory_bytes\":" + std::to_string(1000 + i) + "}]}";
+    }
+    assert(reg.ingest(many + "]}", err));
+    assert(reg.pods("").size() == 41 && reg.pod("default", "q39", p) && p.containers[0].memory_bytes == 1039);
+    // A node's push lists the pods it runs: one it no longer lists is gone,
+    // another node's are kept
     assert(reg.ingest("{\"node\":\"n1\",\"window_ms\":5000,\"usage\":{\"cpu_nanocores\":3095224,\"memory_bytes\":1}}", err));
+    assert(!reg.pod("default", "p", p) && reg.pods("").size() == 40);
     assert(reg.node("n1", n) && n.has_cpu && n.cpu_nanocores == 3095224);
     assert(api::MetricsRegistry::node_metrics_json(n).find("\"cpu\":\"3095224n\"") != std::string::npos);
     osal::Thread::sleep_ms(1100);
     assert(!reg.node("n1", n));                                   // stale samples are not served
+    assert(reg.pods("").empty());
 
     // Router: 404 for a node without a fresh sample, discovery lists the group
     auto store = mem_store();

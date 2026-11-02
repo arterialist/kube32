@@ -4,8 +4,7 @@
 
 namespace kube32::api {
 
-MetricsRegistry::MetricsRegistry(uint32_t stale_after_ms, size_t max_pods)
-    : stale_after_ms_(stale_after_ms), max_pods_(max_pods == 0 ? 1 : max_pods) {}
+MetricsRegistry::MetricsRegistry(uint32_t stale_after_ms) : stale_after_ms_(stale_after_ms) {}
 
 bool MetricsRegistry::fresh(uint64_t received_uptime_ms, uint64_t now) const {
     return now - received_uptime_ms <= stale_after_ms_;
@@ -34,6 +33,13 @@ bool MetricsRegistry::ingest(const std::string& json, std::string& err) {
 
     osal::LockGuard guard(mutex_);
     nodes_[node] = ns;
+    // The push lists every pod the node runs: its pods missing from it are
+    // gone, and so are the samples of nodes that stopped pushing
+    for (auto it = pods_.begin(); it != pods_.end();) {
+        const bool gone = it->second.node == node || !fresh(it->second.received_uptime_ms, now);
+        it = gone ? pods_.erase(it) : std::next(it);
+    }
+    for (auto it = nodes_.begin(); it != nodes_.end();) it = fresh(it->second.received_uptime_ms, now) ? std::next(it) : nodes_.erase(it);
     if (const auto* pods = doc.get("pods")) {
         if (pods->is_array()) {
             for (const auto& p : pods->arr_val) {
@@ -53,19 +59,11 @@ bool MetricsRegistry::ingest(const std::string& json, std::string& err) {
                             cu.name = c.get_string("name", ps.name);
                             if (c.get("cpu_nanocores")) { cu.has_cpu = true; cu.cpu_nanocores = static_cast<uint64_t>(c.get_int("cpu_nanocores", 0)); }
                             if (c.get("memory_bytes")) { cu.has_memory = true; cu.memory_bytes = static_cast<uint64_t>(c.get_int("memory_bytes", 0)); }
-                            if (c.get("psram_bytes")) { cu.has_psram = true; cu.psram_bytes = static_cast<uint64_t>(c.get_int("psram_bytes", 0)); }
                             ps.containers.push_back(std::move(cu));
                         }
                     }
                 }
                 std::string key = ps.namespace_name + "/" + ps.name;
-                if (pods_.find(key) == pods_.end() && pods_.size() >= max_pods_) {
-                    // Evict the stalest pod sample
-                    auto victim = pods_.begin();
-                    for (auto it = pods_.begin(); it != pods_.end(); ++it)
-                        if (it->second.received_uptime_ms < victim->second.received_uptime_ms) victim = it;
-                    pods_.erase(victim);
-                }
                 pods_[key] = std::move(ps);
             }
         }
@@ -123,15 +121,10 @@ std::string MetricsRegistry::quantity_memory(uint64_t bytes) {
     return std::to_string(bytes);
 }
 
-static void append_usage(std::string& out, bool has_cpu, uint64_t cpu, bool has_mem, uint64_t mem, bool has_psram = false, uint64_t psram = 0) {
+static void append_usage(std::string& out, bool has_cpu, uint64_t cpu, bool has_mem, uint64_t mem) {
     out += "\"usage\":{";
-    bool first = true;
-    if (has_cpu) { out += "\"cpu\":\"" + MetricsRegistry::quantity_cpu(cpu) + "\""; first = false; }
-    if (has_mem) { if (!first) out += ","; out += "\"memory\":\"" + MetricsRegistry::quantity_memory(mem) + "\""; first = false; }
-    // Extra resource name in the usage map: kubectl top ignores it, k9s and
-    // the ingress telemetry can read it, and "memory" keeps the meaning of the
-    // pod's memory request (internal SRAM).
-    if (has_psram) { if (!first) out += ","; out += "\"esp32.io/psram\":\"" + MetricsRegistry::quantity_memory(psram) + "\""; }
+    if (has_cpu) out += "\"cpu\":\"" + MetricsRegistry::quantity_cpu(cpu) + "\"";
+    if (has_mem) { if (has_cpu) out += ","; out += "\"memory\":\"" + MetricsRegistry::quantity_memory(mem) + "\""; }
     out += "}";
 }
 
@@ -163,8 +156,7 @@ std::string MetricsRegistry::pod_metrics_json(const PodUsageSample& s) {
     for (size_t i = 0; i < s.containers.size(); ++i) {
         if (i) out += ",";
         out += "{\"name\":\"" + s.containers[i].name + "\",";
-        append_usage(out, s.containers[i].has_cpu, s.containers[i].cpu_nanocores, s.containers[i].has_memory, s.containers[i].memory_bytes,
-                     s.containers[i].has_psram, s.containers[i].psram_bytes);
+        append_usage(out, s.containers[i].has_cpu, s.containers[i].cpu_nanocores, s.containers[i].has_memory, s.containers[i].memory_bytes);
         out += "}";
     }
     out += "]}";
