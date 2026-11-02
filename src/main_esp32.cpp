@@ -348,6 +348,7 @@ struct Console {
 static std::string s_forward_host = "127.0.0.1";
 static kube32::api::HttpServer* s_api_server = nullptr;       // for console toggles
 static kube32::storage::Store* s_store = nullptr;             // control plane: journal figures for the console
+static kube32::runtime::WasmRuntime* s_runtime = nullptr;     // the containers K32_STATUS counts
 static std::string s_journal_location;                         // control plane: where the store's journal is
 static bool s_api_token_set = false;
 static kube32::osal::TlsServer* s_tls = nullptr;               // control plane: the API server's certificate
@@ -635,7 +636,7 @@ void console_task(void* arg) {
                     (unsigned)kube32_pool_available(nullptr),
                     (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM),
                     (unsigned long long)kube32::osal::System::get_uptime_ms(),
-                    (unsigned)kube32::runtime::AppPodHost::instance().list_pods().size(),
+                    (unsigned)(s_runtime ? s_runtime->container_count() : 0),
                     kube32::hal::storage_medium_name(kube32::hal::node_storage_info().medium), s_api_token_set ? "token" : "off",
                     s_tls ? "on" : "off");
                 con.write(buf, static_cast<size_t>(l));
@@ -1083,7 +1084,7 @@ void cluster_task(void* pv) {
         bool ok = kube32::hal::node_storage_mount(ident.has_display);
         kube32::hal::NodeStorageInfo si = kube32::hal::node_storage_info();
         if (ok) {
-            printf("[STORAGE] %s at %s: %llu KB total, %llu KB free; mount took %lld bytes internal RAM, %lld bytes PSRAM\n",
+            printf("[STORAGE] %s at %s: %llu KiB total, %llu KiB free; mount took %lld bytes internal RAM, %lld bytes PSRAM\n",
                    kube32::hal::storage_medium_name(si.medium), si.root.c_str(), (unsigned long long)(si.total_bytes / 1024),
                    (unsigned long long)(si.free_bytes / 1024), (long long)si.internal_ram_bytes, (long long)si.psram_bytes);
             if (si.medium == kube32::hal::StorageMedium::SdCard) {
@@ -1225,6 +1226,7 @@ void cluster_task(void* pv) {
     }
 
     auto wasm_runtime = kube32::runtime::create_wasm_runtime();
+    s_runtime = wasm_runtime.get();
     std::unique_ptr<kube32::storage::Store> store;
     std::unique_ptr<kube32::controller::NodeLifecycleController> node_lifecycle;
     std::unique_ptr<kube32::scheduler::Scheduler> scheduler;

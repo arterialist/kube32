@@ -1,6 +1,7 @@
 #pragma once
 
 #include "runtime/wasm_runtime.hpp"
+#include "runtime/pod_memory_pool.h"
 #include "osal/thread.hpp"
 #include "osal/mutex.hpp"
 #include "osal/timer.hpp"
@@ -102,6 +103,19 @@ bool compile_scratch_lent();
 // so the guest gets back to metered code and takes the stop trap.
 bool runtime_stop_requested(const void* m3_runtime);
 
+// While alive, what the runtime allocates on this thread is charged to a
+// pod's memory account (runtime/pod_memory_pool.h)
+class PodMemoryScope {
+public:
+    explicit PodMemoryScope(int account) : previous_(kube32_pod_account_enter(account)) {}
+    ~PodMemoryScope() { kube32_pod_account_leave(previous_); }
+    PodMemoryScope(const PodMemoryScope&) = delete;
+    PodMemoryScope& operator=(const PodMemoryScope&) = delete;
+
+private:
+    int previous_;
+};
+
 class ContainerLifecycleController {
 public:
     explicit ContainerLifecycleController(const ContainerConfig& config);
@@ -129,6 +143,11 @@ public:
     // Telemetry and status
     ContainerStatus get_status();
     uint32_t get_memory_usage_bytes() const;
+    // Everything the container holds (ContainerStatus::held_bytes); 0 when
+    // it has no memory account
+    uint64_t held_bytes() const;
+    // The account the runtime's allocations for this container are charged to
+    int memory_account() const { return memory_account_; }
     bool is_running() const;
 
     // Health probe execution hooks
@@ -162,6 +181,7 @@ private:
     static void worker_thread_entry(void* arg);
     void worker_thread_main();
     void on_trap_caught_locked(const std::string& trap_message, int32_t exit_code, const std::string& reason);
+    uint64_t held_bytes_locked() const;   // mutex_ held by caller
     void cleanup_runtime();
 
     ContainerConfig config_;
@@ -194,6 +214,8 @@ private:
     std::atomic<bool> thread_detached_{false};
     std::atomic<bool> worker_done_{false};     // worker_thread_main returned
     std::atomic<bool> stop_gave_up_{false};    // stop() returned while the worker was still running
+    std::atomic<uint32_t> worker_stack_bytes_{0};   // the worker thread's stack while it exists
+    int memory_account_{0};                    // kube32_pod_account_open
 
     uint32_t consecutive_liveness_failures_{0};
     uint32_t consecutive_readiness_failures_{0};

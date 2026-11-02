@@ -1000,7 +1000,9 @@ void test_init_before_tick() {
 // The kubelet's estimate with the board's sizes, as a board without PSRAM
 // admits a pod: on its 80 KiB pool block, the compiler's scratch lent by the
 // interpreter stack (tests/test_pod_pool_fit.cpp checks the estimate against
-// what loading a module takes)
+// what loading a module takes). The scheduler counts each driver pod as its
+// 3Ki request and its Pod Overhead, the rest of the estimate in whole KiB,
+// against the node's allocatable memory, the block.
 void test_pool_estimates() {
     std::cout << "=== pod pool estimates (memory 3Ki) ===" << std::endl;
     std::vector<uint8_t> interp(28 * 1024);
@@ -1008,19 +1010,23 @@ void test_pool_estimates() {
     size_t i2c = 0;
     for (const char* name : {"bme688", "miniscale", "rfid", "chip-temp", "button", "switch"}) {
         const std::vector<uint8_t> wasm = image(std::string("driver-") + name);
-        const size_t board = runtime::estimate_pod_memory(wasm.data(), wasm.size(), 3072, 4096, true, runtime::EstimateSizes::Board);
-        std::cout << "[estimate] driver-" << name << ": " << wasm.size() << " bytes of Wasm, " << board << " bytes on a board" << std::endl;
-        assert(board <= 30 * 1024);
-        if (std::strcmp(name, "bme688") == 0 || std::strcmp(name, "miniscale") == 0 || std::strcmp(name, "rfid") == 0) i2c += board;
+        size_t linear = 0;
+        const size_t board = runtime::estimate_pod_memory(wasm.data(), wasm.size(), 3072, 4096, true, runtime::EstimateSizes::Board, &linear);
+        const size_t scheduled = 3 * 1024 + (board - linear + 1023) / 1024 * 1024;
+        std::cout << "[estimate] driver-" << name << ": " << wasm.size() << " bytes of Wasm, " << board << " bytes on a board, "
+                  << scheduled / 1024 << " KiB with its overhead" << std::endl;
+        assert(linear == 3072 && board <= 30 * 1024);
+        if (std::strcmp(name, "bme688") == 0 || std::strcmp(name, "miniscale") == 0 || std::strcmp(name, "rfid") == 0) i2c += scheduled;
     }
     kube32_interp_stack_set(nullptr, 0);
-    // The ENV Pro, the Mini Scales and the RFID 2 on one Cardputer
+    // The ENV Pro, the Mini Scales and the RFID 2 on one Cardputer: the
+    // scheduler places all three on its 80 KiB (an estimate runs a few KB
+    // above what a load takes: on the Cardputer the three load in
+    // 25.4 + 20.1 + 23.5 KB)
     std::cout << "[estimate] bme688 + miniscale + rfid: " << i2c << " of " << kube32_pool_block_size() << " bytes" << std::endl;
-    // Admission takes them one at a time against what the pool has left, and
-    // an estimate runs a few KB above what a load takes (on the Cardputer
-    // the three load in 25.4 + 20.1 + 23.5 KB)
     assert(i2c <= kube32_pool_block_size());
 }
+
 
 } // namespace
 

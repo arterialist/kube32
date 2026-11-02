@@ -31,6 +31,11 @@ struct ContainerStatus {
     uint64_t bytecode_bytes{0};      // module bytes the controller keeps for restarts
     uint64_t stack_bytes{0};         // interpreter operand stack reserved for the module
     uint64_t runtime_bytes{0};       // backing bytes of the module's memories as wasm3 accounts them (c_m3Limit_MemoryBytes)
+    // Everything the container holds: wasm3's structures, the compiled code,
+    // the operand stack and linear memory, as allocated (headers included),
+    // the module's bytes when the container keeps a copy, and its thread's
+    // stack while it has one. 0 when not measured.
+    uint64_t held_bytes{0};
     std::string exit_message;
     bool ready{false};
     uint64_t start_time_ms{0};
@@ -108,6 +113,7 @@ public:
     bool restart(const std::string& pod_id);
     bool is_deployed(const std::string& pod_id) const;
     std::vector<std::string> list_containers() const;
+    size_t container_count() const;
 
     // Direct execution helper for unit testing and synchronous execution
     int32_t execute_function(const std::string& pod_id, const std::string& fn_name, const std::vector<int32_t>& args = {});

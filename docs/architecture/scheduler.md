@@ -28,20 +28,22 @@ Candidate nodes must pass each filter in order:
 1. `spec.unschedulable` is unset, status is present, and `Ready` is `True`.
 2. `nodeName` matches if specified.
 3. `nodeSelector` labels match the node labels.
-4. `requests.memory`, or `limits.memory` if requests are omitted, fits within allocatable `memory`. Pods without a memory declaration default to 16 KiB.
-5. `esp32.io/psram` or `esp.io/psram` fits within allocatable PSRAM.
+4. `requests.memory`, or `limits.memory` if requests are omitted, plus the pod's `spec.overhead.memory` fits within allocatable `memory` less what the pods bound to the node take. A pod without a memory declaration counts as 64 KiB, the one page of linear memory the kubelet gives it.
+5. `esp32.io/psram` or `esp.io/psram` fits within allocatable PSRAM less the PSRAM requests of the pods bound to the node.
 6. `esp32.io/gpio`, `esp32.io/i2c`, `esp32.io/uart`, `esp32.io/adc`, `esp32.io/rmt-tx`, and `esp32.io/rmt-rx` counts fit within allocatable limits. Named buses such as `esp32.io/i2c-bus-0` or `esp32.io/uart-1` each consume one bus from the node's count.
 
 Quantities follow Kubernetes: `Ki`, `Mi`, `Gi` are binary, `k`, `M`, `G` decimal, and `m` is milli. Unrecognized suffixes count as 0.
 
-Allocatable resources come from `status.allocatable` or `capacity`. The kubelet reports what pods can still be given, counted the way its [memory admission](wasm-runtime.md#memory-admission) counts it, and unclaimed pins, so running pods are already included in the reported figures:
+Allocatable resources come from `status.allocatable` or `capacity`. Allocatable `memory` and `esp32.io/psram` are fixed: what the kubelet's [memory admission](wasm-runtime.md#memory-admission) can give pods with no pod running.
 
 | Node | Allocatable `memory` | Allocatable `esp32.io/psram` |
 | --- | --- | --- |
-| Board with PSRAM | PSRAM above the system reserve, as much as was free when the kubelet first reported, less what pods hold | `memory` plus the free part of the PSRAM pool block |
-| Board without PSRAM | Free part of the 80 KiB pool block | not reported |
+| Board with PSRAM | The 1284 KiB pool block plus the PSRAM that was free above the system reserve when the kubelet first reported | Same as `memory`, since pods get PSRAM only |
+| Board without PSRAM | The 80 KiB pool block | not reported |
 
-The figures change only when pods load or stop. Capacity `memory` is the board's internal RAM plus its PSRAM. The scheduler subtracts requests only for bound pods the report does not include yet: `Pending` pods, containers waiting to restart, and pods modified after the node's last status write.
+As kube-scheduler does, the scheduler subtracts the requests and Pod Overhead of every pod bound to the node that is not `Succeeded` or `Failed`, whether its kubelet has started it or not. Capacity `memory` is the board's internal RAM plus its PSRAM. What pods can be given now is in the Node's `kube32.io/memory-free` annotation ([memory figures](../hardware-spec.md#node-and-pod-memory-figures)).
+
+Pin, bus and channel counts are what the kubelet reports unclaimed, so running pods are already included in them. For these, the scheduler subtracts only bound pods the report does not include yet: `Pending` pods, containers waiting to restart, and pods modified after the node's last status write.
 
 The scheduler ignores `hardware.kube32.io/*` resources, `esp32.io/gpio-<N>` pin claims, taints, affinity, and topology. The kubelet [capability firewall](capability-firewall.md) validates hardware and pin claims at admission.
 

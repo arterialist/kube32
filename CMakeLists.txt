@@ -542,17 +542,17 @@ else()
 
     # The wasm3 operations each bench kernel executes (docs/benchmarks.md):
     # bench_ops <apps/bench/build/ops.wasm>
-    add_executable(bench_ops tools/bench_ops.cpp src/runtime/pod_memory_pool.cpp)
+    add_executable(bench_ops tools/bench_ops.cpp src/runtime/pod_memory_pool.cpp src/osal/system_posix.cpp)
     target_link_libraries(bench_ops PRIVATE wasm3_opframes)
 
     # The native stack the device drivers' calls take on a board without tail calls
-    add_executable(test_driver_frames tests/test_driver_frames.cpp src/runtime/pod_memory_pool.cpp)
+    add_executable(test_driver_frames tests/test_driver_frames.cpp src/runtime/pod_memory_pool.cpp src/osal/system_posix.cpp)
     target_link_libraries(test_driver_frames PRIVATE wasm3_opframes)
     target_compile_definitions(test_driver_frames PRIVATE KUBE32_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}")
     add_test(NAME test_driver_frames COMMAND test_driver_frames)
 
     # The wasm3 operations of the interpreter speed kernel (kube32.io/interp-mops)
-    add_executable(test_interp_kernel tests/test_interp_kernel.cpp src/runtime/pod_memory_pool.cpp)
+    add_executable(test_interp_kernel tests/test_interp_kernel.cpp src/runtime/pod_memory_pool.cpp src/osal/system_posix.cpp)
     target_link_libraries(test_interp_kernel PRIVATE wasm3_opframes)
     add_test(NAME test_interp_kernel COMMAND test_interp_kernel)
 

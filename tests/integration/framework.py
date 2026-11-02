@@ -236,8 +236,8 @@ class BaseTestCase:
         return items[0]
 
     def wait_for_node_memory(self, min_ki: int = 90, timeout: float = 20.0) -> None:
-        """Wait until the first node reports at least `min_ki` Ki allocatable memory. The node reports
-        its free heap with each heartbeat, so it recovers a few seconds after a pod has stopped."""
+        """Wait until the first node reports at least `min_ki` Ki allocatable memory: what its kubelet
+        can ever give pods, reported once it has registered."""
         def enough():
             mem = self.first_node()["status"]["allocatable"]["memory"]
             return mem.endswith("Ki") and int(mem[:-2]) >= min_ki

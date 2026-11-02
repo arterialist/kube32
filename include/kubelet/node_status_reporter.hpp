@@ -14,11 +14,13 @@ namespace kube32::kubelet {
 // and the resource is then left out of the Node object.
 struct NodeTelemetry {
     size_t total_heap_bytes{0};      // internal heap
-    size_t free_heap_bytes{0};       // free internal heap and pod pool: the MemoryPressure condition
+    size_t free_heap_bytes{0};       // free internal heap: the MemoryPressure condition, annotation kube32.io/heap-free
     size_t min_free_heap_bytes{0};
     size_t memory_capacity_bytes{0};     // capacity.memory: the board's RAM, PSRAM included
-    size_t memory_allocatable_bytes{0};  // allocatable.memory: what pods can be given (kube32_pool_node_room)
-    size_t free_psram_bytes{0};      // allocatable esp32.io/psram: PSRAM pods can be given, the pool block included
+    size_t memory_allocatable_bytes{0};  // allocatable.memory: what pods can be given with no pod running (kube32_pool_node_room)
+    size_t memory_free_bytes{0};         // what pods can be given now (kube32_pool_pod_room): annotation kube32.io/memory-free
+    size_t psram_allocatable_bytes{0};   // allocatable esp32.io/psram (kube32_pool_node_room)
+    size_t free_psram_bytes{0};      // free PSRAM: annotation kube32.io/psram-free
     size_t total_psram_bytes{0};     // capacity esp32.io/psram
     uint32_t cpu_cores{0};
     uint32_t cpu_freq_mhz{0};

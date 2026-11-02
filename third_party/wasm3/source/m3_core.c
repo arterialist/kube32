@@ -165,13 +165,16 @@ extern void*  kube32_pool_alloc(size_t bytes);
 extern int    kube32_pool_owns(const void* ptr);
 extern int    kube32_pool_free(void* ptr);
 extern size_t kube32_pool_block_size(void);
-extern size_t kube32_pool_whole_capacity(void);
 extern void*  kube32_rt_calloc(size_t bytes);
 extern void*  kube32_pool_sub_alloc(size_t bytes);
 extern void*  kube32_rt_realloc(void* ptr, size_t bytes);
 extern void   kube32_rt_free(void* ptr);
 extern int    kube32_rt_shrink(void* ptr, size_t bytes);
 extern size_t kube32_rt_fit(size_t bytes, size_t minimum);
+extern int    kube32_pool_resize(void* ptr, size_t bytes);
+extern int    kube32_rt_owner(const void* ptr);
+extern int    kube32_pod_account_enter(int account);
+extern void   kube32_pod_account_leave(int previous);
 
 void* m3_Malloc_Impl (size_t i_size)
 {
@@ -205,23 +208,17 @@ size_t m3_CodePageFit (size_t i_size, size_t i_minimum)
     return kube32_rt_fit(i_size, i_minimum);
 }
 
-void* m3_Realloc_Impl (void* i_ptr, size_t i_newSize, size_t i_oldSize)
+static void* ReallocOwned (void* i_ptr, size_t i_newSize, size_t i_oldSize)
 {
-    if (M3_UNLIKELY(i_newSize == i_oldSize)) {
-        return i_ptr;
-    }
-
-    if (!i_ptr) {
-        return m3_Malloc_Impl(i_newSize);
-    }
     if (kube32_pool_owns(i_ptr)) {
-        if (i_newSize <= kube32_pool_whole_capacity()) {
+        // In place while the block has room for it
+        if (kube32_pool_resize(i_ptr, i_newSize)) {
             if (i_newSize > i_oldSize) memset((u8*)i_ptr + i_oldSize, 0x0, i_newSize - i_oldSize);
             return i_ptr;
         }
         void* moved = kube32_rt_calloc(i_newSize);
         if (!moved) return NULL;
-        memcpy(moved, i_ptr, i_oldSize);
+        memcpy(moved, i_ptr, i_oldSize < i_newSize ? i_oldSize : i_newSize);
         kube32_pool_free(i_ptr);
         return moved;
     }
@@ -244,6 +241,23 @@ void* m3_Realloc_Impl (void* i_ptr, size_t i_newSize, size_t i_oldSize)
         return newPtr;
     }
     return NULL;
+}
+
+void* m3_Realloc_Impl (void* i_ptr, size_t i_newSize, size_t i_oldSize)
+{
+    if (M3_UNLIKELY(i_newSize == i_oldSize)) {
+        return i_ptr;
+    }
+
+    if (!i_ptr) {
+        return m3_Malloc_Impl(i_newSize);
+    }
+    // What replaces an allocation is charged to the pod that owned it,
+    // whichever thread grows it
+    int previous = kube32_pod_account_enter(kube32_rt_owner(i_ptr));
+    void* newPtr = ReallocOwned(i_ptr, i_newSize, i_oldSize);
+    kube32_pod_account_leave(previous);
+    return newPtr;
 }
 
 #endif

@@ -12,6 +12,7 @@
 #include <cassert>
 #include <cstring>
 #include <iostream>
+#include <thread>
 
 using namespace kube32;
 
@@ -66,12 +67,65 @@ static runtime::DeploySpec unset_stack(uint32_t memory) {
     return spec;
 }
 
+// Bytes of the block's small heap in use, chunk headers included
+static size_t used_chunk_bytes() {
+    size_t used = 0;
+    kube32_pool_chunks([](size_t, size_t size, int in_use, void* ctx) { if (in_use) *static_cast<size_t*>(ctx) += size; }, &used);
+    return used;
+}
+
+// A pod's account holds what was allocated for it until that is freed, on
+// whichever thread; what a realloc returns stays with the owner of what it
+// replaced, whoever grows it
+static void test_accounts_follow_allocations(size_t block) {
+    const int a = kube32_pod_account_open();
+    const int b = kube32_pod_account_open();
+    assert(a > 0 && b > 0 && a != b);
+    void* small = nullptr;
+    void* big = nullptr;
+    const size_t general_before = kube32_pool_general_bytes();
+    {
+        runtime::PodMemoryScope charged(a);
+        small = kube32_rt_calloc(100);               // the block's small heap
+        kube32_pool_prefer_general(1);
+        big = kube32_rt_calloc(5000);                // the general heap, after an 8-byte header
+        kube32_pool_prefer_general(0);
+    }
+    assert(small && big && !kube32_pool_owns(small));
+    assert(kube32_rt_owner(small) == a && kube32_rt_owner(big) == a);
+    assert(kube32_pool_general_allocations() == 1);
+    const size_t general = kube32_pool_general_bytes() - general_before;
+    assert(general >= 5000 + 8 && used_chunk_bytes() == 8 + 104);
+    assert(kube32_pod_account_bytes(a) == 112 + general && kube32_pod_account_bytes(b) == 0);
+
+    // Grown on a thread charging another pod: still a's, and exact
+    std::thread([&] {
+        runtime::PodMemoryScope other(b);
+        big = kube32_rt_realloc(big, 9000);
+        small = kube32_rt_realloc(small, 2000);    // moved within the block
+    }).join();
+    assert(big && small && kube32_rt_owner(big) == a && kube32_rt_owner(small) == a);
+    assert(kube32_pod_account_bytes(b) == 0);
+    assert(kube32_pod_account_bytes(a) == used_chunk_bytes() + (kube32_pool_general_bytes() - general_before));
+
+    // Freed on a thread of no pod: nothing is left on either account
+    std::thread([&] {
+        kube32_rt_free(big);
+        kube32_rt_free(small);
+    }).join();
+    assert(kube32_pod_account_bytes(a) == 0 && kube32_pool_general_allocations() == 0 && kube32_pool_available(nullptr) == block);
+    kube32_pod_account_close(a);
+    kube32_pod_account_close(b);
+    std::cout << "[accounts] owners kept across threads and reallocs" << std::endl;
+}
+
 int main() {
     std::cout << "=== pod pool fit ===" << std::endl;
     kube32_pool_reserve(80 * 1024);
     const size_t block = kube32_pool_block_size();
     auto rt = runtime::create_wasm_runtime();
     std::string err;
+    test_accounts_follow_allocations(block);
 
     // The operand stack is the heaviest call chain's frames, the default
     // (4 KiB) at most; a chain that recurses has no bound and keeps it
@@ -174,6 +228,13 @@ int main() {
                 const size_t before = kube32_pool_available(nullptr);
                 assert(pod.deploy(wasm.data(), wasm.size()));
                 taken = before - kube32_pool_available(nullptr) + kube32_pool_general_bytes();
+                // The pod's account is exactly what it holds of the pool and
+                // the heap; its memory figure adds the module's copy (and on
+                // the host the linear memory mapped outside the pool)
+                const size_t account = kube32_pod_account_bytes(pod.memory_account());
+                assert(account == used_chunk_bytes() + kube32_pool_general_bytes());
+                assert(pod.held_bytes() >= account + wasm.size());
+                std::cout << "[account] " << img.name << ": " << account << " bytes held, " << pod.held_bytes() << " in all" << std::endl;
 #if d_m3GuardedMemory
                 taken += img.memory;   // the host backs linear memory outside the pool
 #endif
@@ -182,6 +243,34 @@ int main() {
             assert(estimate >= taken && estimate <= taken + taken / 5);
             assert(kube32_pool_available(nullptr) == block);
         }
+        kube32_interp_stack_set(nullptr, 0);
+    }
+
+    // What the owner of an allocation costs: in the block it is kept in the
+    // chunk header every allocation has; in the general heap (a pod whose
+    // linear memory takes the block whole keeps its structures there) each
+    // allocation carries an 8-byte header
+    {
+        std::vector<uint8_t> interp(28 * 1024);
+        kube32_interp_stack_set(interp.data(), interp.size());
+        struct Image { const char* name; uint32_t memory; } images[] = {{"echo", 64 * 1024}, {"driver-bme688", 3 * 1024}, {"tessera-hud", 1024}};
+        for (const Image& img : images) {
+            const std::vector<uint8_t> wasm = k32test::read_file(std::string(KUBE32_SOURCE_DIR) + "/images/" + img.name + ".wasm");
+            runtime::ContainerConfig cfg;
+            cfg.pod_id = std::string("default/cost-") + img.name;
+            cfg.memory_limit_bytes = img.memory;
+            cfg.stack_size_bytes = 4096;
+            cfg.stack_from_module = true;
+            runtime::ContainerLifecycleController pod(cfg);
+            assert(pod.deploy(wasm.data(), wasm.size()));
+            size_t chunks = 0;
+            kube32_pool_chunks([](size_t, size_t, int in_use, void* ctx) { if (in_use) ++*static_cast<size_t*>(ctx); }, &chunks);
+            const size_t general = kube32_pool_general_allocations();
+            std::cout << "[owner] " << img.name << ": " << chunks << " allocations in the block (owner in the chunk header), " << general
+                      << " in the general heap (" << general * 8 << " bytes of owner headers)" << std::endl;
+            assert(kube32_pod_account_bytes(pod.memory_account()) == used_chunk_bytes() + kube32_pool_general_bytes());
+        }
+        assert(kube32_pool_general_allocations() == 0 && kube32_pool_available(nullptr) == block);
         kube32_interp_stack_set(nullptr, 0);
     }
 

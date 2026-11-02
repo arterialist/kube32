@@ -603,7 +603,10 @@ void test_heartbeat_patch_in_fixed_buffer() {
     NodeStatusReporter reporter("test-node-01", "192.168.4.2");
     NodeTelemetry t = reporter.collect_telemetry();
     t.total_psram_bytes = 2u << 20;
-    t.free_psram_bytes = 1536u << 10;
+    t.psram_allocatable_bytes = 1536u << 10;
+    t.free_psram_bytes = 417532;
+    t.memory_free_bytes = 1048000;
+    t.free_heap_bytes = 61236;
     t.sd_present = true;
     t.sd_total_bytes = 31154688ull << 10;
     t.sd_free_bytes = 29786912ull << 10;
@@ -624,6 +627,9 @@ void test_heartbeat_patch_in_fixed_buffer() {
     assert(buf.find("\"reason\":\"KubeletHasSufficientMemory\"") != std::string::npos);
     assert(buf.find("\"esp32.io/psram\":\"1536Ki\"") != std::string::npos);
     assert(buf.find("\"hardware.kube32.io/sd\":\"29786912Ki\"") != std::string::npos);
+    // What is free now rides along as annotations, exact bytes
+    assert(buf.find("{\"metadata\":{\"annotations\":{\"kube32.io/memory-free\":\"1048000\",\"kube32.io/heap-free\":\"61236\","
+                    "\"kube32.io/psram-free\":\"417532\"}},\"status\":{") == 0);
     char small[64];
     kube32::mem::FixedText cut(small);
     assert(!reporter.write_heartbeat_patch_json(cut, t, false) && cut.overflowed() && cut.size() <= sizeof(small));

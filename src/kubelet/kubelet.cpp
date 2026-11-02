@@ -876,15 +876,21 @@ bool Kubelet::deploy_and_start_pod(const models::KubePod& pod_in, const std::str
                    size != pod.annotations.end() && pod.annotations.count("kube32.io/wasm-sha256")) {
             module_len = static_cast<size_t>(models::parse_quantity(size->second));   // in the control plane's image store
         }
-        const size_t need = runtime::estimate_pod_memory(module, module_len, rec.memory_limit_bytes, wasm_stack, !wasm_stack_set);
+        size_t linear = 0;
+        const size_t need = runtime::estimate_pod_memory(module, module_len, rec.memory_limit_bytes, wasm_stack, !wasm_stack_set,
+                                                         runtime::EstimateSizes::Board, &linear);
         size_t capacity = 0;
         const size_t room = kube32_pool_pod_room(rec.memory_limit_bytes, &capacity);
+        const size_t linear_max = kube32_pool_linear_max();
         const std::string reserve = osal::System::get_total_psram_bytes() > 0
             ? kib(kube32_pool_system_reserve()) + " of internal RAM and " + kib(kube32_pool_psram_reserve()) + " of PSRAM"
             : kib(kube32_pool_system_reserve());
-        if (need > capacity) {
-            const std::string why = "Pod was rejected: Node didn't have enough resource: memory, needs about " + kib(need) +
-                                    ", the node can give pods at most " + kib(capacity) + " (" + reserve + " kept for the system)";
+        if (need > capacity || linear > linear_max) {
+            const std::string why = need > capacity
+                ? "Pod was rejected: Node didn't have enough resource: memory, needs about " + kib(need) +
+                      ", the node can give pods at most " + kib(capacity) + " (" + reserve + " kept for the system)"
+                : "Pod was rejected: Node didn't have enough resource: memory, its linear memory of " + kib(linear) +
+                      " needs one piece, the largest the node can give is " + kib(linear_max);
             std::cout << "[KUBELET] " << pod_key << ": " << why << std::endl;
             rec.execution_phase = PodExecutionPhase::Failed;
             rec.last_error_message = why;
@@ -1574,10 +1580,6 @@ void Kubelet::push_metrics_sample() {
             if (ps.has_memory) {
                 body += ",\"memory_bytes\":";
                 append_uint(body, ps.memory_bytes);
-                if (ps.has_psram) {
-                    body += ",\"psram_bytes\":";
-                    append_uint(body, ps.psram_bytes);
-                }
             }
             body += "}]}";
         }

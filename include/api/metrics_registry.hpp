@@ -5,6 +5,8 @@
 // the sample with its heartbeat; the registry keeps the latest sample per
 // node and per pod, drops samples that stopped arriving, and renders
 // NodeMetrics / PodMetrics. A field is emitted only when it was measured.
+// A node's push lists every pod it runs, so the registry holds one sample
+// for each pod running in the cluster and none for pods that are gone.
 
 #include "osal/mutex.hpp"
 
@@ -21,8 +23,6 @@ struct ContainerUsage {
     uint64_t cpu_nanocores{0};
     bool has_memory{false};
     uint64_t memory_bytes{0};
-    bool has_psram{false};           // external RAM footprint, reported as esp32.io/psram
-    uint64_t psram_bytes{0};
 };
 
 struct NodeUsageSample {
@@ -48,7 +48,7 @@ struct PodUsageSample {
 
 class MetricsRegistry {
 public:
-    explicit MetricsRegistry(uint32_t stale_after_ms = 30000, size_t max_pods = 32);
+    explicit MetricsRegistry(uint32_t stale_after_ms = 30000);
 
     // Kubelet push body:
     // {"node":"n","window_ms":5000,"timestamp":"...","usage":{"cpu_nanocores":N,"memory_bytes":N},
@@ -70,7 +70,6 @@ private:
     bool fresh(uint64_t received_uptime_ms, uint64_t now) const;
 
     uint32_t stale_after_ms_;
-    size_t max_pods_;
     mutable osal::Mutex mutex_;
     std::map<std::string, NodeUsageSample> nodes_;
     std::map<std::string, PodUsageSample> pods_; // "ns/name"
