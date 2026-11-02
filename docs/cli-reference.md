@@ -79,7 +79,7 @@ Firmware commands (see [Firmware updates](firmware-updates.md)) reach the API se
 | `firmware status` | Print the staged image, the rollout, and a node table showing version, image, slot, confirmation state, target, and `FirmwareUpdate` condition. |
 | `firmware abort` | Delete the rollout. Nodes that have not switched keep their running firmware. |
 | `firmware info <firmware.bin>` | Print the version and SHA-256 of an image file. |
-| `devices` | List the Devices of a namespace (`-n`, default `default`, or `-A`) with the latest reading of each driver. The command reads it with `GET /` from the driver pod's node, at its pod IP and `http` port. Thus this machine must be able to reach the node. Flags: `--timeout <s>`, default `3`. |
+| `devices [<name>...]` | List the Devices of a namespace (`-n`, default `default`, or `-A`), or the named ones, with the latest reading of each driver. The command reads it with `GET /` from the driver pod's node, at its pod IP and `http` port. Thus this machine must be able to reach the node. A reading is a use: the command reports one for each `OnDemand` Device (the `activate` subresource) and waits for the drivers of `Idle` ones to start ([Activation](devices.md#activation)). Flags: `--timeout <s>` for each reading, default `3`; `--activation-timeout <s>`, default `10`; `--no-activate` lists without starting drivers. |
 
 Pod migration commands (see [Pod migration](migration.md)) create and read Checkpoints through `kubectl --raw` (kubeconfig credentials apply) and accept `--context`, `--kubeconfig`, `--server`, and `--kubectl`:
 

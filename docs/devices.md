@@ -11,12 +11,14 @@ flowchart LR
 
 Each node finds the I2C parts on its own buses. It also finds parts behind a PCA9548A multiplexer, for example the M5Stack PaHub. The control plane creates a Device for each part that it can identify. Discovery cannot find buttons, switches or parts at other addresses. For these parts, write a Device manifest.
 
+By default a Device is `OnDemand`: its driver runs only while something uses the Device, and for 5 minutes after the last use (see [Activation](#activation)).
+
 ```
 kubectl get devices
 NAME                                  DRIVER      NODE         ADDRESS            PHASE     AGE
 bme688-cardputer-b0-m70c2-77          bme688      cardputer    i2c0/0x70:2/0x77   Running   3m
-miniscale-cardputer-b0-m70c3-26       miniscale   cardputer    i2c0/0x70:3/0x26   Running   3m
-rfid-cardputer-b0-m70c4-28            rfid        cardputer    i2c0/0x70:4/0x28   Running   3m
+miniscale-cardputer-b0-m70c3-26       miniscale   cardputer    i2c0/0x70:3/0x26   Idle      3m
+rfid-cardputer-b0-m70c4-28            rfid        cardputer    i2c0/0x70:4/0x28   Idle      3m
 
 kubectl label device bme688-cardputer-b0-m70c2-77 location=kitchen
 ```
@@ -44,6 +46,8 @@ spec:
   intervalMs: 5000             # reading period
   config:                      # driver settings
     heater-temp: "320"
+  activation: OnDemand         # the driver runs while the Device is in use
+  idleSeconds: 300             # and this long after the last use
 ```
 
 | Field | Meaning | Default |
@@ -59,6 +63,8 @@ spec:
 | `spec.intervalMs` | Reading period, `50` to `3600000` | The driver's period |
 | `spec.config` | Settings for the driver. Values are strings, numbers or booleans | |
 | `spec.image` | Driver image instead of the catalog's, a `wasm://` reference | `wasm://embedded/driver-<driver>` |
+| `spec.activation` | `OnDemand`: the driver runs while the Device is in use. `Always`: the driver runs all the time | `OnDemand` |
+| `spec.idleSeconds` | `OnDemand`: how long the driver runs after the last use, `10` to `86400` | `300` |
 
 The API server rejects a Device in these conditions:
 
@@ -66,20 +72,21 @@ The API server rejects a Device in these conditions:
 - An I2C field is out of range, or the driver does not use I2C.
 - The address is the multiplexer's own address.
 - A pin is missing, the driver does not know the pin, or the pin is not a GPIO pad of the ESP32-S3.
+- `activation` is not `OnDemand` or `Always`, or `idleSeconds` is not a whole number from `10` to `86400`.
 
-You can write an address without quotes (`address: 0x77`). The API server stores it as a string.
+You can write an address without quotes (`address: 0x77`). The API server stores it as a string. It also stores the defaults of `activation` and, for an `OnDemand` Device, `idleSeconds`.
 
 The Device controller writes the status:
 
 | Field | Meaning |
 | --- | --- |
-| `phase` | `Pending`, `Running`, `Failed` or `Absent` (discovery no longer finds the part) |
+| `phase` | `Pending`, `Running`, `Idle` (an `OnDemand` Device that nobody uses: no driver pod), `Failed` or `Absent` (discovery no longer finds the part) |
 | `nodeName` | Node the driver runs on |
-| `podName` | The driver pod |
+| `podName` | The driver pod, while there is one |
 | `chip` | The chip that discovery identified at the Device's address |
-| `message` | Why the Device is not `Running`: the driver pod's waiting or failure reason, the scheduler's message, or a conflict |
+| `message` | Why the Device is not `Running`: the driver pod's waiting or failure reason, the scheduler's message, a conflict, or `idle: the driver starts on the next use` |
 
-`kubectl get devices -o wide` adds the `CHIP`, `POD` and `MESSAGE` columns. `kubectl describe device` lists the controller's Events: `Discovered`, `SuccessfulCreate`, `Replacing`, `Absent` and `Present`.
+`kubectl get devices -o wide` adds the `CHIP`, `POD`, `ACTIVATION` and `MESSAGE` columns. `kubectl describe device` lists the controller's Events: `Discovered`, `SuccessfulCreate`, `Activated`, `Idle`, `Replacing`, `Absent` and `Present`.
 
 ## Driver pods
 
@@ -121,10 +128,37 @@ The controller keeps the driver pod in step with the Device:
 
 - When the Device's labels change, it updates the pod's labels in place.
 - When the driver, address, pins, period, config, image or node changes, it replaces the pod.
-- When someone deletes the pod, it creates the pod again.
+- When someone deletes the pod, it creates the pod again (an `OnDemand` Device: while it is in use).
 - It replaces a `Failed` pod after 1 minute. If the replacement fails again, the wait doubles each time, up to 10 minutes.
 
 When you delete the Device, the controller deletes its pod and its Service. If a Service with the Device's name exists and the Device does not own it, the controller does not change that Service. The Device's message tells about the conflict.
+
+## Activation
+
+An `OnDemand` Device has a driver pod only while it is in use. A Device without a use is `Idle`: its Service stays, without endpoints, and the driver takes no memory on its node. Each of these is a use:
+
+- A call to a Service that selects the driver pod, from any node: `k32_http_call` to the Device's Service or to an app's own Service that selects drivers by label, and a request to an Ingress rule with such a Service as its backend.
+- A pod that subscribes to `device.<device>` (`kube32.io/event-topics`), on any node, while it is neither terminating nor `Succeeded` or `Failed`. Its subscription counts as a use on each controller pass.
+- A client of an Ingress event stream (`kube32.io/event-stream`) that carries `device.<device>`, for a Device in the Ingress's namespace.
+- `kube32-cli devices`, which reads the Devices it lists.
+- `POST /apis/kube32.io/v1/namespaces/<ns>/devices/<device>/activate`, the `activate` subresource. It answers `200` with a `Status`, or `404` for a Device that does not exist. `kubectl create --raw <path> -f <file with {}>` sends it.
+
+The control plane keeps the time of the last use of each Device in memory. It stores nothing, so a use writes nothing to the journal on flash and starts no watch event. The Device controller deletes the driver pod `idleSeconds` after the last use, gracefully, and sets the phase to `Idle`. A driver pod that runs when the control plane starts gets a full `idleSeconds` before it goes.
+
+Callers report uses to the control plane with the `activate` subresource; on the control plane itself, the Service client and the Ingress controller call the Device controller directly. A caller learns which Devices a Service selects from the Service's Endpoints: the API server gives them the annotation `kube32.io/on-demand-devices: "<device>:<node>:<idleSeconds>[,...]"`. Each node reports a Device at most once per `idleSeconds / 4` while its driver answers, and at most once a second while callers wait for the driver to start. The record of these reports takes about 40 bytes for each Device that the node's pods call.
+
+When a Service has no ready driver, a call to it waits:
+
+1. The caller reports the use, and the Device controller makes a pass at once.
+2. The controller creates the driver pod on the Device's node, and the scheduler binds it in the same pass.
+3. The node's kubelet loads the driver, about 100 ms on a board, and reports the pod `Running`.
+4. The caller sees the endpoint (it checks every 200 ms) and makes the call. A driver answers `503` until its first reading; the call that started the driver asks again every 100 ms until the driver has one.
+
+The first call thus takes the driver's start plus its first reading, typically 0.5 to 1.5 seconds. Later calls do not wait. A call waits at most 10 seconds and never longer than its own timeout. When the driver does not start in time, `k32_http_call` returns `503` with `{"device":"<device>","ok":false,"error":"the driver of Device <device> did not start within <ms> ms (<why>)"}`, and the Ingress controller answers `503 {"error":"unavailable",...}` with `Retry-After: 2`.
+
+On a node with a shared interpreter stack (every board), a pod that calls a Device's Service holds that stack until the call returns, and a driver needs it to start. Such a caller therefore does not wait for a driver that starts on its own node: it reports the use and gets `503` with `the driver of Device <device> starts on this node once this call returns: call again` at once. The driver starts after the call, and the next call reads it.
+
+An `Always` Device keeps its driver pod all the time, as long as the Device exists and its node has the part. Set `activation: Always` for a Device whose driver must run without readers, for example a switch whose output must stay set, or a part whose events an Ingress or another cluster consumes without a subscribed pod.
 
 ## Driver catalog
 
@@ -182,9 +216,9 @@ The scan follows these rules for buses that are in use:
 
 The control plane checks each identified catalog part. If no Device has the same node, bus, multiplexer channel and address, it creates a Device in the `default` namespace. The name is `<driver>-<node>-b<bus>[-m<mux>c<channel>]-<address>`, for example `bme688-cardputer-b0-m70c2-77`. If the name is longer than 63 characters, the control plane cuts it and adds a hash.
 
-The Device has the labels `kube32.io/discovered: "true"` and `kube32.io/driver: <driver>`. Labels that you add later with `kubectl label` stay. If you write a Device for the same part, discovery does not create a second Device.
+The Device has the labels `kube32.io/discovered: "true"` and `kube32.io/driver: <driver>`. It is `OnDemand` with `idleSeconds: 300`: its driver runs only while something uses the part. Change either field with `kubectl patch`. Labels that you add later with `kubectl label` stay. If you write a Device for the same part, discovery does not create a second Device.
 
-A part that one scan misses stays in the report for one more scan. Thus a single failed transfer does not stop a driver. If two scans in a row do not find a discovered part (about 20 seconds), the control plane sets its Device to `Absent`. It deletes the driver pod, but the Device, its labels and its Service stay. When the part answers again, the driver starts again. If you delete a discovered Device while its part is attached, the next pass creates the Device again.
+A part that one scan misses stays in the report for one more scan. Thus a single failed transfer does not stop a driver. If two scans in a row do not find a discovered part (about 20 seconds), the control plane sets its Device to `Absent`. It deletes the driver pod, but the Device, its labels and its Service stay. When the part answers again, the driver starts again on the next use. If you delete a discovered Device while its part is attached, the next pass creates the Device again.
 
 ## Shared I2C buses
 
@@ -227,7 +261,9 @@ uint32_t len = 0;
 int32_t status = k32_http_call("GET", 3, "http://kitchen-air/", 19, 0, 0, 0, 0, buf, sizeof buf, &len, 2000);
 ```
 
-The Device's own Service works the same way (`http://kitchen-env/`). An app can also subscribe to `device.<device>` with `kube32.io/event-topics`. It then receives each reading when the driver takes it.
+The Device's own Service works the same way (`http://kitchen-env/`). An app can also subscribe to `device.<device>` with `kube32.io/event-topics`. It then receives each reading when the driver takes it, and the driver of an `OnDemand` Device runs while the app exists.
+
+The first call to an `Idle` Device starts its driver and waits for its first reading ([Activation](#activation)). Give that call a timeout of a few seconds.
 
 Each Service in a namespace adds about eight variables to the environment of each pod that starts there, and each Device adds a Service. An app that reaches Devices by name can set `enableServiceLinks: false`. On a board without PSRAM, each variable uses about 100 bytes of the internal heap while the pod runs.
 
@@ -266,7 +302,9 @@ kube32-sim --sim-i2c pahub,bme688@2,miniscale@3,rfid@4
 | --- | --- |
 | Each driver pod | Like any pod: its 3 KiB of linear memory, its module's compiled code and the runtime's structures for the pod. The admission estimate is 16 to 29 KiB of a board's pod pool. On the Cardputer, a BME688, a Mini Scales unit and an RFID 2 reader use 69 KB together (25.4 + 20.1 + 23.5 KB). The pool has 80 KiB. The firewall keeps 6 bytes for each grant |
 | A node with shared buses | One I2C driver for each bus, with up to four device handles for all grants. Discovery keeps about 50 bytes for each part that it finds. The node annotation uses about 70 bytes for each part |
-| Control plane | The Device controller's thread (12 KiB stack in PSRAM). It makes a pass when a Device, a driver pod, a Service, or what it reads of a Node changes, at most every 2 seconds, and every 30 s without a change. A Device, its pod and its Service use about 2.5 KiB of the object store |
+| An `Idle` Device | No driver pod: nothing of the pod pool and nothing of its node's internal RAM |
+| Control plane | The Device controller's thread (12 KiB stack in PSRAM). It makes a pass when a Device, a driver pod, a Service, a pod that subscribes to `device.*` topics, or what it reads of a Node changes, at most every 2 seconds, at once when an `Idle` Device gets a use, and every 30 s without a change. A Device, its pod and its Service use about 2.5 KiB of the object store. The time of the last use takes about 60 bytes for each Device |
+| Each node that calls Devices | The time of its last report, about 40 bytes for each Device. Reports use no thread of their own: they go out on the caller's thread |
 
 ## Limitations
 
@@ -275,3 +313,5 @@ kube32-sim --sim-i2c pahub,bme688@2,miniscale@3,rfid@4
 - Discovery identifies catalog parts only at their catalog addresses.
 - Discovery does not scan a multiplexer behind another multiplexer.
 - `Absent` applies only to Devices that discovery created. A Device that you wrote stays `Running` when its part stops answering, and its driver answers `503`.
+- On a board, a call from a pod to an `Idle` Device whose driver starts on the same board gets `503` at once; the next call reads the driver.
+- A request through an Ingress rule that starts a driver gets the driver's first answer, which is `503` when the driver has no reading yet. `k32_http_call` waits for the first reading.

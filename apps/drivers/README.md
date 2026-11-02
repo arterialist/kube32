@@ -2,7 +2,7 @@
 
 A driver pod operates one part for a [Device](../../docs/devices.md). On each tick it reads the part. It serves the readings over HTTP on the pod's port and publishes them on the Device's channel topic.
 
-The Device controller creates the pod on the node that has the part, with the environment and grants below. It also creates a Service with the Device's name. From any node, apps reach the part through that Service, or through their own Service that selects driver pods by label.
+The Device controller creates the pod on the node that has the part, with the environment and grants below. It also creates a Service with the Device's name. From any node, apps reach the part through that Service, or through their own Service that selects driver pods by label. For an `OnDemand` Device (the default), the pod runs only while the Device is in use ([Activation](../../docs/devices.md#activation)).
 
 ```sh
 make -C apps/drivers        # writes images/driver-<name>.wasm (embedded as wasm://embedded/driver-<name>)
@@ -37,7 +37,7 @@ The driver sends events on `DEVICE_TOPIC` with the `GET /` body:
 - Each change of `rfid`, `button` and `switch`. `button` and `switch` also send a periodic report.
 - The part going silent.
 
-An event carries at most 200 bytes. If the body is longer, the driver omits `uptime_ms`, then `node`, then `device` and `driver`. The topic still names the device. To subscribe, set the pod annotation `kube32.io/event-topics: device.<name>`. To stream the topic through an Ingress, use `kube32.io/event-stream`.
+An event carries at most 200 bytes. If the body is longer, the driver omits `uptime_ms`, then `node`, then `device` and `driver`. The topic still names the device. To subscribe, set the pod annotation `kube32.io/event-topics: device.<name>`; the subscription keeps the driver of an `OnDemand` Device running. To stream the topic through an Ingress, use `kube32.io/event-stream`.
 
 When a part is absent or does not answer, the driver tries again on each tick. It logs and publishes the first failure, and then nothing until the part answers again. The driver writes at most one error line a minute. A pod without `hardware.kube32.io/ipc` serves HTTP and logs one time that it cannot publish.
 
