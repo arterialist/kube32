@@ -62,7 +62,10 @@ SUITE_MAPPING = {
     ],
     "devices": [
         "tests.integration.devices.test_laptop_compute",
-    ]
+    ],
+    "llm": [
+        "tests.integration.llm.test_llm_pipeline",
+    ],
 }
 
 
@@ -189,9 +192,9 @@ def main():
     )
     parser.add_argument(
         "--suite",
-        choices=["api", "validation", "resources", "workloads", "cluster", "federation", "devices", "all"],
+        choices=["api", "validation", "resources", "workloads", "cluster", "federation", "devices", "llm", "all"],
         default="all",
-        help="Test suite to execute ('api', 'validation', 'resources', 'workloads', 'cluster', 'federation', 'devices', or 'all')"
+        help="Test suite to execute ('api', 'validation', 'resources', 'workloads', 'cluster', 'federation', 'devices', 'llm', or 'all')"
     )
     parser.add_argument(
         "-v", "--verbose", "--v",
@@ -213,7 +216,7 @@ def main():
         logging.basicConfig(level=logging.INFO, format="%(message)s")
 
     server_url = args.server
-    if args.suite in ("cluster", "federation", "devices"):
+    if args.suite in ("cluster", "federation", "devices", "llm"):
         # Cluster, federation and device tests manage their own multi-node simulated clusters
         pass
     else:
@@ -240,7 +243,8 @@ def main():
             SUITE_MAPPING["workloads"] +
             SUITE_MAPPING["cluster"] +
             SUITE_MAPPING["federation"] +
-            SUITE_MAPPING["devices"]
+            SUITE_MAPPING["devices"] +
+            SUITE_MAPPING["llm"]
         )
     else:
         modules_to_run = SUITE_MAPPING.get(args.suite, [])

@@ -1,0 +1,259 @@
+# llm-pipeline: one language model (stories260K) split into pipeline stages
+# that run as pods on three nodes, with its text on the Cardputer's screen.
+#
+#   llm-store        model host (a kube32-sim node): serves the quantized
+#                    model's slices and tokenizer from its image bundle
+#   llm-shard-0      control plane: token embedding and layers 0-2 (int8)
+#   llm-shard-1      Cardputer: layer 3 (int4) in its 80 KiB pod pool; shows
+#                    the text that passes through on the screen
+#   llm-shard-2      fastest node (the model host): layer 4, final norm and
+#                    classifier (int8)
+#   llm-coordinator  control plane: tokenizer, generation loop, HTTP API
+#
+# Each stage computes a position through its layers and posts the residual
+# stream to the next stage's Service. The last stage posts the chosen token
+# to the coordinator, which feeds it to the first stage and publishes it on
+# the channel topic llm.text.
+#
+# The modules travel inline: apply the copy that apps/llm-pipeline renders.
+#   make -C apps/llm-pipeline
+#   KUBE32_SD_ROOT=apps/llm-pipeline/build/card kube32-sim --role worker \
+#     --join http://<control-plane-ip>:6443 --node-ip <host-ip> --node-name model-host --pod-port 17000
+#   kubectl --context kube32 apply -f apps/llm-pipeline/build/llm-pipeline.yaml
+#   curl -s http://<control-plane-ip>/llm                       # state, text, timing
+#   curl -s -X POST http://<control-plane-ip>/llm/generate -d '{"prompt":"Lily went to the park","steps":64}'
+#   curl -sN http://<control-plane-ip>/llm/events               # tokens as Server-Sent Events
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: llm-store
+  namespace: default
+  labels: {app: llm, tier: store}
+spec:
+  replicas: 1
+  strategy: {type: Recreate}
+  selector:
+    matchLabels: {app: llm, tier: store}
+  template:
+    metadata:
+      labels: {app: llm, tier: store}
+      annotations:
+        kube32.io/wasm-stack: "512"
+    spec:
+      nodeSelector:
+        kube32.io/simulator: "true"
+      containers:
+        - name: store
+          image: wasm://sd/llm-store            # <storage>/kube32/images/llm-store.wasm, files in llm-store/
+          ports: [{name: http, containerPort: 7000}]
+          resources:
+            requests: {memory: 2Ki}
+            limits: {memory: 2Ki}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: llm-shard-0
+  namespace: default
+  labels: {app: llm, tier: shard, stage: "0"}
+spec:
+  replicas: 1
+  strategy: {type: Recreate}
+  selector:
+    matchLabels: {app: llm, tier: shard, stage: "0"}
+  template:
+    metadata:
+      labels: {app: llm, tier: shard, stage: "0"}
+      annotations:
+        kube32.io/wasm-base64: "@llm-shard.wasm"
+        kube32.io/wasm-stack: "1536"
+        kube32.io/execution-budget: "off"
+        kube32.io/tick-interval: "100ms"
+    spec:
+      nodeSelector:
+        node-role.kubernetes.io/control-plane: ""
+      containers:
+        - name: shard
+          image: wasm://inline/llm-shard
+          ports: [{name: http, containerPort: 7000}]
+          env:
+            - {name: STAGE, value: "0"}
+            - {name: MODEL_URL, value: "http://llm-store/shard-0.bin"}
+            - {name: NEXT_URL, value: "http://llm-shard-1/x"}
+            - name: NODE_NAME
+              valueFrom: {fieldRef: {fieldPath: spec.nodeName}}
+          resources:
+            requests: {memory: 256Ki}             # the 196 KB slice, a KV cache of 199 positions
+            limits: {memory: 256Ki}
+          securityContext:
+            capabilities: {add: ["SERVICE_CALL"]}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: llm-shard-1
+  namespace: default
+  labels: {app: llm, tier: shard, stage: "1"}
+spec:
+  replicas: 1
+  strategy: {type: Recreate}
+  selector:
+    matchLabels: {app: llm, tier: shard, stage: "1"}
+  template:
+    metadata:
+      labels: {app: llm, tier: shard, stage: "1"}
+      annotations:
+        kube32.io/wasm-base64: "@llm-shard.wasm"
+        kube32.io/wasm-stack: "1536"
+        kube32.io/execution-budget: "off"
+        kube32.io/tick-interval: "100ms"
+    spec:
+      nodeSelector:
+        kube32.io/board: cardputer
+      containers:
+        - name: shard
+          image: wasm://inline/llm-shard
+          ports: [{name: http, containerPort: 7000}]
+          env:
+            - {name: STAGE, value: "1"}
+            - {name: MODEL_URL, value: "http://llm-store/shard-1.bin"}
+            - {name: NEXT_URL, value: "http://llm-shard-2/x"}
+            - {name: SCREEN, value: "1"}
+            - name: NODE_NAME
+              valueFrom: {fieldRef: {fieldPath: spec.nodeName}}
+          resources:
+            # The 25 KB int4 slice and a KV cache of 135 positions; with the
+            # pod's overhead (spec.overhead) it takes 79 of the 80 KiB pool
+            requests: {memory: 46Ki, hardware.kube32.io/tft-display: "1"}
+            limits: {memory: 46Ki}
+          securityContext:
+            capabilities: {add: ["SERVICE_CALL", "DISPLAY"]}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: llm-shard-2
+  namespace: default
+  labels: {app: llm, tier: shard, stage: "2"}
+spec:
+  replicas: 1
+  strategy: {type: Recreate}
+  selector:
+    matchLabels: {app: llm, tier: shard, stage: "2"}
+  template:
+    metadata:
+      labels: {app: llm, tier: shard, stage: "2"}
+      annotations:
+        kube32.io/wasm-base64: "@llm-shard.wasm"
+        kube32.io/wasm-stack: "1536"
+        kube32.io/execution-budget: "off"
+        kube32.io/tick-interval: "100ms"
+        # On the fastest node (the model host); when that node leaves, the
+        # stage moves to a board with its KV cache and the generation goes on
+        kube32.io/migration: Auto
+        kube32.io/placement: fastest
+    spec:
+      containers:
+        - name: shard
+          image: wasm://inline/llm-shard
+          ports: [{name: http, containerPort: 7000}]
+          env:
+            - {name: STAGE, value: "2"}
+            - {name: MODEL_URL, value: "http://llm-store/shard-2.bin"}
+            - {name: NEXT_URL, value: "http://llm-coordinator/result"}
+            - name: NODE_NAME
+              valueFrom: {fieldRef: {fieldPath: spec.nodeName}}
+          resources:
+            requests: {memory: 128Ki}             # the 83 KB slice with the classifier, a KV cache of 397 positions
+            limits: {memory: 128Ki}
+          securityContext:
+            capabilities: {add: ["SERVICE_CALL"]}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: llm-coordinator
+  namespace: default
+  labels: {app: llm, tier: coordinator}
+spec:
+  replicas: 1
+  strategy: {type: Recreate}
+  selector:
+    matchLabels: {app: llm, tier: coordinator}
+  template:
+    metadata:
+      labels: {app: llm, tier: coordinator}
+      annotations:
+        kube32.io/wasm-base64: "@llm-coordinator.wasm"
+        kube32.io/tick-interval: "100ms"
+    spec:
+      nodeSelector:
+        node-role.kubernetes.io/control-plane: ""
+      containers:
+        - name: coordinator
+          image: wasm://inline/llm-coordinator
+          ports: [{name: http, containerPort: 7000}]
+          env:
+            - {name: SHARD_URL, value: "http://llm-shard-0/x"}
+            - {name: CONTEXT, value: "128"}       # at most; the smallest stage cache decides
+            - {name: STEPS, value: "96"}
+            - name: PROMPT                        # generated once at start; "" for none
+              value: "Once upon a time"
+          resources:
+            requests: {memory: 64Ki, hardware.kube32.io/ipc: "1"}
+            limits: {memory: 64Ki}
+          securityContext:
+            capabilities: {add: ["SERVICE_CALL", "CHANNEL_IPC"]}
+---
+apiVersion: v1
+kind: Service
+metadata: {name: llm-store, namespace: default}
+spec:
+  selector: {app: llm, tier: store}
+  ports: [{name: http, port: 80, targetPort: http}]
+---
+apiVersion: v1
+kind: Service
+metadata: {name: llm-shard-0, namespace: default}
+spec:
+  selector: {app: llm, tier: shard, stage: "0"}
+  ports: [{name: http, port: 80, targetPort: http}]
+---
+apiVersion: v1
+kind: Service
+metadata: {name: llm-shard-1, namespace: default}
+spec:
+  selector: {app: llm, tier: shard, stage: "1"}
+  ports: [{name: http, port: 80, targetPort: http}]
+---
+apiVersion: v1
+kind: Service
+metadata: {name: llm-shard-2, namespace: default}
+spec:
+  selector: {app: llm, tier: shard, stage: "2"}
+  ports: [{name: http, port: 80, targetPort: http}]
+---
+apiVersion: v1
+kind: Service
+metadata: {name: llm-coordinator, namespace: default}
+spec:
+  selector: {app: llm, tier: coordinator}
+  ports: [{name: http, port: 80, targetPort: http}]
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: llm
+  namespace: default
+  annotations:
+    kube32.io/event-stream: "/llm/events=llm.text"
+spec:
+  rules:
+    - http:
+        paths:
+          - path: /llm
+            pathType: Prefix
+            backend:
+              service:
+                name: llm-coordinator
+                port: {number: 80}
