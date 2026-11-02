@@ -630,6 +630,56 @@ void test_heartbeat_patch_in_fixed_buffer() {
     std::cout << "[PASS] (" << buf.size() << " bytes, no allocation)" << std::endl;
 }
 
+// The time of condition `type` in a Node status JSON ("" without one)
+static std::string condition_time(const std::string& json, const std::string& type, const char* field) {
+    kube32::models::JsonValue doc;
+    std::string err;
+    assert(kube32::models::parse_json(json, doc, err));
+    const kube32::models::JsonValue* conds = kube32::models::node_conditions(doc);
+    assert(conds);
+    for (const auto& c : conds->arr_val) {
+        if (c.get_string("type", "") == type) return c.get_string(field, "");
+    }
+    return "";
+}
+
+// Every heartbeat carries lastHeartbeatTime; a condition's
+// lastTransitionTime stays until its status changes
+void test_condition_times() {
+    std::cout << "\n[TEST] Node condition times..." << std::endl;
+    DeepControlledRuntime rt;
+    auto owned = std::make_unique<RecordingKubeClient>();
+    RecordingKubeClient* client = owned.get();
+    KubeletConfig cfg;
+    cfg.node_name = "test-node-01";
+    Kubelet kubelet(cfg, rt, std::move(owned));
+    kubelet.reconcile_node_registration();   // Ready False: no pod sync yet
+    const std::string reg = client->last_node_registration_json;
+    const std::string not_ready_since = condition_time(reg, "Ready", "lastTransitionTime");
+    assert(!not_ready_since.empty() && !condition_time(reg, "Ready", "lastHeartbeatTime").empty());
+    kubelet.report_heartbeat();
+    std::string hb = client->last_node_patch;
+    assert(condition_time(hb, "Ready", "lastTransitionTime") == not_ready_since);
+    const std::string pressure_since = condition_time(hb, "MemoryPressure", "lastTransitionTime");
+    assert(!pressure_since.empty());
+
+    kube32::osal::Thread::sleep_ms(1100);   // times have whole seconds
+    kubelet.sync_assigned_pods();            // Ready True from here
+    kubelet.report_heartbeat();
+    hb = client->last_node_patch;
+    assert(hb.find("\"status\":\"True\",\"reason\":\"KubeletReady\"") != std::string::npos);
+    const std::string ready_since = condition_time(hb, "Ready", "lastTransitionTime");
+    assert(ready_since > not_ready_since);
+    assert(condition_time(hb, "MemoryPressure", "lastTransitionTime") == pressure_since);
+    const std::string beat = condition_time(hb, "Ready", "lastHeartbeatTime");
+    kube32::osal::Thread::sleep_ms(1100);
+    kubelet.report_heartbeat();
+    hb = client->last_node_patch;
+    assert(condition_time(hb, "Ready", "lastTransitionTime") == ready_since);
+    assert(condition_time(hb, "Ready", "lastHeartbeatTime") > beat);
+    std::cout << "[PASS] Ready since " << ready_since << ", MemoryPressure since " << pressure_since << std::endl;
+}
+
 // Registering again over a Node that survived (after a reboot, or after
 // rejected heartbeats on a node short of memory) patches it with the
 // registration: a cordon set with kubectl cordon stays
@@ -667,6 +717,7 @@ int main() {
     test_dynamic_node_telemetry();
     test_heartbeat_patch_in_fixed_buffer();
     test_registration_keeps_cordon();
+    test_condition_times();
 
     std::cout << "\n==================================================================" << std::endl;
     std::cout << " ALL KUBELET NODE STATUS TESTS PASSED                          " << std::endl;

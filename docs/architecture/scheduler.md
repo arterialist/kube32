@@ -70,11 +70,15 @@ Each kubelet renews a Lease in `kube-node-lease` with `leaseDurationSeconds: 15`
 
 | Time without renewal | Action |
 | --- | --- |
-| 15 s, or `leaseDurationSeconds` | Sets Node `Ready` to `Unknown` with reason `NodeStatusUnknown`, adds a `node.kubernetes.io/unreachable:NoSchedule` taint, and emits `NodeNotReady` |
+| 15 s, or `leaseDurationSeconds` | Sets the conditions the kubelet posts (`Ready`, `MemoryPressure`) to `Unknown` with reason `NodeStatusUnknown`, adds a `node.kubernetes.io/unreachable:NoSchedule` taint, and emits `NodeNotReady` |
 | +15 s, or 30 s total | Adds a `node.kubernetes.io/unreachable:NoExecute` taint with `timeAdded` |
 | +300 s, or 330 s total (default) | Evicts pods whose `node.kubernetes.io/unreachable:NoExecute` toleration has expired |
 
 Simulator timeouts are configurable with `--not-ready-timeout` and `--eviction-timeout`. A lease renewal before toleration expiry clears both taints and emits `NodeReady`; bound pods stay on the node and keep running. After a control-plane restart, a previously `Ready` node gets a full lease duration before timing out, and existing `NoExecute` tolerations continue counting from the taint's `timeAdded`.
+
+### Node condition times
+
+The kubelet posts `Ready`, `MemoryPressure` and, on nodes that update their firmware through the cluster, `FirmwareUpdate` with every heartbeat as a strategic merge patch, so conditions merge by `type` and an entry that another writer set stays. Each condition carries `lastHeartbeatTime`, the time of the heartbeat, and `lastTransitionTime`, the time its status last changed. The kubelet notes a change on its uptime clock and reports its wall-clock time once the clock is set. The API server keeps a condition's stored `lastTransitionTime` while its status stays the same, and when the status changes it keeps the writer's time only if that time is later than the stored one, else it records the time of the write. A kubelet that comes back after the node lifecycle controller set `Ready` to `Unknown` therefore shows the moment it returned. When neither the kubelet nor the API server has a wall clock, a time that cannot be known is left out, and `kubectl describe node` prints the zero time (`0001-01-01`) in its place.
 
 Pod admission and the Deployment and Job controllers add default `node.kubernetes.io/not-ready:NoExecute` and `node.kubernetes.io/unreachable:NoExecute` tolerations (`operator: Exists`, `tolerationSeconds: 300`) unless the pod already tolerates those taints. A pod is evicted when it has no matching toleration or when `tolerationSeconds` has elapsed since `timeAdded` (`<= 0` evicts immediately; omitting `tolerationSeconds` tolerates indefinitely). DaemonSet pods receive both tolerations without `tolerationSeconds` and are never evicted for these taints.
 

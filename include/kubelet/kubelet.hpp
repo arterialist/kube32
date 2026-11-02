@@ -190,6 +190,10 @@ private:
     // Fills the Ready condition from the health of the pod sync loop.
     void fill_ready_condition(NodeTelemetry& t) const;
     void fill_firmware_condition(NodeTelemetry& t) const;
+    // Condition times: lastHeartbeatTime now, lastTransitionTime when each
+    // condition's status last changed. `memory_pressure` is null where the
+    // MemoryPressure condition is not posted (registration).
+    void time_conditions(NodeTelemetry& t, const bool* memory_pressure);
 
     // Pod lifecycle actions. `previous` carries restart state when the pod
     // is being restarted after a back-off.
@@ -247,6 +251,17 @@ private:
     std::map<std::string, std::string> found_annotations_;   // from node_annotation_source
     bool annotations_sent_{false};                          // found_annotations_ are on the Node
     uint32_t heartbeat_failures_{0};
+    // The status each posted condition has and the uptime it took it on;
+    // status -1 before the first post. Registration and heartbeats run on
+    // two threads: condition_mutex_.
+    struct ConditionClock {
+        int8_t status{-1};
+        uint64_t since_ms{0};
+    };
+    osal::Mutex condition_mutex_;
+    ConditionClock ready_clock_;
+    ConditionClock memory_pressure_clock_;
+    ConditionClock firmware_clock_;
     // The Node object is written here, allocated at start while the heap is
     // whole: re-registering must work when the heap is fragmented
     static constexpr size_t kRegistrationBufBytes = 2048;

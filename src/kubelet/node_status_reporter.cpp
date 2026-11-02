@@ -171,6 +171,20 @@ static void append_resources(Out& json, const NodeTelemetry& t, bool capacity) {
     if (t.sd_present) quantity("hardware.kube32.io/sd", capacity ? t.sd_total_bytes : t.sd_free_bytes);
 }
 
+// ,"lastHeartbeatTime":"...","lastTransitionTime":"..." for the times known
+template <typename Out>
+static void append_condition_times(Out& json, const NodeTelemetry& t, uint64_t transition_unix_ms) {
+    char ts[32];
+    for (const auto& field : {std::make_pair(",\"lastHeartbeatTime\":\"", t.heartbeat_unix_ms),
+                              std::make_pair(",\"lastTransitionTime\":\"", transition_unix_ms)}) {
+        const size_t n = field.second ? models::format_rfc3339(field.second, ts, sizeof(ts)) : 0;
+        if (!n) continue;
+        json += field.first;
+        json.append(ts, n);
+        json += "\"";
+    }
+}
+
 template <typename Out>
 static void append_ready_condition(Out& json, const NodeTelemetry& t) {
     json += "{\"type\":\"Ready\",\"status\":\"";
@@ -179,7 +193,9 @@ static void append_ready_condition(Out& json, const NodeTelemetry& t) {
     json += t.ready_reason;
     json += "\",\"message\":\"";
     json += t.ready_message;
-    json += "\"}";
+    json += "\"";
+    append_condition_times(json, t, t.ready_transition_unix_ms);
+    json += "}";
 }
 
 template <typename Out>
@@ -194,7 +210,9 @@ static void append_firmware_condition(Out& json, const NodeTelemetry& t) {
         if (*p == '"' || *p == '\\') json += '\\';
         json += *p;
     }
-    json += "\"}";
+    json += "\"";
+    append_condition_times(json, t, t.firmware_transition_unix_ms);
+    json += "}";
 }
 
 template <typename Out>
@@ -289,7 +307,9 @@ static void append_heartbeat_patch(Out& json, const NodeTelemetry& telemetry, bo
     json += memory_pressure ? "True" : "False";
     json += "\",\"reason\":\"";
     json += memory_pressure ? "KubeletHasMemoryPressure" : "KubeletHasSufficientMemory";
-    json += "\"}";
+    json += "\"";
+    append_condition_times(json, telemetry, telemetry.memory_pressure_transition_unix_ms);
+    json += "}";
     append_firmware_condition(json, telemetry);
     json += "],";
     json += "\"allocatable\":{";

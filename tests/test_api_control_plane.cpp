@@ -438,7 +438,49 @@ static void test_full_store_refuses_creates() {
     std::cout << "[PASS] test_full_store_refuses_creates" << std::endl;
 }
 
+// The Node's conditions through the API: a registration without times gets
+// the write's time, a heartbeat (strategic merge) leaves the conditions it
+// does not carry in place and moves lastTransitionTime only on a change
+static void test_node_condition_times_through_api() {
+    std::cout << "[RUN] test_node_condition_times_through_api" << std::endl;
+    auto store = ram_store();
+    RouteHandler h(*store);
+    assert(call(h, HttpMethod::Post, "/api/v1/nodes", R"({"kind":"Node","apiVersion":"v1","metadata":{"name":"n1"},
+        "status":{"conditions":[{"type":"Ready","status":"False","reason":"KubeletNotReady"}]}})").status_code == 201);
+    std::string json;
+    store->get("/registry/nodes/n1", json);
+    auto ready = [&](const char* field) {
+        store->get("/registry/nodes/n1", json);
+        const models::JsonValue node = parse(json);
+        for (const auto& c : node.get("status")->get("conditions")->arr_val) {
+            if (c.get_string("type", "") == "Ready") return c.get_string(field, "");
+        }
+        return std::string();
+    };
+    const std::string registered = ready("lastTransitionTime");
+    assert(!registered.empty() && !ready("lastHeartbeatTime").empty());
+    // Another writer's condition, then a heartbeat that does not carry it
+    {
+        models::JsonValue node = parse(json);
+        node.get_mut("status")->get_mut("conditions")->arr_val.push_back(parse(R"({"type":"NetworkUnavailable","status":"False"})"));
+        store->put("/registry/nodes/n1", node.to_string(), true);
+    }
+    const char* smp = "application/strategic-merge-patch+json";
+    assert(call(h, HttpMethod::Patch, "/api/v1/nodes/n1/status",
+                R"({"status":{"conditions":[{"type":"Ready","status":"False","reason":"KubeletNotReady"}]}})", "", "", smp).status_code == 200);
+    assert(ready("lastTransitionTime") == registered);
+    assert(json.find("NetworkUnavailable") != std::string::npos);
+    assert(call(h, HttpMethod::Patch, "/api/v1/nodes/n1/status",
+                R"({"status":{"conditions":[{"type":"Ready","status":"True","reason":"KubeletReady","lastTransitionTime":"2020-01-01T00:00:00Z"}]}})",
+                "", "", smp).status_code == 200);
+    const std::string became_ready = ready("lastTransitionTime");
+    assert(became_ready >= registered && became_ready != "2020-01-01T00:00:00Z");   // older than the stored time: the change is now
+    assert(json.find("NetworkUnavailable") != std::string::npos);
+    std::cout << "[PASS] test_node_condition_times_through_api" << std::endl;
+}
+
 int main() {
+    test_node_condition_times_through_api();
     test_bearer_token_authentication();
     test_dry_run_stores_nothing();
     test_list_pagination();

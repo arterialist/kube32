@@ -283,22 +283,27 @@ bool NodeLifecycleController::update_node(const std::string& node_name, bool not
             status->set("conditions", std::move(c));
             conds = status->get_mut("conditions");
         }
-        models::JsonValue* ready = nullptr;
-        for (auto& c : conds->arr_val) {
-            if (c.is_object() && c.get_string("type", "") == "Ready") { ready = &c; break; }
-        }
-        if (!ready) {
+        bool has_ready = false;
+        for (const auto& c : conds->arr_val) has_ready = has_ready || (c.is_object() && c.get_string("type", "") == "Ready");
+        if (!has_ready) {
             models::JsonValue c;
             c.type = models::JsonType::Object;
             c.set("type", jstr("Ready"));
             conds->arr_val.push_back(std::move(c));
-            ready = &conds->arr_val.back();
         }
-        if (ready->get_string("status", "") != "Unknown") {
-            ready->set("status", jstr("Unknown"));
-            ready->set("reason", jstr("NodeStatusUnknown"));
-            ready->set("message", jstr("Kubelet stopped posting node status."));
-            if (!now.empty()) ready->set("lastTransitionTime", jstr(now));
+        // As Kubernetes' node lifecycle controller: every condition the
+        // kubelet posts becomes Unknown, lastHeartbeatTime stays the
+        // kubelet's last and lastTransitionTime is now (left out without a
+        // wall clock: the stored one belongs to the earlier status)
+        for (auto& c : conds->arr_val) {
+            const std::string type = c.is_object() ? c.get_string("type", "") : std::string();
+            if (type != "Ready" && type != "MemoryPressure" && type != "DiskPressure" && type != "PIDPressure") continue;
+            if (c.get_string("status", "") == "Unknown") continue;
+            c.set("status", jstr("Unknown"));
+            c.set("reason", jstr("NodeStatusUnknown"));
+            c.set("message", jstr("Kubelet stopped posting node status."));
+            if (now.empty()) c.remove("lastTransitionTime");
+            else c.set("lastTransitionTime", jstr(now));
         }
     }
 

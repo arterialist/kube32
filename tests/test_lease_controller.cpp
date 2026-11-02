@@ -196,6 +196,55 @@ void test_node_lifecycle_thresholds_and_eviction() {
     std::cout << "[PASS] test_node_lifecycle_thresholds_and_eviction" << std::endl;
 }
 
+// A lease that runs out turns every condition the kubelet posts Unknown, as
+// Kubernetes does: lastTransitionTime is now, lastHeartbeatTime stays the
+// kubelet's last; a condition of another kind stays as it was
+void test_node_conditions_unknown_on_lease_expiry() {
+    StoreOptions opts;
+    opts.enable_flash_persistence = false;
+    auto store = create_radix_store(opts);
+    store->put("/registry/nodes/n1", R"({"kind":"Node","metadata":{"name":"n1"},"status":{"conditions":[
+        {"type":"Ready","status":"True","reason":"KubeletReady","lastHeartbeatTime":"2026-11-02T11:59:00Z","lastTransitionTime":"2026-11-02T10:00:00Z"},
+        {"type":"MemoryPressure","status":"False","reason":"KubeletHasSufficientMemory","lastHeartbeatTime":"2026-11-02T11:59:00Z","lastTransitionTime":"2026-11-02T10:00:00Z"},
+        {"type":"FirmwareUpdate","status":"False","reason":"Idle","lastTransitionTime":"2026-11-02T10:00:00Z"}]}})", true);
+    NodeLifecycleConfig cfg;
+    cfg.not_ready_threshold_ms = 15000;
+    cfg.eviction_threshold_ms = 30000;
+    cfg.unix_time_ms = [] { return 1793620800000ULL; };   // 2026-11-02T12:00:00Z
+    NodeLifecycleController controller(*store, cfg);
+    put_lease(*store, "n1", "2026-11-02T11:59:00.000000Z");
+    controller.reconcile_nodes(1000);
+    controller.reconcile_nodes(1000 + 15000);
+    std::string out;
+    assert(store->get("/registry/nodes/n1", out).ok());
+    JsonValue doc;
+    std::string err;
+    assert(parse_json(out, doc, err));
+    for (const auto& c : doc.get("status")->get("conditions")->arr_val) {
+        const std::string type = c.get_string("type", "");
+        if (type == "FirmwareUpdate") {
+            assert(c.get_string("status", "") == "False" && c.get_string("lastTransitionTime", "") == "2026-11-02T10:00:00Z");
+            continue;
+        }
+        assert(c.get_string("status", "") == "Unknown" && c.get_string("reason", "") == "NodeStatusUnknown");
+        assert(c.get_string("lastTransitionTime", "") == "2026-11-02T12:00:00Z");
+        assert(c.get_string("lastHeartbeatTime", "") == "2026-11-02T11:59:00Z");
+    }
+
+    // Without a wall clock the change has no known time: the field goes
+    store->put("/registry/nodes/n2", R"({"kind":"Node","metadata":{"name":"n2"},"status":{"conditions":[
+        {"type":"Ready","status":"True","lastTransitionTime":"2026-11-02T10:00:00Z"}]}})", true);
+    NodeLifecycleConfig no_clock = cfg;
+    no_clock.unix_time_ms = [] { return uint64_t{0}; };
+    NodeLifecycleController blind(*store, no_clock);
+    put_lease(*store, "n2", "");
+    blind.reconcile_nodes(1000);
+    blind.reconcile_nodes(1000 + 15000);
+    assert(store->get("/registry/nodes/n2", out).ok());
+    assert(out.find("\"status\":\"Unknown\"") != std::string::npos && out.find("lastTransitionTime") == std::string::npos);
+    std::cout << "[PASS] test_node_conditions_unknown_on_lease_expiry" << std::endl;
+}
+
 // A control-plane restart loses the Leases (they are not persisted) but keeps
 // the Nodes: a node that was Ready gets a full lease from the restart, a node
 // that was already NotReady stays NotReady and is not given a fresh grace.
@@ -935,6 +984,7 @@ int main() {
     test_kube_lease_serialization();
     test_lease_api_rest_endpoints();
     test_node_lifecycle_thresholds_and_eviction();
+    test_node_conditions_unknown_on_lease_expiry();
     test_node_lifecycle_after_control_plane_restart();
     test_self_healing_rescheduling();
     test_daemonset_controller();

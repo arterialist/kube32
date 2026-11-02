@@ -291,6 +291,7 @@ void Kubelet::reconcile_node_registration() {
     NodeTelemetry t = status_reporter_->collect_telemetry();
     fill_ready_condition(t);
     fill_firmware_condition(t);
+    time_conditions(t, nullptr);
     if (firmware_) status_reporter_->set_annotations(firmware_->annotations());
     std::string reg_heap;
     std::string_view reg_json;
@@ -439,6 +440,7 @@ void Kubelet::report_heartbeat() {
     fill_ready_condition(t);
     fill_firmware_condition(t);
     bool memory_pressure = (t.free_heap_bytes < config_.memory_pressure_threshold_bytes);
+    time_conditions(t, &memory_pressure);
     // Written on this thread's stack; a patch that does not fit (a board
     // with an unusual set of resources) is built on the heap instead
     char patch_buf[1024];
@@ -464,6 +466,26 @@ void Kubelet::report_heartbeat() {
     }
     if (firmware_) firmware_->on_heartbeat(patched, t.ready, now_ms);
     last_heartbeat_ms_ = now_ms;
+}
+
+// A change is noted on the uptime clock, so its time is known in wall-clock
+// time once the clock is set, also when it happened before
+void Kubelet::time_conditions(NodeTelemetry& t, const bool* memory_pressure) {
+    const uint64_t up = osal::System::get_uptime_ms();
+    const uint64_t unix_now = osal::System::get_unix_time_ms();
+    auto since = [&](ConditionClock& c, bool status) -> uint64_t {
+        if (c.status != static_cast<int8_t>(status)) {
+            c.status = static_cast<int8_t>(status);
+            c.since_ms = up;
+        }
+        const uint64_t ago = up - c.since_ms;
+        return unix_now > ago ? unix_now - ago : 0;
+    };
+    osal::LockGuard guard(condition_mutex_);
+    t.heartbeat_unix_ms = unix_now;
+    t.ready_transition_unix_ms = since(ready_clock_, t.ready);
+    if (memory_pressure) t.memory_pressure_transition_unix_ms = since(memory_pressure_clock_, *memory_pressure);
+    if (t.firmware_reported) t.firmware_transition_unix_ms = since(firmware_clock_, t.firmware_updating);
 }
 
 void Kubelet::fill_firmware_condition(NodeTelemetry& t) const {

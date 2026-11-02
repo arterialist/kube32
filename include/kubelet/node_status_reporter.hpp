@@ -50,6 +50,15 @@ struct NodeTelemetry {
     bool firmware_updating{false};
     char firmware_reason[16]{""};
     char firmware_message[128]{""};
+    // Condition times in Unix milliseconds, filled by the kubelet
+    // (Kubelet::time_conditions); 0 while the wall clock is unset, and the
+    // field is then left out. lastTransitionTime is when this kubelet saw
+    // the status change; the API server keeps the stored time while the
+    // status on the Node stays the same (models::settle_node_condition_times).
+    uint64_t heartbeat_unix_ms{0};
+    uint64_t ready_transition_unix_ms{0};
+    uint64_t memory_pressure_transition_unix_ms{0};
+    uint64_t firmware_transition_unix_ms{0};
 };
 
 class NodeStatusReporter {

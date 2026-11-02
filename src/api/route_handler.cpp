@@ -1480,6 +1480,10 @@ HttpResponse RouteHandler::handle_nodes(const HttpRequest& req, const RouteMatch
             ResourceInfo ninfo;
             resource_info(RouteCategory::NodesCollection, ninfo);
             stamp_new_object(doc, "", ninfo);
+            if (const models::JsonValue* sent = models::node_conditions(doc)) {
+                const models::JsonValue conditions = *sent;
+                models::settle_node_condition_times(doc, nullptr, &conditions, osal::System::get_unix_time_ms());
+            }
             std::string node_json = doc.to_string();
             if (storage::Status ps = store_.put(key, node_json, false); !ps.ok()) return store_failure(ps, "nodes", node_name);
             {
@@ -1528,6 +1532,10 @@ HttpResponse RouteHandler::handle_nodes(const HttpRequest& req, const RouteMatch
         }
         models::JsonValue old_doc;
         if (models::parse_json(existing_json, old_doc, err)) carry_server_fields(old_doc, doc, true);
+        if (const models::JsonValue* sent = models::node_conditions(doc)) {
+            const models::JsonValue conditions = *sent;
+            models::settle_node_condition_times(doc, models::node_conditions(old_doc), &conditions, osal::System::get_unix_time_ms());
+        }
         const std::string updated = doc.to_string();
         if (storage::Status ps = store_.put(key, updated, true); !ps.ok()) return store_failure(ps, "nodes", name);
         HttpResponse resp;
@@ -1555,7 +1563,11 @@ HttpResponse RouteHandler::handle_nodes(const HttpRequest& req, const RouteMatch
             if (!models::parse_json(existing_json, target_doc, err)) {
                 return make_status(500, "InternalError", "Failed to parse existing resource");
             }
+            const models::JsonValue* stored = models::node_conditions(target_doc);
+            const models::JsonValue stored_conditions = stored ? *stored : models::JsonValue{};
             models::apply_patch(target_doc, patch_doc, req.content_type);
+            models::settle_node_condition_times(target_doc, stored ? &stored_conditions : nullptr, models::node_conditions(patch_doc),
+                                                osal::System::get_unix_time_ms());
             updated_json = target_doc.to_string();
             storage::Status ps = put_if_unchanged(store_, key, updated_json, version);
             if (retry_update(ps, attempt)) continue;
