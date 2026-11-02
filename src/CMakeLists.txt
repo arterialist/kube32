@@ -99,6 +99,7 @@ set(KUBE32_APP_SRCS
     app/node_storage_api.cpp
     app/pod_checkpoint_api.cpp
     app/console_relay.cpp
+    app/improv_serial.cpp
     embedded/embedded_blobs_esp.cpp
     scheduler/scheduler.cpp
     storage/littlefs_journal.cpp
@@ -177,7 +178,8 @@ set_source_files_properties(${CMAKE_CURRENT_LIST_DIR}/api/version_info.cpp PROPE
 # per container start, every few seconds or once per IR frame, firmware
 # rollouts once per update, the Device controller and I2C discovery every
 # few seconds, the kubelet's passes and the module loader once a second or
-# once per container start, snapshots and Checkpoint data once per move:
+# once per container start, snapshots and Checkpoint data once per move,
+# Improv packets during a browser install:
 # built for size, they take half the flash -O2 gives them.
 set_source_files_properties(
     ${CMAKE_CURRENT_LIST_DIR}/kubelet/pod_env.cpp
@@ -203,6 +205,7 @@ set_source_files_properties(
     ${CMAKE_CURRENT_LIST_DIR}/runtime/pod_snapshot.cpp
     ${CMAKE_CURRENT_LIST_DIR}/runtime/app_pod_migration.cpp
     ${CMAKE_CURRENT_LIST_DIR}/app/pod_checkpoint_api.cpp
+    ${CMAKE_CURRENT_LIST_DIR}/app/improv_serial.cpp
     ${CMAKE_CURRENT_LIST_DIR}/api/checkpoint_api.cpp
     ${CMAKE_CURRENT_LIST_DIR}/kubelet/kubelet.cpp
     ${CMAKE_CURRENT_LIST_DIR}/runtime/wasm_runtime.cpp
