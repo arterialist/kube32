@@ -267,6 +267,14 @@ The first call to an `Idle` Device starts its driver and waits for its first rea
 
 Each Service in a namespace adds about eight variables to the environment of each pod that starts there, and each Device adds a Service. An app that reaches Devices by name can set `enableServiceLinks: false`. On a board without PSRAM, each variable uses about 100 bytes of the internal heap while the pod runs.
 
+## Notes and limits for agents
+
+Two annotations describe a Device to an AI agent that works through [`kube32 mcp`](mcp.md): `kube32.io/notes`, free text about the part and its place, and `kube32.io/limits`, one rule a line on its actions and readings (`deny tare`, `led.r <= 64`, `set every 30s`, `humidity_pct <= 80`). The MCP server refuses actions outside the limits and flags readings outside them. See [Notes and limits](mcp.md#notes-and-limits).
+
+```sh
+kubectl annotate device kitchen-env kube32.io/notes='On the shelf above the kettle.'
+```
+
 ## Compute on a laptop
 
 A `kube32-sim` worker can join a cluster of boards and run app pods. Driver pods stay on the boards that have their parts:

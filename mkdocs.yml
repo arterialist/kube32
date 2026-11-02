@@ -63,6 +63,7 @@ nav:
       - Storage and volumes: storage.md
       - Peripherals: peripherals.md
       - Devices: devices.md
+      - MCP server for agents: mcp.md
       - Pod migration: migration.md
       - "Example: Tessera": examples/tessera.md
   - Architecture:

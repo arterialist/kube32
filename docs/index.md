@@ -24,6 +24,7 @@ flowchart LR
 | Control plane journal, persistent volumes, and node storage | [Storage and persistence](storage.md) |
 | Claim GPIO, I2C, UART, ADC, display, keypad, and speaker resources | [Peripherals and capabilities](peripherals.md) |
 | Sensors and switches as Devices: discovery, driver pods, shared I2C buses | [Devices](devices.md) |
+| Let Claude Code and other agents read Devices and deploy pods over MCP | [MCP server for agents](mcp.md) |
 | Four-pod issue tracker running across a devkit and Cardputer | [Tessera example](examples/tessera.md) |
 | Control plane, kubelet, and runtime internals | [Architecture overview](architecture/index.md) |
 | Supported Kubernetes API resources, subresources, and semantics | [Kubernetes API reference](api-reference.md) |
