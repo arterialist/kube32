@@ -53,7 +53,7 @@ Discovery endpoints accept `GET` and `HEAD`.
 | `networking.k8s.io/v1` | Ingress | `ing` | get, list, watch, create, update, patch, delete | Routes HTTP traffic on port 80 |
 | `networking.k8s.io/v1` | NetworkPolicy | `netpol` | get, list, watch, create, update, patch, delete | Validated and defaulted as by kube-apiserver. Egress rules restrict `k32_http_call` on the calling pod's node ([NetworkPolicy](networking.md#networkpolicy)); ingress rules are stored and not enforced |
 | `discovery.k8s.io/v1` | EndpointSlice | | get, list | Read-only. Computed on read from Services and their pods |
-| `metrics.k8s.io/v1beta1` | NodeMetrics, PodMetrics | | get, list | Kubelet samples, up to 32 pods with a 30 s TTL |
+| `metrics.k8s.io/v1beta1` | NodeMetrics, PodMetrics | | get, list | Kubelet samples of every running pod, kept 30 s |
 | `authorization.k8s.io/v1` | SelfSubjectAccessReview, SelfSubjectRulesReview | | create | Always returns allowed |
 | `kube32.io/v1` | FirmwareRollout | `fwr` | get, list, watch, create, update, patch, delete | Cluster-scoped. `spec.sha256` names the staged firmware image. The rollout controller updates nodes one at a time and writes `status`. The API server serves the staged image at `/apis/kube32.io/v1/firmware`. See [Firmware updates](firmware-updates.md#api). |
 | `kube32.io/v1` | Device | `dev` | get, list, watch, create, update, patch, delete; `status` | A part wired to a node. `spec.driver` must be a driver of the catalog. The API server checks I2C addresses, multiplexer channels and pins, and stores addresses as `"0x77"`. A write to the object keeps `status`. A write to `status` changes nothing else. The Device controller runs the driver pod and Service and writes `status`. See [Devices](devices.md). |

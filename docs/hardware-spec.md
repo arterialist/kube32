@@ -44,6 +44,26 @@ A pod's module loads only into pieces of the pool block left free by earlier pod
 
 Check free internal RAM and PSRAM on the serial console with `K32_CMD:STATUS`.
 
+## Node and pod memory figures
+
+| Figure | Board with PSRAM | Board without PSRAM |
+| --- | --- | --- |
+| `capacity` `memory` | Internal heap plus PSRAM | Internal heap |
+| `capacity` `esp32.io/psram` | PSRAM | not reported |
+| `allocatable` `memory` | The pool block plus the PSRAM that was free above the system reserve when the kubelet first reported | The pool block |
+| `allocatable` `esp32.io/psram` | Same as `allocatable` `memory` | not reported |
+| `kube32.io/memory-free` annotation | Free part of the pool block plus PSRAM above the system reserve | Free part of the pool block |
+| `kube32.io/heap-free` annotation | Free internal RAM | Free internal RAM |
+| `kube32.io/psram-free` annotation | Free PSRAM | not reported |
+
+Allocatable figures stay the same while pods start and stop. The scheduler subtracts what bound pods request, and the kubelet admits each pod against what is free now. The kubelet writes the annotations with each heartbeat, in bytes. `MemoryPressure` compares free internal RAM with 24 KiB.
+
+```bash
+kubectl get node <node> -o jsonpath='{.status.allocatable.memory} {.metadata.annotations.kube32\.io/memory-free}'
+```
+
+`kubectl top pod` reports every byte that a pod's runtime holds: wasm3's structures, compiled code, value stack and linear memory as allocated, allocator headers included, the module's bytes when the pod keeps a copy, and the stack of its thread when it runs `app_main`. The runtime charges each allocation to the pod it is made for and credits it back when it is freed, on whichever thread frees it. An allocation in the pool block keeps its owner in the chunk header that it has anyway. An allocation in the general heap or PSRAM carries an 8-byte header. `kubectl top node` reports internal RAM and PSRAM in use, less the pool block's free part, on the base of `capacity` `memory`.
+
 ## Partition table
 
 Layout in `partitions.csv` for 8 MB flash:
