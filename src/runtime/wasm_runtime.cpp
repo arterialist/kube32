@@ -139,7 +139,7 @@ bool WasmRuntime::deploy_impl(const std::string& pod_id, const uint8_t* wasm_byt
         const char* start_step = spec.restore_from ? "restore" : "k32_init";
         const unsigned start_ms = (unsigned)((t_done - t_init) / 1000);
 #if defined(ESP_PLATFORM)
-        printf("[POD] %s: %u bytes wasm, load+compile %u ms, %s %u ms (rc=%d), memory internal %+d KB psram %+d KB%s\n",
+        printf("[POD] %s: %u bytes wasm, load+compile %u ms, %s %u ms (rc=%d), memory internal %+d KiB psram %+d KiB%s\n",
                pod_id.c_str(), (unsigned)len, (unsigned)((t_init - t_load) / 1000), start_step, start_ms, (int)init_rc,
                (int)((long)heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT) - (long)internal_before) / 1024,
                (int)((long)heap_caps_get_free_size(MALLOC_CAP_SPIRAM) - (long)psram_before) / 1024, pool);
@@ -253,6 +253,11 @@ std::vector<std::string> WasmRuntime::list_containers() const {
         ids.push_back(kv.first);
     }
     return ids;
+}
+
+size_t WasmRuntime::container_count() const {
+    osal::LockGuard guard(impl_->mutex);
+    return impl_->containers.size();
 }
 
 int32_t WasmRuntime::execute_function(const std::string& pod_id, const std::string& fn_name, const std::vector<int32_t>& args) {

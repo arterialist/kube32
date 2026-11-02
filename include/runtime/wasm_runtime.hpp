@@ -113,6 +113,7 @@ public:
     bool restart(const std::string& pod_id);
     bool is_deployed(const std::string& pod_id) const;
     std::vector<std::string> list_containers() const;
+    size_t container_count() const;
 
     // Direct execution helper for unit testing and synchronous execution
     int32_t execute_function(const std::string& pod_id, const std::string& fn_name, const std::vector<int32_t>& args = {});
