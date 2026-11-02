@@ -8,6 +8,10 @@ runs on board-1 only, and an app pod on the laptop reaches it through the
 Device's Service and through a Service of its own that selects drivers by
 Device labels. In the other direction, board-1's Ingress controller reaches
 the app on the laptop at the laptop's pod port.
+
+The Device is OnDemand: Idle without a driver until the app's first call,
+which starts the driver and gets its reading; Idle again idleSeconds after
+the last use.
 """
 
 import json
@@ -82,7 +86,8 @@ def stub_driver_wasm(body: bytes) -> bytes:
             _section(11, _vec(data)))
 
 
-class TestLaptopCompute(BaseTestCase):
+class DeviceClusterCase(BaseTestCase):
+    """kube32-sim processes started by a test, and what the tests read of them"""
     API_PORT = 16743
     BOARD_POD_PORT = 17710
     LAPTOP_POD_PORT = 17711
@@ -121,12 +126,31 @@ class TestLaptopCompute(BaseTestCase):
         r = self.api.get(path)
         return r.json() if r.status_code == 200 else None
 
-    def _probe(self, url: str):
-        """GET /call on the app pod through the laptop's pod server: the app calls `url`"""
-        req = urllib.request.Request(f"http://127.0.0.1:{self.LAPTOP_POD_PORT}/call?u={urllib.parse.quote(url, safe='')}",
-                                     headers={"X-Kube32-Pod": "default/app"})
-        with urllib.request.urlopen(req, timeout=5.0) as resp:
+    def _probe(self, url: str, timeout_ms: int = 0, port: int = 0, pod: str = "default/app"):
+        """GET /call on an app pod through its node's pod server (the laptop's by default): the app calls `url`"""
+        query = f"/call?u={urllib.parse.quote(url, safe='')}" + (f"&t={timeout_ms}" if timeout_ms else "")
+        req = urllib.request.Request(f"http://127.0.0.1:{port or self.LAPTOP_POD_PORT}{query}", headers={"X-Kube32-Pod": pod})
+        with urllib.request.urlopen(req, timeout=5.0 + timeout_ms / 1000.0) as resp:
             return json.loads(resp.read().decode())
+
+    def _phase(self, path: str):
+        return ((self._get(path) or {}).get("status") or {}).get("phase")
+
+    def _app(self, node: str, image: str, annotations=None):
+        """The svcprobe app as pod `app` on `node`"""
+        meta = {"name": "app", "labels": {"app": "probe"}}
+        if annotations:
+            meta["annotations"] = annotations
+        r = self.api.post("/api/v1/namespaces/default/pods", {
+            "apiVersion": "v1", "kind": "Pod", "metadata": meta,
+            "spec": {"nodeSelector": {"kubernetes.io/hostname": node},
+                     "containers": [{"name": "probe", "image": image, "ports": [{"name": "http", "containerPort": 7000}],
+                                     "env": [{"name": "HOSTNAME", "value": "app"}],
+                                     "resources": {"requests": {"memory": "16Ki"}, "limits": {"memory": "16Ki"}},
+                                     "securityContext": {"capabilities": {"add": ["SERVICE_CALL"]}}}]}})
+        self.assertEqual(r.status_code, 201, r.text)
+        self.wait_for_condition(lambda: self._phase("/api/v1/namespaces/default/pods/app") == "Running",
+                                timeout=20.0, description=f"app Running on {node}")
 
     def _ingress(self, path: str):
         """GET `path` through board-1's Ingress controller: the body, None until it answers 200"""
@@ -136,6 +160,7 @@ class TestLaptopCompute(BaseTestCase):
         except (urllib.error.URLError, OSError):
             return None
 
+class TestLaptopCompute(DeviceClusterCase):
     def test_app_on_laptop_reads_device_on_board(self):
         """The driver runs where the part is wired; an app on a node without GPIO reaches it by Service"""
         board_dir = self._dir("board")
@@ -171,32 +196,36 @@ class TestLaptopCompute(BaseTestCase):
         r = self.api.patch(device_path, {"metadata": {"labels": {"location": "kitchen"}}, "spec": {"image": "wasm://sd/stub-driver"}},
                            headers={"Content-Type": "application/merge-patch+json"})
         self.assertEqual(r.status_code, 200, r.text)
-        dev = self.wait_for_condition(lambda: (lambda d: d if d and d.get("status", {}).get("phase") == "Running" else None)(self._get(device_path)),
-                                      timeout=20.0, description="Device Running")
+        # OnDemand: Idle, no driver until a use
+        dev = self.wait_for_condition(lambda: (lambda d: d if d and d.get("status", {}).get("phase") == "Idle" else None)(self._get(device_path)),
+                                      timeout=20.0, description="Device Idle")
+        self.assertEqual(dev["spec"]["activation"], "OnDemand")
         self.assertEqual(dev["status"]["chip"], "BME688")
         self.assertEqual(dev["status"]["nodeName"], "board-1")
-        pod = self._get(f"/api/v1/namespaces/default/pods/{self.DEVICE}-driver")
-        self.assertEqual(pod["spec"]["nodeName"], "board-1")
-        self.assertEqual(pod["metadata"]["labels"]["location"], "kitchen")
-        self.assertEqual(pod["metadata"]["annotations"]["kube32.io/i2c-device"], "bus=0,addr=0x77,mux=0x70:2")
+        self.assertIsNone(self._get(f"/api/v1/namespaces/default/pods/{self.DEVICE}-driver"))
 
         # The app's own Service: drivers by Device labels
         r = self.api.post("/api/v1/namespaces/default/services", {
             "apiVersion": "v1", "kind": "Service", "metadata": {"name": "kitchen-air"},
             "spec": {"selector": {"kube32.io/driver": "bme688", "location": "kitchen"}, "ports": [{"port": 80, "targetPort": "http"}]}})
         self.assertEqual(r.status_code, 201, r.text)
+        # Its Endpoints name the Device the app's Service selects
+        ep = self._get("/api/v1/namespaces/default/endpoints/kitchen-air")
+        self.assertEqual(ep["metadata"]["annotations"]["kube32.io/on-demand-devices"], f"{self.DEVICE}:board-1:300")
         # The app, on the laptop
-        r = self.api.post("/api/v1/namespaces/default/pods", {
-            "apiVersion": "v1", "kind": "Pod", "metadata": {"name": "app", "labels": {"app": "probe"}},
-            "spec": {"nodeSelector": {"kubernetes.io/hostname": "laptop"},
-                     "containers": [{"name": "probe", "image": "wasm://sd/svcprobe", "ports": [{"name": "http", "containerPort": 7000}],
-                                     "env": [{"name": "HOSTNAME", "value": "app"}],
-                                     "resources": {"requests": {"memory": "16Ki"}, "limits": {"memory": "16Ki"}},
-                                     "securityContext": {"capabilities": {"add": ["SERVICE_CALL"]}}}]}})
-        self.assertEqual(r.status_code, 201, r.text)
-        self.wait_for_condition(lambda: (self._get("/api/v1/namespaces/default/pods/app") or {}).get("status", {}).get("phase") == "Running",
-                                timeout=20.0, description="app Running on the laptop")
+        self._app("laptop", "wasm://sd/svcprobe")
         self.assertEqual(self._get("/api/v1/namespaces/default/pods/app")["spec"]["nodeName"], "laptop")
+
+        # The first call, through the app's own Service, starts the driver on board-1 and gets its answer
+        answer = self._probe("http://kitchen-air/", timeout_ms=10000)
+        self.assertEqual(answer["rc"], 200, answer)
+        self.assertIn('"driver":"stub"', answer["body"])
+        print(f"    first call to an Idle Device: {answer['ms']} ms")
+        self.wait_for_condition(lambda: self._phase(device_path) == "Running", timeout=10.0, description="Device Running")
+        pod =self._get(f"/api/v1/namespaces/default/pods/{self.DEVICE}-driver")
+        self.assertEqual(pod["spec"]["nodeName"], "board-1")
+        self.assertEqual(pod["metadata"]["labels"]["location"], "kitchen")
+        self.assertEqual(pod["metadata"]["annotations"]["kube32.io/i2c-device"], "bus=0,addr=0x77,mux=0x70:2")
 
         for url in (f"http://{self.DEVICE}/", "http://kitchen-air/", f"http://{self.DEVICE}.default.svc/"):
             answer = self.wait_for_condition(lambda url=url: (lambda a: a if a.get("rc") == 200 else None)(self._probe(url)),
@@ -223,3 +252,88 @@ class TestLaptopCompute(BaseTestCase):
 
         # Whatever happens, the driver never leaves the board with the part
         self.assertEqual(self._get(f"/api/v1/namespaces/default/pods/{self.DEVICE}-driver")["spec"]["nodeName"], "board-1")
+
+
+class TestOnDemandDevice(DeviceClusterCase):
+    """A Device that runs its driver only while it is used: Idle, started by
+    a call that gets the driver's reading, Idle again idleSeconds later;
+    started by the activate subresource; kept running by a subscriber of its
+    topic"""
+    API_PORT = 16744
+    BOARD_POD_PORT = 17720
+
+    def _driver_reading(self):
+        """GET / of the driver at its node's pod server, as kube32-cli devices reads it"""
+        req = urllib.request.Request(f"http://127.0.0.1:{self.BOARD_POD_PORT}/", headers={"X-Kube32-Pod": f"default/{self.DEVICE}-driver"})
+        with urllib.request.urlopen(req, timeout=5.0) as resp:
+            return json.loads(resp.read().decode())
+
+    def test_idle_device_starts_on_a_call_and_idles_again(self):
+        board_dir = self._dir("ondemand")
+        shutil.copy(os.path.join(PROJECT_ROOT, "images", "sd", "svcprobe.wasm"), os.path.join(board_dir, "card", "kube32", "images", "svcprobe.wasm"))
+        self._start("board-1", [BIN_PATH, "--role", "standalone", "--workers", "", "--node-name", "cp-dev", "--kubelet-name", "board-1",
+                                "--port", str(self.API_PORT), "--ipc-port", "17702", "--pod-port", str(self.BOARD_POD_PORT),
+                                "--data-dir", board_dir, "--sim-i2c", "pahub,bme688@2", "--lease-interval", "1000",
+                                "--reconcile-interval", "500"], board_dir)
+        self.wait_for_condition(lambda: self._get("/version") is not None, timeout=10.0, description="API server")
+        self.wait_for_condition(lambda: (node_ready_condition(self.api.base_url, "board-1") or {}).get("status") == "True",
+                                timeout=15.0, description="board-1 Ready")
+        device_path = f"/apis/kube32.io/v1/namespaces/default/devices/{self.DEVICE}"
+        pod_path = f"/api/v1/namespaces/default/pods/{self.DEVICE}-driver"
+        self.wait_for_condition(lambda: self._get(device_path), timeout=10.0, description="discovered Device")
+
+        # The catalog driver (wasm://embedded/driver-bme688) reads the simulated BME688; Idle after 10 s without a use
+        r = self.api.patch(device_path, {"spec": {"idleSeconds": 10, "intervalMs": 1000}}, headers={"Content-Type": "application/merge-patch+json"})
+        self.assertEqual(r.status_code, 200, r.text)
+        self.wait_for_condition(lambda: self._phase(device_path) == "Idle", timeout=10.0, description="Device Idle")
+        dev = self._get(device_path)
+        self.assertEqual(dev["status"]["message"], "idle: the driver starts on the next use")
+        self.assertNotIn("podName", dev["status"])
+        self.assertIsNone(self._get(pod_path))
+        self.assertIsNotNone(self._get(f"/api/v1/namespaces/default/services/{self.DEVICE}"))
+        self._app("board-1", "wasm://sd/svcprobe")
+
+        # One call starts the driver and gets its answer: 200 only once the driver has a reading
+        answer = self._probe(f"http://{self.DEVICE}/", timeout_ms=10000, port=self.BOARD_POD_PORT)
+        self.assertEqual(answer["rc"], 200, answer)
+        print(f"    first call to an Idle Device: {answer['ms']} ms")
+        self.wait_for_condition(lambda: self._phase(device_path) == "Running", timeout=10.0, description="Device Running")
+        reading = self._driver_reading()
+        self.assertTrue(reading["ok"], reading)
+        self.assertEqual(reading["driver"], "bme688")
+        self.assertIn("temperature_c", reading["readings"])
+        self.assertEqual(self._get(pod_path)["spec"]["nodeName"], "board-1")
+        # A call while the driver runs does not wait
+        answer = self._probe(f"http://{self.DEVICE}/", port=self.BOARD_POD_PORT)
+        self.assertEqual(answer["rc"], 200, answer)
+        self.assertGreater(1000, answer["ms"], answer)
+
+        # No use for idleSeconds: Idle again, the driver pod gone, the Service kept
+        last_use = time.time()
+        self.wait_for_condition(lambda: self._phase(device_path) == "Idle", timeout=25.0, description="Device Idle again")
+        print(f"    Idle {time.time() - last_use:.1f} s after the last call")
+        self.assertGreaterEqual(time.time() - last_use, 7.0)
+        self.wait_for_condition(lambda: self._get(pod_path) is None, timeout=40.0, description="driver pod deleted")
+        self.assertIsNotNone(self._get(f"/api/v1/namespaces/default/services/{self.DEVICE}"))
+        events = self._get("/api/v1/namespaces/default/events")["items"]
+        reasons = {e["reason"] for e in events if e.get("involvedObject", {}).get("name") == self.DEVICE}
+        self.assertTrue({"Activated", "Idle"} <= reasons, reasons)
+
+        # The activate subresource (kube32-cli devices) starts it too
+        r = self.api.post(f"{device_path}/activate", {})
+        self.assertEqual(r.status_code, 200, r.text)
+        self.wait_for_condition(lambda: self._phase(device_path) == "Running", timeout=15.0, description="Device Running after activate")
+        self.assertEqual(self.api.post("/apis/kube32.io/v1/namespaces/default/devices/nosuch/activate", {}).status_code, 404)
+
+        # A pod subscribed to device.<name> keeps it in use past idleSeconds
+        r = self.api.post("/api/v1/namespaces/default/pods", {
+            "apiVersion": "v1", "kind": "Pod",
+            "metadata": {"name": "listener", "annotations": {"kube32.io/event-topics": f"device.{self.DEVICE}"}},
+            "spec": {"nodeSelector": {"kubernetes.io/hostname": "board-1"},
+                     "containers": [{"name": "c", "image": "wasm://sd/svcprobe",
+                                     "resources": {"requests": {"memory": "16Ki"}, "limits": {"memory": "16Ki"}}}]}})
+        self.assertEqual(r.status_code, 201, r.text)
+        time.sleep(14.0)
+        self.assertEqual(self._phase(device_path), "Running")
+        self.assertEqual(self.api.delete("/api/v1/namespaces/default/pods/listener").status_code, 200)
+        self.wait_for_condition(lambda: self._phase(device_path) == "Idle", timeout=25.0, description="Device Idle without the subscriber")
