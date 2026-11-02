@@ -235,13 +235,34 @@ class BaseTestCase:
         self.assertTrue(len(items) > 0, "Expected at least one node registered in cluster")
         return items[0]
 
-    def wait_for_node_memory(self, min_ki: int = 90, timeout: float = 20.0) -> None:
-        """Wait until the first node reports at least `min_ki` Ki allocatable memory: what its kubelet
-        can ever give pods, reported once it has registered."""
+    @staticmethod
+    def _bytes(q: str) -> int:
+        units = {"Ki": 1 << 10, "Mi": 1 << 20, "Gi": 1 << 30, "k": 1000, "M": 1000 ** 2, "G": 1000 ** 3}
+        for u in ("Ki", "Mi", "Gi", "k", "M", "G"):
+            if q.endswith(u):
+                return int(float(q[: -len(u)]) * units[u])
+        return int(float(q)) if q else 0
+
+    def wait_for_node_memory(self, min_ki: int = 90, timeout: float = 30.0) -> None:
+        """Wait until the first node has at least `min_ki` Ki left for the scheduler: its allocatable
+        memory less the requests and Pod Overhead of every pod bound to it that has not finished
+        (a deleted pod counts until its kubelet removes it; one without a memory request counts
+        as a 64 KiB page)."""
         def enough():
-            mem = self.first_node()["status"]["allocatable"]["memory"]
-            return mem.endswith("Ki") and int(mem[:-2]) >= min_ki
-        self.wait_for_condition(enough, timeout=timeout, interval=0.5, description=f"node memory >= {min_ki}Ki")
+            node = self.first_node()
+            mem = node["status"].get("allocatable", {}).get("memory", "")
+            if not mem:
+                return False
+            name = node["metadata"]["name"]
+            pods = self.http.get(f"/api/v1/pods?fieldSelector=spec.nodeName%3D{name}").json().get("items", [])
+            used = 0
+            for p in pods:
+                if p.get("status", {}).get("phase") in ("Succeeded", "Failed"):
+                    continue
+                req = sum(self._bytes(c.get("resources", {}).get("requests", {}).get("memory", "")) for c in p["spec"].get("containers", []))
+                used += (req or 64 << 10) + self._bytes(p["spec"].get("overhead", {}).get("memory", ""))
+            return self._bytes(mem) - used >= min_ki << 10
+        self.wait_for_condition(enough, timeout=timeout, interval=0.5, description=f"node memory left >= {min_ki}Ki")
 
     def unique_name(self, prefix: str = "test") -> str:
         return f"{prefix}-{self.unique_id}-{os.urandom(2).hex()}"
@@ -257,6 +278,14 @@ class BaseTestCase:
     def assertFalse(self, expr: bool, msg: Optional[str] = None):
         if expr:
             raise AssertionError(msg or "Expected False, got True")
+
+    def assertGreater(self, first: Any, second: Any, msg: Optional[str] = None):
+        if not first > second:
+            raise AssertionError(msg or f"Expected {first!r} > {second!r}")
+
+    def assertGreaterEqual(self, first: Any, second: Any, msg: Optional[str] = None):
+        if not first >= second:
+            raise AssertionError(msg or f"Expected {first!r} >= {second!r}")
 
     def assertIn(self, member: Any, container: Any, msg: Optional[str] = None):
         if member not in container:

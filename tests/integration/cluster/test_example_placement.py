@@ -82,7 +82,7 @@ class TestExamplePlacement(BaseTestCase):
     def _memory_free(self, node: str) -> int:
         """KiB the node can give pods now (its kube32.io/memory-free annotation)"""
         annotations = self._get(f"/api/v1/nodes/{node}")["metadata"].get("annotations", {})
-        return int(annotations.get("kube32.io/memory-free", "0")) // KIB
+        return kib(annotations.get("kube32.io/memory-free", "0"))
 
     def _pod_node(self, prefix: str) -> str:
         pods = self._get("/api/v1/namespaces/default/pods")["items"]
