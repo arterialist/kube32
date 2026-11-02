@@ -903,7 +903,19 @@ void console_task(void* arg) {
                 // 2.4 GHz networks as seen by this radio (the only band an ESP32 has)
                 wifi_scan_config_t sc = {};
                 sc.show_hidden = false;
-                if (esp_wifi_scan_start(&sc, true) == ESP_OK) {
+                // A station still looking for its network refuses to scan: it
+                // stops looking for the scan and joins again afterwards
+                const int64_t scan_t0 = esp_timer_get_time();
+                esp_err_t scan = esp_wifi_scan_start(&sc, true);
+                bool rejoin = false;
+                for (int tries = 0; scan == ESP_ERR_WIFI_STATE && tries < 5; ++tries) {
+                    kube32::net::hold_station_rejoin(true);
+                    esp_wifi_disconnect();
+                    rejoin = true;
+                    vTaskDelay(pdMS_TO_TICKS(300));
+                    scan = esp_wifi_scan_start(&sc, true);
+                }
+                if (scan == ESP_OK) {
                     uint16_t n = 0;
                     esp_wifi_scan_get_ap_num(&n);
                     if (n > 20) n = 20;
@@ -916,9 +928,18 @@ void console_task(void* arg) {
                         }
                     }
                     free(recs);
-                    con.write("K32_OK scan done\n", 17);
+                    char l[64];
+                    int ll = snprintf(l, sizeof(l), "K32_OK scan done: %u networks in %u ms\n", (unsigned)n,
+                                      (unsigned)((esp_timer_get_time() - scan_t0) / 1000));
+                    con.write(l, static_cast<size_t>(ll));
                 } else {
-                    con.write("K32_ERR scan failed\n", 20);
+                    char l[64];
+                    int ll = snprintf(l, sizeof(l), "K32_ERR scan failed: %s\n", esp_err_to_name(scan));
+                    con.write(l, static_cast<size_t>(ll));
+                }
+                if (rejoin) {
+                    kube32::net::hold_station_rejoin(false);
+                    esp_wifi_connect();
                 }
             } else if (line == "K32_CMD:REBOOT") {
                 con.write("K32_OK rebooting\n", 17);

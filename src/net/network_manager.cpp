@@ -30,6 +30,10 @@ static constexpr size_t k_napt_table_bytes = 512 * 32;
 
 namespace kube32::net {
 
+namespace {
+std::atomic<bool> s_rejoin_held{false};
+}
+
 #if defined(KUBE32_TARGET_ESP32)
 
 class EspNetworkManager : public NetworkManager {
@@ -85,7 +89,7 @@ public:
             self->sta_has_ip_ = false;
             self->uplink_down();
             vTaskDelay(pdMS_TO_TICKS(1000));
-            esp_wifi_connect();
+            if (!s_rejoin_held.load()) esp_wifi_connect();
         } else if (id == WIFI_EVENT_STA_START && self->mode_ != NetworkMode::SoftAP) {
             esp_wifi_connect();
         } else if (id == WIFI_EVENT_STA_CONNECTED) {
@@ -422,6 +426,8 @@ private:
 };
 
 #endif
+
+void hold_station_rejoin(bool hold) { s_rejoin_held.store(hold); }
 
 std::unique_ptr<NetworkManager> create_network_manager() {
 #if defined(KUBE32_TARGET_ESP32)

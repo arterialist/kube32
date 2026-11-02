@@ -50,4 +50,8 @@ public:
 
 std::unique_ptr<NetworkManager> create_network_manager();
 
+// While held, a station that loses or misses its network does not join
+// again by itself (a console scan holds it: a join cancels the scan)
+void hold_station_rejoin(bool hold);
+
 } // namespace kube32::net
