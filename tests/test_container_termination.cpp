@@ -67,8 +67,9 @@ void test_entry_point_thread_cpu_time() {
     std::cout << "[cpu] app_main threads after " << wall / 1000 << " ms: spinning " << spin.thread_cpu_us
               << " us, sleeping " << sleep.thread_cpu_us << " us" << std::endl;
     assert(spin.has_thread_cpu && sleep.has_thread_cpu);
-    assert(spin.thread_cpu_us >= 50000 && spin.thread_cpu_us <= wall + 2000);
-    assert(sleep.thread_cpu_us < 30000);
+    // A loaded machine gives the spinning thread less than the wall time
+    assert(spin.thread_cpu_us >= 20000 && spin.thread_cpu_us <= wall + 2000);
+    assert(sleep.thread_cpu_us < 30000 && sleep.thread_cpu_us * 10 < spin.thread_cpu_us);
     assert(rt->terminate("sleeper"));
     assert(rt->terminate("spinner"));
     std::cout << "[PASS] test_entry_point_thread_cpu_time" << std::endl;

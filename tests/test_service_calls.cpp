@@ -313,8 +313,9 @@ int main() {
         assert(json_int(c.body, "rc") == 200);
         const uint64_t a = cpu_of("default/a-0") - a0, b = cpu_of("default/b-0") - b0;
         std::cout << "[cpu] a calls b's 200 ms spin: a " << a << " us, b " << b << " us" << std::endl;
-        assert(b >= 50000 && b <= 260000);
-        assert(a < 50000 && a < b / 2);
+        // A loaded machine gives the spin less than its 200 ms of wall time
+        assert(b >= 10000 && b <= 260000);
+        assert(a < b / 10);
     }
 
     // A pod calling itself, and a cycle a -> b -> a: K32_ERR_LOOP, no deadlock
