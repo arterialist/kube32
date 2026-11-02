@@ -393,6 +393,11 @@ void NodeStatusReporter::append_heartbeat_patch(Out& json, const NodeTelemetry& 
     json += memory_pressure ? "True" : "False";
     json += "\",\"reason\":\"";
     json += memory_pressure ? "KubeletHasMemoryPressure" : "KubeletHasSufficientMemory";
+    // Its own message, as the Kubernetes kubelet sends: conditions merge by
+    // type, and another writer's message (the lifecycle controller's) would
+    // otherwise stay
+    json += "\",\"message\":\"";
+    json += memory_pressure ? "kubelet has insufficient memory available" : "kubelet has sufficient memory available";
     json += "\"";
     append_condition_times(json, telemetry, telemetry.memory_pressure_transition_unix_ms);
     json += "}";
