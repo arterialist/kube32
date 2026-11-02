@@ -51,7 +51,7 @@ Use `kubectl` and k9s to manage the cluster. Use the tools below to run the host
 
 ### Modeling boards with PSRAM
 
-`--psram <size>` reserves the PSRAM pool block, and nodes report it as `esp32.io/psram`. With `--heap-budget`, the simulator also models the board's PSRAM besides the block: pods' code, runtime structures and smaller linear memories take from it, and the node reports it above a 16 KiB reserve as allocatable `memory`, and with the block's free part as allocatable `esp32.io/psram`. For example, `--psram 1284Ki --heap-budget 320Ki` gives 304 KiB of allocatable memory. Without `--heap-budget`, the host's memory is not modelled and nodes report 1 GiB of allocatable memory.
+`--psram <size>` reserves the PSRAM pool block, and nodes report it as `esp32.io/psram`. Pods' code, runtime structures and smaller linear memories take from the block's end first. With `--heap-budget`, the simulator also models the board's PSRAM besides the block, which pods take from when the block is full. The node reports the block's free part plus that PSRAM above a 16 KiB reserve as allocatable `memory`, and the linear memory the block can still take whole as allocatable `esp32.io/psram`. For example, `--psram 1284Ki --heap-budget 320Ki` gives 1588 KiB of allocatable memory. Without `--heap-budget`, the host's memory is not modelled and nodes report 1 GiB plus the block of allocatable memory.
 
 The simulator is a 64-bit host build where `wasm3` runtime structures are about 2.3x larger than on the 32-bit ESP32-S3. A pod set that fits on a `--psram 0` simulator fits on the board, while the reverse is not guaranteed.
 

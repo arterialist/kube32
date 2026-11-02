@@ -1023,8 +1023,10 @@ void cluster_task(void* pv) {
         kube32::runtime::AppPodHost::instance().set_event_thread_stack(4096, false);
         kube32::runtime::PodLogStore::runtime().set_ring_capacity(1024);   // 300 KB SRAM: a short log per pod
     } else {
-        // Keep the largest PSRAM block whole for a big data pod (20 Wasm pages
-        // plus header) before task stacks and buffers fragment the heap.
+        // Keep the largest PSRAM block whole for pods (20 Wasm pages plus
+        // header) before task stacks and buffers fragment the heap: a big data
+        // pod's linear memory from its start, small pods from its end down.
+        // The PSRAM besides it is the system's.
         kube32_pool_reserve_external(20 * 64 * 1024 + 4096);   // 20 Wasm pages plus wasm3's memory header
         // One shared interpreter stack here too: the interpreter recursion
         // peaks near 56 KB, and a stack that size on each thread that calls

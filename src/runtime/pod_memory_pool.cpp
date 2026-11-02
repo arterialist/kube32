@@ -139,6 +139,17 @@ int kube32_rt_shrink(void* ptr, size_t bytes) {
     return sub_shrink_locked(ptr, bytes) ? 1 : 0;
 }
 
+size_t kube32_pool_linear_room(void) {
+    if (!s_block || s_in_use.load()) return 0;
+    std::lock_guard<std::mutex> lock(s_sub_mutex);
+    if (!s_sub_active) return s_block_size;
+    // Below the small heap: its bottom chunk when free, less the minimal
+    // chunk kube32_pool_alloc leaves the small heap
+    SubChunk* first = sub_first();
+    if (s_sub_base != s_block || first->used || first->size < kMinChunk) return 0;
+    return first->size - kMinChunk;
+}
+
 size_t kube32_pool_whole_capacity(void) {
     std::lock_guard<std::mutex> lock(s_sub_mutex);
     return s_sub_active ? static_cast<size_t>(s_sub_base - static_cast<uint8_t*>(s_block)) : s_block_size;
@@ -178,6 +189,10 @@ size_t kube32_pool_available(int* out_external) {
 }
 
 size_t kube32_pool_threshold(void) { return k_threshold; }
+
+int kube32_pool_wants_block(size_t memory_bytes) {
+    return (s_block && memory_bytes >= k_threshold && memory_bytes >= s_block_size / 2) ? 1 : 0;
+}
 
 void kube32_pool_reserve_stack(size_t bytes) {
     if (s_stack || bytes == 0) return;
@@ -236,12 +251,12 @@ void* kube32_pool_alloc(size_t bytes) {
 }
 
 // Where pod allocations (runtime, compiled code, linear memory) go:
-//   with PSRAM: external RAM first (a small reserve kept for stacks), then
-//     internal RAM
-//   without PSRAM, when the pod pool is internal: the pool's block first,
-//     then the general heap, which stays for the kubelet, Wi-Fi and lwIP.
-//     A pod whose linear memory wants the block whole asks for the general
-//     heap first while it loads (kube32_pool_prefer_general).
+//   the pool's block first, as a small heap from its end down, then
+//   with PSRAM: the PSRAM above the system's reserve, never internal RAM,
+//     which stays for Wi-Fi, lwIP and the control plane
+//   without PSRAM: the general heap above the system reserve
+//   A pod whose linear memory wants the block whole asks for the rest
+//   first while it loads (kube32_pool_prefer_general).
 // Bytes pods hold in the general heap and in PSRAM are counted. The general
 // heap keeps a reserve for the system that pods are never given: 16 KiB of
 // internal RAM stay free for the kubelet, Wi-Fi and lwIP, 24 KiB on a board
@@ -296,7 +311,26 @@ static void* general_calloc(size_t bytes) {
     return p;
 }
 
-static bool pool_first() { return s_block && !s_external && !s_prefer_general.load(); }
+static bool pool_first() { return s_block && !s_prefer_general.load(); }
+
+// A board with PSRAM gives pods PSRAM only
+static bool board_psram() {
+#if defined(ESP_PLATFORM)
+    return heap_caps_get_total_size(MALLOC_CAP_SPIRAM) > 0;
+#else
+    return false;
+#endif
+}
+
+// PSRAM above the reserve, which pods may take besides the block
+static size_t psram_above_reserve() {
+#if defined(ESP_PLATFORM)
+    const size_t psram = heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
+    return psram > s_psram_reserve.load() ? psram - s_psram_reserve.load() : 0;
+#else
+    return 0;
+#endif
+}
 
 void kube32_pool_prefer_general(int on) { s_prefer_general.fetch_add(on ? 1 : -1); }
 void kube32_pool_set_heap_budget(size_t bytes) { s_heap_budget = bytes; }
@@ -315,20 +349,23 @@ size_t kube32_pool_pod_room(size_t memory_bytes, size_t* out_capacity) {
         room = s_heap_budget > used ? s_heap_budget - used : 0;
     } else {
 #if defined(ESP_PLATFORM)
-        // Without PSRAM a pod is admitted on the pool block alone: general
-        // heap that looks free now is what the network needs in a burst
-        const size_t internal = heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
-        if (!(s_block && !s_external)) room = internal > system_reserve() ? internal - system_reserve() : 0;
-        const size_t psram = heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
-        if (psram > s_psram_reserve.load()) room += psram - s_psram_reserve.load();
+        // With PSRAM a pod gets PSRAM above the reserve. Without, it is
+        // admitted on the pool block alone: general heap that looks free now
+        // is what the network needs in a burst
+        if (board_psram()) {
+            room = psram_above_reserve();
+        } else if (!s_block) {
+            const size_t internal = heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+            room = internal > system_reserve() ? internal - system_reserve() : 0;
+        }
 #else
         room = static_cast<size_t>(1) << 30;   // the host's heap: not modelled
 #endif
     }
-    // The block is not part of the heap figures above. An internal block is
-    // shared by small pods; an external one serves one large linear memory.
+    // The block is not part of the heap figures above; pods share it
+    (void)memory_bytes;
     size_t pool_held = 0;
-    if (s_block && (!s_external || block_takes(memory_bytes))) {
+    if (s_block) {
         const size_t pool_free = kube32_pool_available(nullptr);
         room += pool_free;
         pool_held = s_block_size - pool_free;
@@ -337,31 +374,15 @@ size_t kube32_pool_pod_room(size_t memory_bytes, size_t* out_capacity) {
     return room;
 }
 
-// PSRAM pods may take besides the pool block: as much as was free above the
-// reserve the first time a node's figures were asked for (the system's use
-// then included), less what pods hold now
-static size_t psram_room(size_t free_now, size_t held) {
-    static std::mutex mutex;
-    static bool measured = false;
-    static size_t budget = 0;
-    {
-        std::lock_guard<std::mutex> lock(mutex);
-        if (!measured) {
-            const size_t base = free_now + held;
-            budget = base > s_psram_reserve.load() ? base - s_psram_reserve.load() : 0;
-            measured = true;
-        }
-    }
-    return budget > held ? budget - held : 0;
-}
-
 void kube32_pool_node_room(size_t* out_memory, size_t* out_psram) {
     size_t memory = 0, psram = 0;
     const size_t block_free = s_block ? kube32_pool_available(nullptr) : 0;
 #if defined(ESP_PLATFORM)
-    if (heap_caps_get_total_size(MALLOC_CAP_SPIRAM) > 0) {
-        memory = psram_room(heap_caps_get_free_size(MALLOC_CAP_SPIRAM), s_psram_bytes.load());
-        psram = memory + (s_external ? block_free : 0);
+    if (board_psram()) {
+        // What admission gives a pod now (kube32_pool_pod_room), and the
+        // linear memory the block can still take whole
+        memory = psram_above_reserve() + block_free;
+        psram = kube32_pool_linear_room();
     } else if (s_block) {
         memory = block_free;
     } else {
@@ -375,16 +396,15 @@ void kube32_pool_node_room(size_t* out_memory, size_t* out_psram) {
     // them. The host's memory itself is not modelled.
     const size_t general = s_general_bytes.load();
     if (s_external && s_heap_budget) {
-        memory = psram_room(s_heap_budget > general ? s_heap_budget - general : 0, general);
-        psram = memory + block_free;
+        memory = (s_heap_budget > general + system_reserve() ? s_heap_budget - general - system_reserve() : 0) + block_free;
+        psram = kube32_pool_linear_room();
     } else if (s_heap_budget) {
         const size_t used = general + system_reserve();
         memory = (s_heap_budget > used ? s_heap_budget - used : 0) + block_free;
     } else {
         const size_t host = static_cast<size_t>(1) << 30;
-        memory = host > general ? host - general : 0;
-        if (s_external) psram = block_free;
-        else memory += block_free;
+        memory = (host > general ? host - general : 0) + block_free;
+        if (s_external) psram = kube32_pool_linear_room();
     }
 #endif
     if (out_memory) *out_memory = memory;
@@ -437,21 +457,20 @@ size_t kube32_rt_fit(size_t bytes, size_t minimum) {
 }
 
 void* kube32_rt_calloc(size_t bytes) {
-#if defined(ESP_PLATFORM)
-    // Keep a small PSRAM reserve for stacks allocated later; everything else
-    // the interpreter needs is better off external than in the 300 KB SRAM.
-    if (heap_caps_get_free_size(MALLOC_CAP_SPIRAM) > bytes + s_psram_reserve.load()) {
-        void* p = heap_caps_calloc(bytes, 1, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-        if (p) {
-            s_psram_bytes.fetch_add(general_size(p));
-            return p;
-        }
-    }
-#endif
     if (pool_first()) {
         void* shared = kube32_pool_sub_alloc(bytes);
         if (shared) return shared;
     }
+#if defined(ESP_PLATFORM)
+    if (board_psram()) {
+        void* p = nullptr;
+        if (psram_above_reserve() > bytes) p = heap_caps_calloc(bytes, 1, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        if (p) s_psram_bytes.fetch_add(general_size(p));
+        if (!p) p = kube32_pool_sub_alloc(bytes);
+        if (!p) s_last_refused.store(bytes);
+        return p;
+    }
+#endif
     void* p = general_calloc(bytes);
     if (!p) p = kube32_pool_sub_alloc(bytes);
     if (!p) s_last_refused.store(bytes);

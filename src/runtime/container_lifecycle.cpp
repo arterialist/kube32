@@ -278,7 +278,7 @@ bool ContainerLifecycleController::deploy(const uint8_t* wasm_bytes, size_t len)
         bool on;
         explicit PreferGeneral(bool o) : on(o) { if (on) kube32_pool_prefer_general(1); }
         ~PreferGeneral() { if (on) kube32_pool_prefer_general(0); }
-    } prefer_general(config_.memory_limit_bytes >= kube32_pool_threshold());
+    } prefer_general(kube32_pool_wants_block(config_.memory_limit_bytes) != 0);
     m3_env_ = m3_NewEnvironment();
     if (!m3_env_) {
         status_.phase = ContainerPhase::Failed;

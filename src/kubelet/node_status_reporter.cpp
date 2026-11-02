@@ -63,7 +63,7 @@ NodeTelemetry NodeStatusReporter::collect_telemetry() const {
         const size_t used = kube32_pool_general_bytes();
         t.total_heap_bytes = budget;
         t.free_heap_bytes = used < budget ? budget - used : 0;
-        t.memory_capacity_bytes = budget + (pool_external ? 0 : kube32_pool_block_size());
+        t.memory_capacity_bytes = budget + kube32_pool_block_size();
     }
 #endif
     if (!pool_external) t.free_heap_bytes += pool_free;

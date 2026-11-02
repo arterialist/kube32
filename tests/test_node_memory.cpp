@@ -4,9 +4,11 @@
 //
 //   psram     a control plane with PSRAM: the 1284 KiB pool block (--psram)
 //             and the PSRAM besides it (--heap-budget). Allocatable memory is
-//             that PSRAM above the reserve: a 64Ki pod such as the echo
-//             example and the Tessera pods of the control plane fit, and the
-//             kubelet's admission gives the same pods room.
+//             the block's free part and that PSRAM above the reserve, and
+//             esp32.io/psram the linear memory the block takes whole: a 64Ki
+//             pod such as the echo example and the Tessera pods of the
+//             control plane fit, and the kubelet's admission gives the same
+//             pods room.
 //   internal  a worker without PSRAM: the 80 KiB pool block and the heap
 //             budget, as the simulator admits pods there.
 //
@@ -98,10 +100,11 @@ void test_psram_node() {
 
     auto store = ram_store();
     const models::JsonValue node = parse(register_node(*store, "devkit", true, "generic"));
-    // PSRAM above the reserve, not the internal heap; esp32.io/psram adds the block
+    // Pods get the block and the PSRAM above the reserve, not the internal
+    // heap; esp32.io/psram is the linear memory the block takes whole
     const uint64_t memory = quantity(node, "allocatable", "memory");
-    assert(memory == 320 * 1024 - kube32_pool_psram_reserve());
-    assert(quantity(node, "allocatable", "esp32.io/psram") == memory + block);
+    assert(memory == 320 * 1024 - kube32_pool_system_reserve() + block);
+    assert(quantity(node, "allocatable", "esp32.io/psram") == block);
     assert(quantity(node, "capacity", "memory") >= memory && quantity(node, "capacity", "esp32.io/psram") == block);
 
     // The examples' control-plane pods are bound to it
@@ -116,35 +119,45 @@ void test_psram_node() {
     assert(oversized == "Unschedulable: 0/1 nodes are available: 1 Insufficient memory.");
 
     // The kubelet gives the echo pod room: its estimate fits what it admits
-    // against, and what the node advertises
+    // against, and what the node advertises, the same figure
     const runtime::EmbeddedImage* echo = echo_image();
     const size_t need = runtime::estimate_pod_memory(echo->data, echo->len, 64 * 1024, 4 * 1024, true);
     size_t capacity = 0;
     const size_t room = kube32_pool_pod_room(64 * 1024, &capacity);
     assert(need <= room && need <= memory && need <= capacity);
-    // A 64 KiB memory is not one the block takes: the block is not counted
-    // for it, only for the large memory of tessera-api
     assert(room == memory);
-    assert(kube32_pool_pod_room(1280 * 1024, nullptr) == memory + block);
 
     // Stable while no pod loads or goes ...
     kubelet::NodeStatusReporter reporter("devkit", "10.0.0.2", true);
     const kubelet::NodeTelemetry before = reporter.collect_telemetry();
     assert(before.memory_allocatable_bytes == memory && reporter.collect_telemetry().memory_allocatable_bytes == memory);
-    // ... and following what pods take: a module's structures, then a large
-    // linear memory in the block
+    // ... and following what pods take. A module's structures go to the
+    // block's end: the block can no longer take a linear memory whole, and
+    // the node says so
     void* structures = kube32_rt_calloc(40 * 1024);
+    assert(structures && kube32_pool_available(nullptr) <= block - 40 * 1024);
+    kubelet::NodeTelemetry during = reporter.collect_telemetry();
+    assert(during.memory_allocatable_bytes == memory - (block - kube32_pool_available(nullptr)));
+    assert(during.free_psram_bytes < 1280 * 1024 + 4096 && during.free_psram_bytes + 41 * 1024 >= block);
+    assert(!kube32_pool_alloc(1280 * 1024 + 4096));
+    kube32_rt_free(structures);
+    assert(reporter.collect_telemetry().memory_allocatable_bytes == memory);
+    assert(reporter.collect_telemetry().free_psram_bytes == block);
+    // A large linear memory takes the block whole; structures then come from
+    // the PSRAM besides it
     void* linear = kube32_pool_alloc(1280 * 1024 + 4096);
-    assert(structures && linear);
-    const kubelet::NodeTelemetry during = reporter.collect_telemetry();
+    structures = kube32_rt_calloc(40 * 1024);
+    assert(linear && structures);
+    during = reporter.collect_telemetry();
     // At least the 40 KiB taken; the host allocator may round the block up
     // (macOS rounds large blocks to its pages), so allow up to 64 KiB
-    assert(during.memory_allocatable_bytes <= memory - 40 * 1024 && during.memory_allocatable_bytes + 64 * 1024 >= memory);
-    assert(during.free_psram_bytes == during.memory_allocatable_bytes + (block - (1280 * 1024 + 4096)));
+    const size_t besides = memory - block;
+    assert(during.memory_allocatable_bytes <= besides - 40 * 1024 && during.memory_allocatable_bytes + 64 * 1024 >= besides);
+    assert(during.free_psram_bytes == 0);
     kube32_pool_free(linear);
     kube32_rt_free(structures);
     assert(reporter.collect_telemetry().memory_allocatable_bytes == memory);
-    std::cout << "[PASS] test_psram_node (allocatable memory " << memory / 1024 << " KiB, psram " << (memory + block) / 1024 << " KiB)" << std::endl;
+    std::cout << "[PASS] test_psram_node (allocatable memory " << memory / 1024 << " KiB, psram " << block / 1024 << " KiB)" << std::endl;
 }
 
 void test_internal_pool_node() {
