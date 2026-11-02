@@ -166,6 +166,7 @@ else()
         src/runtime/container_lifecycle.cpp
         src/runtime/wasm_runtime.cpp
         src/runtime/app_pod.cpp
+        src/runtime/pod_linalg.cpp
         src/runtime/pod_log.cpp
         src/runtime/image_registry.cpp
         src/runtime/pod_fs.cpp
@@ -228,6 +229,9 @@ else()
         ${KUBE32_CORE_SRCS}
         ${KUBE32_BUILD_INFO_H}
     )
+    # The pods' linear algebra computes the bits a board computes: no fused
+    # multiply-adds (src/runtime/pod_linalg.cpp)
+    set_source_files_properties(src/runtime/pod_linalg.cpp PROPERTIES COMPILE_OPTIONS "-ffp-contract=off")
     target_include_directories(kube32_core PUBLIC
         ${CMAKE_CURRENT_SOURCE_DIR}/include
         ${CMAKE_CURRENT_SOURCE_DIR}/third_party/wasm3/source
@@ -356,6 +360,12 @@ else()
     )
     target_link_libraries(test_wasm_runtime PRIVATE kube32_core)
     add_test(NAME test_wasm_runtime COMMAND test_wasm_runtime)
+
+    # 10b. Native linear algebra imports (k32_matvec_*): results, bounds, gas
+    add_executable(test_pod_linalg tests/test_pod_linalg.cpp)
+    target_link_libraries(test_pod_linalg PRIVATE kube32_core)
+    target_compile_options(test_pod_linalg PRIVATE -ffp-contract=off)   # its reference loops round as the kernels do
+    add_test(NAME test_pod_linalg COMMAND test_pod_linalg)
 
     # 11. Kubelet node agent and reconciler
     add_executable(test_kubelet

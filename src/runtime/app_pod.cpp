@@ -4,6 +4,7 @@
 #include "runtime/pod_cpu.hpp"
 #include "runtime/pod_log.hpp"
 #include "runtime/pod_fs.hpp"
+#include "runtime/pod_linalg.hpp"
 #include "runtime/k32_app_abi.h"
 #include "hal/capability_firewall.hpp"
 #include "ipc/channel.hpp"
@@ -674,6 +675,7 @@ void link_app_host_functions(IM3Module module, const std::string& pod_id) {
     m3_LinkRawFunction(module, "env", "k32_fs_size",      "i(i)",       &raw_fs_size);
     m3_LinkRawFunction(module, "env", "k32_fs_list",      "i(iiii)",    &raw_fs_list);
     m3_LinkRawFunction(module, "env", "k32_fs_remove",    "i(ii)",      &raw_fs_remove);
+    link_linalg_host_functions(module);
 }
 
 // -----------------------------------------------------------------------------

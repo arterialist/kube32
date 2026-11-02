@@ -46,6 +46,11 @@ APP_IMPORTS = {
     "k32_fs_size": "i(i)",
     "k32_fs_list": "i(iiii)",
     "k32_fs_remove": "i(ii)",
+    "k32_matvec_i8": "i(iiiifiii)",
+    "k32_matvec_i4": "i(iiiifiii)",
+    "k32_matvec_f32_i8": "i(iiiifiiii)",
+    "k32_vecmat_f32_i8": "i(iiiiiiii)",
+    "k32_softmax_f32": "i(ii)",
 }
 # src/runtime/host_functions.cpp link_host_functions
 LOW_LEVEL_IMPORTS = {

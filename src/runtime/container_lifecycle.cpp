@@ -211,7 +211,9 @@ TrapReport describe_trap(const char* trap, const TrapContext& ctx) {
                      (ctx.native_on_interpreter ? "the shared interpreter stack" : "the calling thread's stack") +
                      (ctx.native_limit ? "; " + std::to_string(ctx.native_used) + " used at the trap, limit " + std::to_string(ctx.native_limit) + " below the start)" : ")");
     }
-    if (trap == m3Err_trapOutOfBoundsMemoryAccess || trap == m3Err_trapStackOverflow || trap == m3Err_trapTableOutOfBounds ||
+    // A host call that finds an operand outside the linear memory traps with
+    // its own "out of bounds memory access: ..." message
+    if (trap == m3Err_trapOutOfBoundsMemoryAccess || what.rfind("out of bounds memory access", 0) == 0 || trap == m3Err_trapStackOverflow || trap == m3Err_trapTableOutOfBounds ||
         trap == m3Err_trapTableIndexOutOfRange || trap == m3Err_trapTableElementIsNull ||
         trap == m3Err_trapIndirectCallTypeMismatch || trap == m3Err_trapNullFunctionRef || trap == m3Err_trapNullReference) {
         t.exit_code = 139;   // SIGSEGV

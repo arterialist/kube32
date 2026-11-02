@@ -168,6 +168,31 @@ extern "C" {
 #define K32_RMT_RX_QUEUE_FRAMES     8
 #define K32_RMT_RX_QUEUE_DURATIONS  512
 
+/* e^x as k32_softmax_f32 computes it on every node: x = n ln2 + r with
+ * |r| <= ln2 / 2, then a degree-6 polynomial for e^r, each step one IEEE
+ * binary32 operation. 0 below -87, e^88 above 88. A pod that computes exp
+ * with this function gets the host's bits; build it without fused
+ * multiply-adds (Wasm has none). */
+static inline float k32_expf(float x) {
+    if (x < -87.0f) return 0.0f;
+    if (x > 88.0f) x = 88.0f;
+    float t = x * 1.44269504f;
+    int32_t n = (int32_t)(t + (t >= 0.0f ? 0.5f : -0.5f));
+    float r = x - (float)n * 0.693145752f;
+    r = r - (float)n * 1.42860677e-6f;
+    float p = 1.38888889e-3f;
+    p = p * r + 8.33333333e-3f;
+    p = p * r + 4.16666667e-2f;
+    p = p * r + 1.66666667e-1f;
+    p = p * r + 0.5f;
+    p = p * r + 1.0f;
+    p = p * r + 1.0f;
+    uint32_t bits = (uint32_t)(n + 127) << 23;
+    float scale;
+    __builtin_memcpy(&scale, &bits, sizeof scale);
+    return p * scale;
+}
+
 /* Modes for esp32_gpio_set_mode */
 #define K32_GPIO_INPUT          0
 #define K32_GPIO_OUTPUT         1
@@ -262,6 +287,49 @@ K32_IMPORT("k32_http_call")   int32_t k32_http_call(const char* method, uint32_t
 /* The HTTP status of the answer to this pod's last k32_http_call, also when
  * that call returned K32_ERR_TOOBIG; 0 when no answer arrived. */
 K32_IMPORT("k32_http_status") int32_t k32_http_status(void);
+
+/* ---- Linear algebra: quantized products for neural networks -----------
+ * The node computes these natively. They need no capability. Every float
+ * step is one IEEE binary32 operation in the order written here, and
+ * integer sums are exact int32 values (wrapping beyond that range), so every
+ * node computes the same bits. A metered pod pays 10,000 gas units plus 45
+ * per unit of work before the call runs: rows x (cols + 1) units for a
+ * matrix, 32 per element for k32_softmax_f32.
+ *
+ * w is a matrix of rows x cols weights, row r starting row_stride bytes
+ * after row r - 1 (0: the rows follow each other); w_scale holds one float
+ * per row, scale_stride bytes apart (0: 4). out must not overlap the other
+ * operands. Each call returns K32_OK, or K32_ERR_INVAL for a stride that is
+ * not 0 and below a row's bytes (or 4 for scale_stride). An operand outside
+ * the linear memory traps (exit code 139) with a message that names it; a
+ * call reads and writes nothing outside the linear memory.
+ *
+ * k32_matvec_i8, k32_matvec_i4: int8 weights times an int8 vector x of cols
+ * values with the scale x_scale, into rows floats:
+ *   out[r] = (float)(sum over c of w[r][c] * x[c]) * (w_scale[r] * x_scale)
+ * k32_matvec_i4 takes int4 weights, two a byte: column 2j in the low nibble
+ * and 2j + 1 in the high nibble, each a signed value -8..7; with an odd cols
+ * a row ends in an unused high nibble.
+ *
+ * k32_matvec_f32_i8: int8 rows times a float vector x of cols values, the
+ * sum from 0 in column order (attention scores over an int8 key cache):
+ *   out[r] = ((sum over c of x[c] * (float)w[r][c]) * w_scale[r]) * alpha
+ *
+ * k32_vecmat_f32_i8: a weighted sum of int8 rows, x holding rows floats, the
+ * sum from 0 in row order, into cols floats (attention over a value cache):
+ *   out[c] = sum over r of (x[r] * w_scale[r]) * (float)w[r][c]
+ *
+ * k32_softmax_f32: x[i] = k32_expf(x[i] - max) / sum, in place over n
+ * floats, the sum from 0 in order. */
+K32_IMPORT("k32_matvec_i8") int32_t k32_matvec_i8(float* out, const int8_t* w, const float* w_scale, const int8_t* x, float x_scale,
+                                                  uint32_t rows, uint32_t cols, uint32_t row_stride);
+K32_IMPORT("k32_matvec_i4") int32_t k32_matvec_i4(float* out, const void* w, const float* w_scale, const int8_t* x, float x_scale,
+                                                  uint32_t rows, uint32_t cols, uint32_t row_stride);
+K32_IMPORT("k32_matvec_f32_i8") int32_t k32_matvec_f32_i8(float* out, const int8_t* w, const float* w_scale, const float* x, float alpha,
+                                                          uint32_t rows, uint32_t cols, uint32_t row_stride, uint32_t scale_stride);
+K32_IMPORT("k32_vecmat_f32_i8") int32_t k32_vecmat_f32_i8(float* out, const int8_t* w, const float* w_scale, const float* x,
+                                                          uint32_t rows, uint32_t cols, uint32_t row_stride, uint32_t scale_stride);
+K32_IMPORT("k32_softmax_f32") int32_t k32_softmax_f32(float* x, uint32_t n);
 
 /* ---- Hardware imports, gated by the capability firewall ---------------
  * The pod manifest must request the matching resource:
