@@ -87,25 +87,8 @@ static inline float* llm_msg_floats(struct llm_msg* m) { return (float*)(m + 1);
 
 /* ---- arithmetic -------------------------------------------------------- */
 
-/* e^x: x = n ln2 + r, |r| <= ln2/2, degree-6 polynomial for e^r */
-__attribute__((noinline, unused)) static float llm_exp(float x) {
-    if (x < -87.0f) return 0.0f;
-    if (x > 88.0f) x = 88.0f;
-    float t = x * 1.44269504f;
-    int32_t n = (int32_t)(t + (t >= 0.0f ? 0.5f : -0.5f));
-    float r = x - (float)n * 0.693145752f;
-    r = r - (float)n * 1.42860677e-6f;
-    float p = 1.38888889e-3f;
-    p = p * r + 8.33333333e-3f;
-    p = p * r + 4.16666667e-2f;
-    p = p * r + 1.66666667e-1f;
-    p = p * r + 0.5f;
-    p = p * r + 1.0f;
-    p = p * r + 1.0f;
-    union { uint32_t u; float f; } b;
-    b.u = (uint32_t)(n + 127) << 23;
-    return p * b.f;
-}
+/* e^x as the node's k32_softmax_f32 computes it (k32_expf) */
+__attribute__((noinline, unused)) static float llm_exp(float x) { return k32_expf(x); }
 
 /* ---- text -------------------------------------------------------------- */
 static inline uint32_t llm_strlen(const char* s) { uint32_t n = 0; while (s[n]) n++; return n; }

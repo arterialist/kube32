@@ -228,11 +228,11 @@ class TestLlmPipeline(LlmClusterCase):
 
         with open(self.logs["cardputer"]) as f:
             screen_from = len(f.read())
-        st = self._generate("Lily went to the park", 80)
-        ref = self._reference("Lily went to the park", 80, st["context"])
+        st = self._generate("Lily went to the park", 60)
+        ref = self._reference("Lily went to the park", 60, st["context"])
         self.assertEqual(st["tokens"], ref["tokens"], "the pipeline's tokens differ from the reference's")
         self.assertEqual(st["text"], ref["text"])
-        self.assertEqual(st["generated"], 80)
+        self.assertEqual(st["generated"], 60)
         self.assertEqual(st["replays"], 0)
         self.assertEqual([(s["stage"], s["layers"], s["node"]) for s in st["stages"]],
                          [(0, [0, 3], "devkit"), (1, [3, 4], "cardputer"), (2, [4, 5], "laptop")])
@@ -247,7 +247,7 @@ class TestLlmPipeline(LlmClusterCase):
         drawn = [m.groups() for m in (re.match(r"^\[DISPLAY (\d+),(\d+)\] (.*)$", l) for l in lines) if m]
         text = "".join(t for x, y, t in drawn if y != "0")
         self.assertEqual(re.sub(r"\s", "", text), re.sub(r"\s", "", st["text"]), "the screen's text")
-        self.assertIn("80 tokens", [t for x, y, t in drawn if y == "0"][-1])
+        self.assertIn("60 tokens", [t for x, y, t in drawn if y == "0"][-1])
 
     def test_stage_moves_when_its_node_leaves(self):
         """laptop leaves mid-generation: its stage moves to devkit with its cache and the tokens stay the reference's"""
@@ -256,8 +256,10 @@ class TestLlmPipeline(LlmClusterCase):
         self._cluster()
         left = []
 
+        # Early: the Cardputer stage's cache ends the generation at its
+        # context, and the move needs about a second
         def leave(st):
-            if not left and st["generated"] >= 20:
+            if not left and st["generated"] >= 2:
                 left.append(st["generated"])
                 self.nodes["laptop"].process.send_signal(signal.SIGTERM)
 

@@ -117,30 +117,14 @@ __attribute__((noinline)) static float quantize(int8_t* qd, const float* src, ui
     return amax / 127.0f;
 }
 
-__attribute__((noinline)) static int32_t dot(const int8_t* a, const int8_t* b, uint32_t n) {
-    int32_t s = 0;
-    for (uint32_t i = 0; i < n; i += 4)
-        s += a[i] * b[i] + a[i + 1] * b[i + 1] + a[i + 2] * b[i + 2] + a[i + 3] * b[i + 3];
-    return s;
-}
-
-/* a: n int4 values, two a byte */
-__attribute__((noinline)) static int32_t dot4(const int8_t* a, const int8_t* b, uint32_t n) {
-    int32_t s = 0;
-    for (uint32_t i = 0; i < n; i += 2) {
-        const int32_t w = a[i >> 1];
-        s += ((int32_t)((uint32_t)w << 28) >> 28) * b[i] + (w >> 4) * b[i + 1];
-    }
-    return s;
-}
-
-/* out = W_t xq of layer g_l, with W's row scales and g_xs */
+/* out = W_t xq of layer g_l, with W's row scales and g_xs; the node
+ * computes the product natively (k32_matvec_i8, k32_matvec_i4) */
 __attribute__((noinline)) static void proj(float* out, uint32_t t) {
     const int8_t* w = (const int8_t*)g_t[g_l][t];
     const float* ws = (const float*)g_t[g_l][t - (t >= W1 ? 7 : 8)];
     const uint32_t rows = g_dims[kShape[t] >> 4], n = g_dims[kShape[t] & 15];
-    for (uint32_t r = 0; r < rows; r++)
-        out[r] = (float)(g_bits == 4 ? dot4(w + r * n / 2, xq, n) : dot(w + r * n, xq, n)) * (ws[r] * g_xs);
+    if (g_bits == 4) k32_matvec_i4(out, w, ws, xq, g_xs, rows, n, 0);
+    else k32_matvec_i8(out, w, ws, xq, g_xs, rows, n, 0);
 }
 
 /* the rotary embedding of every head of a (n floats) for this position */
@@ -157,48 +141,18 @@ __attribute__((noinline)) static void rope(float* a, uint32_t n, const float* cs
  * frame for each operation a function has run until it returns, and a
  * board without PSRAM gives a call about 22 KB of native stack. */
 
-/* att[t] = q_h . k_t / sqrt(head_size) for t <= pos; returns the largest */
-__attribute__((noinline)) static float scores(uint32_t h, uint32_t pos) {
-    const float scale = 1.0f / __builtin_sqrtf((float)g_hs);
-    const uint32_t kh = h / (g_heads / g_kvh), base = g_l * g_ctx;
-    const float* qh = q + h * g_hs;
-    float m = 0.0f;
-    for (uint32_t t = 0; t <= pos; t++) {
-        const int8_t* kt = g_kq + (base + t) * g_kvd + kh * g_hs;
-        float d = 0.0f;
-        for (uint32_t i = 0; i < g_hs; i++) d += qh[i] * (float)kt[i];
-        att[t] = d * g_ks[(base + t) * g_kvh + kh] * scale;
-        if (t == 0 || att[t] > m) m = att[t];
-    }
-    return m;
-}
-
-/* att[0..n) = exp(att - m) / their sum */
-__attribute__((noinline)) static void softmax(uint32_t n, float m) {
-    float sum = 0.0f;
-    for (uint32_t t = 0; t < n; t++) {
-        att[t] = llm_exp(att[t] - m);
-        sum += att[t];
-    }
-    for (uint32_t t = 0; t < n; t++) att[t] = att[t] / sum;
-}
-
-/* head h of xb2 = sum over t <= pos of att[t] v_t */
-__attribute__((noinline)) static void mix(uint32_t h, uint32_t pos) {
-    const uint32_t kh = h / (g_heads / g_kvh), base = g_l * g_ctx;
-    float* o = xb2 + h * g_hs;
-    for (uint32_t i = 0; i < g_hs; i++) o[i] = 0.0f;
-    for (uint32_t t = 0; t <= pos; t++) {
-        const float a = att[t] * g_vs[(base + t) * g_kvh + kh];
-        const int8_t* vt = g_vq + (base + t) * g_kvd + kh * g_hs;
-        for (uint32_t i = 0; i < g_hs; i++) o[i] += a * (float)vt[i];
-    }
-}
-
+/* Each head of q attends to the cached positions 0..pos of its KV head: the
+ * node computes the scores q_h . k_t / sqrt(head_size), their softmax and
+ * the sum of the values they weigh, into head h of xb2 */
 __attribute__((noinline)) static void attention(uint32_t pos) {
+    const float scale = 1.0f / __builtin_sqrtf((float)g_hs);
+    const uint32_t base = g_l * g_ctx;
     for (uint32_t h = 0; h < g_heads; h++) {
-        softmax(pos + 1, scores(h, pos));
-        mix(h, pos);
+        const uint32_t kh = h / (g_heads / g_kvh);
+        const uint32_t kv = base * g_kvd + kh * g_hs, ks = base * g_kvh + kh;
+        k32_matvec_f32_i8(att, g_kq + kv, g_ks + ks, q + h * g_hs, scale, pos + 1, g_hs, g_kvd, 4 * g_kvh);
+        k32_softmax_f32(att, pos + 1);
+        k32_vecmat_f32_i8(xb2 + h * g_hs, g_vq + kv, g_vs + ks, att, pos + 1, g_hs, g_kvd, 4 * g_kvh);
     }
 }
 
@@ -251,15 +205,18 @@ __attribute__((noinline)) static void ffn_block(void) {
     residual();
 }
 
-/* the most likely next token, the first of equal ones */
+/* the most likely next token, the first of equal ones; the logits go
+ * through hb, g_hidden at a time */
 __attribute__((noinline)) static uint32_t classify(void) {
     norm(g_rms_final);
     const float s = quantize(xq, xb, g_dim);
     uint32_t best = 0;
     float best_logit = 0.0f;
-    for (uint32_t r = 0; r < g_vocab; r++) {
-        const float logit = (float)dot(g_cls_q + r * g_dim, xq, g_dim) * (g_cls_s[r] * s);
-        if (r == 0 || logit > best_logit) { best = r; best_logit = logit; }
+    for (uint32_t r0 = 0; r0 < g_vocab; r0 += g_hidden) {
+        const uint32_t n = g_vocab - r0 < g_hidden ? g_vocab - r0 : g_hidden;
+        k32_matvec_i8(hb, g_cls_q + r0 * g_dim, g_cls_s + r0, xq, s, n, g_dim, 0);
+        for (uint32_t r = 0; r < n; r++)
+            if (r0 + r == 0 || hb[r] > best_logit) { best = r0 + r; best_logit = hb[r]; }
     }
     return best;
 }

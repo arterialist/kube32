@@ -15,24 +15,25 @@ The model is Andrej Karpathy's [stories260K](https://huggingface.co/karpathy/tin
 ## How it works
 
 - **Weights.** Each matrix row is int8 or int4 (-7..7, two values a byte) with one float scale. Before each matrix product a stage quantizes the activation vector to int8 with one scale, so the product is a sum of integers. The KV cache is int8 with one scale per head and position. The rotary table goes with the first stage, which sends each position's coefficients along with it.
+- **Native products.** The node computes the matrix products (`k32_matvec_i8`, `k32_matvec_i4`) and the attention over the KV cache (`k32_matvec_f32_i8`, `k32_softmax_f32`, `k32_vecmat_f32_i8`) natively ([linear algebra](../../docs/app-development.md#linear-algebra)). The interpreter runs the norms, the quantization, the rotary embedding and SiLU, about 31,000 wasm3 operations a layer at any position.
 - **Stages.** At start a stage fetches its slice (`MODEL_URL`) into its linear memory and gives the rest of its memory limit to the KV cache. `POST /x` queues a position. `k32_tick` computes the oldest one and posts it to `NEXT_URL`. Thus a stage that waits for the network leaves its node's interpreter to the other pods, and stages on different nodes compute at the same time while the coordinator feeds the prompt. The last stage picks the most likely token and posts the position to the coordinator.
 - **Coordinator.** It encodes prompts with the model's tokenizer, keeps up to 4 positions in flight, and feeds each chosen token back to the first stage. It publishes each token on the channel topic `llm.text`. A stage that lost its cache answers `409`, or no position comes back for 10 s. The coordinator then replays the session, and greedy decoding picks the same tokens again.
 - **Screen.** A stage with `SCREEN=1` and the `DISPLAY` capability draws the text of the positions that pass through it, the prompt in grey, under a title row with the speed.
-- **Same bits everywhere.** Every float operation runs in a fixed order as one IEEE binary32 operation, with no fused multiply-add and exp from its own polynomial. Thus a stage computes the same bits on an ESP32-S3 and on `kube32-sim`, and `tools/llm.py generate` gives the tokens the pipeline must produce.
+- **Same bits everywhere.** Every float operation runs in a fixed order as one IEEE binary32 operation, with no fused multiply-add and exp from its own polynomial (`k32_expf`), in the pod and in the node's native products alike. Thus a stage computes the same bits on an ESP32-S3 and on `kube32-sim`, and `tools/llm.py generate` gives the tokens the pipeline must produce.
 - **Moves.** `llm-shard-2` has `kube32.io/migration: Auto` and `kube32.io/placement: fastest`. It runs on the fastest node. When that node leaves, the stage moves to a board with its KV cache and the generation goes on.
 
 ### Memory on the Cardputer
 
-A board without PSRAM admits pods on its 80 KiB pool block, counting each pod's linear memory and its Pod Overhead (wasm3's structures, compiled code and value stack). `llm-shard-1` takes 46 KiB of linear memory and 33 KiB of overhead, 79 KiB in all:
+A board without PSRAM admits pods on its 80 KiB pool block, counting each pod's linear memory and its Pod Overhead (wasm3's structures, compiled code, value stack and the module's bytes). `llm-shard-1` takes 40 KiB of linear memory and 40 KiB of overhead, 80 KiB in all:
 
 | Part | Bytes |
 | --- | ---: |
 | Shadow stack and static data | 3,472 |
 | Layer 3: 7 int4 matrices, 600 row scales, 2 norm vectors | 25,632 |
 | Activations, the int8 buffer, 3 position slots of 524 B | 4,464 |
-| KV cache: 135 positions at 100 B (unused: 36 B) | 13,536 |
-| Linear memory | 47,104 (46 KiB) |
-| Pod Overhead (`spec.overhead`) | 33 KiB |
+| KV cache: 73 positions at 100 B (unused: 92 B) | 7,392 |
+| Linear memory | 40,960 (40 KiB) |
+| Pod Overhead (`spec.overhead`) | 40 KiB |
 
 At int8 the layer is 48,288 B, and with its overhead it does not fit the pool. Other pods on the Cardputer, such as an active device driver, leave the stage `Pending`.
 

@@ -122,10 +122,10 @@ spec:
             - name: NODE_NAME
               valueFrom: {fieldRef: {fieldPath: spec.nodeName}}
           resources:
-            # The 25 KB int4 slice and a KV cache of 135 positions; with the
-            # pod's overhead (spec.overhead) it takes 79 of the 80 KiB pool
-            requests: {memory: 46Ki, hardware.kube32.io/tft-display: "1"}
-            limits: {memory: 46Ki}
+            # The 25 KB int4 slice and a KV cache of 73 positions; with the
+            # pod's overhead (spec.overhead) it takes the 80 KiB pool
+            requests: {memory: 40Ki, hardware.kube32.io/tft-display: "1"}
+            limits: {memory: 40Ki}
           securityContext:
             capabilities: {add: ["SERVICE_CALL", "DISPLAY"]}
 ---
