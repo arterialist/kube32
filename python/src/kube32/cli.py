@@ -1,6 +1,7 @@
 """The kube32 command line (also installed as kube32-cli).
 
-    kube32 build   <dir>                    compile a C, Rust or AssemblyScript app to .wasm and check it
+    kube32 new     <dir> --lang c|rust      a new app project
+    kube32 build   [<dir>]                  compile a C, Rust or AssemblyScript app to .wasm and check it
     kube32 check   <file.wasm>              validate a module against the app ABI
     kube32 deploy  <file.wasm>              create a Pod that carries the module inline (no reflash)
     kube32 embed   <file.wasm>              copy the module into images/ for the next firmware build
@@ -40,6 +41,11 @@ from .common import EXIT_CODES_HELP, EXIT_INPUT, EXIT_OK, EXIT_USAGE, err_exit
 from .firmware import cmd_firmware_abort, cmd_firmware_info, cmd_firmware_push, cmd_firmware_rollout, cmd_firmware_status
 from .kube import kubectl_base, kubectl_flags, kubectl_missing
 from .pods import cmd_deploy, cmd_embed, cmd_push, cmd_sd_push
+
+
+def cmd_new(args):
+    from .scaffold import cmd_new as run
+    return run(args)
 
 
 def missing_pyserial():
@@ -98,8 +104,14 @@ def build_parser(prog="kube32"):
     p.add_argument("--version", action=VersionAction, help="show the version and exit")
     sub = p.add_subparsers(dest="command", metavar="<command>")
 
+    n = sub.add_parser("new", help="create an app project in a new directory: a C Makefile project or a Rust crate")
+    n.add_argument("path", help="the directory to create; its name names the app, the module and the crate")
+    n.add_argument("--lang", choices=["c", "rust"], default="c", help="language (default c)")
+    n.add_argument("--sdk-path", help="Rust: depend on the kube32-sdk crate in this directory (sdk/rust/kube32-sdk of a checkout)")
+    n.set_defaults(func=cmd_new)
+
     b = sub.add_parser("build", help="compile a C, Rust or AssemblyScript app directory to .wasm and check it")
-    b.add_argument("dir")
+    b.add_argument("dir", nargs="?", default=".", help="the app directory (default: the current directory)")
     b.add_argument("--lang", choices=["c", "c-make", "rust", "assemblyscript"], help="override language detection")
     b.add_argument("--name", help="module name (default: crate name or directory name)")
     b.add_argument("-o", "--out", help="output path (default: <dir>/build/<name>.wasm; Makefile projects: where the Makefile writes it)")

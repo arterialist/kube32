@@ -16,8 +16,8 @@
 //! `kube32.io/event-topics`. `event` is "denied" when the manifest does not grant
 //! `hardware.kube32.io/ipc` (the capability firewall answers K32_ERR_PERM).
 //!
-//! Build: cargo build --release --target wasm32-unknown-unknown   (in sdk/rust)
-//!    or: tools/kube32-cli build sdk/rust/examples/counter
+//! Build: kube32 build   (in this crate's directory)
+//!    or: cargo build --release --target wasm32-unknown-unknown
 #![no_std]
 
 use core::sync::atomic::{AtomicU32, AtomicU64, Ordering::Relaxed};

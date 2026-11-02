@@ -1,5 +1,5 @@
-"""Tests for what the kube32 package adds to the CLI: the build hook, port
-detection and `version`.
+"""Tests for what the kube32 package adds to the CLI: the build hook, `new`,
+port detection and `version`.
 
 Run from the repository root:
 
@@ -22,9 +22,10 @@ from unittest import mock
 from kube32_under_test import INSTALLED, PACKAGE_DIR, REPO, cli_command
 
 import kube32
-from kube32 import common, ports
+from kube32 import common, ports, scaffold
 
 HEADER = os.path.join(REPO, "include", "runtime", "k32_app_abi.h")
+COUNTER = os.path.join(REPO, "sdk", "rust", "examples", "counter", "src", "lib.rs")
 
 try:
     import serial  # noqa: F401
@@ -97,8 +98,12 @@ class TestSharedFiles(TempDirCase):
     def test_hook_copies_the_repository_files(self):
         hook = load_build_hook()
         project = os.path.join(REPO, "python")
-        self.assertEqual(hook.shared_sources(project, "wheel"), {HEADER: "kube32/_data/include/runtime/k32_app_abi.h"})
-        self.assertEqual(hook.shared_sources(project, "sdist"), {HEADER: "src/kube32/_data/include/runtime/k32_app_abi.h"})
+        self.assertEqual(hook.shared_sources(project, "wheel"), {
+            HEADER: "kube32/_data/include/runtime/k32_app_abi.h",
+            COUNTER: "kube32/_data/templates/rust/lib.rs",
+        })
+        self.assertEqual(set(hook.shared_sources(project, "sdist").values()),
+                         {"src/kube32/_data/include/runtime/k32_app_abi.h", "src/kube32/_data/templates/rust/lib.rs"})
 
     def test_hook_in_an_unpacked_sdist(self):
         hook = load_build_hook()
@@ -120,6 +125,108 @@ class TestSharedFiles(TempDirCase):
 
     def test_include_dir(self):
         self.assertTrue(os.path.isfile(os.path.join(common.abi_include_dir(), "runtime", "k32_app_abi.h")))
+
+
+# ---------------------------------------------------------------------------
+# new
+# ---------------------------------------------------------------------------
+def have_c_toolchain():
+    from kube32 import build as kbuild
+    clang = shutil.which(os.environ.get("CLANG", "clang"))
+    if not clang or not shutil.which("make") or not kbuild.find_rust_lld():
+        return False
+    proc = subprocess.run([clang, "--target=wasm32", "-x", "c", "-c", "-", "-o", os.devnull], input="int x;", text=True,
+                          stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    return proc.returncode == 0
+
+
+def have_rust_wasm():
+    from kube32 import build as kbuild
+    env = kbuild.cargo_env()
+    rustup = shutil.which("rustup", path=env["PATH"])
+    if not rustup or not shutil.which("cargo", path=env["PATH"]):
+        return False
+    proc = subprocess.run([rustup, "target", "list", "--installed"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=env)
+    return "wasm32-unknown-unknown" in proc.stdout.split()
+
+
+class TestNew(TempDirCase):
+    def test_c_project(self):
+        rc, out, err = run_cli("new", "hello-c", cwd=self.tmp)
+        self.assertEqual(rc, 0, err)
+        d = os.path.join(self.tmp, "hello-c")
+        self.assertEqual(out.splitlines()[0], "created hello-c (C): Makefile, main.c, include/runtime/k32_app_abi.h, .gitignore")
+        self.assertEqual(read(os.path.join(d, "include", "runtime", "k32_app_abi.h"), "rb"), read(HEADER, "rb"))
+        makefile = read(os.path.join(d, "Makefile"))
+        self.assertIn("NAME := hello-c\n", makefile)
+        self.assertIn("CFLAGS = --target=wasm32 -Oz -nostdlib -ffreestanding -fno-exceptions -mcpu=mvp -msign-ext -mbulk-memory", makefile)
+        self.assertIn("\t$(WASM_LD) $(LD_FLAVOR) $(LDFLAGS) -o $@ $(OBJECTS)\n", makefile)
+        main_c = read(os.path.join(d, "main.c"))
+        self.assertIn('#include "runtime/k32_app_abi.h"', main_c)
+        self.assertIn('K32_EXPORT("k32_handle")', main_c)
+        self.assertIn('LIT("hello-c: request ")', main_c)
+
+    def test_rust_project(self):
+        rc, out, err = run_cli("new", os.path.join(self.tmp, "apps", "tally"), "--lang", "rust")
+        self.assertEqual(rc, 0, err)
+        d = os.path.join(self.tmp, "apps", "tally")
+        self.assertEqual(sorted(os.listdir(d)), [".cargo", ".gitignore", "Cargo.toml", "src"])
+        self.assertEqual(read(os.path.join(d, "src", "lib.rs"), "rb"), read(COUNTER, "rb"))
+        cargo = read(os.path.join(d, "Cargo.toml"))
+        self.assertIn('name = "tally"', cargo)
+        self.assertIn('crate-type = ["cdylib"]', cargo)
+        self.assertIn(scaffold.sdk_dependency(), cargo)
+        self.assertIn("link-arg=--max-memory=65536", read(os.path.join(d, ".cargo", "config.toml")))
+
+    def test_sdk_dependency(self):
+        self.assertEqual(scaffold.sdk_dependency(release="1.4.2"), 'kube32-sdk = "1.4.2"')
+        dev = scaffold.sdk_dependency(release="1.5.0.dev3+gabc1234")
+        self.assertTrue(dev.endswith('kube32-sdk = { git = "https://github.com/arterialist/kube32" }'), dev)
+        self.assertIn("development build", dev)
+        sdk = os.path.join(REPO, "sdk", "rust", "kube32-sdk")
+        self.assertEqual(scaffold.sdk_dependency(sdk_path=sdk), 'kube32-sdk = { path = "%s" }' % sdk)
+
+    def test_refusals(self):
+        os.makedirs(os.path.join(self.tmp, "taken"))
+        open(os.path.join(self.tmp, "taken", "x"), "w").close()
+        cases = [
+            (("new", "taken"), 1, "error: taken exists and is not an empty directory\n"),
+            (("new", "Bad_Name"), 2, "error: invalid app name 'Bad_Name'"),
+            (("new", "9lives"), 2, "error: invalid app name '9lives'"),
+            (("new", "app", "--sdk-path", self.tmp), 2, "error: --sdk-path is for --lang rust\n"),
+            (("new", "app", "--lang", "rust", "--sdk-path", self.tmp), 2, "has no Cargo.toml"),
+            (("new", "app", "--lang", "go"), 2, "invalid choice: 'go'"),
+        ]
+        for args, code, msg in cases:
+            rc, _, err = run_cli(*args, cwd=self.tmp)
+            self.assertEqual(rc, code, args)
+            self.assertIn(msg, err, args)
+        self.assertFalse(os.path.exists(os.path.join(self.tmp, "app")))
+
+    @unittest.skipUnless(have_c_toolchain(), "make, clang with the wasm32 target and wasm-ld/rust-lld are needed")
+    def test_new_then_build_c(self):
+        self.assertEqual(run_cli("new", "demo", cwd=self.tmp)[0], 0)
+        rc, out, err = run_cli("build", "demo", cwd=self.tmp)
+        self.assertEqual(rc, 0, out + err)
+        self.assertIn("building %s (c-make)" % os.path.join(self.tmp, "demo"), out)
+        self.assertIn("demo/build/demo.wasm: ", out)
+        self.assertIn("kind: request pod (k32_handle)", out)
+        self.assertIn("imports (4): k32_log, k32_resp_begin, k32_resp_end, k32_resp_write", out)
+        self.assertEqual(out.splitlines()[-1], "ok")
+        # kube32 build without a directory builds the current one
+        rc, out, _ = run_cli("build", cwd=os.path.join(self.tmp, "demo"))
+        self.assertEqual(rc, 0)
+        self.assertIn("build/demo.wasm", out)
+
+    @unittest.skipUnless(have_rust_wasm(), "cargo and the wasm32-unknown-unknown target are needed")
+    def test_new_then_build_rust(self):
+        sdk = os.path.join(REPO, "sdk", "rust", "kube32-sdk")
+        self.assertEqual(run_cli("new", "tally", "--lang", "rust", "--sdk-path", sdk, cwd=self.tmp)[0], 0)
+        rc, out, err = run_cli("build", "tally", cwd=self.tmp)
+        self.assertEqual(rc, 0, out + err)
+        self.assertIn("tally/build/tally.wasm: ", out)
+        self.assertIn("kind: request pod (k32_handle)", out)
+        self.assertEqual(out.splitlines()[-1], "ok")
 
 
 # ---------------------------------------------------------------------------
@@ -196,7 +303,7 @@ class TestVersionAndHelp(TempDirCase):
     def test_help_lists_every_command(self):
         rc, out, _ = run_cli("--help")
         self.assertEqual(rc, 0)
-        for command in ("build", "check", "deploy", "embed", "sd-push", "push", "firmware", "devices", "checkpoint",
+        for command in ("new", "build", "check", "deploy", "embed", "sd-push", "push", "firmware", "devices", "checkpoint",
                         "move", "checkpoints", "gateway", "version"):
             self.assertRegex(out, r"\n    %s\s" % command)
         rc, out, err = run_cli("version", "--client", "--bogus")

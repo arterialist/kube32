@@ -1,9 +1,10 @@
 """Build hook: the package carries files that live elsewhere in the repository.
 
-include/runtime/k32_app_abi.h is the single copy of the pod ABI, which
-`kube32 build` compiles against. A build from the repository copies it into
-the package as kube32/_data/<path>; a build from the sdist uses the copy
-the sdist carries under src/kube32/_data/. The repository's
+include/runtime/k32_app_abi.h is the single copy of the pod ABI: `kube32 new`
+vendors it into C projects and `kube32 build` compiles against it. The Rust
+template is the SDK's counter example. A build from the repository copies
+them into the package as kube32/_data/<path>; a build from the sdist uses
+the copies the sdist carries under src/kube32/_data/. The repository's
 LICENSE goes into the sdist and into the wheel's .dist-info/licenses/.
 """
 import os
@@ -13,6 +14,7 @@ from hatchling.builders.hooks.plugin.interface import BuildHookInterface
 # repository path -> path below kube32/_data/ (the same table as kube32.common.SHARED_FILES)
 SHARED_FILES = {
     "include/runtime/k32_app_abi.h": "include/runtime/k32_app_abi.h",
+    "sdk/rust/examples/counter/src/lib.rs": "templates/rust/lib.rs",
 }
 
 

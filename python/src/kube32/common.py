@@ -27,6 +27,7 @@ PACKAGE_DIR = os.path.dirname(os.path.abspath(__file__))
 # repository path -> path below kube32/_data/
 SHARED_FILES = {
     "include/runtime/k32_app_abi.h": "include/runtime/k32_app_abi.h",
+    "sdk/rust/examples/counter/src/lib.rs": "templates/rust/lib.rs",
 }
 
 
