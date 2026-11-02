@@ -135,6 +135,21 @@ void run_pods(storage::Store& store) {
     }
 }
 
+
+// The pass count once a loop has settled: unchanged for half a second (a
+// pass a change started may still be due when a test begins to count)
+template <typename Loop>
+static uint64_t settled_passes(Loop& loop) {
+    uint64_t passes = loop.passes();
+    for (int i = 0; i < 50; ++i) {
+        osal::Thread::sleep_ms(500);
+        const uint64_t now = loop.passes();
+        if (now == passes) break;
+        passes = now;
+    }
+    return passes;
+}
+
 void test_trigger() {
     std::cout << "[RUN] test_trigger" << std::endl;
     auto store = ram_store();
@@ -228,7 +243,8 @@ void test_deployment_loop() {
         return parse(d).get("status")->get_int("readyReplicas", 0) == 1;
     }));
 
-    // Quiet: no pass, whatever else the cluster writes
+    // Quiet: no pass, whatever else the cluster writes (the resync is
+    // 1.5 s away: no longer wait to settle)
     osal::Thread::sleep_ms(200);
     const uint64_t quiet = dc.passes();
     const uint64_t revision = real->current_version();
@@ -291,9 +307,10 @@ void test_device_loop() {
     };
     assert(eventually([&] { return !uid().empty(); }));
 
-    // Heartbeats are no change; a label, or a part discovery finds, is
-    osal::Thread::sleep_ms(200);
-    uint64_t quiet = dc.passes();
+    // Heartbeats are no change; a label, or a part discovery finds, is.
+    // First the passes the Device's creation started end: the count holds
+    // still for half a second
+    const uint64_t quiet = settled_passes(dc);
     for (int i = 0; i < 10; ++i) {
         background_writes(*store, i);
         osal::Thread::sleep_ms(30);
@@ -354,8 +371,7 @@ void test_device_activation_loop() {
     std::cout << "  driver pod created " << took << " ms after the activation" << std::endl;
     assert(took < 1500);
     // The driver exists: further uses only move the time of the last one
-    osal::Thread::sleep_ms(100);
-    const uint64_t quiet = dc.passes();
+    const uint64_t quiet = settled_passes(dc);
     for (int i = 0; i < 5; ++i) dc.activate("default", "temp");
     osal::Thread::sleep_ms(300);
     assert(dc.passes() == quiet);
@@ -378,8 +394,7 @@ void test_daemonset_loop() {
                     "template":{"metadata":{"labels":{"app":"hud"}},"spec":{"nodeSelector":{"board":"cardputer"},
                     "containers":[{"name":"c","image":"wasm://embedded/echo"}]}}}})").status_code == 201);
     assert(eventually([&] { return pods(*store).size() == 1; }));
-    osal::Thread::sleep_ms(200);
-    const uint64_t quiet = wc.passes();
+    const uint64_t quiet = settled_passes(wc);
     for (int i = 0; i < 10; ++i) {
         background_writes(*store, i);   // node-a without its label now: a change
         if (i == 0) {
