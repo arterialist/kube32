@@ -3,6 +3,7 @@
 #include "api/table_serializer.hpp"
 #include "api/chunked_stream_writer.hpp"
 #include "api/http_server.hpp"
+#include "api/version_info.hpp"
 #include "storage/store.hpp"
 #include "mem/monotonic_arena.hpp"
 #include "models/kube_models.hpp"
@@ -143,6 +144,8 @@ void test_discovery_and_method_enforcement() {
         assert(platform.rfind("linux/", 0) == 0);
 #endif
         assert(platform.find("xtensa") == std::string::npos);
+        // The release this build is, as nodes report it
+        assert(v.get_string("kube32Version", "") == kube32::api::firmware_version());
     }
 
     // 2. POST /version -> 405 MethodNotAllowed

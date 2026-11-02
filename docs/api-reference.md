@@ -28,7 +28,7 @@ Discovery endpoints accept `GET` and `HEAD`.
 
 | Path | Answer |
 | --- | --- |
-| `/version` | `gitVersion` `v1.33.0-kube32`, git commit, tree state, UTC build time, compiler and platform: `darwin/arm64`, `linux/amd64` or `freertos/xtensa`. `goVersion` is empty |
+| `/version` | `gitVersion` `v1.33.0-kube32`, git commit, tree state, UTC build time, compiler and platform: `darwin/arm64`, `linux/amd64` or `freertos/xtensa`. `goVersion` is empty. `kube32Version` is the kube32 release, such as `0.4.0` |
 | `/healthz`, `/livez`, `/readyz` | `200 OK` with body `ok` |
 | `/api`, `/api/v1` | core `v1` |
 | `/apis`, `/apis/<group>`, `/apis/<group>/<version>` | `apps/v1`, `batch/v1`, `coordination.k8s.io/v1`, `discovery.k8s.io/v1`, `events.k8s.io/v1`, `networking.k8s.io/v1`, `authorization.k8s.io/v1`, `metrics.k8s.io/v1beta1`, `kube32.io/v1` |
