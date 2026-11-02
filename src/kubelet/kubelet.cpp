@@ -256,7 +256,7 @@ void Kubelet::run_loop() {
             } else {
                 uint64_t now = osal::System::get_uptime_ms();
 
-                if (now - last_sync_ms_ >= config_.sync_frequency_ms) {
+                if (sync_due_.exchange(false) || now - last_sync_ms_ >= config_.sync_frequency_ms) {
                     step = "pod sync";
                     sync_assigned_pods();
                 }

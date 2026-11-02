@@ -202,6 +202,9 @@ struct PeerInfo {
 };
 
 constexpr const char* K32C_HELLO_TOPIC = "k32.hello";
+// A node name: that node's kubelet lists its pods at once (the control
+// plane bound a pod to it or is deleting one)
+constexpr const char* K32C_KUBELET_SYNC_TOPIC = "k32.kubelet.sync";
 
 class ChannelManager {
 public:

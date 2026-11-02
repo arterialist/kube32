@@ -1372,6 +1372,45 @@ void cluster_task(void* pv) {
         // From here on (the journal's objects are an earlier boot's): what
         // is created before the clock is set gets its time once it is
         if (kube32::osal::System::get_unix_time_ms() == 0) backfill = std::make_unique<kube32::api::TimestampBackfill>(*store);
+        // A pod bound to another node, or one it is to stop: tell that
+        // node's kubelet over the channel fabric, so it lists its pods now
+        // and not at its next poll (two seconds on a board). At most every
+        // 200 ms a node; the watch runs on the writer's thread.
+        store->watch("/registry/pods/", [self = ident.name](const kube32::storage::WatchEvent& ev) {
+            static kube32::osal::Mutex mu;
+            static std::map<std::string, std::string, std::less<>> bound;   // pod key -> node, pods of other nodes
+            static std::map<std::string, uint64_t, std::less<>> last;       // node -> last wake
+            std::string_view node;
+            if (ev.type != kube32::storage::WatchEventType::Deleted) {
+                static constexpr std::string_view kKey = "\"nodeName\":\"";
+                const size_t at = ev.json.find(kKey);
+                if (at != std::string::npos) {
+                    const size_t from = at + kKey.size();
+                    const size_t to = ev.json.find('"', from);
+                    if (to != std::string::npos && to - from <= 63) node = std::string_view(ev.json.data() + from, to - from);
+                }
+            }
+            const bool deleting = ev.json.find("\"deletionTimestamp\"") != std::string::npos;
+            std::string wake;
+            {
+                kube32::osal::LockGuard guard(mu);
+                auto it = bound.find(ev.key);
+                if (ev.type == kube32::storage::WatchEventType::Deleted || node.empty() || node == self) {
+                    if (it != bound.end()) bound.erase(it);
+                    return;
+                }
+                // Bound here or to another node since the last write, or being deleted
+                if (it == bound.end() || it->second != node) bound[ev.key] = std::string(node);
+                else if (!deleting) return;
+                const uint64_t now = kube32::osal::System::get_uptime_ms();
+                auto l = last.find(node);
+                if (l != last.end() && now - l->second < 200) return;
+                last[std::string(node)] = now;
+                wake.assign(node);
+            }
+            kube32::ipc::ChannelManager::instance().publish("control-plane", kube32::ipc::K32C_KUBELET_SYNC_TOPIC,
+                                                            reinterpret_cast<const uint8_t*>(wake.data()), wake.size());
+        });
 
         kube32::controller::NodeLifecycleConfig nl_cfg;
         nl_cfg.check_interval_ms = 1000;
@@ -1606,6 +1645,12 @@ void cluster_task(void* pv) {
 
         kubelet = std::make_unique<kube32::kubelet::Kubelet>(kubelet_cfg, *wasm_runtime);
         kubelet->start();
+        // The control plane names this node when it binds or deletes a pod
+        // here: list the pods now, not at the next poll
+        kube32::ipc::ChannelManager::instance().subscribe(kube32::ipc::K32C_KUBELET_SYNC_TOPIC,
+            [k = kubelet.get(), name = ident.name](std::string_view, uint32_t, const uint8_t* data, size_t len) {
+                if (len == name.size() && std::memcmp(data, name.data(), len) == 0) k->request_sync();
+            });
         printf("[WORKER] kubelet -> http://%s:6443\n", api_host.c_str());
         if (has_display) {
             kube32::hal::display_fill_rect(0, 0, kube32::hal::LCD_WIDTH, 18, 0x194B);

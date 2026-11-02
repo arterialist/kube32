@@ -163,6 +163,9 @@ public:
     bool init();
     bool start();
     void stop();
+    // The next loop pass lists the node's pods at once, not after
+    // sync_frequency_ms: the control plane bound or deleted one of them
+    void request_sync() { sync_due_.store(true); }
     bool is_running() const { return running_.load(); }
 
     // Core reconciler loops (invoked sequentially by the main task loop)
@@ -284,6 +287,7 @@ private:
     std::unique_ptr<char[]> registration_buf_;
     std::atomic<uint64_t> last_sync_ok_ms_{0};     // end of the last pod sync pass that listed pods
     std::atomic<bool> heartbeat_due_{false};       // send the next heartbeat without waiting
+    std::atomic<bool> sync_due_{false};            // list the node's pods without waiting (request_sync)
 
     // Local state map: key = namespace/name (looked up by view)
     std::map<std::string, LocalPodRecord, std::less<>> active_pods_;
