@@ -8,6 +8,7 @@ from .common import EXIT_INPUT, EXIT_OK, err_exit
 from .ports import PortError, choose_port, is_bridge
 
 FIRMWARE_ASSET = "kube32-firmware-esp32s3-%s.bin"
+FLASH_PARTS_ASSET = "kube32-firmware-esp32s3-%s-flash.json"
 BAUDS = (921600, 460800)
 ESP_IMAGE_MAGIC = 0xE9
 PARTITION_TABLE_OFFSET = 0x8000
@@ -41,8 +42,8 @@ def check_image(path):
 
 
 def esptool_argv(esptool_version, port, baud, image, bridge):
-    """esptool arguments that write `image` at 0x0. esptool 5 names commands and reset modes with
-    hyphens, esptool 4 with underscores."""
+    """esptool arguments that write `image` (a path, written at 0x0, or a list of (offset, path))
+    esptool 5 names commands and reset modes with hyphens, esptool 4 with underscores."""
     kebab = int(str(esptool_version).split(".")[0]) >= 5
 
     def name(s):
@@ -54,7 +55,10 @@ def esptool_argv(esptool_version, port, baud, image, bridge):
             name("write-flash")]
     if bridge:
         argv.append("-u")   # uncompressed: the paced blocks below
-    return argv + ["0x0", image]
+    parts = [(0, image)] if isinstance(image, str) else image
+    for offset, path in parts:
+        argv += [hex(offset), path]
+    return argv
 
 
 def pace_bridge_writes(esptool):
@@ -77,8 +81,26 @@ def pace_bridge_writes(esptool):
     return True
 
 
+def release_parts(release, out=None):
+    """[(offset, path)] of a release's bootloader, partition table, otadata and app, each checked
+    against its SHA-256: everything but NVS, so the board keeps its settings"""
+    import json
+    with open(releases.fetch(release, FLASH_PARTS_ASSET % release, out)) as f:
+        layout = json.load(f)
+    parts = []
+    for p in layout.get("parts", []):
+        path = releases.fetch(release, p["file"], out)
+        if releases.sha256_file(path) != p["sha256"]:
+            raise releases.ReleaseError("%s does not match the SHA-256 in %s" % (p["file"], FLASH_PARTS_ASSET % release))
+        parts.append((int(p["offset"]), path))
+    if not parts:
+        raise releases.ReleaseError("%s lists no parts" % (FLASH_PARTS_ASSET % release))
+    return parts
+
+
 def write_image(port, image, bauds, out=None):
-    """Flashes `image` at the first baud rate that works. Returns None, or why every attempt failed."""
+    """Flashes `image` (a merged image path, or [(offset, path)]) at the first baud rate that works.
+    Returns None, or why every attempt failed."""
     out = out or sys.stdout
     try:
         import esptool
@@ -118,14 +140,21 @@ def cmd_flash(args):
         try:
             release = releases.release_for(args.version, "firmware",
                                            "pass --version X.Y.Z to flash a release, or --file <image> to flash an image file")
-            image = releases.fetch(release, FIRMWARE_ASSET % release)
+            if args.erase_settings:
+                image = releases.fetch(release, FIRMWARE_ASSET % release)
+            else:
+                image = release_parts(release)
         except releases.ReleaseError as e:
             return err_exit(str(e), EXIT_INPUT)
         what = "kube32 %s" % release
-    try:
-        check_image(image)
-    except (OSError, ValueError) as e:
-        return err_exit("%s: %s" % (image, e), EXIT_INPUT)
+    if isinstance(image, str):
+        try:
+            check_image(image)
+        except (OSError, ValueError) as e:
+            return err_exit("%s: %s" % (image, e), EXIT_INPUT)
+        print("writing the whole image from 0x0: the board's stored settings (Wi-Fi, node name, cluster) are erased")
+    else:
+        print("writing the bootloader, partition table and firmware: the board keeps its stored settings")
     try:
         port = choose_port(args.port)
     except PortError as e:

@@ -254,7 +254,10 @@ def build_parser(prog="kube32"):
     fl = sub.add_parser("flash", help="write the release firmware (or an image file) to an ESP32-S3 board over USB")
     fl.add_argument("--port", help="serial port (default: KUBE32_SERIAL_PORT, or the one board connected)")
     fl.add_argument("--version", help="flash this release, X.Y.Z (default: the release of this kube32)")
-    fl.add_argument("--file", help="flash this merged image at offset 0x0 instead of a release")
+    fl.add_argument("--file", help="flash this merged image at offset 0x0 instead of a release (erases the board's stored settings)")
+    fl.add_argument("--erase-settings", action="store_true",
+                    help="write the release's whole image from 0x0, erasing stored settings (Wi-Fi, node name, cluster); "
+                         "by default only the bootloader, partition table and firmware are written")
     fl.add_argument("--baud", type=int, help="baud rate (default 921600, then 460800 when that fails)")
     fl.add_argument("--console", dest="console", action="store_true", default=None, help="open the serial console after flashing")
     fl.add_argument("--no-console", dest="console", action="store_false", help="do not offer the serial console after flashing")

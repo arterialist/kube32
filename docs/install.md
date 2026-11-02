@@ -56,7 +56,7 @@ Each release of kube32 has a version `X.Y.Z` and a Git tag `vX.Y.Z`, and its par
 | Part | Name |
 | --- | --- |
 | The `kube32` Python package | `kube32` `X.Y.Z` on PyPI |
-| Firmware for the ESP32-S3, a merged image written at `0x0` | `kube32-firmware-esp32s3-X.Y.Z.bin` on the GitHub release |
+| Firmware for the ESP32-S3: its parts, written at their offsets (stored settings stay), or with `--erase-settings` the merged image from `0x0` | `kube32-firmware-esp32s3-X.Y.Z-flash.json` and the parts it lists, or `kube32-firmware-esp32s3-X.Y.Z.bin`, on the GitHub release |
 | `kube32-sim` for macOS and Linux, arm64 and x86_64 | `kube32-sim-X.Y.Z-<macos\|linux>-<arm64\|x86_64>.tar.gz` on the GitHub release |
 | `kube32-sim` container image | `ghcr.io/arterialist/kube32-sim:X.Y.Z` |
 | Rust SDK | `kube32-sdk` `X.Y.Z` on crates.io |

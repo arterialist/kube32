@@ -160,9 +160,11 @@ def main():
     if image[nvs[2]:nvs[2] + nvs[3]] != b"\xff" * nvs[3]:
         sys.exit("the merged image does not erase NVS")
     flash["merged"] = {"file": os.path.basename(merged), "offset": 0, "size": len(image), "sha256": write_sha256(merged)}
-    with open(os.path.join(args.out, base + "-flash.json"), "w") as f:
+    flash_json = os.path.join(args.out, base + "-flash.json")
+    with open(flash_json, "w") as f:
         json.dump(flash, f, indent=2)
         f.write("\n")
+    write_sha256(flash_json)
 
     manifest = {
         "name": "kube32",

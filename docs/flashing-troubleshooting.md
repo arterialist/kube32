@@ -10,10 +10,11 @@ The [browser installer](flash.md) installs a release without a build or any tool
 kube32 flash [--port <serial port>] [--version X.Y.Z]
 ```
 
-- Downloads `kube32-firmware-esp32s3-<version>.bin` from the GitHub release of the installed `kube32`, or of `--version`, checks it against the `.sha256` file next to it, and keeps it in the cache directory ([Install](install.md#releases-and-versions)).
+- Downloads the firmware parts of the installed `kube32`'s GitHub release, or of `--version`: the bootloader, partition table, `otadata` and application listed in `kube32-firmware-esp32s3-<version>-flash.json`. It checks each file against its `.sha256` file and the SHA-256 in the list, and keeps them in the cache directory ([Install](install.md#releases-and-versions)).
 - Uses `--port`, else `KUBE32_SERIAL_PORT`, else the one connected port with USB vendor ID `0x303a` (native USB-Serial/JTAG) or `0x1a86` (CH340). With several boards connected, pass `--port`.
-- Writes the merged image (bootloader, partition table, and firmware) at `0x0` with esptool at 921600 baud, and again at 460800 baud when that fails. `--baud` sets one rate. Writes paced blocks on CH340 bridges and resets the board as `scripts/flash.sh` does (below), reading the same `KUBE32_FLASH_BEFORE` and `KUBE32_FLASH_AFTER`.
-- `--file <image>` writes a local merged image instead of a release.
+- Writes each part at its offset with esptool at 921600 baud, and again at 460800 baud when that fails. `--baud` sets one rate. Writes paced blocks on CH340 bridges and resets the board as `scripts/flash.sh` does (below), reading the same `KUBE32_FLASH_BEFORE` and `KUBE32_FLASH_AFTER`.
+- The parts leave NVS alone, so the board keeps its stored settings: Wi-Fi, node name and cluster. `--erase-settings` writes the release's merged image from `0x0` instead, which erases them.
+- `--file <image>` writes a local merged image from `0x0` instead of a release, which also erases the stored settings.
 - Prints the console commands that set the board up, and offers to open `kube32 console`.
 
 ### Flashing a build from source

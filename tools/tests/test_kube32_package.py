@@ -525,19 +525,37 @@ class TestFlash(TempDirCase):
     def test_flash_a_release(self):
         server = ReleaseServer(os.path.join(self.tmp, "www"))
         self.addCleanup(server.close)
-        server.add("2.0.1", "kube32-firmware-esp32s3-2.0.1.bin", merged_image())
+        image = merged_image()
+        server.add("2.0.1", "kube32-firmware-esp32s3-2.0.1.bin", image)
+        # The parts, each at its offset: NVS (0x9000) is not among them
+        parts = [("bootloader", 0x0, image[:0x100]), ("partitions", 0x8000, image[0x8000:0x8C00]), ("app", 0x20000, b"\xe9app")]
+        layout = {"chip": "esp32s3", "version": "2.0.1", "parts": []}
+        for name, offset, data in parts:
+            fname = "kube32-firmware-esp32s3-2.0.1-%s.bin" % name
+            server.add("2.0.1", fname, data)
+            layout["parts"].append({"name": name, "offset": offset, "size": len(data), "file": fname,
+                                    "sha256": hashlib.sha256(data).hexdigest()})
+        server.add("2.0.1", "kube32-firmware-esp32s3-2.0.1-flash.json", json.dumps(layout).encode())
         env = self.flash_env(KUBE32_RELEASES_URL=server.url, FAKE_ESPTOOL_VERSION="4.8.1", FAKE_ESPTOOL_FAILS="1")
         rc, out, err = run_cli("flash", "--version", "2.0.1", "--port", "/dev/fake0", "--no-console", env=env)
         self.assertEqual(rc, 0, out + err)
-        cached = os.path.join(self.tmp, "cache", "releases", "2.0.1", "kube32-firmware-esp32s3-2.0.1.bin")
+        cache = os.path.join(self.tmp, "cache", "releases", "2.0.1")
         self.assertEqual([c[5] for c in self.calls()], ["921600", "460800"])
-        self.assertEqual(self.calls()[1][-3:], ["write_flash", "0x0", cached])
+        self.assertEqual(self.calls()[1][-6:], ["0x0", os.path.join(cache, "kube32-firmware-esp32s3-2.0.1-bootloader.bin"),
+                                                "0x8000", os.path.join(cache, "kube32-firmware-esp32s3-2.0.1-partitions.bin"),
+                                                "0x20000", os.path.join(cache, "kube32-firmware-esp32s3-2.0.1-app.bin")])
+        self.assertIn("the board keeps its stored settings", out)
         self.assertIn("flashed /dev/fake0 with kube32 2.0.1", out)
+        # --erase-settings: the merged image from 0x0
+        rc, out, err = run_cli("flash", "--version", "2.0.1", "--port", "/dev/fake0", "--no-console", "--erase-settings", env=env)
+        self.assertEqual(rc, 0, out + err)
+        self.assertEqual(self.calls()[-1][-3:], ["write_flash", "0x0", os.path.join(cache, "kube32-firmware-esp32s3-2.0.1.bin")])
+        self.assertIn("stored settings (Wi-Fi, node name, cluster) are erased", out)
 
     def test_refusals(self):
         rc, _, err = run_cli("flash", "--version", "7.7.7", "--port", "/dev/fake0", env=self.flash_env(KUBE32_RELEASES_URL="http://127.0.0.1:9"))
         self.assertEqual(rc, 1)
-        self.assertIn("cannot download http://127.0.0.1:9/v7.7.7/kube32-firmware-esp32s3-7.7.7.bin.sha256", err)
+        self.assertIn("cannot download http://127.0.0.1:9/v7.7.7/kube32-firmware-esp32s3-7.7.7-flash.json.sha256", err)
         rc, _, err = run_cli("flash", "--file", os.path.join(self.tmp, "none.bin"), env=self.flash_env())
         self.assertEqual((rc, err), (1, "error: no such file: %s\n" % os.path.join(self.tmp, "none.bin")))
         rc, _, err = run_cli("flash", "--file", self.image, env=self.flash_env())   # no board listed
