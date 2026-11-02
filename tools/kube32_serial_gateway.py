@@ -35,7 +35,7 @@ import serial.tools.list_ports
 
 BAUD = 115200            # native USB-Serial/JTAG ignores the baud rate; CH340 corrupts bytes above it
 MARK = b"\x1e"           # board frames start with this byte
-BOOT_TRIES = 6     # hellos to a named port before giving up: a board takes a few seconds to boot
+BOOT_TRIES = 6     # hellos to a named port before it says it is still waiting
 MAX_REQUEST = 60 * 1024  # the board takes requests below 64 KiB
 FIRST_BYTE_TIMEOUT = 30.0
 HELLO_TIMEOUT = 3.0
@@ -401,10 +401,15 @@ def connect(prefer):
             print(f"[gateway] {port}: {e}", flush=True)
             continue
         # A board that is still booting (just flashed or reset) answers once
-        # its console task runs: a named port gets a few more tries
-        tries = BOOT_TRIES if prefer else 1
-        while tries and not relay.hello():
-            tries -= 1
+        # its console task runs, which can take half a minute while its Wi-Fi
+        # join times out: a named port is asked until it answers
+        tries = 0
+        while not relay.hello():
+            tries += 1
+            if not prefer:
+                break
+            if tries == BOOT_TRIES:
+                print(f"[gateway] {port}: no answer to K32_RESET yet, still asking", flush=True)
         if not relay.ready.is_set():
             print(f"[gateway] {port}: no answer to K32_RESET (firmware without the console relay?)", flush=True)
             relay.alive = False
