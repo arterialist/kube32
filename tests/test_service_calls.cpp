@@ -52,6 +52,7 @@ struct FakeNode {
     uint16_t port{0};
     std::atomic<bool> running{true};
     std::atomic<int> connections{0};
+    std::atomic<int> warm{0};
     std::mutex mu;
     std::vector<std::string> heads;   // request heads seen
     std::thread th;
@@ -110,6 +111,10 @@ struct FakeNode {
             else if (path == "/chunked") out = "HTTP/1.1 201 Created\r\nTransfer-Encoding: chunked\r\n\r\n3;ext=1\r\nhel\r\n2\r\nlo\r\n0\r\n\r\n";
             else if (path == "/echo") out = "HTTP/1.1 200 OK\r\nContent-Length: " + std::to_string(body.size()) + "\r\n\r\n" + body;
             else if (path == "/slow") { osal::Thread::sleep_ms(1500); out = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok"; }
+            else if (path == "/warm") {   // a driver before its first reading: 503 twice
+                out = warm++ < 2 ? "HTTP/1.1 503 Service Unavailable\r\nContent-Length: 15\r\n\r\nno reading yet\n"
+                                 : "HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\nwarm";
+            }
             else if (path == "/close") {
                 out = "HTTP/1.1 200 OK\r\nConnection: close\r\n\r\nuntil-close";
                 s.send_all(out.data(), out.size());
@@ -372,9 +377,10 @@ static void test_on_demand(storage::Store& store, FakeNode& node) {
     };
     app::ServiceClient worker(app::make_api_service_resolver(api_get), wo);
     app::install_service_client(&worker);
-    c = call_pod("default/a-0", "/call?u=http://kitchen/cl&t=5000");
+    // The new driver answers 503 until its first reading: the call that started it asks again
+    c = call_pod("default/a-0", "/call?u=http://kitchen/warm&t=5000");
     std::cout << "[on demand] worker: " << c.body << std::endl;
-    assert(json_int(c.body, "rc") == 200 && c.body.find("\"body\":\"hello\"") != std::string::npos);
+    assert(json_int(c.body, "rc") == 200 && c.body.find("\"body\":\"warm\"") != std::string::npos && node.warm.load() == 3);
     assert(posts.load() == 1 && worker.stats().activated.load() == 1);
     c = call_pod("default/a-0", "/call?u=http://kitchen/cl");
     assert(json_int(c.body, "rc") == 200 && posts.load() == 1);

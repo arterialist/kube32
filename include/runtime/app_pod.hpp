@@ -72,6 +72,8 @@ public:
     bool ended() const { return ended_; }
     // Appends bytes received from elsewhere (a remote pod's body)
     void append(const uint8_t* data, size_t len) { write(data, len); }
+    // Empty again, for another answer
+    void reset() { len_ = total_ = 0; status_ = 0; ended_ = false; }
 private:
     uint8_t* buf_;
     size_t cap_;

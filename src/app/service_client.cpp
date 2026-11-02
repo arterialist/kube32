@@ -714,13 +714,21 @@ int32_t ServiceClient::call(const runtime::ServiceCallRequest& req, runtime::Buf
         demand_.use(ns, target.devices, ready);
         if (!ready) {
             const uint64_t start = osal::System::get_uptime_ms();
-            const int32_t rc = await_driver(req, t, ns, target, out);
+            int32_t rc = await_driver(req, t, ns, target, out);
             if (rc != 0) return rc;
-            // What is left of the call's time
-            runtime::ServiceCallRequest rest = req;
-            const uint64_t waited = osal::System::get_uptime_ms() - start;
-            rest.timeout_ms = waited < req.timeout_ms ? static_cast<uint32_t>(req.timeout_ms - waited) : 1;
-            return call_service(rest, t, ns, target.endpoints, out);
+            // A driver that just started answers 503 until its first
+            // reading: asked again while the call's wait lasts
+            const uint32_t limit = req.timeout_ms < opts_.activation_wait_ms ? req.timeout_ms : opts_.activation_wait_ms;
+            for (;;) {
+                runtime::ServiceCallRequest rest = req;   // what is left of the call's time
+                const uint64_t waited = osal::System::get_uptime_ms() - start;
+                rest.timeout_ms = waited < req.timeout_ms ? static_cast<uint32_t>(req.timeout_ms - waited) : 1;
+                ResponseBody attempt{sink, sink.capacity()};
+                rc = call_service(rest, t, ns, target.endpoints, attempt);
+                if (rc != 503 || waited + 100 >= limit || call_stopped(req)) return rc;
+                osal::Thread::sleep_ms(100);
+                sink.reset();
+            }
         }
     }
     if (!ready) {
