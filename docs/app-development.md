@@ -40,6 +40,7 @@ All imports belong to the `env` module (`src/runtime/app_pod.cpp`, `src/runtime/
 | HTTP calls | `k32_http_call`, `k32_http_status` | `i(iiiiiiiiiiii)`, `i()` | `securityContext.capabilities.add: ["SERVICE_CALL"]` | [Networking](networking.md) |
 | Events and channels | `k32_event_emit`, `kube32_channel_open/send/recv/close` | `i(iiii)`, `i(ii)`, `i(iii)`, `i(iiii)`, `i(i)` | `hardware.kube32.io/ipc` (`CHANNEL_IPC`) | [Networking](networking.md) |
 | Node services | `k32_log`, `k32_time_ms`, `k32_unix_time_ms`, `k32_random`, `k32_env_get`, `k32_mem_stats`, `esp32_delay_ms`, `esp32_get_time_us` | `v(ii)`, `I()`, `I()`, `i()`, `i(iiii)`, `i(ii)`, `v(i)`, `I()` | nothing | `include/runtime/k32_app_abi.h` |
+| Linear algebra | `k32_matvec_i8`, `k32_matvec_i4`, `k32_matvec_f32_i8`, `k32_vecmat_f32_i8`, `k32_softmax_f32` | `i(iiiifiii)`, `i(iiiifiii)`, `i(iiiifiiii)`, `i(iiiiiiii)`, `i(ii)` | nothing | [Linear algebra](#linear-algebra) |
 | Storage | `k32_fs_open/read/write/close/size/list/remove` | `i(iii)`, `i(iii)`, `i(iii)`, `i(i)`, `i(i)`, `i(iiii)`, `i(ii)` | `hardware.kube32.io/sd` (`SD`) and a volume claim | [Storage](storage.md), [storage](storage.md) |
 | Cardputer UI | `k32_display_text`, `k32_display_rect`, `k32_display_bar`, `k32_key_read`, `k32_tone` | `i(iiiiii)`, `i(iiiii)`, `i(iiiiiii)`, `i()`, `i(iii)` | `hardware.kube32.io/tft-display` (`DISPLAY`), `keyboard` (`KEYBOARD`), `speaker` (`SPEAKER`) | [Peripherals](peripherals.md), [Capability firewall](architecture/capability-firewall.md) |
 | ESP32 peripherals | `esp32_gpio_set_mode/write/read`, `esp32_adc_read`, `esp32_i2c_write/read`, `esp32_uart_write/read` | `i(ii)`, `i(ii)`, `i(i)`, `i(i)`, `i(iiii)`, `i(iiii)`, `i(iii)`, `i(iii)` | `esp32.io/*` resources | [Peripherals](peripherals.md), [GPIO and other peripherals](peripherals.md) |
@@ -54,6 +55,24 @@ Calls without the required resource or capability return `K32_ERR_PERM` (`-1`) a
 
 `k32_unix_time_ms()` returns the node's wall clock in Unix milliseconds, or `0` while the clock is not set. The control plane sets its clock over SNTP when it has an uplink. `k32_time_ms()` counts milliseconds since the node booted.
 `esp32_rmt_send(durations_us, count)` sends one IR frame (mark and space durations in microseconds, mark first) on the pod's RMT TX channel and returns `count` once the frame is out, or `K32_ERR_PERM` (`-1`), `K32_ERR_INVAL` (`-22`, an empty, overlong, or zero-duration frame), or `K32_ERR_FAULT` (`-14`). `esp32_rmt_receive(out_us, cap)` never waits: it copies the oldest frame the pod's RMT RX channel captured and returns its duration count, or `K32_ERR_AGAIN` (`-11`) when none is queued, `K32_ERR_TOOBIG` (`-7`, the first `cap` durations copied and the frame dropped), or `K32_ERR_PERM` (`-1`). Poll it from `k32_tick`; see [Peripherals](peripherals.md#infrared-rmt) for pins, carrier, and the receive queue.
+
+### Linear algebra
+
+The `k32_matvec_*`, `k32_vecmat_f32_i8` and `k32_softmax_f32` imports run the products of small quantized neural networks in native code instead of the interpreter. Any pod can call them; a pod that does not import them does not get them. Weights are rows of int8 (or int4) values with one float scale per row:
+
+| Import | Computes |
+| --- | --- |
+| `k32_matvec_i8(out, w, w_scale, x, x_scale, rows, cols, row_stride)` | `out[r] = (float)(sum over c of w[r][c] * x[c]) * (w_scale[r] * x_scale)` for int8 `w` and int8 `x` |
+| `k32_matvec_i4(...)` | The same for int4 weights, two a byte: column `2j` in the low nibble, `2j + 1` in the high nibble, each signed |
+| `k32_matvec_f32_i8(out, w, w_scale, x, alpha, rows, cols, row_stride, scale_stride)` | `out[r] = ((sum over c of x[c] * (float)w[r][c]) * w_scale[r]) * alpha` for a float `x`, such as attention scores over an int8 key cache |
+| `k32_vecmat_f32_i8(out, w, w_scale, x, rows, cols, row_stride, scale_stride)` | `out[c] = sum over r of (x[r] * w_scale[r]) * (float)w[r][c]`, a weighted sum of int8 rows, such as attention over a value cache |
+| `k32_softmax_f32(x, n)` | `x[i] = k32_expf(x[i] - max) / sum` in place |
+
+Row `r` of `w` starts `row_stride` bytes after row `r - 1`, and scale `r` `scale_stride` bytes after scale `r - 1`. A stride of `0` packs the rows, or the scales. Thus a pod passes one head of an interleaved cache without copying it. Each call returns `K32_OK`, or `K32_ERR_INVAL` (`-22`) for a stride that is not `0` and is below a row's bytes (or `4` for `scale_stride`). `out` must not overlap the other operands.
+
+The results are the same bits on every node. Integer sums are exact `int32` values; they wrap beyond that range. Every float step is one IEEE binary32 operation in the order the table shows, sums run from `0` in index order, and the node builds the kernels without fused multiply-adds. `k32_softmax_f32` computes exp with `k32_expf`, an inline function in `k32_app_abi.h`. A pod that computes exp itself with it gets the node's bits.
+
+The node checks every operand against the pod's linear memory before it reads anything. An operand outside the linear memory traps the call with exit code `139` and a message that names the operand and the import, for example `wasm trap: out of bounds memory access: w of k32_matvec_i8`. A metered pod pays for the work before it runs: 10,000 gas units (the cost of a bulk memory instruction), plus 45 (an arithmetic instruction) per unit of work. A matrix call is `rows x (cols + 1)` units and a softmax 32 per element. A call that its budget does not cover traps with exit code `152` and writes nothing.
 
 ---
 
@@ -89,7 +108,7 @@ wasm3 on the ESP32-S3 also uses the native stack. The compiler makes no tail cal
 
 ### Execution budget
 
-Every host-initiated call (`k32_init`, `k32_alloc`, `k32_handle`, `k32_tick`, `k32_event`) gets a fresh wasm3 gas budget, defaulting to `4,000,000,000` units. Override it with the pod annotation `kube32.io/execution-budget: "<units>"` or disable metering with `"off"` (or `"0"`). Unmetered pods compile without gas checks and cannot be interrupted mid-call when stopped.
+Every host-initiated call (`k32_init`, `k32_alloc`, `k32_handle`, `k32_tick`, `k32_event`) gets a fresh wasm3 gas budget, defaulting to `4,000,000,000` units. The [linear algebra](#linear-algebra) imports charge the budget for their work. Override it with the pod annotation `kube32.io/execution-budget: "<units>"` or disable metering with `"off"` (or `"0"`). Unmetered pods compile without gas checks and cannot be interrupted mid-call when stopped.
 
 ### Restart policy and exit codes
 
@@ -180,6 +199,7 @@ The `Makefile` of a C project compiles every `.c` file with `clang --target=wasm
 | `panic-handler` (default) | `#[panic_handler]` that logs through `k32_log` and traps |
 | `hardware` | `hardware::{display_text, display_rect, display_bar, key_read, tone, rgb565, rmt_send, rmt_receive}` |
 | `fs` | `fs::{File, list, remove}` over `k32_fs_*` |
+| `linalg` | `linalg::{matvec_i8, matvec_i4, matvec_f32_i8, vecmat_f32_i8, softmax_f32, expf}` |
 
 ### Request pod
 
@@ -322,7 +342,7 @@ K32_EXPORT("k32_handle") int32_t k32_handle(uint32_t ptr, uint32_t len) {
 }
 ```
 
-`kube32 build` compiles `.c` files with `clang --target=wasm32 -O2 -nostdlib -ffreestanding -fno-exceptions -mcpu=mvp -msign-ext -mbulk-memory` and links them with `rust-lld` or `wasm-ld`. If the directory contains a `Makefile`, `kube32 build` runs `make -C <dir>` (pass `--artifact <path>` when the output `.wasm` cannot be inferred from `make -n -B`). See `apps/echo`, `apps/sdnote`, `apps/i2cscan`, `apps/irremote`, and `apps/tessera` for complete C pods.
+`kube32 build` compiles `.c` files with `clang --target=wasm32 -O2 -nostdlib -ffreestanding -fno-exceptions -mcpu=mvp -msign-ext -mbulk-memory` and links them with `rust-lld` or `wasm-ld`. If the directory contains a `Makefile`, `kube32 build` runs `make -C <dir>` (pass `--artifact <path>` when the output `.wasm` cannot be inferred from `make -n -B`). See `apps/echo`, `apps/sdnote`, `apps/i2cscan`, `apps/irremote`, `apps/tessera`, and `apps/llm-pipeline` for complete C pods.
 
 ---
 
