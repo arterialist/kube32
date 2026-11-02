@@ -806,7 +806,7 @@ std::string IngressController::build_cluster_json() {
             std::string name = meta ? meta->get_string("name", "") : "";
             const models::JsonValue* status = doc.get("status");
             bool ready = false;
-            std::string free_mem, free_psram, cap_psram;
+            std::string cap_psram;
             if (status) {
                 const models::JsonValue* conds = status->get("conditions");
                 if (conds && conds->is_array()) {
@@ -814,14 +814,16 @@ std::string IngressController::build_cluster_json() {
                         if (c.get_string("type", "") == "Ready") ready = (c.get_string("status", "") == "True");
                     }
                 }
-                const models::JsonValue* alloc = status->get("allocatable");
-                if (alloc) {
-                    free_mem = alloc->get_string("memory", "");
-                    free_psram = alloc->get_string("esp32.io/psram", alloc->get_string("esp.io/psram", ""));
-                }
                 const models::JsonValue* capv = status->get("capacity");
                 if (capv) cap_psram = capv->get_string("esp32.io/psram", capv->get_string("esp.io/psram", ""));
             }
+            // What is free now, from the kubelet's heartbeat: free internal
+            // RAM, free PSRAM, and what pods can still be given
+            const models::JsonValue* ann = meta ? meta->get("annotations") : nullptr;
+            auto annotation = [&](const char* key) { return ann && ann->is_object() ? ann->get_string(key, "") : std::string(); };
+            const std::string free_heap = annotation("kube32.io/heap-free");
+            const std::string free_psram = annotation("kube32.io/psram-free");
+            const std::string free_pods = annotation("kube32.io/memory-free");
             bool is_cp = false;
             if (meta) {
                 const models::JsonValue* labels = meta->get("labels");
@@ -830,9 +832,10 @@ std::string IngressController::build_cluster_json() {
             if (!first) out += ",";
             first = false;
             out += "{\"name\":\"" + name + "\",\"role\":\"" + (is_cp ? "control-plane" : "worker") + "\",\"ready\":" + (ready ? "true" : "false");
-            out += ",\"free_heap\":" + std::to_string(models::parse_quantity(free_mem));
-            out += ",\"free_psram\":" + std::to_string(models::parse_quantity(free_psram));
+            if (!free_heap.empty()) out += ",\"free_heap\":" + std::to_string(models::parse_quantity(free_heap));
+            if (!free_psram.empty()) out += ",\"free_psram\":" + std::to_string(models::parse_quantity(free_psram));
             out += ",\"total_psram\":" + std::to_string(models::parse_quantity(cap_psram));
+            if (!free_pods.empty()) out += ",\"free_pod_memory\":" + std::to_string(models::parse_quantity(free_pods));
             if (name == opts_.local_node_name) {
                 const size_t min_free = osal::System::get_min_free_heap_bytes();   // 0: not tracked (host)
                 if (min_free > 0) out += ",\"min_free_heap\":" + std::to_string(min_free);

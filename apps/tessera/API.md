@@ -176,11 +176,14 @@ patching local state, except for the board which may move the card directly.
 `GET /api/cluster` -> 200
 
 ```json
-{"nodes":[{"name":"esp32-node-01","role":"control-plane","free_heap":n,"min_free_heap":n,"free_psram":n,"uptime_ms":n,"pods":["tessera-hud"],"ready":true}, {...}],
+{"nodes":[{"name":"esp32-node-01","role":"control-plane","ready":true,"free_heap":n,"free_psram":n,"total_psram":n,"free_pod_memory":n,
+           "min_free_heap":n,"uptime_ms":n,"free_heap_live":n,"pods":[{"name":"tessera-hud","phase":"Running","restarts":0}]}, {...}],
  "ingress":{"rps":n,"p50_us":n,"p99_us":n,"active_sse":n,"workers":4,"requests":n},
  "link":{"espnow_frames_rx":n,"espnow_frames_tx":n,"crc_errors":n,"reassembled":n},
  "now":n}
 ```
+
+`free_heap` is the node's free internal RAM, `free_psram` its free PSRAM and `free_pod_memory` what pods can be given now, in bytes, from the node's last heartbeat (its `kube32.io/heap-free`, `kube32.io/psram-free` and `kube32.io/memory-free` annotations). A node without PSRAM has no `free_psram`. `min_free_heap`, `uptime_ms` and `free_heap_live` (free internal RAM now) come only for the node that serves the request.
 
 ## Keyboard input path
 
