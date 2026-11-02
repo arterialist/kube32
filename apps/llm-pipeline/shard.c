@@ -90,7 +90,7 @@ __attribute__((noinline)) static void say(const char* what, int32_t value) {
     k32_log(g_line, g_n);
 }
 
-/* ---- arithmetic (llm.h) -------------------------------------------------- */
+/* ---- arithmetic: tools/llm.py repeats each operation in this order -------- */
 /* xb = x / rms(x) * w */
 __attribute__((noinline)) static void norm(const float* w) {
     float ss = 0.0f;
@@ -351,7 +351,7 @@ static void newline(void) {
 
 /* The title row and the text of the position just computed */
 __attribute__((noinline)) static void screen(const struct llm_msg* m) {
-    if (m->flags & LLM_MSG_CLEAR) {
+    if ((m->flags & LLM_MSG_CLEAR) || !g_row) {
         k32_display_rect(0, 0, 240, 135, 0);
         g_col = 0;
         g_row = 1;

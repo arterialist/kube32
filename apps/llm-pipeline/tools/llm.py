@@ -19,7 +19,7 @@ run, and a client.
                                      print the text as it arrives, then the
                                      speed and the time of each stage and hop
 
-The reference does every float operation of the pods (llm.h) in the same
+The reference does every float operation of the stages (shard.c) in the same
 order in IEEE binary32, so its tokens match the pipeline's exactly.
 
 Run it with uv (`uv run --script tools/llm.py ...`) or a Python with numpy.
@@ -206,7 +206,7 @@ def read_blob(data):
     return out
 
 
-# ---- the arithmetic of llm.h, operation for operation ----------------------
+# ---- the arithmetic of shard.c, operation for operation --------------------
 
 def k_exp(x):
     x = np.asarray(x, dtype=F32)
@@ -224,10 +224,10 @@ def k_exp(x):
     return np.where(under, F32(0.0), p * b).astype(F32)
 
 
-def seqsum(a, axis=0):
-    """a[0] + a[1] + ... from left to right in float32, as a C loop adds"""
-    return np.add.accumulate(a.astype(F32), axis=axis, dtype=F32)[-1] if axis == 0 else \
-        np.add.accumulate(a.astype(F32), axis=axis, dtype=F32)[..., -1]
+def seqsum(a):
+    """a[0] + a[1] + ... from left to right in float32, as a C loop adds
+    (along the first axis)"""
+    return np.add.accumulate(a.astype(F32), axis=0, dtype=F32)[-1]
 
 
 def rmsnorm(x, w):
