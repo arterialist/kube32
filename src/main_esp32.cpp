@@ -1677,10 +1677,18 @@ void cluster_task(void* pv) {
             // restarted answers a station still holding its 802.11w keys
             // with SA queries and handshakes the station never finishes,
             // linked or not), restart the Wi-Fi driver, at most once a minute.
+            // After five restarts without an answer the board reboots: a
+            // station whose heap fragmented can associate and lose the link
+            // again every few seconds until it does. By then the control
+            // plane has marked the node NotReady and evicts its pods.
             static uint64_t quiet_since = kube32::osal::System::get_uptime_ms();
             static bool rejoined = false;
+            static int restarts = 0;
             const uint64_t now = kube32::osal::System::get_uptime_ms();
-            if (kubelet->last_sync_ok_ms() > quiet_since) rejoined = false;   // answered since
+            if (kubelet->last_sync_ok_ms() > quiet_since) {   // answered since
+                rejoined = false;
+                restarts = 0;
+            }
             const uint64_t heard = std::max(kubelet->last_sync_ok_ms(), quiet_since);
             if (now - heard > 60000 && !rejoined && net_mgr->station_has_ip()) {
                 printf("[NET] no answer from the control plane for %u s on a connected link, joining the access point again\n",
@@ -1689,6 +1697,12 @@ void cluster_task(void* pv) {
                 rejoined = true;
                 quiet_since = now;
             } else if (now - heard > 60000 && (rejoined || !net_mgr->station_has_ip())) {
+                if (++restarts > 5) {
+                    log_memory("before reboot");
+                    printf("[NET] no answer from the control plane after 5 Wi-Fi restarts, rebooting\n");
+                    fflush(stdout);
+                    esp_restart();
+                }
                 printf("[NET] no answer from the control plane for %u s, restarting Wi-Fi\n", (unsigned)((now - heard) / 1000));
                 net_mgr->restart_radio();
                 quiet_since = now;
