@@ -20,11 +20,9 @@
 namespace kube32::kubelet {
 
 static CpuTimeSampler s_cpu_sampler = nullptr;
-static PodCpuTimeSampler s_pod_cpu_sampler = nullptr;
 
 void set_platform_cpu_sampler(CpuTimeSampler sampler) { s_cpu_sampler = sampler; }
 CpuTimeSampler platform_cpu_sampler() { return s_cpu_sampler; }
-void set_platform_pod_cpu_sampler(PodCpuTimeSampler sampler) { s_pod_cpu_sampler = sampler; }
 
 bool sample_pod_from_runtime(const std::string& pod_key, runtime::Runtime& rt, PodResourceSample& out) {
     runtime::ContainerStatus st = rt.get_status(pod_key);
@@ -50,13 +48,16 @@ bool sample_pod_from_runtime(const std::string& pod_key, runtime::Runtime& rt, P
             out.memory_bytes = linear + runtime_part;
         }
     }
-    uint64_t task_us = 0;
-    if (s_pod_cpu_sampler && s_pod_cpu_sampler(pod_key, task_us)) {
+    // CPU time: the pod's export calls on the node's threads plus its own
+    // thread (an entry point), both measured as thread CPU time
+    static const bool cpu_measured = [] {
+        uint64_t probe = 0;
+        return osal::Thread::current_cpu_time_us(probe);
+    }();
+    const bool app = runtime::AppPodHost::instance().has_pod(pod_key);
+    if (cpu_measured && (app || st.has_thread_cpu)) {
         out.has_cpu = true;
-        out.cpu_busy_us = task_us;
-    } else if (runtime::AppPodHost::instance().has_pod(pod_key)) {
-        out.has_cpu = true;
-        out.cpu_busy_us = runtime::AppPodHost::instance().stats(pod_key).total_us;
+        out.cpu_busy_us = (app ? runtime::AppPodHost::instance().stats(pod_key).cpu_us : 0) + (st.has_thread_cpu ? st.thread_cpu_us : 0);
     }
     return true;
 }

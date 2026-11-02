@@ -298,10 +298,59 @@ void test_timer_oneshot_state_reset() {
     std::cout << "[PASS] test_timer_oneshot_state_reset" << std::endl;
 }
 
+// Thread CPU time counts running, not waiting: a thread that sleeps uses
+// almost none, and one thread never uses more than the wall time it spans
+static void spin_cpu_us(uint64_t us) {
+    volatile uint64_t x = 0;
+    uint64_t start = 0, now = 0;
+    Thread::current_cpu_time_us(start);
+    do {
+        for (int i = 0; i < 1000; ++i) x = x + 1;
+        Thread::current_cpu_time_us(now);
+    } while (now - start < us);
+}
+
+void test_thread_cpu_time() {
+    std::cout << "[RUN] test_thread_cpu_time" << std::endl;
+    uint64_t c0 = 0, c1 = 0, c2 = 0;
+    assert(Thread::current_cpu_time_us(c0));
+    Thread::sleep_ms(200);
+    assert(Thread::current_cpu_time_us(c1));
+    assert(c1 - c0 < 50000);   // asleep: not CPU time
+    const uint64_t w0 = Thread::get_time_us();
+    spin_cpu_us(100000);
+    const uint64_t wall = Thread::get_time_us() - w0;
+    assert(Thread::current_cpu_time_us(c2));
+    assert(c2 - c1 >= 100000 && c2 - c1 <= wall + 2000);
+
+    // Another thread's CPU time, read while it runs
+    struct Shared { std::atomic<int> phase{0}; } sh;
+    Thread t;
+    assert(t.start([](void* arg) {
+        auto* s = static_cast<Shared*>(arg);
+        spin_cpu_us(150000);
+        s->phase.store(1);
+        while (s->phase.load() != 2) Thread::sleep_ms(5);
+    }, &sh));
+    while (sh.phase.load() != 1) Thread::sleep_ms(5);
+    uint64_t busy = 0;
+    assert(t.cpu_time_us(busy));
+    assert(busy >= 150000 && busy < 250000);
+    Thread::sleep_ms(100);   // it sleeps now: its CPU time stays
+    uint64_t later = 0;
+    assert(t.cpu_time_us(later));
+    assert(later - busy < 50000);
+    sh.phase.store(2);
+    assert(t.join());
+    assert(!t.cpu_time_us(busy));   // joined: nothing to read
+    std::cout << "[PASS] test_thread_cpu_time" << std::endl;
+}
+
 int main() {
     std::cout << "=== Running Kube32 OSAL Tests ===" << std::endl;
     test_thread_lifecycle();
     test_thread_static_utilities();
+    test_thread_cpu_time();
     test_mutex_basic();
     test_recursive_mutex();
     test_condition_variable();

@@ -50,6 +50,30 @@ static const uint8_t wasm_tone_loop[] = {
     0x0a, 0x16, 0x01, 0x14, 0x00, 0x03, 0x40, 0x41, 0xb8, 0x03, 0x41, 0xd0, 0x0f, 0x41, 0x00, 0x10, 0x00, 0x1a, 0x0c, 0x00, 0x0b, 0x41, 0x00, 0x0b
 };
 
+// An app_main pod runs on its own thread, whose CPU time the container
+// reports: a spinning pod about the time it spun, a sleeping one next to
+// nothing.
+void test_entry_point_thread_cpu_time() {
+    auto rt = create_wasm_runtime();
+    assert(rt->deploy_workload("spinner", wasm_infinite_loop, sizeof(wasm_infinite_loop), 64 * 1024));
+    assert(rt->deploy_workload("sleeper", wasm_long_sleep, sizeof(wasm_long_sleep), 64 * 1024));
+    assert(rt->start("spinner"));
+    assert(rt->start("sleeper"));
+    const uint64_t w0 = osal::Thread::get_time_us();
+    osal::Thread::sleep_ms(300);
+    ContainerStatus spin = rt->get_status("spinner");
+    ContainerStatus sleep = rt->get_status("sleeper");
+    const uint64_t wall = osal::Thread::get_time_us() - w0;
+    std::cout << "[cpu] app_main threads after " << wall / 1000 << " ms: spinning " << spin.thread_cpu_us
+              << " us, sleeping " << sleep.thread_cpu_us << " us" << std::endl;
+    assert(spin.has_thread_cpu && sleep.has_thread_cpu);
+    assert(spin.thread_cpu_us >= 50000 && spin.thread_cpu_us <= wall + 2000);
+    assert(sleep.thread_cpu_us < 30000);
+    assert(rt->terminate("sleeper"));
+    assert(rt->terminate("spinner"));
+    std::cout << "[PASS] test_entry_point_thread_cpu_time" << std::endl;
+}
+
 // A guest sleeping in esp32_delay_ms leaves the call when the container is
 // stopped, so the stop completes and frees its thread at once.
 void test_stop_interrupts_blocking_host_call() {
@@ -486,6 +510,7 @@ int main() {
     test_stress_repeated_termination_and_destruction();
     test_concurrent_uncooperative_loops();
     test_stop_interrupts_blocking_host_call();
+    test_entry_point_thread_cpu_time();
     test_lingering_container_is_reaped();
 
     // Generic Pin Rollback on Multi-Resource Allocation Failure

@@ -9,6 +9,7 @@
 #include "runtime/host_functions.hpp"
 #include "runtime/app_pod.hpp"
 #include "runtime/pod_fs.hpp"
+#include "runtime/pod_cpu.hpp"
 #include "osal/system.hpp"
 #include "osal/socket.hpp"
 #include "osal/sha256.hpp"
@@ -33,6 +34,30 @@
 #endif
 
 namespace kube32::runtime {
+
+static thread_local PodCpuRegion* t_cpu_region = nullptr;
+static thread_local std::atomic<uint64_t>* t_nested_cpu_sink = nullptr;
+
+PodCpuRegion::PodCpuRegion() : parent_(t_cpu_region) {
+    measured_ = osal::Thread::current_cpu_time_us(start_us_);
+    t_cpu_region = this;
+}
+
+uint64_t PodCpuRegion::finish() {
+    if (done_) return 0;
+    done_ = true;
+    t_cpu_region = parent_;
+    uint64_t now = 0;
+    if (!measured_ || !osal::Thread::current_cpu_time_us(now) || now < start_us_) return 0;
+    const uint64_t total = now - start_us_;
+    if (parent_) parent_->nested_us_ += total;
+    else if (t_nested_cpu_sink) t_nested_cpu_sink->fetch_add(total);
+    return total > nested_us_ ? total - nested_us_ : 0;
+}
+
+void set_thread_nested_cpu_sink(std::atomic<uint64_t>* sink) {
+    t_nested_cpu_sink = sink;
+}
 
 // Held while a call runs on the shared interpreter stack, and while a module
 // loads with its compile scratch lent from it (CompileScratchLoan)
@@ -415,10 +440,26 @@ void ContainerLifecycleController::worker_thread_entry(void* arg) {
 }
 
 void ContainerLifecycleController::worker_thread_main() {
+    set_thread_nested_cpu_sink(&worker_nested_cpu_us_);
+    run_entry_point();
+    set_thread_nested_cpu_sink(nullptr);
+    {
+        // The thread ends: its CPU time is kept and the thread not read again
+        uint64_t cpu = 0;
+        const bool measured = osal::Thread::current_cpu_time_us(cpu);
+        osal::LockGuard guard(mutex_);
+        worker_cpu_thread_ = nullptr;
+        worker_cpu_us_ = cpu;
+        worker_cpu_measured_ = measured;
+    }
+    worker_done_.store(true);
+}
+
+void ContainerLifecycleController::run_entry_point() {
     IM3Function entry_fn = nullptr;
     IM3Runtime runtime = reinterpret_cast<IM3Runtime>(m3_runtime_);
 
-    if (!runtime) { worker_done_.store(true); return; }
+    if (!runtime) return;
 
     // Look for standard entrypoints: _start, app_main, main
     if (m3_FindFunction(&entry_fn, runtime, "_start") != m3Err_none) {
@@ -467,7 +508,6 @@ void ContainerLifecycleController::worker_thread_main() {
         status_.exit_code = 0;
         status_.ready = false;
     }
-    worker_done_.store(true);
 }
 
 void ContainerLifecycleController::on_trap_caught_locked(const std::string& trap_message, int32_t exit_code, const std::string& reason) {
@@ -540,8 +580,12 @@ bool ContainerLifecycleController::start() {
     }
 #endif
 
+    worker_cpu_us_ = 0;
+    worker_cpu_measured_ = false;
+    worker_nested_cpu_us_.store(0);
     worker_thread_ = std::make_unique<osal::Thread>();
     bool ok = worker_thread_->start(worker_thread_entry, this, t_cfg);
+    if (ok) worker_cpu_thread_ = worker_thread_.get();   // the worker clears it under mutex_, which this function holds
     if (!ok) {
         worker_thread_.reset();
         if (pod_stack_) { kube32_pool_stack_free(pod_stack_); pod_stack_ = nullptr; }
@@ -682,6 +726,12 @@ ContainerStatus ContainerLifecycleController::get_status() {
     }
     if (m3_runtime_) {
         status_.runtime_bytes = m3_GetResourceUsage(reinterpret_cast<IM3Runtime>(m3_runtime_), c_m3Limit_MemoryBytes);
+    }
+    uint64_t cpu = worker_cpu_us_;
+    status_.has_thread_cpu = worker_cpu_thread_ ? worker_cpu_thread_->cpu_time_us(cpu) : worker_cpu_measured_;
+    if (status_.has_thread_cpu) {
+        const uint64_t nested = worker_nested_cpu_us_.load();
+        status_.thread_cpu_us = cpu > nested ? cpu - nested : 0;
     }
     return status_;
 }

@@ -303,6 +303,20 @@ int main() {
     c = call_pod("default/a-0", "/call?u=http://b/echo&m=POST", "POST", bin);
     assert(json_int(c.body, "rc") == 200 && json_int(c.body, "len") == 6);
 
+    // CPU time (runtime/pod_cpu.hpp): b's work is charged to b, not to a,
+    // which called it in-process on its own thread
+    runtime::AppPodHost& host = runtime::AppPodHost::instance();
+    auto cpu_of = [&](const char* pod) { return host.stats(pod).cpu_us; };
+    {
+        const uint64_t a0 = cpu_of("default/a-0"), b0 = cpu_of("default/b-0");
+        c = call_pod("default/a-0", "/call?u=http://b/spin%3Fms%3D200");
+        assert(json_int(c.body, "rc") == 200);
+        const uint64_t a = cpu_of("default/a-0") - a0, b = cpu_of("default/b-0") - b0;
+        std::cout << "[cpu] a calls b's 200 ms spin: a " << a << " us, b " << b << " us" << std::endl;
+        assert(b >= 50000 && b <= 260000);
+        assert(a < 50000 && a < b / 2);
+    }
+
     // A pod calling itself, and a cycle a -> b -> a: K32_ERR_LOOP, no deadlock
     c = call_pod("default/a-0", "/call?u=http://a/hello");
     std::cout << "[self] " << c.body << std::endl;
@@ -339,10 +353,12 @@ int main() {
     std::thread busy([]() { call_pod("default/b-0", "/spin?ms=1500"); });
     osal::Thread::sleep_ms(200);
     uint64_t t0 = osal::System::get_uptime_ms();
+    uint64_t a0 = cpu_of("default/a-0");
     c = call_pod("default/a-0", "/call?u=http://b/hello&t=300");
     uint64_t took = osal::System::get_uptime_ms() - t0;
-    std::cout << "[busy] " << c.body << " in " << took << " ms" << std::endl;
+    std::cout << "[busy] " << c.body << " in " << took << " ms, a used " << cpu_of("default/a-0") - a0 << " us of CPU" << std::endl;
     assert(json_int(c.body, "rc") == K32_ERR_TIMEOUT && took < 1200);
+    assert(cpu_of("default/a-0") - a0 < 50000);   // waiting for b's call lock is not CPU time
     busy.join();
 
     // Remote: Content-Length, chunked, keep-alive reuse, headers
@@ -369,10 +385,12 @@ int main() {
 
     // Remote timeout: honoured, and the caller's thread was free meanwhile
     t0 = osal::System::get_uptime_ms();
+    a0 = cpu_of("default/a-0");
     c = call_pod("default/a-0", "/call?u=http://r:8080/slow&t=300");
     took = osal::System::get_uptime_ms() - t0;
     std::cout << "[remote timeout] " << c.body << " in " << took << " ms" << std::endl;
     assert(json_int(c.body, "rc") == K32_ERR_TIMEOUT && took >= 250 && took < 1000);
+    assert(cpu_of("default/a-0") - a0 < 50000);   // blocked in the socket: not CPU time
 
     // Unreachable node
     store->put("/registry/services/default/gone", service_json("gone", "gone", "[{\"port\":80,\"targetPort\":1}]"), true);

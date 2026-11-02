@@ -161,6 +161,7 @@ public:
 private:
     static void worker_thread_entry(void* arg);
     void worker_thread_main();
+    void run_entry_point();
     void on_trap_caught_locked(const std::string& trap_message, int32_t exit_code, const std::string& reason);
     void cleanup_runtime();
 
@@ -194,6 +195,12 @@ private:
     std::atomic<bool> thread_detached_{false};
     std::atomic<bool> worker_done_{false};     // worker_thread_main returned
     std::atomic<bool> stop_gave_up_{false};    // stop() returned while the worker was still running
+    // CPU time of the worker thread: read from the thread while it runs
+    // (mutex_ keeps it from ending meanwhile), kept once it ended
+    osal::Thread* worker_cpu_thread_{nullptr};      // mutex_
+    uint64_t worker_cpu_us_{0};                     // mutex_
+    bool worker_cpu_measured_{false};               // mutex_
+    std::atomic<uint64_t> worker_nested_cpu_us_{0}; // calls into other pods made on the worker
 
     uint32_t consecutive_liveness_failures_{0};
     uint32_t consecutive_readiness_failures_{0};

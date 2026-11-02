@@ -162,8 +162,8 @@ struct SnapshotSummary {
 struct AppPodStats {
     uint64_t requests{0};
     uint64_t errors{0};
-    uint64_t total_us{0};
-    uint32_t last_us{0};
+    uint64_t cpu_us{0};      // CPU time of the pod's export calls (runtime/pod_cpu.hpp)
+    uint32_t last_us{0};     // wall time of the last request, lock wait included
     uint32_t max_us{0};
 };
 
@@ -293,6 +293,8 @@ private:
     };
     std::map<std::string, MigrationInfo> migration_;
     void set_busy(const std::string& pod_id, const char* fn);
+    // Charges a call's CPU time to the pod (AppPodStats::cpu_us)
+    void add_cpu(const std::string& pod_id, uint64_t us);
     // Puts events back at the front of the event queue, in order
     void requeue_events(const std::string& pod_id, std::vector<HeldEvent>&& events);
     // An export called with a fresh budget, named while it runs (freeze timeouts)
