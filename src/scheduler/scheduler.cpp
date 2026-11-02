@@ -110,6 +110,11 @@ ResourceSpec extract_pod_resource_requests(const std::string& pod_json) {
     }
 
     spec.memory_bytes = (total_mem > 0) ? total_mem : (16 * 1024);
+    // Pod Overhead: what the runtime takes beyond the containers' requests
+    // (set at admission), counted as Kubernetes' scheduler counts it
+    if (const models::JsonValue* overhead = spec_val->get("overhead"); overhead && overhead->is_object()) {
+        spec.memory_bytes += parse_quantity(overhead->get_string("memory", ""));
+    }
     spec.psram_bytes = total_psram;
     spec.gpio_pins = total_gpio;
     spec.i2c_buses = total_i2c;

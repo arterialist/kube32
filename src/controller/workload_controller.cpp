@@ -1,6 +1,7 @@
 #include "controller/workload_controller.hpp"
 #include "models/kube_models.hpp"
 #include "models/tolerations.hpp"
+#include "runtime/wasm_runtime.hpp"
 #include "osal/system.hpp"
 
 #include <algorithm>
@@ -224,6 +225,7 @@ std::string WorkloadController::create_pod(const std::string& owner_kind, const 
     if (owner_kind == "DaemonSet") models::add_daemon_pod_tolerations(pspec);
     models::add_default_tolerations(pspec);
     pod.set("spec", std::move(pspec));
+    runtime::set_pod_overhead(pod);   // as the API server's admission does for a created pod
     models::JsonValue st = jobj();
     st.set("phase", jstr("Pending"));
     pod.set("status", std::move(st));

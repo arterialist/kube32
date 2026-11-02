@@ -1,4 +1,5 @@
 #include "runtime/wasm_runtime.hpp"
+#include "runtime/image_registry.hpp"
 #if defined(ESP_PLATFORM)
 #include "esp_heap_caps.h"
 #endif
@@ -477,7 +478,7 @@ Wasm3Sizes this_build_sizes() {
 } // namespace
 
 size_t estimate_pod_memory(const uint8_t* wasm, size_t len, uint32_t memory_limit_bytes, uint32_t stack_bytes, bool stack_from_module,
-                           EstimateSizes which) {
+                           EstimateSizes which, size_t* out_linear) {
     const Wasm3Sizes z = which == EstimateSizes::Board ? kBoardSizes : this_build_sizes();
     // What the module declares: its function types, imports, functions,
     // exports, the first memory's initial pages and the function bodies
@@ -570,6 +571,7 @@ size_t estimate_pod_memory(const uint8_t* wasm, size_t len, uint32_t memory_limi
 
     const size_t page = 64 * 1024;
     const size_t linear = memory_limit_bytes < page ? memory_limit_bytes : (initial_pages ? initial_pages : 1) * page;
+    if (out_linear) *out_linear = linear;
     // Function bodies compile to about 0.78 code lines a byte, metering
     // included, on pages of d_m3CodePageAlignSize bytes
     const size_t code_bytes = code * 39 / 50 * z.line;
@@ -588,6 +590,70 @@ size_t estimate_pod_memory(const uint8_t* wasm, size_t len, uint32_t memory_limi
     int external = 0;
     if (kube32_pool_block_size() == 0 || (kube32_pool_available(&external), external)) need += 2048;
     return need;
+}
+
+size_t set_pod_overhead(models::JsonValue& pod) {
+    models::JsonValue* spec = pod.get_mut("spec");
+    if (!spec || !spec->is_object()) return 0;
+    const models::JsonValue* meta = pod.get("metadata");
+    const models::JsonValue* ann = meta ? meta->get("annotations") : nullptr;
+    auto annotation = [&](const char* key) {
+        const models::JsonValue* v = ann && ann->is_object() ? ann->get(key) : nullptr;
+        return v && v->is_string() ? v->str_val : std::string();
+    };
+    const models::JsonValue* containers = spec->get("containers");
+    if (!containers || !containers->is_array()) return 0;
+    size_t overhead = 0;
+    for (const auto& c : containers->arr_val) {
+        // The linear memory budget, as the kubelet takes it: esp32.io/psram
+        // when larger, else limits.memory, then requests.memory, then a page
+        uint64_t mem = 0, psram = 0;
+        if (const models::JsonValue* res = c.get("resources")) {
+            const models::JsonValue* lim = res->get("limits");
+            const models::JsonValue* req = res->get("requests");
+            if (lim && lim->is_object()) mem = models::parse_quantity(lim->get_string("memory", ""));
+            if (!mem && req && req->is_object()) mem = models::parse_quantity(req->get_string("memory", ""));
+            for (const models::JsonValue* r : {req, lim}) {
+                if (r && r->is_object()) psram = std::max<uint64_t>(psram, models::parse_quantity(r->get_string("esp32.io/psram", "")));
+            }
+        }
+        if (!mem) mem = 64 * 1024;
+        if (psram > mem) mem = psram;
+        uint32_t stack = mem <= 64 * 1024 ? 4 * 1024 : 16 * 1024;
+        bool stack_set = false;
+        if (const std::string v = annotation("kube32.io/wasm-stack"); !v.empty()) {
+            const uint64_t n = models::parse_quantity(v);
+            if (n >= 512 && n <= 64 * 1024) { stack = static_cast<uint32_t>(n); stack_set = true; }
+        }
+        const uint8_t* module = nullptr;
+        size_t module_len = 0;
+        if (const EmbeddedImage* img = ImageRegistry::instance().resolve(c.get_string("image", ""), nullptr)) {
+            module = img->data;
+            module_len = img->len;
+        } else if (const std::string size = annotation("kube32.io/wasm-size"); !size.empty()) {
+            module_len = static_cast<size_t>(models::parse_quantity(size));
+        } else {
+            continue;   // an image this node cannot see (on a worker's SD card): the kubelet's admission counts it
+        }
+        size_t linear = 0;
+        const size_t need = estimate_pod_memory(module, module_len, static_cast<uint32_t>(std::min<uint64_t>(mem, UINT32_MAX)), stack, !stack_set,
+                                                EstimateSizes::Board, &linear);
+        if (need > linear) overhead += need - linear;
+    }
+    if (overhead == 0) {
+        spec->remove("overhead");
+        return 0;
+    }
+    // Rounded up to whole KiB, as a quantity a client reads back unchanged
+    const size_t kib = (overhead + 1023) / 1024;
+    models::JsonValue o;
+    o.type = models::JsonType::Object;
+    models::JsonValue q;
+    q.type = models::JsonType::String;
+    q.str_val = std::to_string(kib) + "Ki";
+    o.set("memory", std::move(q));
+    spec->set("overhead", std::move(o));
+    return kib * 1024;
 }
 
 uint32_t module_stack_need_bytes(const M3Module* module) {

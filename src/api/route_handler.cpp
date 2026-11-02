@@ -10,6 +10,7 @@
 #include "models/kube_lease.hpp"
 #include "models/migration.hpp"
 #include "models/tolerations.hpp"
+#include "runtime/wasm_runtime.hpp"
 #include "net/network_policy.hpp"
 #include "runtime/pod_log.hpp"
 #include "runtime/pod_snapshot.hpp"
@@ -1759,6 +1760,8 @@ HttpResponse RouteHandler::handle_pods(const HttpRequest& req, const RouteMatch&
             // DefaultTolerationSeconds admission: 300 s on a not-ready or
             // unreachable node unless the pod sets its own toleration
             models::add_default_tolerations(*doc.get_mut("spec"));
+            // Pod Overhead admission: the runtime's memory beyond the containers'
+            runtime::set_pod_overhead(doc);
 
             std::string pod_json = doc.to_string();
 
@@ -1833,6 +1836,7 @@ HttpResponse RouteHandler::handle_pods(const HttpRequest& req, const RouteMatch&
         }
         // Admission runs on updates too: a replaced spec keeps the default tolerations
         if (models::JsonValue* pspec = doc.get_mut("spec"); pspec && pspec->is_object()) models::add_default_tolerations(*pspec);
+        runtime::set_pod_overhead(doc);
         const std::string updated_pod = doc.to_string();
         if (storage::Status ps = store_.put(key, updated_pod, true); !ps.ok()) return store_failure(ps, "pods", name);
         HttpResponse resp;
@@ -1864,6 +1868,7 @@ HttpResponse RouteHandler::handle_pods(const HttpRequest& req, const RouteMatch&
             models::apply_patch(target_doc, patch_doc, req.content_type);
             if (match.category != RouteCategory::PodStatus) {
                 if (models::JsonValue* pspec = target_doc.get_mut("spec"); pspec && pspec->is_object()) models::add_default_tolerations(*pspec);
+                runtime::set_pod_overhead(target_doc);
             }
             updated_json = target_doc.to_string();
             storage::Status ps = put_if_unchanged(store_, key, updated_json, version);

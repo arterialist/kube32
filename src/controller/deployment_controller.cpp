@@ -1,6 +1,7 @@
 #include "controller/deployment_controller.hpp"
 #include "models/kube_models.hpp"
 #include "models/tolerations.hpp"
+#include "runtime/wasm_runtime.hpp"
 #include "osal/system.hpp"
 
 #include <algorithm>
@@ -256,6 +257,7 @@ void DeploymentController::reconcile_one(const std::string& key, models::JsonVal
         if (tspec && tspec->is_object()) pspec = *tspec; else pspec.type = models::JsonType::Object;
         models::add_default_tolerations(pspec);   // as the API server's admission does for a created pod
         pod.set("spec", std::move(pspec));
+        runtime::set_pod_overhead(pod);
         models::JsonValue st;
         st.type = models::JsonType::Object;
         st.set("phase", jstr("Pending"));

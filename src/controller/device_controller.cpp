@@ -1,6 +1,7 @@
 #include "controller/device_controller.hpp"
 #include "models/kube_models.hpp"
 #include "models/tolerations.hpp"
+#include "runtime/wasm_runtime.hpp"
 #include "osal/system.hpp"
 #include "osal/thread.hpp"
 
@@ -652,6 +653,7 @@ std::string DeviceController::pod_json(const DeviceView& d, const NodeView* node
     set_str(pod, "kind", "Pod");
     set_val(pod, "metadata", std::move(meta));
     set_val(pod, "spec", std::move(spec));
+    runtime::set_pod_overhead(pod);   // Pod Overhead admission, as for a created pod
     models::JsonValue st = jobj();
     set_str(st, "phase", "Pending");
     set_val(pod, "status", std::move(st));
