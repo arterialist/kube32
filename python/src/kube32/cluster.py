@@ -1,4 +1,5 @@
 """`kube32 devices`, `checkpoint`, `move` and `checkpoints`."""
+import http.client
 import json
 import os
 import time
@@ -11,29 +12,53 @@ from .kube import ApiError, api_call
 from .pods import _NAME_RE
 
 
-def device_reading(pod, timeout):
-    """The latest reading of a driver pod, from its node's pod server
-    (GET / with X-Kube32-Pod): 'key=value ...', or why there is none."""
-    meta, status = pod.get("metadata", {}), pod.get("status", {}) or {}
-    ip = status.get("podIP") or ""
+def driver_address(pod):
+    """(pod IP, http port) of a driver pod, or None while it has none."""
+    ip = (pod.get("status", {}) or {}).get("podIP") or ""
     port = 0
     for c in pod.get("spec", {}).get("containers", []):
         for p in c.get("ports", []) or []:
             if p.get("name") == "http":
                 port = p.get("containerPort", 0)
-    if not ip or not port:
-        return "-"
-    req = urllib.request.Request("http://%s:%d/" % (ip, port),
-                                 headers={"X-Kube32-Pod": "%s/%s" % (meta.get("namespace", "default"), meta.get("name", ""))})
+    return (ip, port) if ip and port else None
+
+
+def driver_request(pod, timeout, method="GET", path="/", body=None):
+    """A request to a driver pod on its node's pod server (X-Kube32-Pod): (HTTP status, the JSON answer).
+    Raises OSError when the pod server does not answer and ValueError for an answer that is not JSON."""
+    ip, port = driver_address(pod) or ("", 0)
+    if not ip:
+        raise OSError("the driver pod has no address yet")
+    meta = pod.get("metadata", {})
+    headers = {"X-Kube32-Pod": "%s/%s" % (meta.get("namespace", "default"), meta.get("name", ""))}
+    data = None
+    if body is not None:
+        data = json.dumps(body).encode()
+        headers["Content-Type"] = "application/json"
+    req = urllib.request.Request("http://%s:%d%s" % (ip, port, path), data=data, headers=headers, method=method)
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
-            body = json.loads(resp.read().decode("utf-8", "replace"))
+            status, text = resp.status, resp.read().decode("utf-8", "replace")
     except urllib.error.HTTPError as e:
-        try:
-            body = json.loads(e.read().decode("utf-8", "replace"))
-        except ValueError:
-            return "http %d" % e.code
-    except (OSError, ValueError) as e:
+        status, text = e.code, e.read().decode("utf-8", "replace")
+    except http.client.HTTPException as e:     # a malformed answer
+        raise OSError("%s: %s" % (type(e).__name__, e))
+    try:
+        return status, json.loads(text)
+    except ValueError:
+        raise ValueError("http %d" % status if status != 200 else "the answer is not JSON")
+
+
+def device_reading(pod, timeout):
+    """The latest reading of a driver pod, from its node's pod server
+    (GET / with X-Kube32-Pod): 'key=value ...', or why there is none."""
+    if not driver_address(pod):
+        return "-"
+    try:
+        _, body = driver_request(pod, timeout)
+    except ValueError as e:
+        return str(e)
+    except OSError as e:
         return "unreachable (%s)" % (getattr(e, "reason", None) or e)
     if not body.get("ok", False):
         return "error: %s" % body.get("error", "?")

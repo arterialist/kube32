@@ -77,7 +77,8 @@ def build_c_sources(d, out_path, memory_bytes, stack_bytes, log):
                     sys.stderr.write(outp)
                 return EXIT_INPUT, "clang failed on %s (exit %d)" % (src, rc)
             objs.append(obj)
-        cmd = [lld, "-flavor", "wasm", "--no-entry", "--export-dynamic", "--allow-undefined",
+        # __heap_base: where the static data and the stack end (wasm.static_memory_bytes)
+        cmd = [lld, "-flavor", "wasm", "--no-entry", "--export-dynamic", "--export=__heap_base", "--allow-undefined",
                "-z", "stack-size=%d" % stack_bytes, "--initial-memory=%d" % memory_bytes, "--max-memory=%d" % memory_bytes,
                "-o", out_path] + objs
         log(" ".join(shlex.quote(c) for c in cmd))

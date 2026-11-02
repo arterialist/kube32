@@ -214,6 +214,7 @@ class Module:
         self.imported_table = False
         self.tables = 0
         self.globals = 0
+        self.global_inits = []   # [(valtype, mutable, value of an i32.const initializer or None)] of defined globals
         self.exports = []        # [(name, kind, index)]
         self.start = None
         self.data_segments = 0
@@ -345,10 +346,11 @@ def parse_module(data):
         elif sid == 6:
             m.globals = s.u32()
             for _ in range(m.globals):
-                if s.byte() == 0x7B:
+                valtype = s.byte()
+                if valtype == 0x7B:
                     m.unsupported.append((None, "a v128 global (SIMD)"))
-                s.byte()
-                _skip_const_expr(m, s)
+                mutable = s.byte() == 1
+                m.global_inits.append((valtype, mutable, _read_const_expr(m, s)))
         elif sid == 7:
             for _ in range(s.u32()):
                 nm = s.name()
@@ -380,7 +382,7 @@ def parse_module(data):
                     if flag == 2:
                         if s.u32() != 0:
                             m.feature_note("multi-memory", "data segment for memory > 0")
-                    _skip_const_expr(m, s)
+                    _read_const_expr(m, s)
                 s.bytes(s.u32())
         elif sid == 13:
             m.unsupported.append((None, "a tag section (exception handling, disabled in this wasm3 build)"))
@@ -393,13 +395,16 @@ def parse_module(data):
 EXTENDED_CONST = {0x6A: "i32.add", 0x6B: "i32.sub", 0x6C: "i32.mul", 0x7C: "i64.add", 0x7D: "i64.sub", 0x7E: "i64.mul"}
 
 
-def _skip_const_expr(m, r):
+def _read_const_expr(m, r):
+    """Reads a constant expression; returns its value when it is a lone i32.const, else None."""
+    value, ops = None, 0
     while True:
         op = r.byte()
         if op == 0x0B:
-            return
+            return value if ops == 1 else None
+        ops += 1
         if op == 0x41:
-            r.s_leb(32)
+            value = r.s_leb(32) & 0xFFFFFFFF
         elif op == 0x42:
             r.s_leb(64)
         elif op == 0x43:
@@ -714,6 +719,20 @@ def check_module(path, data, memory_limit=None):
     if m.imported_table:
         err("the module imports a table; the host provides none")
     return res
+
+
+def static_memory_bytes(m):
+    """The end of a module's static data, its zeroed data and its shadow stack in linear memory: the
+    initial value of the exported global __heap_base, which wasm-ld defines (kube32 build exports it
+    for C, and Rust exports it). None without that export: nothing then tells how much memory the
+    module uses."""
+    if m is None:
+        return None
+    imported = sum(1 for imp in m.imports if imp[2] == 3)
+    for (name, kind, index) in m.exports:
+        if kind == 3 and name == "__heap_base" and 0 <= index - imported < len(m.global_inits):
+            return m.global_inits[index - imported][2]
+    return None
 
 
 def hardware_for_name(text):
