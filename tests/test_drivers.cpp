@@ -1011,7 +1011,7 @@ void test_pool_estimates() {
     for (const char* name : {"bme688", "miniscale", "rfid", "chip-temp", "button", "switch"}) {
         const std::vector<uint8_t> wasm = image(std::string("driver-") + name);
         size_t linear = 0;
-        const size_t board = runtime::estimate_pod_memory(wasm.data(), wasm.size(), 3072, 4096, true, runtime::EstimateSizes::Board, &linear);
+        const size_t board = runtime::estimate_pod_memory(wasm.data(), wasm.size(), 3072, 4096, true, runtime::EstimateSizes::BoardHeld, &linear);
         const size_t scheduled = 3 * 1024 + (board - linear + 1023) / 1024 * 1024;
         std::cout << "[estimate] driver-" << name << ": " << wasm.size() << " bytes of Wasm, " << board << " bytes on a board, "
                   << scheduled / 1024 << " KiB with its overhead" << std::endl;

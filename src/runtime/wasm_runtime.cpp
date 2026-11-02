@@ -484,7 +484,8 @@ Wasm3Sizes this_build_sizes() {
 
 size_t estimate_pod_memory(const uint8_t* wasm, size_t len, uint32_t memory_limit_bytes, uint32_t stack_bytes, bool stack_from_module,
                            EstimateSizes which, size_t* out_linear) {
-    const Wasm3Sizes z = which == EstimateSizes::Board ? kBoardSizes : this_build_sizes();
+    const Wasm3Sizes z = which == EstimateSizes::ThisBuild ? this_build_sizes() : kBoardSizes;
+    const bool held_only = which == EstimateSizes::BoardHeld;
     // What the module declares: its function types, imports, functions,
     // exports, the first memory's initial pages and the function bodies
     std::vector<std::string> types;                              // parameter and result types of each
@@ -589,11 +590,11 @@ size_t estimate_pod_memory(const uint8_t* wasm, size_t len, uint32_t memory_limi
     need += pool_chunk(linear + z.memory_header) + pool_chunk(stack_bytes + 4 * z.slot);
     need += 256;                                                 // data and element segments, globals, a table
     // The compiler's scratch while the module loads, unless it is lent
-    if (!compile_scratch_lent()) need += pool_chunk(z.scratch);
+    if (!held_only && !compile_scratch_lent()) need += pool_chunk(z.scratch);
     // The pod's log ring, environment and registration, unless the pods of
     // this node live in an internal pool block (the general heap holds them)
     int external = 0;
-    if (kube32_pool_block_size() == 0 || (kube32_pool_available(&external), external)) need += 2048;
+    if (!held_only && (kube32_pool_block_size() == 0 || (kube32_pool_available(&external), external))) need += 2048;
     return need;
 }
 
@@ -642,7 +643,7 @@ size_t set_pod_overhead(models::JsonValue& pod) {
         }
         size_t linear = 0;
         const size_t need = estimate_pod_memory(module, module_len, static_cast<uint32_t>(std::min<uint64_t>(mem, UINT32_MAX)), stack, !stack_set,
-                                                EstimateSizes::Board, &linear);
+                                                EstimateSizes::BoardHeld, &linear);
         if (need > linear) overhead += need - linear;
     }
     if (overhead == 0) {

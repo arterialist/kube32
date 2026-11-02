@@ -136,7 +136,10 @@ std::unique_ptr<WasmRuntime> create_wasm_runtime();
 // Which sizes of wasm3's structures an estimate counts: the ESP32-S3
 // board's (admission's, also in the simulator, so that both admit the same
 // pods) or this build's
-enum class EstimateSizes { Board, ThisBuild };
+// BoardHeld: board sizes, and only what the pod holds while it runs (no
+// compiler scratch, no host-side state outside the pod's account): Pod
+// Overhead, which must not depend on the node that computes it
+enum class EstimateSizes { Board, ThisBuild, BoardHeld };
 
 // Memory a pod needs to start: its runtime and module structures, operand
 // stack, linear memory (memory_limit_bytes below one page, else the module's

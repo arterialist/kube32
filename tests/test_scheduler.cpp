@@ -439,7 +439,7 @@ void test_pod_overhead() {
     // from the module (4 KiB at most)
     kube32::models::JsonValue pod = parse(R"({"metadata":{"name":"e"},"spec":{"containers":[{"name":"c","image":"wasm://embedded/echo"}]}})");
     size_t linear = 0;
-    size_t need = kube32::runtime::estimate_pod_memory(echo->data, echo->len, 64 * 1024, 4 * 1024, true, kube32::runtime::EstimateSizes::Board, &linear);
+    size_t need = kube32::runtime::estimate_pod_memory(echo->data, echo->len, 64 * 1024, 4 * 1024, true, kube32::runtime::EstimateSizes::BoardHeld, &linear);
     assert(linear == 64 * 1024);
     size_t got = kube32::runtime::set_pod_overhead(pod);
     assert(got == kib_up(need - linear) && overhead_of(pod) == got);
@@ -450,7 +450,7 @@ void test_pod_overhead() {
     // what the scheduler counts, the overhead on top
     pod = parse(R"({"metadata":{"name":"e"},"spec":{"containers":[{"name":"c","image":"wasm://embedded/echo",)"
                 R"("resources":{"requests":{"memory":"3Ki"},"limits":{"memory":"3Ki"}}}]}})");
-    need = kube32::runtime::estimate_pod_memory(echo->data, echo->len, 3 * 1024, 4 * 1024, true, kube32::runtime::EstimateSizes::Board, &linear);
+    need = kube32::runtime::estimate_pod_memory(echo->data, echo->len, 3 * 1024, 4 * 1024, true, kube32::runtime::EstimateSizes::BoardHeld, &linear);
     assert(linear == 3 * 1024);
     got = kube32::runtime::set_pod_overhead(pod);
     assert(got == kib_up(need - linear) && overhead_of(pod) == got);
@@ -461,7 +461,7 @@ void test_pod_overhead() {
     // sets the stack
     pod = parse(R"({"metadata":{"name":"a","annotations":{"kube32.io/wasm-stack":"8Ki"}},"spec":{"containers":[{"name":"c",)"
                 R"("image":"wasm://embedded/tessera-api","resources":{"requests":{"memory":"16Ki","esp32.io/psram":"1280Ki"}}}]}})");
-    need = kube32::runtime::estimate_pod_memory(api->data, api->len, 1280 * 1024, 8 * 1024, false, kube32::runtime::EstimateSizes::Board, &linear);
+    need = kube32::runtime::estimate_pod_memory(api->data, api->len, 1280 * 1024, 8 * 1024, false, kube32::runtime::EstimateSizes::BoardHeld, &linear);
     got = kube32::runtime::set_pod_overhead(pod);
     assert(got == kib_up(need - linear) && got > 0);
     ResourceSpec req = extract_pod_resource_requests(pod.to_string());
@@ -470,7 +470,7 @@ void test_pod_overhead() {
     // An image in the control plane's image store: estimated from its size
     pod = parse(R"({"metadata":{"name":"s","annotations":{"kube32.io/wasm-size":"20000","kube32.io/wasm-sha256":"ab"}},)"
                 R"("spec":{"containers":[{"name":"c","image":"registry.local/s:1"}]}})");
-    need = kube32::runtime::estimate_pod_memory(nullptr, 20000, 64 * 1024, 4 * 1024, true, kube32::runtime::EstimateSizes::Board, &linear);
+    need = kube32::runtime::estimate_pod_memory(nullptr, 20000, 64 * 1024, 4 * 1024, true, kube32::runtime::EstimateSizes::BoardHeld, &linear);
     assert(kube32::runtime::set_pod_overhead(pod) == kib_up(need - linear));
 
     // An image this node cannot see (a worker's card): no overhead, and a
