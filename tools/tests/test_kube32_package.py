@@ -670,7 +670,7 @@ class TestVersionAndHelp(TempDirCase):
         rc, out, _ = run_cli("--help")
         self.assertEqual(rc, 0)
         for command in ("new", "build", "check", "deploy", "embed", "sd-push", "push", "firmware", "devices", "checkpoint",
-                        "move", "checkpoints", "flash", "console", "gateway", "sim", "version"):
+                        "move", "checkpoints", "mcp", "flash", "console", "gateway", "sim", "version"):
             self.assertRegex(out, r"\n    %s\s" % command)
         rc, out, err = run_cli("version", "--client", "--bogus")
         self.assertEqual(rc, 2)

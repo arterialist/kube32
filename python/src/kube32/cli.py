@@ -12,6 +12,8 @@
     kube32 firmware rollout                 update every node to the staged image, one at a time
     kube32 firmware status|abort|info       the rollout and each node's firmware; stop a rollout; read an image file
     kube32 devices [<name>...]              every Device with the latest reading of its driver (starts Idle ones)
+    kube32 mcp                              a Model Context Protocol server: AI agents read and operate Devices
+                                            and deploy the pods they write (stdio, or HTTP with --http)
     kube32 checkpoint <pod>                 save a running pod's state in a Checkpoint
     kube32 move <pod> [--to <node>]         move a running pod to another node with its state
     kube32 checkpoints                      list Checkpoints
@@ -48,6 +50,11 @@ from .pods import cmd_deploy, cmd_embed, cmd_push, cmd_sd_push
 
 def cmd_new(args):
     from .scaffold import cmd_new as run
+    return run(args)
+
+
+def cmd_mcp(args):
+    from .mcp import cmd_mcp as run
     return run(args)
 
 
@@ -229,6 +236,18 @@ def build_parser(prog="kube32"):
     dv.add_argument("--no-activate", action="store_true", help="list without starting the drivers of Idle Devices (no use reported)")
     kubectl_flags(dv)
     dv.set_defaults(func=cmd_devices)
+
+    mc = sub.add_parser("mcp", help="a Model Context Protocol server: AI agents such as Claude Code read and operate Devices "
+                                     "and deploy the pods they write")
+    mc.add_argument("--allow-writes", action="store_true",
+                    help="send actions to Devices (write_device) within each Device's kube32.io/limits; off by default")
+    mc.add_argument("--allow-deploy", action="store_true",
+                    help="build, deploy and delete pods (deploy_code, delete_workload); off by default")
+    mc.add_argument("-n", "--namespace", default="default", help="namespace of the pods the server deploys and reports (default default)")
+    mc.add_argument("--http", metavar="[HOST:]PORT", help="serve streamable HTTP at http://HOST:PORT/mcp instead of stdio (HOST default 127.0.0.1)")
+    mc.add_argument("--token", help="with --http: require 'Authorization: Bearer <token>' (default KUBE32_MCP_TOKEN); needed on a host other than loopback")
+    kubectl_flags(mc)
+    mc.set_defaults(func=cmd_mcp)
 
     def checkpoint_flags(sp, timeout):
         sp.add_argument("pod")
