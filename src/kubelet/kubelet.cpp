@@ -516,6 +516,43 @@ void Kubelet::fill_ready_condition(NodeTelemetry& t) const {
     }
 }
 
+// ,"lastState":{...} of the container's last termination, "" when none is known
+static std::string last_state_json(const LocalPodRecord& rec) {
+    if (!rec.has_last_state) return std::string();
+    return ",\"lastState\":{\"terminated\":{\"exitCode\":" + std::to_string(rec.last_exit_code) + ",\"reason\":\"" + rec.last_reason + "\"" +
+           (rec.last_message.empty() ? std::string() : ",\"message\":\"" + json_escape(rec.last_message) + "\"") +
+           (rec.last_started_at.empty() ? std::string() : ",\"startedAt\":\"" + rec.last_started_at + "\"") +
+           (rec.last_finished_at.empty() ? std::string() : ",\"finishedAt\":\"" + rec.last_finished_at + "\"") + "}}";
+}
+
+// A pod this kubelet has no record of, after its node restarted: the
+// container history the pod's status records stands in for one. The restart
+// count goes on from there, and a container that ran before is restarted
+// (counted, as Kubernetes counts a container a node reboot ended). One that
+// was running when the node went down has no exit code to tell: it is
+// recorded as Kubernetes records a container its kubelet lost.
+static bool history_from_status(const models::KubePod& pod, LocalPodRecord& out) {
+    if (!pod.container_ran && pod.start_time.empty()) return false;
+    out.restart_count = pod.first_restart_count;
+    out.restart_due = pod.container_ran;
+    out.start_time_set = !pod.start_time.empty();
+    if (pod.container_running) {
+        out.has_last_state = true;
+        out.last_exit_code = 137;
+        out.last_reason = "ContainerStatusUnknown";
+        out.last_message = "The container was running when its node restarted";
+        out.last_started_at = pod.container_started_at;
+    } else if (pod.has_last_state) {
+        out.has_last_state = true;
+        out.last_exit_code = pod.last_exit_code;
+        out.last_reason = pod.last_reason;
+        out.last_message = pod.last_message;
+        out.last_started_at = pod.last_started_at;
+        out.last_finished_at = pod.last_finished_at;
+    }
+    return true;
+}
+
 // The pod key "namespace/name" in `buf`
 static std::string_view pod_key_view(std::string_view ns, std::string_view name, char* buf, size_t cap) {
     if (ns.size() + 1 + name.size() > cap) return std::string_view();
@@ -678,7 +715,8 @@ void Kubelet::sync_assigned_pods() {
             it = active_pods_.end();
         }
         if (it == active_pods_.end()) {
-            start_pod_guarded(st.pod, st.manifest, nullptr);
+            LocalPodRecord history;
+            start_pod_guarded(st.pod, st.manifest, history_from_status(st.pod, history) ? &history : nullptr);
         } else {
             // Tried again once due: a crashed container after its back-off, a
             // container whose ConfigMap or Secret may exist by now, a pod the
@@ -796,7 +834,8 @@ bool Kubelet::wait_for(const std::string& pod_key, LocalPodRecord& rec, PodExecu
                                "{\"type\":\"ContainersReady\",\"status\":\"False\",\"reason\":\"ContainersNotReady\"}],"
                                "\"containerStatuses\":[{\"name\":\"" + rec.container_name + "\",\"image\":\"" + rec.image +
                                "\",\"ready\":false,\"started\":false,\"restartCount\":" + std::to_string(rec.restart_count) + ","
-                               "\"state\":{\"waiting\":{\"reason\":\"" + reason + "\",\"message\":\"" + json_escape(message) + "\"}}}]}}";
+                               "\"state\":{\"waiting\":{\"reason\":\"" + reason + "\",\"message\":\"" + json_escape(message) + "\"}}" +
+                               last_state_json(rec) + "}]}}";
     api_client_->patch_pod_status(rec.namespace_name, rec.name, status_patch);
     record_pod_event(rec, reason, message, true);
     return false;
@@ -833,10 +872,14 @@ bool Kubelet::deploy_and_start_pod(const models::KubePod& pod_in, const std::str
     if (previous) {
         rec.restart_count = previous->restart_count + (restarting ? 1 : 0);
         rec.crash_streak = previous->crash_streak;
+        rec.has_last_state = previous->has_last_state;
         rec.last_exit_code = previous->last_exit_code;
         rec.last_reason = previous->last_reason;
+        rec.last_message = previous->last_message;
+        rec.last_started_at = previous->last_started_at;
         rec.last_finished_at = previous->last_finished_at;
         rec.started_at_ms = previous->started_at_ms;
+        rec.start_time_set = previous->start_time_set;
         rec.shipped_log_seq = previous->shipped_log_seq;
     }
     // Lines after this one belong to the container instance started now
@@ -1019,7 +1062,8 @@ bool Kubelet::deploy_and_start_pod(const models::KubePod& pod_in, const std::str
                                        "{\"type\":\"ContainersReady\",\"status\":\"False\",\"reason\":\"ContainersNotReady\"}],"
                                        "\"containerStatuses\":[{\"name\":\"" + rec.container_name + "\",\"image\":\"" + pod.image +
                                        "\",\"ready\":false,\"started\":false,\"restartCount\":" + std::to_string(rec.restart_count) + ","
-                                       "\"state\":{\"waiting\":{\"reason\":\"CreateContainerConfigError\",\"message\":\"" + json_escape(env_err) + "\"}}}]}}";
+                                       "\"state\":{\"waiting\":{\"reason\":\"CreateContainerConfigError\",\"message\":\"" + json_escape(env_err) + "\"}}" +
+                                       last_state_json(rec) + "}]}}";
             api_client_->patch_pod_status(pod.namespace_name, pod.name, status_patch);
             record_pod_event(rec, "Failed", "Error: " + env_err, true);
             return false;
@@ -1267,21 +1311,24 @@ bool Kubelet::deploy_and_start_pod(const models::KubePod& pod_in, const std::str
     record_pod_event(rec, "Started", "Started container " + rec.container_name +
                                      (rec.restored_from.empty() ? std::string() : " from checkpoint " + rec.restored_from), false);
 
-    rec.execution_phase = PodExecutionPhase::Running;
-    rec.started_at_ms = osal::System::get_uptime_ms();
-    active_pods_[pod_key] = rec;
-
     // Report status to API server. Times come from the wall clock and are
     // omitted while it is unset.
     const std::string now = models::now_rfc3339();
+    // startTime: when the pod first started, kept over restarts and node restarts
+    const bool send_start_time = !rec.start_time_set && !now.empty();
+    rec.execution_phase = PodExecutionPhase::Running;
+    rec.started_at_ms = osal::System::get_uptime_ms();
+    rec.started_at = now;
+    rec.start_time_set = rec.start_time_set || send_start_time;
+    active_pods_[pod_key] = rec;
+
     std::string status_patch;
     status_patch.reserve(512);
     status_patch += "{\"status\":{";
     status_patch += "\"phase\":\"Running\",";
     status_patch += "\"podIP\":\"" + rec.pod_ip + "\",";
     status_patch += "\"hostIP\":\"" + config_.node_ip + "\",";
-    // startTime: when the pod first started here, not at restarts
-    if (!now.empty() && (!previous || previous->started_at_ms == 0)) status_patch += "\"startTime\":\"" + now + "\",";
+    if (send_start_time) status_patch += "\"startTime\":\"" + now + "\",";
     status_patch += "\"conditions\":[";
     status_patch += "{\"type\":\"PodScheduled\",\"status\":\"True\"},";
     status_patch += "{\"type\":\"Initialized\",\"status\":\"True\"},";
@@ -1294,10 +1341,7 @@ bool Kubelet::deploy_and_start_pod(const models::KubePod& pod_in, const std::str
     status_patch += "\"started\":true,";
     status_patch += "\"restartCount\":" + std::to_string(rec.restart_count) + ",";
     status_patch += "\"state\":{\"running\":{" + (now.empty() ? std::string() : "\"startedAt\":\"" + now + "\"") + "}}";
-    if (rec.restart_count > 0) {
-        status_patch += ",\"lastState\":{\"terminated\":{\"exitCode\":" + std::to_string(rec.last_exit_code) + ",\"reason\":\"" + rec.last_reason + "\"" +
-                        (rec.last_finished_at.empty() ? std::string() : ",\"finishedAt\":\"" + rec.last_finished_at + "\"") + "}}";
-    }
+    status_patch += last_state_json(rec);
     status_patch += "}]";
     status_patch += "}}";
 
@@ -1422,8 +1466,11 @@ void Kubelet::handle_container_exit(const std::string& pod_key, LocalPodRecord& 
     rec.crash_streak++;
     rec.next_restart_allowed_ms = now + delay;
     rec.execution_phase = PodExecutionPhase::CrashLoopBackOff;
+    rec.has_last_state = true;
     rec.last_exit_code = exit_code;
     rec.last_reason = reason;
+    rec.last_message = message;
+    rec.last_started_at = rec.started_at;
     rec.last_finished_at = finished;
     rec.last_error_message = message;
 
@@ -1436,9 +1483,8 @@ void Kubelet::handle_container_exit(const std::string& pod_key, LocalPodRecord& 
                     "{\"type\":\"ContainersReady\",\"status\":\"False\",\"reason\":\"ContainersNotReady\"}],";
     status_patch += "\"containerStatuses\":[{\"name\":\"" + cname + "\",\"image\":\"" + rec.image + "\",\"ready\":false,\"started\":false,";
     status_patch += "\"restartCount\":" + std::to_string(rec.restart_count) + ",";
-    status_patch += "\"state\":{\"waiting\":{\"reason\":\"CrashLoopBackOff\",\"message\":\"" + json_escape(backoff) + "\"}},";
-    status_patch += "\"lastState\":{\"terminated\":{\"exitCode\":" + std::to_string(exit_code) + ",\"reason\":\"" + reason + "\",\"message\":\"" +
-                    json_escape(message) + "\"" + (finished.empty() ? std::string() : ",\"finishedAt\":\"" + finished + "\"") + "}}";
+    status_patch += "\"state\":{\"waiting\":{\"reason\":\"CrashLoopBackOff\",\"message\":\"" + json_escape(backoff) + "\"}}";
+    status_patch += last_state_json(rec);
     status_patch += "}]}}";
     api_client_->patch_pod_status(rec.namespace_name, rec.name, status_patch);
     std::cout << "[KUBELET] " << pod_key << ": container " << cname << " exited (" << reason << ", exit code " << exit_code

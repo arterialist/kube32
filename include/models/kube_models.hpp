@@ -129,6 +129,20 @@ struct KubePod {
     std::vector<std::pair<std::string, std::string>> env; // container env name/value pairs
     std::map<std::string, std::string> labels;
     std::map<std::string, std::string> annotations;
+
+    // The first container's history as the pod's status records it, for a
+    // kubelet that starts a pod it has no record of (its node restarted)
+    std::string start_time;                  // status.startTime
+    uint32_t first_restart_count{0};         // containerStatuses[0].restartCount
+    bool container_ran{false};               // it started before: running, exited, crash looping or restarted
+    bool container_running{false};           // state.running: the node stopped it
+    std::string container_started_at;        // state.running.startedAt
+    bool has_last_state{false};              // lastState.terminated (or state.terminated)
+    int32_t last_exit_code{0};
+    std::string last_reason;
+    std::string last_message;
+    std::string last_started_at;
+    std::string last_finished_at;
 };
 
 // Parses a Kubernetes resource quantity ("1536Ki", "2Mi", "64k", "1e3", "4096")

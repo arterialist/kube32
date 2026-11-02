@@ -43,11 +43,16 @@ struct LocalPodRecord {
     uint32_t restart_count{0};               // containers restarted so far (status restartCount)
     uint32_t crash_streak{0};                // restarts since the container last ran 10 minutes
     uint64_t started_at_ms{0};
+    std::string started_at;                  // state.running.startedAt of the running container ("" without a wall clock)
+    bool start_time_set{false};              // the pod's status.startTime is written
     uint64_t next_restart_allowed_ms{0};     // end of the CrashLoopBackOff delay, or of the wait before a config retry
     bool restart_due{false};                 // a container exited and the next start is a restart
     // Last terminated container, reported as lastState after a restart
+    bool has_last_state{false};
     int32_t last_exit_code{0};
     std::string last_reason;
+    std::string last_message;
+    std::string last_started_at;
     std::string last_finished_at;
     std::string last_error_message;
     std::string pod_ip;

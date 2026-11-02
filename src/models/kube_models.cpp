@@ -1126,6 +1126,32 @@ KubePod parse_pod_manifest(const std::string& json_str) {
         } else {
             pod.ready_containers = (pod.status == "Running") ? pod.total_containers : 0;
         }
+        pod.start_time = status->get_string("startTime", "");
+        const JsonValue* first = (cstatuses && cstatuses->is_array() && !cstatuses->arr_val.empty() && cstatuses->arr_val[0].is_object())
+                                     ? &cstatuses->arr_val[0] : nullptr;
+        if (first) {
+            pod.first_restart_count = static_cast<uint32_t>(first->get_int("restartCount", 0));
+            const JsonValue* state = first->get("state");
+            const JsonValue* last = first->get("lastState");
+            const JsonValue* running = state ? state->get("running") : nullptr;
+            const JsonValue* waiting = state ? state->get("waiting") : nullptr;
+            const JsonValue* ended = state ? state->get("terminated") : nullptr;
+            if (!ended && last) ended = last->get("terminated");
+            if (running && running->is_object()) {
+                pod.container_running = true;
+                pod.container_started_at = running->get_string("startedAt", "");
+            }
+            if (ended && ended->is_object()) {
+                pod.has_last_state = true;
+                pod.last_exit_code = static_cast<int32_t>(ended->get_int("exitCode", 0));
+                pod.last_reason = ended->get_string("reason", "");
+                pod.last_message = ended->get_string("message", "");
+                pod.last_started_at = ended->get_string("startedAt", "");
+                pod.last_finished_at = ended->get_string("finishedAt", "");
+            }
+            pod.container_ran = pod.container_running || pod.has_last_state || pod.first_restart_count > 0 ||
+                                (waiting && waiting->get_string("reason", "") == "CrashLoopBackOff");
+        }
     }
 
     return pod;

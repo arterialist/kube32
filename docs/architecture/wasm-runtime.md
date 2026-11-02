@@ -93,6 +93,8 @@ When a container exits, the kubelet releases its memory, thread, open files, and
 
 Restarts back off for 10 s, doubling up to 5 minutes, and reset to 10 s after 10 minutes of running. While waiting, the pod stays `Running` with the container in `CrashLoopBackOff`, `lastState` holding the exit code and reason, and a `BackOff` event. Each restart loads a fresh instance, increments `restartCount`, and rotates the container log so `kubectl logs --previous` serves the prior instance.
 
+A node restart (a reboot, a crash, a firmware rollout) ends its containers, and the kubelet that comes up has no record of them. It reads the container's history from the pod's status: `restartCount` continues from the stored count, and a container that had run before (running, crash looping, or restarted earlier) starts again as a restart and increments it, as on a Kubernetes node that reboots. `startTime` keeps its first value. A container that was running when the node went down has no exit code; its `lastState` is `terminated` with reason `ContainerStatusUnknown`, exit code 137, and the `startedAt` it had, as the Kubernetes kubelet reports a container it lost. A crash-looping container keeps the `lastState` it had.
+
 ## Host functions
 
 Every module links two function groups in the `env` module:
