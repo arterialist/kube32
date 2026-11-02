@@ -5,11 +5,13 @@
 // server's MetricsRegistry with its heartbeat.
 //
 // Platform split:
-//   * Host simulator: HostMetricsProvider measures the process (resident set
-//     size, getrusage CPU time). Both simulated kubelets live in that process,
-//     so they report the process's usage.
-//   * ESP32: EspMetricsProvider reports memory from the heap allocator (total
-//     internal heap minus free) and CPU only once the firmware installs a
+//   * Host simulator: HostMetricsProvider measures the host's RAM in use (or
+//     what pods hold of a modelled board's heap and pool block, with
+//     --heap-budget) and the process's getrusage CPU time. Both simulated
+//     kubelets live in that process, so they report the process's usage.
+//   * ESP32: EspMetricsProvider reports memory from the heap allocator (internal
+//     heap and PSRAM in use, less the pool block's free part, on the base of
+//     capacity.memory) and CPU only once the firmware installs a
 //     CpuTimeSampler (FreeRTOS run-time stats). Until then CPU is "not
 //     measured" and the API omits it; nothing is ever reported as zero.
 //
@@ -30,7 +32,7 @@ namespace kube32::kubelet {
 
 struct NodeResourceSample {
     bool has_memory{false};
-    uint64_t memory_used_bytes{0};   // internal heap in use
+    uint64_t memory_used_bytes{0};   // internal heap and PSRAM in use
     bool has_cpu{false};
     uint64_t cpu_busy_us{0};         // cumulative busy time summed over all cores
     uint64_t cpu_wall_us{0};         // cumulative wall-clock time the busy figure spans

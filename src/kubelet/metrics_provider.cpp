@@ -9,12 +9,6 @@
 #else
 #include <sys/resource.h>
 #include <sys/time.h>
-#if defined(__APPLE__)
-#include <mach/mach.h>
-#else
-#include <cstdio>
-#include <unistd.h>
-#endif
 #endif
 
 namespace kube32::kubelet {
@@ -54,11 +48,18 @@ class EspMetricsProvider : public MetricsProvider {
 public:
     bool sample_node(NodeResourceSample& out) override {
         out = NodeResourceSample{};
-        size_t total = heap_caps_get_total_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
-        size_t free_b = heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
-        if (total > 0 && free_b <= total) {
+        // On the base of capacity.memory (internal heap and PSRAM): what is
+        // allocated in both, less the pool block's free part, which the block
+        // holds for pods but nothing uses
+        const size_t total = heap_caps_get_total_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+        const size_t free_b = heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+        const size_t psram_total = heap_caps_get_total_size(MALLOC_CAP_SPIRAM);
+        const size_t psram_free = heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
+        if (total > 0 && free_b <= total && psram_free <= psram_total) {
+            const uint64_t used = static_cast<uint64_t>(total - free_b) + (psram_total - psram_free);
+            const uint64_t block_free = kube32_pool_available(nullptr);
             out.has_memory = true;
-            out.memory_used_bytes = total - free_b;
+            out.memory_used_bytes = used > block_free ? used - block_free : 0;
         }
         uint64_t busy = 0, wall = 0;
         if (s_cpu_sampler && s_cpu_sampler(busy, wall) && wall > 0) {
@@ -90,24 +91,19 @@ public:
                               static_cast<uint64_t>(ru.ru_stime.tv_sec) * 1000000ULL + static_cast<uint64_t>(ru.ru_stime.tv_usec);
             out.cpu_wall_us = osal::Thread::get_time_us();
         }
-#if defined(__APPLE__)
-        mach_task_basic_info info;
-        mach_msg_type_number_t count = MACH_TASK_BASIC_INFO_COUNT;
-        if (task_info(mach_task_self(), MACH_TASK_BASIC_INFO, reinterpret_cast<task_info_t>(&info), &count) == KERN_SUCCESS) {
+        // On the base of capacity.memory: the heap a simulated board has
+        // (--heap-budget) and its pool block, or the host's RAM
+        if (kube32_pool_heap_budget()) {
             out.has_memory = true;
-            out.memory_used_bytes = static_cast<uint64_t>(info.resident_size);
-        }
-#else
-        FILE* f = fopen("/proc/self/statm", "r");
-        if (f) {
-            unsigned long size = 0, resident = 0;
-            if (fscanf(f, "%lu %lu", &size, &resident) == 2) {
+            out.memory_used_bytes = kube32_pool_general_bytes() + (kube32_pool_block_size() - kube32_pool_available(nullptr));
+        } else {
+            const size_t total = osal::System::get_total_heap_bytes();
+            const size_t available = osal::System::get_free_heap_bytes();
+            if (total > 0 && available <= total) {
                 out.has_memory = true;
-                out.memory_used_bytes = static_cast<uint64_t>(resident) * static_cast<uint64_t>(sysconf(_SC_PAGESIZE));
+                out.memory_used_bytes = total - available;
             }
-            fclose(f);
         }
-#endif
         return out.has_memory || out.has_cpu;
     }
     bool sample_pod(const std::string& pod_key, runtime::Runtime& rt, PodResourceSample& out) override {
