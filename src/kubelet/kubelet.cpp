@@ -249,6 +249,7 @@ void Kubelet::task_entry(void* arg) {
 
 void Kubelet::run_loop() {
     while (running_.load()) {
+        const char* step = "registration";   // named in the log when it throws
         try {
             if (!registered_.load()) {
                 reconcile_node_registration();
@@ -256,25 +257,30 @@ void Kubelet::run_loop() {
                 uint64_t now = osal::System::get_uptime_ms();
 
                 if (now - last_sync_ms_ >= config_.sync_frequency_ms) {
+                    step = "pod sync";
                     sync_assigned_pods();
                 }
 
                 if (now - last_status_report_ms_ >= config_.pod_status_frequency_ms) {
+                    step = "pod status";
                     monitor_and_report_pod_statuses();
                 }
 
                 if (config_.node_label_source && now - last_label_refresh_ms_ >= config_.node_label_refresh_ms) {
+                    step = "node labels";
                     refresh_node_labels();
                 } else if (!config_.node_label_source && now - last_label_refresh_ms_ >= config_.node_label_refresh_ms) {
                     last_label_refresh_ms_ = now;
+                    step = "node annotations";
                     patch_node_annotations();   // what changed (the card's free space), or a patch that failed
                 }
             }
             // Runs unregistered too: an image that cannot reach the API
             // server must still reject itself in time
+            step = "firmware";
             if (firmware_) firmware_->tick(osal::System::get_uptime_ms(), registered_.load());
         } catch (const std::exception& e) {
-            std::cout << "[KUBELET] loop iteration failed: " << e.what() << " (free heap "
+            std::cout << "[KUBELET] " << step << " failed: " << e.what() << " (free heap "
                       << osal::System::get_free_heap_bytes() << ")" << std::endl;
             osal::Thread::sleep_ms(500);
         }
