@@ -143,14 +143,14 @@ void add_subscriptions(const std::string& json, std::set<std::string>& out) {
     if (!meta || !meta->get_string("deletionTimestamp", "").empty() || phase == "Succeeded" || phase == "Failed") return;
     const models::JsonValue* ann = meta->get("annotations");
     const std::string topics = ann ? ann->get_string(models::kAnnotationEventTopics, "") : "";
+    // Topics are separated by commas or whitespace, as the kubelet reads them
     const size_t prefix = std::strlen(models::kDeviceTopicPrefix);
     for (size_t start = 0; start < topics.size();) {
-        size_t end = topics.find(',', start);
+        size_t end = topics.find_first_of(", \t\n", start);
         if (end == std::string::npos) end = topics.size();
-        size_t a = start, b = end;
-        while (a < b && topics[a] == ' ') ++a;
-        while (b > a && topics[b - 1] == ' ') --b;
-        if (b - a > prefix && topics.compare(a, prefix, models::kDeviceTopicPrefix) == 0) out.insert(topics.substr(a + prefix, b - a - prefix));
+        if (end - start > prefix && topics.compare(start, prefix, models::kDeviceTopicPrefix) == 0) {
+            out.insert(topics.substr(start + prefix, end - start - prefix));
+        }
         start = end + 1;
     }
 }
