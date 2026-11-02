@@ -451,14 +451,14 @@ static Measured measure(size_t module_size, uint16_t port, int watchers, int pod
         assert(seen == pods);
         record("kubelet sync pass", w);
         if (module_size > 0) {
-            std::vector<uint8_t> got;
+            runtime::ModuleBytes got;
             std::string why;
             const std::vector<uint8_t> want = module_bytes(module_size, 0);
             m = board::mark();
             const bool ok = client.get_image(digest_of(want), got, why);
             w = board::since(m);
-            assert(ok && got == want);
-            record("kubelet image fetch", w);   // retains the module, which the runtime takes over
+            assert(ok && std::vector<uint8_t>(got.begin(), got.end()) == want);
+            record("kubelet image fetch", w);   // the module goes to pod memory, outside this heap
         }
     }
     // A status update as the kubelet sends it, to every watcher
@@ -591,7 +591,7 @@ static bool deploy_on_board(size_t module_size, int watchers, int pods, uint16_t
         int seen = 0;
         try {
             expect("kubelet sync pass", kubelet.for_each_node_pod([&](const kubelet::PodListEntry&) { ++seen; }) ? 1 : 0, 1);
-            std::vector<uint8_t> module;
+            runtime::ModuleBytes module;
             std::string why;
             const bool pulled = kubelet.get_image(digests[i], module, why);
             if (!pulled) std::printf("    image: %s\n", why.c_str());
@@ -674,20 +674,19 @@ int main() {
     uint16_t port = 18760;
 
     // Peak heap per request type against module size: the same for a 64 KiB
-    // module as for none (the image itself aside, which the kubelet keeps)
+    // module as for none. The kubelet reads a module into pod memory (the
+    // pool block, then PSRAM above its reserve), not this heap: its fetch
+    // takes as much for a 64 KiB module as for a 10 KiB one.
     std::vector<std::pair<size_t, Measured>> by_size;
     for (size_t kib : {0, 10, 32, 64}) {
         const size_t size = kib * 1024 + (kib ? 400 : 0);
         by_size.emplace_back(size, measure(size, port++, 3, 3));
     }
     const Measured& none = by_size.front().second;
+    const Measured& small = by_size[1].second;
     for (const auto& [size, got] : by_size) {
         for (const auto& [what, w] : got.rows) {
-            if (what == "kubelet image fetch") {
-                assert(w.peak_total <= size + 32 * 1024);
-                continue;
-            }
-            const board::Window& base = none[what];
+            const board::Window& base = what == "kubelet image fetch" ? small[what] : none[what];
             assert(w.peak_total <= base.peak_total + 8 * 1024);
             assert(w.peak_internal <= base.peak_internal + 8 * 1024);
             assert(w.largest <= 16 * 1024);

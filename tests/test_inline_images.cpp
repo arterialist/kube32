@@ -409,9 +409,9 @@ static void test_server_filters_bodies_and_kubelets_read_modules() {
 
     // The kubelet reads the module by its digest, checked against it
     kubelet::HttpKubeClient client("127.0.0.1", o.port);
-    std::vector<uint8_t> got;
+    runtime::ModuleBytes got;
     std::string why;
-    assert(client.get_image(d, got, why) && got == m);
+    assert(client.get_image(d, got, why) && std::vector<uint8_t>(got.begin(), got.end()) == m);
     assert(!client.get_image(std::string(64, 'a'), got, why) && why.find("404") != std::string::npos && got.empty());
     assert(!client.get_image("not-a-digest", got, why));
     server.stop();

@@ -296,12 +296,25 @@ void ContainerLifecycleController::cleanup_runtime() {
     }
 }
 
-bool ContainerLifecycleController::deploy(std::vector<uint8_t>&& wasm_bytes) {
+bool ContainerLifecycleController::deploy(ModuleBytes&& wasm_bytes) {
     {
         osal::LockGuard guard(mutex_);
         wasm_bytecode_ = std::move(wasm_bytes);
+        wasm_bytecode_.charge_to(memory_account_);   // read before the pod's account opened
     }
     return deploy(wasm_bytecode_.data(), wasm_bytecode_.size());
+}
+
+// Images embedded in the firmware: memory mapped from flash on the board
+// (the S3 maps flash and PSRAM into one data address range, and a buffer in
+// PSRAM is not flash), part of the program in the simulator
+static bool module_is_mapped(const uint8_t* bytes, size_t len) {
+#if defined(ESP_PLATFORM)
+    (void)len;
+    return esp_ptr_in_drom(bytes) && !esp_ptr_external_ram(bytes);
+#else
+    return ImageRegistry::instance().holds(bytes, len);
+#endif
 }
 
 bool ContainerLifecycleController::deploy(const uint8_t* wasm_bytes, size_t len) {
@@ -321,26 +334,6 @@ bool ContainerLifecycleController::deploy(const uint8_t* wasm_bytes, size_t len)
         return false;
     }
 
-    // wasm3 keeps pointers into the binary for the lifetime of the module, so
-    // the bytes must stay valid. Images embedded in flash are memory mapped and
-    // are used in place; anything else (manifest-inline images) is copied. The
-    // S3 maps flash and PSRAM into one data address range: a buffer in PSRAM
-    // is not flash, and the pod's own copy is kept wherever it lives.
-    const bool own_copy = !wasm_bytecode_.empty() && wasm_bytes == wasm_bytecode_.data();
-#if defined(ESP_PLATFORM)
-    if (!own_copy && esp_ptr_in_drom(wasm_bytes) && !esp_ptr_external_ram(wasm_bytes)) {
-        wasm_bytecode_.clear();
-        wasm_bytecode_.shrink_to_fit();
-        wasm_view_ = wasm_bytes;
-        wasm_view_len_ = len;
-    } else
-#endif
-    {
-        if (!own_copy) wasm_bytecode_.assign(wasm_bytes, wasm_bytes + len);   // restart reuses the copy
-        wasm_view_ = wasm_bytecode_.data();
-        wasm_view_len_ = wasm_bytecode_.size();
-    }
-
     // A pod whose linear memory wants the pool's block whole keeps its own
     // runtime structures in the general heap, so the block stays free for it
     struct PreferGeneral {
@@ -348,6 +341,29 @@ bool ContainerLifecycleController::deploy(const uint8_t* wasm_bytes, size_t len)
         explicit PreferGeneral(bool o) : on(o) { if (on) kube32_pool_prefer_general(1); }
         ~PreferGeneral() { if (on) kube32_pool_prefer_general(0); }
     } prefer_general(kube32_pool_wants_block(config_.memory_limit_bytes) != 0);
+
+    // wasm3 keeps pointers into the module's bytes for the module's lifetime,
+    // so they must stay valid. An embedded image is used in place; other
+    // bytes are the pod's: taken over (deploy(ModuleBytes&&)), or copied into
+    // pod memory here. Restarts reuse them.
+    const bool own_copy = !wasm_bytecode_.empty() && wasm_bytes == wasm_bytecode_.data();
+    if (!own_copy && module_is_mapped(wasm_bytes, len)) {
+        wasm_bytecode_.clear();
+        wasm_view_ = wasm_bytes;
+        wasm_view_len_ = len;
+    } else {
+        if (!own_copy) {
+            ModuleBytes copy;
+            if (!copy.append(wasm_bytes, len)) {
+                status_.phase = ContainerPhase::Failed;
+                status_.exit_message = std::string("Wasm load error: ") + m3Err_mallocFailed + " (the module's " + std::to_string(len) + " bytes)";
+                return false;
+            }
+            wasm_bytecode_ = std::move(copy);
+        }
+        wasm_view_ = wasm_bytecode_.data();
+        wasm_view_len_ = wasm_bytecode_.size();
+    }
     m3_env_ = m3_NewEnvironment();
     if (!m3_env_) {
         status_.phase = ContainerPhase::Failed;
@@ -794,7 +810,8 @@ uint64_t ContainerLifecycleController::held_bytes() const {
 uint64_t ContainerLifecycleController::held_bytes_locked() const {
     if (!memory_account_) return 0;
     // What the runtime allocated for the container (kube32_rt_*, the pool
-    // block), each allocation as the allocator holds it
+    // block), each allocation as the allocator holds it, the module's bytes
+    // included when they are not memory mapped
     uint64_t held = kube32_pod_account_bytes(memory_account_);
 #if d_m3GuardedMemory
     // The host maps linear memory outside the pool: the committed pages of
@@ -808,8 +825,6 @@ uint64_t ContainerLifecycleController::held_bytes_locked() const {
         }
     }
 #endif
-    // The module's bytes when they are a copy (not mapped from flash)
-    if (!wasm_bytecode_.empty()) held += kube32_heap_allocated_size(wasm_bytecode_.data());
     return held + worker_stack_bytes_.load();
 }
 

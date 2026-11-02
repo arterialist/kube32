@@ -397,7 +397,6 @@ size_t kube32_pool_general_allocations(void) { return s_general_allocs.load(); }
 size_t kube32_pool_system_reserve(void) { return system_reserve(); }
 void kube32_pool_set_psram_reserve(size_t bytes) { s_psram_reserve.store(bytes); }
 size_t kube32_pool_psram_reserve(void) { return s_psram_reserve.load(); }
-size_t kube32_heap_allocated_size(const void* ptr) { return ptr ? general_size(ptr) : 0; }
 
 int kube32_pod_account_open(void) {
     for (int i = 1; i <= kAccounts; ++i) {
@@ -600,6 +599,33 @@ int kube32_rt_owner(const void* ptr) {
         if (in_sub_heap(ptr)) return static_cast<int>((static_cast<const SubChunk*>(ptr) - 1)->used) - 1;
     }
     return (static_cast<const GeneralHeader*>(ptr) - 1)->account;
+}
+
+void kube32_rt_set_owner(void* ptr, int account) {
+    if (!ptr) return;
+    if (account < 0 || account > kAccounts) account = 0;
+    if (kube32_pool_owns(ptr)) {
+        std::lock_guard<std::mutex> lock(s_sub_mutex);
+        uncharge(s_whole_owner, align8(s_whole_bytes));
+        s_whole_owner = account;
+        charge(account, align8(s_whole_bytes));
+        return;
+    }
+    if (sub_in_range(ptr)) {
+        std::lock_guard<std::mutex> lock(s_sub_mutex);
+        if (in_sub_heap(ptr)) {
+            SubChunk* c = static_cast<SubChunk*>(ptr) - 1;
+            uncharge(static_cast<int>(c->used) - 1, c->size);
+            c->used = static_cast<uint32_t>(account) + 1;
+            charge(account, c->size);
+            return;
+        }
+    }
+    GeneralHeader* h = header_of(ptr);
+    const size_t size = general_size(h);
+    uncharge(h->account, size);
+    h->account = account;
+    charge(account, size);
 }
 
 void* kube32_rt_realloc(void* ptr, size_t bytes) {

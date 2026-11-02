@@ -116,10 +116,11 @@ size_t kube32_pod_account_bytes(int account);   /* bytes it holds, headers inclu
 int    kube32_pod_account_enter(int account);   /* the thread's current account; returns the one before */
 void   kube32_pod_account_leave(int previous);
 int    kube32_rt_owner(const void* ptr);        /* the account an allocation is charged to */
+/* Charges an allocation to `account` from now on, and no longer to the one
+ * it was charged to (a module's bytes, read before its pod's account opened) */
+void   kube32_rt_set_owner(void* ptr, int account);
 /* Pod allocations in the general heap or PSRAM (each with its header) */
 size_t kube32_pool_general_allocations(void);
-/* Bytes the allocator holds for a heap pointer that is not the pool's */
-size_t kube32_heap_allocated_size(const void* ptr);
 /* General allocator for the interpreter: external RAM first when present,
  * internal otherwise. Keeps code pages and runtime structures out of the
  * 300 KB internal heap that Wi-Fi and lwIP need. */

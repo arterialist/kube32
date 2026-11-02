@@ -630,8 +630,9 @@ private:
 // Finds "kube32.io/wasm-base64":"<value>" in a stream and decodes the value
 class InlineImageExtractor {
 public:
-    explicit InlineImageExtractor(std::vector<uint8_t>& out) : out_(out) {}
-    void feed(const char* p, size_t n) {
+    explicit InlineImageExtractor(runtime::ModuleBytes& out) : out_(out) {}
+    // False once the module found no room
+    bool feed(const char* p, size_t n) {
         static const char kKey[] = "\"kube32.io/wasm-base64\":\"";
         for (size_t i = 0; i < n && !done_; ++i) {
             const char c = p[i];
@@ -652,13 +653,14 @@ public:
             bits_ += 6;
             if (bits_ >= 8) {
                 bits_ -= 8;
-                out_.push_back(static_cast<uint8_t>((acc_ >> bits_) & 0xFF));
+                if (!out_.push_back(static_cast<uint8_t>((acc_ >> bits_) & 0xFF))) return false;
             }
         }
+        return true;
     }
     bool found() const { return done_; }
 private:
-    std::vector<uint8_t>& out_;
+    runtime::ModuleBytes& out_;
     size_t matched_{0};
     bool in_value_{false};
     bool done_{false};
@@ -760,26 +762,32 @@ bool HttpKubeClient::for_each_node_pod(mem::FunctionRef<void(const PodListEntry&
     return status == 200 && splitter.complete() && !unreadable;
 }
 
-bool HttpKubeClient::get_pod_image(const std::string& ns, const std::string& name, std::vector<uint8_t>& out, std::string& why) {
+bool HttpKubeClient::get_pod_image(const std::string& ns, const std::string& name, runtime::ModuleBytes& out, std::string& why) {
     out.clear();
     InlineImageExtractor ex(out);
     bool reserved = false;
+    size_t no_room = 0;   // the bytes that found no room
     long content_length = -1;
-    int status = 0;
-    try {
-        status = stream_request("GET", "/api/v1/namespaces/" + ns + "/pods/" + name, "", [&](const char* data, size_t len) {
-            if (!reserved) {
-                reserved = true;
-                // The image is most of the pod: three quarters of the response
-                // bounds it, one allocation instead of repeated growth
-                if (content_length > 0) out.reserve(static_cast<size_t>(content_length) / 4 * 3);
+    const int status = stream_request("GET", "/api/v1/namespaces/" + ns + "/pods/" + name, "", [&](const char* data, size_t len) {
+        if (!reserved) {
+            reserved = true;
+            // The image is most of the pod: three quarters of the response
+            // bound it, one allocation instead of repeated growth
+            const size_t most = content_length > 0 ? static_cast<size_t>(content_length) / 4 * 3 : 0;
+            if (!out.reserve(most)) {
+                no_room = most;
+                return false;
             }
-            ex.feed(data, len);
-            return !ex.found();
-        }, &content_length);
-    } catch (const std::bad_alloc&) {
-        why = "not enough memory for the image of pod " + ns + "/" + name + " (" + std::to_string(content_length) + " byte pod)";
-        std::vector<uint8_t>().swap(out);
+        }
+        if (!ex.feed(data, len)) {
+            no_room = out.size() + 1;
+            return false;
+        }
+        return !ex.found();
+    }, &content_length);
+    if (no_room) {
+        why = runtime::module_no_memory(no_room) + " (the image of pod " + ns + "/" + name + ")";
+        out.clear();
         return false;
     }
     if (status != 200) {
@@ -792,10 +800,11 @@ bool HttpKubeClient::get_pod_image(const std::string& ns, const std::string& nam
         out.clear();
         return false;
     }
+    out.shrink_to_fit();
     return true;
 }
 
-bool HttpKubeClient::get_image(const std::string& sha256, std::vector<uint8_t>& out, std::string& why) {
+bool HttpKubeClient::get_image(const std::string& sha256, runtime::ModuleBytes& out, std::string& why) {
     out.clear();
     if (!osal::Sha256::valid_hex(sha256)) {
         why = "kube32.io/wasm-sha256 \"" + sha256 + "\" is not a SHA-256";
@@ -806,25 +815,31 @@ bool HttpKubeClient::get_image(const std::string& sha256, std::vector<uint8_t>& 
     osal::Sha256 sha;
     long content_length = -1;
     bool reserved = false;
-    int status = 0;
-    try {
-        status = stream_request("GET", path.view(), std::string_view(), [&](const char* data, size_t len) {
-            if (!reserved) {
-                reserved = true;
-                if (content_length > 0) out.reserve(static_cast<size_t>(content_length));
+    size_t no_room = 0;   // the bytes that found no room
+    const int status = stream_request("GET", path.view(), std::string_view(), [&](const char* data, size_t len) {
+        // One allocation of the module's size, in pod memory
+        if (!reserved) {
+            reserved = true;
+            if (content_length > 0 && !out.reserve(static_cast<size_t>(content_length))) {
+                no_room = static_cast<size_t>(content_length);
+                return false;
             }
-            sha.update(data, len);
-            out.insert(out.end(), reinterpret_cast<const uint8_t*>(data), reinterpret_cast<const uint8_t*>(data) + len);
-            return true;
-        }, &content_length);
-    } catch (const std::bad_alloc&) {
-        why = "not enough memory for image sha256:" + sha256.substr(0, 12) + " (" + std::to_string(content_length) + " bytes)";
-        std::vector<uint8_t>().swap(out);
+        }
+        sha.update(data, len);
+        if (!out.append(data, len)) {
+            no_room = out.size() + len;
+            return false;
+        }
+        return true;
+    }, &content_length);
+    if (no_room) {
+        why = runtime::module_no_memory(no_room) + " (image sha256:" + sha256.substr(0, 12) + ")";
+        out.clear();
         return false;
     }
     if (status != 200) {
         why = "image sha256:" + sha256.substr(0, 12) + ": http " + std::to_string(status);
-        std::vector<uint8_t>().swap(out);
+        out.clear();
         return false;
     }
     const std::string got = osal::Sha256::hex(sha.finish());
@@ -832,7 +847,7 @@ bool HttpKubeClient::get_image(const std::string& sha256, std::vector<uint8_t>& 
     for (char& c : want) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
     if (got != want || (content_length >= 0 && out.size() != static_cast<size_t>(content_length))) {
         why = "image sha256:" + sha256.substr(0, 12) + ": the bytes read (" + std::to_string(out.size()) + ") do not match the digest";
-        std::vector<uint8_t>().swap(out);
+        out.clear();
         return false;
     }
     return true;

@@ -1,18 +1,43 @@
 // What a pod takes from the pod pool of a board without PSRAM: an operand
 // stack sized from the module's call chains, no room for the compiler's
 // scratch (lent from the shared interpreter stack while a module loads), the
-// kubelet's estimate against what a load really takes, and loads that run
-// out of memory part way.
+// kubelet's estimate against what a load really takes, loads that run out of
+// memory part way, and a module read from the API server, which lives in
+// the block on the pod's account.
 
 #include "pod_test_util.hpp"
 #include "runtime/pod_memory_pool.h"
 #include "runtime/container_lifecycle.hpp"
+#include "kubelet/kube_api_client.hpp"
+#include "kubelet/kubelet.hpp"
+#include "osal/sha256.hpp"
+#include "osal/socket.hpp"
 #include "m3_env.h"
+#include "m3_host.h"
 
+#include <atomic>
 #include <cassert>
+#include <cstdlib>
 #include <cstring>
 #include <iostream>
+#include <new>
 #include <thread>
+
+// The general heap as Wi-Fi leaves it on a board without PSRAM: while set,
+// no piece of it holds more than this many bytes (0: any size)
+static std::atomic<size_t> g_heap_largest{0};
+void* operator new(size_t n) {
+    const size_t largest = g_heap_largest.load();
+    if (largest && n > largest) throw std::bad_alloc();
+    void* p = std::malloc(n ? n : 1);
+    if (!p) throw std::bad_alloc();
+    return p;
+}
+void* operator new[](size_t n) { return operator new(n); }
+void operator delete(void* p) noexcept { std::free(p); }
+void operator delete[](void* p) noexcept { std::free(p); }
+void operator delete(void* p, size_t) noexcept { std::free(p); }
+void operator delete[](void* p, size_t) noexcept { std::free(p); }
 
 using namespace kube32;
 
@@ -72,6 +97,201 @@ static size_t used_chunk_bytes() {
     size_t used = 0;
     kube32_pool_chunks([](size_t, size_t size, int in_use, void* ctx) { if (in_use) *static_cast<size_t*>(ctx) += size; }, &used);
     return used;
+}
+
+// An allocation of `bytes` in the block's small heap: 8-byte aligned, with its header
+static size_t pool_chunk(size_t bytes) { return ((bytes + 7) & ~static_cast<size_t>(7)) + 8; }
+
+// Whether the block's small heap has an allocation of exactly `size` bytes, header included
+static bool has_chunk(size_t size) {
+    struct Find { size_t size; bool found; } f{size, false};
+    kube32_pool_chunks([](size_t, size_t sz, int in_use, void* ctx) {
+        Find* f = static_cast<Find*>(ctx);
+        if (in_use && sz == f->size) f->found = true;
+    }, &f);
+    return f.found;
+}
+
+// A kubelet's API server: the pods given, and the module of an inline image
+// read over HTTP from a server that keeps it under its digest
+class ImageStoreClient : public kubelet::KubeApiClient {
+public:
+    explicit ImageStoreClient(uint16_t port) : http_("127.0.0.1", port) {}
+    std::vector<std::pair<models::KubePod, std::string>> pods;
+    std::vector<std::string> status_patches;
+    bool register_node(std::string_view, bool& c) override { c = false; return true; }
+    bool patch_node_status(const std::string&, std::string_view) override { return true; }
+    bool list_pods(std::vector<models::KubePod>&) override { return true; }
+    bool list_pods_raw(std::vector<std::pair<models::KubePod, std::string>>& out) override { out = pods; return true; }
+    bool patch_pod_status(const std::string&, const std::string&, const std::string& patch) override {
+        status_patches.push_back(patch);
+        return true;
+    }
+    bool get_image(const std::string& sha256, runtime::ModuleBytes& out, std::string& why) override { return http_.get_image(sha256, out, why); }
+    void add(const std::string& name, const std::string& digest, size_t size, const std::string& memory) {
+        const std::string m = "{\"metadata\":{\"name\":\"" + name + "\",\"namespace\":\"default\",\"annotations\":{\"kube32.io/wasm-sha256\":\"" +
+                              digest + "\",\"kube32.io/wasm-size\":\"" + std::to_string(size) + "\"}},\"spec\":{\"nodeName\":\"n1\",\"containers\":[{"
+                              "\"name\":\"c\",\"image\":\"wasm://inline/" + name + "\",\"resources\":{\"limits\":{\"memory\":\"" + memory + "\"}}}]}}";
+        pods.emplace_back(models::parse_pod_manifest(m), m);
+    }
+    size_t patches_with(const std::string& what) const {
+        size_t n = 0;
+        for (const auto& p : status_patches) if (p.find(what) != std::string::npos) ++n;
+        return n;
+    }
+
+private:
+    kubelet::HttpKubeClient http_;
+};
+
+// A module the kubelet reads from the API server's image store on a board
+// without PSRAM: it goes into the pool block in one allocation, the general
+// heap has no piece large enough for it and gives pods nothing, and once the
+// pod runs the bytes are on its account. The kubelet admits the pod with the
+// module counted.
+static void test_pulled_module_in_the_block(size_t block) {
+    const std::vector<uint8_t> wasm = k32test::svcprobe();
+    const std::string digest = osal::Sha256::hex(osal::Sha256::of(wasm.data(), wasm.size()));
+    std::string reply = "HTTP/1.1 200 OK\r\nContent-Type: application/wasm\r\nContent-Length: " + std::to_string(wasm.size()) +
+                        "\r\nConnection: close\r\n\r\n";
+    reply.append(reinterpret_cast<const char*>(wasm.data()), wasm.size());
+    const uint16_t port = 18790;
+    osal::Socket listener;
+    assert(listener.create(osal::SocketType::Tcp));
+    listener.set_reuse_addr(true);
+    assert(listener.bind("127.0.0.1", port) && listener.listen(4));
+    std::atomic<bool> serving{true};
+    std::thread server([&]() {
+        for (;;) {
+            osal::Socket c = listener.accept();
+            if (!serving.load()) break;
+            char head[1024];
+            c.recv(head, sizeof head);
+            c.send_all(reply.data(), reply.size());
+            c.close();
+        }
+    });
+    std::vector<uint8_t> interp(28 * 1024);
+    kube32_interp_stack_set(interp.data(), interp.size());
+    kube32_pool_set_heap_budget(kube32_pool_system_reserve());   // pods get none of the general heap
+    g_heap_largest.store(wasm.size() - 1);                         // which has no piece for the module
+    bool refused = false;
+    try {
+        std::vector<uint8_t> copy(wasm.begin(), wasm.end());
+    } catch (const std::bad_alloc&) {
+        refused = true;
+    }
+    assert(refused);   // one contiguous copy on the general heap finds no room
+
+    // The download: one allocation of the module's size in the block,
+    // nobody's until a pod takes it
+    {
+        kubelet::HttpKubeClient client("127.0.0.1", port);
+        runtime::ModuleBytes got;
+        std::string why;
+        assert(client.get_image(digest, got, why));
+        assert(got.size() == wasm.size() && std::memcmp(got.data(), wasm.data(), wasm.size()) == 0);
+        assert(kube32_pool_general_bytes() == 0 && used_chunk_bytes() == pool_chunk(wasm.size()));
+        assert(kube32_rt_owner(got.data()) == 0);
+        const int pod = kube32_pod_account_open();
+        got.charge_to(pod);
+        assert(kube32_rt_owner(got.data()) == pod && kube32_pod_account_bytes(pod) == pool_chunk(wasm.size()));
+        got.clear();
+        assert(kube32_pod_account_bytes(pod) == 0 && kube32_pool_available(nullptr) == block);
+        kube32_pod_account_close(pod);
+        std::cout << "[pull] " << wasm.size() << " bytes read into the block, the general heap untouched" << std::endl;
+    }
+
+    // The kubelet: the pod with the image in the store, admitted with its
+    // module counted, the module pulled into the block and kept by the
+    // container on the pod's account
+    {
+        auto store = std::make_unique<ImageStoreClient>(port);
+        store->add("pulled", digest, wasm.size(), "16Ki");
+        ImageStoreClient* api = store.get();
+        kubelet::KubeletConfig cfg;
+        cfg.node_name = "n1";
+        auto rt = runtime::create_wasm_runtime();
+        {
+            kubelet::Kubelet k(cfg, *rt, std::move(store));
+            k.sync_assigned_pods();
+            kubelet::LocalPodRecord rec;
+            assert(k.get_pod_record("default/pulled", rec));
+            if (rec.execution_phase != kubelet::PodExecutionPhase::Running) std::cout << "[pull] " << rec.last_error_message << std::endl;
+            assert(rec.execution_phase == kubelet::PodExecutionPhase::Running);
+            const runtime::ContainerStatus st = rt->get_status("default/pulled");
+            assert(st.bytecode_bytes == wasm.size());
+            // Everything the pod holds is in the block, the module's chunk
+            // among it, and all of it is on the pod's account
+            assert(kube32_pool_general_bytes() == 0 && has_chunk(pool_chunk(wasm.size())));
+            size_t outside = 0;   // linear memory the host maps outside the pool
+#if d_m3GuardedMemory
+            const size_t page = m3_HostPageSize();
+            outside = page + (16 * 1024 + page - 1) / page * page;
+#endif
+            std::cout << "[pull] the pod holds " << st.held_bytes - outside << " bytes of the block, its module's " << pool_chunk(wasm.size())
+                      << " among them; " << kube32_pool_available(nullptr) << " free" << std::endl;
+            assert(st.held_bytes == used_chunk_bytes() + outside);
+            // ... which the estimate with the module's bytes covers, as for
+            // the modules above (this build's structure sizes)
+            const size_t taken = used_chunk_bytes() + (outside ? 16 * 1024 : 0);
+            const size_t estimate = runtime::estimate_pod_memory(wasm.data(), wasm.size(), 16 * 1024, 4096, true, runtime::EstimateSizes::ThisBuild,
+                                                                 nullptr, true);
+            std::cout << "[pull] estimate " << estimate << " bytes, the pod took " << taken << std::endl;
+            assert(estimate >= taken && estimate <= taken + taken / 5);
+            api->pods.clear();
+            k.sync_assigned_pods();
+            assert(!rt->is_deployed("default/pulled"));
+        }
+        assert(kube32_pool_available(nullptr) == block);
+    }
+
+    // The block in pieces smaller than the module, with room enough in all
+    // for the pod: it is admitted, the pull finds no piece for the module,
+    // and the pod waits for memory as a load short of memory does (not
+    // ErrImagePull); it starts once the block has a piece for it
+    {
+        std::vector<void*> pieces;
+        while (void* p = kube32_pool_sub_alloc(1024)) pieces.push_back(p);
+        for (size_t i = 0; i < pieces.size(); i += 2) kube32_rt_free(pieces[i]);
+        assert(kube32_pool_largest_free() < wasm.size());
+        const size_t free_before = kube32_pool_available(nullptr);
+        auto store = std::make_unique<ImageStoreClient>(port);
+        store->add("pulled-late", digest, wasm.size(), "8Ki");
+        ImageStoreClient* api = store.get();
+        kubelet::KubeletConfig cfg;
+        cfg.node_name = "n1";
+        cfg.memory_retry_ms = 0;
+        auto rt = runtime::create_wasm_runtime();
+        {
+            kubelet::Kubelet k(cfg, *rt, std::move(store));
+            k.sync_assigned_pods();
+            kubelet::LocalPodRecord rec;
+            assert(k.get_pod_record("default/pulled-late", rec) && rec.execution_phase == kubelet::PodExecutionPhase::InsufficientMemory);
+            std::cout << "[pull] in pieces of " << kube32_pool_largest_free() << " bytes: " << rec.last_error_message << std::endl;
+            assert(runtime::module_error_is_out_of_memory(rec.last_error_message) && rec.load_failures == 1 && !rt->is_deployed("default/pulled-late"));
+            assert(api->patches_with("\"reason\":\"InsufficientMemory\"") == 1 && api->patches_with("ErrImagePull") == 0);
+            assert(kube32_pool_available(nullptr) == free_before && kube32_pool_general_bytes() == 0);   // the failed pull left nothing
+            for (size_t i = 1; i < pieces.size(); i += 2) kube32_rt_free(pieces[i]);
+            k.sync_assigned_pods();
+            assert(k.get_pod_record("default/pulled-late", rec) && rec.execution_phase == kubelet::PodExecutionPhase::Running);
+            api->pods.clear();
+            k.sync_assigned_pods();
+        }
+        assert(kube32_pool_available(nullptr) == block);
+    }
+    g_heap_largest.store(0);
+    kube32_pool_set_heap_budget(0);
+    kube32_interp_stack_set(nullptr, 0);
+    serving.store(false);
+    {
+        osal::Socket poke;   // the server's last accept
+        assert(poke.create(osal::SocketType::Tcp) && poke.connect("127.0.0.1", port, 1000));
+        poke.close();
+    }
+    server.join();
+    listener.close();
+    std::cout << "[pull] the pods ran with their module in the block and on their account" << std::endl;
 }
 
 // A pod's account holds what was allocated for it until that is freed, on
@@ -205,7 +425,8 @@ int main() {
 
     // The estimate the kubelet admits a pod on against what loading the pod
     // takes from the pool (with the interpreter stack lending the scratch,
-    // as on the board): close, and not below it
+    // as on the board): close, and not below it. The modules are not
+    // embedded images: the pod keeps a copy of their bytes, which counts
     {
         std::vector<uint8_t> interp(28 * 1024);
         kube32_interp_stack_set(interp.data(), interp.size());
@@ -221,7 +442,8 @@ int main() {
             cfg.memory_limit_bytes = img.memory;
             cfg.stack_size_bytes = 4096;
             cfg.stack_from_module = true;
-            const size_t estimate = runtime::estimate_pod_memory(wasm.data(), wasm.size(), img.memory, 4096, true, runtime::EstimateSizes::ThisBuild);
+            const size_t estimate = runtime::estimate_pod_memory(wasm.data(), wasm.size(), img.memory, 4096, true, runtime::EstimateSizes::ThisBuild,
+                                                                 nullptr, true);
             size_t taken = 0;
             {
                 runtime::ContainerLifecycleController pod(cfg);
@@ -229,11 +451,11 @@ int main() {
                 assert(pod.deploy(wasm.data(), wasm.size()));
                 taken = before - kube32_pool_available(nullptr) + kube32_pool_general_bytes();
                 // The pod's account is exactly what it holds of the pool and
-                // the heap; its memory figure adds the module's copy (and on
-                // the host the linear memory mapped outside the pool)
+                // the heap, the module's copy included; its memory figure
+                // adds, on the host, the linear memory mapped outside the pool
                 const size_t account = kube32_pod_account_bytes(pod.memory_account());
                 assert(account == used_chunk_bytes() + kube32_pool_general_bytes());
-                assert(pod.held_bytes() >= account + wasm.size());
+                assert(has_chunk(pool_chunk(wasm.size())) && pod.held_bytes() >= account);
                 std::cout << "[account] " << img.name << ": " << account << " bytes held, " << pod.held_bytes() << " in all" << std::endl;
 #if d_m3GuardedMemory
                 taken += img.memory;   // the host backs linear memory outside the pool
@@ -245,6 +467,51 @@ int main() {
         }
         kube32_interp_stack_set(nullptr, 0);
     }
+
+    // An embedded image is used in place: the same module deployed from the
+    // image registry and from a copy differ by the copy, one chunk of the
+    // block on the pod's account
+    {
+        std::vector<uint8_t> interp(28 * 1024);
+        kube32_interp_stack_set(interp.data(), interp.size());
+        static std::vector<std::vector<uint8_t>> embedded;   // the registry keeps pointers into them
+        for (const char* name : {"tessera-db", "rfid", "driver-bme688"}) {
+            embedded.push_back(k32test::read_file(std::string(KUBE32_SOURCE_DIR) + "/images/" + name + ".wasm"));
+            const std::vector<uint8_t>& image = embedded.back();
+            const std::string key = std::string("fit-") + name;
+            runtime::ImageRegistry::instance().add({strdup(key.c_str()), image.data(), image.size()});
+            const runtime::EmbeddedImage* mapped = runtime::ImageRegistry::instance().resolve("wasm://embedded/" + key);
+            assert(mapped && mapped->data == image.data());
+            const std::vector<uint8_t> copy = image;
+            runtime::ContainerConfig cfg;
+            cfg.pod_id = std::string("default/mapped-") + name;
+            cfg.memory_limit_bytes = 4 * 1024;
+            cfg.stack_size_bytes = 4096;
+            cfg.stack_from_module = true;
+            size_t in_place = 0, copied = 0;
+            {
+                runtime::ContainerLifecycleController pod(cfg);
+                assert(pod.deploy(mapped->data, mapped->len));
+                in_place = kube32_pod_account_bytes(pod.memory_account());
+                assert(pod.get_status().bytecode_bytes == 0);
+            }
+            {
+                runtime::ContainerLifecycleController pod(cfg);
+                assert(pod.deploy(copy.data(), copy.size()));
+                copied = kube32_pod_account_bytes(pod.memory_account());
+                assert(pod.get_status().bytecode_bytes == copy.size());
+            }
+            std::cout << "[module] " << name << ": " << in_place << " bytes on the account in place, " << copied << " with a copy" << std::endl;
+            assert(copied == in_place + pool_chunk(copy.size()));
+            const size_t a = runtime::estimate_pod_memory(copy.data(), copy.size(), 4096, 4096, true, runtime::EstimateSizes::ThisBuild);
+            const size_t b = runtime::estimate_pod_memory(copy.data(), copy.size(), 4096, 4096, true, runtime::EstimateSizes::ThisBuild, nullptr, true);
+            assert(b == a + pool_chunk(copy.size()));
+            assert(kube32_pool_available(nullptr) == block);
+        }
+        kube32_interp_stack_set(nullptr, 0);
+    }
+
+    test_pulled_module_in_the_block(block);
 
     // What the owner of an allocation costs: in the block it is kept in the
     // chunk header every allocation has; in the general heap (a pod whose

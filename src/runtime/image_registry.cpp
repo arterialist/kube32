@@ -1,5 +1,8 @@
 #include "runtime/image_registry.hpp"
+#include "runtime/pod_memory_pool.h"
 
+#include <algorithm>
+#include <cstdio>
 #include <cstring>
 
 namespace kube32::runtime {
@@ -50,6 +53,108 @@ std::vector<std::string> ImageRegistry::list() const {
     return out;
 }
 
+bool ImageRegistry::holds(const uint8_t* data, size_t len) const {
+    const uintptr_t p = reinterpret_cast<uintptr_t>(data);
+    for (const auto& img : images_) {
+        const uintptr_t start = reinterpret_cast<uintptr_t>(img.data);
+        if (p >= start && len <= img.len && p - start <= img.len - len) return true;
+    }
+    return false;
+}
+
+namespace {
+// While alive, pod allocations try outside the pool block first
+struct OutsideBlock {
+    bool on;
+    explicit OutsideBlock(bool o) : on(o) { if (on) kube32_pool_prefer_general(1); }
+    ~OutsideBlock() { if (on) kube32_pool_prefer_general(0); }
+};
+} // namespace
+
+ModuleBytes::ModuleBytes(uint32_t memory_limit_bytes) : outside_block_(kube32_pool_wants_block(memory_limit_bytes) != 0) {}
+
+ModuleBytes::ModuleBytes(ModuleBytes&& other) noexcept
+    : data_(other.data_), size_(other.size_), capacity_(other.capacity_), outside_block_(other.outside_block_) {
+    other.data_ = nullptr;
+    other.size_ = other.capacity_ = 0;
+}
+
+ModuleBytes& ModuleBytes::operator=(ModuleBytes&& other) noexcept {
+    if (this != &other) {
+        clear();
+        data_ = other.data_;
+        size_ = other.size_;
+        capacity_ = other.capacity_;
+        outside_block_ = other.outside_block_;
+        other.data_ = nullptr;
+        other.size_ = other.capacity_ = 0;
+    }
+    return *this;
+}
+
+bool ModuleBytes::reserve(size_t bytes) {
+    if (bytes <= capacity_) return true;
+    OutsideBlock outside(outside_block_);
+    void* p = data_ ? kube32_rt_realloc(data_, bytes) : kube32_rt_calloc(bytes);
+    if (!p) return false;
+    data_ = static_cast<uint8_t*>(p);
+    capacity_ = bytes;
+    return true;
+}
+
+bool ModuleBytes::resize(size_t bytes) {
+    if (!reserve(bytes)) return false;
+    if (bytes > size_) std::memset(data_ + size_, 0, bytes - size_);
+    size_ = bytes;
+    return true;
+}
+
+bool ModuleBytes::append(const void* data, size_t len) {
+    // Grown twice as large when the size was not known up front, else to fit
+    if (size_ + len > capacity_ && !reserve(std::max({size_ + len, capacity_ * 2, static_cast<size_t>(256)})) && !reserve(size_ + len)) {
+        return false;
+    }
+    if (len) std::memcpy(data_ + size_, data, len);
+    size_ += len;
+    return true;
+}
+
+void ModuleBytes::shrink_to_fit() {
+    if (!data_ || capacity_ == size_) return;
+    if (size_ == 0) {
+        clear();
+        return;
+    }
+    if (!kube32_rt_shrink(data_, size_)) {
+        if (void* p = kube32_rt_realloc(data_, size_)) data_ = static_cast<uint8_t*>(p);
+    }
+    capacity_ = size_;
+}
+
+void ModuleBytes::clear() {
+    if (data_) kube32_rt_free(data_);
+    data_ = nullptr;
+    size_ = capacity_ = 0;
+}
+
+void ModuleBytes::charge_to(int account) {
+    if (data_) kube32_rt_set_owner(data_, account);
+}
+
+std::string module_no_memory(size_t bytes) {
+    char why[160];
+    const int n = snprintf(why, sizeof why, "%s: %u bytes in one piece", kModuleNoMemory, static_cast<unsigned>(bytes));
+    if (kube32_pool_block_size() > 0 && n > 0 && static_cast<size_t>(n) < sizeof why) {
+        snprintf(why + n, sizeof why - n, " (pool block: %u bytes free, in pieces of at most %u)", static_cast<unsigned>(kube32_pool_available(nullptr)),
+                 static_cast<unsigned>(kube32_pool_largest_free()));
+    }
+    return why;
+}
+
+bool module_error_is_out_of_memory(const std::string& why) {
+    return why.find(kModuleNoMemory) != std::string::npos;
+}
+
 static bool valid_image_token(const std::string& s, size_t max_len) {
     if (s.empty() || s.size() > max_len || s[0] == '.') return false;
     for (char c : s) {
@@ -81,7 +186,11 @@ std::string sd_image_relative_path(const std::string& name, const std::string& t
     return "kube32/images/" + name + (tag.empty() ? std::string() : "-" + tag) + ".wasm";
 }
 
-bool base64_decode(const std::string& in, std::vector<uint8_t>& out) {
+namespace {
+// Calls `put` with each byte `in` decodes to; false when `in` is not base64
+// or `put` returns false
+template <class Put>
+bool base64_each(const std::string& in, Put put) {
     static const int8_t table[256] = {
         -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1, -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
         -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,62,-1,62,-1,63, 52,53,54,55,56,57,58,59,60,61,-1,-1,-1,-1,-1,-1,
@@ -92,8 +201,6 @@ bool base64_decode(const std::string& in, std::vector<uint8_t>& out) {
         -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1, -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
         -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1, -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1
     };
-    out.clear();
-    out.reserve((in.size() / 4) * 3);
     uint32_t acc = 0;
     int bits = 0;
     for (char ch : in) {
@@ -105,10 +212,33 @@ bool base64_decode(const std::string& in, std::vector<uint8_t>& out) {
         bits += 6;
         if (bits >= 8) {
             bits -= 8;
-            out.push_back(static_cast<uint8_t>((acc >> bits) & 0xFF));
+            if (!put(static_cast<uint8_t>((acc >> bits) & 0xFF))) return false;
         }
     }
-    return !out.empty();
+    return true;
+}
+} // namespace
+
+bool base64_decode(const std::string& in, std::vector<uint8_t>& out) {
+    out.clear();
+    out.reserve((in.size() / 4) * 3);
+    return base64_each(in, [&](uint8_t b) { out.push_back(b); return true; }) && !out.empty();
+}
+
+bool base64_decode(const std::string& in, ModuleBytes& out, std::string& why) {
+    out.clear();
+    const size_t most = (in.size() * 3 + 3) / 4;
+    if (!out.reserve(most)) {
+        why = module_no_memory(most);
+        return false;
+    }
+    if (!base64_each(in, [&](uint8_t b) { return out.push_back(b); }) || out.empty()) {
+        out.clear();
+        why = "kube32.io/wasm-base64 is not a base64 module";
+        return false;
+    }
+    out.shrink_to_fit();
+    return true;
 }
 
 } // namespace kube32::runtime

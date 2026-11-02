@@ -8,6 +8,7 @@
 #include "storage/store.hpp"
 #include "models/kube_models.hpp"
 #include "osal/socket.hpp"
+#include "runtime/pod_memory_pool.h"
 
 #include <atomic>
 #include <cassert>
@@ -175,16 +176,21 @@ int main() {
         assert(g_allocs.load() == 0);
     }
 
-    // The image comes with its pod, decoded as it streams
-    std::vector<uint8_t> got;
+    // The image comes with its pod, decoded as it streams into one
+    // allocation of pod memory (kube32_rt_calloc), not the heap
+    runtime::ModuleBytes got;
     std::string why;
     g_max_alloc = 0;
     g_track = true;
+    const size_t pod_bytes_before = kube32_pool_general_bytes();
     assert(client.get_pod_image("default", "p1", got, why));
     g_track = false;
-    std::cout << "[image] " << got.size() << " bytes, largest allocation " << g_max_alloc.load() << " bytes" << std::endl;
-    assert(got == images[1]);
-    assert(g_max_alloc.load() <= images[1].size() * 105 / 100 + 1024);   // the image itself, reserved once
+    std::cout << "[image] " << got.size() << " bytes in pod memory, largest heap allocation " << g_max_alloc.load() << " bytes" << std::endl;
+    assert(std::vector<uint8_t>(got.begin(), got.end()) == images[1]);
+    assert(kube32_pool_general_allocations() == 1 && kube32_pool_general_bytes() - pod_bytes_before >= images[1].size());
+    assert(g_max_alloc.load() < images[1].size());
+    got.clear();
+    assert(kube32_pool_general_allocations() == 0);
     assert(!client.get_pod_image("default", "missing", got, why) && !why.empty());
 
     // A list cut short is refused, not taken as fewer pods: a server that

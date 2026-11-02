@@ -123,9 +123,10 @@ public:
 
     // Lifecycle transitions
     bool deploy(const uint8_t* wasm_bytes, size_t len);
-    // Takes ownership of a heap image (pulled from the card or decoded from a
-    // manifest) so no second copy is ever made; kept for restarts.
-    bool deploy(std::vector<uint8_t>&& wasm_bytes);
+    // Takes the bytes of a module read into pod memory (from the card or the
+    // API server) and charges them to the pod: no second copy is made, and
+    // restarts reuse them.
+    bool deploy(ModuleBytes&& wasm_bytes);
     bool start();
     bool pause();
     bool resume();
@@ -190,7 +191,7 @@ private:
     osal::Mutex call_mutex_;             // one call into the module at a time (call_function, deploy)
     ContainerStatus status_;
     
-    std::vector<uint8_t> wasm_bytecode_;      // owned copy when the image is not memory mapped
+    ModuleBytes wasm_bytecode_;               // the module's bytes when the image is not memory mapped
     const uint8_t* wasm_view_{nullptr};       // bytes the module was parsed from
     size_t wasm_view_len_{0};
     std::atomic<bool> stop_requested_{false};

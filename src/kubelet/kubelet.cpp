@@ -49,9 +49,10 @@ static uint64_t sd_image_limit_bytes() {
 #endif
 }
 
-// Reads <sd root>/kube32/images/<name>[-<tag>].wasm into `out` (sized from
-// the file, filled 4 KiB at a time). On failure `why` says what happened.
-static bool pull_sd_image(const std::string& name, const std::string& tag, std::vector<uint8_t>& out, std::string& out_path, std::string& why) {
+// Reads <sd root>/kube32/images/<name>[-<tag>].wasm into `out` (pod memory,
+// sized from the file, filled 4 KiB at a time). On failure `why` says what
+// happened.
+static bool pull_sd_image(const std::string& name, const std::string& tag, runtime::ModuleBytes& out, std::string& out_path, std::string& why) {
     out.clear();
     std::string root = hal::sd_root_path();
     if (root.empty()) {
@@ -76,17 +77,14 @@ static bool pull_sd_image(const std::string& name, const std::string& tag, std::
               (limit < (1024u * 1024u) ? " (no PSRAM)" : "");
         return false;
     }
-    try {
-        out.resize(static_cast<size_t>(size));
-    } catch (const std::bad_alloc&) {
-        why = "cannot allocate " + std::to_string(size) + " bytes for " + out_path + " (free heap " +
-              std::to_string(osal::System::get_free_heap_bytes()) + ")";
+    if (!out.resize(static_cast<size_t>(size))) {
+        why = runtime::module_no_memory(static_cast<size_t>(size)) + " (" + out_path + ")";
         return false;
     }
     int fd = ::open(out_path.c_str(), O_RDONLY);
     if (fd < 0) {
         why = out_path + ": open failed (errno " + std::to_string(errno) + ")";
-        out.clear(); out.shrink_to_fit();
+        out.clear();
         return false;
     }
     size_t got = 0;
@@ -97,7 +95,7 @@ static bool pull_sd_image(const std::string& name, const std::string& tag, std::
         if (n <= 0) {
             why = out_path + ": read failed at byte " + std::to_string(got) + " (errno " + std::to_string(errno) + ")";
             ::close(fd);
-            out.clear(); out.shrink_to_fit();
+            out.clear();
             return false;
         }
         got += static_cast<size_t>(n);
@@ -881,6 +879,21 @@ bool Kubelet::wait_for_memory(const std::string& pod_key, LocalPodRecord& rec, c
     return wait_for(pod_key, rec, PodExecutionPhase::InsufficientMemory, "InsufficientMemory", why, previous);
 }
 
+// A module whose bytes found no room in pod memory: the pod waits as one
+// whose load ran out of memory does
+bool Kubelet::wait_for_module_memory(const std::string& pod_key, LocalPodRecord& rec, const std::string& why, const LocalPodRecord* previous,
+                                     bool restarting) {
+    hal::CapabilityFirewall::instance().unregister_pod(pod_key);
+    if (previous) {
+        rec.restart_count = previous->restart_count;
+        rec.restart_due = previous->restart_due || restarting;
+        rec.repacked = previous->repacked;
+    }
+    const uint8_t failures = previous ? previous->load_failures : 0;
+    rec.load_failures = failures < 255 ? failures + 1 : failures;
+    return wait_for_memory(pod_key, rec, why, previous);
+}
+
 bool Kubelet::wait_for(const std::string& pod_key, LocalPodRecord& rec, PodExecutionPhase phase, const char* reason, const std::string& why,
                        const LocalPodRecord* previous) {
     rec.execution_phase = phase;
@@ -1156,7 +1169,7 @@ bool Kubelet::deploy_and_start_pod(const models::KubePod& pod_in, const std::str
     // (kube32.io/wasm-sha256), else the inline annotation itself
     const uint8_t* image_bytes = nullptr;
     size_t image_len = 0;
-    std::vector<uint8_t> inline_bytes;   // heap image the runtime takes over
+    runtime::ModuleBytes inline_bytes(rec.memory_limit_bytes);   // pod memory the runtime takes over
     std::string image_key;
     std::string image_source = "embedded registry";
     std::string sd_name, sd_tag;
@@ -1170,6 +1183,7 @@ bool Kubelet::deploy_and_start_pod(const models::KubePod& pod_in, const std::str
         uint64_t t_pull = osal::System::get_uptime_ms();
         if (!pull_sd_image(sd_name, sd_tag, inline_bytes, sd_path, why)) {
             std::cout << "[KUBELET] " << pod_key << ": image '" << pod.image << "': " << why << std::endl;
+            if (runtime::module_error_is_out_of_memory(why)) return wait_for_module_memory(pod_key, rec, why, previous, restarting);
             record_pod_event(rec, "Failed", "Failed to pull image \"" + pod.image + "\": " + why, true);
             return [&]() {
                 rec.execution_phase = PodExecutionPhase::Failed;
@@ -1213,6 +1227,7 @@ bool Kubelet::deploy_and_start_pod(const models::KubePod& pod_in, const std::str
                 std::cout << "[KUBELET] " << pod_key << ": image sha256:" << digest->second.substr(0, 12) << ", " << image_len << " bytes" << std::endl;
             } else {
                 std::cout << "[KUBELET] " << pod_key << ": image sha256:" << digest->second.substr(0, 12) << ": " << why << std::endl;
+                if (runtime::module_error_is_out_of_memory(why)) return wait_for_module_memory(pod_key, rec, why, previous, restarting);
                 image_error = why;
             }
         } else {
@@ -1222,7 +1237,7 @@ bool Kubelet::deploy_and_start_pod(const models::KubePod& pod_in, const std::str
                 // the pod itself, decoded as it streams in
                 std::string why;
                 bool ok = ann->second.empty() ? api_client_->get_pod_image(pod.namespace_name, pod.name, inline_bytes, why)
-                                              : runtime::base64_decode(ann->second, inline_bytes);
+                                              : runtime::base64_decode(ann->second, inline_bytes, why);
                 if (ok) {
                     image_bytes = inline_bytes.data();
                     image_len = inline_bytes.size();
@@ -1237,6 +1252,7 @@ bool Kubelet::deploy_and_start_pod(const models::KubePod& pod_in, const std::str
                     std::cout << "[KUBELET] " << pod_key << ": inline image, " << image_len << " bytes, crc32 " << crc_hex << std::endl;
                 } else if (!why.empty()) {
                     std::cout << "[KUBELET] " << pod_key << ": inline image: " << why << std::endl;
+                    if (runtime::module_error_is_out_of_memory(why)) return wait_for_module_memory(pod_key, rec, why, previous, restarting);
                     image_error = why;
                 }
             }
@@ -1344,7 +1360,8 @@ bool Kubelet::deploy_and_start_pod(const models::KubePod& pod_in, const std::str
             }
         }
     }
-    // Heap images move into the runtime (no second copy); flash images are used in place
+    // Modules read into pod memory move into the runtime (no second copy);
+    // embedded images are used in place
     bool deployed = inline_bytes.empty()
         ? runtime_.deploy_workload_ex(pod_key, image_bytes, image_len, spec, deploy_err)
         : runtime_.deploy_workload_owned(pod_key, std::move(inline_bytes), spec, deploy_err);

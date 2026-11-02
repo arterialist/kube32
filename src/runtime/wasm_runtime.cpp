@@ -69,12 +69,12 @@ bool WasmRuntime::deploy_workload_ex(const std::string& pod_id, const uint8_t* w
     return deploy_impl(pod_id, wasm_bytes, len, nullptr, spec, out_error);
 }
 
-bool WasmRuntime::deploy_workload_owned(const std::string& pod_id, std::vector<uint8_t>&& wasm_bytes, const DeploySpec& spec, std::string& out_error) {
-    std::vector<uint8_t> owned = std::move(wasm_bytes);
+bool WasmRuntime::deploy_workload_owned(const std::string& pod_id, ModuleBytes&& wasm_bytes, const DeploySpec& spec, std::string& out_error) {
+    ModuleBytes owned = std::move(wasm_bytes);
     return deploy_impl(pod_id, owned.data(), owned.size(), &owned, spec, out_error);
 }
 
-bool WasmRuntime::deploy_impl(const std::string& pod_id, const uint8_t* wasm_bytes, size_t len, std::vector<uint8_t>* owned, const DeploySpec& spec, std::string& out_error) {
+bool WasmRuntime::deploy_impl(const std::string& pod_id, const uint8_t* wasm_bytes, size_t len, ModuleBytes* owned, const DeploySpec& spec, std::string& out_error) {
     out_error.clear();
     osal::LockGuard guard(impl_->mutex);
     impl_->reap_locked();   // memory a stopped container held may be free now

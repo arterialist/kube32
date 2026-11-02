@@ -1,6 +1,7 @@
 #pragma once
 
 #include "models/kube_models.hpp"
+#include "runtime/image_registry.hpp"
 
 #include <cstdint>
 #include <cstddef>
@@ -28,7 +29,7 @@ struct ContainerStatus {
     ContainerPhase phase{ContainerPhase::Pending};
     int restart_count{0};
     uint32_t memory_used_bytes{0};   // Wasm linear memory currently mapped
-    uint64_t bytecode_bytes{0};      // module bytes the controller keeps for restarts
+    uint64_t bytecode_bytes{0};      // module bytes the controller keeps (an image not memory mapped)
     uint64_t stack_bytes{0};         // interpreter operand stack reserved for the module
     uint64_t runtime_bytes{0};       // backing bytes of the module's memories as wasm3 accounts them (c_m3Limit_MemoryBytes)
     // Everything the container holds: wasm3's structures, the compiled code,
@@ -82,11 +83,11 @@ public:
         if (!ok) out_error = "runtime rejected module";
         return ok;
     }
-    // Deploys an image the caller owns on the heap; the runtime keeps the
-    // buffer for the module's lifetime instead of copying it (the only way a
-    // 64 KiB image fits a board with 90 KB of free RAM).
-    virtual bool deploy_workload_owned(const std::string& pod_id, std::vector<uint8_t>&& wasm_bytes, const DeploySpec& spec, std::string& out_error) {
-        std::vector<uint8_t> bytes = std::move(wasm_bytes);
+    // Deploys a module read into pod memory (from the card or the API
+    // server); the runtime keeps those bytes for the module's lifetime,
+    // charged to the pod, instead of copying them.
+    virtual bool deploy_workload_owned(const std::string& pod_id, ModuleBytes&& wasm_bytes, const DeploySpec& spec, std::string& out_error) {
+        ModuleBytes bytes = std::move(wasm_bytes);
         return deploy_workload_ex(pod_id, bytes.data(), bytes.size(), spec, out_error);
     }
     virtual bool start(const std::string& pod_id) = 0;
@@ -127,11 +128,11 @@ public:
     // of application pods (modules exporting k32_* entry points). On success
     // `out_error` is empty; otherwise it carries a human readable reason.
     bool deploy_workload_ex(const std::string& pod_id, const uint8_t* wasm_bytes, size_t len, const DeploySpec& spec, std::string& out_error) override;
-    bool deploy_workload_owned(const std::string& pod_id, std::vector<uint8_t>&& wasm_bytes, const DeploySpec& spec, std::string& out_error) override;
+    bool deploy_workload_owned(const std::string& pod_id, ModuleBytes&& wasm_bytes, const DeploySpec& spec, std::string& out_error) override;
 
 private:
     struct Impl;
-    bool deploy_impl(const std::string& pod_id, const uint8_t* wasm_bytes, size_t len, std::vector<uint8_t>* owned, const DeploySpec& spec, std::string& out_error);
+    bool deploy_impl(const std::string& pod_id, const uint8_t* wasm_bytes, size_t len, ModuleBytes* owned, const DeploySpec& spec, std::string& out_error);
     std::unique_ptr<Impl> impl_;
 };
 

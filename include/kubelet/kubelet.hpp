@@ -228,6 +228,8 @@ private:
     // reason in its container status and is admitted again after
     // memory_retry_ms. Status and Event go out when it starts waiting.
     bool wait_for_memory(const std::string& pod_key, LocalPodRecord& rec, const std::string& why, const LocalPodRecord* previous);
+    bool wait_for_module_memory(const std::string& pod_key, LocalPodRecord& rec, const std::string& why, const LocalPodRecord* previous,
+                                bool restarting);
     // The same wait for `phase` (InsufficientMemory, BusInUse), reported with `reason`
     bool wait_for(const std::string& pod_key, LocalPodRecord& rec, PodExecutionPhase phase, const char* reason, const std::string& why,
                   const LocalPodRecord* previous);
