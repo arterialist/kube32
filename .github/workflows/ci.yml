@@ -142,6 +142,9 @@ jobs:
           python3 tests/integration/runner.py --suite cluster
           python3 tests/integration/runner.py --suite federation
           python3 tests/integration/runner.py --suite devices
+      # kubectl, clang and rust-lld come with the runner image; the test skips itself without them
+      - name: kube32 mcp against the simulator
+        run: KUBE32_SIM=build/kube32-sim python3 -m unittest discover -s tools/tests -p test_kube32_mcp_sim.py -v
       - name: Stress scripts (each starts its own simulator)
         run: |
           for script in test_api_chunked_stream_stress test_api_malformed_requests test_api_socket_disconnect test_sim_wasm_sandbox; do
