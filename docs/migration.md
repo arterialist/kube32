@@ -106,7 +106,7 @@ kubectl uncordon cardputer
 
 When a move that an eviction asked for fails before the replacement, the pod is deleted as an eviction deletes it, so the drain completes.
 
-A `kube32-sim` worker stopped with Ctrl-C or `SIGTERM` drains itself before it exits. It cordons its Node, marks it with the annotation `kube32.io/left: "true"`, evicts its pods other than DaemonSet pods and waits up to 20 s for them to leave.
+A `kube32-sim` worker stopped with Ctrl-C or `SIGTERM` drains itself before it exits. It cordons its Node, marks it with the annotation `kube32.io/left: "true"`, evicts its pods other than DaemonSet pods and waits up to 20 s for them to leave. When every pod has left, the worker deletes its Node and its Lease after its kubelet stops. A Node that still has pods stays cordoned with the annotation, so the node lifecycle controller evicts those pods once the Node is NotReady. The worker makes its Node schedulable again when it starts.
 
 ## Policies
 

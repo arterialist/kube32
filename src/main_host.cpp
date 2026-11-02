@@ -104,9 +104,12 @@ static std::vector<std::pair<std::string, std::string>> node_pods(kube32::kubele
 
 // A worker leaving the cluster: it cordons its Node, asks the control plane
 // to evict its pods (movable pods move with their state), and waits up to
-// 20 s for them to go. The Node carries kube32.io/left until the worker
-// starts again and makes it schedulable.
-static void leave_cluster(const std::string& host, uint16_t port, const std::string& token, const std::string& node) {
+// 20 s for them to go. True when every pod left: the worker then deletes its
+// Node once its kubelet has stopped. A Node with pods still on it stays,
+// cordoned and marked kube32.io/left, so the node lifecycle controller
+// evicts them when it goes NotReady; the worker makes it schedulable again
+// when it starts.
+static bool leave_cluster(const std::string& host, uint16_t port, const std::string& token, const std::string& node) {
     kube32::kubelet::HttpKubeClient api(host, port);
     api.set_bearer_token(token);
     const int cordoned = api_call(host, port, token, "PATCH", "/api/v1/nodes/" + node,
@@ -114,7 +117,7 @@ static void leave_cluster(const std::string& host, uint16_t port, const std::str
                                   "application/merge-patch+json");
     if (cordoned != 200) {
         std::cout << "[LEAVE] cannot cordon " << node << " (HTTP " << cordoned << "); leaving as it is" << std::endl;
-        return;
+        return false;
     }
     bool listed = false;
     const auto pods = node_pods(api, node, listed);
@@ -126,7 +129,7 @@ static void leave_cluster(const std::string& host, uint16_t port, const std::str
                                 "application/json");
         if (st == 404 || st == 405) {
             std::cout << "[LEAVE] the control plane does not evict pods (HTTP " << st << "); leaving after the cordon" << std::endl;
-            return;
+            return false;
         }
         std::cout << "[LEAVE] eviction of " << p.first << "/" << p.second << ": HTTP " << st << std::endl;
     }
@@ -136,11 +139,12 @@ static void leave_cluster(const std::string& host, uint16_t port, const std::str
         const size_t left = node_pods(api, node, ok).size();
         if (ok && left == 0) {
             std::cout << "[LEAVE] every pod left " << node << std::endl;
-            return;
+            return true;
         }
         kube32::osal::Thread::sleep_ms(500);
     }
     std::cout << "[LEAVE] pods still on " << node << " after 20 s; leaving" << std::endl;
+    return false;
 }
 
 struct SimOptions {
@@ -565,10 +569,11 @@ int main(int argc, char* argv[]) {
         }
         // A signal: the worker leaves the cluster while its kubelet and pod
         // server still serve the moves
+        bool emptied = false;
         if (!rebooting) {
             std::atomic<bool> left{false};
             std::thread leave([&] {
-                leave_cluster(master_host, master_port, opts.token, opts.node_name);
+                emptied = leave_cluster(master_host, master_port, opts.token, opts.node_name);
                 left.store(true);
             });
             while (!left.load()) tick();
@@ -579,6 +584,14 @@ int main(int argc, char* argv[]) {
         kube32::app::install_service_client(nullptr);
         pod_server.stop();
         kubelet->stop();
+        // After the kubelet stops, so no heartbeat registers the Node again
+        if (emptied) {
+            const int node_st = api_call(master_host, master_port, opts.token, "DELETE", "/api/v1/nodes/" + opts.node_name, "",
+                                         "application/json");
+            api_call(master_host, master_port, opts.token, "DELETE",
+                     "/apis/coordination.k8s.io/v1/namespaces/kube-node-lease/leases/" + opts.node_name, "", "application/json");
+            std::cout << "[LEAVE] deleted Node " << opts.node_name << ": HTTP " << node_st << std::endl;
+        }
         kube32::ipc::ChannelManager::instance().shutdown();
         kube32::osal::Socket::cleanup_networking();
         return 0;

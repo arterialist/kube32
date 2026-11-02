@@ -170,7 +170,7 @@ class TestPodMigration(BaseTestCase):
         self.assertEqual(self._requests(b, "lost"), (200, 1))
 
     def test_worker_leaves_on_sigint(self):
-        """A worker cordons itself on SIGINT and asks for evictions: its pod moves to the other worker with its state"""
+        """A worker cordons itself on SIGINT and asks for evictions: its pod moves to the other worker with its state, then its Node goes"""
         cp = self.harness.start_control_plane(name="cp-leave", lease_interval_ms=500, reconcile_interval_ms=200)
         w = self.harness.start_worker("worker-leave", 1, cp, lease_interval_ms=500, pod_port=17941)
         stay = self.harness.start_worker("worker-stay", 2, cp, lease_interval_ms=500, pod_port=17942)
@@ -184,12 +184,12 @@ class TestPodMigration(BaseTestCase):
         w.process.send_signal(signal.SIGINT)
         w.process.wait(timeout=25.0)
         self.assertTrue(time.time() - t0 < 25.0)
-        _, _, body = http("GET", f"{api}/api/v1/nodes/{w.name}")
-        node = json.loads(body)
-        self.assertTrue(node.get("spec", {}).get("unschedulable"), "the node cordoned itself")
-        self.assertEqual(node["metadata"].get("annotations", {}).get("kube32.io/left"), "true")
         out = w.process.stdout.read().decode(errors="replace")
         self.assertIn("[LEAVE]", out)
+        # Every pod left, so the worker deleted its Node
+        self.assertIn("[LEAVE] every pod left", out)
+        status, _, _ = http("GET", f"{api}/api/v1/nodes/{w.name}")
+        self.assertEqual(status, 404, "the Node is gone after the worker left")
         moved = self.wait_for_condition(lambda: (lambda p: p if p and p["spec"].get("nodeName") == stay.name else None)(self._running(cp, "echo")),
                                         timeout=15.0, description="echo Running on the worker that stays")
         self.assertTrue(moved)
