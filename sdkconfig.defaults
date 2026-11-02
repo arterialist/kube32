@@ -47,7 +47,12 @@ CONFIG_FREERTOS_USE_TRACE_FACILITY=y
 
 CONFIG_FREERTOS_RUN_TIME_COUNTER_TYPE_U64=y
 
-CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL=4096
+# With PSRAM, malloc() serves requests up to 256 bytes from internal RAM
+# first and larger ones from PSRAM first. lwIP allocates with malloc() too.
+# At 4096 the control plane's own objects filled internal RAM down to its
+# reserve and Wi-Fi and lwIP ran out (minimum 23 bytes); at 256 the devkit
+# keeps about 85 KB internal and 139 KB of PSRAM free under API load.
+CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL=256
 
 CONFIG_SPIRAM_SPEED_80M=y
 

@@ -976,18 +976,20 @@ void print_banner(const NodeIdentity& id) {
 // refused since the last [MEM] line (Wi-Fi's own retries included)
 std::atomic<uint32_t> s_alloc_fail_bytes{0};
 std::atomic<uint32_t> s_alloc_fail_count{0};
+std::atomic<uint32_t> s_alloc_fail_caps{0};
 
 void on_alloc_failed(size_t size, uint32_t caps, const char* function_name) {
-    (void)caps;
     (void)function_name;
     s_alloc_fail_bytes.store(static_cast<uint32_t>(size));
+    s_alloc_fail_caps.store(caps);
     s_alloc_fail_count.fetch_add(1);
 }
 
 void log_memory(const char* stage) {
     char failed[64] = "";
     if (const uint32_t n = s_alloc_fail_count.exchange(0)) {
-        snprintf(failed, sizeof(failed), "  %u failed alloc(s), last %u bytes", (unsigned)n, (unsigned)s_alloc_fail_bytes.load());
+        snprintf(failed, sizeof(failed), "  %u failed alloc(s), last %u bytes (caps 0x%x)", (unsigned)n, (unsigned)s_alloc_fail_bytes.load(),
+                 (unsigned)s_alloc_fail_caps.load());
     }
     printf("[MEM] %-22s internal free %6u (min %6u, largest %6u)  psram free %7u (min %7u)%s\n", stage,
            (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
