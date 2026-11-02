@@ -37,7 +37,7 @@
 #define TOK_BYTES_MAX 16384
 #define WINDOW 4
 #define RETRY_MS 200
-#define MAX_REPLAYS 3
+#define MAX_REPLAYS 12
 
 extern unsigned char __heap_base;
 
