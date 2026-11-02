@@ -24,6 +24,22 @@ jobs:
           python-version: "3.12"
       - name: Build documentation
         run: uv run --with "mkdocs-material>=9.5" mkdocs build --strict --site-dir site
+      # The browser installer (docs/flash.md) loads the latest release's merged
+      # firmware and manifest from this site: GitHub release downloads carry no
+      # CORS headers. The release workflow starts this workflow after a release.
+      - name: Firmware of the latest release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p site/firmware/latest
+          cd site/firmware/latest
+          if gh release download --repo "$GITHUB_REPOSITORY" --pattern manifest.json; then
+            # The merged image the manifest names
+            gh release download --repo "$GITHUB_REPOSITORY" --pattern "$(jq -r '.builds[0].parts[0].path' manifest.json)"
+            ls -l
+          else
+            echo "::notice::no release yet: the installer has no firmware to offer"
+          fi
       - uses: actions/upload-pages-artifact@v3
         with:
           path: site
