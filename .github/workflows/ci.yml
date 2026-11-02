@@ -66,6 +66,43 @@ jobs:
       - name: unittest
         run: python3 -m unittest discover -s tools/tests -v
 
+  python-package:
+    name: kube32 package (uv build, uv tool install)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0 # the version comes from the release tags
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+      - name: Install clang and lld (wasm-ld)
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends clang lld
+      - name: Build the sdist and the wheel
+        working-directory: python
+        run: uv build --out-dir ../dist
+      - name: The wheel carries the repository's ABI header and Rust template
+        run: |
+          unzip -p dist/kube32-*.whl kube32/_data/include/runtime/k32_app_abi.h | cmp - include/runtime/k32_app_abi.h
+          unzip -p dist/kube32-*.whl kube32/_data/templates/rust/lib.rs | cmp - sdk/rust/examples/counter/src/lib.rs
+      - name: Install the wheel with uv tool install
+        run: |
+          uv tool install dist/kube32-*.whl
+          uv tool dir --bin >> "$GITHUB_PATH"
+      - name: Smoke test the kube32 command
+        working-directory: ${{ runner.temp }}
+        run: |
+          kube32 --help
+          kube32 version
+          kube32 new demo --lang c
+          kube32 build demo
+          test -f demo/build/demo.wasm
+      # The Rust tests build the counter example and a new Rust project
+      - name: Install Rust ${{ env.RUST_TOOLCHAIN }} with the wasm32 target
+        run: |
+          rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal --target wasm32-unknown-unknown
+          rustup default "$RUST_TOOLCHAIN"
+      - name: tools/tests against the installed package
+        run: KUBE32_TEST_INSTALLED=1 "$(uv tool dir)/kube32/bin/python" -m unittest discover -s tools/tests -v
+
   integration:
     name: Integration suites (kube32-sim)
     runs-on: ubuntu-24.04
