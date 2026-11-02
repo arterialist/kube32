@@ -235,7 +235,7 @@ PUT /apis/kube32.io/v1/namespaces/<namespace>/checkpoints/<name>/data
 
 `PUT` takes the snapshot as `application/octet-stream` with a `Content-Length`. The API server checks its magic, version and trailer and answers `422` when they are wrong. It then sets `status.sizeBytes`, `status.snapshotSha256`, `status.imageSha256` and `status.podTimeMs` from the snapshot and answers the Checkpoint. `GET` answers the snapshot, or `404` while the Checkpoint has none.
 
-Snapshot data lives in the control plane's memory, outside the object store: PSRAM on the board, with 256 KiB for all snapshots, and 16 MiB in the simulator. Storing a snapshot that does not fit drops the oldest other snapshots first. A snapshot larger than the whole space gets `413`. Deleting a Checkpoint drops its data. A control plane restart loses the data and keeps the Checkpoint objects. A snapshot holds whatever the pod holds, environment values included, so the data has the same access rules as a Secret.
+Snapshot data lives in the control plane's memory, outside the object store, up to 256 KiB for all snapshots on the board and 16 MiB in the simulator. It is pod state, so it takes the control plane's pod pool block first, and the node's allocatable memory counts it. When the block is full it takes PSRAM above the system reserve. Storing a snapshot that does not fit drops the oldest other snapshots first. A snapshot larger than the whole space gets `413`, and one the memory cannot hold gets `507`. Deleting a Checkpoint drops its data. A control plane restart loses the data and keeps the Checkpoint objects. A snapshot holds whatever the pod holds, environment values included, so the data has the same access rules as a Secret.
 
 `kubectl get checkpoints` prints `NAME`, `POD`, `ACTION`, `PHASE`, `NODE`, `SIZE` and `AGE`. `-o wide` adds `TARGET`, `NEW POD` and `MESSAGE`.
 
@@ -248,7 +248,7 @@ The Checkpoint controller carries out `Save` and `Move` Checkpoints, see [Moves]
 - A replacement that does not run within 60 s rolls back. When the source node is not Ready then, the pod waits for the scheduler and restores where it is bound.
 - The cooldowns of the `Auto` policy live in memory: a control plane restart clears them.
 - A moved pod has a new uid and creation time, so `kubectl get pods` shows its age from the move.
-- Checkpoint data lives in the control plane's memory, 256 KiB on the board. The oldest data goes first when the space is full, and a control plane restart loses it. A restore from a Checkpoint without data fails, and the pod starts afresh.
+- Checkpoint data lives in the control plane's memory, 256 KiB on the board, and counts against the memory the control plane offers pods. The oldest data goes first when the space is full, and a control plane restart loses it. A restore from a Checkpoint without data fails, and the pod starts afresh.
 - A pod moves only to a node with room for it. A pod with one 64 KiB page does not fit a Cardputer that runs three drivers.
 
 ## Measured times

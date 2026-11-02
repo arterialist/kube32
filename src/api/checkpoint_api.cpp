@@ -2,6 +2,7 @@
 #include "api/route_handler.hpp"
 #include "models/kube_models.hpp"
 #include "osal/sha256.hpp"
+#include "runtime/pod_memory_pool.h"
 #include "runtime/pod_snapshot.hpp"
 
 #if defined(ESP_PLATFORM)
@@ -21,12 +22,23 @@ namespace {
 constexpr std::string_view kPrefix = "/apis/kube32.io/v1/namespaces/";
 constexpr std::string_view kStorePrefix = "/registry/checkpoints/";
 
-// Snapshot data goes to PSRAM where there is some
+// Snapshot data is pod state: it goes to the pod pool block where there is
+// one, so admission and allocatable memory count it and the system's own
+// memory stays whole. When the block is full, PSRAM above the system's
+// reserve (kube32_pool_psram_reserve), or the heap without PSRAM.
 uint8_t* blob_alloc(size_t len) {
+    if (void* p = kube32_pool_sub_alloc(len)) return static_cast<uint8_t*>(p);
 #if defined(ESP_PLATFORM)
-    if (void* p = heap_caps_malloc(len, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT)) return static_cast<uint8_t*>(p);
+    if (heap_caps_get_total_size(MALLOC_CAP_SPIRAM) > 0) {
+        if (heap_caps_get_free_size(MALLOC_CAP_SPIRAM) < len + kube32_pool_psram_reserve()) return nullptr;
+        return static_cast<uint8_t*>(heap_caps_malloc(len, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+    }
 #endif
     return static_cast<uint8_t*>(std::malloc(len));
+}
+
+void blob_free(uint8_t* p) {
+    if (!kube32_pool_sub_free(p)) std::free(p);
 }
 
 bool fail(HttpConnection& conn, int code, const char* reason, const char* fmt, ...) __attribute__((format(printf, 4, 5)));
@@ -47,7 +59,7 @@ struct CheckpointApi::Blob {
     uint8_t* data{nullptr};
     size_t len{0};
     uint64_t seq{0};
-    ~Blob() { std::free(data); }
+    ~Blob() { blob_free(data); }
 };
 
 CheckpointApi::CheckpointApi(storage::Store& store, RouteHandler& routes, size_t cap_bytes, HttpHandler* next)
@@ -170,7 +182,7 @@ bool CheckpointApi::put(HttpConnection& conn, const std::string& key, const std:
     }
     auto blob = std::make_shared<Blob>();
     blob->data = blob_alloc(len);
-    if (!blob->data) return fail(conn, 507, "InsufficientStorage", "no memory for a snapshot of %u bytes", (unsigned)len);
+    if (!blob->data) return fail(conn, 507, "InsufficientStorage", "no memory for a snapshot of %u bytes besides the system's reserve", (unsigned)len);
     blob->len = len;
     size_t got = 0;
     while (got < len) {

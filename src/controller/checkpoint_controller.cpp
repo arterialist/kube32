@@ -735,6 +735,11 @@ CheckpointController::Snapshot CheckpointController::take_snapshot(const Node& n
         std::string answer;
         const int put = s.error.empty() ? up.finish(answer) : 0;
         if (!s.error.empty()) return s;
+        if (s.bytes != static_cast<uint64_t>(length) && put != 0 && put != 201 && put != 200) {
+            // The API server refused the data before it was all sent
+            s.error = str_cat({"the API server did not store the checkpoint data (HTTP ", std::to_string(put), ": ", message_of(answer), ")"});
+            return s;
+        }
         if (s.bytes != static_cast<uint64_t>(length)) {
             s.error = str_cat({"the snapshot ended after ", std::to_string(s.bytes), " of ", std::to_string(length), " bytes"});
         } else if (put < 200 || put >= 300) {
