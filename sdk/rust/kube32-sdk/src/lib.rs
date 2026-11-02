@@ -32,6 +32,8 @@
 //!   `k32_tone` and the infrared imports `esp32_rmt_send` and
 //!   `esp32_rmt_receive`.
 //! * `fs`: [`fs`] wraps the `k32_fs_*` imports (pod storage on the microSD card).
+//! * `linalg`: [`linalg`] wraps the native products for quantized neural
+//!   networks (`k32_matvec_*`, `k32_vecmat_f32_i8`, `k32_softmax_f32`).
 //!
 //! An import is only linked into the module when the app calls it, so the
 //! module's import list tells which manifest resources it needs;
@@ -46,6 +48,8 @@ pub mod channel;
 pub mod fs;
 #[cfg(feature = "hardware")]
 pub mod hardware;
+#[cfg(feature = "linalg")]
+pub mod linalg;
 pub mod host;
 pub mod request;
 pub mod response;

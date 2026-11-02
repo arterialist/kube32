@@ -11,7 +11,7 @@ readme = "README.md"
 keywords = ["kube32", "wasm", "esp32", "kubernetes", "no-std"]
 categories = ["wasm", "embedded", "no-std", "api-bindings"]
 
-# docs.rs documents the hardware and fs modules too
+# docs.rs documents the hardware, fs and linalg modules too
 [package.metadata.docs.rs]
 all-features = true
 
@@ -30,3 +30,6 @@ hardware = []
 # k32_fs_* wrappers (pod storage on the microSD card). Calls need
 # hardware.kube32.io/sd: "1" and a volume claim in the pod manifest.
 fs = []
+# k32_matvec_*, k32_vecmat_f32_i8 and k32_softmax_f32 wrappers: native
+# products for quantized neural networks. They need no manifest resource.
+linalg = []

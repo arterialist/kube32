@@ -166,7 +166,7 @@ jobs:
       - name: Build the SDK and the example pods
         run: cargo build --release --target wasm32-unknown-unknown --locked
       - name: SDK unit tests (host target)
-        run: cargo test -p kube32-sdk --locked
+        run: cargo test -p kube32-sdk --locked --features linalg
       - name: Check the example modules against the runtime ABI
         run: |
           for m in target/wasm32-unknown-unknown/release/*.wasm; do
