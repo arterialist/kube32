@@ -47,27 +47,34 @@ NodeTelemetry NodeStatusReporter::collect_telemetry() const {
     t.free_heap_bytes = osal::System::get_free_heap_bytes();
     t.min_free_heap_bytes = osal::System::get_min_free_heap_bytes();
     t.total_psram_bytes = osal::System::get_total_psram_bytes();
-    // What pods can be given, counted as the kubelet admits them: the pool
-    // block without PSRAM, PSRAM with it
-    kube32_pool_node_room(&t.memory_allocatable_bytes, &t.free_psram_bytes);
+    t.free_psram_bytes = osal::System::get_free_psram_bytes();
+    // What pods can be given, counted as the kubelet admits them: with no
+    // pod running (allocatable), and now
+    kube32_pool_node_room(&t.memory_allocatable_bytes, &t.psram_allocatable_bytes);
+    t.memory_free_bytes = kube32_pool_pod_room(0, nullptr);
     t.memory_capacity_bytes = t.total_heap_bytes + t.total_psram_bytes;
-    int pool_external = 0;
-    const size_t pool_free = kube32_pool_available(&pool_external);
 #if !defined(ESP_PLATFORM)
     // The simulator's PSRAM is the external pool block it reserved
-    // (kube32-sim --psram); the host itself has none.
-    if (pool_external) t.total_psram_bytes = kube32_pool_block_size();
+    // (kube32-sim --psram) and, with a heap budget, the PSRAM besides it;
+    // the host itself has none.
+    int pool_external = 0;
+    const size_t pool_free = kube32_pool_available(&pool_external);
+    const size_t budget = kube32_pool_heap_budget();
+    const size_t pods_heap = kube32_pool_general_bytes();
+    if (pool_external) {
+        t.total_psram_bytes = kube32_pool_block_size() + budget;
+        t.free_psram_bytes = pool_free + (pods_heap < budget ? budget - pods_heap : 0);
+    }
     t.memory_capacity_bytes = t.total_heap_bytes;
-    // A modelled board heap (kube32-sim --heap-budget): what pods leave of it
-    if (const size_t budget = kube32_pool_heap_budget()) {
-        const size_t used = kube32_pool_general_bytes();
-        t.total_heap_bytes = budget;
-        t.free_heap_bytes = used < budget ? budget - used : 0;
+    if (budget) {
+        // A modelled board heap (kube32-sim --heap-budget): what pods leave of it
+        if (!pool_external) {
+            t.total_heap_bytes = budget;
+            t.free_heap_bytes = pods_heap < budget ? budget - pods_heap : 0;
+        }
         t.memory_capacity_bytes = budget + kube32_pool_block_size();
     }
 #endif
-    if (!pool_external) t.free_heap_bytes += pool_free;
-    t.free_heap_bytes += kube32_pool_stack_available();
     t.cpu_cores = osal::System::get_cpu_cores();
     t.cpu_freq_mhz = osal::System::get_cpu_freq_mhz();
     t.uptime_ms = osal::System::get_uptime_ms();
@@ -129,6 +136,8 @@ static void append_resources(Out& json, const NodeTelemetry& t, bool capacity) {
         append_bytes_quantity(json, bytes);
         json += "\"";
     };
+    // Memory: allocatable is what pods can be given with no pod running, a
+    // fixed figure; the scheduler subtracts what bound pods request
     if (t.memory_capacity_bytes > 0) kib("memory", capacity ? t.memory_capacity_bytes : t.memory_allocatable_bytes);
     if (t.cpu_cores > 0) count("cpu", t.cpu_cores);
     if (t.total_gpio_count > 0) {
@@ -164,11 +173,28 @@ static void append_resources(Out& json, const NodeTelemetry& t, bool capacity) {
     if (t.total_psram_bytes > 0) {
         for (const char* name : {"esp.io/psram", "esp32.io/psram"}) {
             if (capacity) quantity(name, t.total_psram_bytes);
-            else kib(name, t.free_psram_bytes);
+            else kib(name, t.psram_allocatable_bytes);
         }
     }
     // The card: capacity is its size, allocatable the free space, both measured
     if (t.sd_present) quantity("hardware.kube32.io/sd", capacity ? t.sd_total_bytes : t.sd_free_bytes);
+}
+
+// What is free now, as annotations: kube32.io/memory-free (what pods can be
+// given now, on the base of allocatable.memory), kube32.io/heap-free (free
+// internal RAM) and kube32.io/psram-free (free PSRAM)
+template <typename Out>
+static void append_memory_annotations(Out& json, const NodeTelemetry& t) {
+    json += "\"kube32.io/memory-free\":\"";
+    append_bytes_quantity(json, t.memory_free_bytes);
+    json += "\",\"kube32.io/heap-free\":\"";
+    append_bytes_quantity(json, t.free_heap_bytes);
+    json += "\"";
+    if (t.total_psram_bytes > 0) {
+        json += ",\"kube32.io/psram-free\":\"";
+        append_bytes_quantity(json, t.free_psram_bytes);
+        json += "\"";
+    }
 }
 
 template <typename Out>
@@ -215,20 +241,16 @@ void NodeStatusReporter::append_registration(Out& json, const NodeTelemetry& tel
         json += "\",";
     }
     json += control_plane_ ? "\"node-role.kubernetes.io/control-plane\":\"\"}" : "\"node-role.kubernetes.io/worker\":\"\"}";
-    if (!annotations_.empty()) {
-        json += ",\"annotations\":{";
-        bool first = true;
-        for (const auto& kv : annotations_) {
-            if (!first) json += ",";
-            first = false;
-            json += "\"";
-            json += kv.first;
-            json += "\":\"";
-            json += kv.second;
-            json += "\"";
-        }
-        json += "}";
+    json += ",\"annotations\":{";
+    append_memory_annotations(json, telemetry);
+    for (const auto& kv : annotations_) {
+        json += ",\"";
+        json += kv.first;
+        json += "\":\"";
+        json += kv.second;
+        json += "\"";
     }
+    json += "}";
     json += "},";
     // No spec: registering again over an existing Node (after a reboot or
     // rejected heartbeats) must not uncordon it
@@ -282,7 +304,9 @@ bool NodeStatusReporter::write_registration_json(mem::FixedText& out, const Node
 
 template <typename Out>
 static void append_heartbeat_patch(Out& json, const NodeTelemetry& telemetry, bool memory_pressure) {
-    json += "{\"status\":{";
+    json += "{\"metadata\":{\"annotations\":{";
+    append_memory_annotations(json, telemetry);
+    json += "}},\"status\":{";
     json += "\"conditions\":[";
     append_ready_condition(json, telemetry);
     json += ",{\"type\":\"MemoryPressure\",\"status\":\"";

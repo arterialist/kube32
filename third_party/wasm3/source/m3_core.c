@@ -165,7 +165,6 @@ extern void*  kube32_pool_alloc(size_t bytes);
 extern int    kube32_pool_owns(const void* ptr);
 extern int    kube32_pool_free(void* ptr);
 extern size_t kube32_pool_block_size(void);
-extern size_t kube32_pool_whole_capacity(void);
 extern void*  kube32_rt_calloc(size_t bytes);
 extern void*  kube32_pool_sub_alloc(size_t bytes);
 extern void*  kube32_rt_realloc(void* ptr, size_t bytes);

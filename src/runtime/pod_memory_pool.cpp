@@ -1,4 +1,5 @@
 #include "runtime/pod_memory_pool.h"
+#include "osal/system.hpp"
 #include <atomic>
 #include <cstdint>
 #include <cstdlib>
@@ -170,17 +171,6 @@ int kube32_rt_shrink(void* ptr, size_t bytes) {
     return sub_shrink_locked(ptr, bytes) ? 1 : 0;
 }
 
-size_t kube32_pool_linear_room(void) {
-    if (!s_block || s_in_use.load()) return 0;
-    std::lock_guard<std::mutex> lock(s_sub_mutex);
-    if (!s_sub_active) return s_block_size;
-    // Below the small heap: its bottom chunk when free, less the minimal
-    // chunk kube32_pool_alloc leaves the small heap
-    SubChunk* first = sub_first();
-    if (s_sub_base != s_block || first->used || first->size < kMinChunk) return 0;
-    return first->size - kMinChunk;
-}
-
 size_t kube32_pool_whole_capacity(void) {
     std::lock_guard<std::mutex> lock(s_sub_mutex);
     return s_sub_active ? static_cast<size_t>(s_sub_base - static_cast<uint8_t*>(s_block)) : s_block_size;
@@ -249,7 +239,6 @@ int kube32_pool_stack_free(void* ptr) {
 }
 
 size_t kube32_pool_stack_size(void) { return s_stack_size; }
-size_t kube32_pool_stack_available(void) { return (s_stack && !s_stack_in_use.load()) ? s_stack_size : 0; }
 size_t kube32_pool_block_size(void) { return s_block_size; }
 
 // The block is sized for the node's largest pod: a request under half of it
@@ -440,6 +429,32 @@ int kube32_pod_account_enter(int account) {
 
 void kube32_pod_account_leave(int previous) { t_account = previous; }
 
+// What the system's own use leaves pods of PSRAM besides the block (or of
+// the internal heap on a board with neither, or of the host's memory),
+// measured the first time it is asked for with what pods hold then added
+// back. The reserve covers the system's growth after that.
+static std::mutex s_besides_mutex;
+static bool s_besides_measured = false;
+static size_t s_besides = 0;
+
+static size_t besides_block() {
+    std::lock_guard<std::mutex> lock(s_besides_mutex);
+    if (!s_besides_measured) {
+#if defined(ESP_PLATFORM)
+        if (board_psram()) {
+            s_besides = psram_above_reserve() + s_psram_bytes.load();
+        } else {
+            const size_t internal = heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+            s_besides = (internal > system_reserve() ? internal - system_reserve() : 0) + s_general_bytes.load();
+        }
+#else
+        s_besides = kube32::osal::System::get_free_heap_bytes() + s_general_bytes.load();
+#endif
+        s_besides_measured = true;
+    }
+    return s_besides;
+}
+
 size_t kube32_pool_pod_room(size_t memory_bytes, size_t* out_capacity) {
     size_t room = 0;
     if (s_heap_budget) {
@@ -459,56 +474,50 @@ size_t kube32_pool_pod_room(size_t memory_bytes, size_t* out_capacity) {
             room = internal > system_reserve() ? internal - system_reserve() : 0;
         }
 #else
-        room = static_cast<size_t>(1) << 30;   // the host's heap: not modelled
+        room = kube32::osal::System::get_free_heap_bytes();   // the host's available memory
 #endif
     }
     // The block is not part of the heap figures above; pods share it
     (void)memory_bytes;
-    size_t pool_held = 0;
-    if (s_block) {
-        const size_t pool_free = kube32_pool_available(nullptr);
-        room += pool_free;
-        pool_held = s_block_size - pool_free;
-    }
-    if (out_capacity) *out_capacity = room + pool_held + s_general_bytes.load() + s_psram_bytes.load();
+    if (s_block) room += kube32_pool_available(nullptr);
+    if (out_capacity) kube32_pool_node_room(out_capacity, nullptr);
     return room;
 }
 
 void kube32_pool_node_room(size_t* out_memory, size_t* out_psram) {
     size_t memory = 0, psram = 0;
-    const size_t block_free = s_block ? kube32_pool_available(nullptr) : 0;
 #if defined(ESP_PLATFORM)
     if (board_psram()) {
-        // What admission gives a pod now (kube32_pool_pod_room), and the
-        // linear memory the block can still take whole
-        memory = psram_above_reserve() + block_free;
-        psram = kube32_pool_linear_room();
+        // The block and the PSRAM above the reserve; pods get nothing else
+        memory = s_block_size + besides_block();
+        psram = memory;
     } else if (s_block) {
-        memory = block_free;
+        memory = s_block_size;   // admission counts the block alone
     } else {
-        const size_t internal = heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
-        memory = internal > system_reserve() ? internal - system_reserve() : 0;
+        memory = besides_block();
     }
 #else
     // The simulator's boards: its PSRAM is the block (--psram) and, with a
     // heap budget, the PSRAM besides it that pods' allocations come from;
     // without PSRAM the block and the budget, as kube32_pool_pod_room counts
-    // them. The host's memory itself is not modelled.
-    const size_t general = s_general_bytes.load();
-    if (s_external && s_heap_budget) {
-        memory = (s_heap_budget > general + system_reserve() ? s_heap_budget - general - system_reserve() : 0) + block_free;
-        psram = kube32_pool_linear_room();
-    } else if (s_heap_budget) {
-        const size_t used = general + system_reserve();
-        memory = (s_heap_budget > used ? s_heap_budget - used : 0) + block_free;
+    // them. Without a budget, the host's memory besides the block.
+    if (s_heap_budget) {
+        memory = (s_heap_budget > system_reserve() ? s_heap_budget - system_reserve() : 0) + s_block_size;
+        if (s_external) psram = memory;
     } else {
-        const size_t host = static_cast<size_t>(1) << 30;
-        memory = (host > general ? host - general : 0) + block_free;
-        if (s_external) psram = kube32_pool_linear_room();
+        memory = besides_block() + s_block_size;
+        if (s_external) psram = s_block_size;
     }
 #endif
     if (out_memory) *out_memory = memory;
     if (out_psram) *out_psram = psram;
+}
+
+size_t kube32_pool_linear_max(void) {
+    size_t memory = 0;
+    kube32_pool_node_room(&memory, nullptr);
+    const size_t besides = memory > s_block_size ? memory - s_block_size : 0;
+    return s_block_size > besides ? s_block_size : besides;
 }
 
 static bool in_psram(const void* p) {

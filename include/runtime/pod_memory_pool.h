@@ -22,7 +22,6 @@ void   kube32_pool_reserve_stack(size_t bytes);
 void*  kube32_pool_stack_alloc(size_t bytes);      /* NULL when taken or too small */
 int    kube32_pool_stack_free(void* ptr);
 size_t kube32_pool_stack_size(void);
-size_t kube32_pool_stack_available(void);          /* bytes free for scheduling purposes */
 /* Boards without PSRAM run every host-initiated call into a pod (k32_init,
  * k32_handle, k32_tick, k32_event) on one shared interpreter stack, so no
  * task needs a stack sized for the interpreter (tens of KB on Xtensa, which
@@ -55,9 +54,6 @@ size_t kube32_pool_last_refused(void);
  * pointer was one of these. */
 void* kube32_pool_sub_alloc(size_t bytes);
 int   kube32_pool_sub_free(void* ptr);
-/* Bytes a large linear memory can still take whole at the block's start (0
- * while one holds it or small allocations reach down to it). */
-size_t kube32_pool_linear_room(void);
 /* Bytes the large memory at the block's start may grow to in place. */
 size_t kube32_pool_whole_capacity(void);
 /* Nesting counter: while above zero, pod allocations try the general heap
@@ -79,21 +75,30 @@ size_t kube32_pool_heap_budget(void);
 /* Bytes a pod could be given now: the pool block's free part, and PSRAM
  * above its reserve on a board with PSRAM, or the general heap above the
  * system reserve on a board with neither PSRAM nor a block. A board with
- * PSRAM never gives pods internal RAM. *out_capacity (optional) adds what
- * pods hold already: what the pod could be given with no other pod running.
- * `memory_bytes` is the pod's memory limit. */
+ * PSRAM never gives pods internal RAM. The simulator without a heap budget
+ * gives pods the host's available memory. *out_capacity (optional) is what
+ * pods can ever be given (kube32_pool_node_room's memory): a pod that needs
+ * more never fits. `memory_bytes` is the pod's memory limit. */
 size_t kube32_pool_pod_room(size_t memory_bytes, size_t* out_capacity);
-/* What the Node offers pods (status.allocatable), the room the kubelet's
- * admission gives a pod now (kube32_pool_pod_room):
- *   *out_memory: memory for a pod's module, structures and linear memory.
- *     Without PSRAM the pool block's free part; with PSRAM the block's free
- *     part and the PSRAM above its reserve. The host models a board with a
- *     heap budget (the budget above the system reserve, and the block's free
- *     part); without one it gives pods up to 1 GiB.
- *   *out_psram: with PSRAM, the linear memory the block can still take
- *     whole (kube32_pool_linear_room), what a pod's esp32.io/psram request
- *     is for; 0 without PSRAM. */
+/* What the Node offers pods (status.allocatable): what pods can be given
+ * with no pod running. Pods starting and stopping do not change it; the
+ * scheduler subtracts what the pods bound to the node request.
+ *   *out_memory: memory for pods' modules, structures and linear memories.
+ *     Without PSRAM the pool block. With PSRAM the block and the PSRAM
+ *     above its reserve. The host models a board with a heap budget (the
+ *     budget above the system reserve, and the block); without one, the
+ *     host's available memory and the block.
+ *   *out_psram: with PSRAM, the same figure (a pod's memory is all PSRAM
+ *     there, and an esp32.io/psram request sizes its linear memory); the
+ *     simulator's PSRAM stand-in without a budget is the block alone. 0
+ *     without PSRAM.
+ * What the system's own use leaves of PSRAM (and of the host's memory) is
+ * measured once, the first time, with what pods hold then added back: the
+ * reserve covers the system's growth after that. */
 void kube32_pool_node_room(size_t* out_memory, size_t* out_psram);
+/* The largest linear memory the node can ever place in one piece: the
+ * block, or the PSRAM (or host memory) besides it when that is larger. */
+size_t kube32_pool_linear_max(void);
 /* Grows or shrinks, in place, the large memory at the block's start to
  * `bytes`; 1 when it fits there (it then counts as that size), 0 when it
  * must move. */
