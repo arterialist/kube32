@@ -62,7 +62,7 @@ Allocatable figures stay the same while pods start and stop. The scheduler subtr
 kubectl get node <node> -o jsonpath='{.status.allocatable.memory} {.metadata.annotations.kube32\.io/memory-free}'
 ```
 
-`kubectl top pod` reports every byte that a pod's runtime holds: wasm3's structures, compiled code, value stack and linear memory as allocated, allocator headers included, the module's bytes when the pod keeps a copy, and the stack of its thread when it runs `app_main`. The runtime charges each allocation to the pod it is made for and credits it back when it is freed, on whichever thread frees it. An allocation in the pool block keeps its owner in the chunk header that it has anyway. An allocation in the general heap or PSRAM carries an 8-byte header. `kubectl top node` reports internal RAM and PSRAM in use, less the pool block's free part, on the base of `capacity` `memory`.
+`kubectl top pod` reports every byte that a pod's runtime holds: wasm3's structures, compiled code, value stack and linear memory as allocated, allocator headers included, the module's bytes when the image is not embedded, and the stack of its thread when it runs `app_main`. The runtime charges each allocation to the pod it is made for and credits it back when it is freed, on whichever thread frees it. An allocation in the pool block keeps its owner in the chunk header that it has anyway. An allocation in the general heap or PSRAM carries an 8-byte header. `kubectl top node` reports internal RAM and PSRAM in use, less the pool block's free part, on the base of `capacity` `memory`.
 
 ## Partition table
 

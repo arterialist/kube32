@@ -78,11 +78,11 @@ The control plane persists cluster objects in a log-structured journal. When the
 
 ## Images from the card
 
-Use `wasm://sd/<name>` or `wasm://sd/<name>:<tag>` to load `/sd/kube32/images/<name>.wasm` or `<name>-<tag>.wasm`. The kubelet reads the file in 4 KiB chunks into a single heap buffer retained for the module's lifetime.
+Use `wasm://sd/<name>` or `wasm://sd/<name>:<tag>` to load `/sd/kube32/images/<name>.wasm` or `<name>-<tag>.wasm`. The kubelet reads the file in 4 KiB chunks into one allocation of pod memory, which the pod keeps for the module's lifetime and is charged for ([Memory](architecture/wasm-runtime.md#memory)).
 
 * Maximum image size is 256 KiB without PSRAM, or 2 MiB with PSRAM.
 * Names and tags allow `[A-Za-z0-9._-]`.
-* Pull failures emit `ErrImagePull` pod events when the file is missing, exceeds the size limit, lacks a mounted card, or fails memory allocation.
+* Pull failures emit `ErrImagePull` pod events when the file is missing, exceeds the size limit, or lacks a mounted card. A module that finds no room in pod memory makes the pod wait with `InsufficientMemory`.
 
 ```
 $ kubectl --context kube32 get events --field-selector involvedObject.name=sdnote
