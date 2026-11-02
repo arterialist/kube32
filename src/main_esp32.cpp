@@ -1127,6 +1127,8 @@ void cluster_task(void* pv) {
             profile.uart_pins[1] = {2, 1};    // Grove TX, RX
             profile.rmt_tx_pin_mask = 1ULL << 44;
             profile.rmt_tx_default_pin = 44;  // IR LED
+            // ST7789 panel, matrix keyboard, I2S speaker
+            profile.onboard_devices = kube32::hal::KUBE32_CAP_DISPLAY | kube32::hal::KUBE32_CAP_KEYBOARD | kube32::hal::KUBE32_CAP_SPEAKER;
         }
         kube32::hal::CapabilityFirewall::instance().set_board_profile(profile);
     }
@@ -1228,6 +1230,7 @@ void cluster_task(void* pv) {
     auto wasm_runtime = kube32::runtime::create_wasm_runtime();
     s_runtime = wasm_runtime.get();
     std::unique_ptr<kube32::storage::Store> store;
+    std::unique_ptr<kube32::api::TimestampBackfill> backfill;   // objects created before the clock is set
     std::unique_ptr<kube32::controller::NodeLifecycleController> node_lifecycle;
     std::unique_ptr<kube32::scheduler::Scheduler> scheduler;
     std::unique_ptr<kube32::controller::DeploymentController> deployments;
@@ -1366,6 +1369,9 @@ void cluster_task(void* pv) {
                    (unsigned long long)store->current_version(), rs.ok() ? "" : (" (" + rs.message + ")").c_str());
         }
         s_store = store.get();
+        // From here on (the journal's objects are an earlier boot's): what
+        // is created before the clock is set gets its time once it is
+        if (kube32::osal::System::get_unix_time_ms() == 0) backfill = std::make_unique<kube32::api::TimestampBackfill>(*store);
 
         kube32::controller::NodeLifecycleConfig nl_cfg;
         nl_cfg.check_interval_ms = 1000;
@@ -1661,12 +1667,14 @@ void cluster_task(void* pv) {
             // Changes no API request waited for (controllers, Node
             // heartbeats) reach the journal here
             store->flush(false);
-            // Objects made before the clock was set get their timestamps once it is
-            static int backfills = 0;
-            if (backfills < 2 && kube32::osal::System::get_unix_time_ms() != 0 && (backfills == 0 || iter % 60 == 0)) {
-                size_t n = kube32::api::backfill_timestamps(*store);
+            // Objects made before the clock was set get their timestamps once
+            // it is; one that could not be written is tried again a minute later
+            static bool backfilled = false;
+            if (backfill && kube32::osal::System::get_unix_time_ms() != 0 && (!backfilled || iter % 60 == 0)) {
+                backfilled = true;
+                const size_t n = backfill->run();
                 if (n) printf("[CLOCK] timestamps set on %u object(s) created before the clock synchronized\n", (unsigned)n);
-                ++backfills;
+                if (backfill->pending() == 0) backfill.reset();
             }
         }
         if (ident.is_control_plane && store && iter % 10 == 0) try {

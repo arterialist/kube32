@@ -361,6 +361,9 @@ int main(int argc, char* argv[]) {
     // Host has memory to spare: 16 KiB per pod log ring (the device keeps 2 KiB)
     kube32::runtime::PodLogStore::runtime().set_ring_capacity(16 * 1024);
     kube32::runtime::PodLogStore::apiserver().set_ring_capacity(16 * 1024);
+    // The kubelets of this process (in-process workers too) share one store:
+    // a log ring for every pod each of them admits
+    kube32::runtime::PodLogStore::runtime().set_max_pods(kube32::kubelet::KubeletConfig{}.max_pods * (1 + opts.workers.size()));
 
     std::cout << "==================================================================" << std::endl;
     std::cout << "  Kube32 Embedded Cluster Host Simulation Daemon (kube32-sim)     " << std::endl;

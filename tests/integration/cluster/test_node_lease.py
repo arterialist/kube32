@@ -63,7 +63,10 @@ class TestNodeLease(BaseTestCase):
         def ready(status):
             cond = node_ready_condition(cp.api_url, worker.name)
             return cond if cond and cond.get("status") == status else None
-        self.wait_for_condition(lambda: ready("True"), timeout=10.0, description="node Ready=True")
+        up = self.wait_for_condition(lambda: ready("True"), timeout=10.0, description="node Ready=True")
+        # Heartbeats carry the times Kubernetes defines (the simulator has a wall clock)
+        self.assertTrue(up.get("lastHeartbeatTime"))
+        self.assertTrue(up.get("lastTransitionTime"))
 
         # Kill worker to simulate abrupt hardware drop
         self.harness.kill_node(worker.name)
@@ -73,3 +76,10 @@ class TestNodeLease(BaseTestCase):
         cond = self.wait_for_condition(lambda: ready("Unknown"), timeout=25.0, interval=0.5,
                                        description="node Ready=Unknown")
         self.assertEqual(cond.get("reason"), "NodeStatusUnknown")
+        # The transition is the controller's; the heartbeat time stays the kubelet's last
+        self.assertGreater(cond.get("lastTransitionTime", ""), up.get("lastTransitionTime"))
+        self.assertGreaterEqual(cond.get("lastHeartbeatTime", ""), up.get("lastHeartbeatTime"))
+        with urllib.request.urlopen(f"{cp.api_url}/api/v1/nodes/{worker.name}", timeout=2.0) as resp:
+            conds = json.loads(resp.read().decode()).get("status", {}).get("conditions", [])
+        pressure = next(c for c in conds if c.get("type") == "MemoryPressure")
+        self.assertEqual(pressure.get("status"), "Unknown")

@@ -210,15 +210,15 @@ std::string_view header_value(std::string_view head, std::string_view name) {
 // nothing from the heap (lwIP's own buffers aside).
 int HttpKubeClient::stream_request(const char* method, std::string_view path, std::string_view body,
                                    mem::FunctionRef<bool(const char*, size_t)> on_data, long* out_content_length,
-                                   mem::FunctionRef<bool(int, std::string_view)>* on_head) {
+                                   mem::FunctionRef<bool(int, std::string_view)>* on_head, const char* content_type) {
     if (out_content_length) *out_content_length = -1;
     if (path.empty()) return 0;
     char buf[1024];
     int head_len = snprintf(buf, sizeof(buf),
                             "%s %.*s HTTP/1.1\r\nHost: %s:%u\r\nUser-Agent: kubelet/v1.33.0\r\nAccept: application/json\r\n"
-                            "Content-Type: application/json\r\nContent-Length: %u\r\n%s%s%sConnection: close\r\n\r\n",
+                            "Content-Type: %s\r\nContent-Length: %u\r\n%s%s%sConnection: close\r\n\r\n",
                             method, static_cast<int>(path.size()), path.data(), host_.c_str(), static_cast<unsigned>(port_),
-                            static_cast<unsigned>(body.size()), token_.empty() ? "" : "Authorization: Bearer ", token_.c_str(),
+                            content_type, static_cast<unsigned>(body.size()), token_.empty() ? "" : "Authorization: Bearer ", token_.c_str(),
                             token_.empty() ? "" : "\r\n");
     if (head_len <= 0 || static_cast<size_t>(head_len) >= sizeof(buf)) return 0;
 
@@ -307,7 +307,7 @@ int HttpKubeClient::stream_request(const char* method, std::string_view path, st
     return status;
 }
 
-int HttpKubeClient::exchange(const char* method, std::string_view path, std::string_view body, BodyStart* start) {
+int HttpKubeClient::exchange(const char* method, std::string_view path, std::string_view body, BodyStart* start, const char* content_type) {
     if (start) start->len = 0;
     return stream_request(method, path, body, [&](const char* data, size_t len) {
         if (start && start->len < sizeof(start->text)) {
@@ -316,7 +316,7 @@ int HttpKubeClient::exchange(const char* method, std::string_view path, std::str
             start->len += take;
         }
         return true;
-    });
+    }, nullptr, nullptr, content_type);
 }
 
 bool HttpKubeClient::register_node(std::string_view node_json, bool& out_conflict) {
@@ -343,7 +343,10 @@ bool HttpKubeClient::patch_node_status(const std::string& node_name, std::string
     PathBuf path;
     path.add("/api/v1/nodes/").add(node_name);
     BodyStart answer;
-    const int status = exchange("PATCH", path.view(), patch_json, &answer);
+    // Strategic merge, as the Kubernetes kubelet patches its Node: conditions
+    // merge by type, so the node lifecycle controller's and this kubelet's
+    // entries stay side by side
+    const int status = exchange("PATCH", path.view(), patch_json, &answer, "application/strategic-merge-patch+json");
     if (status != 200) {
         std::cout << "[KUBELET] node status patch failed: http " << status
                   << (answer.len ? " " : "") << std::string_view(answer.text, std::min<size_t>(answer.len, 120)) << std::endl;

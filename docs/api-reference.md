@@ -126,7 +126,7 @@ Error from server (BadRequest): error when creating "typo.yaml": strict decoding
 
 Write requests honour `dryRun=All` in the query string or in a `DeleteOptions` request body. The server validates the request and checks preconditions without writing to the store or firing watch events.
 
-`application/merge-patch+json` and `application/strategic-merge-patch+json` apply a recursive JSON merge where objects merge and arrays or scalars replace. `PUT` and `PATCH` preserve `uid`, `creationTimestamp` and `status`, and increment `metadata.generation` when `spec` changes.
+`application/merge-patch+json` applies a recursive JSON merge where objects merge and arrays or scalars replace. `application/strategic-merge-patch+json` also merges the lists of the core types by their key, for example containers by `name` and conditions by `type`. `PUT` and `PATCH` preserve `uid`, `creationTimestamp` and `status`, and increment `metadata.generation` when `spec` changes.
 
 `fieldSelector` supports `=`, `==` and `!=` on any dotted path. `labelSelector` supports `=`, `==`, `!=`, `in`, `notin`, `key` and `!key`. List endpoints honour `limit` and `continue` and set `remainingItemCount` in the list metadata. Pod list endpoints accept `?inlineImages=omit` (used by the kubelet) to omit `kube32.io/wasm-base64` annotation payloads.
 

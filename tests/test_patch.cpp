@@ -88,10 +88,73 @@ static void test_null_and_directives_on_maps() {
     expect(strategic(R"({"selector":{"a":"1"}})", R"({"selector":{"$patch":"replace","b":"2"}})"), R"({"selector":{"b":"2"}})");
 }
 
+// A kubelet heartbeat (strategic merge) over a Node whose conditions two
+// writers set: settled times as Kubernetes defines them
+static std::string heartbeat(const std::string& node, const std::string& patch, uint64_t now_ms) {
+    JsonValue n = parse(node);
+    const JsonValue* stored = kube32::models::node_conditions(n);
+    const JsonValue before = stored ? *stored : JsonValue{};
+    const JsonValue p = parse(patch);
+    kube32::models::apply_patch(n, p, "application/strategic-merge-patch+json");
+    kube32::models::settle_node_condition_times(n, stored ? &before : nullptr, kube32::models::node_conditions(p), now_ms);
+    return n.to_string();
+}
+
+static void test_node_condition_times() {
+    std::cout << "[RUN] test_node_condition_times" << std::endl;
+    const uint64_t now = 1793620800000ULL;   // 2026-11-02T12:00:00Z
+    // The node lifecycle controller set Ready Unknown at 11:50; the kubelet
+    // is back and reports Ready True, which it has been since 10:00 by its
+    // own count: the condition on the Node changes now. FirmwareUpdate,
+    // which the patch does not carry, keeps its entry.
+    const std::string unknown = R"({"status":{"conditions":[
+        {"type":"Ready","status":"Unknown","reason":"NodeStatusUnknown","lastHeartbeatTime":"2026-11-02T11:49:40Z","lastTransitionTime":"2026-11-02T11:50:00Z"},
+        {"type":"FirmwareUpdate","status":"False","reason":"Idle","lastTransitionTime":"2026-11-01T08:00:00Z"}]}})";
+    expect(heartbeat(unknown, R"({"status":{"conditions":[
+        {"type":"Ready","status":"True","reason":"KubeletReady","lastHeartbeatTime":"2026-11-02T12:00:00Z","lastTransitionTime":"2026-11-02T10:00:00Z"}]}})", now),
+           R"({"status":{"conditions":[
+        {"type":"Ready","status":"True","reason":"KubeletReady","lastHeartbeatTime":"2026-11-02T12:00:00Z","lastTransitionTime":"2026-11-02T12:00:00Z"},
+        {"type":"FirmwareUpdate","status":"False","reason":"Idle","lastTransitionTime":"2026-11-01T08:00:00Z"}]}})");
+
+    // The same status again (a rebooted kubelet counts from its boot): the
+    // stored transition stays
+    const std::string ready = R"({"status":{"conditions":[
+        {"type":"Ready","status":"True","reason":"KubeletReady","lastHeartbeatTime":"2026-11-02T11:59:55Z","lastTransitionTime":"2026-11-01T09:00:00Z"}]}})";
+    expect(heartbeat(ready, R"({"status":{"conditions":[
+        {"type":"Ready","status":"True","reason":"KubeletReady","lastHeartbeatTime":"2026-11-02T12:00:00Z","lastTransitionTime":"2026-11-02T11:58:00Z"}]}})", now),
+           R"({"status":{"conditions":[
+        {"type":"Ready","status":"True","reason":"KubeletReady","lastHeartbeatTime":"2026-11-02T12:00:00Z","lastTransitionTime":"2026-11-01T09:00:00Z"}]}})");
+
+    // A change the kubelet saw and timed after the stored one keeps its time
+    expect(heartbeat(ready, R"({"status":{"conditions":[
+        {"type":"Ready","status":"False","reason":"KubeletNotReady","lastHeartbeatTime":"2026-11-02T12:00:00Z","lastTransitionTime":"2026-11-02T11:59:58Z"}]}})", now),
+           R"({"status":{"conditions":[
+        {"type":"Ready","status":"False","reason":"KubeletNotReady","lastHeartbeatTime":"2026-11-02T12:00:00Z","lastTransitionTime":"2026-11-02T11:59:58Z"}]}})");
+
+    // A kubelet without a wall clock: the API server stamps the write; with
+    // no clock there either, the times of the earlier status are dropped
+    expect(heartbeat(ready, R"({"status":{"conditions":[{"type":"Ready","status":"False","reason":"KubeletNotReady"}]}})", now),
+           R"({"status":{"conditions":[
+        {"type":"Ready","status":"False","reason":"KubeletNotReady","lastHeartbeatTime":"2026-11-02T12:00:00Z","lastTransitionTime":"2026-11-02T12:00:00Z"}]}})");
+    expect(heartbeat(ready, R"({"status":{"conditions":[{"type":"Ready","status":"False","reason":"KubeletNotReady"}]}})", 0),
+           R"({"status":{"conditions":[{"type":"Ready","status":"False","reason":"KubeletNotReady"}]}})");
+    expect(heartbeat(ready, R"({"status":{"conditions":[{"type":"Ready","status":"True","reason":"KubeletReady"}]}})", 0),
+           R"({"status":{"conditions":[{"type":"Ready","status":"True","reason":"KubeletReady","lastTransitionTime":"2026-11-01T09:00:00Z"}]}})");
+
+    // A first registration: conditions without times get the write's time
+    JsonValue created = parse(R"({"status":{"conditions":[{"type":"Ready","status":"False"}]}})");
+    const JsonValue sent = *kube32::models::node_conditions(created);
+    kube32::models::settle_node_condition_times(created, nullptr, &sent, now);
+    expect(created.to_string(), R"({"status":{"conditions":[
+        {"type":"Ready","status":"False","lastHeartbeatTime":"2026-11-02T12:00:00Z","lastTransitionTime":"2026-11-02T12:00:00Z"}]}})");
+    std::cout << "[PASS] test_node_condition_times" << std::endl;
+}
+
 int main() {
     test_apply_changes_one_container_field();
     test_keyed_lists_add_delete_order();
     test_null_and_directives_on_maps();
+    test_node_condition_times();
     std::cout << "All patch tests passed" << std::endl;
     return 0;
 }

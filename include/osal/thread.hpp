@@ -42,6 +42,17 @@ public:
     // Check if thread can be joined
     bool is_joinable() const;
 
+    // CPU time this thread has run so far, in microseconds; false once it
+    // has ended or where it cannot be measured. The caller keeps the thread
+    // from ending during the call. On the ESP32 the figure is the task's
+    // FreeRTOS run-time counter, which grows when the task is switched out.
+    bool cpu_time_us(uint64_t& out_us) const;
+    // CPU time the calling thread has run, in microseconds; false where it
+    // cannot be measured. Time spent blocked (locks, sockets, sleeps) is
+    // not CPU time. On the ESP32 the call yields once so that the slice
+    // running now is counted.
+    static bool current_cpu_time_us(uint64_t& out_us);
+
     // Static concurrency utilities
     static bool create(EntryFn entry, void* arg, const Config& config = Config());
     static void sleep_ms(uint32_t ms);
@@ -51,6 +62,8 @@ public:
     static uint64_t get_time_us();
     static const char* get_current_name();
     static int get_current_core();
+    // Identifies the calling thread while it runs (its task or pthread)
+    static uintptr_t current_id();
 
 private:
     struct Impl;

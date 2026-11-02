@@ -848,6 +848,51 @@ void apply_patch(JsonValue& target, const JsonValue& patch, std::string_view con
     else merge_json(target, patch);
 }
 
+static const JsonValue* condition_of_type(const JsonValue* conditions, const std::string& type) {
+    if (!conditions || !conditions->is_array()) return nullptr;
+    for (const auto& c : conditions->arr_val) {
+        if (c.is_object() && c.get_string("type", "") == type) return &c;
+    }
+    return nullptr;
+}
+
+const JsonValue* node_conditions(const JsonValue& node) {
+    const JsonValue* status = node.get("status");
+    const JsonValue* conditions = status ? status->get("conditions") : nullptr;
+    return conditions && conditions->is_array() ? conditions : nullptr;
+}
+
+void settle_node_condition_times(JsonValue& node, const JsonValue* stored, const JsonValue* sent, uint64_t now_ms) {
+    JsonValue* status = node.get_mut("status");
+    JsonValue* conditions = status ? status->get_mut("conditions") : nullptr;
+    if (!conditions || !conditions->is_array() || !sent || !sent->is_array()) return;
+    const std::string now = now_ms ? format_rfc3339(now_ms) : std::string();
+    auto set_time = [&](JsonValue& c, const char* field, const std::string& value) {
+        if (value.empty()) c.remove(field);
+        else c.set(field, JsonValue{JsonType::String, false, 0, value, {}, {}});
+    };
+    for (auto& c : conditions->arr_val) {
+        if (!c.is_object()) continue;
+        const std::string type = c.get_string("type", "");
+        const JsonValue* written = condition_of_type(sent, type);
+        if (!written) continue;   // not part of this write: as it was
+        if (written->get_string("lastHeartbeatTime", "").empty()) set_time(c, "lastHeartbeatTime", now);
+        const JsonValue* old = condition_of_type(stored, type);
+        const std::string old_since = old ? old->get_string("lastTransitionTime", "") : std::string();
+        if (old && old->get_string("status", "") == c.get_string("status", "")) {
+            if (!old_since.empty()) set_time(c, "lastTransitionTime", old_since);
+            continue;
+        }
+        // The status changed: the writer's time when it saw the change, which
+        // is after the stored one; otherwise the change is happening now
+        const std::string since = written->get_string("lastTransitionTime", "");
+        uint64_t since_ms = 0, old_ms = 0;
+        const bool newer = !since.empty() && parse_rfc3339(since, since_ms) &&
+                           (old_since.empty() || !parse_rfc3339(old_since, old_ms) || since_ms > old_ms);
+        set_time(c, "lastTransitionTime", newer ? since : now);
+    }
+}
+
 // =============================================================================
 // Model Manifest Parsers
 // =============================================================================
@@ -1080,6 +1125,32 @@ KubePod parse_pod_manifest(const std::string& json_str) {
             pod.restart_count = restarts;
         } else {
             pod.ready_containers = (pod.status == "Running") ? pod.total_containers : 0;
+        }
+        pod.start_time = status->get_string("startTime", "");
+        const JsonValue* first = (cstatuses && cstatuses->is_array() && !cstatuses->arr_val.empty() && cstatuses->arr_val[0].is_object())
+                                     ? &cstatuses->arr_val[0] : nullptr;
+        if (first) {
+            pod.first_restart_count = static_cast<uint32_t>(first->get_int("restartCount", 0));
+            const JsonValue* state = first->get("state");
+            const JsonValue* last = first->get("lastState");
+            const JsonValue* running = state ? state->get("running") : nullptr;
+            const JsonValue* waiting = state ? state->get("waiting") : nullptr;
+            const JsonValue* ended = state ? state->get("terminated") : nullptr;
+            if (!ended && last) ended = last->get("terminated");
+            if (running && running->is_object()) {
+                pod.container_running = true;
+                pod.container_started_at = running->get_string("startedAt", "");
+            }
+            if (ended && ended->is_object()) {
+                pod.has_last_state = true;
+                pod.last_exit_code = static_cast<int32_t>(ended->get_int("exitCode", 0));
+                pod.last_reason = ended->get_string("reason", "");
+                pod.last_message = ended->get_string("message", "");
+                pod.last_started_at = ended->get_string("startedAt", "");
+                pod.last_finished_at = ended->get_string("finishedAt", "");
+            }
+            pod.container_ran = pod.container_running || pod.has_last_state || pod.first_restart_count > 0 ||
+                                (waiting && waiting->get_string("reason", "") == "CrashLoopBackOff");
         }
     }
 

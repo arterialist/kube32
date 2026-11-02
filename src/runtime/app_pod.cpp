@@ -1,6 +1,7 @@
 #include "runtime/app_pod.hpp"
 #include "runtime/pod_memory_pool.h"
 #include "runtime/container_lifecycle.hpp"
+#include "runtime/pod_cpu.hpp"
 #include "runtime/pod_log.hpp"
 #include "runtime/pod_fs.hpp"
 #include "runtime/k32_app_abi.h"
@@ -971,6 +972,14 @@ int32_t AppPodHost::call_with_block(Entry& e, const std::string& pod_id, const c
     ContainerLifecycleController* ctrl = e.ctrl;
     if (!e.has_alloc) return -1;
 
+    // The call's CPU time goes to the pod; a pod it calls on this thread is
+    // charged its own
+    struct Charge {
+        AppPodHost* host;
+        const std::string& id;
+        PodCpuRegion cpu;
+        ~Charge() { host->add_cpu(id, cpu.finish()); }
+    } charge{this, pod_id};
     uint32_t total = static_cast<uint32_t>(len + topic.size());
     set_busy(pod_id, fn);
     struct Idle { AppPodHost* h; const std::string& id; ~Idle() { h->set_busy(id, nullptr); } } idle{this, pod_id};
@@ -1159,7 +1168,6 @@ int32_t AppPodHost::dispatch(const std::string& pod_id, const AppRequest& req, A
         Entry* e2 = find_locked(pod_id);
         if (e2) {
             e2->stats.requests++;
-            e2->stats.total_us += us;
             e2->stats.last_us = us;
             if (us > e2->stats.max_us) e2->stats.max_us = us;
             if (status < 0 || status >= 500) e2->stats.errors++;
@@ -1178,8 +1186,8 @@ int32_t AppPodHost::tick(const std::string& pod_id, uint32_t uptime_ms) {
         ctrl = e->ctrl;
         cm = e->call_mutex.get();
     }
-    uint64_t t0 = osal::Thread::get_time_us();
     int32_t rc;
+    uint64_t cpu_us = 0;
     {
         osal::LockGuard call_guard(*cm);
         int64_t offset = 0;
@@ -1191,17 +1199,14 @@ int32_t AppPodHost::tick(const std::string& pod_id, uint32_t uptime_ms) {
             e->busy_fn = K32_EXPORT_TICK;
             e->busy_since_ms = osal::System::get_uptime_ms();
         }
+        PodCpuRegion cpu;
         arm_call_budget(ctrl);
         rc = ctrl->call_function(K32_EXPORT_TICK, {static_cast<int32_t>(static_cast<int64_t>(uptime_ms) + offset)});
         note_call_cost(ctrl, K32_EXPORT_TICK);
+        cpu_us = cpu.finish();
         set_busy(pod_id, nullptr);
     }
-    uint32_t us = static_cast<uint32_t>(osal::Thread::get_time_us() - t0);
-    {
-        osal::LockGuard guard(mutex_);
-        Entry* e2 = find_locked(pod_id);
-        if (e2) e2->stats.total_us += us;   // interpreter time feeds pod CPU metrics
-    }
+    add_cpu(pod_id, cpu_us);
     return rc;
 }
 
@@ -1262,7 +1267,6 @@ int32_t AppPodHost::event(const std::string& pod_id, std::string_view topic, con
         if (e->frozen) return hold(*e);
         cm = e->call_mutex.get();
     }
-    uint64_t t0 = osal::Thread::get_time_us();
     int32_t rc;
     {
         osal::LockGuard call_guard(*cm);
@@ -1274,12 +1278,6 @@ int32_t AppPodHost::event(const std::string& pod_id, std::string_view topic, con
         }
         rc = call_with_block(*e, pod_id, K32_EXPORT_EVENT, topic, data, len, nullptr);
     }
-    uint32_t us = static_cast<uint32_t>(osal::Thread::get_time_us() - t0);
-    {
-        osal::LockGuard guard(mutex_);
-        Entry* e2 = find_locked(pod_id);
-        if (e2) e2->stats.total_us += us;
-    }
     return rc;
 }
 
@@ -1288,11 +1286,19 @@ int32_t AppPodHost::event(const std::string& pod_id, std::string_view topic, con
 // -----------------------------------------------------------------------------
 int32_t AppPodHost::call_export(const std::string& pod_id, ContainerLifecycleController* ctrl, const char* fn) {
     set_busy(pod_id, fn);
+    PodCpuRegion cpu;
     arm_call_budget(ctrl);
     const int32_t rc = ctrl->call_function(fn);
     note_call_cost(ctrl, fn);
+    add_cpu(pod_id, cpu.finish());
     set_busy(pod_id, nullptr);
     return rc;
+}
+
+void AppPodHost::add_cpu(const std::string& pod_id, uint64_t us) {
+    if (us == 0) return;
+    osal::LockGuard guard(mutex_);
+    if (Entry* e = find_locked(pod_id)) e->stats.cpu_us += us;
 }
 
 void AppPodHost::set_busy(const std::string& pod_id, const char* fn) {

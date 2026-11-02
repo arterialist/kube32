@@ -2,11 +2,17 @@
 
 #include "models/kube_models.hpp"
 #include "mem/fixed_text.hpp"
+#include <atomic>
 #include <map>
 #include <string>
 #include <cstdint>
 
 namespace kube32::kubelet {
+
+// Node annotations of a node with a mounted microSD card: its size, and its
+// free space in whole MiB rounded down
+constexpr const char* kAnnotationSdCapacity = "kube32.io/sd-capacity";
+constexpr const char* kAnnotationSdFree = "kube32.io/sd-free";
 
 // What the node reports in status.capacity / status.allocatable and its
 // conditions. Every figure is measured on the node or read from the board
@@ -37,10 +43,18 @@ struct NodeTelemetry {
     uint32_t allocatable_rmt_tx_count{0};
     uint32_t total_rmt_rx_count{0};  // RMT (IR) RX channels with a pin to run on
     uint32_t allocatable_rmt_rx_count{0};
-    // microSD card (hardware.kube32.io/sd): measured at collection, absent without a card
+    // pods: the most pods the kubelet admits at once (KubeletConfig::max_pods)
+    uint32_t pods_capacity{0};
+    // Device grants (hardware.kube32.io/*) the node can give: a mounted
+    // microSD card, the board's on-board devices, the chip's temperature
+    // sensor; channel IPC on every node. Each pod holds a grant at most once
+    // and any number of pods share a device, so each grant's count is
+    // pods_capacity.
     bool sd_present{false};
-    uint64_t sd_total_bytes{0};
-    uint64_t sd_free_bytes{0};
+    bool has_display{false};
+    bool has_keyboard{false};
+    bool has_speaker{false};
+    bool has_chip_temp{false};
     // Ready condition, from the kubelet's own health (Kubelet::fill_ready_condition).
     // Fixed storage: telemetry is collected every heartbeat.
     bool ready{false};
@@ -52,6 +66,15 @@ struct NodeTelemetry {
     bool firmware_updating{false};
     char firmware_reason[16]{""};
     char firmware_message[128]{""};
+    // Condition times in Unix milliseconds, filled by the kubelet
+    // (Kubelet::time_conditions); 0 while the wall clock is unset, and the
+    // field is then left out. lastTransitionTime is when this kubelet saw
+    // the status change; the API server keeps the stored time while the
+    // status on the Node stays the same (models::settle_node_condition_times).
+    uint64_t heartbeat_unix_ms{0};
+    uint64_t ready_transition_unix_ms{0};
+    uint64_t memory_pressure_transition_unix_ms{0};
+    uint64_t firmware_transition_unix_ms{0};
 };
 
 class NodeStatusReporter {
@@ -62,14 +85,27 @@ public:
     // Collect telemetry from OSAL & HAL
     NodeTelemetry collect_telemetry() const;
 
-    // JSON builders
-    std::string build_registration_json(const NodeTelemetry& telemetry) const;
+    // JSON builders. The registration is the Node object to create, or with
+    // `as_patch` the patch over a Node that outlived this kubelet: each
+    // resource the node no longer has is set to null in capacity and
+    // allocatable, so it leaves the Node. A heartbeat carries allocatable,
+    // and capacity too when the resources differ from node_resources().
+    std::string build_registration_json(const NodeTelemetry& telemetry, bool as_patch = false) const;
     std::string build_heartbeat_patch_json(const NodeTelemetry& telemetry, bool memory_pressure) const;
     // The heartbeat patch or the Node object written into `out` (cleared
     // first), storage the caller owns: nothing is taken from the heap.
     // False when it did not fit.
     bool write_heartbeat_patch_json(mem::FixedText& out, const NodeTelemetry& telemetry, bool memory_pressure) const;
-    bool write_registration_json(mem::FixedText& out, const NodeTelemetry& telemetry) const;
+    bool write_registration_json(mem::FixedText& out, const NodeTelemetry& telemetry, bool as_patch = false) const;
+
+    // Resources that come and go (device grants, peripheral counts), one bit
+    // each: the ones `telemetry` has
+    static uint32_t resource_bits(const NodeTelemetry& telemetry);
+    // The ones the Node object has, as this kubelet last wrote it
+    void set_node_resources(uint32_t bits) { node_resources_ = bits; }
+    uint32_t node_resources() const { return node_resources_; }
+    // capacity and allocatable pods
+    void set_max_pods(uint32_t pods) { max_pods_ = pods; }
 
     // Extra labels for the Node object (board profile and the like).
     void set_labels(const std::map<std::string, std::string>& labels) { labels_ = labels; }
@@ -86,7 +122,9 @@ public:
 
 private:
     template <typename Out>
-    void append_registration(Out& json, const NodeTelemetry& telemetry) const;
+    void append_registration(Out& json, const NodeTelemetry& telemetry, bool as_patch) const;
+    template <typename Out>
+    void append_heartbeat_patch(Out& json, const NodeTelemetry& telemetry, bool memory_pressure) const;
 
     std::string node_name_;
     std::string node_ip_;
@@ -95,6 +133,8 @@ private:
     std::map<std::string, std::string> annotations_;
     std::string firmware_version_;
     uint16_t kubelet_port_{0};
+    uint32_t max_pods_{0};
+    std::atomic<uint32_t> node_resources_{0};
 };
 
 } // namespace kube32::kubelet

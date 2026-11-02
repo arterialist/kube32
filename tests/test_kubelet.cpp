@@ -293,6 +293,85 @@ void test_kubelet_recreated_pod_replaces_old() {
     std::cout << "[PASS] test_kubelet_recreated_pod_replaces_old" << std::endl;
 }
 
+// A node that restarted has no record of its pods: the restart count goes on
+// from the pod's status, a container that ran before is restarted (counted),
+// startTime stays, and lastState says what is known of the last container
+void test_kubelet_restart_history_after_node_restart() {
+    auto start = [](const std::string& name, const std::string& status) {
+        KubeletConfig cfg;
+        cfg.node_name = "test-node-01";
+        auto wasm_rt = kube32::runtime::create_wasm_runtime();
+        auto client = std::make_unique<MockKubeClient>();
+        MockKubeClient* c = client.get();
+        const std::string manifest = R"({"metadata":{"name":")" + name + R"(","namespace":"default","uid":"u-)" + name + R"("},
+            "spec":{"nodeName":"test-node-01","containers":[{"name":"reader","image":"wasm://sensor"}]},"status":)" + status + "}";
+        c->mock_pods.emplace_back(parse_pod_manifest(manifest), manifest);
+        Kubelet k(cfg, *wasm_rt, std::move(client));
+        k.sync_assigned_pods();
+        LocalPodRecord rec;
+        assert(k.get_pod_record("default/" + name, rec) && rec.execution_phase == PodExecutionPhase::Running);
+        const std::string patch = c->last_pod_status_patch;
+        k.sync_assigned_pods();
+        return patch;
+    };
+
+    // Running when the node went down: a restart, and the container the node
+    // stopped is the last state, as Kubernetes reports a container it lost
+    std::string p = start("was-running", R"({"phase":"Running","startTime":"2026-11-01T08:00:00Z","containerStatuses":[{"name":"reader",
+        "ready":true,"started":true,"restartCount":2,"state":{"running":{"startedAt":"2026-11-01T09:00:00Z"}},
+        "lastState":{"terminated":{"exitCode":1,"reason":"Error"}}}]})");
+    std::cout << "[restart history] " << p << std::endl;
+    assert(p.find("\"restartCount\":3") != std::string::npos);
+    assert(p.find("startTime") == std::string::npos);   // kept as it is
+    assert(p.find("\"lastState\":{\"terminated\":{\"exitCode\":137,\"reason\":\"ContainerStatusUnknown\"") != std::string::npos);
+    assert(p.find("\"startedAt\":\"2026-11-01T09:00:00Z\"") != std::string::npos);
+
+    // Crash looping: the restart that was due happens, the last state stays
+    p = start("crash-looping", R"({"phase":"Running","startTime":"2026-11-01T08:00:00Z","containerStatuses":[{"name":"reader",
+        "ready":false,"restartCount":1,"state":{"waiting":{"reason":"CrashLoopBackOff"}},
+        "lastState":{"terminated":{"exitCode":3,"reason":"Error","finishedAt":"2026-11-01T09:30:00Z"}}}]})");
+    assert(p.find("\"restartCount\":2") != std::string::npos && p.find("startTime") == std::string::npos);
+    assert(p.find("\"lastState\":{\"terminated\":{\"exitCode\":3,\"reason\":\"Error\",\"finishedAt\":\"2026-11-01T09:30:00Z\"}}") != std::string::npos);
+
+    // Never started (it waited for memory): the first start, not a restart
+    p = start("never-ran", R"({"phase":"Pending","containerStatuses":[{"name":"reader","ready":false,"restartCount":0,
+        "state":{"waiting":{"reason":"InsufficientMemory"}}}]})");
+    assert(p.find("\"restartCount\":0") != std::string::npos && p.find("lastState") == std::string::npos);
+    assert(p.find("\"startTime\"") != std::string::npos);
+    std::cout << "[PASS] test_kubelet_restart_history_after_node_restart" << std::endl;
+}
+
+// max_pods: the node runs that many pods at once; one more fails with
+// OutOfpods, as the Kubernetes kubelet rejects a pod past maxPods, and is
+// not tried again
+void test_kubelet_max_pods() {
+    KubeletConfig cfg;
+    cfg.node_name = "test-node-01";
+    cfg.max_pods = 3;
+    auto wasm_rt = kube32::runtime::create_wasm_runtime();
+    auto client = std::make_unique<MockKubeClient>();
+    MockKubeClient* c = client.get();
+    for (const char* name : {"a", "b", "c", "d"}) {
+        const std::string manifest = std::string(R"({"metadata":{"name":")") + name +
+            R"(","namespace":"default"},"spec":{"nodeName":"test-node-01","containers":[{"name":"c","image":"wasm://sensor"}]}})";
+        c->mock_pods.emplace_back(parse_pod_manifest(manifest), manifest);
+    }
+    Kubelet k(cfg, *wasm_rt, std::move(client));
+    k.sync_assigned_pods();
+    LocalPodRecord rec;
+    assert(k.get_pod_record("default/c", rec) && rec.execution_phase == PodExecutionPhase::Running);
+    assert(k.get_pod_record("default/d", rec) && rec.execution_phase == PodExecutionPhase::Failed);
+    const std::string p = c->last_pod_status_patch;
+    std::cout << "[max pods] " << p << std::endl;
+    assert(p.find("\"reason\":\"OutOfpods\"") != std::string::npos);
+    assert(p.find("used: 3, capacity: 3") != std::string::npos);
+    c->last_pod_status_patch.clear();
+    k.sync_assigned_pods();
+    assert(c->last_pod_status_patch.empty());   // rejected once
+    assert(k.get_pod_record("default/d", rec) && rec.execution_phase == PodExecutionPhase::Failed);
+    std::cout << "[PASS] test_kubelet_max_pods" << std::endl;
+}
+
 void test_kubelet_thread_lifecycle() {
     KubeletConfig cfg;
     cfg.node_name = "thread-node-01";
@@ -658,6 +737,8 @@ int main() {
     test_kubelet_mock_registration_and_heartbeat();
     test_kubelet_differential_pod_sync();
     test_kubelet_recreated_pod_replaces_old();
+    test_kubelet_restart_history_after_node_restart();
+    test_kubelet_max_pods();
     test_kubelet_starts_per_sync();
     test_kubelet_thread_lifecycle();
     test_kubelet_capability_admission_rejection();

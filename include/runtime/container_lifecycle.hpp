@@ -180,6 +180,7 @@ public:
 private:
     static void worker_thread_entry(void* arg);
     void worker_thread_main();
+    void run_entry_point();
     void on_trap_caught_locked(const std::string& trap_message, int32_t exit_code, const std::string& reason);
     uint64_t held_bytes_locked() const;   // mutex_ held by caller
     void cleanup_runtime();
@@ -216,6 +217,12 @@ private:
     std::atomic<bool> stop_gave_up_{false};    // stop() returned while the worker was still running
     std::atomic<uint32_t> worker_stack_bytes_{0};   // the worker thread's stack while it exists
     int memory_account_{0};                    // kube32_pod_account_open
+    // CPU time of the worker thread: read from the thread while it runs
+    // (mutex_ keeps it from ending meanwhile), kept once it ended
+    osal::Thread* worker_cpu_thread_{nullptr};      // mutex_
+    uint64_t worker_cpu_us_{0};                     // mutex_
+    bool worker_cpu_measured_{false};               // mutex_
+    std::atomic<uint64_t> worker_nested_cpu_us_{0}; // calls into other pods made on the worker
 
     uint32_t consecutive_liveness_failures_{0};
     uint32_t consecutive_readiness_failures_{0};

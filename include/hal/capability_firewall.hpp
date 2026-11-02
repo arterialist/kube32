@@ -55,6 +55,9 @@ struct BoardProfile {
     uint64_t rmt_tx_pin_mask{0};
     int8_t rmt_tx_default_pin{-1};
     int8_t rmt_rx_default_pin{-1};
+    // On-board devices the board has (KUBE32_CAP_DISPLAY, KUBE32_CAP_KEYBOARD,
+    // KUBE32_CAP_SPEAKER): the Node advertises their hardware.kube32.io/* grants
+    uint32_t onboard_devices{0};
 };
 
 struct PodSecurityRecord {
@@ -163,6 +166,8 @@ public:
     // chip's four of each direction
     uint32_t claimable_rmt_tx_count() const;
     uint32_t claimable_rmt_rx_count() const;
+    // BoardProfile::onboard_devices
+    uint32_t onboard_devices() const;
     uint32_t get_allocated_rmt_tx_count() const;
     uint32_t get_allocated_rmt_rx_count() const;
     // Buses (with pins) the pod was admitted with

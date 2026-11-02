@@ -62,6 +62,21 @@ void merge_json(JsonValue& target, const JsonValue& patch);
 void strategic_merge_json(JsonValue& target, const JsonValue& patch);
 // The patch semantics a request's Content-Type selects
 void apply_patch(JsonValue& target, const JsonValue& patch, std::string_view content_type);
+// Node condition times as Kubernetes defines them, whoever writes the
+// conditions (the kubelet, the node lifecycle controller, kubectl): a
+// condition's lastTransitionTime changes only when its status does, and its
+// lastHeartbeatTime is the time of the last write that carried it. `node`
+// is the result of a write, `stored` the conditions the Node had before it
+// (null for a create) and `sent` the conditions the write carried (null
+// when it carried none). For each sent condition: a status that did not
+// change keeps the stored lastTransitionTime; a changed status keeps the
+// writer's time when it is newer than the stored one, else gets `now_ms`;
+// a missing lastHeartbeatTime gets `now_ms`. With `now_ms` 0 (no wall
+// clock) a time that cannot be known is left out rather than kept from an
+// earlier status.
+void settle_node_condition_times(JsonValue& node, const JsonValue* stored, const JsonValue* sent, uint64_t now_ms);
+// status.conditions of an object, null when it has none
+const JsonValue* node_conditions(const JsonValue& node);
 
 // =============================================================================
 // Strongly-Typed Model Structs for Table Serialization and Scheduler
@@ -114,6 +129,20 @@ struct KubePod {
     std::vector<std::pair<std::string, std::string>> env; // container env name/value pairs
     std::map<std::string, std::string> labels;
     std::map<std::string, std::string> annotations;
+
+    // The first container's history as the pod's status records it, for a
+    // kubelet that starts a pod it has no record of (its node restarted)
+    std::string start_time;                  // status.startTime
+    uint32_t first_restart_count{0};         // containerStatuses[0].restartCount
+    bool container_ran{false};               // it started before: running, exited, crash looping or restarted
+    bool container_running{false};           // state.running: the node stopped it
+    std::string container_started_at;        // state.running.startedAt
+    bool has_last_state{false};              // lastState.terminated (or state.terminated)
+    int32_t last_exit_code{0};
+    std::string last_reason;
+    std::string last_message;
+    std::string last_started_at;
+    std::string last_finished_at;
 };
 
 // Parses a Kubernetes resource quantity ("1536Ki", "2Mi", "64k", "1e3", "4096")

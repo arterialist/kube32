@@ -350,8 +350,8 @@ static void test_generation_and_deployment_conditions() {
     std::cout << "[PASS] test_generation_and_deployment_conditions" << std::endl;
 }
 
-static void test_lease_renew_time_and_backfill() {
-    std::cout << "[RUN] test_lease_renew_time_and_backfill" << std::endl;
+static void test_lease_renew_time() {
+    std::cout << "[RUN] test_lease_renew_time" << std::endl;
     auto store = ram_store();
     RouteHandler h(*store);
     HttpResponse r = call(h, HttpMethod::Put, "/apis/coordination.k8s.io/v1/namespaces/kube-node-lease/leases/node-a",
@@ -362,17 +362,48 @@ static void test_lease_renew_time_and_backfill() {
     assert(renew.size() == 27 && renew.back() == 'Z' && renew[19] == '.');   // MicroTime, stamped on arrival
     assert(call(h, HttpMethod::Patch, "/apis/coordination.k8s.io/v1/namespaces/kube-node-lease/leases/none", "{}").status_code == 404);
 
+    std::cout << "[PASS] test_lease_renew_time" << std::endl;
+}
+
+// Objects created before the clock is set get the time they were created,
+// counted back on the uptime clock; an Event its last update. Objects of an
+// earlier boot, and those past the note limit, stay without a time.
+static void test_timestamp_backfill() {
+    std::cout << "[RUN] test_timestamp_backfill" << std::endl;
+    auto store = ram_store();
+    store->put("/registry/configmaps/default/old", R"({"kind":"ConfigMap","metadata":{"name":"old","namespace":"default"}})", false);
+    uint64_t unix_now = 0, up = 10000;
+    TimestampBackfill backfill(*store, 3, [&] { return unix_now; }, [&] { return up; });
     store->put("/registry/configmaps/default/early", R"({"kind":"ConfigMap","metadata":{"name":"early","namespace":"default"}})", false);
-    store->put_extended("/registry/events/default/early.1", R"({"kind":"Event","metadata":{"name":"early.1","namespace":"default"},"reason":"X"})",
-                        false, false);
-    assert(backfill_timestamps(*store) == 2);
-    std::string cm, ev;
-    store->get("/registry/configmaps/default/early", cm);
-    store->get("/registry/events/default/early.1", ev);
-    assert(cm.find("\"creationTimestamp\"") != std::string::npos);
-    assert(ev.find("\"lastTimestamp\"") != std::string::npos && ev.find("\"firstTimestamp\"") != std::string::npos);
-    assert(backfill_timestamps(*store) == 0);
-    std::cout << "[PASS] test_lease_renew_time_and_backfill" << std::endl;
+    up = 70000;
+    const std::string event = R"({"kind":"Event","metadata":{"name":"early.1","namespace":"default"},"reason":"X","count":1})";
+    store->put_extended("/registry/events/default/early.1", event, false, false);
+    up = 100000;
+    store->put_extended("/registry/events/default/early.1", event, true, false);   // seen again: count, lastTimestamp
+    store->put("/registry/configmaps/default/third", R"({"kind":"ConfigMap","metadata":{"name":"third","namespace":"default"}})", false);
+    store->put("/registry/configmaps/default/fourth", R"({"kind":"ConfigMap","metadata":{"name":"fourth","namespace":"default"}})", false);
+    assert(backfill.pending() == 3);
+    assert(backfill.run() == 0);   // no clock yet
+
+    unix_now = 1793620800000ULL;   // 2026-11-02T12:00:00Z
+    up = 130000;
+    store->remove("/registry/configmaps/default/third");   // deleted: nothing to stamp
+    assert(backfill.run() == 2);
+    assert(backfill.pending() == 0);
+    std::string json;
+    store->get("/registry/configmaps/default/early", json);
+    assert(parse(json).get("metadata")->get_string("creationTimestamp", "") == "2026-11-02T11:58:00Z");
+    store->get("/registry/events/default/early.1", json);
+    const models::JsonValue ev = parse(json);
+    assert(ev.get("metadata")->get_string("creationTimestamp", "") == "2026-11-02T11:59:00Z");
+    assert(ev.get_string("firstTimestamp", "") == "2026-11-02T11:59:00Z");
+    assert(ev.get_string("lastTimestamp", "") == "2026-11-02T11:59:30Z");
+    for (const char* key : {"/registry/configmaps/default/old", "/registry/configmaps/default/fourth"}) {
+        store->get(key, json);
+        assert(json.find("creationTimestamp") == std::string::npos);
+    }
+    assert(backfill.run() == 0);
+    std::cout << "[PASS] test_timestamp_backfill" << std::endl;
 }
 
 // Creates are refused once the journal is full; the API says so instead of
@@ -438,7 +469,49 @@ static void test_full_store_refuses_creates() {
     std::cout << "[PASS] test_full_store_refuses_creates" << std::endl;
 }
 
+// The Node's conditions through the API: a registration without times gets
+// the write's time, a heartbeat (strategic merge) leaves the conditions it
+// does not carry in place and moves lastTransitionTime only on a change
+static void test_node_condition_times_through_api() {
+    std::cout << "[RUN] test_node_condition_times_through_api" << std::endl;
+    auto store = ram_store();
+    RouteHandler h(*store);
+    assert(call(h, HttpMethod::Post, "/api/v1/nodes", R"({"kind":"Node","apiVersion":"v1","metadata":{"name":"n1"},
+        "status":{"conditions":[{"type":"Ready","status":"False","reason":"KubeletNotReady"}]}})").status_code == 201);
+    std::string json;
+    store->get("/registry/nodes/n1", json);
+    auto ready = [&](const char* field) {
+        store->get("/registry/nodes/n1", json);
+        const models::JsonValue node = parse(json);
+        for (const auto& c : node.get("status")->get("conditions")->arr_val) {
+            if (c.get_string("type", "") == "Ready") return c.get_string(field, "");
+        }
+        return std::string();
+    };
+    const std::string registered = ready("lastTransitionTime");
+    assert(!registered.empty() && !ready("lastHeartbeatTime").empty());
+    // Another writer's condition, then a heartbeat that does not carry it
+    {
+        models::JsonValue node = parse(json);
+        node.get_mut("status")->get_mut("conditions")->arr_val.push_back(parse(R"({"type":"NetworkUnavailable","status":"False"})"));
+        store->put("/registry/nodes/n1", node.to_string(), true);
+    }
+    const char* smp = "application/strategic-merge-patch+json";
+    assert(call(h, HttpMethod::Patch, "/api/v1/nodes/n1/status",
+                R"({"status":{"conditions":[{"type":"Ready","status":"False","reason":"KubeletNotReady"}]}})", "", "", smp).status_code == 200);
+    assert(ready("lastTransitionTime") == registered);
+    assert(json.find("NetworkUnavailable") != std::string::npos);
+    assert(call(h, HttpMethod::Patch, "/api/v1/nodes/n1/status",
+                R"({"status":{"conditions":[{"type":"Ready","status":"True","reason":"KubeletReady","lastTransitionTime":"2020-01-01T00:00:00Z"}]}})",
+                "", "", smp).status_code == 200);
+    const std::string became_ready = ready("lastTransitionTime");
+    assert(became_ready >= registered && became_ready != "2020-01-01T00:00:00Z");   // older than the stored time: the change is now
+    assert(json.find("NetworkUnavailable") != std::string::npos);
+    std::cout << "[PASS] test_node_condition_times_through_api" << std::endl;
+}
+
 int main() {
+    test_node_condition_times_through_api();
     test_bearer_token_authentication();
     test_dry_run_stores_nothing();
     test_list_pagination();
@@ -447,7 +520,8 @@ int main() {
     test_endpoints_from_services();
     test_endpoints_at_node_pod_ports();
     test_generation_and_deployment_conditions();
-    test_lease_renew_time_and_backfill();
+    test_lease_renew_time();
+    test_timestamp_backfill();
     test_full_store_refuses_creates();
     std::cout << "All control plane API tests passed" << std::endl;
     return 0;

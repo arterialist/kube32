@@ -43,11 +43,16 @@ struct LocalPodRecord {
     uint32_t restart_count{0};               // containers restarted so far (status restartCount)
     uint32_t crash_streak{0};                // restarts since the container last ran 10 minutes
     uint64_t started_at_ms{0};
+    std::string started_at;                  // state.running.startedAt of the running container ("" without a wall clock)
+    bool start_time_set{false};              // the pod's status.startTime is written
     uint64_t next_restart_allowed_ms{0};     // end of the CrashLoopBackOff delay, or of the wait before a config retry
     bool restart_due{false};                 // a container exited and the next start is a restart
     // Last terminated container, reported as lastState after a restart
+    bool has_last_state{false};
     int32_t last_exit_code{0};
     std::string last_reason;
+    std::string last_message;
+    std::string last_started_at;
     std::string last_finished_at;
     std::string last_error_message;
     std::string pod_ip;
@@ -117,6 +122,12 @@ struct KubeletConfig {
     // A pod the node has no memory for yet waits (Pending, InsufficientMemory)
     // and is admitted again after this long
     uint32_t memory_retry_ms{5000};
+    // Pods the kubelet admits at once (Kubernetes' maxPods), the Node's
+    // capacity and allocatable pods. A pod beyond it fails with OutOfpods.
+    // 64: the pods the runtime keeps a memory account for on a board
+    // (kube32_pod_account_open), so that every pod's figures are its own.
+    // Memory fills a board long before.
+    uint32_t max_pods{64};
     // Pods a sync pass starts at most (0: all that are due). Each start holds
     // the pod's manifest and its parsed form until the pass ends; on a board
     // without PSRAM one at a time keeps that peak small, the rest start on
@@ -190,6 +201,10 @@ private:
     // Fills the Ready condition from the health of the pod sync loop.
     void fill_ready_condition(NodeTelemetry& t) const;
     void fill_firmware_condition(NodeTelemetry& t) const;
+    // Condition times: lastHeartbeatTime now, lastTransitionTime when each
+    // condition's status last changed. `memory_pressure` is null where the
+    // MemoryPressure condition is not posted (registration).
+    void time_conditions(NodeTelemetry& t, const bool* memory_pressure);
 
     // Pod lifecycle actions. `previous` carries restart state when the pod
     // is being restarted after a back-off.
@@ -216,6 +231,11 @@ private:
     // Patches node_annotation_source's annotations onto the Node when they
     // changed or were not sent since the node registered
     void patch_node_annotations();
+    // Pods admitted and not finished (state_mutex_ held)
+    uint32_t admitted_pods() const;
+    // The node runs max_pods already: the pod fails with OutOfpods, as on
+    // Kubernetes (state_mutex_ held)
+    void reject_out_of_pods(const models::KubePod& pod);
     void repack_pool(uint64_t now_ms);
     void ship_pod_logs_locked(const std::string& pod_key, LocalPodRecord& rec);
     // Lists the NetworkPolicies of the namespaces new to config_.network_policies,
@@ -247,6 +267,17 @@ private:
     std::map<std::string, std::string> found_annotations_;   // from node_annotation_source
     bool annotations_sent_{false};                          // found_annotations_ are on the Node
     uint32_t heartbeat_failures_{0};
+    // The status each posted condition has and the uptime it took it on;
+    // status -1 before the first post. Registration and heartbeats run on
+    // two threads: condition_mutex_.
+    struct ConditionClock {
+        int8_t status{-1};
+        uint64_t since_ms{0};
+    };
+    osal::Mutex condition_mutex_;
+    ConditionClock ready_clock_;
+    ConditionClock memory_pressure_clock_;
+    ConditionClock firmware_clock_;
     // The Node object is written here, allocated at start while the heap is
     // whole: re-registering must work when the heap is fragmented
     static constexpr size_t kRegistrationBufBytes = 2048;

@@ -197,6 +197,30 @@ bool Thread::is_joinable() const {
     return impl_ && impl_->joinable;
 }
 
+// The run-time counter counts esp_timer microseconds (sdkconfig)
+#if CONFIG_FREERTOS_GENERATE_RUN_TIME_STATS && CONFIG_FREERTOS_RUN_TIME_STATS_USING_ESP_TIMER && CONFIG_FREERTOS_USE_TRACE_FACILITY
+bool Thread::cpu_time_us(uint64_t& out_us) const {
+    if (!impl_ || !impl_->is_valid || !impl_->handle) return false;
+    TaskStatus_t st;
+    vTaskGetInfo(impl_->handle, &st, pdFALSE, eReady);   // a state other than eInvalid: not looked up
+    out_us = static_cast<uint64_t>(st.ulRunTimeCounter);
+    return true;
+}
+
+bool Thread::current_cpu_time_us(uint64_t& out_us) {
+    // The kernel adds the time a task ran to its counter when it switches
+    // the task out: a yield counts the slice running now
+    taskYIELD();
+    TaskStatus_t st;
+    vTaskGetInfo(nullptr, &st, pdFALSE, eRunning);
+    out_us = static_cast<uint64_t>(st.ulRunTimeCounter);
+    return true;
+}
+#else
+bool Thread::cpu_time_us(uint64_t&) const { return false; }
+bool Thread::current_cpu_time_us(uint64_t&) { return false; }
+#endif
+
 bool Thread::create(EntryFn entry, void* arg, const Config& config) {
     BaseType_t core = (config.core_affinity < 0) ? tskNO_AFFINITY : config.core_affinity;
     struct TempContext {
@@ -279,11 +303,19 @@ int Thread::get_current_core() {
     return xPortGetCoreID();
 }
 
+uintptr_t Thread::current_id() {
+    return reinterpret_cast<uintptr_t>(xTaskGetCurrentTaskHandle());
+}
+
 } // namespace kube32::osal
 
 #else // Host POSIX implementation
 
 #include <pthread.h>
+#include <time.h>
+#if defined(__APPLE__)
+#include <mach/mach.h>
+#endif
 #include <cstdio>
 #include <chrono>
 #include <thread>
@@ -416,6 +448,33 @@ bool Thread::is_joinable() const {
     return impl_ && impl_->is_valid && impl_->joinable;
 }
 
+bool Thread::cpu_time_us(uint64_t& out_us) const {
+    if (!impl_ || !impl_->is_valid || !impl_->joinable) return false;
+#if defined(__APPLE__)
+    thread_basic_info_data_t info;
+    mach_msg_type_number_t count = THREAD_BASIC_INFO_COUNT;
+    if (thread_info(pthread_mach_thread_np(impl_->handle), THREAD_BASIC_INFO, reinterpret_cast<thread_info_t>(&info), &count) != KERN_SUCCESS) {
+        return false;
+    }
+    out_us = static_cast<uint64_t>(info.user_time.seconds + info.system_time.seconds) * 1000000ULL +
+             static_cast<uint64_t>(info.user_time.microseconds + info.system_time.microseconds);
+    return true;
+#else
+    clockid_t clock;
+    struct timespec ts;
+    if (pthread_getcpuclockid(impl_->handle, &clock) != 0 || clock_gettime(clock, &ts) != 0) return false;
+    out_us = static_cast<uint64_t>(ts.tv_sec) * 1000000ULL + static_cast<uint64_t>(ts.tv_nsec) / 1000ULL;
+    return true;
+#endif
+}
+
+bool Thread::current_cpu_time_us(uint64_t& out_us) {
+    struct timespec ts;
+    if (clock_gettime(CLOCK_THREAD_CPUTIME_ID, &ts) != 0) return false;
+    out_us = static_cast<uint64_t>(ts.tv_sec) * 1000000ULL + static_cast<uint64_t>(ts.tv_nsec) / 1000ULL;
+    return true;
+}
+
 // The new thread gets its own copy of what it needs: there is no Thread
 // object it could read once create() has returned.
 bool Thread::create(EntryFn entry, void* arg, const Config& config) {
@@ -493,6 +552,10 @@ const char* Thread::get_current_name() {
 
 int Thread::get_current_core() {
     return 0; // Host simulation runs in OS scheduler pool
+}
+
+uintptr_t Thread::current_id() {
+    return (uintptr_t)pthread_self();   // a pointer on macOS, an integer on Linux
 }
 
 } // namespace kube32::osal

@@ -56,6 +56,10 @@ A pod that passes admission but runs out of memory while it loads also waits wit
 
 All host-initiated pod calls (`k32_init`, `k32_alloc`, `k32_handle`, `k32_tick`, `k32_event`) switch onto the shared interpreter stack (64 KiB in PSRAM, or 28 KiB of internal RAM without PSRAM) and run serialized across the node. `k32_init` runs from `k32_kubelet` (24 KiB PSRAM stack or 12 KiB internal stack), and `k32_handle` runs from the ingress worker or pod server thread. Run `K32_CMD:TASKS` to inspect native stack sizes and high-water marks.
 
+## CPU usage
+
+`kubectl top pod` reports each container's CPU time over the kubelet's 5 s sample window. The runtime counts the thread CPU time of every call into the pod (`k32_init`, `k32_alloc`, `k32_handle`, `k32_tick`, `k32_event`) from the moment the call holds the pod's call lock, plus the CPU time of the pod's own thread when it has an entry point. On the boards the figure is the FreeRTOS run-time counter of the task (esp_timer microseconds). In the simulator it is the thread's CPU clock. Time a call spends blocked does not count: waiting for the pod's call lock or the shared interpreter stack, socket I/O in `k32_http_call`, `esp32_delay_ms`, and waits in channel receives. A pod that calls another pod of the same node in-process (`k32_http_call` to a Service) is charged for its own work only, and the callee for its work. `kubectl top node` reports the time both cores spend outside their idle tasks.
+
 ## Execution budget
 
 Every call into a pod (`k32_init`, `k32_alloc`, `k32_handle`, `k32_tick`, `k32_event`) starts with a fresh wasm3 gas budget, default 4,000,000,000 units. The pod annotation `kube32.io/execution-budget` sets the unit count, or `"off"` or `"0"` to disable metering. Unmetered pods run 25 to 60 percent faster, but their calls cannot be interrupted mid-call. Stopping a pod interrupts metered guest loops and wakes blocking host calls (`esp32_delay_ms`, `kube32_channel_recv`, `k32_tone`, `k32_http_call`).
@@ -90,6 +94,8 @@ When a container exits, the kubelet releases its memory, thread, open files, and
 | `Never` | pod `Succeeded` | pod `Failed` |
 
 Restarts back off for 10 s, doubling up to 5 minutes, and reset to 10 s after 10 minutes of running. While waiting, the pod stays `Running` with the container in `CrashLoopBackOff`, `lastState` holding the exit code and reason, and a `BackOff` event. Each restart loads a fresh instance, increments `restartCount`, and rotates the container log so `kubectl logs --previous` serves the prior instance.
+
+A node restart (a reboot, a crash, a firmware rollout) ends its containers, and the kubelet that comes up has no record of them. It reads the container's history from the pod's status: `restartCount` continues from the stored count, and a container that had run before (running, crash looping, or restarted earlier) starts again as a restart and increments it, as on a Kubernetes node that reboots. `startTime` keeps its first value. A container that was running when the node went down has no exit code; its `lastState` is `terminated` with reason `ContainerStatusUnknown`, exit code 137, and the `startedAt` it had, as the Kubernetes kubelet reports a container it lost. A crash-looping container keeps the `lastState` it had.
 
 ## Host functions
 

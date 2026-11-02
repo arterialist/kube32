@@ -17,10 +17,11 @@
 //
 // Per-pod memory is everything the pod's runtime holds (ContainerStatus::
 // held_bytes), counted allocation by allocation, on every board.
-// Per-pod CPU comes from the interpreter time the app host accounts for
-// (AppPodStats: k32_handle / k32_tick / k32_event calls). Pods that run a
-// free-running main loop are not covered by that counter; the firmware can
-// install a PodCpuTimeSampler keyed by pod key to measure their task time.
+// Per-pod CPU is thread CPU time (runtime/pod_cpu.hpp): the pod's export
+// calls (k32_handle, k32_tick, k32_event, k32_init) on the node's threads,
+// and the pod's own thread when it has an entry point (_start, app_main,
+// main). Lock waits and blocking host calls are not CPU time; a call into
+// another pod of the node is charged to that pod.
 
 #include "runtime/wasm_runtime.hpp"
 
@@ -45,7 +46,7 @@ struct PodResourceSample {
     bool has_memory{false};
     uint64_t memory_bytes{0};
     bool has_cpu{false};
-    uint64_t cpu_busy_us{0};         // cumulative interpreter time
+    uint64_t cpu_busy_us{0};         // cumulative CPU time of the container
 };
 
 class MetricsProvider {
@@ -62,15 +63,12 @@ public:
 using CpuTimeSampler = bool (*)(uint64_t& out_busy_us, uint64_t& out_wall_us);
 void set_platform_cpu_sampler(CpuTimeSampler sampler);
 CpuTimeSampler platform_cpu_sampler();
-// Optional per-pod task time (cumulative microseconds) for free-running pods.
-using PodCpuTimeSampler = bool (*)(const std::string& pod_key, uint64_t& out_busy_us);
-void set_platform_pod_cpu_sampler(PodCpuTimeSampler sampler);
 
 // Host: process measurements. ESP32: heap + installed samplers.
 std::unique_ptr<MetricsProvider> create_platform_metrics_provider();
 
-// Shared pod accounting used by both providers: interpreter time from
-// AppPodStats plus memory reported by the runtime. Returns false when the pod
+// Shared pod accounting used by both providers: CPU time of the pod's calls
+// and thread plus memory reported by the runtime. Returns false when the pod
 // is unknown to the runtime.
 bool sample_pod_from_runtime(const std::string& pod_key, runtime::Runtime& runtime, PodResourceSample& out);
 

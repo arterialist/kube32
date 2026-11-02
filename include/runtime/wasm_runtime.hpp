@@ -41,6 +41,11 @@ struct ContainerStatus {
     uint64_t start_time_ms{0};
     int32_t exit_code{0};
     std::string termination_reason;
+    // CPU time of the container's own thread (its entry point: _start,
+    // app_main, main), calls into other pods made on it left out. False for
+    // containers without one and where CPU time cannot be measured.
+    bool has_thread_cpu{false};
+    uint64_t thread_cpu_us{0};
 };
 
 // Full deployment spec used by the kubelet: memory limit, env, stack.

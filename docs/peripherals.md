@@ -29,6 +29,19 @@ The firewall reads `resources.requests`, or `resources.limits` when `requests` i
 
 If a requested pin, channel, or bus is reserved or owned by another pod, admission fails with `CapabilityAdmissionFailed`. Ungranted calls at runtime return `K32_ERR_PERM` (`-1`) and log `[FIREWALL] denied <pod>: ...`.
 
+### Device grants on the Node
+
+Pods share each device that a `hardware.kube32.io/*` resource grants, and a pod holds a grant at most once. A node therefore advertises each grant it can give with a count of its `pods` capacity, in both `capacity` and `allocatable`:
+
+| Resource | Advertised by |
+| --- | --- |
+| `hardware.kube32.io/ipc` | Every node |
+| `hardware.kube32.io/chip-temp` | Every node: the ESP32-S3's internal sensor, a stand-in in the simulator |
+| `hardware.kube32.io/tft-display`, `keyboard`, `speaker` | Boards with the devices on board (the Cardputer profile) |
+| `hardware.kube32.io/sd` | Nodes with a mounted microSD card ([storage](storage.md)) |
+
+A resource that a node no longer has (a card taken out, a board profile changed between boots) is set to `null` in the next status write and leaves the Node. The scheduler does not filter on these resources; the firewall checks the grants at admission.
+
 ## Host functions
 
 ### GPIO, ADC, I2C, UART, and infrared

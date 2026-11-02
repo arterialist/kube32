@@ -357,7 +357,7 @@ static void create_rollout(const std::string& sha) {
 
 // The Node object and the heartbeat of a board without PSRAM, with every
 // firmware annotation and the longest condition message, still fit the
-// kubelet's fixed buffers (2048 bytes for the Node, 1024 for a heartbeat)
+// kubelet's fixed buffers (2048 bytes for the Node, 1536 for a heartbeat)
 static void test_node_documents_fit() {
     kubelet::NodeStatusReporter r("esp32-a1b2c3", "192.168.4.2", false);
     r.set_labels({{"kube32.io/board", "cardputer"}, {"i2c.kube32.io/0x76", "bus-0"}, {"i2c.kube32.io/0x28", "bus-0"}});
@@ -373,7 +373,7 @@ static void test_node_documents_fit() {
     std::strcpy(t.firmware_reason, "Downloading");
     std::memset(t.firmware_message, 'x', sizeof(t.firmware_message) - 1);
     t.firmware_message[sizeof(t.firmware_message) - 1] = 0;
-    char reg[2048], hb[1024];
+    char reg[2048], hb[1536];
     mem::FixedText reg_text(reg), hb_text(hb);
     const bool reg_fits = r.write_registration_json(reg_text, t);
     const bool hb_fits = r.write_heartbeat_patch_json(hb_text, t, false);

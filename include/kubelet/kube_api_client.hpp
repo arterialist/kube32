@@ -147,13 +147,15 @@ private:
 
     // One request whose answer is not used: returns the status, and the start
     // of the body in `start` when given. Nothing is taken from the heap.
-    int exchange(const char* method, std::string_view path, std::string_view body, BodyStart* start = nullptr);
+    int exchange(const char* method, std::string_view path, std::string_view body, BodyStart* start = nullptr,
+                 const char* content_type = "application/json");
     // Streams one exchange: the body reaches `on_data` as it arrives (false
     // from it ends the exchange). Returns the status, 0 when the server could
     // not be reached or the response was malformed.
     int stream_request(const char* method, std::string_view path, std::string_view body,
                        mem::FunctionRef<bool(const char*, size_t)> on_data, long* out_content_length = nullptr,
-                       mem::FunctionRef<bool(int, std::string_view)>* on_head = nullptr);
+                       mem::FunctionRef<bool(int, std::string_view)>* on_head = nullptr,
+                       const char* content_type = "application/json");
 
     std::string host_;
     uint16_t port_;

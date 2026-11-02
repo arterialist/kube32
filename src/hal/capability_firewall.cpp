@@ -48,6 +48,11 @@ BoardProfile CapabilityFirewall::board_profile() const {
     return profile_;
 }
 
+uint32_t CapabilityFirewall::onboard_devices() const {
+    osal::LockGuard guard(mutex_);
+    return profile_.onboard_devices;
+}
+
 uint64_t CapabilityFirewall::claimable_gpio_mask_locked() const {
     return KUBE32_SAFE_GPIO_MASK & ~profile_.reserved_gpio_mask;
 }

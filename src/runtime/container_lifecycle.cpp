@@ -9,6 +9,7 @@
 #include "runtime/host_functions.hpp"
 #include "runtime/app_pod.hpp"
 #include "runtime/pod_fs.hpp"
+#include "runtime/pod_cpu.hpp"
 #include "osal/system.hpp"
 #include "osal/socket.hpp"
 #include "osal/sha256.hpp"
@@ -21,6 +22,7 @@
 #include <iostream>
 #include <cstring>
 #include <algorithm>
+#include <vector>
 #include <mutex>
 #if defined(ESP_PLATFORM)
 #include "freertos/FreeRTOS.h"
@@ -33,6 +35,71 @@
 #endif
 
 namespace kube32::runtime {
+
+// Per thread: the innermost PodCpuRegion and the pod thread's sink. A table
+// rather than thread-local storage: nested regions run on the shared
+// interpreter stack, where ESP-IDF rules thread-local storage out
+// (esp_execute_shared_stack_function). Holds the threads inside a region and
+// the pod threads, a few entries.
+namespace {
+struct CpuThread {
+    uintptr_t thread;
+    PodCpuRegion* region;
+    std::atomic<uint64_t>* sink;
+};
+std::mutex s_cpu_mutex;
+std::vector<CpuThread> s_cpu_threads;
+
+CpuThread& cpu_thread_locked(uintptr_t thread) {
+    for (auto& t : s_cpu_threads) {
+        if (t.thread == thread) return t;
+    }
+    s_cpu_threads.push_back(CpuThread{thread, nullptr, nullptr});
+    return s_cpu_threads.back();
+}
+
+void drop_idle_locked(uintptr_t thread) {
+    s_cpu_threads.erase(std::remove_if(s_cpu_threads.begin(), s_cpu_threads.end(), [thread](const CpuThread& t) {
+        return t.thread == thread && !t.region && !t.sink;
+    }), s_cpu_threads.end());
+}
+} // namespace
+
+PodCpuRegion::PodCpuRegion() {
+    measured_ = osal::Thread::current_cpu_time_us(start_us_);
+    std::lock_guard<std::mutex> lock(s_cpu_mutex);
+    CpuThread& t = cpu_thread_locked(osal::Thread::current_id());
+    parent_ = t.region;
+    t.region = this;
+}
+
+uint64_t PodCpuRegion::finish() {
+    if (done_) return 0;
+    done_ = true;
+    uint64_t now = 0;
+    const bool measured = measured_ && osal::Thread::current_cpu_time_us(now) && now >= start_us_;
+    std::atomic<uint64_t>* sink = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(s_cpu_mutex);
+        const uintptr_t id = osal::Thread::current_id();
+        CpuThread& t = cpu_thread_locked(id);
+        t.region = parent_;
+        sink = t.sink;
+        drop_idle_locked(id);
+    }
+    if (!measured) return 0;
+    const uint64_t total = now - start_us_;
+    if (parent_) parent_->nested_us_ += total;   // the parent is on this thread
+    else if (sink) sink->fetch_add(total);
+    return total > nested_us_ ? total - nested_us_ : 0;
+}
+
+void set_thread_nested_cpu_sink(std::atomic<uint64_t>* sink) {
+    std::lock_guard<std::mutex> lock(s_cpu_mutex);
+    const uintptr_t id = osal::Thread::current_id();
+    cpu_thread_locked(id).sink = sink;
+    drop_idle_locked(id);
+}
 
 // Held while a call runs on the shared interpreter stack, and while a module
 // loads with its compile scratch lent from it (CompileScratchLoan)
@@ -417,6 +484,22 @@ void ContainerLifecycleController::worker_thread_entry(void* arg) {
 }
 
 void ContainerLifecycleController::worker_thread_main() {
+    set_thread_nested_cpu_sink(&worker_nested_cpu_us_);
+    run_entry_point();
+    set_thread_nested_cpu_sink(nullptr);
+    {
+        // The thread ends: its CPU time is kept and the thread not read again
+        uint64_t cpu = 0;
+        const bool measured = osal::Thread::current_cpu_time_us(cpu);
+        osal::LockGuard guard(mutex_);
+        worker_cpu_thread_ = nullptr;
+        worker_cpu_us_ = cpu;
+        worker_cpu_measured_ = measured;
+    }
+    worker_done_.store(true);
+}
+
+void ContainerLifecycleController::run_entry_point() {
     IM3Function entry_fn = nullptr;
     IM3Runtime runtime = reinterpret_cast<IM3Runtime>(m3_runtime_);
 
@@ -470,7 +553,6 @@ void ContainerLifecycleController::worker_thread_main() {
         status_.exit_code = 0;
         status_.ready = false;
     }
-    worker_done_.store(true);
 }
 
 void ContainerLifecycleController::on_trap_caught_locked(const std::string& trap_message, int32_t exit_code, const std::string& reason) {
@@ -543,9 +625,15 @@ bool ContainerLifecycleController::start() {
     }
 #endif
 
+    worker_cpu_us_ = 0;
+    worker_cpu_measured_ = false;
+    worker_nested_cpu_us_.store(0);
     worker_thread_ = std::make_unique<osal::Thread>();
     bool ok = worker_thread_->start(worker_thread_entry, this, t_cfg);
-    if (ok) worker_stack_bytes_.store(static_cast<uint32_t>(t_cfg.stack_size));
+    if (ok) {
+        worker_stack_bytes_.store(static_cast<uint32_t>(t_cfg.stack_size));
+        worker_cpu_thread_ = worker_thread_.get();   // the worker clears it under mutex_, which this function holds
+    }
     if (!ok) {
         worker_thread_.reset();
         if (pod_stack_) { kube32_pool_stack_free(pod_stack_); pod_stack_ = nullptr; }
@@ -689,6 +777,12 @@ ContainerStatus ContainerLifecycleController::get_status() {
         status_.runtime_bytes = m3_GetResourceUsage(reinterpret_cast<IM3Runtime>(m3_runtime_), c_m3Limit_MemoryBytes);
     }
     status_.held_bytes = held_bytes_locked();
+    uint64_t cpu = worker_cpu_us_;
+    status_.has_thread_cpu = worker_cpu_thread_ ? worker_cpu_thread_->cpu_time_us(cpu) : worker_cpu_measured_;
+    if (status_.has_thread_cpu) {
+        const uint64_t nested = worker_nested_cpu_us_.load();
+        status_.thread_cpu_us = cpu > nested ? cpu - nested : 0;
+    }
     return status_;
 }
 
