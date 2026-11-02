@@ -9,6 +9,7 @@
 #include "app/service_client.hpp"
 #include "app/pod_server.hpp"
 #include "api/route_handler.hpp"
+#include "controller/device_controller.hpp"
 #include "mem/monotonic_arena.hpp"
 #include "storage/store.hpp"
 #include "runtime/k32_app_abi.h"
@@ -254,6 +255,138 @@ static void test_egress(storage::Store& store, FakeNode& node) {
     std::cout << "[PASS] k32_http_call: hosts outside the cluster, NetworkPolicy egress" << std::endl;
 }
 
+// OnDemand Devices: a call to a Service whose Device has no driver running
+// reports the use and waits for the driver, at most the call's timeout. On
+// the control plane through the Device controller in-process (the driver on
+// node "sim", whose pod server is the scripted node); on a worker through the
+// activate subresource, with Services and Endpoints read from the API.
+static void test_on_demand(storage::Store& store, FakeNode& node) {
+    std::cout << "=== k32_http_call: OnDemand Devices ===" << std::endl;
+    store.put("/registry/devices/default/env", R"({"apiVersion":"kube32.io/v1","kind":"Device","metadata":{"name":"env","namespace":"default",
+        "uid":"u-env"},"spec":{"driver":"chip-temp","nodeName":"sim","idleSeconds":10}})", true);
+    store.put("/registry/devices/default/never", R"({"apiVersion":"kube32.io/v1","kind":"Device","metadata":{"name":"never","namespace":"default",
+        "uid":"u-never"},"spec":{"driver":"chip-temp","nodeName":"sim"}})", true);
+    controller::DeviceControllerConfig cfg;
+    cfg.reconcile_interval_ms = 5000;   // an activation does not wait for this
+    cfg.resync_interval_ms = 60000;
+    controller::DeviceController dc(store, nullptr, cfg);
+    assert(dc.start());
+    auto exists = [&](const std::string& key) { std::string j; return store.get(key, j).ok(); };
+    for (int i = 0; i < 100 && !(exists("/registry/services/default/env") && exists("/registry/services/default/never")); ++i) osal::Thread::sleep_ms(20);
+    assert(!exists("/registry/pods/default/env-driver"));
+
+    // node "sim"'s kubelet: runs env's driver 300 ms after it is created, never never's
+    std::atomic<bool> kubelet_on{true};
+    std::thread kubelet([&]() {
+        uint64_t seen = 0;
+        while (kubelet_on) {
+            std::string json;
+            if (store.get("/registry/pods/default/env-driver", json).ok() && json.find("\"podIP\"") == std::string::npos) {
+                if (!seen) seen = osal::System::get_uptime_ms();
+                if (osal::System::get_uptime_ms() - seen >= 300) {
+                    models::JsonValue p;
+                    std::string err;
+                    models::parse_json(json, p, err);
+                    p.get_mut("spec")->set("nodeName", models::JsonValue{models::JsonType::String, false, 0, "sim", {}, {}});
+                    models::JsonValue st;
+                    models::parse_json(R"({"phase":"Running","podIP":"127.0.0.1","conditions":[{"type":"Ready","status":"True"}]})", st, err);
+                    p.set("status", st);
+                    store.put("/registry/pods/default/env-driver", p.to_string(), true);
+                }
+            }
+            osal::Thread::sleep_ms(20);
+        }
+    });
+
+    std::atomic<int> reports{0};
+    app::ServiceClientOptions opts;
+    opts.activate_device = [&](const std::string& ns, const std::string& name) {
+        reports++;
+        dc.activate(ns, name);
+        return true;
+    };
+    opts.node_name = "laptop";
+    app::ServiceClient cp(app::make_store_service_resolver(store), opts);
+    app::install_service_client(&cp);
+
+    // The first call starts the driver and waits for it
+    uint64_t t0 = osal::System::get_uptime_ms();
+    k32test::Collect c = call_pod("default/a-0", "/call?u=http://env/cl&t=5000");
+    uint64_t took = osal::System::get_uptime_ms() - t0;
+    std::cout << "[on demand] first call " << c.body << " in " << took << " ms" << std::endl;
+    assert(json_int(c.body, "rc") == 200 && c.body.find("\"body\":\"hello\"") != std::string::npos);
+    assert(took >= 300 && took < 3000 && cp.stats().activated.load() == 1 && reports.load() == 1);
+    // Running: no wait, and no report before idleSeconds/4
+    c = call_pod("default/a-0", "/call?u=http://env/cl");
+    assert(json_int(c.body, "rc") == 200 && cp.stats().activated.load() == 1 && reports.load() == 1);
+
+    // A driver that does not start: 503 with the reason once the call's time is up
+    t0 = osal::System::get_uptime_ms();
+    c = call_pod("default/a-0", "/call?u=http://never/&t=600");
+    took = osal::System::get_uptime_ms() - t0;
+    std::cout << "[on demand] no driver: " << c.body << " in " << took << " ms" << std::endl;
+    assert(json_int(c.body, "rc") == 503 && c.body.find("\\\"device\\\":\\\"never\\\",\\\"ok\\\":false") != std::string::npos);
+    assert(took >= 550 && took < 2000);
+    {
+        uint8_t buf[256];
+        runtime::BufferResponseSink sink(buf, sizeof buf);
+        runtime::ServiceCallRequest req;
+        req.caller_pod = "default/a-0";
+        req.method = "GET";
+        req.url = "http://never/";
+        req.timeout_ms = 300;
+        assert(cp.call(req, sink) == 503 && sink.status() == 503);
+        const std::string body(reinterpret_cast<const char*>(buf), sink.copied());
+        std::cout << "[on demand] " << body << std::endl;
+        assert(body.find("\"error\":\"the driver of Device never did not start within 300 ms") != std::string::npos);
+    }
+    kubelet_on = false;
+    kubelet.join();
+    dc.stop();
+
+    // A worker: the Endpoints name the Device; the activate subresource starts it
+    std::atomic<bool> started{false};
+    std::atomic<int> posts{0};
+    auto api_get = [&](const std::string& path, std::string& body) {
+        if (path == "/api/v1/namespaces/default/services/kitchen") {
+            body = service_json("kitchen", "x", "[{\"name\":\"http\",\"port\":80,\"targetPort\":\"http\"}]");
+            return 200;
+        }
+        if (path == "/api/v1/namespaces/default/endpoints/kitchen") {
+            body = R"({"kind":"Endpoints","metadata":{"name":"kitchen","annotations":{"kube32.io/on-demand-devices":"env:sim:60"}})";
+            if (started) {
+                body += R"(,"subsets":[{"addresses":[{"ip":"127.0.0.1","targetRef":{"kind":"Pod","namespace":"default","name":"env-driver"}}],)"
+                        R"("ports":[{"name":"http","port":)" + std::to_string(node.port) + "}]}]";
+            }
+            body += "}";
+            return 200;
+        }
+        return 404;
+    };
+    app::ServiceClientOptions wo;
+    wo.activate_device = [&](const std::string& ns, const std::string& name) {
+        assert(ns == "default" && name == "env");
+        posts++;
+        std::thread([&]() { osal::Thread::sleep_ms(250); started = true; }).detach();
+        return true;
+    };
+    app::ServiceClient worker(app::make_api_service_resolver(api_get), wo);
+    app::install_service_client(&worker);
+    c = call_pod("default/a-0", "/call?u=http://kitchen/cl&t=5000");
+    std::cout << "[on demand] worker: " << c.body << std::endl;
+    assert(json_int(c.body, "rc") == 200 && c.body.find("\"body\":\"hello\"") != std::string::npos);
+    assert(posts.load() == 1 && worker.stats().activated.load() == 1);
+    c = call_pod("default/a-0", "/call?u=http://kitchen/cl");
+    assert(json_int(c.body, "rc") == 200 && posts.load() == 1);
+
+    app::install_service_client(nullptr);
+    for (const char* k : {"/registry/devices/default/env", "/registry/devices/default/never", "/registry/services/default/env",
+                          "/registry/services/default/never", "/registry/pods/default/env-driver", "/registry/pods/default/never-driver"}) {
+        store.remove(k);
+    }
+    std::cout << "[PASS] k32_http_call: OnDemand Devices" << std::endl;
+}
+
 int main() {
     std::cout << "=== k32_http_call ===" << std::endl;
     osal::Socket::init_networking();
@@ -422,6 +555,7 @@ int main() {
     server.stop();
 
     test_egress(*store, node);
+    test_on_demand(*store, node);
 
     app::install_service_client(nullptr);
     node.stop();

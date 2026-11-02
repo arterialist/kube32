@@ -1406,6 +1406,11 @@ void cluster_task(void* pv) {
         dev_cfg.stack_in_psram = ident.has_psram;
         devices = std::make_unique<kube32::controller::DeviceController>(*store, scheduler.get(), dev_cfg);
         devices->start();
+        // A use of an OnDemand Device, from this node's callers and the activate subresource
+        kube32::app::DeviceDemand::Activate activate_device = [dc = devices.get()](const std::string& ns, const std::string& name) {
+            dc->activate(ns, name);
+            return true;
+        };
         // Checkpoints and moves of pods: snapshots go from the kubelets to
         // this node's API server (checkpoint data), freezes wait 10 s at most
         kube32::controller::CheckpointControllerConfig ck_cfg;
@@ -1452,6 +1457,7 @@ void cluster_task(void* pv) {
         }
         api_server = std::make_unique<kube32::api::HttpServer>(http_opts, *store, scheduler.get());
         if (s_api_token_set) api_server->route_handler().set_bearer_token(api_token);
+        api_server->route_handler().set_device_activator([dc = devices.get()](const std::string& ns, const std::string& name) { dc->activate(ns, name); });
         // Node proxy (/api/v1/nodes/<node>/proxy/...): this node's storage
         // in-process, the workers' through their kubelet endpoint
         static std::unique_ptr<kube32::api::NodeProxyHandler> node_proxy;
@@ -1490,6 +1496,8 @@ void cluster_task(void* pv) {
         sc_opts.tls_sessions = 2;
         sc_opts.tls_stack_bytes = 12288;
         sc_opts.tls_stack_in_psram = ident.has_psram;
+        sc_opts.activate_device = activate_device;
+        sc_opts.node_name = ident.name;
         service_client = std::make_unique<kube32::app::ServiceClient>(kube32::app::make_store_service_resolver(*store), sc_opts,
                                                                       kube32::app::make_store_egress_source(*store));
         kube32::app::install_service_client(service_client.get());
@@ -1536,6 +1544,7 @@ void cluster_task(void* pv) {
         io.rx_buffer = ident.has_psram ? 4096 : 2560;
         io.core_affinity = 1;
         io.stacks_in_psram = ident.has_psram;
+        io.activate_device = activate_device;
         ingress = std::make_unique<kube32::app::IngressController>(io);
         ingress->start();
     } else {
@@ -1583,6 +1592,13 @@ void cluster_task(void* pv) {
         sc_opts.gateway_host = api_host;
         sc_opts.gateway_port = 6443;
         if (s_api_token_set) sc_opts.gateway_token = api_token;
+        // A use of an OnDemand Device: the activate subresource; the answer's body is not kept
+        sc_opts.activate_device = [](const std::string& ns, const std::string& name) {
+            auto head = [](int, std::string_view) { return true; };
+            auto skip = [](const char*, size_t) { return true; };
+            return svc_api->request("POST", "/apis/kube32.io/v1/namespaces/" + ns + "/devices/" + name + "/activate", "{}", head, skip) == 200;
+        };
+        sc_opts.node_name = ident.name;
         static std::unique_ptr<kube32::app::ServiceClient> service_client;
         service_client = std::make_unique<kube32::app::ServiceClient>(kube32::app::make_api_service_resolver(api_get), sc_opts,
                                                                       kube32::app::make_node_egress_source(kubelet_cfg.network_policies, api_get));

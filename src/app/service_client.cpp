@@ -1,6 +1,7 @@
 #include "app/service_client.hpp"
 #include "runtime/k32_app_abi.h"
 #include "runtime/container_lifecycle.hpp"
+#include "runtime/pod_memory_pool.h"
 #include "models/kube_models.hpp"
 #include "storage/store.hpp"
 #include "osal/condition_variable.hpp"
@@ -137,17 +138,37 @@ constexpr size_t kMaxChain = 8;   // pods in one call chain
 // Resolvers
 // ---------------------------------------------------------------------------
 struct CachedTarget {
-    bool ok{false};
-    bool no_service{false};
-    std::string why;
-    std::vector<IngressEndpoint> endpoints;
+    ServiceTarget target;
     uint64_t at_ms{0};
 };
+
+// The selector of Service `name` among `service_jsons`, empty when there is none
+std::vector<std::pair<std::string, std::string>> service_selector(const std::vector<std::string>& service_jsons, const std::string& name) {
+    std::vector<std::pair<std::string, std::string>> out;
+    const std::string mark = "\"name\":\"" + name + "\"";
+    for (const auto& json : service_jsons) {
+        if (json.find(mark) == std::string::npos) continue;
+        models::JsonValue doc;
+        std::string err;
+        if (!models::parse_json(json, doc, err) || !doc.is_object()) continue;
+        const models::JsonValue* meta = doc.get("metadata");
+        if (!meta || meta->get_string("name", "") != name) continue;
+        const models::JsonValue* spec = doc.get("spec");
+        const models::JsonValue* sel = spec ? spec->get("selector") : nullptr;
+        if (sel && sel->is_object()) {
+            for (const auto& kv : sel->obj_val) {
+                if (kv.second.is_string()) out.emplace_back(kv.first, kv.second.str_val);
+            }
+        }
+        break;
+    }
+    return out;
+}
 
 class StoreResolver : public ServiceResolver {
 public:
     explicit StoreResolver(storage::Store& store) : store_(store), dirty_(std::make_shared<std::atomic<bool>>(false)) {
-        for (const char* prefix : {"/registry/services/", "/registry/pods/"}) {
+        for (const char* prefix : {"/registry/services/", "/registry/pods/", "/registry/devices/"}) {
             std::shared_ptr<std::atomic<bool>> dirty = dirty_;
             watches_.push_back(store_.watch(prefix, [dirty](const storage::WatchEvent&) { dirty->store(true); }));
         }
@@ -155,37 +176,36 @@ public:
     ~StoreResolver() override {
         for (uint32_t id : watches_) store_.unwatch(id);
     }
-    bool resolve(const std::string& ns, const std::string& name, uint16_t port, std::vector<IngressEndpoint>& out, std::string& why,
-                 bool* no_service) override {
+    // Kept until a Service, a Pod or a Device changes: always fresh
+    bool resolve(const std::string& ns, const std::string& name, uint16_t port, ServiceTarget& out, bool) override {
         const std::string key = ns + "/" + name + ":" + std::to_string(port);
         {
             osal::LockGuard guard(mutex_);
             if (dirty_->exchange(false)) cache_.clear();
             auto it = cache_.find(key);
             if (it != cache_.end()) {
-                out = it->second.endpoints;
-                why = it->second.why;
-                if (no_service) *no_service = it->second.no_service;
-                return it->second.ok;
+                out = it->second.target;
+                return !out.endpoints.empty();
             }
         }
-        std::vector<std::string> services, pods, nodes;
+        std::vector<std::string> services, pods, nodes, devices;
         store_.list("/registry/services/" + ns + "/", services);
         store_.list("/registry/pods/" + ns + "/", pods);
         store_.list("/registry/nodes/", nodes);
+        store_.list("/registry/devices/" + ns + "/", devices);
         CachedTarget t;
-        t.ok = resolve_service_endpoints(ns, name, port, services, pods, t.endpoints, t.why, nodes);
-        if (!t.ok) {
+        if (!resolve_service_endpoints(ns, name, port, services, pods, t.target.endpoints, t.target.why, nodes)) {
             std::string unused;
-            t.no_service = !store_.get("/registry/services/" + ns + "/" + name, unused).ok();
+            t.target.no_service = !store_.get("/registry/services/" + ns + "/" + name, unused).ok();
         }
-        out = t.endpoints;
-        why = t.why;
-        if (no_service) *no_service = t.no_service;
+        if (!devices.empty()) {
+            models::select_on_demand(models::on_demand_drivers(devices), ns, service_selector(services, name), t.target.devices);
+        }
+        out = t.target;
         osal::LockGuard guard(mutex_);
         if (cache_.size() > 32) cache_.clear();
         cache_[key] = std::move(t);
-        return out.size() > 0;
+        return !out.endpoints.empty();
     }
 private:
     storage::Store& store_;
@@ -198,36 +218,34 @@ private:
 class ApiResolver : public ServiceResolver {
 public:
     ApiResolver(std::function<int(const std::string&, std::string&)> get, uint32_t ttl) : get_(std::move(get)), ttl_ms_(ttl) {}
-    bool resolve(const std::string& ns, const std::string& name, uint16_t port, std::vector<IngressEndpoint>& out, std::string& why,
-                 bool* no_service) override {
+    bool resolve(const std::string& ns, const std::string& name, uint16_t port, ServiceTarget& out, bool fresh) override {
         const std::string key = ns + "/" + name + ":" + std::to_string(port);
         const uint64_t now = osal::System::get_uptime_ms();
-        {
+        if (!fresh) {
             osal::LockGuard guard(mutex_);
             auto it = cache_.find(key);
             if (it != cache_.end() && now - it->second.at_ms < ttl_ms_) {
-                out = it->second.endpoints;
-                why = it->second.why;
-                if (no_service) *no_service = it->second.no_service;
-                return it->second.ok;
+                out = it->second.target;
+                return !out.endpoints.empty();
             }
         }
         CachedTarget t;
         t.at_ms = now;
-        t.ok = fetch(ns, name, port, t.endpoints, t.why, t.no_service);
-        out = t.endpoints;
-        why = t.why;
-        if (no_service) *no_service = t.no_service;
+        fetch(ns, name, port, t.target);
+        out = t.target;
         osal::LockGuard guard(mutex_);
         if (cache_.size() > 16) cache_.clear();
         cache_[key] = std::move(t);
-        return out.size() > 0;
+        return !out.endpoints.empty();
     }
 private:
-    // The Service names the port; its Endpoints carry the addresses and the
-    // resolved target port under the same port name
-    bool fetch(const std::string& ns, const std::string& name, uint16_t port, std::vector<IngressEndpoint>& out, std::string& why,
-               bool& no_service) {
+    // The Service names the port; its Endpoints carry the addresses, the
+    // resolved target port under the same port name, and the OnDemand
+    // Devices whose drivers the Service selects
+    bool fetch(const std::string& ns, const std::string& name, uint16_t port, ServiceTarget& target) {
+        std::vector<IngressEndpoint>& out = target.endpoints;
+        std::string& why = target.why;
+        bool& no_service = target.no_service;
         const std::string svc_key = ns + "/" + name;
         std::string body, err;
         int code = get_("/api/v1/namespaces/" + ns + "/services/" + name, body);
@@ -269,6 +287,11 @@ private:
         if (code != 200) { why = "no endpoints for service " + svc_key + " (http " + std::to_string(code) + ")"; return false; }
         models::JsonValue doc;
         if (!models::parse_json(body, doc, err)) { why = "endpoints " + svc_key + ": " + err; return false; }
+        if (const models::JsonValue* meta = doc.get("metadata")) {
+            if (const models::JsonValue* ann = meta->get("annotations"); ann && ann->is_object()) {
+                models::parse_on_demand_annotation(ann->get_string(models::kAnnotationOnDemandDevices, ""), target.devices);
+            }
+        }
         const models::JsonValue* subsets = doc.get("subsets");
         if (subsets && subsets->is_array()) {
             for (const auto& sub : subsets->arr_val) {
@@ -568,8 +591,28 @@ std::unique_ptr<ServiceResolver> make_api_service_resolver(std::function<int(con
 // ---------------------------------------------------------------------------
 // ServiceClient
 // ---------------------------------------------------------------------------
+void DeviceDemand::use(const std::string& ns, const std::vector<models::OnDemandDevice>& devices, bool running) {
+    if (!activate_) return;
+    for (const auto& d : devices) {
+        const std::string key = ns + "/" + d.name;
+        const uint64_t now = osal::System::get_uptime_ms();
+        {
+            osal::LockGuard guard(mutex_);
+            auto it = next_.find(key);
+            if (it != next_.end() && now < it->second) continue;
+            if (it == next_.end() && next_.size() >= 32) next_.clear();
+            // Reserved before the report, so concurrent callers make one
+            next_[key] = now + (running ? static_cast<uint64_t>(d.idle_seconds) * 250 : 1000);
+        }
+        if (!activate_(ns, d.name)) {
+            osal::LockGuard guard(mutex_);
+            next_[key] = now + 1000;
+        }
+    }
+}
+
 ServiceClient::ServiceClient(std::unique_ptr<ServiceResolver> resolver, ServiceClientOptions opts, std::unique_ptr<EgressPolicySource> egress)
-    : resolver_(std::move(resolver)), opts_(std::move(opts)), egress_(std::move(egress)) {}
+    : resolver_(std::move(resolver)), opts_(std::move(opts)), egress_(std::move(egress)), demand_(opts_.activate_device) {}
 
 ServiceClient::~ServiceClient() {
     {
@@ -665,16 +708,60 @@ int32_t ServiceClient::call(const runtime::ServiceCallRequest& req, runtime::Buf
 
     const std::string ns = t.ns.empty() ? std::string(namespace_of(req.caller_pod)) : t.ns;
     if (chain_length(req.call_chain) >= kMaxChain) return K32_ERR_LOOP;
-    std::vector<IngressEndpoint> eps;
-    std::string why;
-    bool no_service = false;
-    if (!resolver_->resolve(ns, t.service, t.port, eps, why, &no_service)) {
+    ServiceTarget target;
+    bool ready = resolver_->resolve(ns, t.service, t.port, target);
+    if (!target.devices.empty() && demand_.enabled()) {
+        demand_.use(ns, target.devices, ready);
+        if (!ready) {
+            const uint64_t start = osal::System::get_uptime_ms();
+            const int32_t rc = await_driver(req, t, ns, target, out);
+            if (rc != 0) return rc;
+            // What is left of the call's time
+            runtime::ServiceCallRequest rest = req;
+            const uint64_t waited = osal::System::get_uptime_ms() - start;
+            rest.timeout_ms = waited < req.timeout_ms ? static_cast<uint32_t>(req.timeout_ms - waited) : 1;
+            return call_service(rest, t, ns, target.endpoints, out);
+        }
+    }
+    if (!ready) {
         // <name>.<name> that is no Service: the search path ends with the name itself
-        if (t.or_external && no_service) return call_external(req, t, out);
+        if (t.or_external && target.no_service) return call_external(req, t, out);
         stats_.failed.fetch_add(1, std::memory_order_relaxed);
         return K32_ERR_NOENT;
     }
-    return call_service(req, t, ns, eps, out);
+    return call_service(req, t, ns, target.endpoints, out);
+}
+
+int32_t ServiceClient::await_driver(const runtime::ServiceCallRequest& req, const Target& t, const std::string& ns, ServiceTarget& target,
+                                    ResponseBody& out) {
+    const uint64_t start = osal::System::get_uptime_ms();
+    const uint32_t limit = req.timeout_ms < opts_.activation_wait_ms ? req.timeout_ms : opts_.activation_wait_ms;
+    // A call on this node's shared interpreter stack holds it while it
+    // waits; a driver that starts here needs it to load and initialize
+    bool here = false;
+    if (kube32_interp_stack_base_for(__builtin_frame_address(0))) {
+        for (const auto& d : target.devices) here |= !opts_.node_name.empty() && d.node == opts_.node_name;
+    }
+    while (!here && !call_stopped(req)) {
+        const uint64_t spent = osal::System::get_uptime_ms() - start;
+        if (spent >= limit) break;
+        osal::Thread::sleep_ms(static_cast<uint32_t>(limit - spent < 200 ? limit - spent : 200));
+        if (resolver_->resolve(ns, t.service, t.port, target, true)) {
+            stats_.activated.fetch_add(1, std::memory_order_relaxed);
+            return 0;
+        }
+        demand_.use(ns, target.devices, false);
+    }
+    stats_.failed.fetch_add(1, std::memory_order_relaxed);
+    std::string names;
+    for (const auto& d : target.devices) names += (names.empty() ? "" : ", ") + d.name;
+    const std::string why = here ? "starts on this node once this call returns: call again"
+                                 : "did not start within " + std::to_string(limit) + " ms (" + target.why + ")";
+    const std::string body = "{\"device\":\"" + target.devices[0].name + "\",\"ok\":false,\"error\":\"the driver of Device " + names + " " + why + "\"}";
+    out.begin(503);
+    out.append(body.data(), body.size());
+    out.end();
+    return 503;
 }
 
 bool ServiceClient::start_tls_session(TlsJob job) {

@@ -190,8 +190,16 @@ static std::string_view request_path(const api::HttpRequest& req) {
     return q == std::string_view::npos ? raw : raw.substr(0, q);
 }
 
+// The namespace of the Ingress a route comes from
+static std::string route_namespace(const RouteTable& table, const IngressRoute& route) {
+    if (route.ingress >= table.ingresses.size()) return "default";
+    const std::string& key = table.ingresses[route.ingress].key;
+    return key.substr(0, key.find('/'));
+}
+
 IngressController::IngressController(IngressControllerOptions opts)
-    : opts_(std::move(opts)), hub_(std::make_shared<SseHub>()), dirty_(std::make_shared<std::atomic<bool>>(true)) {
+    : opts_(std::move(opts)), demand_(opts_.activate_device), hub_(std::make_shared<SseHub>()),
+      dirty_(std::make_shared<std::atomic<bool>>(true)) {
     hub_->set_max_clients(opts_.max_stream_clients);
 }
 
@@ -201,7 +209,7 @@ IngressController::~IngressController() {
 
 bool IngressController::start() {
     if (opts_.store) {
-        for (const char* prefix : {"/registry/ingresses/", "/registry/services/", "/registry/pods/"}) {
+        for (const char* prefix : {"/registry/ingresses/", "/registry/services/", "/registry/pods/", "/registry/devices/"}) {
             std::shared_ptr<std::atomic<bool>> dirty = dirty_;
             store_watches_.push_back(opts_.store->watch(prefix, [dirty](const storage::WatchEvent&) { dirty->store(true); }));
         }
@@ -280,13 +288,14 @@ void IngressController::rebuild_locked() {
     dirty_->store(false);
     std::shared_ptr<RouteTable> table;
     try {
-        std::vector<std::string> ingresses, services, pods, nodes;
+        std::vector<std::string> ingresses, services, pods, nodes, devices;
         opts_.store->list("/registry/ingresses/", ingresses);
         opts_.store->list("/registry/services/", services);
         opts_.store->list("/registry/pods/", pods);
         opts_.store->list("/registry/nodes/", nodes);
+        if (!ingresses.empty()) opts_.store->list("/registry/devices/", devices);
         std::shared_ptr<const RouteTable> previous = routes();
-        table = build_route_table(ingresses, services, pods, previous.get(), nodes);
+        table = build_route_table(ingresses, services, pods, previous.get(), nodes, devices);
     } catch (const std::exception& e) {
         // Out of memory: keep serving the previous table and retry later
         std::cout << "[INGRESS] routing table rebuild skipped: " << e.what() << std::endl;
@@ -390,6 +399,15 @@ void IngressController::tick() {
         }
     }
 
+    // Streams of OnDemand Devices' topics: in use while a client listens
+    if (demand_.enabled()) {
+        for (const auto& r : t->routes) {
+            if (r.kind == BackendKind::EventStream && !r.devices.empty() && hub_->count_streams({r.stream_id}) > 0) {
+                demand_.use(route_namespace(*t, r), r.devices, true);
+            }
+        }
+    }
+
     // kube32.cluster streams: telemetry every 2 s while someone listens
     uint64_t now = osal::System::get_uptime_ms();
     static const uint32_t kClusterHash = topic_hash(kTopicClusterTelemetry);
@@ -420,6 +438,19 @@ bool IngressController::handle(api::HttpConnection& conn) {
     table->ingresses[route->ingress].counters->requests.fetch_add(1, std::memory_order_relaxed);
     switch (route->kind) {
         case BackendKind::Service:
+            if (!route->devices.empty() && demand_.enabled()) {
+                const bool running = !route->endpoints.empty();
+                demand_.use(route_namespace(*table, *route), route->devices, running);
+                if (!running && !await_driver(req, path, table, route)) {
+                    stats_.proxy_errors.fetch_add(1, std::memory_order_relaxed);
+                    std::string names;
+                    for (const auto& d : route->devices) names += (names.empty() ? "" : ", ") + d.name;
+                    return conn.send_simple(503, "application/json",
+                                            "{\"error\":\"unavailable\",\"message\":\"the driver of Device " + names + " did not start within " +
+                                                std::to_string(opts_.activation_wait_ms) + " ms\"}",
+                                            "Retry-After: 2\r\n");
+                }
+            }
             return serve_service(conn, *route);
         case BackendKind::StaticBundle:
             return serve_bundle(conn, *route, path);
@@ -476,9 +507,33 @@ bool IngressController::serve_bundle(api::HttpConnection& conn, const IngressRou
     return conn.send_blob(match->content_type, match->data, match->len, match->gzip, etag, cache);
 }
 
+bool IngressController::await_driver(const api::HttpRequest& req, std::string_view path, std::shared_ptr<const RouteTable>& table,
+                                     const IngressRoute*& route) {
+    const uint64_t start = osal::System::get_uptime_ms();
+    const std::string ns = route_namespace(*table, *route);
+    while (osal::System::get_uptime_ms() - start < opts_.activation_wait_ms) {
+        osal::Thread::sleep_ms(100);
+        std::shared_ptr<const RouteTable> now = current_routes();
+        const IngressRoute* r = now ? now->match(req.host, path) : nullptr;
+        if (!r || r->kind != BackendKind::Service) return false;
+        if (!r->endpoints.empty()) {
+            table = std::move(now);
+            route = r;
+            return true;
+        }
+        demand_.use(ns, r->devices, false);
+    }
+    return false;
+}
+
 bool IngressController::serve_stream(api::HttpConnection& conn, const IngressRoute& route) {
     const api::HttpRequest& req = conn.request();
     if (req.method != api::HttpMethod::Get) return conn.send_simple(405, "text/plain", "GET only\n");
+    // Readings flow once the Devices' drivers run
+    if (!route.devices.empty()) {
+        std::shared_ptr<const RouteTable> t = routes();
+        if (t) demand_.use(route_namespace(*t, route), route.devices, false);
+    }
     SseHub::Subscription sub;
     sub.stream_id = route.stream_id;
     for (const auto& t : route.topics) {

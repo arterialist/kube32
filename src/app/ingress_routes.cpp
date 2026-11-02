@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <cctype>
 #include <cstdlib>
+#include <cstring>
 #include <map>
 
 namespace kube32::app {
@@ -223,7 +224,8 @@ bool parse_backend(const models::JsonValue* b, BackendRef& out) {
 }
 
 void resolve_service(IngressRoute& route, const std::string& ns, const BackendRef& ref, const std::vector<ServiceInfo>& services,
-                     const std::vector<PodInfo>& pods, const std::map<std::string, uint16_t>& node_ports) {
+                     const std::vector<PodInfo>& pods, const std::map<std::string, uint16_t>& node_ports,
+                     const std::vector<models::OnDemandDriver>& drivers = {}) {
     route.kind = BackendKind::Service;
     route.service = ns + "/" + ref.service_name;
     const ServiceInfo* svc = nullptr;
@@ -231,6 +233,7 @@ void resolve_service(IngressRoute& route, const std::string& ns, const BackendRe
         if (s.ns == ns && s.name == ref.service_name) { svc = &s; break; }
     }
     if (!svc) { route.unavailable = "service " + route.service + " not found"; return; }
+    models::select_on_demand(drivers, ns, svc->selector, route.devices);
     const ServiceInfo::Port* port = nullptr;
     for (const auto& p : svc->ports) {
         if ((ref.port_number && p.port == ref.port_number) || (!ref.port_name.empty() && p.name == ref.port_name)) { port = &p; break; }
@@ -331,9 +334,11 @@ std::shared_ptr<RouteTable> build_route_table(const std::vector<std::string>& in
                                               const std::vector<std::string>& service_jsons,
                                               const std::vector<std::string>& pod_jsons,
                                               const RouteTable* previous,
-                                              const std::vector<std::string>& node_jsons) {
+                                              const std::vector<std::string>& node_jsons,
+                                              const std::vector<std::string>& device_jsons) {
     auto table = std::make_shared<RouteTable>();
     const std::map<std::string, uint16_t> node_ports = models::node_pod_ports(node_jsons);
+    const std::vector<models::OnDemandDriver> drivers = models::on_demand_drivers(device_jsons);
 
     std::vector<ServiceInfo> services;
     services.reserve(service_jsons.size());
@@ -403,7 +408,7 @@ std::shared_ptr<RouteTable> build_route_table(const std::vector<std::string>& in
                 r.kind = BackendKind::StaticBundle;
                 r.bundle = ref.bundle;
             } else {
-                resolve_service(r, ns, ref, services, pods, node_ports);
+                resolve_service(r, ns, ref, services, pods, node_ports, drivers);
             }
             return r;
         };
@@ -449,6 +454,15 @@ std::shared_ptr<RouteTable> build_route_table(const std::vector<std::string>& in
                 stream_id = ipc::fnv1a_32(ident);
                 if (stream_id == 0) stream_id = 1;
             }
+            // The Devices whose readings the stream carries
+            std::vector<models::OnDemandDevice> devices;
+            const size_t prefix = std::strlen(models::kDeviceTopicPrefix);
+            for (const auto& t : topics) {
+                if (t.size() <= prefix || t.compare(0, prefix, models::kDeviceTopicPrefix) != 0) continue;
+                for (const auto& d : drivers) {
+                    if (d.ns == ns && d.device.name == t.substr(prefix)) devices.push_back(d.device);
+                }
+            }
             for (const auto& h : route_hosts) {
                 IngressRoute r;
                 r.host = h;
@@ -458,6 +472,7 @@ std::shared_ptr<RouteTable> build_route_table(const std::vector<std::string>& in
                 r.ingress = index;
                 r.topics = topics;
                 r.stream_id = stream_id;
+                r.devices = devices;
                 table->routes.push_back(std::move(r));
             }
         };

@@ -15,10 +15,18 @@
 //   * cluster telemetry: JSON summary of nodes, pods, this server and the
 //     channel layer.
 //
-// The routing table is rebuilt when an Ingress, Service or Pod changes in the
-// store (at most every 250 ms on the request path, and from tick()).
+// The routing table is rebuilt when an Ingress, Service, Pod or Device
+// changes in the store (at most every 250 ms on the request path, and from
+// tick()).
+//
+// OnDemand Devices (docs/devices.md#activation): a request to a service
+// backend that selects their drivers reports their use, and with no driver
+// running yet waits for one (activation_wait_ms at most), then 503 with the
+// reason. An event stream of their device.<name> topics reports a use when a
+// client connects and while clients listen.
 
 #include "app/ingress_routes.hpp"
+#include "app/service_client.hpp"
 #include "api/http_server.hpp"
 #include "storage/store.hpp"
 #include "osal/mutex.hpp"
@@ -103,6 +111,11 @@ struct IngressControllerOptions {
     uint32_t upstream_timeout_ms{4000};
     size_t upstream_pool_size{4};   // keep-alive connections to pod servers, all targets together
     size_t max_stream_clients{6};
+
+    // OnDemand Devices: how a use is reported (unset: never), and how long a
+    // request waits for an Idle Device's driver to start
+    DeviceDemand::Activate activate_device;
+    uint32_t activation_wait_ms{10000};
 };
 
 class IngressController : public api::HttpHandler {
@@ -145,6 +158,10 @@ private:
     void sync_subscriptions_locked(const RouteTable& table);
     void sync_status();
 
+    // A service route whose OnDemand Devices have no driver running yet:
+    // waits for the table to show an endpoint; false when none came in time
+    bool await_driver(const api::HttpRequest& req, std::string_view path, std::shared_ptr<const RouteTable>& table,
+                      const IngressRoute*& route);
     bool serve_service(api::HttpConnection& conn, const IngressRoute& route);
     bool serve_bundle(api::HttpConnection& conn, const IngressRoute& route, std::string_view path);
     bool serve_stream(api::HttpConnection& conn, const IngressRoute& route);
@@ -160,6 +177,7 @@ private:
     void release_upstream(Upstream* u, bool reusable);
 
     IngressControllerOptions opts_;
+    DeviceDemand demand_;
     std::shared_ptr<SseHub> hub_;   // shared with channel callbacks that may outlive a stop()
     std::unique_ptr<api::HttpServer> server_;
     Stats stats_;

@@ -20,6 +20,15 @@
 // the request (X-Kube32-Call-Chain), and a call that would re-enter one of
 // them fails with K32_ERR_LOOP instead of waiting on itself.
 //
+// A Service that selects the driver pods of OnDemand Devices (Endpoints
+// annotation kube32.io/on-demand-devices, models/device.hpp) reports each
+// call as a use of those Devices (DeviceDemand). With no ready driver, the
+// call waits for one (ServiceClientOptions::activation_wait_ms at most, and
+// never past the call's own timeout), then goes on; a driver that does not
+// start in time answers 503 {"device":...,"ok":false,"error":...}. A caller
+// on this node's shared interpreter stack does not wait for a driver that
+// starts on this node: that driver loads once the call returns.
+//
 // A host outside the cluster is looked up with the node's resolver and gets
 // a connection of its own (Connection: close), read as the answer arrives
 // and closed once it is complete or no longer fits the caller's buffer. The
@@ -43,6 +52,7 @@
 
 #include "app/egress_policy.hpp"
 #include "app/ingress_routes.hpp"
+#include "models/device.hpp"
 #include "runtime/app_pod.hpp"
 #include "osal/mutex.hpp"
 #include "osal/socket.hpp"
@@ -59,14 +69,39 @@ namespace kube32::osal { class TlsClient; }
 
 namespace kube32::app {
 
+// What a Service resolves to
+struct ServiceTarget {
+    std::vector<IngressEndpoint> endpoints;          // its ready pods
+    std::string why;                                 // no endpoint: why
+    bool no_service{false};                          // there is no such Service
+    std::vector<models::OnDemandDevice> devices;     // OnDemand Devices whose driver pods it selects
+};
+
 class ServiceResolver {
 public:
     virtual ~ServiceResolver() = default;
-    // Ready pods behind Service `ns/name` for its port `port` (0: the first
-    // port). False with `why` when there is no such Service, port or pod;
-    // `no_service` (optional) is set when there is no such Service.
-    virtual bool resolve(const std::string& ns, const std::string& name, uint16_t port,
-                         std::vector<IngressEndpoint>& out, std::string& why, bool* no_service = nullptr) = 0;
+    // Service `ns/name` for its port `port` (0: the first port). True when
+    // it has a ready pod. `fresh`: read again, not what an earlier call kept.
+    virtual bool resolve(const std::string& ns, const std::string& name, uint16_t port, ServiceTarget& out, bool fresh = false) = 0;
+};
+
+// Reports uses of OnDemand Devices (docs/devices.md#activation) with
+// `activate`: the activate subresource from a worker, the Device controller
+// itself on the control plane. While a Device's driver answers, at most once
+// per idleSeconds/4 for each Device; while callers wait for it to start, at
+// most once a second; after a report that failed, again a second later.
+class DeviceDemand {
+public:
+    using Activate = std::function<bool(const std::string& ns, const std::string& name)>;
+    explicit DeviceDemand(Activate activate = nullptr) : activate_(std::move(activate)) {}
+    bool enabled() const { return static_cast<bool>(activate_); }
+    // Callers in namespace `ns` use `devices`; `running`: their drivers answer
+    void use(const std::string& ns, const std::vector<models::OnDemandDevice>& devices, bool running);
+
+private:
+    Activate activate_;
+    osal::Mutex mutex_;
+    std::map<std::string, uint64_t> next_;   // "<namespace>/<name>" -> earliest time of the next report
 };
 
 // From the object store (control plane); results are kept until a Service or
@@ -98,6 +133,11 @@ struct ServiceClientOptions {
     std::string gateway_host;
     uint16_t gateway_port{6443};
     std::string gateway_token;
+    // OnDemand Devices (DeviceDemand): how a use is reported (unset: never),
+    // this node's name, and how long a call waits for an Idle Device's driver
+    DeviceDemand::Activate activate_device;
+    std::string node_name;
+    uint32_t activation_wait_ms{10000};
 };
 
 struct ResponseBody;   // where an answer goes as it is read (service_client.cpp)
@@ -139,6 +179,7 @@ public:
         std::atomic<uint64_t> denied{0};     // by NetworkPolicy
         std::atomic<uint64_t> failed{0};
         std::atomic<uint64_t> reused{0};     // remote calls on a pooled connection
+        std::atomic<uint64_t> activated{0};  // calls that waited for an OnDemand Device's driver to start
     };
     const Stats& stats() const { return stats_; }
 
@@ -156,6 +197,10 @@ public:
     static bool parse_target(std::string_view url, Target& out);
 
 private:
+    // The Service selects an OnDemand Device whose driver does not run: waits
+    // for an endpoint. 0 once `target` has one, else the answer the caller got.
+    int32_t await_driver(const runtime::ServiceCallRequest& req, const Target& t, const std::string& ns, ServiceTarget& target,
+                         ResponseBody& out);
     int32_t call_service(const runtime::ServiceCallRequest& req, const Target& t, const std::string& ns,
                          std::vector<IngressEndpoint>& eps, ResponseBody& out);
     int32_t call_https(const runtime::ServiceCallRequest& req, const Target& t, ResponseBody& out);
@@ -173,6 +218,7 @@ private:
     std::unique_ptr<ServiceResolver> resolver_;
     ServiceClientOptions opts_;
     std::unique_ptr<EgressPolicySource> egress_;
+    DeviceDemand demand_;
     Stats stats_;
     std::atomic<uint32_t> rr_{0};
     std::atomic<uint64_t> last_denial_log_ms_{0};

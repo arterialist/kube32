@@ -513,6 +513,13 @@ int main(int argc, char* argv[]) {
         sc_opts.gateway_host = master_host;
         sc_opts.gateway_port = master_port;
         sc_opts.gateway_token = opts.token;
+        // A use of an OnDemand Device: the activate subresource; the answer's body is not kept
+        sc_opts.activate_device = [api_client](const std::string& ns, const std::string& name) {
+            auto head = [](int, std::string_view) { return true; };
+            auto skip = [](const char*, size_t) { return true; };
+            return api_client->request("POST", "/apis/kube32.io/v1/namespaces/" + ns + "/devices/" + name + "/activate", "{}", head, skip) == 200;
+        };
+        sc_opts.node_name = opts.node_name;
         kube32::app::ServiceClient service_client(kube32::app::make_api_service_resolver(api_get), sc_opts,
                                                   kube32::app::make_node_egress_source(kubelet_cfg.network_policies, api_get));
         kube32::app::install_service_client(&service_client);
@@ -744,6 +751,12 @@ int main(int argc, char* argv[]) {
     dev_cfg.stack_bytes = 65536;
     kube32::controller::DeviceController devices(*store, scheduler.get(), dev_cfg);
     devices.start();
+    // A use of an OnDemand Device, from this process's callers and the activate subresource
+    kube32::app::DeviceDemand::Activate activate_device = [&devices](const std::string& ns, const std::string& name) {
+        devices.activate(ns, name);
+        return true;
+    };
+    server->route_handler().set_device_activator([&devices](const std::string& ns, const std::string& name) { devices.activate(ns, name); });
     // Checkpoints and moves of pods: snapshots go from the kubelets to this
     // API server's checkpoint data
     kube32::controller::CheckpointControllerConfig ck_cfg;
@@ -772,6 +785,8 @@ int main(int argc, char* argv[]) {
     sc_opts.response_head_bytes = 8192;
     sc_opts.tls = tls_client.get();
     sc_opts.tls_stack_bytes = 262144;
+    sc_opts.activate_device = activate_device;
+    sc_opts.node_name = local_node;
     kube32::app::ServiceClient service_client(kube32::app::make_store_service_resolver(*store), sc_opts,
                                               kube32::app::make_store_egress_source(*store));
     kube32::app::install_service_client(&service_client);
@@ -871,6 +886,7 @@ int main(int argc, char* argv[]) {
         io.port = opts.ingress_port;
         io.workers = 4;
         io.worker_stack = 262144;
+        io.activate_device = activate_device;
         ingress = std::make_unique<kube32::app::IngressController>(io);
         ingress->start();
     }

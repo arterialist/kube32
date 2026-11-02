@@ -38,8 +38,14 @@
 // The extra routes apply to the hosts of the Ingress's rules (any host when a
 // rule has none or the Ingress has no rules).
 //
+// A service backend that selects the driver pods of OnDemand Devices, and an
+// event stream of device.<name> topics, name those Devices (in the Ingress's
+// namespace): the controller reports their use (docs/devices.md#activation).
+//
 // Ingresses whose spec.ingressClassName is set to something other than
 // "kube32" belong to another controller and are ignored.
+
+#include "models/device.hpp"
 
 #include <atomic>
 #include <cstdint>
@@ -79,6 +85,9 @@ struct IngressRoute {
     std::string service;                   // "<namespace>/<name>" (error messages)
     std::string unavailable;               // why there is no endpoint (empty when endpoints exist)
     std::vector<IngressEndpoint> endpoints;
+    // OnDemand Devices whose driver pods the Service selects, or whose
+    // device.<name> topics an event stream carries (the Ingress's namespace)
+    std::vector<models::OnDemandDevice> devices;
 
     // StaticBundle backend
     std::string bundle;
@@ -115,12 +124,14 @@ public:
 
 // Builds a table from stored JSON objects. Counters of Ingresses present in
 // `previous` are carried over. A pod on one of `node_jsons` that reports its
-// pod port is reached at that port (models::node_pod_port).
+// pod port is reached at that port (models::node_pod_port). Routes name the
+// OnDemand Devices among `device_jsons` they use.
 std::shared_ptr<RouteTable> build_route_table(const std::vector<std::string>& ingress_jsons,
                                               const std::vector<std::string>& service_jsons,
                                               const std::vector<std::string>& pod_jsons,
                                               const RouteTable* previous,
-                                              const std::vector<std::string>& node_jsons = {});
+                                              const std::vector<std::string>& node_jsons = {},
+                                              const std::vector<std::string>& device_jsons = {});
 
 // Endpoints of Service `ns/name` for its port `port` (0: the Service's first
 // port): the Running pods it selects, the target port resolved per pod and
