@@ -21,6 +21,7 @@
 #include "osal/thread.hpp"
 
 #include <algorithm>
+#include <atomic>
 #include <cctype>
 #include <cstring>
 #include <sstream>
@@ -111,6 +112,48 @@ bool retry_update(const storage::Status& s, int attempt) {
     osal::Thread::yield();
     return true;
 }
+
+// A writer that keeps losing the race for an object (a delete reading a
+// large pod while a kubelet streams status patches) takes the write turn
+// after kTurnAfter conflicts: it closes a gate that every other optimistic
+// writer waits at before its next attempt, so its own read and write meet
+// no other. One atomic load per attempt when nobody holds the turn.
+constexpr int kTurnAfter = 8;
+std::atomic<bool> g_turn_held{false};
+osal::Mutex g_turn;
+
+class WriteTurn {
+public:
+    WriteTurn() = default;
+    WriteTurn(const WriteTurn&) = delete;
+    WriteTurn& operator=(const WriteTurn&) = delete;
+    ~WriteTurn() {
+        if (holding_) {
+            g_turn_held.store(false);
+            g_turn.unlock();
+        }
+    }
+    // Before reading the object: wait while another writer holds the turn
+    void wait() {
+        if (!holding_ && g_turn_held.load()) {
+            g_turn.lock();
+            g_turn.unlock();
+        }
+    }
+    // retry_update, taking the turn once the writer has lost often enough
+    bool retry(const storage::Status& s, int attempt) {
+        if (!retry_update(s, attempt)) return false;
+        if (!holding_ && attempt + 1 >= kTurnAfter) {
+            g_turn.lock();
+            holding_ = true;
+            g_turn_held.store(true);
+        }
+        return true;
+    }
+
+private:
+    bool holding_{false};
+};
 
 // Objects whose writes may carry inline images: Pods and the workloads that
 // hold a pod template (status and scale subresources do not)
@@ -1553,7 +1596,9 @@ HttpResponse RouteHandler::handle_nodes(const HttpRequest& req, const RouteMatch
             return make_status(400, "BadRequest", "Failed to parse request body: " + err);
         }
         std::string updated_json;
+        WriteTurn turn;
         for (int attempt = 0;; ++attempt) {
+            turn.wait();
             std::string existing_json;
             uint64_t version = 0;
             if (!store_.get_extended(key, existing_json, &version).ok()) {
@@ -1570,7 +1615,7 @@ HttpResponse RouteHandler::handle_nodes(const HttpRequest& req, const RouteMatch
                                                 osal::System::get_unix_time_ms());
             updated_json = target_doc.to_string();
             storage::Status ps = put_if_unchanged(store_, key, updated_json, version);
-            if (retry_update(ps, attempt)) continue;
+            if (turn.retry(ps, attempt)) continue;
             if (!ps.ok()) return store_failure(ps, "nodes", name);
             break;
         }
@@ -1867,7 +1912,9 @@ HttpResponse RouteHandler::handle_pods(const HttpRequest& req, const RouteMatch&
         }
 
         std::string updated_json;
+        WriteTurn turn;
         for (int attempt = 0;; ++attempt) {
+            turn.wait();
             std::string existing_json;
             uint64_t version = 0;
             if (!store_.get_extended(key, existing_json, &version).ok()) {
@@ -1884,7 +1931,7 @@ HttpResponse RouteHandler::handle_pods(const HttpRequest& req, const RouteMatch&
             }
             updated_json = target_doc.to_string();
             storage::Status ps = put_if_unchanged(store_, key, updated_json, version);
-            if (retry_update(ps, attempt)) continue;
+            if (turn.retry(ps, attempt)) continue;
             if (!ps.ok()) return store_failure(ps, "pods", name);
             break;
         }
@@ -1945,7 +1992,9 @@ HttpResponse RouteHandler::handle_pods(const HttpRequest& req, const RouteMatch&
 HttpResponse RouteHandler::delete_pod(const std::string& ns, const std::string& name, const std::string& key, std::string existing_json,
                                       uint64_t existing_version, uint64_t grace) {
     const std::string now = models::now_rfc3339();
+    WriteTurn turn;
     for (int attempt = 0;; ++attempt) {
+        turn.wait();
         models::JsonValue pdoc;
         std::string perr;
         std::string node_name;
@@ -1962,7 +2011,7 @@ HttpResponse RouteHandler::delete_pod(const std::string& ns, const std::string& 
         meta->set("deletionGracePeriodSeconds", jnum(static_cast<double>(grace)));
         std::string updated = pdoc.to_string();
         storage::Status ps = put_if_unchanged(store_, key, updated, existing_version);
-        if (retry_update(ps, attempt)) {
+        if (turn.retry(ps, attempt)) {
             // Written meanwhile (a status update): mark the newer pod
             if (!store_.get_extended(key, existing_json, &existing_version).ok()) {
                 return make_status(404, "NotFound", "pods \"" + name + "\" not found", name, "pods");
