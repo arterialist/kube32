@@ -153,38 +153,59 @@ __attribute__((noinline)) static void rope(float* a, uint32_t n, const float* cs
     }
 }
 
-__attribute__((noinline)) static void attention(uint32_t pos) {
+/* The functions on the path of a compute stay short: wasm3 keeps a native
+ * frame for each operation a function has run until it returns, and a
+ * board without PSRAM gives a call about 22 KB of native stack. */
+
+/* att[t] = q_h . k_t / sqrt(head_size) for t <= pos; returns the largest */
+__attribute__((noinline)) static float scores(uint32_t h, uint32_t pos) {
     const float scale = 1.0f / __builtin_sqrtf((float)g_hs);
-    const uint32_t base = g_l * g_ctx;
+    const uint32_t kh = h / (g_heads / g_kvh), base = g_l * g_ctx;
+    const float* qh = q + h * g_hs;
+    float m = 0.0f;
+    for (uint32_t t = 0; t <= pos; t++) {
+        const int8_t* kt = g_kq + (base + t) * g_kvd + kh * g_hs;
+        float d = 0.0f;
+        for (uint32_t i = 0; i < g_hs; i++) d += qh[i] * (float)kt[i];
+        att[t] = d * g_ks[(base + t) * g_kvh + kh] * scale;
+        if (t == 0 || att[t] > m) m = att[t];
+    }
+    return m;
+}
+
+/* att[0..n) = exp(att - m) / their sum */
+__attribute__((noinline)) static void softmax(uint32_t n, float m) {
+    float sum = 0.0f;
+    for (uint32_t t = 0; t < n; t++) {
+        att[t] = llm_exp(att[t] - m);
+        sum += att[t];
+    }
+    for (uint32_t t = 0; t < n; t++) att[t] = att[t] / sum;
+}
+
+/* head h of xb2 = sum over t <= pos of att[t] v_t */
+__attribute__((noinline)) static void mix(uint32_t h, uint32_t pos) {
+    const uint32_t kh = h / (g_heads / g_kvh), base = g_l * g_ctx;
+    float* o = xb2 + h * g_hs;
+    for (uint32_t i = 0; i < g_hs; i++) o[i] = 0.0f;
+    for (uint32_t t = 0; t <= pos; t++) {
+        const float a = att[t] * g_vs[(base + t) * g_kvh + kh];
+        const int8_t* vt = g_vq + (base + t) * g_kvd + kh * g_hs;
+        for (uint32_t i = 0; i < g_hs; i++) o[i] += a * (float)vt[i];
+    }
+}
+
+__attribute__((noinline)) static void attention(uint32_t pos) {
     for (uint32_t h = 0; h < g_heads; h++) {
-        const uint32_t kh = h / (g_heads / g_kvh);
-        const float* qh = q + h * g_hs;
-        float m = 0.0f, sum = 0.0f;
-        for (uint32_t t = 0; t <= pos; t++) {
-            const int8_t* kt = g_kq + (base + t) * g_kvd + kh * g_hs;
-            float d = 0.0f;
-            for (uint32_t i = 0; i < g_hs; i++) d += qh[i] * (float)kt[i];
-            att[t] = d * g_ks[(base + t) * g_kvh + kh] * scale;
-            if (t == 0 || att[t] > m) m = att[t];
-        }
-        for (uint32_t t = 0; t <= pos; t++) {
-            att[t] = llm_exp(att[t] - m);
-            sum += att[t];
-        }
-        float* o = xb2 + h * g_hs;
-        for (uint32_t i = 0; i < g_hs; i++) o[i] = 0.0f;
-        for (uint32_t t = 0; t <= pos; t++) {
-            const float a = att[t] / sum * g_vs[(base + t) * g_kvh + kh];
-            const int8_t* vt = g_vq + (base + t) * g_kvd + kh * g_hs;
-            for (uint32_t i = 0; i < g_hs; i++) o[i] += a * (float)vt[i];
-        }
+        softmax(pos + 1, scores(h, pos));
+        mix(h, pos);
     }
 }
 
 static void residual(void) { for (uint32_t i = 0; i < g_dim; i++) x[i] += xb[i]; }
 
-/* x += Wo attention(norm(x) Wq, Wk, Wv) */
-__attribute__((noinline)) static void attention_block(uint32_t pos, const float* cs) {
+/* q, k, v of norm(x); k and v into the cache at pos */
+__attribute__((noinline)) static void qkv(uint32_t pos, const float* cs) {
     norm((const float*)g_t[g_l][RMS_ATT]);
     g_xs = quantize(xq, xb, g_dim);
     proj(q, WQ);
@@ -198,10 +219,24 @@ __attribute__((noinline)) static void attention_block(uint32_t pos, const float*
         g_ks[row * g_kvh + h] = quantize(g_kq + row * g_kvd + o, k + o, g_hs);
         g_vs[row * g_kvh + h] = quantize(g_vq + row * g_kvd + o, v + o, g_hs);
     }
+}
+
+/* x += Wo attention(q, k, v) */
+__attribute__((noinline)) static void attention_block(uint32_t pos, const float* cs) {
+    qkv(pos, cs);
     attention(pos);
     g_xs = quantize(xq, xb2, g_dim);
     proj(xb, WO);
     residual();
+}
+
+/* hb = silu(hb) * hb2 */
+__attribute__((noinline)) static void silu(void) {
+    for (uint32_t i = 0; i < g_hidden; i++) {
+        float a = hb[i];
+        a = a * (1.0f / (1.0f + llm_exp(-a)));
+        hb[i] = a * hb2[i];
+    }
 }
 
 /* x += W2 (silu(W1 norm(x)) * W3 norm(x)) */
@@ -210,11 +245,7 @@ __attribute__((noinline)) static void ffn_block(void) {
     g_xs = quantize(xq, xb, g_dim);
     proj(hb, W1);
     proj(hb2, W3);
-    for (uint32_t i = 0; i < g_hidden; i++) {
-        float a = hb[i];
-        a = a * (1.0f / (1.0f + llm_exp(-a)));
-        hb[i] = a * hb2[i];
-    }
+    silu();
     g_xs = quantize(xq, hb, g_hidden);
     proj(xb, W2);
     residual();
@@ -346,10 +377,9 @@ __attribute__((noinline)) static void screen(const struct llm_msg* m) {
 }
 
 /* ---- the pipeline -------------------------------------------------------- */
-/* The oldest queued position through this stage, into the outgoing slot */
-__attribute__((noinline)) static void compute(void) {
+/* x and the rotary coefficients of the oldest queued position */
+__attribute__((noinline)) static struct llm_msg* begin(void) {
     struct llm_msg* m = (struct llm_msg*)(g_queue + g_qhead * g_msg_bytes);
-    const uint32_t t0 = now_us();
     float* f = llm_msg_floats(m);
     if (B->flags & LLM_BLOB_EMBED) {
         for (uint32_t i = 0; i < g_dim; i++) x[i] = (float)g_tok_q[m->token * g_dim + i] * g_tok_s[m->token];
@@ -357,10 +387,12 @@ __attribute__((noinline)) static void compute(void) {
     } else {
         __builtin_memcpy(x, f + g_hs, 4 * g_dim);
     }
-    for (g_l = 0; g_l < g_nl; g_l++) {
-        attention_block(m->pos, f);
-        ffn_block();
-    }
+    return m;
+}
+
+/* The position's output and this stage's trace into the outgoing slot */
+__attribute__((noinline)) static void end(struct llm_msg* m, uint32_t t0) {
+    float* f = llm_msg_floats(m);
     m->rope = g_hs;
     m->dim = g_dim;
     m->next = LLM_NO_TOKEN;
@@ -379,6 +411,17 @@ __attribute__((noinline)) static void compute(void) {
     g_out_pending = 1;
     g_qhead = (g_qhead + 1) % QUEUE;
     g_qcount--;
+}
+
+/* The oldest queued position through this stage */
+__attribute__((noinline)) static void compute(void) {
+    const uint32_t t0 = now_us();
+    struct llm_msg* m = begin();
+    for (g_l = 0; g_l < g_nl; g_l++) {
+        attention_block(m->pos, llm_msg_floats(m));
+        ffn_block();
+    }
+    end(m, t0);
 }
 
 /* The outgoing position to the next stage: 0 to try again later */

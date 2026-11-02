@@ -23,7 +23,7 @@ The model is Andrej Karpathy's [stories260K](https://huggingface.co/karpathy/tin
 
 ### Memory on the Cardputer
 
-A board without PSRAM admits pods on its 80 KiB pool block, counting each pod's linear memory and its Pod Overhead (wasm3's structures, compiled code and value stack). `llm-shard-1` takes 46 KiB of linear memory and 32 KiB of overhead, 78 KiB in all:
+A board without PSRAM admits pods on its 80 KiB pool block, counting each pod's linear memory and its Pod Overhead (wasm3's structures, compiled code and value stack). `llm-shard-1` takes 46 KiB of linear memory and 33 KiB of overhead, 79 KiB in all:
 
 | Part | Bytes |
 | --- | ---: |
@@ -32,7 +32,7 @@ A board without PSRAM admits pods on its 80 KiB pool block, counting each pod's 
 | Activations, the int8 buffer, 3 position slots of 524 B | 4,464 |
 | KV cache: 135 positions at 100 B (unused: 36 B) | 13,536 |
 | Linear memory | 47,104 (46 KiB) |
-| Pod Overhead (`spec.overhead`) | 32 KiB |
+| Pod Overhead (`spec.overhead`) | 33 KiB |
 
 At int8 the layer is 48,288 B, and with its overhead it does not fit the pool. Other pods on the Cardputer, such as an active device driver, leave the stage `Pending`.
 
