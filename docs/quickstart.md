@@ -4,7 +4,13 @@ Run Kube32 on the host simulator or on a two-board ESP32-S3 cluster. Both use th
 
 ## Host simulator
 
-Requirements:
+The container image runs the latest release with no build. It serves the API on port 6443 and the Ingress on port 8080; configure `kubectl` as below:
+
+```sh
+docker run --rm -p 6443:6443 -p 8080:8080 ghcr.io/arterialist/kube32-sim
+```
+
+To build the simulator from source instead, you need:
 
 - `kube32`
 - `kubectl`
@@ -105,6 +111,8 @@ kube32 flash
 ```
 
 `kube32 flash` downloads the firmware of the release that matches the installed `kube32`, checks it against its SHA-256, and writes it over USB with esptool. It finds the board by its USB vendor ID; with several boards connected, pass `--port <serial-port>`. See [Flashing and the serial console](flashing-troubleshooting.md#flashing) for ports, drivers, and flashing a build from source.
+
+The [browser installer](flash.md) writes the latest release instead, with no tools, and sets up each board's Wi-Fi.
 
 ### 2. Provision over the serial console
 

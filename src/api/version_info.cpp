@@ -61,11 +61,14 @@ static std::string json_escape(const std::string& in) {
 std::string version_json() {
     const BuildInfo& b = build_info();
     // goVersion stays empty: nothing here is built with Go. Kubernetes itself
-    // reports empty strings for build fields it was not given.
+    // reports empty strings for build fields it was not given. kube32Version
+    // is the release this build is (the firmware version nodes report);
+    // clients ignore fields they do not know.
     return std::string("{\"major\":\"1\",\"minor\":\"33\",\"gitVersion\":\"") + KUBE32_GIT_VERSION + "\"," +
            "\"gitCommit\":\"" + b.git_commit + "\",\"gitTreeState\":\"" + b.git_tree_state + "\"," +
            "\"buildDate\":\"" + b.build_date + "\",\"goVersion\":\"\"," +
-           "\"compiler\":\"" + json_escape(b.compiler) + "\",\"platform\":\"" + b.os + "/" + b.arch + "\"}";
+           "\"compiler\":\"" + json_escape(b.compiler) + "\",\"platform\":\"" + b.os + "/" + b.arch + "\"," +
+           "\"kube32Version\":\"" + firmware_version() + "\"}";
 }
 
 } // namespace kube32::api

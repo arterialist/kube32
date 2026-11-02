@@ -30,7 +30,8 @@ if(GIT_EXECUTABLE)
 endif()
 string(TIMESTAMP build_date "%Y-%m-%dT%H:%M:%SZ" UTC)
 
-# The firmware version nodes report: $KUBE32_VERSION, or `git describe`
+# The firmware version nodes report: $KUBE32_VERSION, or `git describe`.
+# The "v" of a release tag is dropped: tag v1.2.0 reports 1.2.0.
 set(version "$ENV{KUBE32_VERSION}")
 if(version STREQUAL "" AND GIT_EXECUTABLE)
     execute_process(COMMAND ${GIT_EXECUTABLE} -C ${SOURCE_DIR} describe --tags --always --dirty
@@ -40,6 +41,7 @@ if(version STREQUAL "" AND GIT_EXECUTABLE)
         set(version "")
     endif()
 endif()
+string(REGEX REPLACE "^v([0-9])" "\\1" version "${version}")
 string(REGEX REPLACE "[^A-Za-z0-9._+-]" "" version "${version}")
 string(SUBSTRING "${version}" 0 31 version)
 if(version STREQUAL "")

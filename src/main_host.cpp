@@ -230,7 +230,8 @@ static void print_sim_usage(std::ostream& out) {
            "  --eviction-timeout <ms>     taint a node NoExecute after this long without a heartbeat (default 30000)\n"
            "  --reconcile-interval <ms>   shortest time between controller passes (default 1000)\n"
            "\n"
-           "  -h, --help                  show this help\n";
+           "  -h, --help                  show this help\n"
+           "  --version                   print the kube32 version and exit\n";
 }
 
 static SimOptions parse_sim_args(int argc, char* argv[]) {
@@ -240,6 +241,7 @@ static SimOptions parse_sim_args(int argc, char* argv[]) {
     for (int i = 1; i < argc; ++i) {
         std::string arg = argv[i];
         if (arg == "--help" || arg == "-h") { print_sim_usage(std::cout); std::exit(0); }
+        else if (arg == "--version") { std::cout << kube32::api::firmware_version() << "\n"; std::exit(0); }
         else if (arg == "--role" && i + 1 < argc) { opts.role = argv[++i]; has_role = true; }
         else if (arg == "--node-name" && i + 1 < argc) opts.node_name = argv[++i];
         else if (arg == "--node-id" && i + 1 < argc) opts.node_id = static_cast<uint16_t>(std::stoi(argv[++i]));

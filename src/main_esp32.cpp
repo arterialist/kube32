@@ -52,6 +52,8 @@
 #include "app/pod_checkpoint_api.hpp"
 #include "api/checkpoint_api.hpp"
 #include "app/console_relay.hpp"
+#include "app/improv_serial.hpp"
+#include "api/version_info.hpp"
 #include "api/node_proxy.hpp"
 #include "kubelet/kube_api_client.hpp"
 #include "osal/thread.hpp"
@@ -76,12 +78,14 @@
 #include <functional>
 #include <memory>
 #include <string>
+#include <vector>
 #include <dirent.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
 #include "esp_system.h"
 #include "esp_wifi.h"
+#include "esp_netif.h"
 #include "esp_event.h"
 #include "esp_random.h"
 #include "bootloader_random.h"
@@ -521,9 +525,192 @@ static uint32_t crc32_bytes(const uint8_t* p, size_t n) {
     return ~c;
 }
 
+// Networks in range, at most `max`. The cluster access point alone cannot
+// scan, so the radio adds its station interface first (it stays up, idle). A
+// station still looking for its network refuses to scan: it stops looking
+// for the scan and joins again afterwards.
+static esp_err_t scan_networks(std::vector<wifi_ap_record_t>& out, uint16_t max) {
+    wifi_mode_t mode = WIFI_MODE_NULL;
+    if (esp_wifi_get_mode(&mode) == ESP_OK && mode == WIFI_MODE_AP) esp_wifi_set_mode(WIFI_MODE_APSTA);
+    wifi_scan_config_t sc = {};
+    sc.show_hidden = false;
+    esp_err_t scan = esp_wifi_scan_start(&sc, true);
+    bool rejoin = false;
+    for (int tries = 0; scan == ESP_ERR_WIFI_STATE && tries < 5; ++tries) {
+        kube32::net::hold_station_rejoin(true);
+        esp_wifi_disconnect();
+        rejoin = true;
+        vTaskDelay(pdMS_TO_TICKS(300));
+        scan = esp_wifi_scan_start(&sc, true);
+    }
+    if (scan == ESP_OK) {
+        uint16_t n = 0;
+        esp_wifi_scan_get_ap_num(&n);
+        if (n > max) n = max;
+        // Reading the records, none included, frees the driver's scan list
+        out.resize(n ? n : 1);
+        if (esp_wifi_scan_get_ap_records(&n, out.data()) != ESP_OK) n = 0;
+        out.resize(n);
+    }
+    if (rejoin) {
+        kube32::net::hold_station_rejoin(false);
+        esp_wifi_connect();
+    }
+    return scan;
+}
+
+// The station's address while it is associated, "" otherwise
+static std::string station_ip() {
+    wifi_ap_record_t ap;
+    esp_netif_ip_info_t info;
+    esp_netif_t* nif = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
+    if (esp_wifi_sta_get_ap_info(&ap) != ESP_OK || !nif || esp_netif_get_ip_info(nif, &info) != ESP_OK || info.ip.addr == 0) return "";
+    char buf[16];
+    snprintf(buf, sizeof(buf), IPSTR, IP2STR(&info.ip));
+    return buf;
+}
+
+static std::atomic<uint32_t> s_join_ip{0};
+
+// Joins `ssid` as a station beside the cluster access point and waits up to
+// `timeout_ms` for an address. Returns the address, or "" after putting the
+// station back on the network it had.
+static std::string join_station(const std::string& ssid, const std::string& pass, uint32_t timeout_ms) {
+    wifi_mode_t mode = WIFI_MODE_NULL;
+    esp_wifi_get_mode(&mode);
+    const bool had_station = mode != WIFI_MODE_AP;
+    wifi_config_t before = {};
+    if (had_station) esp_wifi_get_config(WIFI_IF_STA, &before);
+    else esp_wifi_set_mode(WIFI_MODE_APSTA);
+    // The configuration the node's network manager uses: the strongest
+    // access point with that name
+    wifi_config_t cfg = {};
+    std::memcpy(cfg.sta.ssid, ssid.data(), std::min(ssid.size(), sizeof(cfg.sta.ssid)));
+    std::memcpy(cfg.sta.password, pass.data(), std::min(pass.size(), sizeof(cfg.sta.password)));
+    cfg.sta.scan_method = WIFI_ALL_CHANNEL_SCAN;
+    cfg.sta.sort_method = WIFI_CONNECT_AP_BY_SIGNAL;
+    cfg.sta.failure_retry_cnt = 2;
+    // The station takes a configuration once it has left its network
+    auto configure = [](wifi_config_t& c) {
+        kube32::net::hold_station_rejoin(true);
+        esp_wifi_disconnect();
+        for (int i = 0; esp_wifi_set_config(WIFI_IF_STA, &c) == ESP_ERR_WIFI_STATE && i < 30; ++i) vTaskDelay(pdMS_TO_TICKS(100));
+        kube32::net::hold_station_rejoin(false);
+    };
+    esp_event_handler_t got_ip = [](void*, esp_event_base_t, int32_t, void* data) {
+        s_join_ip.store(static_cast<ip_event_got_ip_t*>(data)->ip_info.ip.addr);
+    };
+    s_join_ip.store(0);
+    esp_event_handler_register(IP_EVENT, IP_EVENT_STA_GOT_IP, got_ip, nullptr);
+    configure(cfg);
+    // Joins again after a failed attempt (a station beside the access point
+    // alone is not rejoined by the network manager)
+    for (uint32_t waited = 0; s_join_ip.load() == 0 && waited < timeout_ms; waited += 250) {
+        if (waited % 4000 == 0) esp_wifi_connect();
+        vTaskDelay(pdMS_TO_TICKS(250));
+    }
+    esp_event_handler_unregister(IP_EVENT, IP_EVENT_STA_GOT_IP, got_ip);
+    const uint32_t addr = s_join_ip.load();
+    if (addr != 0) {
+        esp_ip4_addr_t ip = {addr};
+        char buf[16];
+        snprintf(buf, sizeof(buf), IPSTR, IP2STR(&ip));
+        return buf;
+    }
+    if (had_station) {
+        configure(before);
+        esp_wifi_connect();
+    } else {
+        esp_wifi_disconnect();
+    }
+    return "";
+}
+
+void write_nvs_wifi(const std::string& ssid, const std::string& pass) {
+    nvs_handle_t h;
+    if (nvs_open("k32", NVS_READWRITE, &h) != ESP_OK) return;
+    if (ssid.empty()) { nvs_erase_key(h, "wifi_ssid"); nvs_erase_key(h, "wifi_pass"); }
+    else { nvs_set_str(h, "wifi_ssid", ssid.c_str()); nvs_set_str(h, "wifi_pass", pass.c_str()); }
+    nvs_commit(h);
+    nvs_close(h);
+}
+
+// Improv Wi-Fi over the console (include/app/improv_serial.hpp): a browser
+// installer asks for the node's state and information, scans, and sends
+// Wi-Fi credentials. The node joins the network beside its cluster access
+// point, answers with the API server's URL (a control plane), stores the
+// credentials and restarts on that network, as after K32_CMD:WIFI.
+static void improv_send(Console& con, const std::string& packet) {
+    // A client reads a packet only at the start of a line
+    const std::string out = "\n" + packet;
+    con.write(out.data(), out.size());
+}
+
+static void improv_command(Console& con, const NodeIdentity& ident, const std::string& packet) {
+    namespace improv = kube32::app::improv;
+    improv::Rpc rpc;
+    const improv::Error err = improv::parse_rpc(reinterpret_cast<const uint8_t*>(packet.data()), packet.size(), rpc);
+    if (err != improv::kNoError) {
+        improv_send(con, improv::error_packet(err));
+        return;
+    }
+    auto urls = [&ident](const std::string& ip) {
+        return ident.is_control_plane ? std::vector<std::string>{"http://" + ip + ":6443"} : std::vector<std::string>{};
+    };
+    switch (rpc.command) {
+    case improv::kCurrentStateRequest: {
+        // Provisioned: joined to the network the node has credentials for
+        std::string ssid, pass;
+        const std::string ip = read_nvs_wifi(ssid, pass) ? station_ip() : "";
+        improv_send(con, improv::state_packet(ip.empty() ? improv::kReady : improv::kProvisioned));
+        if (!ip.empty()) improv_send(con, improv::rpc_result(improv::kCurrentStateRequest, urls(ip)));
+        break;
+    }
+    case improv::kDeviceInfo:
+        improv_send(con, improv::rpc_result(improv::kDeviceInfo, {"kube32", kube32::api::firmware_version(), "ESP32-S3", ident.name}));
+        break;
+    case improv::kScanNetworks: {
+        // One result per network name, the strongest first; an empty one ends the list
+        std::vector<wifi_ap_record_t> aps;
+        scan_networks(aps, 20);
+        for (size_t i = 0; i < aps.size(); ++i) {
+            const char* name = reinterpret_cast<const char*>(aps[i].ssid);
+            bool seen = !name[0];
+            for (size_t k = 0; k < i && !seen; ++k) seen = std::strcmp(name, reinterpret_cast<const char*>(aps[k].ssid)) == 0;
+            if (seen) continue;
+            improv_send(con, improv::rpc_result(improv::kScanNetworks,
+                                                {name, std::to_string(aps[i].rssi), aps[i].authmode == WIFI_AUTH_OPEN ? "NO" : "YES"}));
+        }
+        improv_send(con, improv::rpc_result(improv::kScanNetworks, {}));
+        break;
+    }
+    case improv::kWifiSettings: {
+        improv_send(con, improv::state_packet(improv::kProvisioning));
+        const std::string ip = join_station(rpc.ssid, rpc.password, 20000);
+        if (ip.empty()) {
+            improv_send(con, improv::error_packet(improv::kUnableToConnect));
+            improv_send(con, improv::state_packet(improv::kReady));
+            break;
+        }
+        write_nvs_wifi(rpc.ssid, rpc.password);
+        improv_send(con, improv::state_packet(improv::kProvisioned));
+        improv_send(con, improv::rpc_result(improv::kWifiSettings, urls(ip)));
+        printf("[NET] joined %s at %s: wifi stored, rebooting\n", rpc.ssid.c_str(), ip.c_str());
+        // The installer shows the address before a restart on the native USB
+        // port drops its connection
+        vTaskDelay(pdMS_TO_TICKS(3000));
+        esp_restart();
+        break;
+    }
+    default:
+        improv_send(con, improv::error_packet(improv::kUnknownRpc));
+    }
+}
+
 // Console protocol (line oriented, binary-safe payloads):
 //   K32_RESET, K32_OPEN, K32_CLOSE: concurrent streamed HTTP (include/app/console_relay.hpp)
 //   K32_HTTP <port> <len> [crc32hex]\n<len bytes of HTTP request> -> K32_RESP <len>\n<bytes>
+//   IMPROV...: Improv Wi-Fi serial packets (include/app/improv_serial.hpp)
 //   A CRC mismatch answers K32_ERR crc so the gateway can resend.
 //   K32_CMD:STATUS                                       -> telemetry line
 //   K32_CMD:STORE                                        -> object store journal figures
@@ -584,6 +771,17 @@ void console_task(void* arg) {
             char c = rx[i];
             if (c != '\n' && c != '\r') {
                 if (line.size() < 512) line.push_back(c);
+                if (line.size() == kube32::app::improv::kHeaderSize && line == kube32::app::improv::kHeader) {
+                    // An Improv packet: binary, its length in the third byte
+                    // after the header
+                    bool fits = true;
+                    std::string packet = line + read_payload(i, n, kube32::app::improv::kPrefixSize - line.size(), fits);
+                    if (packet.size() == kube32::app::improv::kPrefixSize) {
+                        packet += read_payload(i, n, kube32::app::improv::remaining_after_prefix(reinterpret_cast<const uint8_t*>(packet.data())), fits);
+                    }
+                    improv_command(con, ident, packet);
+                    line.clear();
+                }
                 continue;
             }
             if (line.empty()) continue;
@@ -735,13 +933,7 @@ void console_task(void* arg) {
                 size_t sep = rest.find(':');
                 std::string ssid = (sep == std::string::npos) ? rest : rest.substr(0, sep);
                 std::string pass = (sep == std::string::npos) ? "" : rest.substr(sep + 1);
-                nvs_handle_t h;
-                if (nvs_open("k32", NVS_READWRITE, &h) == ESP_OK) {
-                    if (ssid.empty()) { nvs_erase_key(h, "wifi_ssid"); nvs_erase_key(h, "wifi_pass"); }
-                    else { nvs_set_str(h, "wifi_ssid", ssid.c_str()); nvs_set_str(h, "wifi_pass", pass.c_str()); }
-                    nvs_commit(h);
-                    nvs_close(h);
-                }
+                write_nvs_wifi(ssid, pass);
                 con.write("K32_OK wifi stored, rebooting\n", 30);
                 vTaskDelay(pdMS_TO_TICKS(200));
                 esp_restart();
@@ -902,45 +1094,23 @@ void console_task(void* arg) {
                 con.write(l, static_cast<size_t>(ll));
             } else if (line == "K32_CMD:SCAN") {
                 // 2.4 GHz networks as seen by this radio (the only band an ESP32 has)
-                wifi_scan_config_t sc = {};
-                sc.show_hidden = false;
-                // A station still looking for its network refuses to scan: it
-                // stops looking for the scan and joins again afterwards
                 const int64_t scan_t0 = esp_timer_get_time();
-                esp_err_t scan = esp_wifi_scan_start(&sc, true);
-                bool rejoin = false;
-                for (int tries = 0; scan == ESP_ERR_WIFI_STATE && tries < 5; ++tries) {
-                    kube32::net::hold_station_rejoin(true);
-                    esp_wifi_disconnect();
-                    rejoin = true;
-                    vTaskDelay(pdMS_TO_TICKS(300));
-                    scan = esp_wifi_scan_start(&sc, true);
-                }
+                std::vector<wifi_ap_record_t> aps;
+                const esp_err_t scan = scan_networks(aps, 20);
                 if (scan == ESP_OK) {
-                    uint16_t n = 0;
-                    esp_wifi_scan_get_ap_num(&n);
-                    if (n > 20) n = 20;
-                    wifi_ap_record_t* recs = static_cast<wifi_ap_record_t*>(calloc(n ? n : 1, sizeof(wifi_ap_record_t)));
-                    if (recs && esp_wifi_scan_get_ap_records(&n, recs) == ESP_OK) {
-                        for (uint16_t i = 0; i < n; ++i) {
-                            char l[96];
-                            int ll = snprintf(l, sizeof(l), "K32_AP ssid=\"%s\" rssi=%d ch=%u auth=%d\n", (const char*)recs[i].ssid, recs[i].rssi, recs[i].primary, (int)recs[i].authmode);
-                            con.write(l, static_cast<size_t>(ll));
-                        }
+                    for (const wifi_ap_record_t& ap : aps) {
+                        char l[96];
+                        int ll = snprintf(l, sizeof(l), "K32_AP ssid=\"%s\" rssi=%d ch=%u auth=%d\n", (const char*)ap.ssid, ap.rssi, ap.primary, (int)ap.authmode);
+                        con.write(l, static_cast<size_t>(ll));
                     }
-                    free(recs);
                     char l[64];
-                    int ll = snprintf(l, sizeof(l), "K32_OK scan done: %u networks in %u ms\n", (unsigned)n,
+                    int ll = snprintf(l, sizeof(l), "K32_OK scan done: %u networks in %u ms\n", (unsigned)aps.size(),
                                       (unsigned)((esp_timer_get_time() - scan_t0) / 1000));
                     con.write(l, static_cast<size_t>(ll));
                 } else {
                     char l[64];
                     int ll = snprintf(l, sizeof(l), "K32_ERR scan failed: %s\n", esp_err_to_name(scan));
                     con.write(l, static_cast<size_t>(ll));
-                }
-                if (rejoin) {
-                    kube32::net::hold_station_rejoin(false);
-                    esp_wifi_connect();
                 }
             } else if (line == "K32_CMD:REBOOT") {
                 con.write("K32_OK rebooting\n", 17);

@@ -35,8 +35,11 @@ def newest_input_mtime():
 gen_dir = os.path.join(env.subst("$BUILD_DIR"), "generated")
 header = os.path.join(gen_dir, "kube32_build_info.h")
 os.makedirs(gen_dir, exist_ok=True)
-# The firmware version nodes report: $KUBE32_VERSION, or `git describe`
+# The firmware version nodes report: $KUBE32_VERSION, or `git describe`.
+# The "v" of a release tag is dropped: tag v1.2.0 reports 1.2.0.
 version = os.environ.get("KUBE32_VERSION") or git("describe", "--tags", "--always", "--dirty") or "unknown"
+if len(version) > 1 and version[0] == "v" and version[1].isdigit():
+    version = version[1:]
 version_line = '#define KUBE32_FIRMWARE_VERSION "%s"\n' % "".join(c for c in version if c.isalnum() or c in "._+-")[:31]
 try:
     with open(header) as f:

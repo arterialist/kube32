@@ -182,6 +182,7 @@ else()
         src/app/node_storage_api.cpp
         src/app/pod_checkpoint_api.cpp
         src/app/console_relay.cpp
+        src/app/improv_serial.cpp
         src/kubelet/node_status_reporter.cpp
         src/kubelet/metrics_provider.cpp
         src/kubelet/kube_api_client.cpp
@@ -592,6 +593,11 @@ else()
     )
     target_link_libraries(test_console_relay PRIVATE kube32_core)
     add_test(NAME test_console_relay COMMAND test_console_relay)
+
+    # Improv Wi-Fi packets on the serial console (browser installers)
+    add_executable(test_improv_serial tests/test_improv_serial.cpp)
+    target_link_libraries(test_improv_serial PRIVATE kube32_core)
+    add_test(NAME test_improv_serial COMMAND test_improv_serial)
 
     # Firmware rollouts: staging over HTTP, the rollout controller, the
     # kubelet's update agent and the slots' rollback state machine

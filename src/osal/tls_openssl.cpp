@@ -11,6 +11,7 @@
 
 #include <cerrno>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <string>
 #include <vector>
@@ -167,6 +168,16 @@ std::unique_ptr<TlsClient> TlsClient::create(const std::string& extra_roots_pem,
     // reports it); the HTTP framing tells whether the answer was complete
     SSL_CTX_set_options(impl.ctx, SSL_OP_IGNORE_UNEXPECTED_EOF);
     SSL_CTX_set_default_verify_paths(impl.ctx);
+    // A statically linked simulator carries the OpenSSL directory of the
+    // machine that built it, so it also reads the system's CA bundle where
+    // Linux distributions and macOS keep it ($SSL_CERT_FILE takes precedence)
+    if (!std::getenv("SSL_CERT_FILE")) {
+        for (const char* bundle : {"/etc/ssl/certs/ca-certificates.crt", "/etc/pki/tls/certs/ca-bundle.crt",
+                                   "/etc/ssl/ca-bundle.pem", "/etc/ssl/cert.pem"}) {
+            if (SSL_CTX_load_verify_locations(impl.ctx, bundle, nullptr) == 1) break;
+        }
+        ERR_clear_error();   // the bundles that are not there
+    }
     if (!extra_roots_pem.empty()) {
         BIO* bio = BIO_new_mem_buf(extra_roots_pem.data(), static_cast<int>(extra_roots_pem.size()));
         X509_STORE* store = SSL_CTX_get_cert_store(impl.ctx);

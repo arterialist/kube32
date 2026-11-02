@@ -2,9 +2,18 @@
 name = "kube32-sdk"
 version = "0.1.0"
 edition = "2021"
-description = "no_std Rust bindings for the Kube32 WebAssembly pod ABI (include/runtime/k32_app_abi.h)"
+description = "no_std Rust bindings for the kube32 WebAssembly pod ABI"
 license = "Apache-2.0"
-publish = false
+repository = "https://github.com/arterialist/kube32"
+homepage = "https://arterialist.github.io/kube32/"
+documentation = "https://docs.rs/kube32-sdk"
+readme = "README.md"
+keywords = ["kube32", "wasm", "esp32", "kubernetes", "no-std"]
+categories = ["wasm", "embedded", "no-std", "api-bindings"]
+
+# docs.rs documents the hardware and fs modules too
+[package.metadata.docs.rs]
+all-features = true
 
 [lib]
 crate-type = ["rlib"]

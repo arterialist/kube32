@@ -1,0 +1,376 @@
+name: Release
+
+# A tag vX.Y.Z releases kube32 X.Y.Z: the GitHub Release with the firmware,
+# simulator and C SDK assets, the container image ghcr.io/<owner>/kube32-sim
+# and the kube32-sdk crate. Nothing is published until every asset has built.
+#
+# workflow_dispatch builds the same assets. With dry-run (the default) it
+# publishes nothing and keeps them as the workflow artifact release-dry-run;
+# on a tag with dry-run off it publishes, which re-runs a release.
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      dry-run:
+        description: Build everything and keep the assets as workflow artifacts; publish nothing
+        type: boolean
+        default: true
+      version:
+        description: Version to build when the ref is a branch (X.Y.Z)
+        type: string
+        default: 0.0.0-dev
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  RUST_TOOLCHAIN: "1.96.0"
+  PLATFORMIO_VERSION: "6.1.18"
+  ESPTOOL_VERSION: "5.4.0"
+  # The oldest macOS the simulator runs on
+  MACOSX_DEPLOYMENT_TARGET: "13.0"
+
+jobs:
+  version:
+    name: Version and release notes
+    runs-on: ubuntu-24.04
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      publish: ${{ steps.version.outputs.publish }}
+      prerelease: ${{ steps.version.outputs.prerelease }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Version from the tag
+        id: version
+        env:
+          EVENT: ${{ github.event_name }}
+          REF_TYPE: ${{ github.ref_type }}
+          REF_NAME: ${{ github.ref_name }}
+          DRY_RUN: ${{ inputs.dry-run }}
+          INPUT_VERSION: ${{ inputs.version }}
+        run: |
+          if [ "$REF_TYPE" = tag ]; then
+            version="${REF_NAME#v}"
+          else
+            version="$INPUT_VERSION"
+          fi
+          if ! printf '%s' "$version" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$'; then
+            echo "::error::'$version' is not a release version X.Y.Z (tags are vX.Y.Z)"
+            exit 1
+          fi
+          publish=false
+          if [ "$REF_TYPE" = tag ] && { [ "$EVENT" = push ] || [ "$DRY_RUN" = false ]; }; then
+            publish=true
+          fi
+          prerelease=false
+          case "$version" in *-*) prerelease=true ;; esac
+          {
+            echo "version=$version"
+            echo "publish=$publish"
+            echo "prerelease=$prerelease"
+          } >> "$GITHUB_OUTPUT"
+          echo "kube32 $version: publish $publish, prerelease $prerelease" >> "$GITHUB_STEP_SUMMARY"
+      - name: Release notes from CHANGELOG.md
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+          PUBLISH: ${{ steps.version.outputs.publish }}
+        run: |
+          if [ "$PUBLISH" = true ]; then
+            python3 scripts/release/release-notes.py "$VERSION" > release-notes.md
+          else
+            python3 scripts/release/release-notes.py "$VERSION" --fallback-unreleased > release-notes.md
+          fi
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: release-notes
+          path: release-notes.md
+          if-no-files-found: error
+
+  firmware:
+    name: Firmware (esp32s3)
+    needs: version
+    runs-on: ubuntu-24.04
+    env:
+      VERSION: ${{ needs.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.platformio
+          key: platformio-${{ runner.os }}-${{ hashFiles('platformio.ini') }}
+      - name: Install PlatformIO and esptool
+        run: pip install "platformio==$PLATFORMIO_VERSION" "esptool==$ESPTOOL_VERSION"
+      - name: pio run -e esp32s3
+        env:
+          KUBE32_VERSION: ${{ needs.version.outputs.version }}
+        run: pio run -e esp32s3
+      - name: Merged image, parts, flash.json, manifest and checksums
+        run: python scripts/release/package-firmware.py --version "$VERSION" --out dist
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: firmware
+          path: dist/
+          if-no-files-found: error
+
+  sim:
+    name: Simulator (${{ matrix.platform }})
+    needs: version
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        include:
+          # macOS: one runner builds both architectures against a static
+          # OpenSSL; Rosetta runs the x86_64 binary for its check
+          - { platform: macos-arm64, os: macos-15, arch: arm64 }
+          - { platform: macos-x86_64, os: macos-15, arch: x86_64, launch: arch -x86_64 }
+          # Linux: the Dockerfile's static musl build, on native runners
+          - { platform: linux-x86_64, os: ubuntu-24.04, arch: amd64 }
+          - { platform: linux-arm64, os: ubuntu-24.04-arm, arch: arm64 }
+    env:
+      VERSION: ${{ needs.version.outputs.version }}
+      ARCHIVE: kube32-sim-${{ needs.version.outputs.version }}-${{ matrix.platform }}.tar.gz
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Static OpenSSL (cached)
+        if: runner.os == 'macOS'
+        id: openssl
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/openssl-${{ matrix.arch }}
+          key: openssl-macos-${{ matrix.arch }}-${{ env.MACOSX_DEPLOYMENT_TARGET }}-${{ hashFiles('scripts/release/build-openssl-macos.sh') }}
+      - name: Build OpenSSL
+        if: runner.os == 'macOS' && steps.openssl.outputs.cache-hit != 'true'
+        run: scripts/release/build-openssl-macos.sh "${{ matrix.arch }}" "$HOME/openssl-${{ matrix.arch }}"
+      - name: Build kube32-sim (macOS)
+        if: runner.os == 'macOS'
+        env:
+          KUBE32_VERSION: ${{ needs.version.outputs.version }}
+        run: |
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_OSX_ARCHITECTURES="${{ matrix.arch }}" -DCMAKE_OSX_DEPLOYMENT_TARGET="$MACOSX_DEPLOYMENT_TARGET" \
+            -DOPENSSL_USE_STATIC_LIBS=TRUE -DOPENSSL_ROOT_DIR="$HOME/openssl-${{ matrix.arch }}"
+          cmake --build build --parallel 4 --target kube32-sim
+          mkdir -p out
+          strip -o out/kube32-sim build/kube32-sim
+          otool -L out/kube32-sim
+          # Only the system's libraries
+          if otool -L out/kube32-sim | tail -n +2 | grep -Ev '^[[:space:]]+(/usr/lib/|/System/)'; then exit 1; fi
+      - name: Build kube32-sim (Linux, static)
+        if: runner.os == 'Linux'
+        run: |
+          docker buildx build --platform "linux/${{ matrix.arch }}" --build-arg "KUBE32_VERSION=$VERSION" \
+            --target sim-binary --output type=local,dest=build-out .
+          mkdir -p out
+          cp "build-out/linux-${{ matrix.arch }}/kube32-sim" out/
+          file out/kube32-sim
+          file out/kube32-sim | grep -q 'statically linked'
+      - name: Check the binary
+        run: |
+          if [ -n "${{ matrix.launch }}" ] && ! ${{ matrix.launch }} /usr/bin/true 2> /dev/null; then
+            echo "::warning::this runner cannot start ${{ matrix.platform }} binaries; checked the architecture only"
+            lipo -info out/kube32-sim | grep -q "${{ matrix.arch }}"
+            exit 0
+          fi
+          test "$(${{ matrix.launch }} out/kube32-sim --version)" = "$VERSION"
+          scripts/release/smoke-sim.sh "$VERSION" ${{ matrix.launch }} out/kube32-sim \
+            --workers "" --pod-port 17000 --data-dir "$RUNNER_TEMP/sim"
+      - name: Archive
+        run: |
+          cp LICENSE out/LICENSE
+          cp third_party/wasm3/LICENSE out/LICENSE.wasm3
+          flags=()
+          if [ "$RUNNER_OS" = macOS ]; then flags+=(--no-mac-metadata); fi
+          tar "${flags[@]}" -C out -czf "$ARCHIVE" kube32-sim LICENSE LICENSE.wasm3
+          shasum -a 256 "$ARCHIVE" > "$ARCHIVE.sha256"
+          cat "$ARCHIVE.sha256"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: sim-${{ matrix.platform }}
+          path: |
+            ${{ env.ARCHIVE }}
+            ${{ env.ARCHIVE }}.sha256
+          if-no-files-found: error
+
+  c-sdk:
+    name: C SDK
+    needs: version
+    runs-on: ubuntu-24.04
+    env:
+      VERSION: ${{ needs.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install clang and wasm-ld
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends clang lld
+      - name: Package
+        run: scripts/release/package-c-sdk.sh "$VERSION" dist
+      - name: Build the example app from the archive
+        run: |
+          tar -xzf "dist/kube32-c-sdk-$VERSION.tar.gz" -C "$RUNNER_TEMP"
+          make -C "$RUNNER_TEMP/kube32-c-sdk-$VERSION"
+          python3 tools/kube32-cli check "$RUNNER_TEMP/kube32-c-sdk-$VERSION/build/hello.wasm"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: c-sdk
+          path: dist/
+          if-no-files-found: error
+
+  container:
+    name: Container image
+    needs: [version, firmware, sim, c-sdk]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: write
+    env:
+      VERSION: ${{ needs.version.outputs.version }}
+      PUBLISH: ${{ needs.version.outputs.publish }}
+      PRERELEASE: ${{ needs.version.outputs.prerelease }}
+      IMAGE: ghcr.io/${{ github.repository_owner }}/kube32-sim
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: sim-linux-*
+          path: sims
+          merge-multiple: true
+      # The image holds the released Linux binaries, by Docker platform
+      - name: Linux binaries
+        run: |
+          for pair in x86_64:amd64 arm64:arm64; do
+            mkdir -p "prebuilt/linux-${pair#*:}"
+            tar -xzf "sims/kube32-sim-$VERSION-linux-${pair%%:*}.tar.gz" -C "prebuilt/linux-${pair#*:}" kube32-sim
+          done
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      - name: Check the linux/amd64 image
+        run: |
+          docker buildx build --platform linux/amd64 --build-context sim-binary=prebuilt --load -t kube32-sim:check .
+          scripts/release/smoke-sim.sh "$VERSION" docker run --rm -p 6443:6443 kube32-sim:check
+      - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        if: needs.version.outputs.publish == 'true'
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Build linux/amd64 and linux/arm64
+        run: |
+          tags=(--tag "$IMAGE:$VERSION")
+          if [ "$PRERELEASE" != true ]; then tags+=(--tag "$IMAGE:latest"); fi
+          output=(--output "type=image,push=false")
+          if [ "$PUBLISH" = true ]; then output=(--push); fi
+          docker buildx build --platform linux/amd64,linux/arm64 --build-context sim-binary=prebuilt \
+            --label "org.opencontainers.image.version=$VERSION" --label "org.opencontainers.image.revision=$GITHUB_SHA" \
+            --annotation "index:org.opencontainers.image.source=https://github.com/$GITHUB_REPOSITORY" \
+            --annotation "index:org.opencontainers.image.description=kube32 host simulator" \
+            --annotation "index:org.opencontainers.image.licenses=Apache-2.0" \
+            "${tags[@]}" "${output[@]}" .
+          echo "$IMAGE:$VERSION (pushed: $PUBLISH)" >> "$GITHUB_STEP_SUMMARY"
+
+  crate:
+    name: Rust crate (kube32-sdk)
+    needs: [version, firmware, sim, c-sdk]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      id-token: write   # crates.io trusted publishing
+    env:
+      VERSION: ${{ needs.version.outputs.version }}
+      PUBLISH: ${{ needs.version.outputs.publish }}
+      HAS_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN != '' }}
+    defaults:
+      run:
+        working-directory: sdk/rust
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install Rust ${{ env.RUST_TOOLCHAIN }} with the wasm32 target
+        run: |
+          rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal --target wasm32-unknown-unknown
+          rustup default "$RUST_TOOLCHAIN"
+      - name: Crate version from the tag
+        run: |
+          sed -i "0,/^version = .*/s//version = \"$VERSION\"/" kube32-sdk/Cargo.toml
+          grep -m1 '^version = ' kube32-sdk/Cargo.toml
+      - name: cargo package
+        run: cargo package -p kube32-sdk --allow-dirty
+      - name: Already on crates.io
+        id: published
+        run: |
+          if curl -sf -A "kube32-release (github.com/$GITHUB_REPOSITORY)" "https://crates.io/api/v1/crates/kube32-sdk/$VERSION" > /dev/null; then
+            echo "kube32-sdk $VERSION is on crates.io already"
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+          fi
+      # Trusted publishing when no CARGO_REGISTRY_TOKEN secret is set
+      - name: crates.io token
+        id: auth
+        if: env.PUBLISH == 'true' && env.HAS_TOKEN != 'true' && steps.published.outputs.exists != 'true'
+        uses: rust-lang/crates-io-auth-action@c6f97d42243bad5fab37ca0427f495c86d5b1a18 # v1.0.5
+      - name: cargo publish
+        if: env.PUBLISH == 'true' && steps.published.outputs.exists != 'true'
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN || steps.auth.outputs.token }}
+        run: cargo publish -p kube32-sdk --allow-dirty
+      - name: cargo publish --dry-run
+        if: env.PUBLISH != 'true'
+        run: cargo publish -p kube32-sdk --allow-dirty --dry-run
+
+  release:
+    name: GitHub Release
+    needs: [version, firmware, sim, c-sdk, container, crate]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+      actions: write   # starts the docs workflow
+    env:
+      VERSION: ${{ needs.version.outputs.version }}
+      PUBLISH: ${{ needs.version.outputs.publish }}
+      PRERELEASE: ${{ needs.version.outputs.prerelease }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Check the assets
+        run: |
+          mv dist/release-notes.md .
+          cd dist
+          for f in "kube32-firmware-esp32s3-$VERSION"{,-bootloader,-partitions,-otadata,-app}.bin \
+                   "kube32-firmware-esp32s3-$VERSION-flash.json" manifest.json "kube32-c-sdk-$VERSION.tar.gz" \
+                   "kube32-sim-$VERSION"-{macos-arm64,macos-x86_64,linux-x86_64,linux-arm64}.tar.gz; do
+            test -f "$f" || { echo "::error::missing $f"; exit 1; }
+          done
+          sha256sum -c ./*.sha256
+          ls -l
+      - name: Create the release
+        if: env.PUBLISH == 'true'
+        run: |
+          tag="v$VERSION"
+          if gh release view "$tag" > /dev/null 2>&1; then
+            gh release upload "$tag" dist/* --clobber
+          else
+            flags=()
+            if [ "$PRERELEASE" = true ]; then flags+=(--prerelease); fi
+            gh release create "$tag" dist/* --verify-tag --title "kube32 $VERSION" --notes-file release-notes.md "${flags[@]}"
+          fi
+      # The docs site serves the latest release's firmware to the browser installer
+      - name: Update the docs site
+        if: env.PUBLISH == 'true' && env.PRERELEASE != 'true'
+        run: gh workflow run docs.yaml --repo "$GITHUB_REPOSITORY" --ref "${{ github.event.repository.default_branch }}"
+      - name: Keep the assets
+        if: env.PUBLISH != 'true'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: release-dry-run
+          path: |
+            dist/
+            release-notes.md
+          if-no-files-found: error
