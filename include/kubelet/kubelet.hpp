@@ -131,7 +131,7 @@ struct KubeletConfig {
     // Pods a sync pass starts at most (0: all that are due). Each start holds
     // the pod's manifest and its parsed form until the pass ends; on a board
     // without PSRAM one at a time keeps that peak small, the rest start on
-    // the next passes.
+    // the next passes, which follow at once.
     uint32_t max_starts_per_sync{0};
     // Workers enforce NetworkPolicy egress on their pods' calls with this
     // view (null: none kept here). Each pod sync records the labels of the

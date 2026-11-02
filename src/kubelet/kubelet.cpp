@@ -666,6 +666,7 @@ void Kubelet::sync_assigned_pods() {
         std::string manifest;
     };
     std::vector<PodStart> starts;
+    bool deferred_start = false;
     std::vector<std::pair<std::string, std::string>> terminating;   // (ns, name), deletionTimestamp set
     char key_buf[320];
     net::NodeNetworkPolicies* policies = config_.network_policies.get();
@@ -715,8 +716,13 @@ void Kubelet::sync_assigned_pods() {
         }
         if (start && (config_.max_starts_per_sync == 0 || starts.size() < config_.max_starts_per_sync)) {
             starts.push_back(PodStart{e.pod ? *e.pod : models::parse_pod_manifest(std::string(e.manifest)), std::string(e.manifest)});
+        } else if (start) {
+            deferred_start = true;
         }
     });
+    // Pods left for the next pass start on the next loop turn, not after
+    // sync_frequency_ms: one at a time, without the wait in between
+    if (deferred_start) sync_due_.store(true);
     if (!listed) {
         return;
     }

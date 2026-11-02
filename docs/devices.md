@@ -151,10 +151,10 @@ When a Service has no ready driver, a call to it waits:
 
 1. The caller reports the use, and the Device controller makes a pass at once.
 2. The controller creates the driver pod on the Device's node, and the scheduler binds it in the same pass.
-3. The node's kubelet loads the driver, about 100 ms on a board, and reports the pod `Running`.
+3. The control plane tells the node's kubelet over the channel fabric, and the kubelet lists its pods at once. It loads the driver (about 100 ms on a board) and reports the pod `Running`. Each start also writes the pod's status and its events to the API server, about 2 seconds on a board over Wi-Fi. A board without PSRAM starts its pods one after another.
 4. The caller sees the endpoint (it checks every 200 ms) and makes the call. A driver answers `503` until its first reading; the call that started the driver asks again every 100 ms until the driver has one.
 
-The first call thus takes the driver's start plus its first reading, typically 0.5 to 1.5 seconds. Later calls do not wait. A call waits at most 10 seconds and never longer than its own timeout. When the driver does not start in time, `k32_http_call` returns `503` with `{"device":"<device>","ok":false,"error":"the driver of Device <device> did not start within <ms> ms (<why>)"}`, and the Ingress controller answers `503 {"error":"unavailable",...}` with `Retry-After: 2`.
+The first call thus takes the driver's start plus its first reading: about 2 seconds for one driver on a board, and about 2 seconds more for each further driver that starts on the same board at the same time (three drivers on a Cardputer: about 6 seconds). Later calls do not wait. A call waits at most 10 seconds and never longer than its own timeout. When the driver does not start in time, `k32_http_call` returns `503` with `{"device":"<device>","ok":false,"error":"the driver of Device <device> did not start within <ms> ms (<why>)"}`, and the Ingress controller answers `503 {"error":"unavailable",...}` with `Retry-After: 2`.
 
 On a node with a shared interpreter stack (every board), a pod that calls a Device's Service holds that stack until the call returns, and a driver needs it to start. Such a caller therefore does not wait for a driver that starts on its own node: it reports the use and gets `503` with `the driver of Device <device> starts on this node once this call returns: call again` at once. The driver starts after the call, and the next call reads it.
 
