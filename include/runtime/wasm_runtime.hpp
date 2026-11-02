@@ -154,17 +154,22 @@ enum class EstimateSizes { Board, ThisBuild, BoardHeld };
 // `stack_from_module` what the module's call chains need, `stack_bytes` at
 // most. `wasm` may be null when only the size is known.
 // `out_linear`, when given, receives the linear memory part of the estimate.
+// `module_held`: the module is not memory mapped (an image from the card or
+// the API server, or decoded from an annotation), so the pod holds its
+// bytes in its memory, and they count too.
 size_t estimate_pod_memory(const uint8_t* wasm, size_t len, uint32_t memory_limit_bytes, uint32_t stack_bytes,
                            bool stack_from_module = false, EstimateSizes sizes = EstimateSizes::Board,
-                           size_t* out_linear = nullptr);
+                           size_t* out_linear = nullptr, bool module_held = false);
 
 // Pod Overhead admission: sets spec.overhead.memory of a pod (`pod` is the
 // whole object, or a pod template with metadata and spec) to what the
 // runtime needs beyond its containers' linear memory: wasm3's structures,
 // the compiled code and the operand stack, estimated from each container's
 // image (an embedded image, or kube32.io/wasm-size for one in the image
-// store) with board sizes. The scheduler adds it to the pod's requests, as
-// Kubernetes does with a RuntimeClass's overhead. Returns the overhead.
+// store) with board sizes, and the module's bytes for an image in the image
+// store, which the pod holds in its memory. The scheduler adds it to the
+// pod's requests, as Kubernetes does with a RuntimeClass's overhead.
+// Returns the overhead.
 size_t set_pod_overhead(models::JsonValue& pod);
 
 // The operand stack a compiled module can need at most: the deepest chain of

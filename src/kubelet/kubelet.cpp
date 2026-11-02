@@ -998,6 +998,7 @@ bool Kubelet::deploy_and_start_pod(const models::KubePod& pod_in, const std::str
     {
         const uint8_t* module = nullptr;
         size_t module_len = 0;
+        bool module_held = true;   // read into pod memory, unless embedded (mapped from flash)
         std::string sd_name, sd_tag;
         if (runtime::parse_sd_image_ref(pod.image, sd_name, sd_tag)) {
             struct stat st;
@@ -1008,6 +1009,7 @@ bool Kubelet::deploy_and_start_pod(const models::KubePod& pod_in, const std::str
         } else if (const runtime::EmbeddedImage* img = runtime::ImageRegistry::instance().resolve(pod.image, nullptr)) {
             module = img->data;
             module_len = img->len;
+            module_held = false;
         } else if (auto ann = pod.annotations.find("kube32.io/wasm-base64"); ann != pod.annotations.end()) {
             module_len = ann->second.size() / 4 * 3;   // empty in pod lists: then only the rest is estimated
         } else if (auto size = pod.annotations.find("kube32.io/wasm-size");
@@ -1016,7 +1018,7 @@ bool Kubelet::deploy_and_start_pod(const models::KubePod& pod_in, const std::str
         }
         size_t linear = 0;
         const size_t need = runtime::estimate_pod_memory(module, module_len, rec.memory_limit_bytes, wasm_stack, !wasm_stack_set,
-                                                         runtime::EstimateSizes::Board, &linear);
+                                                         runtime::EstimateSizes::Board, &linear, module_held);
         size_t capacity = 0;
         const size_t room = kube32_pool_pod_room(rec.memory_limit_bytes, &capacity);
         const size_t linear_max = kube32_pool_linear_max();

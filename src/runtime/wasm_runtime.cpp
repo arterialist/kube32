@@ -483,7 +483,7 @@ Wasm3Sizes this_build_sizes() {
 } // namespace
 
 size_t estimate_pod_memory(const uint8_t* wasm, size_t len, uint32_t memory_limit_bytes, uint32_t stack_bytes, bool stack_from_module,
-                           EstimateSizes which, size_t* out_linear) {
+                           EstimateSizes which, size_t* out_linear, bool module_held) {
     const Wasm3Sizes z = which == EstimateSizes::ThisBuild ? this_build_sizes() : kBoardSizes;
     const bool held_only = which == EstimateSizes::BoardHeld;
     // What the module declares: its function types, imports, functions,
@@ -589,6 +589,9 @@ size_t estimate_pod_memory(const uint8_t* wasm, size_t len, uint32_t memory_limi
     need += code_bytes + pages * pool_chunk(z.page_header);
     need += pool_chunk(linear + z.memory_header) + pool_chunk(stack_bytes + 4 * z.slot);
     need += 256;                                                 // data and element segments, globals, a table
+    // The module's bytes, which wasm3 reads in place for the module's
+    // lifetime, unless they are memory mapped from flash
+    if (module_held && len > 0) need += pool_chunk(len);
     // The compiler's scratch while the module loads, unless it is lent
     if (!held_only && !compile_scratch_lent()) need += pool_chunk(z.scratch);
     // The pod's log ring, environment and registration, unless the pods of
@@ -631,19 +634,27 @@ size_t set_pod_overhead(models::JsonValue& pod) {
             const uint64_t n = models::parse_quantity(v);
             if (n >= 512 && n <= 64 * 1024) { stack = static_cast<uint32_t>(n); stack_set = true; }
         }
+        // The image as the kubelet resolves it: an embedded one is mapped
+        // from flash, the module of one in the image store is pod memory
         const uint8_t* module = nullptr;
         size_t module_len = 0;
-        if (const EmbeddedImage* img = ImageRegistry::instance().resolve(c.get_string("image", ""), nullptr)) {
+        bool held = false;
+        const std::string image = c.get_string("image", "");
+        std::string sd_name, sd_tag;
+        if (parse_sd_image_ref(image, sd_name, sd_tag)) {
+            continue;   // on a node's card, which this node cannot see: the kubelet's admission counts it
+        } else if (const EmbeddedImage* img = ImageRegistry::instance().resolve(image, nullptr)) {
             module = img->data;
             module_len = img->len;
         } else if (const std::string size = annotation("kube32.io/wasm-size"); !size.empty()) {
             module_len = static_cast<size_t>(models::parse_quantity(size));
+            held = true;
         } else {
-            continue;   // an image this node cannot see (on a worker's SD card): the kubelet's admission counts it
+            continue;   // an image this node cannot see: the kubelet's admission counts it
         }
         size_t linear = 0;
         const size_t need = estimate_pod_memory(module, module_len, static_cast<uint32_t>(std::min<uint64_t>(mem, UINT32_MAX)), stack, !stack_set,
-                                                EstimateSizes::BoardHeld, &linear);
+                                                EstimateSizes::BoardHeld, &linear, held);
         if (need > linear) overhead += need - linear;
     }
     if (overhead == 0) {

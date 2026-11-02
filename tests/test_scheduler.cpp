@@ -467,17 +467,28 @@ void test_pod_overhead() {
     ResourceSpec req = extract_pod_resource_requests(pod.to_string());
     assert(req.memory_bytes == 16 * 1024 + got && req.psram_bytes == 1280 * 1024);
 
-    // An image in the control plane's image store: estimated from its size
+    // An image in the control plane's image store: estimated from its size.
+    // The kubelet reads the module into the pod's memory, where it stays for
+    // the module's lifetime (an embedded image is mapped from flash), so the
+    // overhead counts its bytes: 20,000 in one 8-byte aligned chunk of the
+    // pool block with its 8-byte header. The kubelet's estimate (board
+    // sizes, with the compiler's scratch) counts the same bytes.
     pod = parse(R"({"metadata":{"name":"s","annotations":{"kube32.io/wasm-size":"20000","kube32.io/wasm-sha256":"ab"}},)"
                 R"("spec":{"containers":[{"name":"c","image":"registry.local/s:1"}]}})");
-    need = kube32::runtime::estimate_pod_memory(nullptr, 20000, 64 * 1024, 4 * 1024, true, kube32::runtime::EstimateSizes::BoardHeld, &linear);
+    need = kube32::runtime::estimate_pod_memory(nullptr, 20000, 64 * 1024, 4 * 1024, true, kube32::runtime::EstimateSizes::BoardHeld, &linear, true);
+    assert(need == kube32::runtime::estimate_pod_memory(nullptr, 20000, 64 * 1024, 4 * 1024, true, kube32::runtime::EstimateSizes::BoardHeld) + 20008);
+    assert(kube32::runtime::estimate_pod_memory(nullptr, 20000, 64 * 1024, 4 * 1024, true, kube32::runtime::EstimateSizes::Board, nullptr, true) ==
+           kube32::runtime::estimate_pod_memory(nullptr, 20000, 64 * 1024, 4 * 1024, true, kube32::runtime::EstimateSizes::Board) + 20008);
     assert(kube32::runtime::set_pod_overhead(pod) == kib_up(need - linear));
 
     // An image this node cannot see (a worker's card): no overhead, and a
-    // stale one is taken away
+    // stale one is taken away. A card image named like an embedded one is
+    // the card's: the kubelet reads it from there
     pod = parse(R"({"metadata":{"name":"x"},"spec":{"overhead":{"memory":"99Ki"},"containers":[{"name":"c","image":"sd://x:1"}]}})");
     assert(kube32::runtime::set_pod_overhead(pod) == 0 && !pod.get("spec")->get("overhead"));
     assert(extract_pod_resource_requests(pod.to_string()).memory_bytes == 64 * 1024);
+    pod = parse(R"({"metadata":{"name":"e"},"spec":{"containers":[{"name":"c","image":"wasm://sd/echo"}]}})");
+    assert(kube32::runtime::set_pod_overhead(pod) == 0);
     std::cout << "[PASS] test_pod_overhead" << std::endl;
 }
 
