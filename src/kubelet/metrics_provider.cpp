@@ -30,25 +30,12 @@ bool sample_pod_from_runtime(const std::string& pod_key, runtime::Runtime& rt, P
     runtime::ContainerStatus st = rt.get_status(pod_key);
     if (st.phase == runtime::ContainerPhase::Terminated && st.exit_message == "Pod not found") return false;
     out = PodResourceSample{};
-    if (st.memory_used_bytes > 0) {
-        // Linear memory comes from the pod pool, which is PSRAM on boards that
-        // have it; the interpreter's own allocations follow the same policy
-        // (kube32_rt_calloc). Bytecode is parsed in place from flash.
-        int pool_external = 0;
-        kube32_pool_available(&pool_external);
-        bool external = pool_external != 0;
-        uint64_t linear = static_cast<uint64_t>(st.memory_used_bytes);
-        // runtime_bytes is wasm3's own accounting of the same linear memory,
-        // so only the interpreter stack is added on top of it.
-        uint64_t runtime_part = st.stack_bytes;
+    // Everything the pod holds, counted allocation by allocation as the
+    // runtime makes them (ContainerStatus::held_bytes), wherever it lives:
+    // internal RAM, the pool block or PSRAM
+    if (st.held_bytes > 0) {
         out.has_memory = true;
-        out.has_psram = external;
-        if (external) {
-            out.psram_bytes = linear + runtime_part;
-            out.memory_bytes = 0;
-        } else {
-            out.memory_bytes = linear + runtime_part;
-        }
+        out.memory_bytes = st.held_bytes;
     }
     uint64_t task_us = 0;
     if (s_pod_cpu_sampler && s_pod_cpu_sampler(pod_key, task_us)) {

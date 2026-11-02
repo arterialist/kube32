@@ -22,6 +22,33 @@ static void* s_stack = nullptr;
 static size_t s_stack_size = 0;
 static std::atomic<bool> s_stack_in_use{false};
 
+// Per-pod accounts: bytes each pod holds, charged to the thread's current
+// account when allocated and to the allocation's owner when freed
+namespace {
+#if defined(ESP_PLATFORM)
+constexpr int kAccounts = 64;
+#else
+constexpr int kAccounts = 512;   // the simulator runs several nodes' pods in one process
+#endif
+enum : uint8_t { kAccountFree = 0, kAccountOpen = 1, kAccountClosed = 2 };
+std::atomic<size_t> s_account_bytes[kAccounts + 1];
+std::atomic<uint8_t> s_account_state[kAccounts + 1];
+thread_local int t_account = 0;
+
+void charge(int account, size_t bytes) {
+    if (account > 0 && account <= kAccounts) s_account_bytes[account].fetch_add(bytes);
+}
+void uncharge(int account, size_t bytes) {
+    if (account > 0 && account <= kAccounts) s_account_bytes[account].fetch_sub(bytes);
+}
+// While alive, allocations on this thread go to `account`
+struct ChargeTo {
+    int previous;
+    explicit ChargeTo(int account) : previous(t_account) { t_account = account; }
+    ~ChargeTo() { t_account = previous; }
+};
+} // namespace
+
 // The block's two uses can share it: one large linear memory (a pod whose
 // memory wants most of the block) at its start, and pod allocations the
 // general heap cannot place (it keeps a reserve for the system, and after
@@ -31,7 +58,7 @@ static std::atomic<bool> s_stack_in_use{false};
 namespace {
 struct SubChunk {
     uint32_t size;   // whole chunk, header included, multiple of 8
-    uint32_t used;
+    uint32_t used;   // 0 when free, else the owner's account + 1
 };
 constexpr size_t kSubAlign = 8;
 constexpr size_t kMinChunk = 4 * sizeof(SubChunk);
@@ -40,6 +67,7 @@ bool s_sub_active = false;
 size_t s_sub_allocs = 0;
 uint8_t* s_sub_base = nullptr;    // start of the small heap (above a large memory)
 size_t s_whole_bytes = 0;         // the large memory's size while one is placed
+int s_whole_owner = 0;            // ... and the account it is charged to
 
 size_t align8(size_t n) { return (n + kSubAlign - 1) & ~(kSubAlign - 1); }
 uint8_t* sub_end() { return static_cast<uint8_t*>(s_block) + (s_block_size & ~(kSubAlign - 1)); }
@@ -88,13 +116,15 @@ void* sub_alloc_locked(size_t bytes) {
         out = sub_next(fit);
         out->size = static_cast<uint32_t>(need);
     }
-    out->used = 1;
+    out->used = static_cast<uint32_t>(t_account) + 1;
+    charge(t_account, out->size);
     s_sub_allocs++;
     return out + 1;
 }
 
 void sub_free_locked(void* p) {
     SubChunk* c = static_cast<SubChunk*>(p) - 1;
+    uncharge(static_cast<int>(c->used) - 1, c->size);
     c->used = 0;
     if (--s_sub_allocs == 0) s_sub_active = false;
     else sub_coalesce();
@@ -109,6 +139,7 @@ bool sub_shrink_locked(void* p, size_t bytes) {
     SubChunk* tail = reinterpret_cast<SubChunk*>(reinterpret_cast<uint8_t*>(c) + need);
     tail->size = static_cast<uint32_t>(c->size - need);
     tail->used = 0;
+    uncharge(static_cast<int>(c->used) - 1, tail->size);
     c->size = static_cast<uint32_t>(need);
     sub_coalesce();
     return true;
@@ -246,8 +277,21 @@ void* kube32_pool_alloc(size_t bytes) {
     }
     s_in_use.store(true);
     s_whole_bytes = bytes;
+    s_whole_owner = t_account;
+    charge(s_whole_owner, align8(bytes));
     std::memset(s_block, 0, bytes);
     return s_block;
+}
+
+int kube32_pool_resize(void* ptr, size_t bytes) {
+    if (!kube32_pool_owns(ptr) || !s_in_use.load()) return 0;
+    std::lock_guard<std::mutex> lock(s_sub_mutex);
+    const size_t capacity = s_sub_active ? static_cast<size_t>(s_sub_base - static_cast<uint8_t*>(s_block)) : s_block_size;
+    if (bytes > capacity) return 0;
+    uncharge(s_whole_owner, align8(s_whole_bytes));
+    charge(s_whole_owner, align8(bytes));
+    s_whole_bytes = bytes;
+    return 1;
 }
 
 // Where pod allocations (runtime, compiled code, linear memory) go:
@@ -265,6 +309,7 @@ void* kube32_pool_alloc(size_t bytes) {
 static std::atomic<int> s_prefer_general{0};
 static std::atomic<size_t> s_general_bytes{0};
 static std::atomic<size_t> s_psram_bytes{0};
+static std::atomic<size_t> s_general_allocs{0};
 static size_t s_heap_budget = 0;                    // 0: not modelled
 static const size_t k_system_reserve_default = 16 * 1024;
 // PSRAM pods are never given: thread stacks made later, and on a control
@@ -272,14 +317,38 @@ static const size_t k_system_reserve_default = 16 * 1024;
 // staging (kube32_pool_set_psram_reserve)
 static std::atomic<size_t> s_psram_reserve{16 * 1024};
 
-static size_t general_size(void* p) {
+// A pod allocation in the general heap or PSRAM starts with the account it
+// is charged to; the pointer handed out follows, 8-byte aligned as in the
+// block's small heap
+namespace {
+struct alignas(8) GeneralHeader {
+    int32_t account;
+};
+static_assert(sizeof(GeneralHeader) == 8, "the header keeps 8-byte alignment");
+constexpr size_t kHeader = sizeof(GeneralHeader);
+GeneralHeader* header_of(void* p) { return static_cast<GeneralHeader*>(p) - 1; }
+} // namespace
+
+static size_t general_size(const void* p) {
 #if defined(ESP_PLATFORM)
-    return heap_caps_get_allocated_size(p);
+    return heap_caps_get_allocated_size(const_cast<void*>(p));
 #elif defined(__APPLE__)
     return malloc_size(p);
 #else
-    return malloc_usable_size(p);
+    return malloc_usable_size(const_cast<void*>(p));
 #endif
+}
+
+// Counts an allocation just made (`base`, header first) as the current
+// account's and returns what the pod gets
+static void* adopt(void* base, bool psram) {
+    GeneralHeader* h = static_cast<GeneralHeader*>(base);
+    h->account = t_account;
+    const size_t size = general_size(base);
+    (psram ? s_psram_bytes : s_general_bytes).fetch_add(size);
+    s_general_allocs.fetch_add(1);
+    charge(t_account, size);
+    return h + 1;
 }
 
 // Internal RAM pods leave to the system. A board without PSRAM keeps more:
@@ -301,14 +370,13 @@ static bool general_has_room(size_t bytes) {
 }
 
 static void* general_calloc(size_t bytes) {
-    if (!general_has_room(bytes)) return nullptr;
+    if (!general_has_room(bytes + kHeader)) return nullptr;
 #if defined(ESP_PLATFORM)
-    void* p = heap_caps_calloc(bytes, 1, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    void* base = heap_caps_calloc(bytes + kHeader, 1, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
 #else
-    void* p = std::calloc(bytes, 1);
+    void* base = std::calloc(bytes + kHeader, 1);
 #endif
-    if (p) s_general_bytes.fetch_add(general_size(p));
-    return p;
+    return base ? adopt(base, false) : nullptr;
 }
 
 static bool pool_first() { return s_block && !s_prefer_general.load(); }
@@ -336,9 +404,41 @@ void kube32_pool_prefer_general(int on) { s_prefer_general.fetch_add(on ? 1 : -1
 void kube32_pool_set_heap_budget(size_t bytes) { s_heap_budget = bytes; }
 size_t kube32_pool_heap_budget(void) { return s_heap_budget; }
 size_t kube32_pool_general_bytes(void) { return s_general_bytes.load(); }
+size_t kube32_pool_general_allocations(void) { return s_general_allocs.load(); }
 size_t kube32_pool_system_reserve(void) { return system_reserve(); }
 void kube32_pool_set_psram_reserve(size_t bytes) { s_psram_reserve.store(bytes); }
 size_t kube32_pool_psram_reserve(void) { return s_psram_reserve.load(); }
+size_t kube32_heap_allocated_size(const void* ptr) { return ptr ? general_size(ptr) : 0; }
+
+int kube32_pod_account_open(void) {
+    for (int i = 1; i <= kAccounts; ++i) {
+        uint8_t expected = kAccountFree;
+        if (s_account_state[i].compare_exchange_strong(expected, kAccountOpen)) return i;
+    }
+    // A closed account is free again once its last allocation is freed
+    for (int i = 1; i <= kAccounts; ++i) {
+        uint8_t expected = kAccountClosed;
+        if (s_account_bytes[i].load() == 0 && s_account_state[i].compare_exchange_strong(expected, kAccountOpen)) return i;
+    }
+    return 0;
+}
+
+void kube32_pod_account_close(int account) {
+    if (account <= 0 || account > kAccounts) return;
+    s_account_state[account].store(s_account_bytes[account].load() == 0 ? kAccountFree : kAccountClosed);
+}
+
+size_t kube32_pod_account_bytes(int account) {
+    return (account > 0 && account <= kAccounts) ? s_account_bytes[account].load() : 0;
+}
+
+int kube32_pod_account_enter(int account) {
+    const int previous = t_account;
+    t_account = (account > 0 && account <= kAccounts) ? account : 0;
+    return previous;
+}
+
+void kube32_pod_account_leave(int previous) { t_account = previous; }
 
 size_t kube32_pool_pod_room(size_t memory_bytes, size_t* out_capacity) {
     size_t room = 0;
@@ -464,8 +564,10 @@ void* kube32_rt_calloc(size_t bytes) {
 #if defined(ESP_PLATFORM)
     if (board_psram()) {
         void* p = nullptr;
-        if (psram_above_reserve() > bytes) p = heap_caps_calloc(bytes, 1, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-        if (p) s_psram_bytes.fetch_add(general_size(p));
+        if (psram_above_reserve() > bytes + kHeader) {
+            void* base = heap_caps_calloc(bytes + kHeader, 1, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+            if (base) p = adopt(base, true);
+        }
         if (!p) p = kube32_pool_sub_alloc(bytes);
         if (!p) s_last_refused.store(bytes);
         return p;
@@ -477,9 +579,25 @@ void* kube32_rt_calloc(size_t bytes) {
     return p;
 }
 
+static bool in_sub_heap(const void* ptr) {
+    return sub_in_range(ptr) && s_sub_active && static_cast<const uint8_t*>(ptr) > s_sub_base;
+}
+
+int kube32_rt_owner(const void* ptr) {
+    if (!ptr) return 0;
+    if (kube32_pool_owns(ptr)) return s_whole_owner;
+    if (sub_in_range(ptr)) {
+        std::lock_guard<std::mutex> lock(s_sub_mutex);
+        if (in_sub_heap(ptr)) return static_cast<int>((static_cast<const SubChunk*>(ptr) - 1)->used) - 1;
+    }
+    return (static_cast<const GeneralHeader*>(ptr) - 1)->account;
+}
+
 void* kube32_rt_realloc(void* ptr, size_t bytes) {
     if (!ptr) return kube32_rt_calloc(bytes);
-    if (sub_in_range(ptr) && s_sub_active && static_cast<uint8_t*>(ptr) > s_sub_base) {
+    // What replaces an allocation is its owner's
+    ChargeTo owner(kube32_rt_owner(ptr));
+    if (in_sub_heap(ptr)) {
         // Within the block's own heap: in place when the chunk is large
         // enough, else moved
         SubChunk* c = static_cast<SubChunk*>(ptr) - 1;
@@ -491,46 +609,58 @@ void* kube32_rt_realloc(void* ptr, size_t bytes) {
         kube32_pool_sub_free(ptr);
         return moved;
     }
-    const size_t old = general_size(ptr);
-    if (in_psram(ptr)) {
+    GeneralHeader* h = header_of(ptr);
+    const int account = h->account;
+    const size_t old = general_size(h);
+    const size_t have = old - kHeader;
+    if (in_psram(h)) {
         // Grown in place in PSRAM, or moved to wherever kube32_rt_calloc finds room
-        void* p = nullptr;
+        void* base = nullptr;
 #if defined(ESP_PLATFORM)
-        if (bytes <= old || heap_caps_get_free_size(MALLOC_CAP_SPIRAM) > (bytes - old) + s_psram_reserve.load()) {
-            p = heap_caps_realloc(ptr, bytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        if (bytes + kHeader <= old || heap_caps_get_free_size(MALLOC_CAP_SPIRAM) > (bytes + kHeader - old) + s_psram_reserve.load()) {
+            base = heap_caps_realloc(h, bytes + kHeader, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
         }
 #endif
-        if (p) {
+        if (base) {
+            const size_t now = general_size(base);
             s_psram_bytes.fetch_sub(old);
-            s_psram_bytes.fetch_add(general_size(p));
-            return p;
+            s_psram_bytes.fetch_add(now);
+            uncharge(account, old);
+            charge(account, now);
+            return static_cast<GeneralHeader*>(base) + 1;
         }
         void* moved = kube32_rt_calloc(bytes);
         if (!moved) return nullptr;
-        std::memcpy(moved, ptr, old < bytes ? old : bytes);
+        std::memcpy(moved, ptr, have < bytes ? have : bytes);
         kube32_rt_free(ptr);
         return moved;
     }
-    if (bytes > old && !general_has_room(bytes - old)) return nullptr;
+    if (bytes + kHeader > old && !general_has_room(bytes + kHeader - old)) return nullptr;
 #if defined(ESP_PLATFORM)
-    void* p = heap_caps_realloc(ptr, bytes, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    void* base = heap_caps_realloc(h, bytes + kHeader, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
 #else
-    void* p = std::realloc(ptr, bytes);
+    void* base = std::realloc(h, bytes + kHeader);
 #endif
-    if (p) {
-        s_general_bytes.fetch_sub(old);
-        s_general_bytes.fetch_add(general_size(p));
-    }
-    return p;
+    if (!base) return nullptr;
+    const size_t now = general_size(base);
+    s_general_bytes.fetch_sub(old);
+    s_general_bytes.fetch_add(now);
+    uncharge(account, old);
+    charge(account, now);
+    return static_cast<GeneralHeader*>(base) + 1;
 }
 
 void kube32_rt_free(void* ptr) {
     if (!ptr || kube32_pool_sub_free(ptr)) return;
-    (in_psram(ptr) ? s_psram_bytes : s_general_bytes).fetch_sub(general_size(ptr));
+    GeneralHeader* h = header_of(ptr);
+    const size_t size = general_size(h);
+    (in_psram(h) ? s_psram_bytes : s_general_bytes).fetch_sub(size);
+    s_general_allocs.fetch_sub(1);
+    uncharge(h->account, size);
 #if defined(ESP_PLATFORM)
-    heap_caps_free(ptr);
+    heap_caps_free(h);
 #else
-    std::free(ptr);
+    std::free(h);
 #endif
 }
 
@@ -571,7 +701,9 @@ int kube32_pool_free(void* ptr) {
         if (first->used) bottom->size = static_cast<uint32_t>(gained);
         s_sub_base = static_cast<uint8_t*>(s_block);
     }
+    uncharge(s_whole_owner, align8(s_whole_bytes));
     s_whole_bytes = 0;
+    s_whole_owner = 0;
     s_in_use.store(false);
     return 1;
 }

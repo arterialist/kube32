@@ -13,6 +13,8 @@
 //     CpuTimeSampler (FreeRTOS run-time stats). Until then CPU is "not
 //     measured" and the API omits it; nothing is ever reported as zero.
 //
+// Per-pod memory is everything the pod's runtime holds (ContainerStatus::
+// held_bytes), counted allocation by allocation, on every board.
 // Per-pod CPU comes from the interpreter time the app host accounts for
 // (AppPodStats: k32_handle / k32_tick / k32_event calls). Pods that run a
 // free-running main loop are not covered by that counter; the firmware can
@@ -36,13 +38,10 @@ struct NodeResourceSample {
 };
 
 struct PodResourceSample {
-    // memory_bytes counts what the node's "memory" resource governs (internal
-    // SRAM); psram_bytes is the pod's footprint in external RAM, the resource
-    // esp32.io/psram. A pod's 1.3 MB data set on a PSRAM board is psram, not memory.
+    // Everything the pod holds, wherever it lives (internal RAM, the pool
+    // block, PSRAM)
     bool has_memory{false};
     uint64_t memory_bytes{0};
-    bool has_psram{false};
-    uint64_t psram_bytes{0};
     bool has_cpu{false};
     uint64_t cpu_busy_us{0};         // cumulative interpreter time
 };

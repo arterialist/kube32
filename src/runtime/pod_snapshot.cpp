@@ -289,6 +289,7 @@ bool SnapshotRestorer::begin_memory() {
 }
 
 bool SnapshotRestorer::feed(const uint8_t* data, size_t len) {
+    PodMemoryScope charged(ctrl_.memory_account());   // memory and tables grown to the snapshot's sizes
     while (len > 0) {
         if (phase_ == Phase::Failed) return false;
         if (phase_ == Phase::Done) return fail("bytes after the snapshot's trailer");

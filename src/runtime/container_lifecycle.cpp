@@ -175,7 +175,7 @@ TrapReport describe_trap(const char* trap, const TrapContext& ctx) {
 }
 
 ContainerLifecycleController::ContainerLifecycleController(const ContainerConfig& config)
-    : config_(config) {
+    : config_(config), memory_account_(kube32_pod_account_open()) {
     status_.phase = ContainerPhase::Pending;
     status_.restart_count = 0;
     status_.memory_used_bytes = 0;
@@ -195,6 +195,7 @@ ContainerLifecycleController::~ContainerLifecycleController() {
         thread_detached_.store(true);
     }
     cleanup_runtime();
+    kube32_pod_account_close(memory_account_);
 }
 
 bool ContainerLifecycleController::lingering() const {
@@ -241,6 +242,7 @@ bool ContainerLifecycleController::deploy(const uint8_t* wasm_bytes, size_t len)
     osal::LockGuard call_guard(call_mutex_);
     osal::LockGuard guard(mutex_);
     osal::LockGuard<osal::RecursiveMutex> global_guard(s_wasm3_global_mutex);
+    PodMemoryScope charged(memory_account_);
 
     cleanup_runtime();
     // A fresh instance starts with no SD files open (also on restart)
@@ -419,6 +421,7 @@ void ContainerLifecycleController::worker_thread_main() {
     IM3Runtime runtime = reinterpret_cast<IM3Runtime>(m3_runtime_);
 
     if (!runtime) { worker_done_.store(true); return; }
+    PodMemoryScope charged(memory_account_);
 
     // Look for standard entrypoints: _start, app_main, main
     if (m3_FindFunction(&entry_fn, runtime, "_start") != m3Err_none) {
@@ -542,6 +545,7 @@ bool ContainerLifecycleController::start() {
 
     worker_thread_ = std::make_unique<osal::Thread>();
     bool ok = worker_thread_->start(worker_thread_entry, this, t_cfg);
+    if (ok) worker_stack_bytes_.store(static_cast<uint32_t>(t_cfg.stack_size));
     if (!ok) {
         worker_thread_.reset();
         if (pod_stack_) { kube32_pool_stack_free(pod_stack_); pod_stack_ = nullptr; }
@@ -641,6 +645,7 @@ bool ContainerLifecycleController::stop(uint32_t grace_period_ms) {
         if (worker_thread_ && worker_thread_->is_joinable()) {
             worker_thread_->join();
             worker_thread_.reset();   // waits for the kernel to retire a static task
+            worker_stack_bytes_.store(0);
             if (pod_stack_) { kube32_pool_stack_free(pod_stack_); pod_stack_ = nullptr; }
             std::cout << "[RUNTIME] " << config_.pod_id << ": stopped (" << status_.termination_reason << ")" << std::endl;
             PodLogStore::runtime().append(config_.pod_id, "[kube32] container stopped (" +
@@ -683,7 +688,35 @@ ContainerStatus ContainerLifecycleController::get_status() {
     if (m3_runtime_) {
         status_.runtime_bytes = m3_GetResourceUsage(reinterpret_cast<IM3Runtime>(m3_runtime_), c_m3Limit_MemoryBytes);
     }
+    status_.held_bytes = held_bytes_locked();
     return status_;
+}
+
+uint64_t ContainerLifecycleController::held_bytes() const {
+    osal::LockGuard guard(mutex_);
+    return held_bytes_locked();
+}
+
+uint64_t ContainerLifecycleController::held_bytes_locked() const {
+    if (!memory_account_) return 0;
+    // What the runtime allocated for the container (kube32_rt_*, the pool
+    // block), each allocation as the allocator holds it
+    uint64_t held = kube32_pod_account_bytes(memory_account_);
+#if d_m3GuardedMemory
+    // The host maps linear memory outside the pool: the committed pages of
+    // each memory's slot, its header page included
+    if (const IM3Module module = reinterpret_cast<IM3Module>(m3_module_)) {
+        const size_t page = m3_HostPageSize();
+        for (uint32_t i = 0; i < module->numMemories; ++i) {
+            const IM3Memory mem = module->memories[i];
+            if (!mem || mem->owner != module || !mem->guardSlot || !mem->mallocated) continue;
+            held += page + (mem->mallocated->length + page - 1) / page * page;
+        }
+    }
+#endif
+    // The module's bytes when they are a copy (not mapped from flash)
+    if (!wasm_bytecode_.empty()) held += kube32_heap_allocated_size(wasm_bytecode_.data());
+    return held + worker_stack_bytes_.load();
 }
 
 uint32_t ContainerLifecycleController::get_memory_usage_bytes() const {
@@ -715,6 +748,7 @@ int32_t ContainerLifecycleController::call_function(const std::string& fn_name, 
     // is not held while the guest runs, so status queries do not wait for a
     // call that is blocked in a host function (a service call, for example).
     osal::LockGuard call_guard(call_mutex_);
+    PodMemoryScope charged(memory_account_);   // memory.grow, tables
     IM3Function fn = nullptr;
     IM3Runtime rt = nullptr;
     {

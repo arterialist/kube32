@@ -94,6 +94,27 @@ size_t kube32_pool_pod_room(size_t memory_bytes, size_t* out_capacity);
  *     whole (kube32_pool_linear_room), what a pod's esp32.io/psram request
  *     is for; 0 without PSRAM. */
 void kube32_pool_node_room(size_t* out_memory, size_t* out_psram);
+/* Grows or shrinks, in place, the large memory at the block's start to
+ * `bytes`; 1 when it fits there (it then counts as that size), 0 when it
+ * must move. */
+int   kube32_pool_resize(void* ptr, size_t bytes);
+/* Per-pod accounts. Every allocation made through this pool (the
+ * kube32_rt_* allocator, kube32_pool_alloc, kube32_pool_sub_alloc) is
+ * charged to the calling thread's current account and stays charged to it
+ * until it is freed, on whatever thread that happens; what a realloc returns
+ * stays with the owner of what it replaced. Account 0 is nobody's. A pod
+ * allocation in the block's small heap keeps its owner in the chunk header
+ * it has anyway; one in the general heap or PSRAM carries an 8-byte header. */
+int    kube32_pod_account_open(void);           /* a free account, 0 when none is left */
+void   kube32_pod_account_close(int account);   /* reused once what it holds is freed */
+size_t kube32_pod_account_bytes(int account);   /* bytes it holds, headers included */
+int    kube32_pod_account_enter(int account);   /* the thread's current account; returns the one before */
+void   kube32_pod_account_leave(int previous);
+int    kube32_rt_owner(const void* ptr);        /* the account an allocation is charged to */
+/* Pod allocations in the general heap or PSRAM (each with its header) */
+size_t kube32_pool_general_allocations(void);
+/* Bytes the allocator holds for a heap pointer that is not the pool's */
+size_t kube32_heap_allocated_size(const void* ptr);
 /* General allocator for the interpreter: external RAM first when present,
  * internal otherwise. Keeps code pages and runtime structures out of the
  * 300 KB internal heap that Wi-Fi and lwIP need. */

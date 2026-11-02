@@ -1574,10 +1574,6 @@ void Kubelet::push_metrics_sample() {
             if (ps.has_memory) {
                 body += ",\"memory_bytes\":";
                 append_uint(body, ps.memory_bytes);
-                if (ps.has_psram) {
-                    body += ",\"psram_bytes\":";
-                    append_uint(body, ps.psram_bytes);
-                }
             }
             body += "}]}";
         }
