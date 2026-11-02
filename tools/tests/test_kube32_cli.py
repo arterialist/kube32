@@ -1190,12 +1190,22 @@ class TestFirmware(TempDirCase):
 # ---------------------------------------------------------------------------
 # devices
 # ---------------------------------------------------------------------------
-# A kubectl that answers GET --raw from a JSON file of {path: answer}
+# A kubectl that answers GET --raw from a JSON file of {path: answer}. A
+# create --raw (the activate subresource) is logged to FAKE_POST_LOG; once
+# one was, a GET answers "<path>#activated" where the file has it
 FAKE_GET_KUBECTL = textwrap.dedent('''\
     #!/usr/bin/env python3
     import json, os, sys
     answers = json.load(open(os.environ["FAKE_GET_ANSWERS"]))
     raw = sys.argv[sys.argv.index("--raw") + 1]
+    log = os.environ.get("FAKE_POST_LOG", "")
+    if "create" in sys.argv:
+        with open(log, "a") as f:
+            f.write(raw + "\\n")
+        print(json.dumps({"kind": "Status", "status": "Success"}))
+        sys.exit(0)
+    if log and os.path.exists(log) and raw + "#activated" in answers:
+        raw += "#activated"
     if raw not in answers:
         sys.stderr.write("Error from server (NotFound): the server could not find the requested resource\\n")
         sys.exit(1)
@@ -1214,6 +1224,8 @@ class TestDevices(TempDirCase):
                 pod = self.headers.get("X-Kube32-Pod", "")
                 if pod == "default/kitchen-env-driver":
                     code, body = 200, {"device": "kitchen-env", "ok": True, "readings": {"temperature_c": 21.4, "humidity_pct": 41.0}}
+                elif pod == "default/door-driver":
+                    code, body = 200, {"device": "door", "ok": True, "readings": {"present": False}}
                 else:
                     code, body = 503, {"device": "scale", "ok": False, "error": "the part does not answer"}
                 data = json.dumps(body).encode()
@@ -1232,44 +1244,71 @@ class TestDevices(TempDirCase):
         self.kubectl = self.write("kubectl", FAKE_GET_KUBECTL)
         os.chmod(self.kubectl, os.stat(self.kubectl).st_mode | stat.S_IXUSR)
 
-        def device(name, driver, phase, pod="", message=""):
+        def device(name, driver, phase, pod="", message="", activation="OnDemand"):
             st = {"phase": phase, "nodeName": "cardputer", "message": message}
             if pod:
                 st["podName"] = pod
-            return {"metadata": {"name": name, "namespace": "default"}, "spec": {"driver": driver, "nodeName": "cardputer"}, "status": st}
+            return {"metadata": {"name": name, "namespace": "default"},
+                    "spec": {"driver": driver, "nodeName": "cardputer", "activation": activation}, "status": st}
 
         def pod(name):
             return {"metadata": {"name": name, "namespace": "default"}, "status": {"podIP": "127.0.0.1"},
                     "spec": {"containers": [{"ports": [{"name": "http", "containerPort": port}]}]}}
 
+        devices = [
+            device("kitchen-env", "bme688", "Running", "kitchen-env-driver"),
+            device("scale", "miniscale", "Running", "scale-driver", activation="Always"),
+            device("bme688-cardputer-b0-m70c2-77", "bme688", "Absent", message="node cardputer no longer finds the part at i2c0/0x70:2/0x77"),
+            device("door", "rfid", "Idle", message="idle: the driver starts on the next use"),
+        ]
+        list_path = "/apis/kube32.io/v1/namespaces/default/devices"
         answers = {
-            "/apis/kube32.io/v1/namespaces/default/devices": {"items": [
-                device("kitchen-env", "bme688", "Running", "kitchen-env-driver"),
-                device("scale", "miniscale", "Running", "scale-driver"),
-                device("bme688-cardputer-b0-m70c2-77", "bme688", "Absent", message="node cardputer no longer finds the part at i2c0/0x70:2/0x77"),
-            ]},
+            list_path: {"items": devices},
+            list_path + "#activated": {"items": devices[:3] + [device("door", "rfid", "Running", "door-driver")]},
             "/api/v1/namespaces/default/pods/kitchen-env-driver": pod("kitchen-env-driver"),
             "/api/v1/namespaces/default/pods/scale-driver": pod("scale-driver"),
+            "/api/v1/namespaces/default/pods/door-driver": pod("door-driver"),
         }
         self.answers = self.write("answers.json", json.dumps(answers))
+        self.posts = os.path.join(self.tmp, "posts.log")
 
     def tearDown(self):
         self.server.shutdown()
         self.server.server_close()
         super().tearDown()
 
+    def env(self):
+        return dict(os.environ, FAKE_GET_ANSWERS=self.answers, FAKE_POST_LOG=self.posts)
+
+    def posted(self):
+        if not os.path.exists(self.posts):
+            return []
+        with open(self.posts) as f:
+            return f.read().split()
+
     def test_devices_with_readings(self):
-        rc, out, err = run_cli("devices", "--kubectl", self.kubectl, env=dict(os.environ, FAKE_GET_ANSWERS=self.answers))
+        rc, out, err = run_cli("devices", "--kubectl", self.kubectl, env=self.env())
         self.assertEqual(rc, 0, err)
         lines = out.splitlines()
         self.assertRegex(lines[0], r"^NAME\s+DRIVER\s+NODE\s+PHASE\s+READING$")
         self.assertRegex(out, r"kitchen-env\s+bme688\s+cardputer\s+Running\s+temperature_c=21.4 humidity_pct=41.0")
         self.assertRegex(out, r"scale\s+miniscale\s+cardputer\s+Running\s+error: the part does not answer")
         self.assertRegex(out, r"bme688-cardputer-b0-m70c2-77\s+bme688\s+cardputer\s+Absent\s+node cardputer no longer finds")
+        # A reading is a use of each OnDemand Device: the Idle one started and was read
+        self.assertRegex(out, r"door\s+rfid\s+cardputer\s+Running\s+present=False")
+        self.assertEqual(self.posted(), ["/apis/kube32.io/v1/namespaces/default/devices/kitchen-env/activate",
+                                         "/apis/kube32.io/v1/namespaces/default/devices/door/activate"])
         # An API error (here: no answer for the all-namespaces list) exits 4
-        rc, _, err = run_cli("devices", "-A", "--kubectl", self.kubectl, env=dict(os.environ, FAKE_GET_ANSWERS=self.answers))
+        rc, _, err = run_cli("devices", "-A", "--kubectl", self.kubectl, env=self.env())
         self.assertEqual(rc, 4)
         self.assertIn("NotFound", err)
+
+    def test_devices_without_activation(self):
+        rc, out, err = run_cli("devices", "door", "--no-activate", "--kubectl", self.kubectl, env=self.env())
+        self.assertEqual(rc, 0, err)
+        self.assertRegex(out, r"door\s+rfid\s+cardputer\s+Idle\s+idle: the driver starts on the next use")
+        self.assertNotIn("kitchen-env", out)
+        self.assertEqual(self.posted(), [])
 
 
 # A kubectl that keeps Checkpoints and moves each one a phase further at

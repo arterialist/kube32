@@ -12,7 +12,7 @@ kube32-cli: build, check, deploy and ship WebAssembly pods for Kube32.
     kube32-cli firmware push <firmware.bin>   stage a firmware image on the control plane
     kube32-cli firmware rollout              update every node to the staged image, one at a time
     kube32-cli firmware status|abort|info    the rollout and each node's firmware; stop a rollout; read an image file
-    kube32-cli devices                       every Device with the latest reading of its driver
+    kube32-cli devices [<name>...]           every Device with the latest reading of its driver (starts Idle ones)
     kube32-cli checkpoint <pod>              save a running pod's state in a Checkpoint
     kube32-cli move <pod> [--to <node>]      move a running pod to another node with its state
     kube32-cli checkpoints                   list Checkpoints
@@ -1962,9 +1962,13 @@ def build_parser():
     fw.set_defaults(func=lambda args: (fw.print_help(), EXIT_USAGE)[1])
 
     dv = sub.add_parser("devices", help="list Devices with the latest reading of each driver (read from its node's pod server)")
+    dv.add_argument("names", nargs="*", metavar="NAME", help="only these Devices")
     dv.add_argument("-n", "--namespace", default="default")
     dv.add_argument("-A", "--all-namespaces", action="store_true")
     dv.add_argument("--timeout", type=float, default=3.0, help="seconds to wait for each driver (default 3)")
+    dv.add_argument("--activation-timeout", type=float, default=10.0,
+                    help="seconds to wait for the drivers of Idle OnDemand Devices to start (default 10)")
+    dv.add_argument("--no-activate", action="store_true", help="list without starting the drivers of Idle Devices (no use reported)")
     kubectl_flags(dv)
     dv.set_defaults(func=cmd_devices)
 
@@ -2021,11 +2025,38 @@ def device_reading(pod, timeout):
     return " ".join("%s=%s" % (k, v) for k, v in readings.items()) or "-"
 
 
+def device_key(d):
+    return (d["metadata"].get("namespace", "default"), d["metadata"]["name"])
+
+
+def activate_devices(args, path, devices):
+    """A reading is a use: POST devices/<name>/activate for each OnDemand
+    Device, then wait (--activation-timeout) for the Idle ones to run.
+    Returns the Device list as it is afterwards."""
+    waiting = set()
+    for d in devices:
+        spec, st = d.get("spec", {}), d.get("status", {}) or {}
+        if spec.get("activation", "OnDemand") == "Always" or st.get("phase") in ("Absent", "Failed"):
+            continue
+        ns, name = device_key(d)
+        api_call(args, "create", "/apis/kube32.io/v1/namespaces/%s/devices/%s/activate" % (ns, name), b"{}")
+        if st.get("phase") != "Running":
+            waiting.add((ns, name))
+    deadline = time.time() + args.activation_timeout
+    while waiting and time.time() < deadline:
+        time.sleep(0.5)
+        devices = [d for d in (api_call(args, "get", path) or {}).get("items", []) if not args.names or d["metadata"]["name"] in args.names]
+        waiting = {device_key(d) for d in devices if device_key(d) in waiting and (d.get("status", {}) or {}).get("phase") != "Running"}
+    return devices
+
+
 def cmd_devices(args):
     """Every Device, with the latest reading of its driver"""
     path = "/apis/kube32.io/v1/devices" if args.all_namespaces else "/apis/kube32.io/v1/namespaces/%s/devices" % args.namespace
     try:
-        devices = (api_call(args, "get", path) or {}).get("items", [])
+        devices = [d for d in (api_call(args, "get", path) or {}).get("items", []) if not args.names or d["metadata"]["name"] in args.names]
+        if not args.no_activate:
+            devices = activate_devices(args, path, devices)
         rows = []
         for d in sorted(devices, key=lambda d: (d["metadata"].get("namespace", ""), d["metadata"]["name"])):
             meta, spec, st = d["metadata"], d.get("spec", {}), d.get("status", {}) or {}
