@@ -22,6 +22,9 @@ struct ResourceSpec {
     uint32_t rmt_tx_channels{0};
     uint32_t rmt_rx_channels{0};
     uint32_t cpu_cores{1};
+    // A node's allocatable pods (0: it reports none, no limit), or the pods
+    // bound to it that have not finished
+    uint32_t pods{0};
 };
 
 struct ScheduleResult {
@@ -101,6 +104,18 @@ public:
 class NodePeripheralPredicate : public Predicate {
 public:
     const char* name() const override { return "NodePeripheral"; }
+    bool evaluate(const std::string& pod_json,
+                  const std::string& node_json,
+                  const ResourceSpec& pod_req,
+                  const ResourceSpec& node_allocatable,
+                  const ResourceSpec& node_allocated,
+                  std::string& failure_reason) override;
+};
+
+// Allocatable pods: a node runs at most that many pods ("Too many pods")
+class NodePodCountPredicate : public Predicate {
+public:
+    const char* name() const override { return "NodePodCount"; }
     bool evaluate(const std::string& pod_json,
                   const std::string& node_json,
                   const ResourceSpec& pod_req,

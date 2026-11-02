@@ -341,6 +341,37 @@ void test_kubelet_restart_history_after_node_restart() {
     std::cout << "[PASS] test_kubelet_restart_history_after_node_restart" << std::endl;
 }
 
+// max_pods: the node runs that many pods at once; one more fails with
+// OutOfpods, as the Kubernetes kubelet rejects a pod past maxPods, and is
+// not tried again
+void test_kubelet_max_pods() {
+    KubeletConfig cfg;
+    cfg.node_name = "test-node-01";
+    cfg.max_pods = 3;
+    auto wasm_rt = kube32::runtime::create_wasm_runtime();
+    auto client = std::make_unique<MockKubeClient>();
+    MockKubeClient* c = client.get();
+    for (const char* name : {"a", "b", "c", "d"}) {
+        const std::string manifest = std::string(R"({"metadata":{"name":")") + name +
+            R"(","namespace":"default"},"spec":{"nodeName":"test-node-01","containers":[{"name":"c","image":"wasm://sensor"}]}})";
+        c->mock_pods.emplace_back(parse_pod_manifest(manifest), manifest);
+    }
+    Kubelet k(cfg, *wasm_rt, std::move(client));
+    k.sync_assigned_pods();
+    LocalPodRecord rec;
+    assert(k.get_pod_record("default/c", rec) && rec.execution_phase == PodExecutionPhase::Running);
+    assert(k.get_pod_record("default/d", rec) && rec.execution_phase == PodExecutionPhase::Failed);
+    const std::string p = c->last_pod_status_patch;
+    std::cout << "[max pods] " << p << std::endl;
+    assert(p.find("\"reason\":\"OutOfpods\"") != std::string::npos);
+    assert(p.find("used: 3, capacity: 3") != std::string::npos);
+    c->last_pod_status_patch.clear();
+    k.sync_assigned_pods();
+    assert(c->last_pod_status_patch.empty());   // rejected once
+    assert(k.get_pod_record("default/d", rec) && rec.execution_phase == PodExecutionPhase::Failed);
+    std::cout << "[PASS] test_kubelet_max_pods" << std::endl;
+}
+
 void test_kubelet_thread_lifecycle() {
     KubeletConfig cfg;
     cfg.node_name = "thread-node-01";
@@ -707,6 +738,7 @@ int main() {
     test_kubelet_differential_pod_sync();
     test_kubelet_recreated_pod_replaces_old();
     test_kubelet_restart_history_after_node_restart();
+    test_kubelet_max_pods();
     test_kubelet_starts_per_sync();
     test_kubelet_thread_lifecycle();
     test_kubelet_capability_admission_rejection();

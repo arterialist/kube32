@@ -122,6 +122,11 @@ struct KubeletConfig {
     // A pod the node has no memory for yet waits (Pending, InsufficientMemory)
     // and is admitted again after this long
     uint32_t memory_retry_ms{5000};
+    // Pods the kubelet admits at once (Kubernetes' maxPods), the Node's
+    // capacity and allocatable pods. A pod beyond it fails with OutOfpods.
+    // Eight: the runtime keeps a log ring for eight pods
+    // (runtime::PodLogStore), and a ninth would take the oldest one's.
+    uint32_t max_pods{8};
     // Pods a sync pass starts at most (0: all that are due). Each start holds
     // the pod's manifest and its parsed form until the pass ends; on a board
     // without PSRAM one at a time keeps that peak small, the rest start on
@@ -225,6 +230,11 @@ private:
     // Patches node_annotation_source's annotations onto the Node when they
     // changed or were not sent since the node registered
     void patch_node_annotations();
+    // Pods admitted and not finished (state_mutex_ held)
+    uint32_t admitted_pods() const;
+    // The node runs max_pods already: the pod fails with OutOfpods, as on
+    // Kubernetes (state_mutex_ held)
+    void reject_out_of_pods(const models::KubePod& pod);
     void repack_pool(uint64_t now_ms);
     void ship_pod_logs_locked(const std::string& pod_key, LocalPodRecord& rec);
     // Lists the NetworkPolicies of the namespaces new to config_.network_policies,

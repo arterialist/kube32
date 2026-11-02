@@ -395,8 +395,41 @@ void test_retries_on_changes() {
     std::cout << "[PASS] test_retries_on_changes" << std::endl;
 }
 
+// Allocatable pods: a node full of pods that have not finished takes no more
+// ("Too many pods"); finished pods do not count, and a node that reports no
+// pods count has no such limit
+void test_pod_count_limit() {
+    std::cout << "[RUN] test_pod_count_limit" << std::endl;
+    StoreOptions opts;
+    opts.enable_flash_persistence = false;
+    auto store = create_radix_store(opts);
+    store->put("/registry/nodes/n1", "{\"kind\":\"Node\",\"metadata\":{\"name\":\"n1\"},\"status\":{\"conditions\":[{\"type\":\"Ready\",\"status\":\"True\"}],"
+                                     "\"allocatable\":{\"memory\":\"4Mi\",\"pods\":\"2\"}}}", true);
+    auto pod = [](const std::string& name, const std::string& phase) {
+        return "{\"kind\":\"Pod\",\"metadata\":{\"name\":\"" + name + "\",\"namespace\":\"default\"},"
+               "\"spec\":{\"nodeName\":\"n1\",\"containers\":[{\"name\":\"c\"}]},\"status\":{\"phase\":\"" + phase + "\"}}";
+    };
+    store->put("/registry/pods/default/a", pod("a", "Running"), true);
+    store->put("/registry/pods/default/done", pod("done", "Succeeded"), true);
+    auto sched = create_scheduler(*store);
+    std::string next = "{\"kind\":\"Pod\",\"metadata\":{\"name\":\"next\",\"namespace\":\"default\"},\"spec\":{\"containers\":[{\"name\":\"c\"}]}}";
+    ScheduleResult r = sched->schedule_pod_manifest(next);
+    assert(r.scheduled && r.target_node == "n1");
+    store->put("/registry/pods/default/b", pod("b", "Pending"), true);
+    std::string third = "{\"kind\":\"Pod\",\"metadata\":{\"name\":\"third\",\"namespace\":\"default\"},\"spec\":{\"containers\":[{\"name\":\"c\"}]}}";
+    r = sched->schedule_pod_manifest(third);
+    assert(!r.scheduled && r.failure_reason == "0/1 nodes are available: 1 Too many pods.");
+    store->put("/registry/nodes/n1", "{\"kind\":\"Node\",\"metadata\":{\"name\":\"n1\"},\"status\":{\"conditions\":[{\"type\":\"Ready\",\"status\":\"True\"}],"
+                                     "\"allocatable\":{\"memory\":\"4Mi\"}}}", true);
+    third = "{\"kind\":\"Pod\",\"metadata\":{\"name\":\"third\",\"namespace\":\"default\"},\"spec\":{\"containers\":[{\"name\":\"c\"}]}}";
+    r = sched->schedule_pod_manifest(third);
+    assert(r.scheduled);
+    std::cout << "[PASS] test_pod_count_limit" << std::endl;
+}
+
 int main() {
     std::cout << "=== Running Kube32 Autonomous Scheduler Unit Tests ===" << std::endl;
+    test_pod_count_limit();
     test_quantity_parser();
     test_predicates();
     test_scheduler_atomic_binding();

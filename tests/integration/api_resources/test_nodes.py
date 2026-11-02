@@ -67,6 +67,13 @@ class TestNodes(BaseTestCase):
         for key in ["memory", "cpu"]:
             self.assertTrue(len(str(capacity[key])) > 0)
 
+        # The pods the kubelet admits; device grants count the pods that can hold them
+        for resources in (capacity, allocatable):
+            self.assertEqual(resources.get("pods"), "8")
+            self.assertEqual(resources.get("hardware.kube32.io/ipc"), "8")
+            self.assertEqual(resources.get("hardware.kube32.io/chip-temp"), "8")
+            self.assertNotIn(None, resources.values())
+
     def test_get_single_node(self):
         """
         Verify GET /api/v1/nodes/{name} returns individual node specification.

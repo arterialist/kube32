@@ -120,6 +120,7 @@ Kubelet::Kubelet(const KubeletConfig& config,
     status_reporter_ = std::make_unique<NodeStatusReporter>(config_.node_name, config_.node_ip, config_.control_plane);
     status_reporter_->set_labels(config_.node_labels);
     status_reporter_->set_kubelet_port(config_.kubelet_port);
+    status_reporter_->set_max_pods(config_.max_pods);
     metrics_ = create_platform_metrics_provider();
     if (config_.firmware_slots) {
         FirmwareAgentConfig fw = config_.firmware;
@@ -193,7 +194,7 @@ bool Kubelet::start() {
     // initialises Wasm modules (seconds on a 240 MHz core).
     osal::Thread::Config h_cfg;
     h_cfg.name = "k32_kubelet_hb";
-    h_cfg.stack_size = config_.task_stack_in_psram ? 12288 : 8192;   // status patch and metrics sample are written here: 6.1 KB high-water on the worker
+    h_cfg.stack_size = config_.task_stack_in_psram ? 12288 : 8192;   // the status patch (1.5 KB) and the metrics sample (1.5 KB) are written here
     h_cfg.priority = config_.task_priority;
     h_cfg.core_affinity = config_.core_affinity;
     h_cfg.stack_in_psram = config_.task_stack_in_psram;
@@ -264,9 +265,9 @@ void Kubelet::run_loop() {
 
                 if (config_.node_label_source && now - last_label_refresh_ms_ >= config_.node_label_refresh_ms) {
                     refresh_node_labels();
-                } else if (!config_.node_label_source && !annotations_sent_ && now - last_label_refresh_ms_ >= config_.node_label_refresh_ms) {
+                } else if (!config_.node_label_source && now - last_label_refresh_ms_ >= config_.node_label_refresh_ms) {
                     last_label_refresh_ms_ = now;
-                    patch_node_annotations();   // the annotations patch at registration failed
+                    patch_node_annotations();   // what changed (the card's free space), or a patch that failed
                 }
             }
             // Runs unregistered too: an image that cannot reach the API
@@ -306,10 +307,20 @@ void Kubelet::reconcile_node_registration() {
     bool conflict = false;
     bool ok = api_client_->register_node(reg_json, conflict);
     if (ok) {
+        status_reporter_->set_node_resources(NodeStatusReporter::resource_bits(t));
         // The Node object survived this kubelet (a worker reboot): bring its
-        // labels, nodeInfo and capacity up to date with this boot.
+        // labels, nodeInfo and capacity up to date with this boot. The
+        // resources it had then and this boot has not are taken off.
         if (conflict) {
-            api_client_->patch_node_status(config_.node_name, reg_json);
+            if (registration_buf_ && status_reporter_->write_registration_json(reg, t, true)) {
+                reg_json = reg.view();
+            } else {
+                reg_heap = status_reporter_->build_registration_json(t, true);
+                reg_json = reg_heap;
+            }
+            // Until the patch lands the Node may hold any of them: the
+            // heartbeats take them off then
+            if (!api_client_->patch_node_status(config_.node_name, reg_json)) status_reporter_->set_node_resources(~0u);
             drop_stale_node_labels();
         }
         registered_.store(true);
@@ -323,11 +334,24 @@ void Kubelet::reconcile_node_registration() {
     }
 }
 
+// A byte count as a Kubernetes quantity: "512Mi", "1024Ki" when it divides, else bytes
+static std::string bytes_quantity(uint64_t bytes) {
+    if (bytes > 0 && bytes % (1024ULL * 1024ULL) == 0) return std::to_string(bytes / (1024ULL * 1024ULL)) + "Mi";
+    if (bytes > 0 && bytes % 1024ULL == 0) return std::to_string(bytes / 1024ULL) + "Ki";
+    return std::to_string(bytes);
+}
+
 void Kubelet::patch_node_annotations() {
-    if (!config_.node_annotation_source && config_.node_annotations.empty()) return;
     std::map<std::string, std::string> found;
     if (config_.node_annotation_source) found = config_.node_annotation_source();
     found.insert(config_.node_annotations.begin(), config_.node_annotations.end());
+    // The card's size and free space, measured; free space in whole MiB
+    // (rounded down), so that writes of a few KB do not rewrite the Node
+    const hal::SdInfo sd = hal::sd_info();
+    if (sd.mounted) {
+        found[kAnnotationSdCapacity] = bytes_quantity(sd.total_bytes);
+        found[kAnnotationSdFree] = std::to_string(sd.free_bytes >> 20) + "Mi";
+    }
     if (found == found_annotations_ && annotations_sent_) return;
     if (registered_.load()) {
         std::string patch = "{\"metadata\":{\"annotations\":{";
@@ -339,6 +363,12 @@ void Kubelet::patch_node_annotations() {
         for (const auto& kv : found_annotations_) {
             if (found.count(kv.first)) continue;
             patch += (first ? "\"" : ",\"") + kv.first + "\":null";
+            first = false;
+        }
+        // Card annotations a Node from an earlier boot may still carry
+        for (const char* key : {kAnnotationSdCapacity, kAnnotationSdFree}) {
+            if (found.count(key) || found_annotations_.count(key) || annotations_sent_) continue;
+            patch += (first ? "\"" : ",\"") + std::string(key) + "\":null";
             first = false;
         }
         patch += "}}}";
@@ -442,8 +472,10 @@ void Kubelet::report_heartbeat() {
     bool memory_pressure = (t.free_heap_bytes < config_.memory_pressure_threshold_bytes);
     time_conditions(t, &memory_pressure);
     // Written on this thread's stack; a patch that does not fit (a board
-    // with an unusual set of resources) is built on the heap instead
-    char patch_buf[1024];
+    // with an unusual set of resources, or one whose resources changed) is
+    // built on the heap instead. A node with every device grant, PSRAM and
+    // the FirmwareUpdate condition, all with their times, needs about 1.2 KB.
+    char patch_buf[1536];
     mem::FixedText patch(patch_buf);
     const bool patched = status_reporter_->write_heartbeat_patch_json(patch, t, memory_pressure)
         ? api_client_->patch_node_status(config_.node_name, patch.view())
@@ -462,6 +494,7 @@ void Kubelet::report_heartbeat() {
         }
     } else {
         heartbeat_failures_ = 0;
+        status_reporter_->set_node_resources(NodeStatusReporter::resource_bits(t));
         push_metrics_sample();
     }
     if (firmware_) firmware_->on_heartbeat(patched, t.ready, now_ms);
@@ -716,7 +749,8 @@ void Kubelet::sync_assigned_pods() {
         }
         if (it == active_pods_.end()) {
             LocalPodRecord history;
-            start_pod_guarded(st.pod, st.manifest, history_from_status(st.pod, history) ? &history : nullptr);
+            if (admitted_pods() >= config_.max_pods) reject_out_of_pods(st.pod);
+            else start_pod_guarded(st.pod, st.manifest, history_from_status(st.pod, history) ? &history : nullptr);
         } else {
             // Tried again once due: a crashed container after its back-off, a
             // container whose ConfigMap or Secret may exist by now, a pod the
@@ -744,6 +778,33 @@ void Kubelet::sync_assigned_pods() {
     // first one is announced right away instead of at the next heartbeat.
     const uint64_t done = osal::System::get_uptime_ms();
     if (last_sync_ok_ms_.exchange(done > 0 ? done : 1) == 0) heartbeat_due_.store(true);
+}
+
+uint32_t Kubelet::admitted_pods() const {
+    uint32_t n = 0;
+    for (const auto& kv : active_pods_) {
+        const PodExecutionPhase phase = kv.second.execution_phase;
+        if (phase != PodExecutionPhase::Completed && phase != PodExecutionPhase::Failed) ++n;
+    }
+    return n;
+}
+
+void Kubelet::reject_out_of_pods(const models::KubePod& pod) {
+    LocalPodRecord rec;
+    rec.name = pod.name;
+    rec.namespace_name = pod.namespace_name;
+    rec.uid = pod.uid;
+    rec.image = pod.image;
+    rec.container_name = pod.container_name.empty() ? pod.name : pod.container_name;
+    rec.execution_phase = PodExecutionPhase::Failed;
+    rec.last_error_message = "Pod was rejected: Node didn't have enough resource: pods, requested: 1, used: " +
+                             std::to_string(admitted_pods()) + ", capacity: " + std::to_string(config_.max_pods);
+    active_pods_[pod.namespace_name + "/" + pod.name] = rec;
+    std::cout << "[KUBELET] " << rec.namespace_name << "/" << rec.name << ": " << rec.last_error_message << std::endl;
+    api_client_->patch_pod_status(pod.namespace_name, pod.name,
+                                  "{\"status\":{\"phase\":\"Failed\",\"reason\":\"OutOfpods\",\"message\":\"" + json_escape(rec.last_error_message) +
+                                  "\",\"conditions\":[{\"type\":\"Ready\",\"status\":\"False\",\"reason\":\"PodFailed\"}]}}");
+    record_pod_event(rec, "OutOfpods", rec.last_error_message, true);
 }
 
 void Kubelet::start_pod_guarded(const models::KubePod& pod, const std::string& manifest_json, const LocalPodRecord* previous) {

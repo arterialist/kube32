@@ -321,8 +321,10 @@ void test_kubelet_patches_annotation() {
     NodeClient* c = client.get();
     kubelet::Kubelet k(cfg, *rt, std::move(client));
     k.reconcile_node_registration();
-    // Sent after registering, as an escaped JSON string
-    const std::string sent = R"({"metadata":{"annotations":{"kube32.io/i2c-devices":"[{\"bus\":0,\"mux\":\"0x70\",\"channel\":2,\"address\":\"0x77\",\"chip\":\"BME688\",\"driver\":\"bme688\"}]"}}})";
+    // Sent after registering, as an escaped JSON string; the card annotations
+    // a Node from an earlier boot may carry are removed (no card here)
+    const std::string sent = R"({"metadata":{"annotations":{"kube32.io/i2c-devices":"[{\"bus\":0,\"mux\":\"0x70\",\"channel\":2,\"address\":\"0x77\",\"chip\":\"BME688\",\"driver\":\"bme688\"}]",)"
+                             R"("kube32.io/sd-capacity":null,"kube32.io/sd-free":null}}})";
     assert(std::find(c->patches.begin(), c->patches.end(), sent) != c->patches.end());
     c->patches.clear();
     k.refresh_node_labels();

@@ -31,6 +31,7 @@ Candidate nodes must pass each filter in order:
 4. `requests.memory`, or `limits.memory` if requests are omitted, fits within allocatable `memory`. Pods without a memory declaration default to 16 KiB.
 5. `esp32.io/psram` or `esp.io/psram` fits within allocatable PSRAM.
 6. `esp32.io/gpio`, `esp32.io/i2c`, `esp32.io/uart`, `esp32.io/adc`, `esp32.io/rmt-tx`, and `esp32.io/rmt-rx` counts fit within allocatable limits. Named buses such as `esp32.io/i2c-bus-0` or `esp32.io/uart-1` each consume one bus from the node's count.
+7. The node runs fewer pods than its allocatable `pods` ("Too many pods"); every bound pod that has not finished counts. The filter runs after the node selector, before memory. The kubelet admits at most `pods` pods at once (8) and fails one more with reason `OutOfpods`, as the Kubernetes kubelet does past `maxPods`. Eight is the number of pods for which the runtime keeps a log ring.
 
 Quantities follow Kubernetes: `Ki`, `Mi`, `Gi` are binary, `k`, `M`, `G` decimal, and `m` is milli. Unrecognized suffixes count as 0.
 

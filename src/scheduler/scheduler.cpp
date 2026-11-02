@@ -161,6 +161,7 @@ ResourceSpec extract_node_allocatable(const std::string& node_json) {
     spec.rmt_tx_channels = static_cast<uint32_t>(parse_quantity(alloc->get_string("esp.io/rmt-tx", alloc->get_string("esp32.io/rmt-tx", ""))));
     spec.rmt_rx_channels = static_cast<uint32_t>(parse_quantity(alloc->get_string("esp.io/rmt-rx", alloc->get_string("esp32.io/rmt-rx", ""))));
     spec.psram_bytes = parse_quantity(alloc->get_string("esp.io/psram", alloc->get_string("esp32.io/psram", "")));
+    spec.pods = static_cast<uint32_t>(parse_quantity(alloc->get_string("pods", "")));
 
     return spec;
 }
@@ -216,6 +217,7 @@ static std::map<std::string, ResourceSpec> allocated_by_node(storage::Store& sto
         const models::JsonValue* status = doc.get("status");
         std::string phase = status ? status->get_string("phase", "") : "";
         if (phase != "Running" && phase != "Pending") continue;
+        allocated[node->first].pods++;   // a pod count is not in any report: every pod counts
         const bool reflected = phase == "Running" && container_running(status) && node_rv > 0 && resource_version_of(doc) < node_rv;
         if (reflected) continue;
 
@@ -381,6 +383,17 @@ bool NodePeripheralPredicate::evaluate(const std::string&,
     return true;
 }
 
+bool NodePodCountPredicate::evaluate(const std::string&,
+                                     const std::string&,
+                                     const ResourceSpec&,
+                                     const ResourceSpec& node_allocatable,
+                                     const ResourceSpec& node_allocated,
+                                     std::string& failure_reason) {
+    if (node_allocatable.pods == 0 || node_allocated.pods < node_allocatable.pods) return true;
+    failure_reason = "Too many pods";
+    return false;
+}
+
 bool NodeSelectorPredicate::evaluate(const std::string& pod_json,
                                      const std::string& node_json,
                                      const ResourceSpec&,
@@ -526,6 +539,7 @@ public:
         add_predicate(std::make_shared<NodeSchedulablePredicate>());
         add_predicate(std::make_shared<NodeNamePredicate>());
         add_predicate(std::make_shared<NodeSelectorPredicate>());
+        add_predicate(std::make_shared<NodePodCountPredicate>());
         add_predicate(std::make_shared<NodeMemoryPredicate>());
         add_predicate(std::make_shared<NodePSRAMPredicate>());
         add_predicate(std::make_shared<NodePeripheralPredicate>());

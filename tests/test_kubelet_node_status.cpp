@@ -4,12 +4,15 @@
 #include "runtime/wasm_runtime.hpp"
 #include "runtime/image_registry.hpp"
 #include "hal/capability_firewall.hpp"
+#include "hal/sd_card.hpp"
 #include "osal/system.hpp"
+#include <unistd.h>
 
 #include <iostream>
 #include <atomic>
 #include <cassert>
 #include <cstdio>
+#include <cstring>
 #include <cstdlib>
 #include <new>
 #include <vector>
@@ -50,11 +53,13 @@ public:
     std::string last_pod_status_patch;
     std::vector<std::pair<std::string, std::string>> pod_status_history; // (pod, patch)
 
+    bool node_exists{false};   // the Node outlived the kubelet: registration answers 409
+
     bool register_node(std::string_view node_json, bool& out_conflict) override {
         register_count++;
         registered = true;
         last_node_registration_json = node_json;
-        out_conflict = false;
+        out_conflict = node_exists;
         return true;
     }
 
@@ -600,18 +605,25 @@ void test_dynamic_node_telemetry() {
 // build_heartbeat_patch_json's. One that does not fit is reported.
 void test_heartbeat_patch_in_fixed_buffer() {
     std::cout << "\n[TEST] Heartbeat patch in a fixed buffer..." << std::endl;
+    // A node with every device grant, PSRAM, all condition times: the
+    // largest steady-state heartbeat
     NodeStatusReporter reporter("test-node-01", "192.168.4.2");
+    reporter.set_max_pods(8);
     NodeTelemetry t = reporter.collect_telemetry();
     t.total_psram_bytes = 2u << 20;
     t.free_psram_bytes = 1536u << 10;
-    t.sd_present = true;
-    t.sd_total_bytes = 31154688ull << 10;
-    t.sd_free_bytes = 29786912ull << 10;
+    t.sd_present = t.has_display = t.has_keyboard = t.has_speaker = true;
     t.ready = true;
     t.ready_reason = "KubeletReady";
     snprintf(t.ready_message, sizeof(t.ready_message), "kubelet is posting ready status");
+    t.heartbeat_unix_ms = t.ready_transition_unix_ms = t.memory_pressure_transition_unix_ms = 1793620800000ULL;
+    t.firmware_reported = true;
+    t.firmware_transition_unix_ms = 1793620800000ULL;
+    snprintf(t.firmware_reason, sizeof(t.firmware_reason), "UpdateFailed");
+    std::memset(t.firmware_message, 'm', sizeof(t.firmware_message) - 1);
+    reporter.set_node_resources(NodeStatusReporter::resource_bits(t));
 
-    char storage[1024];
+    char storage[1536];   // Kubelet::report_heartbeat's buffer
     kube32::mem::FixedText patch(storage);
     g_allocs = 0;
     g_count_allocs = true;
@@ -620,10 +632,14 @@ void test_heartbeat_patch_in_fixed_buffer() {
     assert(fits && g_allocs.load() == 0);
     const std::string buf(patch.view());
     assert(buf == reporter.build_heartbeat_patch_json(t, false));
-    assert(buf.find("{\"type\":\"Ready\",\"status\":\"True\",\"reason\":\"KubeletReady\",\"message\":\"kubelet is posting ready status\"}") != std::string::npos);
+    assert(buf.find("{\"type\":\"Ready\",\"status\":\"True\",\"reason\":\"KubeletReady\",\"message\":\"kubelet is posting ready status\","
+                    "\"lastHeartbeatTime\":\"2026-11-02T12:00:00Z\",\"lastTransitionTime\":\"2026-11-02T12:00:00Z\"}") != std::string::npos);
     assert(buf.find("\"reason\":\"KubeletHasSufficientMemory\"") != std::string::npos);
     assert(buf.find("\"esp32.io/psram\":\"1536Ki\"") != std::string::npos);
-    assert(buf.find("\"hardware.kube32.io/sd\":\"29786912Ki\"") != std::string::npos);
+    assert(buf.find("\"pods\":\"8\"") != std::string::npos);
+    assert(buf.find("\"hardware.kube32.io/sd\":\"8\"") != std::string::npos);
+    assert(buf.find("\"hardware.kube32.io/tft-display\":\"8\"") != std::string::npos);
+    assert(buf.find("\"capacity\"") == std::string::npos);   // unchanged: allocatable only
     char small[64];
     kube32::mem::FixedText cut(small);
     assert(!reporter.write_heartbeat_patch_json(cut, t, false) && cut.overflowed() && cut.size() <= sizeof(small));
@@ -680,6 +696,91 @@ void test_condition_times() {
     std::cout << "[PASS] Ready since " << ready_since << ", MemoryPressure since " << pressure_since << std::endl;
 }
 
+// The JSON object `list` ("capacity" or "allocatable") in a Node or patch
+static std::string resource_list(const std::string& json, const char* list) {
+    kube32::models::JsonValue doc;
+    std::string err;
+    assert(kube32::models::parse_json(json, doc, err));
+    const kube32::models::JsonValue* st = doc.get("status");
+    const kube32::models::JsonValue* l = st ? st->get(list) : nullptr;
+    return l ? l->to_string() : std::string();
+}
+
+// pods, the device grants as counts, the card's size and free space as
+// annotations; a resource the node no longer has leaves the Node: null in a
+// heartbeat after the card went, and in the registration patch over a Node
+// from an earlier boot
+void test_node_resources_come_and_go() {
+    std::cout << "\n[TEST] Node resources come and go..." << std::endl;
+    kube32::hal::CapabilityFirewall::instance().reset();
+    char dir[] = "/tmp/k32_node_sd_XXXXXX";
+    assert(mkdtemp(dir));
+    setenv("KUBE32_SD_ROOT", dir, 1);
+    kube32::hal::sd_unmount();
+    assert(kube32::hal::sd_mount());
+
+    DeepControlledRuntime rt;
+    auto owned = std::make_unique<RecordingKubeClient>();
+    RecordingKubeClient* client = owned.get();
+    KubeletConfig cfg;
+    cfg.node_name = "test-node-01";
+    cfg.node_label_source = [] { return std::map<std::string, std::string>(); };
+    Kubelet kubelet(cfg, rt, std::move(owned));
+    kubelet.reconcile_node_registration();
+    const std::string reg = client->last_node_registration_json;
+    for (const char* list : {"capacity", "allocatable"}) {
+        const std::string l = resource_list(reg, list);
+        assert(l.find("\"pods\":\"8\"") != std::string::npos);
+        assert(l.find("\"hardware.kube32.io/ipc\":\"8\"") != std::string::npos);
+        assert(l.find("\"hardware.kube32.io/chip-temp\":\"8\"") != std::string::npos);
+        assert(l.find("\"hardware.kube32.io/sd\":\"8\"") != std::string::npos);
+        assert(l.find("tft-display") == std::string::npos && l.find("null") == std::string::npos);   // a generic board
+    }
+    bool annotated = false;
+    for (const auto& p : client->all_node_patches) {
+        annotated = annotated || (p.find("\"kube32.io/sd-capacity\":\"") != std::string::npos && p.find("\"kube32.io/sd-free\":\"") != std::string::npos);
+    }
+    assert(annotated);
+
+    // The card goes: the next heartbeat takes the grant off, capacity included
+    kube32::hal::sd_unmount();
+    kubelet.report_heartbeat();
+    std::string hb = client->last_node_patch;
+    assert(resource_list(hb, "allocatable").find("\"hardware.kube32.io/sd\":null") != std::string::npos);
+    assert(resource_list(hb, "capacity").find("\"hardware.kube32.io/sd\":null") != std::string::npos);
+    kubelet.report_heartbeat();
+    hb = client->last_node_patch;
+    assert(hb.find("\"capacity\"") == std::string::npos && hb.find("hardware.kube32.io/sd") == std::string::npos);
+    client->all_node_patches.clear();
+    kubelet.refresh_node_labels();   // patches the annotations as well
+    assert(!client->all_node_patches.empty());
+    assert(client->all_node_patches.back().find("\"kube32.io/sd-capacity\":null") != std::string::npos);
+
+    // A new boot over the Node: everything this boot lacks is taken off
+    auto owned2 = std::make_unique<RecordingKubeClient>();
+    RecordingKubeClient* client2 = owned2.get();
+    client2->node_exists = true;
+    Kubelet rebooted(cfg, rt, std::move(owned2));
+    rebooted.reconcile_node_registration();
+    std::string over;   // the registration as a patch
+    for (const auto& p : client2->all_node_patches) {
+        if (over.empty() && p.find("\"nodeInfo\"") != std::string::npos) over = p;
+    }
+    assert(!over.empty());
+    for (const char* list : {"capacity", "allocatable"}) {
+        const std::string l = resource_list(over, list);
+        assert(l.find("\"hardware.kube32.io/sd\":null") != std::string::npos);
+        assert(l.find("\"hardware.kube32.io/tft-display\":null") != std::string::npos);
+        assert(l.find("\"hardware.kube32.io/ipc\":\"8\"") != std::string::npos);
+    }
+    bool dropped = false;
+    for (const auto& p : client2->all_node_patches) dropped = dropped || p.find("\"kube32.io/sd-free\":null") != std::string::npos;
+    assert(dropped);
+    unsetenv("KUBE32_SD_ROOT");
+    rmdir(dir);
+    std::cout << "[PASS]" << std::endl;
+}
+
 // Registering again over a Node that survived (after a reboot, or after
 // rejected heartbeats on a node short of memory) patches it with the
 // registration: a cordon set with kubectl cordon stays
@@ -718,6 +819,7 @@ int main() {
     test_heartbeat_patch_in_fixed_buffer();
     test_registration_keeps_cordon();
     test_condition_times();
+    test_node_resources_come_and_go();
 
     std::cout << "\n==================================================================" << std::endl;
     std::cout << " ALL KUBELET NODE STATUS TESTS PASSED                          " << std::endl;

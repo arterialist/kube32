@@ -56,10 +56,10 @@ K32_SD /sd/kube32/volumes/notes/boot.log 29
 K32_OK sd
 ```
 
-Nodes with a mounted card report total size as `capacity` and free space as `allocatable` under the `hardware.kube32.io/sd` extended resource at each heartbeat:
+A node with a mounted card advertises the `hardware.kube32.io/sd` grant as a count, as pods request it: any number of pods share the card and each holds the grant once, so capacity and allocatable are the node's `pods` capacity. The card's size and free space are Node annotations, measured every 10 s: `kube32.io/sd-capacity` holds the size, and `kube32.io/sd-free` the free space in whole MiB, rounded down. A card that is no longer mounted takes the grant and the annotations off the Node:
 
 ```
-kubectl --context kube32 get node esp32-node-02 -o jsonpath='{.status.capacity.hardware\.kube32\.io/sd} {.status.allocatable.hardware\.kube32\.io/sd}'
+kubectl --context kube32 get node <node> -o jsonpath='{.status.allocatable.hardware\.kube32\.io/sd} {.metadata.annotations.kube32\.io/sd-capacity} {.metadata.annotations.kube32\.io/sd-free}'
 ```
 
 ## Control plane object store

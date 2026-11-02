@@ -1105,6 +1105,8 @@ void cluster_task(void* pv) {
             profile.uart_pins[1] = {2, 1};    // Grove TX, RX
             profile.rmt_tx_pin_mask = 1ULL << 44;
             profile.rmt_tx_default_pin = 44;  // IR LED
+            // ST7789 panel, matrix keyboard, I2S speaker
+            profile.onboard_devices = kube32::hal::KUBE32_CAP_DISPLAY | kube32::hal::KUBE32_CAP_KEYBOARD | kube32::hal::KUBE32_CAP_SPEAKER;
         }
         kube32::hal::CapabilityFirewall::instance().set_board_profile(profile);
     }

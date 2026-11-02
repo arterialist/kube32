@@ -7,6 +7,7 @@
 #include "api/version_info.hpp"
 
 #include <charconv>
+#include <cstring>
 
 namespace kube32::kubelet {
 
@@ -94,22 +95,56 @@ NodeTelemetry NodeStatusReporter::collect_telemetry() const {
     const uint32_t rmt_rx_held = fw.get_allocated_rmt_rx_count();
     t.allocatable_rmt_rx_count = t.total_rmt_rx_count > rmt_rx_held ? t.total_rmt_rx_count - rmt_rx_held : 0;
 
-    hal::SdInfo sd = hal::sd_info();
-    t.sd_present = sd.mounted;
-    t.sd_total_bytes = sd.mounted ? sd.total_bytes : 0;
-    t.sd_free_bytes = sd.mounted ? sd.free_bytes : 0;
+    t.pods_capacity = max_pods_;
+    t.sd_present = hal::sd_is_mounted();
+    const uint32_t onboard = fw.onboard_devices();
+    t.has_display = (onboard & hal::KUBE32_CAP_DISPLAY) != 0;
+    t.has_keyboard = (onboard & hal::KUBE32_CAP_KEYBOARD) != 0;
+    t.has_speaker = (onboard & hal::KUBE32_CAP_SPEAKER) != 0;
+    // The ESP32-S3's own sensor (hal/chip_temp.hpp); the simulator's HAL
+    // stands in for it
+    t.has_chip_temp = true;
 
     return t;
 }
 
+// Resources a node may have in one boot and not in another, or lose while
+// it runs (a card taken out): a bit each, in this order
+static const char* const kOptionalResources[] = {
+    "esp.io/gpio", "esp32.io/gpio", "esp.io/i2c", "esp32.io/i2c", "esp.io/uart", "esp32.io/uart",
+    "esp.io/adc", "esp32.io/adc", "esp.io/rmt-tx", "esp32.io/rmt-tx", "esp.io/rmt-rx", "esp32.io/rmt-rx",
+    "hardware.kube32.io/ipc", "hardware.kube32.io/tft-display", "hardware.kube32.io/keyboard",
+    "hardware.kube32.io/speaker", "hardware.kube32.io/chip-temp", "hardware.kube32.io/sd",
+};
+static constexpr size_t kOptionalCount = sizeof(kOptionalResources) / sizeof(kOptionalResources[0]);
+static_assert(kOptionalCount <= 32, "one bit per resource in a uint32_t");
+
+static uint32_t optional_bit(const char* name) {
+    for (size_t i = 0; i < kOptionalCount; ++i) {
+        if (std::strcmp(kOptionalResources[i], name) == 0) return 1u << i;
+    }
+    return 0;
+}
+
+// Takes the JSON and keeps nothing: what a resource list would hold
+struct DiscardJson {
+    DiscardJson& operator+=(const char*) { return *this; }
+    DiscardJson& operator+=(char) { return *this; }
+    void append(const char*, size_t) {}
+};
+
 // One resource list (capacity or allocatable). Resources the node does not
-// have are left out. Written piece by piece: no temporary strings.
+// have are left out, and those of `clear_bits` among them set to null (a
+// patch takes them off the Node). Returns the optional resources written.
+// Written piece by piece: no temporary strings.
 template <typename Out>
-static void append_resources(Out& json, const NodeTelemetry& t, bool capacity) {
+static uint32_t append_resources(Out& json, const NodeTelemetry& t, bool capacity, uint32_t clear_bits = 0) {
     bool first = true;
+    uint32_t written = 0;
     auto key = [&](const char* name) {
         if (!first) json += ",";
         first = false;
+        written |= optional_bit(name);
         json += "\"";
         json += name;
         json += "\":\"";
@@ -131,6 +166,9 @@ static void append_resources(Out& json, const NodeTelemetry& t, bool capacity) {
     };
     if (t.memory_capacity_bytes > 0) kib("memory", capacity ? t.memory_capacity_bytes : t.memory_allocatable_bytes);
     if (t.cpu_cores > 0) count("cpu", t.cpu_cores);
+    // As Kubernetes counts pods: allocatable is capacity, the scheduler and
+    // the kubelet's admission count the pods on the node against it
+    if (t.pods_capacity > 0) count("pods", t.pods_capacity);
     if (t.total_gpio_count > 0) {
         const uint64_t v = capacity ? t.total_gpio_count : t.allocatable_gpio_count;
         count("esp.io/gpio", v);
@@ -167,8 +205,30 @@ static void append_resources(Out& json, const NodeTelemetry& t, bool capacity) {
             else kib(name, t.free_psram_bytes);
         }
     }
-    // The card: capacity is its size, allocatable the free space, both measured
-    if (t.sd_present) quantity("hardware.kube32.io/sd", capacity ? t.sd_total_bytes : t.sd_free_bytes);
+    // Device grants: any number of pods share a device and each holds a
+    // grant at most once, so as many pods as the node runs can hold one
+    if (t.pods_capacity > 0) {
+        count("hardware.kube32.io/ipc", t.pods_capacity);
+        if (t.has_display) count("hardware.kube32.io/tft-display", t.pods_capacity);
+        if (t.has_keyboard) count("hardware.kube32.io/keyboard", t.pods_capacity);
+        if (t.has_speaker) count("hardware.kube32.io/speaker", t.pods_capacity);
+        if (t.has_chip_temp) count("hardware.kube32.io/chip-temp", t.pods_capacity);
+        if (t.sd_present) count("hardware.kube32.io/sd", t.pods_capacity);
+    }
+    for (size_t i = 0; i < kOptionalCount; ++i) {
+        if (!(clear_bits & ~written & (1u << i))) continue;
+        if (!first) json += ",";
+        first = false;
+        json += "\"";
+        json += kOptionalResources[i];
+        json += "\":null";
+    }
+    return written;
+}
+
+uint32_t NodeStatusReporter::resource_bits(const NodeTelemetry& telemetry) {
+    DiscardJson none;
+    return append_resources(none, telemetry, true);
 }
 
 // ,"lastHeartbeatTime":"...","lastTransitionTime":"..." for the times known
@@ -216,7 +276,7 @@ static void append_firmware_condition(Out& json, const NodeTelemetry& t) {
 }
 
 template <typename Out>
-void NodeStatusReporter::append_registration(Out& json, const NodeTelemetry& telemetry) const {
+void NodeStatusReporter::append_registration(Out& json, const NodeTelemetry& telemetry, bool as_patch) const {
     json += "{\"kind\":\"Node\",\"apiVersion\":\"v1\",";
     json += "\"metadata\":{\"name\":\"";
     json += node_name_;
@@ -278,28 +338,30 @@ void NodeStatusReporter::append_registration(Out& json, const NodeTelemetry& tel
     json += "\",\"containerRuntimeVersion\":\"wasm3://";
     json += M3_VERSION;
     json += "\"},";
+    // Over a Node from an earlier boot, every resource this boot does not have goes
+    const uint32_t clear = as_patch ? ~0u : 0u;
     json += "\"capacity\":{";
-    append_resources(json, telemetry, true);
+    append_resources(json, telemetry, true, clear);
     json += "},\"allocatable\":{";
-    append_resources(json, telemetry, false);
+    append_resources(json, telemetry, false, clear);
     json += "}}}";
 }
 
-std::string NodeStatusReporter::build_registration_json(const NodeTelemetry& telemetry) const {
+std::string NodeStatusReporter::build_registration_json(const NodeTelemetry& telemetry, bool as_patch) const {
     std::string json;
     json.reserve(1024);
-    append_registration(json, telemetry);
+    append_registration(json, telemetry, as_patch);
     return json;
 }
 
-bool NodeStatusReporter::write_registration_json(mem::FixedText& out, const NodeTelemetry& telemetry) const {
+bool NodeStatusReporter::write_registration_json(mem::FixedText& out, const NodeTelemetry& telemetry, bool as_patch) const {
     out.clear();
-    append_registration(out, telemetry);
+    append_registration(out, telemetry, as_patch);
     return !out.overflowed();
 }
 
 template <typename Out>
-static void append_heartbeat_patch(Out& json, const NodeTelemetry& telemetry, bool memory_pressure) {
+void NodeStatusReporter::append_heartbeat_patch(Out& json, const NodeTelemetry& telemetry, bool memory_pressure) const {
     json += "{\"status\":{";
     json += "\"conditions\":[";
     append_ready_condition(json, telemetry);
@@ -312,8 +374,15 @@ static void append_heartbeat_patch(Out& json, const NodeTelemetry& telemetry, bo
     json += "}";
     append_firmware_condition(json, telemetry);
     json += "],";
+    // Capacity only when the node's resources changed (a card taken out or
+    // put in): then, as allocatable, without the ones it no longer has
+    const uint32_t on_node = node_resources_.load();
     json += "\"allocatable\":{";
-    append_resources(json, telemetry, false);
+    const uint32_t has = append_resources(json, telemetry, false, on_node);
+    if (has != on_node) {
+        json += "},\"capacity\":{";
+        append_resources(json, telemetry, true, on_node);
+    }
     json += "}}}";
 }
 

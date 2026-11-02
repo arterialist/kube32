@@ -99,19 +99,17 @@ void test_hal_with_env() {
     assert(info.type.find("simulated") != std::string::npos);
     assert(info.error.empty());
 
+    // The grant is a count, as pods request it: every pod the node runs can
+    // hold it. The card's size and free space are Node annotations
+    // (Kubelet::patch_node_annotations).
     kubelet::NodeStatusReporter reporter("host-node", "127.0.0.1");
+    reporter.set_max_pods(8);
     kubelet::NodeTelemetry t = reporter.collect_telemetry();
-    assert(t.sd_present && t.sd_free_bytes == info.free_bytes);
+    assert(t.sd_present);
     std::string reg = reporter.build_registration_json(t);
-    assert(reg.find("\"hardware.kube32.io/sd\":\"") != std::string::npos);
+    assert(reg.find("\"hardware.kube32.io/sd\":\"8\"") != std::string::npos);
     std::string hb = reporter.build_heartbeat_patch_json(t, false);
-    assert(hb.find("\"hardware.kube32.io/sd\":\"") != std::string::npos);
-    // allocatable carries the measured free space as a quantity
-    std::string key = "\"hardware.kube32.io/sd\":\"";
-    size_t at = hb.find(key) + key.size();
-    std::string q = hb.substr(at, hb.find('"', at) - at);
-    uint64_t parsed = models::parse_quantity(q);
-    assert(parsed == info.free_bytes);
+    assert(hb.find("\"hardware.kube32.io/sd\":\"8\"") != std::string::npos);
     std::cout << "[PASS] test_hal_with_env" << std::endl;
 }
 
