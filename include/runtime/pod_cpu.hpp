@@ -28,7 +28,7 @@ public:
     uint64_t finish();
 
 private:
-    PodCpuRegion* parent_;
+    PodCpuRegion* parent_{nullptr};
     uint64_t start_us_{0};
     uint64_t nested_us_{0};
     bool measured_{false};

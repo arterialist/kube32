@@ -62,6 +62,8 @@ public:
     static uint64_t get_time_us();
     static const char* get_current_name();
     static int get_current_core();
+    // Identifies the calling thread while it runs (its task or pthread)
+    static uintptr_t current_id();
 
 private:
     struct Impl;

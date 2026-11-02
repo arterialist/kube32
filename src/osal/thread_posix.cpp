@@ -303,6 +303,10 @@ int Thread::get_current_core() {
     return xPortGetCoreID();
 }
 
+uintptr_t Thread::current_id() {
+    return reinterpret_cast<uintptr_t>(xTaskGetCurrentTaskHandle());
+}
+
 } // namespace kube32::osal
 
 #else // Host POSIX implementation
@@ -548,6 +552,10 @@ const char* Thread::get_current_name() {
 
 int Thread::get_current_core() {
     return 0; // Host simulation runs in OS scheduler pool
+}
+
+uintptr_t Thread::current_id() {
+    return (uintptr_t)pthread_self();   // a pointer on macOS, an integer on Linux
 }
 
 } // namespace kube32::osal

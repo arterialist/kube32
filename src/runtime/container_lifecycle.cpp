@@ -22,6 +22,7 @@
 #include <iostream>
 #include <cstring>
 #include <algorithm>
+#include <vector>
 #include <mutex>
 #if defined(ESP_PLATFORM)
 #include "freertos/FreeRTOS.h"
@@ -35,28 +36,69 @@
 
 namespace kube32::runtime {
 
-static thread_local PodCpuRegion* t_cpu_region = nullptr;
-static thread_local std::atomic<uint64_t>* t_nested_cpu_sink = nullptr;
+// Per thread: the innermost PodCpuRegion and the pod thread's sink. A table
+// rather than thread-local storage: nested regions run on the shared
+// interpreter stack, where ESP-IDF rules thread-local storage out
+// (esp_execute_shared_stack_function). Holds the threads inside a region and
+// the pod threads, a few entries.
+namespace {
+struct CpuThread {
+    uintptr_t thread;
+    PodCpuRegion* region;
+    std::atomic<uint64_t>* sink;
+};
+std::mutex s_cpu_mutex;
+std::vector<CpuThread> s_cpu_threads;
 
-PodCpuRegion::PodCpuRegion() : parent_(t_cpu_region) {
+CpuThread& cpu_thread_locked(uintptr_t thread) {
+    for (auto& t : s_cpu_threads) {
+        if (t.thread == thread) return t;
+    }
+    s_cpu_threads.push_back(CpuThread{thread, nullptr, nullptr});
+    return s_cpu_threads.back();
+}
+
+void drop_idle_locked(uintptr_t thread) {
+    s_cpu_threads.erase(std::remove_if(s_cpu_threads.begin(), s_cpu_threads.end(), [thread](const CpuThread& t) {
+        return t.thread == thread && !t.region && !t.sink;
+    }), s_cpu_threads.end());
+}
+} // namespace
+
+PodCpuRegion::PodCpuRegion() {
     measured_ = osal::Thread::current_cpu_time_us(start_us_);
-    t_cpu_region = this;
+    std::lock_guard<std::mutex> lock(s_cpu_mutex);
+    CpuThread& t = cpu_thread_locked(osal::Thread::current_id());
+    parent_ = t.region;
+    t.region = this;
 }
 
 uint64_t PodCpuRegion::finish() {
     if (done_) return 0;
     done_ = true;
-    t_cpu_region = parent_;
     uint64_t now = 0;
-    if (!measured_ || !osal::Thread::current_cpu_time_us(now) || now < start_us_) return 0;
+    const bool measured = measured_ && osal::Thread::current_cpu_time_us(now) && now >= start_us_;
+    std::atomic<uint64_t>* sink = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(s_cpu_mutex);
+        const uintptr_t id = osal::Thread::current_id();
+        CpuThread& t = cpu_thread_locked(id);
+        t.region = parent_;
+        sink = t.sink;
+        drop_idle_locked(id);
+    }
+    if (!measured) return 0;
     const uint64_t total = now - start_us_;
-    if (parent_) parent_->nested_us_ += total;
-    else if (t_nested_cpu_sink) t_nested_cpu_sink->fetch_add(total);
+    if (parent_) parent_->nested_us_ += total;   // the parent is on this thread
+    else if (sink) sink->fetch_add(total);
     return total > nested_us_ ? total - nested_us_ : 0;
 }
 
 void set_thread_nested_cpu_sink(std::atomic<uint64_t>* sink) {
-    t_nested_cpu_sink = sink;
+    std::lock_guard<std::mutex> lock(s_cpu_mutex);
+    const uintptr_t id = osal::Thread::current_id();
+    cpu_thread_locked(id).sink = sink;
+    drop_idle_locked(id);
 }
 
 // Held while a call runs on the shared interpreter stack, and while a module
