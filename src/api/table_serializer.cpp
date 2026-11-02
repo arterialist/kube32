@@ -644,7 +644,7 @@ std::string TableSerializer::build_generic_table_json(std::string_view kind, con
                col("UPDATED", 0) + "," + col("AGE", 0) + "," + col("MESSAGE", 1);
     } else if (kind == "Device") {
         out += col("NAME", 0) + "," + col("DRIVER", 0) + "," + col("NODE", 0) + "," + col("ADDRESS", 0) + "," + col("PHASE", 0) + "," +
-               col("AGE", 0) + "," + col("CHIP", 1) + "," + col("POD", 1) + "," + col("MESSAGE", 1);
+               col("AGE", 0) + "," + col("CHIP", 1) + "," + col("POD", 1) + "," + col("ACTIVATION", 1) + "," + col("MESSAGE", 1);
     } else if (kind == "Checkpoint") {
         out += col("NAME", 0) + "," + col("POD", 0) + "," + col("ACTION", 0) + "," + col("PHASE", 0) + "," + col("NODE", 0) + "," +
                col("SIZE", 0) + "," + col("AGE", 0) + "," + col("TARGET", 1) + "," + col("NEW POD", 1) + "," + col("MESSAGE", 1);
@@ -775,8 +775,9 @@ std::string TableSerializer::build_generic_table_json(std::string_view kind, con
             const models::JsonValue* spec = doc.get("spec");
             const models::JsonValue* st = doc.get("status");
             models::DeviceSpec ds;
-            std::string why, address = "<none>";
+            std::string why, address = "<none>", activation = "<none>";
             if (models::parse_device_spec(spec, ds, why)) {
+                activation = ds.activation == models::DeviceActivation::Always ? "Always" : "OnDemand";
                 if (ds.has_i2c) {
                     address = models::i2c_location_text(ds.i2c);
                 } else if (!ds.pins.empty()) {
@@ -790,7 +791,7 @@ std::string TableSerializer::build_generic_table_json(std::string_view kind, con
             };
             const std::string node = field("nodeName", spec ? spec->get_string("nodeName", "") : "");
             cells = {name, spec ? spec->get_string("driver", "") : "", node.empty() ? "<none>" : node, address, field("phase", "Pending"), age,
-                     field("chip", "<none>"), field("podName", "<none>"), field("message", "")};
+                     field("chip", "<none>"), field("podName", "<none>"), activation, field("message", "")};
         } else if (kind == "Checkpoint") {
             const models::JsonValue* spec = doc.get("spec");
             const models::JsonValue* st = doc.get("status");

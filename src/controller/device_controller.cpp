@@ -7,6 +7,7 @@
 
 #include <algorithm>
 #include <cstdio>
+#include <cstring>
 #include <set>
 
 namespace kube32::controller {
@@ -125,6 +126,35 @@ const models::DiscoveredPart* reported_part(const std::vector<models::Discovered
     return nullptr;
 }
 
+// A pod that may subscribe to a Device's topic, judged from its JSON text
+bool subscribes_to_devices(const std::string& json) {
+    return json.find(models::kAnnotationEventTopics) != std::string::npos && json.find(models::kDeviceTopicPrefix) != std::string::npos;
+}
+
+// Adds the Devices `pod` subscribes to (device.<name> in its event topics)
+// while it is neither terminating nor finished
+void add_subscriptions(const std::string& json, std::set<std::string>& out) {
+    models::JsonValue pod;
+    std::string err;
+    if (!models::parse_json(json, pod, err) || !pod.is_object()) return;
+    const models::JsonValue* meta = pod.get("metadata");
+    const models::JsonValue* st = pod.get("status");
+    const std::string phase = st ? st->get_string("phase", "") : "";
+    if (!meta || !meta->get_string("deletionTimestamp", "").empty() || phase == "Succeeded" || phase == "Failed") return;
+    const models::JsonValue* ann = meta->get("annotations");
+    const std::string topics = ann ? ann->get_string(models::kAnnotationEventTopics, "") : "";
+    const size_t prefix = std::strlen(models::kDeviceTopicPrefix);
+    for (size_t start = 0; start < topics.size();) {
+        size_t end = topics.find(',', start);
+        if (end == std::string::npos) end = topics.size();
+        size_t a = start, b = end;
+        while (a < b && topics[a] == ' ') ++a;
+        while (b > a && topics[b - 1] == ' ') --b;
+        if (b - a > prefix && topics.compare(a, prefix, models::kDeviceTopicPrefix) == 0) out.insert(topics.substr(a + prefix, b - a - prefix));
+        start = end + 1;
+    }
+}
+
 } // namespace
 
 struct DeviceController::DeviceView {
@@ -143,9 +173,10 @@ DeviceController::DeviceController(storage::Store& store, scheduler::Scheduler* 
       trigger_(store, ReconcileTriggerConfig{config_.reconcile_interval_ms, config_.resync_interval_ms}) {
     trigger_.watch(kDevicePrefix);
     trigger_.watch(kServicePrefix);
+    // Driver pods, and pods that subscribe to a device.<name> topic
     trigger_.watch(kPodPrefix, [](const storage::WatchEvent& ev) {
         const std::string& k = ev.key;
-        return k.size() >= 8 && k.compare(k.size() - 7, 7, kPodSuffix) == 0;
+        return (k.size() >= 8 && k.compare(k.size() - 7, 7, kPodSuffix) == 0) || subscribes_to_devices(ev.json);
     });
     // What load_nodes reads of a Node
     trigger_.watch_fields(kNodePrefix, [](const models::JsonValue& node) {
@@ -248,13 +279,16 @@ void DeviceController::reconcile(uint64_t now) {
     store_.list_extended(kDevicePrefix, jsons, &keys);
     discover(nodes, keys, jsons);
 
-    // Driver pods by key: only pods named <device>-driver are parsed
+    // Driver pods by key: only pods named <device>-driver are parsed, and
+    // the pods that subscribe to device.<name> topics (Device names in `subscribed`)
     std::map<std::string, PodView> pods;
+    std::set<std::string> subscribed;
     {
         std::vector<std::string> pod_jsons, pod_keys;
         store_.list_extended(kPodPrefix, pod_jsons, &pod_keys);
         for (size_t i = 0; i < pod_keys.size(); ++i) {
             const std::string& k = pod_keys[i];
+            if (subscribes_to_devices(pod_jsons[i])) add_subscriptions(pod_jsons[i], subscribed);
             if (k.size() < 8 || k.compare(k.size() - 7, 7, kPodSuffix) != 0) continue;
             models::JsonValue p;
             std::string err;
@@ -277,14 +311,24 @@ void DeviceController::reconcile(uint64_t now) {
     }
 
     std::set<std::string> live;
+    std::set<std::string> live_names;   // "<namespace>/<name>"
     for (size_t i = 0; i < jsons.size(); ++i) {
         osal::Thread::yield();
         models::JsonValue doc;
         std::string err;
         if (!models::parse_json(jsons[i], doc, err) || !doc.is_object()) continue;
         const models::JsonValue* meta = doc.get("metadata");
-        if (meta) live.insert(meta->get_string("uid", ""));
-        reconcile_device(keys[i], doc, nodes, pods, now);
+        if (meta) {
+            live.insert(meta->get_string("uid", ""));
+            live_names.insert(meta->get_string("namespace", "default") + "/" + meta->get_string("name", ""));
+        }
+        reconcile_device(keys[i], doc, nodes, pods, subscribed, now);
+    }
+    {
+        osal::LockGuard guard(uses_mutex_);
+        for (auto it = uses_.begin(); it != uses_.end();) {
+            it = live_names.count(it->first) ? std::next(it) : uses_.erase(it);
+        }
     }
 
     // Pods and Services whose Device is gone go with it
@@ -383,6 +427,7 @@ void DeviceController::discover(const std::vector<NodeView>& nodes, std::vector<
             }
             set_val(spec, "i2c", std::move(i2c));
             set_val(doc, "spec", std::move(spec));
+            models::default_device(doc);   // as the API server stores a Device: OnDemand
             const std::string key = kDevicePrefix + config_.discovered_namespace + "/" + name;
             const std::string json = doc.to_string();
             if (!store_.put(key, json, false).ok()) continue;   // there already, or no room
@@ -422,8 +467,32 @@ std::string DeviceController::place(const models::DeviceSpec& spec, const std::s
     return std::string();
 }
 
+void DeviceController::activate(const std::string& ns, const std::string& name, uint64_t now) {
+    if (now == 0) now = osal::System::get_uptime_ms();
+    bool idle = false;
+    {
+        osal::LockGuard guard(uses_mutex_);
+        Use& u = uses_[ns + "/" + name];
+        if (now > u.at) u.at = now;
+        idle = !u.running;
+    }
+    // The caller waits for an Idle Device's driver: no wait for the next pass
+    if (idle) trigger_.wake_now();
+}
+
+bool DeviceController::in_use(const DeviceView& d, const PodView* pod, bool subscribed, uint64_t now, uint64_t& last) {
+    osal::LockGuard guard(uses_mutex_);
+    Use& u = uses_[d.ns + "/" + d.name];
+    // A subscriber uses the Device now; a driver that ran before this
+    // controller started is used for a full idle period
+    if (subscribed || (u.at == 0 && pod && !pod->terminating)) u.at = std::max(u.at, now);
+    last = u.at;
+    u.running = u.at != 0 && now < u.at + static_cast<uint64_t>(d.spec.idle_seconds) * 1000;
+    return u.running;
+}
+
 void DeviceController::reconcile_device(const std::string& key, const models::JsonValue& doc, const std::vector<NodeView>& nodes,
-                                        std::map<std::string, PodView>& pods, uint64_t now) {
+                                        std::map<std::string, PodView>& pods, const std::set<std::string>& subscribed, uint64_t now) {
     std::string err;
     const models::JsonValue* meta = doc.get("metadata");
     if (!meta) return;
@@ -453,7 +522,7 @@ void DeviceController::reconcile_device(const std::string& key, const models::Js
     auto finish = [&](const std::string& phase, const std::string& message) {
         set_str(status, "phase", phase);
         if (!d.node.empty()) set_str(status, "nodeName", d.node);
-        if (((pod && !pod->terminating) || created) && phase != "Absent") set_str(status, "podName", pod_name);
+        if (((pod && !pod->terminating) || created) && phase != "Absent" && phase != "Idle") set_str(status, "podName", pod_name);
         set_str(status, "message", message);
         set_num(status, "observedGeneration", static_cast<double>(meta->get_int("generation", 1)));
         write_status(key, status);
@@ -496,6 +565,28 @@ void DeviceController::reconcile_device(const std::string& key, const models::Js
 
     std::string message;
     ensure_service(d, message);
+
+    // OnDemand: no driver while nobody uses the Device; the Service stays
+    const bool on_demand = d.spec.activation == models::DeviceActivation::OnDemand;
+    const bool has_subscriber = on_demand && subscribed.count(d.name) > 0;
+    if (on_demand) {
+        uint64_t last = 0;
+        if (!in_use(d, pod, has_subscriber, now, last)) {
+            if (pod && !pod->terminating) {
+                delete_pod(pod->key, pod->json);
+                event(d, "Idle", "not used for " + std::to_string(d.spec.idle_seconds) + " s: deleted driver pod " + pod_name, false);
+            }
+            retries_.erase(d.uid);
+            finish("Idle", message.empty() ? "idle: the driver starts on the next use" : message);
+            return;
+        }
+        trigger_.wake_at(last + static_cast<uint64_t>(d.spec.idle_seconds) * 1000);
+    } else {
+        // Always: uses wake no pass; turned OnDemand, a running driver gets a full idle period
+        osal::LockGuard guard(uses_mutex_);
+        uses_[d.ns + "/" + d.name] = Use{0, true};
+    }
+
     std::string hash;
     const std::string desired = pod_json(d, node, hash);
     if (!pod) {
@@ -503,6 +594,7 @@ void DeviceController::reconcile_device(const std::string& key, const models::Js
         if (scheduler_) scheduler_->schedule_pod_manifest(bound);
         if (store_.put(kPodPrefix + d.ns + "/" + pod_name, bound, false).ok()) {
             event(d, "SuccessfulCreate", "Created driver pod: " + pod_name, false);
+            if (on_demand) event(d, "Activated", has_subscriber ? "a pod subscribes to device." + d.name : "the Device is in use", false);
             created = true;
         }
         finish("Pending", message.empty() ? "driver pod " + pod_name + " created" : message);

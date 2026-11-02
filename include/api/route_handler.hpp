@@ -95,6 +95,7 @@ enum class RouteCategory {
     DevicesCollection,
     DeviceItem,
     DeviceStatus,
+    DeviceActivate,          // POST: a use of the Device (OnDemand activation)
     // kube32.io/v1 Checkpoints; their data is served by api/checkpoint_api.hpp
     CheckpointsCollection,
     CheckpointItem,
@@ -143,6 +144,11 @@ public:
     // the endpoints answer 501.
     void set_watch_hub(WatchHub* hub) { watch_hub_ = hub; }
     WatchHub* watch_hub() const { return watch_hub_; }
+    // POST .../devices/<name>/activate reports a use of the Device to this
+    // function (the Device controller's, models/device.hpp). Without one the
+    // subresource answers 503.
+    using DeviceActivator = std::function<void(const std::string& ns, const std::string& name)>;
+    void set_device_activator(DeviceActivator fn) { device_activator_ = std::move(fn); }
     EventRecorder& events() { return events_; }
     MetricsRegistry& metrics() { return metrics_; }
     InlineImages& inline_images() { return *images_; }
@@ -178,6 +184,7 @@ private:
     EventRecorder events_;
     MetricsRegistry metrics_;
     std::unique_ptr<InlineImages> images_;
+    DeviceActivator device_activator_;
 
     std::string openapi_v3_document(const std::string& path) const;
     bool strict_fields_ok(RouteCategory category, std::string_view api_group, const std::string& body, std::string& out_unknown) const;
@@ -194,6 +201,7 @@ private:
     HttpResponse handle_events(const HttpRequest& req, const RouteMatch& match);
     HttpResponse handle_pod_log(const HttpRequest& req, const RouteMatch& match, osal::Socket* client_sock);
     HttpResponse handle_pod_eviction(const HttpRequest& req, const RouteMatch& match);
+    HttpResponse handle_device_activate(const HttpRequest& req, const RouteMatch& match);
     HttpResponse delete_pod(const std::string& ns, const std::string& name, const std::string& key, std::string existing_json,
                             uint64_t existing_version, uint64_t grace);
     HttpResponse handle_metrics(const HttpRequest& req, const RouteMatch& match);

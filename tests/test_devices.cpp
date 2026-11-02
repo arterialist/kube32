@@ -70,7 +70,7 @@ const std::string kDevices = "/apis/kube32.io/v1/namespaces/default/devices";
 
 const char* kKitchen = R"({"apiVersion":"kube32.io/v1","kind":"Device","metadata":{"name":"kitchen-env","labels":{"location":"kitchen"}},
     "spec":{"driver":"bme688","nodeName":"node-a","i2c":{"address":119,"mux":{"address":"0x70","channel":2}},"intervalMs":2000,
-            "config":{"gas.heater-temp":320}},"status":{"phase":"Running"}})";
+            "config":{"gas.heater-temp":320},"activation":"Always"},"status":{"phase":"Running"}})";
 
 std::string node_json(const std::string& name, bool simulator, const std::string& report = "", const std::string& extra_labels = "") {
     std::string labels = R"("kubernetes.io/hostname":")" + name + "\"" + (simulator ? R"(,"kube32.io/simulator":"true")" : "") + extra_labels;
@@ -96,6 +96,10 @@ void test_catalog_and_spec() {
     assert(spec_ok(R"({"driver":"button","nodeSelector":{"kube32.io/board":"cardputer"},"pins":{"pin":0},"config":{"pull":"up","active":"low"}})", s, why));
     assert(!s.has_i2c && s.pins.size() == 1 && s.pins[0].second == 0 && s.config.size() == 2 && s.interval_ms == 50);
     assert(spec_ok(R"({"driver":"chip-temp","nodeName":"a"})", s, why) && s.interval_ms == 10000);
+    // Activation: OnDemand after 300 s by default, Always, or another idle period
+    assert(s.activation == models::DeviceActivation::OnDemand && s.idle_seconds == 300);
+    assert(spec_ok(R"({"driver":"chip-temp","nodeName":"a","activation":"Always"})", s, why) && s.activation == models::DeviceActivation::Always);
+    assert(spec_ok(R"({"driver":"chip-temp","nodeName":"a","activation":"OnDemand","idleSeconds":10})", s, why) && s.idle_seconds == 10);
 
     struct Bad { const char* spec; const char* field; };
     const Bad bad[] = {
@@ -117,6 +121,11 @@ void test_catalog_and_spec() {
         {R"({"driver":"chip-temp","nodeName":"a","intervalMs":10})", "spec.intervalMs"},
         {R"({"driver":"chip-temp","nodeName":"a","config":{"a b":"x"}})", "spec.config.a b"},
         {R"({"driver":"chip-temp","nodeName":"a","image":"http://x"})", "spec.image"},
+        {R"({"driver":"chip-temp","nodeName":"a","activation":"Sometimes"})", "spec.activation: Unsupported value: \"Sometimes\""},
+        {R"({"driver":"chip-temp","nodeName":"a","activation":true})", "spec.activation: Unsupported value"},
+        {R"({"driver":"chip-temp","nodeName":"a","idleSeconds":5})", "spec.idleSeconds: Invalid value: 5"},
+        {R"({"driver":"chip-temp","nodeName":"a","idleSeconds":86401})", "spec.idleSeconds"},
+        {R"({"driver":"chip-temp","nodeName":"a","idleSeconds":"60"})", "spec.idleSeconds"},
     };
     for (const auto& b : bad) {
         why.clear();
@@ -129,6 +138,30 @@ void test_catalog_and_spec() {
     models::default_device(dev);
     const models::JsonValue* i2c = dev.get("spec")->get("i2c");
     assert(i2c->get_int("bus", -1) == 0 && i2c->get_string("address", "") == "0x76" && i2c->get("mux")->get_string("address", "") == "0x70");
+    assert(dev.get("spec")->get_string("activation", "") == "OnDemand" && dev.get("spec")->get_int("idleSeconds", 0) == 300);
+    dev = parse(R"({"spec":{"driver":"button","nodeName":"a","pins":{"pin":0},"activation":"Always"}})");
+    models::default_device(dev);
+    assert(dev.get("spec")->get_string("activation", "") == "Always" && !dev.get("spec")->get("idleSeconds") && !dev.get("spec")->get("i2c"));
+
+    // The OnDemand Devices a Service selects, as the Endpoints annotation names them
+    std::vector<std::string> devs = {
+        R"({"metadata":{"name":"env","namespace":"default","labels":{"location":"kitchen"}},"spec":{"driver":"bme688","nodeSelector":{"b":"c"},"idleSeconds":60},"status":{"nodeName":"node-a"}})",
+        R"({"metadata":{"name":"scale","namespace":"default","labels":{"location":"kitchen"}},"spec":{"driver":"miniscale","nodeName":"node-b","activation":"Always"}})",
+        R"({"metadata":{"name":"env","namespace":"lab","labels":{"location":"kitchen"}},"spec":{"driver":"bme688","nodeName":"node-c"}})"};
+    const std::vector<models::OnDemandDriver> on_demand = models::on_demand_drivers(devs);
+    assert(on_demand.size() == 2);
+    std::vector<models::OnDemandDevice> picked;
+    models::select_on_demand(on_demand, "default", {{"kube32.io/driver", "bme688"}, {"location", "kitchen"}}, picked);
+    assert(picked.size() == 1 && picked[0].name == "env" && picked[0].node == "node-a" && picked[0].idle_seconds == 60);
+    models::select_on_demand(on_demand, "default", {{"location", "kitchen"}}, picked);   // the Always scale is not named
+    models::select_on_demand(on_demand, "default", {{"kube32.io/device", "env"}}, picked);
+    models::select_on_demand(on_demand, "default", {}, picked);
+    assert(picked.size() == 3);
+    const std::string ann = models::on_demand_annotation(picked);
+    assert(ann == "env:node-a:60,env:node-a:60,env:node-a:60");
+    std::vector<models::OnDemandDevice> back2;
+    models::parse_on_demand_annotation("env:node-a:60,x::300,bad", back2);
+    assert(back2.size() == 2 && back2[0].idle_seconds == 60 && back2[1].name == "x" && back2[1].node.empty());
 
     models::I2cLocation loc;
     assert(models::parse_i2c_device_annotation("bus=0,addr=0x77,mux=0x70:2", loc, why) && loc == (models::I2cLocation{0, 0x77, 0x70, 2}));
@@ -181,12 +214,12 @@ void test_device_api() {
     assert(r.status_code == 200 && r.content_type.find("as=Table") != std::string::npos);
     models::JsonValue t = parse(r.body);
     const auto& cols = t.get("columnDefinitions")->arr_val;
-    assert(cols.size() == 9 && cols[0].get_string("name", "") == "NAME" && cols[1].get_string("name", "") == "DRIVER" &&
+    assert(cols.size() == 10 && cols[0].get_string("name", "") == "NAME" && cols[1].get_string("name", "") == "DRIVER" &&
            cols[2].get_string("name", "") == "NODE" && cols[3].get_string("name", "") == "ADDRESS" && cols[4].get_string("name", "") == "PHASE" &&
-           cols[5].get_string("name", "") == "AGE" && cols[6].get_int("priority", 0) == 1);
+           cols[5].get_string("name", "") == "AGE" && cols[6].get_int("priority", 0) == 1 && cols[8].get_string("name", "") == "ACTIVATION");
     const auto& cells = t.get("rows")->arr_val[0].get("cells")->arr_val;
     assert(cells[0].str_val == "kitchen-env" && cells[1].str_val == "bme688" && cells[2].str_val == "node-a" &&
-           cells[3].str_val == "i2c0/0x70:2/0x77" && cells[4].str_val == "Pending");
+           cells[3].str_val == "i2c0/0x70:2/0x77" && cells[4].str_val == "Pending" && cells[8].str_val == "Always");
     // All namespaces, a label selector, one item as a Table
     r = call(h, HttpMethod::Get, "/apis/kube32.io/v1/devices", "", "application/json", false, "labelSelector=location%3Dkitchen");
     assert(r.status_code == 200 && parse(r.body).get("items")->arr_val.size() == 1 && parse(r.body).get_string("kind", "") == "DeviceList");
@@ -220,6 +253,19 @@ void test_device_api() {
     r = call(h, HttpMethod::Get, "/apis/kube32.io/v1");
     assert(r.body.find(R"("name":"devices","singularName":"device","namespaced":true,"kind":"Device")") != std::string::npos);
     assert(r.body.find(R"("shortNames":["dev"])") != std::string::npos && r.body.find(R"("name":"devices/status")") != std::string::npos);
+    assert(r.body.find(R"("name":"devices/activate")") != std::string::npos);
+
+    // The activate subresource: a use reported to the Device controller, nothing stored
+    const uint64_t version = store->current_version();
+    assert(call(h, HttpMethod::Post, kDevices + "/kitchen-env/activate").status_code == 503);   // no controller
+    std::vector<std::string> uses;
+    h.set_device_activator([&](const std::string& ns, const std::string& n) { uses.push_back(ns + "/" + n); });
+    r = call(h, HttpMethod::Post, kDevices + "/kitchen-env/activate", "{}");
+    assert(r.status_code == 200 && uses.size() == 1 && uses[0] == "default/kitchen-env");
+    assert(call(h, HttpMethod::Post, kDevices + "/kitchen-env/activate", "", "application/json", false, "dryRun=All").status_code == 200 && uses.size() == 1);
+    assert(call(h, HttpMethod::Post, kDevices + "/nosuch/activate").status_code == 404);
+    assert(call(h, HttpMethod::Get, kDevices + "/kitchen-env/activate").status_code == 405);
+    assert(store->current_version() == version && uses.size() == 1);
     r = call(h, HttpMethod::Get, "/openapi/v3/apis/kube32.io/v1");
     assert(r.body.find("/apis/kube32.io/v1/namespaces/{namespace}/devices/{name}") != std::string::npos);
 
@@ -342,7 +388,7 @@ void test_discovered_devices() {
     RouteHandler h(*store);
     // A hand-written Device already covers the scale
     assert(call(h, HttpMethod::Post, kDevices, R"({"metadata":{"name":"scale"},"spec":{"driver":"miniscale","nodeName":"node-a",
-        "i2c":{"address":"0x26","mux":{"address":"0x70","channel":3}}}})").status_code == 201);
+        "i2c":{"address":"0x26","mux":{"address":"0x70","channel":3}},"activation":"Always"}})").status_code == 201);
     store->put("/registry/nodes/node-a", node_json("node-a", false, kReport), true);
     controller::DeviceController dc(*store);
     dc.reconcile(1000);
@@ -359,6 +405,14 @@ void test_discovered_devices() {
     assert(d.get("status")->get_string("chip", "") == "BME688");
     assert(get(*store, "/registry/devices/default/rfid-node-a-b0-m70c4-28").get("status")->get_string("chip", "") == "WS1850S");
     assert(get(*store, "/registry/devices/default/scale").get("status")->get_string("chip", "") == "MiniScale");
+    // Discovered Devices are OnDemand: Idle with their Service until a use
+    assert(d.get("spec")->get_string("activation", "") == "OnDemand" && d.get("spec")->get_int("idleSeconds", 0) == 300);
+    assert(d.get("status")->get_string("phase", "") == "Idle" && !d.get("status")->get("podName"));
+    assert(!get(*store, "/registry/pods/default/bme688-node-a-b0-m70c2-77-driver").is_object());
+    assert(get(*store, "/registry/services/default/bme688-node-a-b0-m70c2-77").is_object());
+    assert(get(*store, "/registry/pods/default/scale-driver").is_object());   // Always
+    dc.activate("default", "bme688-node-a-b0-m70c2-77", 1500);
+    dc.reconcile(1600);
     assert(get(*store, "/registry/pods/default/bme688-node-a-b0-m70c2-77-driver").is_object());
     std::vector<std::string> events;
     store->list("/registry/events/default/", events);
@@ -397,7 +451,7 @@ void test_discovered_devices() {
 
     // A Device written for a discovered part takes the place of the discovered one
     assert(call(h, HttpMethod::Post, kDevices, R"({"metadata":{"name":"reader","labels":{"door":"front"}},"spec":{"driver":"rfid",
-        "nodeName":"node-a","i2c":{"address":"0x28","mux":{"address":"0x70","channel":4}}}})").status_code == 201);
+        "nodeName":"node-a","i2c":{"address":"0x28","mux":{"address":"0x70","channel":4}},"activation":"Always"}})").status_code == 201);
     dc.reconcile(5500);
     assert(!get(*store, "/registry/devices/default/rfid-node-a-b0-m70c4-28").is_object());
     assert(!get(*store, "/registry/pods/default/rfid-node-a-b0-m70c4-28-driver").is_object());
@@ -425,8 +479,8 @@ void test_placement() {
     store->put("/registry/nodes/sim-only", node_json("sim-only", true, "", R"(,"room":"lab")"), true);
     controller::DeviceController dc(*store);
     assert(call(h, HttpMethod::Post, kDevices, R"({"metadata":{"name":"btn"},"spec":{"driver":"button","nodeSelector":{"kube32.io/board":"cardputer"},
-        "pins":{"pin":10},"config":{"pull":"up"}}})").status_code == 201);
-    assert(call(h, HttpMethod::Post, kDevices, R"({"metadata":{"name":"lab-temp"},"spec":{"driver":"chip-temp","nodeSelector":{"room":"lab"}}})").status_code == 201);
+        "pins":{"pin":10},"config":{"pull":"up"},"activation":"Always"}})").status_code == 201);
+    assert(call(h, HttpMethod::Post, kDevices, R"({"metadata":{"name":"lab-temp"},"spec":{"driver":"chip-temp","nodeSelector":{"room":"lab"},"activation":"Always"}})").status_code == 201);
     assert(call(h, HttpMethod::Post, kDevices, R"({"metadata":{"name":"nowhere"},"spec":{"driver":"chip-temp","nodeSelector":{"room":"attic"}}})").status_code == 201);
     dc.reconcile(1000);
 
@@ -462,7 +516,7 @@ void test_failed_pod_and_service_conflict() {
     controller::DeviceController dc(*store, nullptr, cfg);
     // A Service of the same name made by someone else is left alone
     assert(call(h, HttpMethod::Post, "/api/v1/namespaces/default/services", R"({"metadata":{"name":"temp"},"spec":{"selector":{"app":"x"},"ports":[{"port":80}]}})").status_code == 201);
-    assert(call(h, HttpMethod::Post, kDevices, R"({"metadata":{"name":"temp"},"spec":{"driver":"chip-temp","nodeName":"node-a"}})").status_code == 201);
+    assert(call(h, HttpMethod::Post, kDevices, R"({"metadata":{"name":"temp"},"spec":{"driver":"chip-temp","nodeName":"node-a","activation":"Always"}})").status_code == 201);
     dc.reconcile(1000);
     assert(get(*store, "/registry/services/default/temp").get("spec")->get("selector")->get_string("app", "") == "x");
     assert(get(*store, "/registry/devices/default/temp").get("status")->get_string("message", "").find("does not belong to the Device") != std::string::npos);
@@ -494,6 +548,117 @@ void test_failed_pod_and_service_conflict() {
     std::cout << "[PASS] test_failed_pod_and_service_conflict" << std::endl;
 }
 
+// OnDemand activation: Idle without a use, a driver from the first use, Idle
+// again idleSeconds after the last one; subscribers, a driver that runs when
+// the controller starts, Always, and the Endpoints that name the Devices
+void test_on_demand() {
+    auto store = ram_store();
+    RouteHandler h(*store);
+    store->put("/registry/nodes/node-a", node_json("node-a", false), true);
+    controller::DeviceController dc(*store);
+    h.set_device_activator([&](const std::string& ns, const std::string& n) { dc.activate(ns, n, 2000); });
+    assert(call(h, HttpMethod::Post, kDevices, R"({"metadata":{"name":"env","labels":{"location":"kitchen"}},"spec":{"driver":"bme688",
+        "nodeName":"node-a","idleSeconds":10}})").status_code == 201);
+    const std::string pod_key = "/registry/pods/default/env-driver";
+    const std::string dev_key = "/registry/devices/default/env";
+    auto phase = [&]() { return get(*store, dev_key).get("status")->get_string("phase", ""); };
+    auto events_with = [&](const std::string& reason) {
+        std::vector<std::string> events;
+        store->list("/registry/events/default/", events);
+        int n = 0;
+        for (const auto& e : events) n += e.find("\"reason\":\"" + reason + "\"") != std::string::npos;
+        return n;
+    };
+
+    // No use yet: Idle, the Service without a driver behind it
+    dc.reconcile(1000);
+    models::JsonValue d = get(*store, dev_key);
+    assert(phase() == "Idle" && d.get("status")->get_string("message", "") == "idle: the driver starts on the next use");
+    assert(!d.get("status")->get("podName") && d.get("status")->get_string("nodeName", "") == "node-a");
+    assert(!get(*store, pod_key).is_object() && get(*store, "/registry/services/default/env").is_object());
+
+    // kube32-cli, a call through the Service: the activate subresource. The driver starts.
+    assert(call(h, HttpMethod::Post, kDevices + "/env/activate").status_code == 200);
+    dc.reconcile(2000);
+    assert(phase() == "Pending" && get(*store, pod_key).is_object() && events_with("Activated") == 1);
+    run_pod(*store, pod_key, "node-a");
+    dc.reconcile(3000);
+    assert(phase() == "Running");
+    // In use until idleSeconds after the last use, then Idle: the driver pod goes, gracefully
+    dc.reconcile(11999);
+    assert(phase() == "Running");
+    dc.activate("default", "env", 5000);
+    dc.reconcile(12000);
+    assert(phase() == "Running");
+    dc.reconcile(15000);
+    models::JsonValue p = get(*store, pod_key);
+    assert(phase() == "Idle" && !get(*store, dev_key).get("status")->get("podName"));
+    assert(!p.get("metadata")->get_string("deletionTimestamp", "").empty() || models::now_rfc3339().empty());
+    assert(events_with("Idle") == 1);
+    store->remove(pod_key);   // the kubelet stopped it
+    dc.reconcile(16000);
+    assert(phase() == "Idle" && !get(*store, pod_key).is_object());
+
+    // A pod on any node subscribed to device.env uses it while it exists and is not finished
+    const std::string sub_key = "/registry/pods/default/watcher";
+    store->put(sub_key, R"({"kind":"Pod","metadata":{"name":"watcher","namespace":"default","annotations":{"kube32.io/event-topics":"other, device.env"}},
+        "spec":{"nodeName":"elsewhere"},"status":{"phase":"Running"}})", true);
+    dc.reconcile(20000);
+    assert(phase() == "Pending" && get(*store, pod_key).is_object());
+    run_pod(*store, pod_key, "node-a");
+    dc.reconcile(60000);
+    assert(phase() == "Running");
+    store->put(sub_key, R"({"kind":"Pod","metadata":{"name":"watcher","namespace":"default","annotations":{"kube32.io/event-topics":"device.env"}},
+        "spec":{"nodeName":"elsewhere"},"status":{"phase":"Succeeded"}})", true);
+    dc.reconcile(65000);
+    assert(phase() == "Running");   // used until the last pass that saw the subscriber, plus idleSeconds
+    dc.reconcile(70000);
+    assert(phase() == "Idle");
+    store->remove(pod_key);
+    store->remove(sub_key);
+
+    // A driver that runs when a controller starts gets a full idle period
+    dc.activate("default", "env", 71000);
+    dc.reconcile(71000);
+    run_pod(*store, pod_key, "node-a");
+    {
+        controller::DeviceController fresh(*store);
+        fresh.reconcile(500000);
+        assert(phase() == "Running");
+        fresh.reconcile(509999);
+        assert(phase() == "Running");
+        fresh.reconcile(510000);
+        assert(phase() == "Idle");
+    }
+    store->remove(pod_key);
+
+    // Always: the driver runs without a use; back to OnDemand, it gets a full idle period
+    assert(call(h, HttpMethod::Patch, kDevices + "/env", R"({"spec":{"activation":"Always"}})", "application/merge-patch+json").status_code == 200);
+    dc.reconcile(600000);
+    assert(phase() == "Pending" && get(*store, pod_key).is_object());
+    run_pod(*store, pod_key, "node-a");
+    dc.reconcile(700000);
+    assert(phase() == "Running");
+    assert(call(h, HttpMethod::Patch, kDevices + "/env", R"({"spec":{"activation":"OnDemand"}})", "application/merge-patch+json").status_code == 200);
+    dc.reconcile(800000);
+    assert(phase() == "Running");
+    dc.reconcile(810000);
+    assert(phase() == "Idle");
+
+    // The Endpoints of a Service that selects the driver name the Device, its node and idle period
+    assert(call(h, HttpMethod::Post, "/api/v1/namespaces/default/services", R"({"metadata":{"name":"kitchen-air"},
+        "spec":{"selector":{"kube32.io/driver":"bme688","location":"kitchen"},"ports":[{"port":80,"targetPort":"http"}]}})").status_code == 201);
+    HttpResponse r = call(h, HttpMethod::Get, "/api/v1/namespaces/default/endpoints/kitchen-air");
+    assert(r.status_code == 200);
+    models::JsonValue ep = parse(r.body);
+    assert(ep.get("metadata")->get("annotations")->get_string("kube32.io/on-demand-devices", "") == "env:node-a:10");
+    r = call(h, HttpMethod::Get, "/api/v1/namespaces/default/endpoints/env");
+    assert(parse(r.body).get("metadata")->get("annotations")->get_string("kube32.io/on-demand-devices", "") == "env:node-a:10");
+    assert(call(h, HttpMethod::Patch, kDevices + "/env", R"({"spec":{"activation":"Always"}})", "application/merge-patch+json").status_code == 200);
+    assert(!parse(call(h, HttpMethod::Get, "/api/v1/namespaces/default/endpoints/kitchen-air").body).get("metadata")->get("annotations"));
+    std::cout << "[PASS] test_on_demand" << std::endl;
+}
+
 } // namespace
 
 int main() {
@@ -503,6 +668,7 @@ int main() {
     test_discovered_devices();
     test_placement();
     test_failed_pod_and_service_conflict();
+    test_on_demand();
     std::cout << "All device tests passed" << std::endl;
     return 0;
 }

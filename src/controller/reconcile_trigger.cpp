@@ -46,6 +46,12 @@ void ReconcileTrigger::wake_at(uint64_t due_ms) {
     cv_.notify_all();
 }
 
+void ReconcileTrigger::wake_now() {
+    osal::LockGuard guard(mutex_);
+    urgent_ = true;
+    cv_.notify_all();
+}
+
 void ReconcileTrigger::interrupt() {
     osal::LockGuard guard(mutex_);
     interrupted_ = true;
@@ -107,8 +113,15 @@ bool ReconcileTrigger::fields_changed() {
 
 uint32_t ReconcileTrigger::due(uint64_t now_ms) {
     if (!primed_) prime_fields();
-    if (ran_ && now_ms < last_pass_ms_ + config_.min_interval_ms) return kNone;
+    bool urgent = false;
+    {
+        osal::LockGuard guard(mutex_);
+        urgent = urgent_;
+        urgent_ = false;
+    }
+    if (!urgent && ran_ && now_ms < last_pass_ms_ + config_.min_interval_ms) return kNone;
     uint32_t why = ran_ ? kNone : kChange;
+    if (urgent) why |= kTimer;
     bool fields_dirty = false;
     {
         osal::LockGuard guard(mutex_);
@@ -132,7 +145,7 @@ uint32_t ReconcileTrigger::due(uint64_t now_ms) {
 
 void ReconcileTrigger::wait(uint64_t now_ms, uint32_t max_ms) {
     osal::UniqueLock<osal::Mutex> lock(mutex_);
-    if (interrupted_) {
+    if (interrupted_ || urgent_) {
         interrupted_ = false;
         return;
     }

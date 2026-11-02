@@ -2,7 +2,10 @@
 
 // Devices (kube32.io/v1 Device, docs/devices.md): parts wired to a node,
 // each read or driven by a driver pod the Device controller runs on that
-// node and reached through a Service of the Device's name.
+// node and reached through a Service of the Device's name. An OnDemand
+// Device (spec.activation, the default) has its driver pod only while it is
+// in use: calls through a Service that selects the driver, pods subscribed to
+// device.<name>, and the activate subresource keep it running.
 //
 // The driver catalog below is the one table the API server (validation),
 // the Device controller (the driver pod it creates) and I2C discovery (the
@@ -21,6 +24,10 @@
 
 namespace kube32::models {
 
+// Pod annotation of the channel topics a pod subscribes to (k32_event): a
+// pod subscribed to device.<name> uses Device <name>
+constexpr const char* kAnnotationEventTopics = "kube32.io/event-topics";
+constexpr const char* kDeviceTopicPrefix = "device.";
 // Pod labels the controller sets on a driver pod, besides the Device's own
 constexpr const char* kLabelDevice = "kube32.io/device";
 constexpr const char* kLabelDriver = "kube32.io/driver";
@@ -85,6 +92,13 @@ struct I2cLocation {
     bool operator!=(const I2cLocation& o) const { return !(*this == o); }
 };
 
+// spec.activation: OnDemand runs the driver while the Device is in use and
+// for spec.idleSeconds after its last use; Always runs it all the time
+enum class DeviceActivation : uint8_t { OnDemand, Always };
+constexpr uint32_t kDefaultIdleSeconds = 300;
+constexpr uint32_t kMinIdleSeconds = 10;
+constexpr uint32_t kMaxIdleSeconds = 86400;
+
 // A Device's spec, read and checked
 struct DeviceSpec {
     const DeviceDriver* driver{nullptr};
@@ -96,14 +110,48 @@ struct DeviceSpec {
     uint32_t interval_ms{0};                                 // spec.intervalMs or the driver's
     std::vector<std::pair<std::string, std::string>> config;
     std::string image;                                       // spec.image or wasm://embedded/driver-<driver>
+    DeviceActivation activation{DeviceActivation::OnDemand};
+    uint32_t idle_seconds{kDefaultIdleSeconds};
 };
 
 // Reads `spec` (a Device's spec) with the driver's defaults filled in;
 // false with the field and the problem in `why` ("spec.i2c.address: ...")
 bool parse_device_spec(const JsonValue* spec, DeviceSpec& out, std::string& why);
 // Fills the defaults kube-apiserver style into a Device about to be stored
-// (spec.i2c.bus and spec.i2c.address of I2C drivers, addresses as "0x77")
+// (spec.activation, spec.idleSeconds of an OnDemand Device, spec.i2c.bus and
+// spec.i2c.address of I2C drivers, addresses as "0x77")
 void default_device(JsonValue& device);
+
+// Annotation the API server puts on the Endpoints of a Service that selects
+// the driver pods of OnDemand Devices: "<device>:<node>:<idleSeconds>[,...]"
+// (node empty while the Device has none). Callers on any node read it with
+// the Endpoints and report each use of those Devices (activate subresource).
+constexpr const char* kAnnotationOnDemandDevices = "kube32.io/on-demand-devices";
+
+// An OnDemand Device behind a Service
+struct OnDemandDevice {
+    std::string name;
+    std::string node;           // where its driver runs: status.nodeName, else spec.nodeName
+    uint32_t idle_seconds{kDefaultIdleSeconds};
+};
+
+// An OnDemand Device with the labels its driver pod carries (the Device's
+// own plus kube32.io/device and kube32.io/driver), so that a Service's
+// selector is matched against the pod before the pod exists
+struct OnDemandDriver {
+    std::string ns;
+    OnDemandDevice device;
+    std::vector<std::pair<std::string, std::string>> labels;
+    // Every key and value of `selector` is among the labels (an empty selector selects nothing)
+    bool selected_by(const std::vector<std::pair<std::string, std::string>>& selector) const;
+};
+// The OnDemand Devices among `device_jsons`
+std::vector<OnDemandDriver> on_demand_drivers(const std::vector<std::string>& device_jsons);
+// The Devices of `drivers` in namespace `ns` that `selector` selects, added to `out`
+void select_on_demand(const std::vector<OnDemandDriver>& drivers, const std::string& ns,
+                      const std::vector<std::pair<std::string, std::string>>& selector, std::vector<OnDemandDevice>& out);
+std::string on_demand_annotation(const std::vector<OnDemandDevice>& devices);
+void parse_on_demand_annotation(std::string_view value, std::vector<OnDemandDevice>& out);
 
 // "0x77"
 std::string hex_byte(uint8_t v);

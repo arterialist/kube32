@@ -283,7 +283,7 @@ void test_device_loop() {
     controller::DeviceController dc(*store, nullptr, cfg);
     assert(dc.start());
     assert(call(h, api::HttpMethod::Post, "/apis/kube32.io/v1/namespaces/default/devices",
-                R"({"metadata":{"name":"temp"},"spec":{"driver":"chip-temp","nodeName":"node-a"}})").status_code == 201);
+                R"({"metadata":{"name":"temp"},"spec":{"driver":"chip-temp","nodeName":"node-a","activation":"Always"}})").status_code == 201);
     const std::string key = "/registry/pods/default/temp-driver";
     auto uid = [&] {
         std::string json;
@@ -320,6 +320,47 @@ void test_device_loop() {
     assert(eventually([&] { const std::string u = uid(); return !u.empty() && u != failed_uid; }, 3000));
     dc.stop();
     std::cout << "[PASS] test_device_loop" << std::endl;
+}
+
+// An activation of an Idle Device makes a pass due at once, not after the
+// shortest interval between passes; a use of a running driver makes none
+void test_device_activation_loop() {
+    std::cout << "[RUN] test_device_activation_loop" << std::endl;
+    auto store = ram_store();
+    api::RouteHandler h(*store);
+    store->put("/registry/nodes/node-a", node_json("node-a", "", "up"), true);
+    assert(call(h, api::HttpMethod::Post, "/apis/kube32.io/v1/namespaces/default/devices",
+                R"({"metadata":{"name":"temp"},"spec":{"driver":"chip-temp","nodeName":"node-a"}})").status_code == 201);
+    controller::DeviceControllerConfig cfg;
+    cfg.reconcile_interval_ms = 10000;
+    cfg.resync_interval_ms = 60000;
+    controller::DeviceController dc(*store, nullptr, cfg);
+    assert(dc.start());
+    auto phase = [&] {
+        std::string json;
+        if (!store->get("/registry/devices/default/temp", json).ok()) return std::string();
+        const models::JsonValue d = parse(json);
+        return d.get("status") ? d.get("status")->get_string("phase", "") : std::string();
+    };
+    assert(eventually([&] { return phase() == "Idle"; }));
+    const std::string key = "/registry/pods/default/temp-driver";
+    std::string json;
+    assert(!store->get(key, json).ok());
+    osal::Thread::sleep_ms(100);
+    const uint64_t t0 = osal::System::get_uptime_ms();
+    dc.activate("default", "temp");
+    assert(eventually([&] { return store->get(key, json).ok(); }, 1500));
+    const uint64_t took = osal::System::get_uptime_ms() - t0;
+    std::cout << "  driver pod created " << took << " ms after the activation" << std::endl;
+    assert(took < 1500);
+    // The driver exists: further uses only move the time of the last one
+    osal::Thread::sleep_ms(100);
+    const uint64_t quiet = dc.passes();
+    for (int i = 0; i < 5; ++i) dc.activate("default", "temp");
+    osal::Thread::sleep_ms(300);
+    assert(dc.passes() == quiet);
+    dc.stop();
+    std::cout << "[PASS] test_device_activation_loop" << std::endl;
 }
 
 void test_daemonset_loop() {
@@ -368,6 +409,7 @@ int main() {
     test_trigger();
     test_deployment_loop();
     test_device_loop();
+    test_device_activation_loop();
     test_daemonset_loop();
     std::cout << "All reconcile loop tests passed" << std::endl;
     return 0;

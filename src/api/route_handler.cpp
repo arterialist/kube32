@@ -781,6 +781,12 @@ RouteMatch RouteHandler::match_route(std::string_view path) {
                     match.subresource = "status";
                     return match;
                 }
+                if (item.substr(sl2 + 1) == "activate" && sl2 > 0) {
+                    match.category = RouteCategory::DeviceActivate;
+                    match.resource_name = item.substr(0, sl2);
+                    match.subresource = "activate";
+                    return match;
+                }
             }
         }
     }
@@ -1173,6 +1179,9 @@ HttpResponse RouteHandler::dispatch(const HttpRequest& req, const RouteMatch& ma
         case RouteCategory::PodEviction:
             return handle_pod_eviction(req, match);
 
+        case RouteCategory::DeviceActivate:
+            return handle_device_activate(req, match);
+
         case RouteCategory::MetricsNodes:
         case RouteCategory::MetricsNodeItem:
         case RouteCategory::MetricsPods:
@@ -1388,6 +1397,8 @@ HttpResponse RouteHandler::handle_discovery(const HttpRequest& req, RouteCategor
                         "\"verbs\":[\"get\",\"list\",\"watch\",\"create\",\"update\",\"patch\",\"delete\"],\"shortNames\":[\"dev\"]},"
                         "{\"name\":\"devices/status\",\"singularName\":\"device\",\"namespaced\":true,\"kind\":\"Device\","
                         "\"verbs\":[\"get\",\"patch\",\"update\"]},"
+                        "{\"name\":\"devices/activate\",\"singularName\":\"device\",\"namespaced\":true,\"kind\":\"Status\","
+                        "\"verbs\":[\"create\"]},"
                         "{\"name\":\"checkpoints\",\"singularName\":\"checkpoint\",\"namespaced\":true,\"kind\":\"Checkpoint\","
                         "\"verbs\":[\"get\",\"list\",\"watch\",\"create\",\"update\",\"patch\",\"delete\"],\"shortNames\":[\"ckpt\"]},"
                         "{\"name\":\"checkpoints/status\",\"singularName\":\"checkpoint\",\"namespaced\":true,\"kind\":\"Checkpoint\","
@@ -3390,9 +3401,12 @@ models::JsonValue target_ref(const EndpointPod* p) {
 // One Endpoints object, or the EndpointSlices, of a Service. A port a pod
 // serves (its targetPort, by number or containerPort name) is reached at its
 // node's pod port when the node reports one. Pods whose ports come out
-// differently land in separate subsets/slices.
+// differently land in separate subsets/slices. The Endpoints of a Service
+// that selects the driver pods of OnDemand Devices name them
+// (models::kAnnotationOnDemandDevices), whether their drivers run or not.
 void build_service_endpoints(const models::JsonValue& svc, const std::vector<EndpointPod>& pods, const std::map<std::string, uint16_t>& node_ports,
-                             bool slices, const std::string& rv, std::vector<std::string>& out) {
+                             bool slices, const std::string& rv, std::vector<std::string>& out,
+                             const std::vector<models::OnDemandDriver>& drivers) {
     const models::JsonValue* meta = svc.get("metadata");
     const models::JsonValue* spec = svc.get("spec");
     if (!meta || !spec) return;
@@ -3462,6 +3476,19 @@ void build_service_endpoints(const models::JsonValue& svc, const std::vector<End
         ep.set("apiVersion", jstr("v1"));
         models::JsonValue m = base_meta(name);
         if (!labels.obj_val.empty()) m.set("labels", labels);
+        if (!drivers.empty()) {
+            std::vector<std::pair<std::string, std::string>> sel;
+            for (const auto& kv : selector->obj_val) {
+                if (kv.second.is_string()) sel.emplace_back(kv.first, kv.second.str_val);
+            }
+            std::vector<models::OnDemandDevice> on_demand;
+            models::select_on_demand(drivers, ns, sel, on_demand);
+            if (!on_demand.empty()) {
+                models::JsonValue ann = jobject();
+                ann.set(models::kAnnotationOnDemandDevices, jstr(models::on_demand_annotation(on_demand)));
+                m.set("annotations", std::move(ann));
+            }
+        }
         ep.set("metadata", std::move(m));
         models::JsonValue subsets = jarray();
         for (const auto& g : groups) {
@@ -3541,6 +3568,22 @@ void build_service_endpoints(const models::JsonValue& svc, const std::vector<End
 // (docs/migration.md): the Checkpoint controller takes it to another node,
 // where it has a new uid, which is what kubectl drain waits for. Any other
 // pod is deleted as DELETE deletes it, with the Eviction's grace period.
+// A use of a Device: its driver runs (OnDemand activation) until
+// spec.idleSeconds pass without another. Nothing is stored: the Device
+// controller keeps the time of the last use.
+HttpResponse RouteHandler::handle_device_activate(const HttpRequest& req, const RouteMatch& match) {
+    const std::string ns = match.namespace_name.empty() ? "default" : std::string(match.namespace_name);
+    const std::string name(match.resource_name);
+    if (req.method != HttpMethod::Post) return make_status(405, "MethodNotAllowed", "only POST reports a use of a Device");
+    std::string json;
+    if (!store_.get(models::str_cat({"/registry/devices/", ns, "/", name}), json).ok()) {
+        return make_status(404, "NotFound", models::str_cat({"devices.kube32.io \"", name, "\" not found"}), name, "devices");
+    }
+    if (!device_activator_) return make_status(503, "ServiceUnavailable", "no Device controller runs on this control plane");
+    if (!dry_run()) device_activator_(ns, name);
+    return make_status(200, "Success", models::str_cat({"devices.kube32.io \"", name, "\" in use"}), name, "devices");
+}
+
 HttpResponse RouteHandler::handle_pod_eviction(const HttpRequest& req, const RouteMatch& match) {
     const std::string ns = match.namespace_name.empty() ? "default" : std::string(match.namespace_name);
     const std::string name(match.resource_name);
@@ -3591,11 +3634,13 @@ HttpResponse RouteHandler::handle_endpoints(const HttpRequest& req, const RouteM
     }
     const std::string ns(match.namespace_name);
     const std::string scope = ns.empty() ? std::string() : ns + "/";
-    std::vector<std::string> svc_jsons, pod_jsons, node_jsons;
+    std::vector<std::string> svc_jsons, pod_jsons, node_jsons, device_jsons;
     store_.list("/registry/services/" + scope, svc_jsons);
     store_.list("/registry/pods/" + scope, pod_jsons);
     store_.list("/registry/nodes/", node_jsons);
+    if (!slices) store_.list("/registry/devices/" + scope, device_jsons);
     const std::map<std::string, uint16_t> node_ports = models::node_pod_ports(node_jsons);
+    const std::vector<models::OnDemandDriver> drivers = models::on_demand_drivers(device_jsons);
     std::vector<EndpointPod> pods;
     pods.reserve(pod_jsons.size());
     for (const auto& j : pod_jsons) {
@@ -3618,7 +3663,7 @@ HttpResponse RouteHandler::handle_endpoints(const HttpRequest& req, const RouteM
             // A slice is named after its Service, with "-<n>" for extra slices
             if (!(sname == want || (slices && want.rfind(sname + "-", 0) == 0))) continue;
         }
-        build_service_endpoints(svc, pods, node_ports, slices, rv, objects);
+        build_service_endpoints(svc, pods, node_ports, slices, rv, objects, drivers);
     }
 
     if (item) {

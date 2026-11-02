@@ -239,6 +239,23 @@ bool parse_device_spec(const JsonValue* spec, DeviceSpec& out, std::string& why)
         why = "spec.image: Invalid value: \"" + out.image + "\": a wasm:// image";
         return false;
     }
+
+    if (const JsonValue* a = spec->get("activation"); a && !a->is_null()) {
+        if (a->is_string() && a->str_val == "Always") out.activation = DeviceActivation::Always;
+        else if (!a->is_string() || a->str_val != "OnDemand") {
+            why = "spec.activation: Unsupported value: \"" + json_text(*a) + "\": supported values: \"OnDemand\", \"Always\"";
+            return false;
+        }
+    }
+    if (const JsonValue* idle = spec->get("idleSeconds"); idle && !idle->is_null()) {
+        int64_t s = 0;
+        if (!json_int(*idle, s) || s < kMinIdleSeconds || s > kMaxIdleSeconds) {
+            why = "spec.idleSeconds: Invalid value: " + json_text(*idle) + ": from " + std::to_string(kMinIdleSeconds) + " to " +
+                  std::to_string(kMaxIdleSeconds) + " (s)";
+            return false;
+        }
+        out.idle_seconds = static_cast<uint32_t>(s);
+    }
     return true;
 }
 
@@ -246,7 +263,11 @@ void default_device(JsonValue& device) {
     JsonValue* spec = device.get_mut("spec");
     DeviceSpec ds;
     std::string why;
-    if (!spec || !parse_device_spec(spec, ds, why) || !ds.has_i2c) return;
+    if (!spec || !parse_device_spec(spec, ds, why)) return;
+    const bool on_demand = ds.activation == DeviceActivation::OnDemand;
+    spec->set("activation", jstr(on_demand ? "OnDemand" : "Always"));
+    if (on_demand) spec->set("idleSeconds", jnum(ds.idle_seconds));
+    if (!ds.has_i2c) return;
     JsonValue* i2c = spec->get_mut("i2c");
     if (!i2c || !i2c->is_object()) {
         JsonValue o;
@@ -366,6 +387,79 @@ bool parse_discovered_parts(std::string_view json, std::vector<DiscoveredPart>& 
         out.push_back(std::move(p));
     }
     return true;
+}
+
+bool OnDemandDriver::selected_by(const std::vector<std::pair<std::string, std::string>>& selector) const {
+    if (selector.empty()) return false;
+    for (const auto& want : selector) {
+        bool found = false;
+        for (const auto& have : labels) found |= have == want;
+        if (!found) return false;
+    }
+    return true;
+}
+
+std::vector<OnDemandDriver> on_demand_drivers(const std::vector<std::string>& device_jsons) {
+    std::vector<OnDemandDriver> out;
+    for (const auto& json : device_jsons) {
+        JsonValue doc;
+        std::string err, why;
+        DeviceSpec spec;
+        if (!parse_json(json, doc, err) || !parse_device_spec(doc.get("spec"), spec, why)) continue;
+        if (spec.activation != DeviceActivation::OnDemand) continue;
+        const JsonValue* meta = doc.get("metadata");
+        if (!meta) continue;
+        OnDemandDriver d;
+        d.ns = meta->get_string("namespace", "default");
+        d.device.name = meta->get_string("name", "");
+        const JsonValue* st = doc.get("status");
+        d.device.node = st ? st->get_string("nodeName", "") : "";
+        if (d.device.node.empty()) d.device.node = spec.node_name;
+        d.device.idle_seconds = spec.idle_seconds;
+        if (const JsonValue* labels = meta->get("labels"); labels && labels->is_object()) {
+            for (const auto& kv : labels->obj_val) {
+                if (kv.second.is_string() && kv.first != kLabelDevice && kv.first != kLabelDriver) d.labels.emplace_back(kv.first, kv.second.str_val);
+            }
+        }
+        d.labels.emplace_back(kLabelDevice, d.device.name);
+        d.labels.emplace_back(kLabelDriver, spec.driver->name);
+        out.push_back(std::move(d));
+    }
+    return out;
+}
+
+void select_on_demand(const std::vector<OnDemandDriver>& drivers, const std::string& ns,
+                      const std::vector<std::pair<std::string, std::string>>& selector, std::vector<OnDemandDevice>& out) {
+    for (const auto& d : drivers) {
+        if (d.ns == ns && d.selected_by(selector)) out.push_back(d.device);
+    }
+}
+
+std::string on_demand_annotation(const std::vector<OnDemandDevice>& devices) {
+    std::string out;
+    for (const auto& d : devices) {
+        if (!out.empty()) out += ",";
+        out += d.name + ":" + d.node + ":" + std::to_string(d.idle_seconds);
+    }
+    return out;
+}
+
+void parse_on_demand_annotation(std::string_view value, std::vector<OnDemandDevice>& out) {
+    while (!value.empty()) {
+        const size_t comma = value.find(',');
+        std::string_view item = value.substr(0, comma);
+        value = comma == std::string_view::npos ? std::string_view() : value.substr(comma + 1);
+        const size_t a = item.find(':');
+        const size_t b = a == std::string_view::npos ? a : item.find(':', a + 1);
+        if (a == 0 || b == std::string_view::npos) continue;
+        OnDemandDevice d;
+        d.name = std::string(item.substr(0, a));
+        d.node = std::string(item.substr(a + 1, b - a - 1));
+        uint32_t s = 0;
+        for (char c : item.substr(b + 1)) s = (c >= '0' && c <= '9' && s < kMaxIdleSeconds) ? s * 10 + static_cast<uint32_t>(c - '0') : s;
+        if (s >= kMinIdleSeconds && s <= kMaxIdleSeconds) d.idle_seconds = s;
+        out.push_back(std::move(d));
+    }
 }
 
 } // namespace kube32::models

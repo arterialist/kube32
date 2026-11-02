@@ -55,6 +55,9 @@ public:
     // forgets the times asked for before it: it asks again for those it
     // still needs.
     void wake_at(uint64_t due_ms);
+    // A pass is due now, before the shortest interval between passes is
+    // over: someone waits for its result (a Device's driver to start)
+    void wake_now();
     // Ends a wait() now (stopping the loop)
     void interrupt();
 
@@ -95,6 +98,7 @@ private:
     std::vector<std::set<std::string>> dirty_;    // per field watch, guarded by mutex_
     uint64_t timer_ms_{0};                        // the earliest time asked for, 0 for none; guarded by mutex_
     bool interrupted_{false};                     // guarded by mutex_
+    bool urgent_{false};                          // wake_now(); guarded by mutex_
     bool primed_{false};
     uint64_t last_pass_ms_{0};
     uint64_t next_resync_ms_{0};

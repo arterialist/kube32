@@ -35,6 +35,16 @@
 // whose part the node no longer reports turns Absent: its driver pod goes,
 // the Device and its Service stay until the part answers again.
 //
+// Activation (spec.activation): an Always Device has its driver pod all the
+// time. An OnDemand Device has it while it is in use and for
+// spec.idleSeconds after its last use, and is Idle (no driver pod, its
+// Service without endpoints) otherwise. A use is an activate() call (the
+// activate subresource, Service calls and Ingress streams on any node, read
+// by kube32-cli), or a pod that subscribes to device.<name>
+// (kube32.io/event-topics) and is not terminating or finished. A driver pod
+// that runs when the controller starts gets a full idle period. An
+// activation of an Idle Device makes a pass due at once.
+//
 // Pods and Services whose Device is gone are deleted. start() runs a pass
 // on a thread of its own after a Device, a driver pod, a Service or what the
 // controller reads of a Node (labels, the discovery report, Ready, the pod
@@ -46,6 +56,7 @@
 #include "controller/reconcile_trigger.hpp"
 #include "models/device.hpp"
 #include "scheduler/scheduler.hpp"
+#include "osal/mutex.hpp"
 #include "osal/thread.hpp"
 #include "storage/store.hpp"
 
@@ -53,6 +64,7 @@
 #include <cstdint>
 #include <map>
 #include <memory>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -84,6 +96,8 @@ public:
     void reconcile(uint64_t now_ms = 0);
     // Passes run so far
     uint64_t passes() const { return passes_.load(); }
+    // A use of Device ns/name at `now_ms` (0: now). Any thread.
+    void activate(const std::string& ns, const std::string& name, uint64_t now_ms = 0);
 
 private:
     struct NodeView {
@@ -110,7 +124,10 @@ private:
     std::vector<NodeView> load_nodes();
     void discover(const std::vector<NodeView>& nodes, std::vector<std::string>& keys, std::vector<std::string>& jsons);
     void reconcile_device(const std::string& key, const models::JsonValue& doc, const std::vector<NodeView>& nodes,
-                          std::map<std::string, PodView>& pods, uint64_t now);
+                          std::map<std::string, PodView>& pods, const std::set<std::string>& subscribed, uint64_t now);
+    // An OnDemand Device: whether it is in use at `now` (the time of its
+    // last use in `last`), recording a subscription and a driver found running
+    bool in_use(const DeviceView& d, const PodView* pod, bool subscribed, uint64_t now, uint64_t& last);
     std::string place(const models::DeviceSpec& spec, const std::string& current, const std::vector<NodeView>& nodes) const;
     // The driver pod for `d` on `node`; `out_hash` is what it was made from
     std::string pod_json(const DeviceView& d, const NodeView* node, std::string& out_hash) const;
@@ -131,6 +148,14 @@ private:
         uint64_t delay_ms{0};
     };
     std::map<std::string, Retry> retries_;
+    // OnDemand Devices by "<namespace>/<name>": the last use (0: none yet)
+    // and whether the last pass left a driver pod
+    struct Use {
+        uint64_t at{0};
+        bool running{false};
+    };
+    osal::Mutex uses_mutex_;
+    std::map<std::string, Use> uses_;
     ReconcileTrigger trigger_;
     std::unique_ptr<osal::Thread> thread_;
     std::atomic<bool> running_{false};
