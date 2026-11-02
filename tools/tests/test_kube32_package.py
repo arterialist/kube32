@@ -1,20 +1,30 @@
 """Tests for what the kube32 package adds to the CLI: the build hook, `new`,
-port detection and `version`.
+releases (download, SHA-256 check, cache), `flash`, `sim`, `console` and
+`version`.
 
 Run from the repository root:
 
     python3 -m unittest discover -s tools/tests -v
 
-kubectl is replaced by a script that records its arguments. Nothing opens a
-real serial port.
+Release downloads come from a local HTTP server (KUBE32_RELEASES_URL), esptool
+and pyserial are replaced by fakes, and docker, kubectl and kube32-sim by
+scripts that record their arguments. Nothing opens a real serial port.
 """
+import hashlib
+import http.server
 import importlib.util
+import io
+import json
 import os
+import select
 import shutil
 import subprocess
 import sys
+import tarfile
 import tempfile
 import textwrap
+import threading
+import time
 import types
 import unittest
 from unittest import mock
@@ -22,8 +32,9 @@ from unittest import mock
 from kube32_under_test import INSTALLED, PACKAGE_DIR, REPO, cli_command
 
 import kube32
-from kube32 import common, ports, scaffold
+from kube32 import common, flash, ports, releases, scaffold, sim
 
+DEV_BUILD = not kube32.is_release(kube32.version())
 HEADER = os.path.join(REPO, "include", "runtime", "k32_app_abi.h")
 COUNTER = os.path.join(REPO, "sdk", "rust", "examples", "counter", "src", "lib.rs")
 
@@ -72,6 +83,61 @@ class TempDirCase(unittest.TestCase):
 # ---------------------------------------------------------------------------
 # A release server
 # ---------------------------------------------------------------------------
+class ReleaseServer:
+    """Serves <root>/v<version>/<asset> on 127.0.0.1 and counts the requests per path."""
+
+    def __init__(self, root):
+        self.root = root
+        self.requests = []
+        server = self
+
+        class Handler(http.server.SimpleHTTPRequestHandler):
+            def __init__(self, *a, **kw):
+                super().__init__(*a, directory=root, **kw)
+
+            def do_GET(self):
+                server.requests.append(self.path)
+                super().do_GET()
+
+            def log_message(self, *a):
+                pass
+
+        self.httpd = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        self.url = "http://127.0.0.1:%d" % self.httpd.server_address[1]
+        threading.Thread(target=self.httpd.serve_forever, daemon=True).start()
+
+    def add(self, release, name, data, digest=None):
+        d = os.path.join(self.root, "v" + release)
+        os.makedirs(d, exist_ok=True)
+        with open(os.path.join(d, name), "wb") as f:
+            f.write(data)
+        with open(os.path.join(d, name + ".sha256"), "w") as f:
+            f.write("%s  %s\n" % (digest or hashlib.sha256(data).hexdigest(), name))
+
+    def close(self):
+        self.httpd.shutdown()
+        self.httpd.server_close()
+
+
+def merged_image(size=0x9000):
+    """A merged image as kube32 flash expects it: bootloader magic at 0x0, partition table at 0x8000."""
+    data = bytearray(b"\xff" * size)
+    data[0] = 0xE9
+    data[0x8000:0x8002] = b"\xaa\x50"
+    return bytes(data)
+
+
+def sim_tarball(script, member="kube32-sim"):
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w:gz") as tf:
+        data = script.encode()
+        info = tarfile.TarInfo(member)
+        info.size = len(data)
+        info.mode = 0o755
+        tf.addfile(info, io.BytesIO(data))
+    return buf.getvalue()
+
+
 # ---------------------------------------------------------------------------
 # Files the package carries from the repository
 # ---------------------------------------------------------------------------
@@ -230,6 +296,90 @@ class TestNew(TempDirCase):
 
 
 # ---------------------------------------------------------------------------
+# Releases
+# ---------------------------------------------------------------------------
+class TestReleases(TempDirCase):
+    def setUp(self):
+        super().setUp()
+        self.server = ReleaseServer(os.path.join(self.tmp, "www"))
+        self.environ = mock.patch.dict(os.environ, {"KUBE32_RELEASES_URL": self.server.url,
+                                                    "KUBE32_CACHE_DIR": os.path.join(self.tmp, "cache")})
+        self.environ.start()
+        self.out = io.StringIO()
+
+    def tearDown(self):
+        self.environ.stop()
+        self.server.close()
+        super().tearDown()
+
+    def test_download_check_and_cache(self):
+        self.server.add("1.2.3", "asset.bin", b"payload" * 1000)
+        path = releases.fetch("1.2.3", "asset.bin", out=self.out)
+        self.assertEqual(path, os.path.join(self.tmp, "cache", "releases", "1.2.3", "asset.bin"))
+        self.assertEqual(read(path, "rb"), b"payload" * 1000)
+        self.assertEqual(self.server.requests, ["/v1.2.3/asset.bin.sha256", "/v1.2.3/asset.bin"])
+        self.assertIn("downloading %s/v1.2.3/asset.bin" % self.server.url, self.out.getvalue())
+        # The cached copy matches its .sha256: no request
+        self.assertEqual(releases.fetch("1.2.3", "asset.bin", out=self.out), path)
+        self.assertEqual(len(self.server.requests), 2)
+        # A damaged cached copy is downloaded again
+        with open(path, "ab") as f:
+            f.write(b"x")
+        releases.fetch("1.2.3", "asset.bin", out=self.out)
+        self.assertEqual(len(self.server.requests), 4)
+        self.assertEqual(read(path, "rb"), b"payload" * 1000)
+
+    def test_checksum_mismatch(self):
+        self.server.add("1.2.3", "asset.bin", b"payload", digest="0" * 64)
+        with self.assertRaises(releases.ReleaseError) as ctx:
+            releases.fetch("1.2.3", "asset.bin", out=self.out)
+        self.assertIn("does not match asset.bin.sha256 (%s); the download was discarded" % ("0" * 64), str(ctx.exception))
+        self.assertEqual(os.listdir(os.path.join(self.tmp, "cache", "releases", "1.2.3")), [])
+
+    def test_missing_release(self):
+        with self.assertRaises(releases.NotFound) as ctx:
+            releases.fetch("9.9.9", "asset.bin", out=self.out)
+        self.assertIn("release v9.9.9 has no asset.bin", str(ctx.exception))
+        self.assertIn("https://github.com/arterialist/kube32/releases", str(ctx.exception))
+
+    def test_bad_sha256_file(self):
+        d = os.path.join(self.tmp, "www", "v1.0.0")
+        os.makedirs(d)
+        with open(os.path.join(d, "a.bin.sha256"), "w") as f:
+            f.write("<html>not a digest</html>")
+        with self.assertRaises(releases.ReleaseError) as ctx:
+            releases.fetch("1.0.0", "a.bin", out=self.out)
+        self.assertEqual(str(ctx.exception), "a.bin.sha256 does not start with a SHA-256 digest")
+
+    def test_release_for(self):
+        self.assertEqual(releases.release_for("1.2.3", "firmware", "x"), "1.2.3")
+        self.assertEqual(releases.release_for("v1.2.3", "firmware", "x"), "1.2.3")
+        with self.assertRaises(releases.ReleaseError):
+            releases.release_for("1.2", "firmware", "x")
+        with mock.patch.object(releases, "version", return_value="1.3.0.dev4+gabc"):
+            with self.assertRaises(releases.ReleaseError) as ctx:
+                releases.release_for(None, "firmware", "pass --version X.Y.Z")
+        self.assertIn("kube32 1.3.0.dev4+gabc is a development build, and no firmware release matches it: pass --version X.Y.Z",
+                      str(ctx.exception))
+        with mock.patch.object(releases, "version", return_value="1.3.0"):
+            self.assertEqual(releases.release_for(None, "firmware", "x"), "1.3.0")
+
+    def test_parse_sha256(self):
+        digest = "ab" * 32
+        self.assertEqual(releases.parse_sha256(digest + "\n", "f"), digest)
+        self.assertEqual(releases.parse_sha256(digest.upper() + "  f.bin\n", "f"), digest)
+
+    def test_cache_dir(self):
+        self.assertEqual(releases.cache_dir(), os.path.join(self.tmp, "cache"))
+        with mock.patch.dict(os.environ, {"XDG_CACHE_HOME": "/xdg"}):
+            del os.environ["KUBE32_CACHE_DIR"]
+            expected = (os.path.join(os.path.expanduser("~"), "Library", "Caches", "kube32") if sys.platform == "darwin"
+                        else os.path.join("/xdg", "kube32"))
+            if os.name != "nt":
+                self.assertEqual(releases.cache_dir(), expected)
+
+
+# ---------------------------------------------------------------------------
 # Ports
 # ---------------------------------------------------------------------------
 def port(device, vid):
@@ -270,6 +420,204 @@ class TestPorts(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
+# flash
+# ---------------------------------------------------------------------------
+FAKE_ESPTOOL = textwrap.dedent('''\
+    import json, os
+    __version__ = os.environ.get("FAKE_ESPTOOL_VERSION", "5.1.0")
+    class FatalError(Exception):
+        pass
+    def main(argv=None, esp=None):
+        log = os.environ["FAKE_ESPTOOL_LOG"]
+        with open(log, "a") as f:
+            f.write(json.dumps(argv) + "\\n")
+        with open(log) as f:
+            calls = len(f.readlines())
+        if calls <= int(os.environ.get("FAKE_ESPTOOL_FAILS", "0")):
+            raise FatalError("Failed to connect to ESP32-S3: No serial data received.")
+''')
+
+
+class FakeEsptool(types.ModuleType):
+    def __init__(self, version="5.1.0", fails=0):
+        super().__init__("esptool")
+        self.__version__ = version
+        self.calls = []
+        self.fails = fails
+
+    def main(self, argv):
+        self.calls.append(argv)
+        if len(self.calls) <= self.fails:
+            raise RuntimeError("Failed to connect")
+
+
+class TestFlash(TempDirCase):
+    def setUp(self):
+        super().setUp()
+        # esptool and pyserial stand-ins for the CLI runs: no serial port is listed or opened
+        self.modules = os.path.join(self.tmp, "modules")
+        os.makedirs(os.path.join(self.modules, "esptool"))
+        os.makedirs(os.path.join(self.modules, "serial", "tools"))
+        with open(os.path.join(self.modules, "esptool", "__init__.py"), "w") as f:
+            f.write(FAKE_ESPTOOL)
+        with open(os.path.join(self.modules, "serial", "__init__.py"), "w") as f:
+            f.write("class SerialException(OSError):\n    pass\n")
+        open(os.path.join(self.modules, "serial", "tools", "__init__.py"), "w").close()
+        with open(os.path.join(self.modules, "serial", "tools", "list_ports.py"), "w") as f:
+            f.write("def comports():\n    return []\n")
+        self.log = os.path.join(self.tmp, "esptool.jsonl")
+        self.image = os.path.join(self.tmp, "merged.bin")
+        with open(self.image, "wb") as f:
+            f.write(merged_image())
+
+    def flash_env(self, **extra):
+        return self.env(PYTHONPATH=self.modules, FAKE_ESPTOOL_LOG=self.log, **extra)
+
+    def calls(self):
+        with open(self.log) as f:
+            return [json.loads(line) for line in f]
+
+    def test_check_image(self):
+        flash.check_image(self.image)
+        app = os.path.join(self.tmp, "app.bin")
+        with open(app, "wb") as f:
+            f.write(b"\xe9" + b"\0" * 0x9000)
+        with self.assertRaises(ValueError) as ctx:
+            flash.check_image(app)
+        self.assertIn("no partition table at 0x8000", str(ctx.exception))
+        with open(app, "wb") as f:
+            f.write(b"\0" * 16)
+        with self.assertRaises(ValueError):
+            flash.check_image(app)
+
+    def test_esptool_arguments(self):
+        with mock.patch.dict(os.environ):
+            os.environ.pop("KUBE32_FLASH_BEFORE", None)
+            os.environ.pop("KUBE32_FLASH_AFTER", None)
+            self.assertEqual(flash.esptool_argv("5.1.0", "/dev/ttyACM0", 921600, "fw.bin", False),
+                             ["--chip", "esp32s3", "--port", "/dev/ttyACM0", "--baud", "921600", "--before", "default-reset",
+                              "--after", "watchdog-reset", "write-flash", "0x0", "fw.bin"])
+            self.assertEqual(flash.esptool_argv("4.8.1", "/dev/ttyUSB0", 460800, "fw.bin", True),
+                             ["--chip", "esp32s3", "--port", "/dev/ttyUSB0", "--baud", "460800", "--before", "default_reset",
+                              "--after", "hard_reset", "write_flash", "-u", "0x0", "fw.bin"])
+
+    def test_falls_back_to_460800(self):
+        fake = FakeEsptool(fails=1)
+        out = io.StringIO()
+        with mock.patch.dict(sys.modules, {"esptool": fake}), mock.patch.object(flash, "is_bridge", return_value=False):
+            self.assertIsNone(flash.write_image("/dev/ttyACM0", "fw.bin", flash.BAUDS, out=out))
+        self.assertEqual([c[5] for c in fake.calls], ["921600", "460800"])
+        self.assertIn("esptool failed at 921600 baud: Failed to connect; retrying at 460800 baud", out.getvalue())
+        fake = FakeEsptool(fails=2)
+        with mock.patch.dict(sys.modules, {"esptool": fake}), mock.patch.object(flash, "is_bridge", return_value=False):
+            self.assertEqual(flash.write_image("/dev/ttyACM0", "fw.bin", flash.BAUDS, out=io.StringIO()),
+                             "esptool failed at 460800 baud: Failed to connect")
+
+    def test_flash_a_file(self):
+        rc, out, err = run_cli("flash", "--file", self.image, "--port", "/dev/fake0", "--no-console", env=self.flash_env())
+        self.assertEqual(rc, 0, out + err)
+        self.assertEqual(self.calls(), [["--chip", "esp32s3", "--port", "/dev/fake0", "--baud", "921600", "--before", "default-reset",
+                                         "--after", "watchdog-reset", "write-flash", "0x0", self.image]])
+        self.assertIn("flashed /dev/fake0 with %s" % self.image, out)
+        self.assertIn("K32_CMD:WIFI:<ssid>:<password>", out)
+        self.assertIn("console --port /dev/fake0", out)
+
+    def test_flash_a_release(self):
+        server = ReleaseServer(os.path.join(self.tmp, "www"))
+        self.addCleanup(server.close)
+        server.add("2.0.1", "kube32-firmware-esp32s3-2.0.1.bin", merged_image())
+        env = self.flash_env(KUBE32_RELEASES_URL=server.url, FAKE_ESPTOOL_VERSION="4.8.1", FAKE_ESPTOOL_FAILS="1")
+        rc, out, err = run_cli("flash", "--version", "2.0.1", "--port", "/dev/fake0", "--no-console", env=env)
+        self.assertEqual(rc, 0, out + err)
+        cached = os.path.join(self.tmp, "cache", "releases", "2.0.1", "kube32-firmware-esp32s3-2.0.1.bin")
+        self.assertEqual([c[5] for c in self.calls()], ["921600", "460800"])
+        self.assertEqual(self.calls()[1][-3:], ["write_flash", "0x0", cached])
+        self.assertIn("flashed /dev/fake0 with kube32 2.0.1", out)
+
+    def test_refusals(self):
+        rc, _, err = run_cli("flash", "--version", "7.7.7", "--port", "/dev/fake0", env=self.flash_env(KUBE32_RELEASES_URL="http://127.0.0.1:9"))
+        self.assertEqual(rc, 1)
+        self.assertIn("cannot download http://127.0.0.1:9/v7.7.7/kube32-firmware-esp32s3-7.7.7.bin.sha256", err)
+        rc, _, err = run_cli("flash", "--file", os.path.join(self.tmp, "none.bin"), env=self.flash_env())
+        self.assertEqual((rc, err), (1, "error: no such file: %s\n" % os.path.join(self.tmp, "none.bin")))
+        rc, _, err = run_cli("flash", "--file", self.image, env=self.flash_env())   # no board listed
+        self.assertEqual(rc, 1)
+        self.assertIn("no ESP32-S3 board found", err)
+        self.assertFalse(os.path.exists(self.log))
+
+    @unittest.skipUnless(DEV_BUILD, "this kube32 is a release")
+    def test_development_build(self):
+        rc, out, err = run_cli("flash", "--port", "/dev/fake0", env=self.flash_env())
+        self.assertEqual((rc, out), (1, ""))
+        self.assertIn("is a development build, and no firmware release matches it: pass --version X.Y.Z to flash a release, "
+                      "or --file <image> to flash an image file", err)
+
+
+# ---------------------------------------------------------------------------
+# sim
+# ---------------------------------------------------------------------------
+RECORDER = '#!/bin/sh\necho "%s $*"\nexit 3\n'
+
+
+class TestSim(TempDirCase):
+    def test_platform_tag(self):
+        self.assertEqual(sim.platform_tag("Darwin", "arm64"), ("macos", "arm64"))
+        self.assertEqual(sim.platform_tag("Darwin", "x86_64"), ("macos", "x86_64"))
+        self.assertEqual(sim.platform_tag("Linux", "aarch64"), ("linux", "arm64"))
+        self.assertEqual(sim.platform_tag("Linux", "x86_64"), ("linux", "x86_64"))
+        with self.assertRaises(releases.ReleaseError):
+            sim.platform_tag("Windows", "AMD64")
+
+    def test_path_first_and_arguments_passed_on(self):
+        write_exe(os.path.join(self.bin, "kube32-sim"), RECORDER % "path-sim")
+        rc, out, _ = run_cli("sim", "--ingress-port", "8080", "--workers", "", "--psram=0", env=self.env())
+        self.assertEqual((rc, out), (3, "path-sim --ingress-port 8080 --workers  --psram=0\n"))
+        rc, out, _ = run_cli("sim", "--", "--help", env=self.env())
+        self.assertEqual(out, "path-sim --help\n")
+
+    def test_release_download(self):
+        os_name, arch = sim.platform_tag()
+        server = ReleaseServer(os.path.join(self.tmp, "www"))
+        self.addCleanup(server.close)
+        server.add("1.2.3", "kube32-sim-1.2.3-%s-%s.tar.gz" % (os_name, arch), sim_tarball(RECORDER % "release-sim"))
+        write_exe(os.path.join(self.bin, "kube32-sim"), RECORDER % "path-sim")   # --version wins over PATH
+        env = self.env(KUBE32_RELEASES_URL=server.url)
+        rc, out, err = run_cli("sim", "--version", "1.2.3", "--port", "7443", env=env)
+        self.assertEqual(rc, 3, err)
+        self.assertTrue(out.endswith("release-sim --port 7443\n"), out)
+        exe = os.path.join(self.tmp, "cache", "releases", "1.2.3", "kube32-sim-%s-%s" % (os_name, arch), "kube32-sim")
+        self.assertTrue(os.access(exe, os.X_OK))
+        rc, out, _ = run_cli("sim", "--version", "1.2.3", env=env)   # cached: no download
+        self.assertEqual(out, "release-sim \n")
+        self.assertEqual(len(server.requests), 2)
+
+    def test_tarball_without_the_simulator(self):
+        tarball = os.path.join(self.tmp, "t.tar.gz")
+        with open(tarball, "wb") as f:
+            f.write(sim_tarball("x", member="bin/kube32-sim"))
+        with self.assertRaises(releases.ReleaseError) as ctx:
+            sim.extract_sim(tarball, os.path.join(self.tmp, "kube32-sim"))
+        self.assertEqual(str(ctx.exception), "t.tar.gz has no top-level kube32-sim file")
+
+    def test_docker(self):
+        write_exe(os.path.join(self.bin, "docker"), RECORDER % "docker")
+        rc, out, _ = run_cli("sim", "--docker", "--version", "1.2.3", "--ingress-port", "8080", "--pod-port=17000", env=self.env())
+        self.assertEqual(rc, 3)
+        self.assertEqual(out, "docker run --rm --init -p 127.0.0.1:6443:6443 -p 127.0.0.1:8080:8080 -p 127.0.0.1:17000:17000 "
+                              "ghcr.io/arterialist/kube32-sim:1.2.3 --ingress-port 8080 --pod-port=17000\n")
+        rc, _, err = run_cli("sim", "--docker", "--version", "1.2.3", env=self.env(PATH="/nonexistent"))
+        self.assertEqual(rc, 1)
+        self.assertIn("docker not found in PATH", err)
+
+    @unittest.skipUnless(DEV_BUILD, "this kube32 is a release")
+    def test_development_build(self):
+        rc, out, err = run_cli("sim", "--ingress-port", "8080", env=self.env())
+        self.assertEqual((rc, out), (1, ""))
+        self.assertIn("is a development build, and no kube32-sim release matches it: pass --version X.Y.Z to run a release, "
+                      "or build kube32-sim from source", err)
+
+
+# ---------------------------------------------------------------------------
 # version, help
 # ---------------------------------------------------------------------------
 FAKE_KUBECTL_VERSION = textwrap.dedent('''\
@@ -304,7 +652,7 @@ class TestVersionAndHelp(TempDirCase):
         rc, out, _ = run_cli("--help")
         self.assertEqual(rc, 0)
         for command in ("new", "build", "check", "deploy", "embed", "sd-push", "push", "firmware", "devices", "checkpoint",
-                        "move", "checkpoints", "gateway", "version"):
+                        "move", "checkpoints", "flash", "console", "gateway", "sim", "version"):
             self.assertRegex(out, r"\n    %s\s" % command)
         rc, out, err = run_cli("version", "--client", "--bogus")
         self.assertEqual(rc, 2)
@@ -314,6 +662,55 @@ class TestVersionAndHelp(TempDirCase):
         rc, _, err = run_cli("devices", env=self.env(PATH="/nonexistent"))
         self.assertEqual(rc, 4)
         self.assertIn("kubectl not found in PATH: this command runs kubectl; install it", err)
+
+
+# ---------------------------------------------------------------------------
+# console
+# ---------------------------------------------------------------------------
+class Output(io.StringIO):
+    def __init__(self):
+        super().__init__()
+        self.lock = threading.Lock()
+
+    def write(self, s):
+        with self.lock:
+            return super().write(s)
+
+    def text(self):
+        with self.lock:
+            return self.getvalue()
+
+
+@unittest.skipUnless(HAVE_SERIAL, "needs pyserial and a pty")
+class TestConsole(unittest.TestCase):
+    def test_console(self):
+        from kube32 import console
+        master, slave = os.openpty()
+        self.addCleanup(os.close, master)
+        self.addCleanup(os.close, slave)
+        r, w = os.pipe()
+        stdin = os.fdopen(r)
+        out = Output()
+        t = threading.Thread(target=console.run, args=(os.ttyname(slave),), kwargs={"stdin": stdin, "stdout": out}, daemon=True)
+        t.start()
+        deadline = time.time() + 5
+        while "[console]" not in out.text() and time.time() < deadline:   # the port is open (raw mode)
+            time.sleep(0.02)
+        self.assertIn("[console] %s at 115200 baud" % os.ttyname(slave), out.text())
+        os.write(master, b"[KUBELET] ready\r\n")
+        os.write(w, b"K32_CMD:STATUS\n")
+        got = b""
+        while b"\n" not in got and time.time() < deadline:
+            if select.select([master], [], [], 0.1)[0]:
+                got += os.read(master, 64)
+        self.assertEqual(got, b"K32_CMD:STATUS\n")
+        while "[KUBELET] ready" not in out.text() and time.time() < deadline:
+            time.sleep(0.05)
+        self.assertIn("[KUBELET] ready", out.text())
+        os.close(w)
+        t.join(5)
+        self.assertFalse(t.is_alive())
+        stdin.close()
 
 
 if __name__ == "__main__":

@@ -15,7 +15,10 @@
     kube32 checkpoint <pod>                 save a running pod's state in a Checkpoint
     kube32 move <pod> [--to <node>]         move a running pod to another node with its state
     kube32 checkpoints                      list Checkpoints
+    kube32 flash                            write the release firmware to a board over USB
+    kube32 console                          a board's serial console
     kube32 gateway                          HTTP to a board over its USB console
+    kube32 sim [<args>...]                  run the kube32-sim simulator
     kube32 version                          this tool's version and the cluster's
 
 The commands that talk to a cluster run kubectl, so kubeconfig contexts and
@@ -48,12 +51,32 @@ def cmd_new(args):
     return run(args)
 
 
+def cmd_flash(args):
+    from .flash import cmd_flash as run
+    return run(args)
+
+
 def missing_pyserial():
     try:
         import serial  # noqa: F401
     except ImportError:
         return err_exit("this command needs pyserial, which the kube32 package installs (pip install pyserial)", EXIT_INPUT)
     return None
+
+
+def cmd_console(args):
+    if missing_pyserial():
+        return EXIT_INPUT
+    from .ports import PortError, choose_port
+    try:
+        port = choose_port(args.port)
+    except PortError as e:
+        return err_exit(str(e), EXIT_INPUT)
+    from . import console
+    try:
+        return console.run(port)
+    except OSError as e:
+        return err_exit("%s: %s" % (port, e), EXIT_INPUT)
 
 
 def cmd_gateway(args):
@@ -99,7 +122,8 @@ class VersionAction(argparse.Action):
 
 
 def build_parser(prog="kube32"):
-    p = argparse.ArgumentParser(prog=prog, description="Build, check and deploy kube32 WebAssembly pods.",
+    p = argparse.ArgumentParser(prog=prog, description="Build, check and deploy kube32 WebAssembly pods, flash ESP32-S3 "
+                                                       "boards, and run the kube32-sim simulator.",
                                 epilog=EXIT_CODES_HELP)
     p.add_argument("--version", action=VersionAction, help="show the version and exit")
     sub = p.add_subparsers(dest="command", metavar="<command>")
@@ -227,11 +251,33 @@ def build_parser(prog="kube32"):
     kubectl_flags(cl)
     cl.set_defaults(func=cmd_checkpoints)
 
+    fl = sub.add_parser("flash", help="write the release firmware (or an image file) to an ESP32-S3 board over USB")
+    fl.add_argument("--port", help="serial port (default: KUBE32_SERIAL_PORT, or the one board connected)")
+    fl.add_argument("--version", help="flash this release, X.Y.Z (default: the release of this kube32)")
+    fl.add_argument("--file", help="flash this merged image at offset 0x0 instead of a release")
+    fl.add_argument("--baud", type=int, help="baud rate (default 921600, then 460800 when that fails)")
+    fl.add_argument("--console", dest="console", action="store_true", default=None, help="open the serial console after flashing")
+    fl.add_argument("--no-console", dest="console", action="store_false", help="do not offer the serial console after flashing")
+    fl.set_defaults(func=cmd_flash)
+
+    co = sub.add_parser("console", help="a board's serial console: prints what the board writes, sends the lines typed")
+    co.add_argument("--port", help="serial port (default: KUBE32_SERIAL_PORT, or the one board connected)")
+    co.set_defaults(func=cmd_console)
+
     gw = sub.add_parser("gateway", help="serve a board's API server and ingress on local ports over its USB console")
     gw.add_argument("--port", help="serial device (default: KUBE32_SERIAL_PORT, or the control plane among the boards connected)")
     gw.add_argument("--map", action="append", default=None, metavar="LOCAL:DEVICE",
                     help="local:device port mapping, repeatable (default 6443:6443 and 8080:80)")
     gw.set_defaults(func=cmd_gateway)
+
+    si = sub.add_parser("sim", allow_abbrev=False, help="run the kube32-sim simulator: from PATH, its release, or --docker",
+                        usage="%s sim [-h] [--docker] [--version X.Y.Z] [--] [kube32-sim arguments ...]" % prog,
+                        description="Runs kube32-sim with the arguments kube32 does not take: kube32-sim from PATH, else the "
+                                    "release's kube32-sim for this machine (downloaded once), or with --docker the release's "
+                                    "container image. '%s sim -- --help' lists the simulator's options." % prog)
+    si.add_argument("--docker", action="store_true", help="run the container image ghcr.io/arterialist/kube32-sim:<version>")
+    si.add_argument("--version", help="run this release, X.Y.Z (default: kube32-sim on PATH, else the release of this kube32)")
+    si.set_defaults(func=None)
 
     ve = sub.add_parser("version", help="this tool's version, and the cluster's when kubectl reaches it")
     ve.add_argument("--client", action="store_true", help="only this tool's version")
@@ -245,6 +291,9 @@ def main(argv=None, prog="kube32"):
     argv = sys.argv[1:] if argv is None else list(argv)
     parser = build_parser(prog)
     args, extra = parser.parse_known_args(argv)
+    if args.command == "sim":
+        from .sim import cmd_sim
+        return cmd_sim(args, extra)
     if extra:
         parser.error("unrecognized arguments: %s" % " ".join(extra))
     if not args.command:
