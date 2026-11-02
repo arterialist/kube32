@@ -98,11 +98,12 @@ class TestExamplePlacement(BaseTestCase):
             self.wait_for_condition(lambda name=name: (node_ready_condition(self.api.base_url, name) or {}).get("status") == "True",
                                     timeout=15.0, description=f"{name} Ready")
 
-        # PSRAM above its 16 KiB reserve, and the pool block for esp32.io/psram;
-        # without PSRAM the pool block and the heap above the 24 KiB reserve
+        # The pool block and the PSRAM above its 16 KiB reserve, and the block
+        # a linear memory can take whole for esp32.io/psram; without PSRAM the
+        # pool block and the heap above the 24 KiB reserve
         devkit = self._memory("devkit")
-        self.assertEqual(devkit[("allocatable", "memory")], 448 - 16, f"devkit: {devkit}")
-        self.assertEqual(devkit[("allocatable", "esp32.io/psram")], 448 - 16 + 1284, f"devkit: {devkit}")
+        self.assertEqual(devkit[("allocatable", "memory")], 1284 + 448 - 16, f"devkit: {devkit}")
+        self.assertEqual(devkit[("allocatable", "esp32.io/psram")], 1284, f"devkit: {devkit}")
         self.assertTrue(devkit[("capacity", "memory")] >= devkit[("allocatable", "memory")], f"devkit: {devkit}")
         cardputer = self._memory("cardputer")
         self.assertEqual(cardputer[("allocatable", "memory")], 80 + 51 - 24, f"cardputer: {cardputer}")
