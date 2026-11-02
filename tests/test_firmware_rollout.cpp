@@ -384,7 +384,25 @@ static void test_node_documents_fit() {
     assert(doc.get("metadata")->get("annotations")->get_string(models::kAnnotationFirmwareState, "") == "Verifying");
 }
 
+// A node left with a target and no rollout (deleted before the control
+// plane restarted, so no pass remembers it) stops waiting: the target goes,
+// and a node that runs its target keeps it
+static void test_target_without_rollout() {
+    auto store = storage::create_radix_store(storage::StoreOptions{"/tmp", false});
+    const std::string sha(64, 'b'), other(64, 'c');
+    store->put("/registry/nodes/w1", "{\"kind\":\"Node\",\"metadata\":{\"name\":\"w1\",\"annotations\":{\"" +
+               std::string(models::kAnnotationFirmwareTarget) + "\":\"" + sha + "\",\"" + models::kAnnotationFirmwareSha256 + "\":\"" + other + "\"}}}", true);
+    store->put("/registry/nodes/w2", "{\"kind\":\"Node\",\"metadata\":{\"name\":\"w2\",\"annotations\":{\"" +
+               std::string(models::kAnnotationFirmwareTarget) + "\":\"" + sha + "\",\"" + models::kAnnotationFirmwareSha256 + "\":\"" + sha + "\"}}}", true);
+    controller::FirmwareRolloutController c(*store, [] { return api::StagedFirmware{}; });
+    c.reconcile(1000);
+    assert(annotation(*store, "w1", models::kAnnotationFirmwareTarget).empty());
+    assert(annotation(*store, "w2", models::kAnnotationFirmwareTarget) == sha);
+    std::cout << "[PASS] a target without a rollout goes" << std::endl;
+}
+
 int main() {
+    test_target_without_rollout();
     test_node_documents_fit();
     const std::vector<uint8_t> v1 = make_image("v1", 96 * 1024, 1);
     const std::vector<uint8_t> v2 = make_image("v2", 300 * 1024 + 17, 2);

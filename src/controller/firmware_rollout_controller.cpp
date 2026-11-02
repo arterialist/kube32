@@ -151,15 +151,14 @@ void FirmwareRolloutController::reconcile(uint64_t now) {
     store_.list_extended(kRolloutPrefix, jsons, &keys);
 
     if (jsons.empty()) {
-        if (!target_.empty()) {
-            // The rollout was deleted: nodes that have not switched stop
-            for (const auto& n : load_nodes()) {
-                if (n.target == target_ && n.running != target_) set_node_target(n.name, std::string());
-            }
-            target_.clear();
-            uid_.clear();
-            started_ms_.clear();
+        // No rollout: a node that has not switched to a target stops waiting
+        // for it, whether the rollout was deleted in this boot or before
+        for (const auto& n : load_nodes()) {
+            if (!n.target.empty() && n.running != n.target) set_node_target(n.name, std::string());
         }
+        target_.clear();
+        uid_.clear();
+        started_ms_.clear();
         return;
     }
 
