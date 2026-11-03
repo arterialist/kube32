@@ -230,8 +230,8 @@ void test_discovery_and_method_enforcement() {
     assert(resp8.body.find("\"name\":\"events\"") != std::string::npos);
     assert(resp8.body.find("\"kind\":\"Event\"") != std::string::npos);
 
-    // 9. Arena scratchpad offset > 0 verification
-    assert(arena.get_offset() > 0);
+    // 9. Discovery takes nothing from the worker's scratch
+    assert(arena.get_offset() == 0);
 
     // 10. HEAD /api/v1/nodes -> 200 OK with empty body
     HttpRequest r9;

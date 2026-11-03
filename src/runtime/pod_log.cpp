@@ -80,13 +80,15 @@ public:
 
     // Reads `dir/file` on the writer thread. False when it does not exist.
     bool read(const std::string& dir, const std::string& file, std::string& out) {
-        ReadSlot slot;
-        push(Op{Op::Read, dir, file, {}, &slot});
+        // The writer holds the slot too: a read that gives up returns while
+        // the operation may still be queued or running
+        auto slot = std::make_shared<ReadSlot>();
+        push(Op{Op::Read, dir, file, {}, slot});
         osal::UniqueLock<osal::Mutex> lock(mutex_);
-        cv_.wait_for(lock, 5000, [&slot]() { return slot.done; });
-        if (!slot.done) { slot.abandoned = true; return false; }
-        out = std::move(slot.data);
-        return slot.ok;
+        cv_.wait_for(lock, 5000, [&slot]() { return slot->done; });
+        if (!slot->done) { slot->abandoned = true; return false; }
+        out = std::move(slot->data);
+        return slot->ok;
     }
 
     // Waits until every queued operation is done
@@ -107,7 +109,7 @@ private:
         std::string dir;
         std::string file;
         std::string text;
-        ReadSlot* slot;
+        std::shared_ptr<ReadSlot> slot;
     };
 
     void push(Op op) {

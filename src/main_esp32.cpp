@@ -1384,20 +1384,25 @@ void print_banner(const NodeIdentity& id) {
 std::atomic<uint32_t> s_alloc_fail_bytes{0};
 std::atomic<uint32_t> s_alloc_fail_count{0};
 std::atomic<uint32_t> s_alloc_fail_caps{0};
+std::atomic<bool> s_alloc_trace_armed{true};
 
 void on_alloc_failed(size_t size, uint32_t caps, const char* function_name) {
     (void)function_name;
     s_alloc_fail_bytes.store(static_cast<uint32_t>(size));
     s_alloc_fail_caps.store(caps);
-    // The first large block refused since the last [MEM] line: where it was asked for
-    if (s_alloc_fail_count.fetch_add(1) == 0 && size > kube32::mem::kLargeBlockMin) {
-        printf("[MEM] refused %u bytes (caps 0x%x)\n", (unsigned)size, (unsigned)caps);
+    s_alloc_fail_count.fetch_add(1);
+    // The first block of 1 KiB or more refused since the last [MEM] line:
+    // where it was asked for, and what the heap had then
+    if (size >= 1024 && s_alloc_trace_armed.exchange(false)) {
+        printf("[MEM] refused %u bytes (caps 0x%x), psram free %u (largest %u)\n", (unsigned)size, (unsigned)caps,
+               (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM), (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM));
         esp_backtrace_print(12);
     }
 }
 
 void log_memory(const char* stage) {
     char failed[64] = "";
+    s_alloc_trace_armed.store(true);
     if (const uint32_t n = s_alloc_fail_count.exchange(0)) {
         snprintf(failed, sizeof(failed), "  %u failed alloc(s), last %u bytes (caps 0x%x)", (unsigned)n, (unsigned)s_alloc_fail_bytes.load(),
                  (unsigned)s_alloc_fail_caps.load());
