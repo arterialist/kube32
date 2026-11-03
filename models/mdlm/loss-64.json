@@ -1,0 +1,10 @@
+{
+ "windows": "2560 windows of 64 tokens from data00 at random offsets; mdlm: the MDLM bound (nats a token), the others: autoregressive loss",
+ "mdlm@float": 1.9078299582004548,
+ "mdlm@int8": 1.9134946674108506,
+ "mdlm_story_starts_half@float": 1.5946625500917435,
+ "target-lm.bin@float": 1.0758742853999137,
+ "target-lm.bin@int8": 1.0770351439714432,
+ "stories260K.bin@float": 1.4813906669616699,
+ "stories260K.bin@int8": 1.4843964904546738
+}

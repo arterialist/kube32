@@ -1,0 +1,19 @@
+[BOS | 8 steps | T 0.0 seed 1] Once upon a time, there was a little girl named Lily. She loved to play with hers a the the the toysss. One day, shessked her to toyy of she wantould too to to at the heros..
+[BOS | 8 steps | T 0.8 seed 1] Once upon a a, there was a little dog named named Timmy. Timmy loved to play usy ball with his friends. One day, Timmy's mom gave him a guft to go on on the slind. H was. T
+[BOS | 8 steps | T 0.8 seed 2] Once upon a time, there was a little girl named Lily. She loved to play withoutside in the warden. One day, she saw a usy cen played to gop up her toy bear.o wanted Lily's friend
+[BOS | 16 steps | T 0.0 seed 1] Once upon a time, there was a little girl named Lily. She loved to play with hers a the the the park. One day, she saw a big antchen on the ground.. The sun told herim aboutas
+[BOS | 16 steps | T 0.8 seed 1] Once upon a time, there was a little girl named Lily. She loved to play with hers and make songs. One day, she's mom ga her her to clean up her toashes. Lily was so happy and cedw
+[BOS | 16 steps | T 0.8 seed 2] Once upon a time, there was a little girl named Lily. She loved to play resy up with her toys. One day, she went to the park to playing outside. played the swing and slide.
+[BOS | 32 steps | T 0.0 seed 1] Once upon a time, there was a little girl named Lily. She loved to play with her toys and explore the world. One day, she found a big buttty flower in her garden. I was
+[BOS | 32 steps | T 0.8 seed 1] Once upon a time, there was a little girl named Lily. She loved to play with her toys andvery day. One day, she's mom baked her to bake cakes. Lily wanted to play play with her toys. 
+
+[BOS | 32 steps | T 0.8 seed 2] Once upon a time, there was a little girl named Lily. She loved to play with her toys, espterdy. One day, she wed to the garden with her mommy. They had a shiny cace fora
+[Lily went to the park | 8 steps | T 0.0 seed 1] Lily went to the park with her mom a a adments... Theyt a toy cs and always bears and toys. They lied to play with the toys and toys. They hadre msy
+[Lily went to the park | 8 steps | T 0.8 seed 1] Lily went to the park with her mom a She sat some s swings and the slide. She wanted to play some sreals shs and the sings. She wanted to play allot and toy
+[Lily went to the park | 8 steps | T 0.8 seed 2] Lily went to the park to play with a big s. They saw a swings and slides, and seing, and swys. They liked to play with the swings. They wanted to swe the sqing and
+[Lily went to the park | 16 steps | T 0.0 seed 1] Lily went to the park with her mom asked her. They saw a bigy le and saided to e mome, " she wantan to play withar it. When they got thereome, there, they saw a big asim
+[Lily went to the park | 16 steps | T 0.8 seed 1] Lily went to the park with her mom as slid.. Lily was very happy. She wanted to find a big idea to She houseed a band, and she wanted no intch appock. She th
+[Lily went to the park | 16 steps | T 0.8 seed 2] Lily went to the park to play with a big slide in the sun. She saw a big tree with aree, of preted a g dress. She wanted to play with it, but she did n't kn
+[Lily went to the park | 32 steps | T 0.0 seed 1] Lily went to the park with her mom. They saw a big tree with many treats werees. Lily wanted to playe the tree, but she didn't know what to do. She want liked the
+[Lily went to the park | 32 steps | T 0.8 seed 1] Lily went to the park with her mom. They saw a big box of yums and cars and songs. Lily wanted to see the birds, but she mom didn't know what to in
+[Lily went to the park | 32 steps | T 0.8 seed 2] Lily went to the park. She saw a pretty crack on the ground. She wanted to toatch it, but she didn't know what to do. So, she found a wre

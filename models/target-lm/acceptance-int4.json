@@ -1,0 +1,66 @@
+{
+ "target": "target-lm.bin",
+ "target_bytes": 2076736,
+ "target_bits": 4,
+ "draft": "stories260K.bin",
+ "draft_bytes": 327456,
+ "draft_bits": 8,
+ "prompts": 50,
+ "steps": 200,
+ "runs": {
+  "draft-k2": {
+   "passes": 4276,
+   "tokens": 9991,
+   "proposed": 8481,
+   "accepted": 5716,
+   "target_positions": 12757,
+   "acceptance": 0.673977125338993,
+   "tokens_per_pass": 2.3365294667913936
+  },
+  "draft-k4": {
+   "passes": 3210,
+   "tokens": 9991,
+   "proposed": 12674,
+   "accepted": 6782,
+   "target_positions": 15884,
+   "acceptance": 0.5351112513807795,
+   "tokens_per_pass": 3.1124610591900312
+  },
+  "draft-k6": {
+   "passes": 2800,
+   "tokens": 9991,
+   "proposed": 16508,
+   "accepted": 7192,
+   "target_positions": 19308,
+   "acceptance": 0.435667555124788,
+   "tokens_per_pass": 3.568214285714286
+  },
+  "ngram-k2": {
+   "passes": 8151,
+   "tokens": 9991,
+   "proposed": 8921,
+   "accepted": 1841,
+   "target_positions": 17072,
+   "acceptance": 0.2063669992153346,
+   "tokens_per_pass": 1.2257391731075942
+  },
+  "ngram-k4": {
+   "passes": 7878,
+   "tokens": 9991,
+   "proposed": 16504,
+   "accepted": 2114,
+   "target_positions": 24382,
+   "acceptance": 0.12809015996122153,
+   "tokens_per_pass": 1.2682152830667681
+  },
+  "ngram-k6": {
+   "passes": 7822,
+   "tokens": 9991,
+   "proposed": 23874,
+   "accepted": 2170,
+   "target_positions": 31696,
+   "acceptance": 0.09089385942866716,
+   "tokens_per_pass": 1.2772948095116339
+  }
+ }
+}
