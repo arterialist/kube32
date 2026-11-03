@@ -29,7 +29,9 @@ static std::unique_ptr<storage::Store> mem_store() {
 }
 
 // Reads from fd until `needle` appears or the deadline passes.
-static std::string read_until(int fd, const std::string& needle, uint32_t timeout_ms) {
+// whole_chunk: after the needle, keep reading until the chunk that holds it
+// is complete (a watch event's payload ends in "\n" and the chunk in CRLF)
+static std::string read_until(int fd, const std::string& needle, uint32_t timeout_ms, bool whole_chunk = false) {
     std::string acc;
     uint64_t t0 = osal::Thread::get_time_ms();
     char buf[1024];
@@ -41,7 +43,8 @@ static std::string read_until(int fd, const std::string& needle, uint32_t timeou
         ssize_t n = ::recv(fd, buf, sizeof(buf), 0);
         if (n > 0) acc.append(buf, static_cast<size_t>(n));
         else if (n == 0) break;
-        if (acc.find(needle) != std::string::npos) break;
+        size_t at = acc.find(needle);
+        if (at != std::string::npos && (!whole_chunk || acc.find("\n\r\n", at) != std::string::npos)) break;
     }
     return acc;
 }
@@ -274,7 +277,7 @@ void test_watch_hub_framing() {
     spec.api_version = "v1";
     spec.bookmarks = true;
     assert(hub.add_watch(osal::Socket(sv[0]), spec));
-    std::string got = read_until(sv[1], "\"type\":\"ADDED\"", 10000);
+    std::string got = read_until(sv[1], "\"type\":\"ADDED\"", 10000, true);
     assert(got.find("{\"type\":\"ADDED\",\"object\":{\"kind\":\"Pod\"") != std::string::npos);
     assert(got.find("\"name\":\"b\"") == std::string::npos);       // other namespace filtered by prefix
     // Chunk framing: hex size line, payload ending in \n, CRLF
@@ -286,12 +289,12 @@ void test_watch_hub_framing() {
     assert(got.compare(crlf + 2 + len, 2, "\r\n") == 0);
 
     store->put("/registry/pods/default/a", "{\"kind\":\"Pod\",\"apiVersion\":\"v1\",\"metadata\":{\"name\":\"a\",\"namespace\":\"default\"},\"spec\":{\"nodeName\":\"n2\"}}", true);
-    got = read_until(sv[1], "\"type\":\"MODIFIED\"", 10000);
+    got = read_until(sv[1], "\"type\":\"MODIFIED\"", 10000, true);
     assert(got.find("\"type\":\"MODIFIED\"") != std::string::npos && got.find("\"nodeName\":\"n2\"") != std::string::npos);
     store->remove("/registry/pods/default/a");
-    got = read_until(sv[1], "\"type\":\"DELETED\"", 10000);
+    got = read_until(sv[1], "\"type\":\"DELETED\"", 10000, true);
     assert(got.find("\"type\":\"DELETED\"") != std::string::npos);
-    got = read_until(sv[1], "\"type\":\"BOOKMARK\"", 10000);
+    got = read_until(sv[1], "\"type\":\"BOOKMARK\"", 10000, true);
     assert(got.find("{\"type\":\"BOOKMARK\",\"object\":{\"kind\":\"Pod\",\"apiVersion\":\"v1\",\"metadata\":{\"resourceVersion\":\"") != std::string::npos);
     assert(hub.active_streams() == 1);
 
@@ -315,7 +318,7 @@ void test_watch_hub_framing() {
     // 3. Field selector on the stream: only pods on n1 come through
     store->put("/registry/pods/default/c", "{\"kind\":\"Pod\",\"apiVersion\":\"v1\",\"metadata\":{\"name\":\"c\",\"namespace\":\"default\"},\"spec\":{\"nodeName\":\"n2\"}}", true);
     store->put("/registry/pods/default/d", "{\"kind\":\"Pod\",\"apiVersion\":\"v1\",\"metadata\":{\"name\":\"d\",\"namespace\":\"default\"},\"spec\":{\"nodeName\":\"n1\"}}", true);
-    got = read_until(sv2[1], "\"name\":\"d\"", 10000);
+    got = read_until(sv2[1], "\"name\":\"d\"", 10000, true);
     assert(got.find("\"name\":\"d\"") != std::string::npos);
     assert(got.find("\"name\":\"c\"") == std::string::npos);
     ::close(sv2[1]);
@@ -330,7 +333,7 @@ void test_watch_hub_framing() {
     spec4.bookmarks = false;
     spec4.since_version = rv_before;
     assert(hub.add_watch(osal::Socket(sv4[0]), spec4));
-    got = read_until(sv4[1], "\"name\":\"e\"", 10000);
+    got = read_until(sv4[1], "\"name\":\"e\"", 10000, true);
     assert(got.find("\"type\":\"ADDED\"") != std::string::npos && got.find("\"name\":\"e\"") != std::string::npos);
     assert(got.find("\"name\":\"d\"") == std::string::npos);        // older than rv_before: not replayed
     ::close(sv4[1]);
