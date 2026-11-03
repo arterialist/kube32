@@ -199,7 +199,7 @@ static NOINLINE void text_char(char c, int prompt) {
 
 /* ---- listening -------------------------------------------------------------- */
 enum { LISTEN, SHOW };
-static uint32_t g_state, g_show_last, g_done_at, g_drawn, g_told;
+static uint32_t g_state, g_show_since, g_show_last, g_done_at, g_drawn, g_told;
 
 static int16_t g_pcm[KWS_WIN];
 static uint32_t g_have;                       /* samples in g_pcm */
@@ -347,7 +347,7 @@ static NOINLINE void accept_word(uint32_t cls, uint32_t p, uint32_t seed) {
     g_p = p;
     g_seed = seed;
     g_state = SHOW;
-    g_show_last = now_ms();
+    g_show_since = g_show_last = now_ms();
     g_t_noise = g_t_step1 = g_t_drawn = g_t_tok0 = g_frames = g_tokens = g_rate = 0;
     g_drawn = g_told = g_done_at = 0;
     /* "W <id> <class> <seed> <steps>" */
@@ -509,9 +509,11 @@ K32_EXPORT("k32_tick") int32_t k32_tick(uint32_t tick_ms) {
         return 1;   /* every 10 ms while listening */
     }
     /* back to listening a moment after the drawing and the story, or after
-     * 60 s without progress; the picture stays until the next word */
+     * 60 s without progress, or after 15 s without a first frame or token
+     * (the word or the story request did not get through); the picture
+     * stays until the next word */
     if (g_drawn && g_told && !g_done_at) g_done_at = now;
-    if ((g_done_at && now - g_done_at > 1500) || now - g_show_last > 60000) {
+    if ((g_done_at && now - g_done_at > 1500) || now - g_show_last > 60000 || (!g_frames && !g_tokens && now - g_show_since > 15000)) {
         report();
         listen_start();
         return 1;
