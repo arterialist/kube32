@@ -38,8 +38,8 @@ $(B)/mdlm_%.o: mdlm/mdlm_%.c mdlm/*.h
 $(B)/mdlm_test: $(B)/mdlm_test.o $(B)/mdlm_infer.o $(LINALG)
 	$(CXX) $(GC) -o $@ $^
 
-$(B)/frontend_test: $(B)/frontend_test.o $(B)/frontend.o
-	$(CC) -o $@ $^
+$(B)/frontend_test: $(B)/frontend_test.o $(B)/frontend.o $(LINALG)
+	$(CXX) $(GC) -o $@ $^
 
 $(B)/kws_test: $(B)/kws_test.o $(B)/kws_infer.o $(B)/frontend.o $(LINALG)
 	$(CXX) $(GC) -o $@ $^

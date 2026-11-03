@@ -93,6 +93,30 @@ static int8_t g_patch[9 * (DOODLE_C1_MAX > DOODLE_C0_MAX ? DOODLE_C1_MAX : DOODL
 static float g_y[DOODLE_C1_MAX > DOODLE_C0_MAX ? DOODLE_C1_MAX : DOODLE_C0_MAX];
 static float g_cond[4 * DOODLE_C0_MAX + (DOODLE_MAX_CONV - 4) * DOODLE_C1_MAX];
 
+/* the 3x3 patch of output pixel (y, x) into g_patch, zero outside the map:
+ * a row's three taps are adjacent pixels, one copy (one a tap with F_UP,
+ * whose 14x14 pixel (iy, ix) is the 7x7 map's (iy / 2, ix / 2)) */
+static void patch(const struct doodle_conv* c, const int8_t* in, uint32_t H, uint32_t Hin, uint32_t y, uint32_t x) {
+    const uint32_t cin = c->cin;
+    int8_t* dst = g_patch;
+    for (uint32_t ky = 0; ky < 3; ky++, dst += 3 * cin) {
+        const int32_t iy = (int32_t)(c->stride * y + ky) - 1, ix0 = (int32_t)(c->stride * x) - 1;
+        if (iy < 0 || (uint32_t)iy >= Hin) {
+            __builtin_memset(dst, 0, 3 * cin);
+            continue;
+        }
+        const uint32_t lo = ix0 < 0 ? 1u : 0u, hi = (uint32_t)(ix0 + 2) >= Hin ? 2u : 3u;   /* taps lo .. hi - 1 inside */
+        if (lo) __builtin_memset(dst, 0, cin);
+        if (hi < 3) __builtin_memset(dst + 2 * cin, 0, cin);
+        if (c->flags & F_UP) {
+            for (uint32_t k = lo; k < hi; k++)
+                __builtin_memcpy(dst + k * cin, in + (((uint32_t)iy >> 1) * H + ((uint32_t)(ix0 + (int32_t)k) >> 1)) * cin, cin);
+        } else {
+            __builtin_memcpy(dst + lo * cin, in + ((uint32_t)iy * H + (uint32_t)(ix0 + (int32_t)lo)) * cin, (hi - lo) * cin);
+        }
+    }
+}
+
 /* conv c over in (H x W, or 7x7 read as 14x14 with F_UP) into out
  * (quantized with next_inv) or, for the last one, into v (28x28 floats) */
 static void conv(const struct doodle_conv* c, const int8_t* in, uint32_t H, const float* cond, const int8_t* skip,
@@ -101,19 +125,7 @@ static void conv(const struct doodle_conv* c, const int8_t* in, uint32_t H, cons
     const uint32_t Ho = (Hin + c->stride - 1) / c->stride, cin = c->cin;
     for (uint32_t y = 0; y < Ho; y++)
         for (uint32_t x = 0; x < Ho; x++) {
-            uint32_t n = 0;
-            for (uint32_t ky = 0; ky < 3; ky++)
-                for (uint32_t kx = 0; kx < 3; kx++) {
-                    const int32_t iy = (int32_t)(c->stride * y + ky) - 1, ix = (int32_t)(c->stride * x + kx) - 1;
-                    if (iy < 0 || ix < 0 || (uint32_t)iy >= Hin || (uint32_t)ix >= Hin) {
-                        for (uint32_t k = 0; k < cin; k++) g_patch[n++] = 0;
-                        continue;
-                    }
-                    const uint32_t sy = c->flags & F_UP ? (uint32_t)iy >> 1 : (uint32_t)iy;
-                    const uint32_t sx = c->flags & F_UP ? (uint32_t)ix >> 1 : (uint32_t)ix;
-                    const int8_t* src = in + (sy * H + sx) * cin;
-                    for (uint32_t k = 0; k < cin; k++) g_patch[n++] = src[k];
-                }
+            patch(c, in, H, Hin, y, x);
             k32_matvec_i8(g_y, c->w, c->ws, g_patch, c->scale, c->cout, 9 * cin, 0);
             const uint32_t p = (y * Ho + x) * c->cout;
             for (uint32_t o = 0; o < c->cout; o++) {

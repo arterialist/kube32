@@ -6,11 +6,8 @@
  * (kws.py, frontend.h). */
 #include "frontend.h"
 
-static uint32_t bitrev9(uint32_t i) {
-    uint32_t r = 0;
-    for (int b = 0; b < 9; b++) r |= ((i >> b) & 1u) << (8 - b);
-    return r;
-}
+#include "../../include/runtime/k32_app_abi.h"
+#include "../common/k32_host.h"
 
 /* floor(log2 e) in Q8 with the 8 bits after the leading one as fraction */
 static int32_t log2_q8(int64_t e) {
@@ -27,26 +24,20 @@ void kws_frame(const struct kws_tables* t, const int16_t* s, int32_t out[KWS_MEL
 
 void kws_frame_buf(const struct kws_tables* t, const int16_t* s, int32_t out[KWS_MELS], int32_t* re) {
     int32_t* im = re + KWS_NFFT;
-    for (uint32_t i = 0; i < KWS_NFFT; i++) {
-        const uint32_t j = bitrev9(i);
+    /* i in bit-reversed order: j counts with its bits mirrored */
+    for (uint32_t i = 0, j = 0; i < KWS_NFFT; i++) {
         re[i] = j < KWS_WIN ? (int32_t)(((int64_t)s[j] * t->hann[j] + 16384) >> 15) : 0;
         im[i] = 0;
-    }
-    for (uint32_t size = 2; size <= KWS_NFFT; size *= 2) {
-        const uint32_t half = size / 2, step = KWS_NFFT / size;
-        for (uint32_t start = 0; start < KWS_NFFT; start += size) {
-            for (uint32_t j = 0; j < half; j++) {
-                const int64_t wr = t->tw_re[j * step], wi = t->tw_im[j * step];
-                const uint32_t a = start + j, b = a + half;
-                const int32_t tr = (int32_t)(((int64_t)re[b] * wr - (int64_t)im[b] * wi + 16384) >> 15);
-                const int32_t ti = (int32_t)(((int64_t)re[b] * wi + (int64_t)im[b] * wr + 16384) >> 15);
-                re[b] = re[a] - tr;
-                im[b] = im[a] - ti;
-                re[a] = re[a] + tr;
-                im[a] = im[a] + ti;
-            }
+        uint32_t bit = KWS_NFFT >> 1;
+        while (j & bit) {
+            j ^= bit;
+            bit >>= 1;
         }
+        j |= bit;
     }
+    /* the butterflies natively (k32_fft_q15), with the bits of the loops
+     * frontend.py runs */
+    k32_fft_q15(re, im, KWS_NFFT, t->tw_re, t->tw_im);
     /* each bin's power where a filter takes it: no array of 257 powers on the stack */
     const int16_t* w = t->mel_w;
     for (uint32_t m = 0; m < KWS_MELS; m++) {

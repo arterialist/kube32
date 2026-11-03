@@ -78,18 +78,22 @@ static float g_y[64], g_z[64], g_acc[64];
 
 /* the 3x3 (or any) patch of output pixel (y, x), zero outside the map */
 static void patch(const struct kws_conv* c, const int8_t* in, uint32_t H, uint32_t W, uint32_t y, uint32_t x) {
-    uint32_t n = 0;
-    for (uint32_t ky = 0; ky < c->kh; ky++)
-        for (uint32_t kx = 0; kx < c->kw; kx++) {
-            const int32_t iy = (int32_t)(c->sh * y + ky) - (int32_t)c->ph;
-            const int32_t ix = (int32_t)(c->sw * x + kx) - (int32_t)c->pw;
-            if (iy >= 0 && ix >= 0 && (uint32_t)iy < H && (uint32_t)ix < W) {
-                const int8_t* src = in + ((uint32_t)iy * W + (uint32_t)ix) * c->ci;
-                for (uint32_t ci = 0; ci < c->ci; ci++) g_patch[n++] = src[ci];
-            } else {
-                for (uint32_t ci = 0; ci < c->ci; ci++) g_patch[n++] = 0;
-            }
+    /* a kernel row's taps are adjacent pixels: one copy, zeros past the edges */
+    const uint32_t row = c->kw * c->ci;
+    const int32_t ix0 = (int32_t)(c->sw * x) - (int32_t)c->pw;
+    const uint32_t lo = ix0 < 0 ? (uint32_t)-ix0 : 0u;
+    const uint32_t hi = ix0 + (int32_t)c->kw > (int32_t)W ? W - (uint32_t)ix0 : c->kw;   /* taps lo .. hi - 1 inside */
+    int8_t* dst = g_patch;
+    for (uint32_t ky = 0; ky < c->kh; ky++, dst += row) {
+        const int32_t iy = (int32_t)(c->sh * y + ky) - (int32_t)c->ph;
+        if (iy < 0 || (uint32_t)iy >= H || lo >= hi) {
+            __builtin_memset(dst, 0, row);
+            continue;
         }
+        if (lo) __builtin_memset(dst, 0, lo * c->ci);
+        if (hi < c->kw) __builtin_memset(dst + hi * c->ci, 0, (c->kw - hi) * c->ci);
+        __builtin_memcpy(dst + lo * c->ci, in + ((uint32_t)iy * W + (uint32_t)(ix0 + (int32_t)lo)) * c->ci, (hi - lo) * c->ci);
+    }
 }
 
 /* y = W patch * scales + bias, ReLU */
