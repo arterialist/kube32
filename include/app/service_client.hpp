@@ -167,6 +167,9 @@ public:
     // it arrives; reading ends once more than `limit` body bytes came.
     int32_t call_https_here(const runtime::ServiceCallRequest& req, runtime::AppResponseSink& sink, size_t limit);
     bool makes_tls() const { return opts_.tls != nullptr; }
+    // The control plane's API server moved: https calls forwarded from now
+    // on go to host:port. A call in flight finishes where it began.
+    void set_gateway(const std::string& host, uint16_t port);
 
     struct Stats {
         std::atomic<uint64_t> calls{0};
@@ -217,6 +220,9 @@ private:
 
     std::unique_ptr<ServiceResolver> resolver_;
     ServiceClientOptions opts_;
+    // opts_.gateway_host and gateway_port change in set_gateway: read through gateway()
+    mutable osal::Mutex gateway_mutex_;
+    std::string gateway(uint16_t& port) const;
     std::unique_ptr<EgressPolicySource> egress_;
     DeviceDemand demand_;
     Stats stats_;

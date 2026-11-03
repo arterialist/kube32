@@ -17,7 +17,20 @@
 namespace kube32::kubelet {
 
 HttpKubeClient::HttpKubeClient(std::string host, uint16_t port)
-    : host_(std::move(host)), port_(port) {}
+    : endpoint_(std::make_shared<const Endpoint>(Endpoint{std::move(host), port})) {}
+
+std::shared_ptr<const HttpKubeClient::Endpoint> HttpKubeClient::endpoint() const {
+    osal::LockGuard guard(endpoint_mutex_);
+    return endpoint_;
+}
+
+bool HttpKubeClient::set_server(const std::string& host, uint16_t port) {
+    if (host.empty()) return false;
+    auto next = std::make_shared<const Endpoint>(Endpoint{host, port});
+    osal::LockGuard guard(endpoint_mutex_);
+    endpoint_ = std::move(next);
+    return true;
+}
 
 bool HttpKubeClient::is_chunked_transfer_encoding(std::string_view headers) {
     size_t cur = 0;
@@ -213,11 +226,12 @@ int HttpKubeClient::stream_request(const char* method, std::string_view path, st
                                    mem::FunctionRef<bool(int, std::string_view)>* on_head, const char* content_type) {
     if (out_content_length) *out_content_length = -1;
     if (path.empty()) return 0;
+    const auto server = endpoint();
     char buf[1024];
     int head_len = snprintf(buf, sizeof(buf),
                             "%s %.*s HTTP/1.1\r\nHost: %s:%u\r\nUser-Agent: kubelet/v1.33.0\r\nAccept: application/json\r\n"
                             "Content-Type: %s\r\nContent-Length: %u\r\n%s%s%sConnection: close\r\n\r\n",
-                            method, static_cast<int>(path.size()), path.data(), host_.c_str(), static_cast<unsigned>(port_),
+                            method, static_cast<int>(path.size()), path.data(), server->host.c_str(), static_cast<unsigned>(server->port),
                             content_type, static_cast<unsigned>(body.size()), token_.empty() ? "" : "Authorization: Bearer ", token_.c_str(),
                             token_.empty() ? "" : "\r\n");
     if (head_len <= 0 || static_cast<size_t>(head_len) >= sizeof(buf)) return 0;
@@ -228,7 +242,7 @@ int HttpKubeClient::stream_request(const char* method, std::string_view path, st
     // Head and body leave as two writes; without Nagle the body does not
     // wait for the server to acknowledge the head
     sock.set_tcp_nodelay(true);
-    if (!sock.connect(host_.c_str(), port_)) return 0;
+    if (!sock.connect(server->host.c_str(), server->port)) return 0;
     if (!sock.send_all(buf, static_cast<size_t>(head_len))) return 0;
     if (!body.empty() && !sock.send_all(body.data(), body.size())) return 0;
 
