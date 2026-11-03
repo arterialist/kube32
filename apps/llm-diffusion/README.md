@@ -81,11 +81,11 @@ ESP32-S3 devkit with PSRAM at 240 MHz, flash in [quad I/O mode](../../docs/flash
 
 | Steps | Per step | Window | Tokens/s | Weights read |
 | ---: | ---: | ---: | ---: | ---: |
-| 8 | 1.73 s | 13.8 s | 4.54 | 6.6 MB |
-| 16 | 1.77 s | 28.4 s | 2.21 | 13.1 MB |
-| 32 | 1.93 s | 61.7 s | 1.02 | 26.2 MB |
+| 8 | 1.63 s | 13.1 s | 4.81 | 6.6 MB |
+| 16 | 1.44 s | 23.1 s | 2.73 | 13.1 MB |
+| 32 | 1.44 s | 46.2 s | 1.36 | 26.2 MB |
 
-Across all 18 test vectors a step takes 1.71 to 1.93 s. At 8 steps the text has misspellings, and at 32 steps it reads cleanly ([model card](../../models/mdlm/README.md#quality)):
+Across all 18 test vectors a step takes 1.41 to 1.63 s on average and the fastest steps 1.17 s. At 8 steps the text has misspellings, and at 32 steps it reads cleanly ([model card](../../models/mdlm/README.md#quality)):
 
 ```
 8 steps:  Once upon a time, there was a little girl named Lily. She loved to play with hers a the the the toysss. One day, shessked her to toyy of she wantould too to to at the heros..
@@ -94,28 +94,28 @@ Across all 18 test vectors a step takes 1.71 to 1.93 s. At 8 steps the text has 
 32 steps, prompt "Lily went to the park": Lily went to the park with her mom. They saw a big tree with many treats werees. Lily wanted to playe the tree, but she didn't know what to do. She want liked the
 ```
 
-A step of 1.8 s splits as follows (32 steps, prompt, temperature 0.8):
+A step of 1.42 s splits as follows (8 steps, greedy, no prompt):
 
 | Part | Per step | Share |
 | --- | ---: | ---: |
-| Matrix products (`k32_matmul_i8`, weights from flash) | 784 ms | 43% |
-| Attention (`k32_matvec_f32_i8`, `k32_softmax_f32`, `k32_vecmat_f32_i8` per head and position) | 549 ms | 30% |
-| Norms, quantization, rotary embedding | 156 ms | 9% |
-| SiLU gate and quantization of the hidden values | 156 ms | 9% |
-| Classifier norms, softmax, selection | 90 ms | 5% |
-| Embedding and residual sums | 63 ms | 3% |
+| Attention (`k32_attention_full_f32_i8`, one call a layer) | 570 ms | 40% |
+| Matrix products (`k32_matmul_i8`, weights from flash) | 431 ms | 30% |
+| Norms, quantization, rotary embedding | 153 ms | 11% |
+| SiLU gate and quantization of the hidden values | 129 ms | 9% |
+| Classifier norms, softmax, selection | 62 ms | 4% |
+| Embedding and residual sums | 56 ms | 4% |
 
-A step does 52 M multiply-adds, 66 M a second in the products. The 819 KB of weights a step reads take about 40 ms of that at the flash's 20 MB/s, so the products are bound by the multiply-adds. The attention makes three native calls per head, position and layer, 3,072 a step.
+A step does 52 M int8 multiply-adds, 120 M a second in the products. The 819 KB of weights a step reads take about 45 ms of that at the flash's 18 MB/s; the rest is the vector unit over the 64 positions. The attention's 4.2 M float multiply-adds over the window, and the element-wise steps over the pod's memory in PSRAM, take the larger part of a step.
 
 | | Weights read per token | Time per token | Tokens/s |
 | --- | ---: | ---: | ---: |
-| Diffusion, 8 steps | 104 KB | 0.22 s | 4.54 |
-| Diffusion, 16 steps | 208 KB | 0.45 s | 2.21 |
-| Diffusion, 32 steps | 416 KB | 0.98 s | 1.02 |
-| stories260K, autoregressive ([llm-speculative](../llm-speculative/README.md), draft alone) | 270 KB | 0.05 s | 20.8 |
+| Diffusion, 8 steps | 104 KB | 0.21 s | 4.81 |
+| Diffusion, 16 steps | 208 KB | 0.37 s | 2.73 |
+| Diffusion, 32 steps | 416 KB | 0.73 s | 1.36 |
+| stories260K, autoregressive ([llm-speculative](../llm-speculative/README.md), draft alone, by the host's clock) | 270 KB | 0.10 s | 10.5 |
 
 ## Limits
 
-- A generation holds the node's interpreter in slices of up to about a second, for 20 s at 8 steps to about 100 s at 32 steps on the clock. Other pods answer between slices.
+- A generation holds the node's interpreter in slices of up to about a second, for about 15 s at 8 steps to about 50 s at 32 steps on the clock. Other pods answer between slices.
 - One generation runs at a time.
 - The blob takes 13 flash blocks, the free blocks of a board that also holds other models.
