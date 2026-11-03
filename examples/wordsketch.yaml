@@ -4,8 +4,8 @@
 #   wordsketch-listen  Cardputer: microphone, keyword spotter (cat, dog, bird,
 #                      house, tree, bed), the screen; publishes the word on
 #                      wordsketch.word and asks the teller for a story
-#   wordsketch-draw    control plane (PSRAM, own thread): the doodle diffusion
-#                      model, every step's image on wordsketch.frame
+#   wordsketch-draw    control plane (PSRAM): the doodle diffusion model, a
+#                      step a tick, every step's image on wordsketch.frame
 #   wordsketch-story   control plane: stories260K, all five layers (llm-shard)
 #   wordsketch-teller  control plane: tokenizer and generation loop
 #                      (llm-coordinator), tokens on wordsketch.text
@@ -79,6 +79,8 @@ spec:
       annotations:
         kube32.io/wasm-base64: "@wordsketch-draw.wasm"
         kube32.io/blobs: wordsketch-doodle
+        kube32.io/event-topics: wordsketch.word
+        kube32.io/tick-interval: "100ms"
         kube32.io/execution-budget: "off"
     spec:
       containers:
@@ -87,7 +89,7 @@ spec:
           env:
             - {name: GUIDANCE, value: "20"}       # classifier-free guidance in tenths
           resources:
-            # PSRAM places it: an entry-point pod runs on its own thread
+            # PSRAM places it: a node with room for the drawing's maps
             requests: {memory: 64Ki, esp32.io/psram: 64Ki, hardware.kube32.io/ipc: "1"}
             limits: {memory: 64Ki, esp32.io/psram: 64Ki}
           securityContext:

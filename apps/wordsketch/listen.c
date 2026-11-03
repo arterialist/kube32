@@ -5,9 +5,13 @@
  * into a frame of 40 log-mel values (models/kws/frontend.c), kept as the
  * network's int8 input; the last 49 frames are the spotter's second. A
  * frame's mean log energy against the room's floor marks where a word
- * starts and ends. When the word sits in the middle of the window, or a
+ * starts and ends; a sound that stays loud for 0.9 s is no word and becomes
+ * the new floor. When the word sits in the middle of the window, or a
  * quarter second after its end, the spotter (models/kws/kws_infer.c)
- * classifies the window. A keyword with at least THRESHOLD percent:
+ * classifies the window, at the level of the training clips: as if the
+ * audio were scaled so that the word's peak is 16,000, which adds
+ * 512 log2(16000 / peak) to every log-mel value. A keyword with at least
+ * THRESHOLD percent:
  *
  *   - goes out as an event on wordsketch.word, which the draw pod turns into
  *     a doodle, every step's image on wordsketch.frame;
@@ -142,6 +146,8 @@ static uint32_t g_frames, g_tokens, g_rate;
 static int32_t g_story_rc;
 
 static uint8_t g_pic[784];      /* levels 0..63 as drawn, 255 before the first */
+static uint8_t g_part_step[4];  /* the step each band of 7 rows shows, 255 before the first */
+static uint32_t g_frames_late;
 static char g_line[COLS];
 static uint32_t g_col, g_row, g_pcols;   /* g_pcols: the prompt's characters at the line's start */
 
@@ -199,6 +205,7 @@ static int16_t g_pcm[KWS_WIN];
 static uint32_t g_have;                       /* samples in g_pcm */
 static int32_t g_dc;                          /* the decimator's DC offset, Q8 */
 static int8_t g_q[KWS_FRAMES * KWS_MELS];     /* the last second, as the network's input */
+static uint16_t g_pk[KWS_FRAMES];           /* each frame's new samples' peak */
 static uint32_t g_frame, g_in_word, g_onset, g_loud, g_fire_at;
 static int32_t g_floor;                       /* the room's mean log2 energy, Q8 */
 
@@ -206,14 +213,36 @@ static NOINLINE void listen_start(void) {
     g_have = g_frame = g_in_word = g_fire_at = 0;
     g_floor = 0x3fffffff;
     __builtin_memset(g_q, 0, sizeof g_q);
+    __builtin_memset(g_pk, 0, sizeof g_pk);
     g_state = LISTEN;
     status("listening");
 }
 
 static NOINLINE void accept_word(uint32_t cls, uint32_t p, uint32_t seed);
 
+/* 256 log2 x */
+static NOINLINE int32_t log2_q8(uint32_t x) {
+    const int32_t n = 31 - __builtin_clz(x | 1u);
+    const uint32_t frac = n >= 8 ? (x >> (n - 8)) & 255u : (x << (8 - n)) & 255u;
+    return 256 * n + (int32_t)frac;
+}
+
 static NOINLINE void classify(void) {
     const uint32_t t0 = now_ms();
+    /* the word's peak, from its first to its last loud frame */
+    const uint32_t n = g_frame;
+    uint32_t peak = 0;
+    for (uint32_t k = g_onset; k <= g_loud; k++) {
+        const uint32_t i = KWS_FRAMES - 1 - (n - k);
+        if (n - k < KWS_FRAMES && g_pk[i] > peak) peak = g_pk[i];
+    }
+    if (peak < 64) peak = 64;   /* at most 250x */
+    const float d = (float)(2 * (log2_q8(16000) - log2_q8(peak))) * g_m.conv[0].inv;
+    const int32_t dq = (int32_t)(d + (d >= 0.0f ? 0.5f : -0.5f));
+    for (uint32_t i = 0; i < sizeof g_q; i++) {
+        const int32_t v = g_q[i] + dq;
+        g_q[i] = (int8_t)(v > 127 ? 127 : v < -127 ? -127 : v);
+    }
     float pr[KWS_CLASSES];
     kws_classify_q(&g_m, g_q, pr);
     k32_softmax_f32(pr, KWS_CLASSES);
@@ -226,7 +255,8 @@ static NOINLINE void classify(void) {
     const uint32_t p = (uint32_t)(pr[best] * 100.0f + 0.5f), t = now_ms();
     put("wordsketch-listen: heard "); put(kNames[best]); put(" "); put_n(p); put(kNames[second]); put(" ");
     put_n((uint32_t)(pr[second] * 100.0f + 0.5f)); put("word_ms "); put_n(20 * (g_loud - g_onset + 1));
-    put("end_to_result_ms "); put_n(t - g_t_end); put("network_ms "); put_i((int32_t)(t - t0));
+    put("end_to_result_ms "); put_n(t - g_t_end); put("network_ms "); put_n(t - t0); put("peak "); put_n(peak);
+    put("gain_lsb "); put_i(dq);
     say();
     if (best < N_WORDS && p >= g_threshold) {
         g_t_word = t;
@@ -240,6 +270,13 @@ static NOINLINE void frame(void) {
     kws_frame_buf(&g_m.fe, g_pcm, f, kws_scratch());   /* the FFT in the network's map */
     __builtin_memmove(g_q, g_q + KWS_MELS, sizeof g_q - KWS_MELS);
     kws_quantize(&g_m, f, KWS_MELS, g_q + sizeof g_q - KWS_MELS);
+    __builtin_memmove(g_pk, g_pk + 1, sizeof g_pk - sizeof g_pk[0]);
+    int32_t pk = 0;
+    for (uint32_t i = KWS_WIN - KWS_HOP; i < KWS_WIN; i++) {
+        const int32_t a = g_pcm[i] < 0 ? -g_pcm[i] : g_pcm[i];
+        if (a > pk) pk = a;
+    }
+    g_pk[KWS_FRAMES - 1] = (uint16_t)pk;
     int32_t e = 0;
     for (uint32_t k = 0; k < KWS_MELS; k++) e += f[k];
     e /= KWS_MELS;
@@ -272,7 +309,14 @@ static NOINLINE void frame(void) {
     }
     if (g_fire_at && n >= g_fire_at) {
         g_fire_at = g_in_word = 0;
-        if (g_loud - g_onset >= 4) classify();   /* 100 ms or more: no clicks */
+        if (g_loud - g_onset >= 45) {
+            /* loud for 0.9 s or more: a tone or the room, the new floor */
+            g_floor = e;
+            put("wordsketch-listen: a sustained sound, the floor follows it");
+            say();
+        } else if (g_loud - g_onset >= 4) {
+            classify();   /* 100 ms or more: no clicks */
+        }
     }
 }
 
@@ -319,6 +363,8 @@ static NOINLINE void accept_word(uint32_t cls, uint32_t p, uint32_t seed) {
     k32_display_rect(0, 0, 240, 135, BLACK);
     k32_display_rect(PIC_X - 1, PIC_Y - 1, 114, 114, GREY);
     __builtin_memset(g_pic, 255, sizeof g_pic);
+    __builtin_memset(g_part_step, 255, sizeof g_part_step);
+    g_frames_late = 0;
     g_col = g_row = g_pcols = 0;
     status("drawing");
     if (g_volume) {
@@ -332,7 +378,7 @@ static NOINLINE void report(void) {
     put("% seed "); put_i((int32_t)g_seed); put(": from its end, result "); put_i((int32_t)(g_t_word - g_t_end));
     put(" ms, noise "); put_i((int32_t)(g_t_noise - g_t_end)); put(" ms, step 1 "); put_i((int32_t)(g_t_step1 - g_t_end));
     put(" ms, drawn "); put_i((int32_t)(g_t_drawn - g_t_end)); put(" ms ("); put_i((int32_t)g_frames); put("/");
-    put_i((int32_t)(4 * (g_steps + 1))); put(" frames); story "); put_i(g_story_rc); put(", "); put_i((int32_t)g_tokens);
+    put_i((int32_t)(4 * (g_steps + 1))); put(" frames, "); put_i((int32_t)g_frames_late); put(" late); story "); put_i(g_story_rc); put(", "); put_i((int32_t)g_tokens);
     put(" tokens, first "); put_i((int32_t)(g_t_tok0 - g_t_end)); put(" ms, last "); put_i((int32_t)(g_t_tok - g_t_end));
     put(" ms, "); put_i((int32_t)g_rate); put(" tok/s x100");
     say();
@@ -343,6 +389,12 @@ static NOINLINE void report(void) {
 static NOINLINE void on_frame(const char* d) {
     const uint32_t step = (uint32_t)(d[2] - 'a'), part = (uint32_t)(d[3] - '0');
     if (d[0] != 'F' || (uint32_t)(d[1] - 'a') != (g_id & 15u) || step > g_steps || part > 3) return;
+    /* a band shows its newest step: a repeated or older frame is late */
+    if (g_part_step[part] != 255 && step <= g_part_step[part]) {
+        g_frames_late++;
+        return;
+    }
+    g_part_step[part] = (uint8_t)step;
     const uint32_t t = now_ms();
     g_show_last = t;
     if (!g_frames++) g_t_noise = t;
@@ -449,15 +501,17 @@ K32_EXPORT("k32_init") int32_t k32_init(void) {
     return 0;
 }
 
-K32_EXPORT("k32_tick") int32_t k32_tick(uint32_t now) {
+K32_EXPORT("k32_tick") int32_t k32_tick(uint32_t tick_ms) {
+    (void)tick_ms;   /* taken before the call waited for the pod: a word accepted in k32_handle meanwhile is newer */
+    const uint32_t now = now_ms();
     if (g_state == LISTEN) {
         hear();
         return 1;   /* every 10 ms while listening */
     }
     /* back to listening a moment after the drawing and the story, or after
-     * 20 s without either */
+     * 60 s without progress; the picture stays until the next word */
     if (g_drawn && g_told && !g_done_at) g_done_at = now;
-    if ((g_done_at && now - g_done_at > 1500) || now - g_show_last > 20000) {
+    if ((g_done_at && now - g_done_at > 1500) || now - g_show_last > 60000) {
         report();
         listen_start();
         return 1;
