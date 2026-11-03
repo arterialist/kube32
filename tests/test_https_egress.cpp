@@ -213,6 +213,36 @@ int main() {
         std::cout << "[PASS] https from control-plane pods" << std::endl;
     }
 
+    // A client's TLS session threads have ended when its destructor returns,
+    // with what a thread does as it ends (OpenSSL frees its per-thread state
+    // there): the process may exit right after
+    {
+        static std::atomic<int> ended{0};
+        struct AtThreadEnd {
+            bool armed{false};
+            ~AtThreadEnd() {
+                if (!armed) return;
+                osal::Thread::sleep_ms(100);   // a thread slow to end
+                ended.fetch_add(1);
+            }
+        };
+        app::ServiceClientOptions o = cp_opts;
+        o.resolve_host = [](const std::string&, uint32_t, uint32_t& out) -> int {
+            static thread_local AtThreadEnd at_end;   // on the session thread
+            at_end.armed = true;
+            out = 0x7F000001;
+            return 0;
+        };
+        {
+            app::ServiceClient client(app::make_store_service_resolver(*store), o, app::make_store_egress_source(*store));
+            app::install_service_client(&client);
+            assert(rc_of(call_pod("default/a-0", "/call?u=" + hosts.url(trusted, "/hello"))) == 200);
+            app::install_service_client(nullptr);
+        }
+        assert(ended.load() == 1);
+        std::cout << "[PASS] TLS session threads end with their client" << std::endl;
+    }
+
     // Pods of a worker: through the egress gateway on the API server
     {
         std::cout << "=== worker, egress gateway ===" << std::endl;

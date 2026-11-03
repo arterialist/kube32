@@ -39,6 +39,7 @@ struct HttpsHost {
     std::deque<int> hook_status;
     std::atomic<size_t> hook_body_bytes{0};   // size of /hook's answer body
     std::thread th;
+    std::vector<std::thread> conns;   // one per connection, joined by stop()
 
     bool start(uint16_t base) {
         if (!listener.create(kube32::osal::SocketType::Tcp)) return false;
@@ -55,12 +56,16 @@ struct HttpsHost {
         listener.shutdown(kube32::osal::ShutdownMode::Both);
         listener.close();
         if (th.joinable()) th.join();
+        // A connection's thread may still be in OpenSSL (a refused handshake
+        // ends late), and OpenSSL's exit cleanup runs when the test ends
+        for (auto& c : conns) c.join();
+        conns.clear();
     }
     void run() {
         while (running) {
             kube32::osal::Socket c = listener.accept();
             if (!c.is_valid()) continue;
-            std::thread([this](kube32::osal::Socket s) { serve(std::move(s)); }, std::move(c)).detach();
+            conns.emplace_back([this](kube32::osal::Socket s) { serve(std::move(s)); }, std::move(c));
         }
     }
     void serve(kube32::osal::Socket s) {

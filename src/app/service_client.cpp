@@ -19,6 +19,7 @@
 #include <memory>
 #include <new>
 #include <strings.h>
+#include <vector>
 
 namespace kube32::app {
 
@@ -43,11 +44,17 @@ class TlsSessions {
 public:
     TlsSessions(size_t size, size_t stack_bytes, bool stack_in_psram)
         : size_(size ? size : 1), stack_bytes_(stack_bytes), stack_in_psram_(stack_in_psram) {}
+    // Joins every thread. A thread that has left its loop is still ending:
+    // OpenSSL frees its per-thread state then, and its exit handler frees
+    // the state of every thread it knows. A process that exits right after
+    // this destructor must find the threads gone.
     ~TlsSessions() {
-        osal::UniqueLock<osal::Mutex> lock(mutex_);
-        stopping_ = true;
-        work_cv_.notify_all();
-        idle_cv_.wait(lock, [this] { return threads_ == 0; });
+        {
+            osal::LockGuard guard(mutex_);
+            stopping_ = true;
+            work_cv_.notify_all();
+        }
+        for (auto& t : threads_) t->join();
     }
     // False when `size` calls are already running, or no thread is free and
     // none can be started. The job may call `release` once its connection
@@ -56,14 +63,15 @@ public:
     bool start(TlsJob job) {
         osal::LockGuard guard(mutex_);
         if (stopping_ || jobs_.size() + running_ >= size_) return false;
-        if (jobs_.size() + running_ >= threads_) {
+        if (jobs_.size() + running_ >= threads_.size()) {
             osal::Thread::Config cfg;
             cfg.name = "k32_tls";
             cfg.stack_size = stack_bytes_;
             cfg.stack_in_psram = stack_in_psram_;
             cfg.priority = 4;
-            if (!osal::Thread::create(&TlsSessions::run, this, cfg)) return false;
-            ++threads_;
+            auto t = std::make_unique<osal::Thread>();
+            if (!t->start(&TlsSessions::run, this, cfg)) return false;
+            threads_.push_back(std::move(t));
         }
         jobs_.push_back(std::move(job));
         work_cv_.notify_one();
@@ -96,8 +104,6 @@ private:
             release();
             lock.lock();
         }
-        --threads_;
-        idle_cv_.notify_all();
     }
 
     const size_t size_;
@@ -105,9 +111,8 @@ private:
     const bool stack_in_psram_;
     osal::Mutex mutex_;
     osal::ConditionVariable work_cv_;
-    osal::ConditionVariable idle_cv_;
     std::deque<TlsJob> jobs_;
-    size_t threads_{0};
+    std::vector<std::unique_ptr<osal::Thread>> threads_;
     size_t running_{0};
     bool stopping_{false};
 };
