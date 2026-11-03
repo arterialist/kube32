@@ -1,0 +1,66 @@
+# llm-speculative: speculative decoding in one pod on the control plane. A
+# 3.6 M-parameter target model reads its int4 weights in place from the
+# node's flash blobs, and stories260K drafts tokens for it from its own blob.
+#
+# The blobs go to the node first, then the manifest with the module inline:
+#   make -C apps/llm-speculative TARGET_CKPT=<target-lm.bin>
+#   python3 apps/llm-pipeline/tools/spec.py upload --dir apps/llm-speculative/build/blobs \
+#     --server http://<control-plane-ip>:6443 --node <control-plane-node>
+#   kubectl --context kube32 apply -f apps/llm-speculative/build/llm-speculative.yaml
+#   curl -s -X POST "http://<control-plane-ip>/spec/generate?k=4&steps=96" -d "Lily and Tom went to the park"
+#   curl -s http://<control-plane-ip>/spec                 # state, speed, acceptance, text
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: llm-speculative
+  namespace: default
+  labels: {app: llm-speculative}
+spec:
+  replicas: 1
+  strategy: {type: Recreate}
+  selector:
+    matchLabels: {app: llm-speculative}
+  template:
+    metadata:
+      labels: {app: llm-speculative}
+      annotations:
+        kube32.io/wasm-base64: "@llm-speculative.wasm"
+        kube32.io/blobs: target-lm,stories260k,tok512
+        kube32.io/tick-interval: "100ms"
+        kube32.io/execution-budget: "off"   # a tick runs one pass: up to 8 positions of the target
+    spec:
+      nodeSelector:
+        node-role.kubernetes.io/control-plane: ""
+      containers:
+        - name: speculative
+          image: wasm://inline/llm-speculative
+          ports: [{name: http, containerPort: 7000}]
+          env:
+            - {name: K, value: "4"}               # drafts a pass, at most 7
+            - {name: STEPS, value: "96"}
+          resources:
+            requests: {memory: 448Ki}             # activations, both KV caches: about 150 positions
+            limits: {memory: 448Ki}
+---
+apiVersion: v1
+kind: Service
+metadata: {name: llm-speculative, namespace: default}
+spec:
+  selector: {app: llm-speculative}
+  ports: [{name: http, port: 80, targetPort: http}]
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: llm-speculative
+  namespace: default
+spec:
+  rules:
+    - http:
+        paths:
+          - path: /spec
+            pathType: Prefix
+            backend:
+              service:
+                name: llm-speculative
+                port: {number: 80}
