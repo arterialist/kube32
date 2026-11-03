@@ -376,6 +376,35 @@ bool Socket::set_tcp_nodelay(bool nodelay) {
     return (setsockopt(fd_, IPPROTO_TCP, TCP_NODELAY, &opt, sizeof(opt)) == 0);
 }
 
+bool Socket::set_broadcast(bool broadcast) {
+    if (fd_ < 0) return false;
+    int opt = broadcast ? 1 : 0;
+    return (setsockopt(fd_, SOL_SOCKET, SO_BROADCAST, &opt, sizeof(opt)) == 0);
+}
+
+std::string Socket::local_address_toward(const char* host, uint16_t port) {
+    if (!host || !*host) return std::string();
+    struct sockaddr_in peer;
+    std::memset(&peer, 0, sizeof(peer));
+    peer.sin_family = AF_INET;
+    peer.sin_port = htons(port ? port : 9);
+    if (inet_pton(AF_INET, host, &peer.sin_addr) <= 0) {
+        uint32_t ip = 0;
+        if (resolve_ipv4(host, 1000, [] { return false; }, ip) != 0) return std::string();
+        peer.sin_addr.s_addr = htonl(ip);
+    }
+    Socket probe;
+    if (!probe.create(SocketType::Udp)) return std::string();
+    if (::connect(probe.fd_, reinterpret_cast<struct sockaddr*>(&peer), sizeof(peer)) != 0) return std::string();
+    struct sockaddr_in local;
+    socklen_t len = sizeof(local);
+    if (::getsockname(probe.fd_, reinterpret_cast<struct sockaddr*>(&local), &len) != 0 || local.sin_family != AF_INET) return std::string();
+    if (local.sin_addr.s_addr == htonl(INADDR_ANY)) return std::string();
+    char text[INET_ADDRSTRLEN];
+    if (!inet_ntop(AF_INET, &local.sin_addr, text, sizeof(text))) return std::string();
+    return text;
+}
+
 bool Socket::peer_closed() const {
     if (fd_ < 0) return true;
     if (tls_) return false;
