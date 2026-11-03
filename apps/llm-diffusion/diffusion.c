@@ -281,52 +281,9 @@ static NOINLINE void put_text(const uint16_t* w) {
 }
 
 /* ---- arithmetic, as mdlm_infer.c's ------------------------------------------ */
-static NOINLINE void norm(float* out, const float* x, const float* w, uint32_t n) {
-    float ss = 0.0f;
-#pragma clang loop unroll_count(4)
-    for (uint32_t i = 0; i < n; i++) ss += x[i] * x[i];
-    ss = ss / (float)n;
-    ss = ss + 1e-5f;
-    ss = 1.0f / __builtin_sqrtf(ss);
-#pragma clang loop unroll_count(4)
-    for (uint32_t i = 0; i < n; i++) out[i] = w[i] * (ss * x[i]);
-}
-
-/* The wasm interpreter runs a float operation several times slower than an integer one, so
- * the largest magnitude is found on the bit patterns (for non-negative floats the order of
- * the bits is the order of the values) and the rounding offset is a copysign. */
-static NOINLINE float quantize(int8_t* q, const float* src, uint32_t n) {
-    uint32_t m = 0;
-#pragma clang loop unroll_count(4)
-    for (uint32_t i = 0; i < n; i++) {
-        uint32_t u;
-        __builtin_memcpy(&u, &src[i], 4);
-        u &= 0x7fffffffu;
-        if (u > m) m = u;
-    }
-    float amax;
-    __builtin_memcpy(&amax, &m, 4);
-    const float inv = amax == 0.0f ? 0.0f : 127.0f / amax;
-#pragma clang loop unroll_count(4)
-    for (uint32_t i = 0; i < n; i++) {
-        const float t = src[i] * inv;
-        int32_t r = (int32_t)(t + __builtin_copysignf(0.5f, t));
-        q[i] = (int8_t)(r > 127 ? 127 : r < -127 ? -127 : r);
-    }
-    return amax / 127.0f;
-}
-
-static NOINLINE void rope(float* a, uint32_t n, const float* cs, uint32_t hs) {
-    for (uint32_t h = 0; h < n; h += hs) {
-        float* v = a + h;
-        for (uint32_t i = 0; i < hs; i += 2) {
-            const float c = cs[i], s = cs[i + 1];
-            const float a0 = v[i], a1 = v[i + 1];
-            v[i] = a0 * c - a1 * s;
-            v[i + 1] = a0 * s + a1 * c;
-        }
-    }
-}
+/* The node computes the norms, the quantization, the rotary embedding, the
+ * SwiGLU gate and the residual additions (k32_app_abi.h), each float step
+ * as mdlm_infer.c's, over all positions of a call. */
 
 /* k32_expf's bits, with the range test on the bit pattern: |x| <= 87 takes the polynomial, other values k32_expf */
 static inline float expf_fast(float x) {
@@ -414,20 +371,15 @@ static NOINLINE void layer(uint32_t l, uint32_t part) {
     const struct layer_off* L = &g_lo[l];
     if (part == 0) {
         sec(S_PRE);
-        for (uint32_t p = 0; p < P; p++) {
-            norm(g_xb, g_x + p * dim, g_rms_att[l], dim);
-            g_xs[p] = quantize(g_xq + p * dim, g_xb, dim);
-        }
+        k32_rmsnorm_f32(g_work, g_x, g_rms_att[l], dim, P, 1e-5f);
+        k32_quantize_i8(g_xq, g_xs, g_work, dim, P);
         mm(g_q, L->w[0], L->f[1], g_xq, g_xs, dim, dim, P);
         mm(g_work, L->w[1], L->f[2], g_xq, g_xs, kvd, dim, P);
-        for (uint32_t p = 0; p < P; p++) {
-            rope(g_q + p * dim, dim, g_rope + p * hs, hs);
-            rope(g_work + p * kvd, kvd, g_rope + p * hs, hs);
-            for (uint32_t h = 0; h < KVH; h++) g_ks[p * KVH + h] = quantize(g_kq + p * kvd + h * hs, g_work + p * kvd + h * hs, hs);
-        }
+        k32_rope_f32(g_q, g_rope, dim, hs, P);
+        k32_rope_f32(g_work, g_rope, kvd, hs, P);
+        k32_quantize_i8(g_kq, g_ks, g_work, hs, P * KVH);   /* a scale per position and KV head */
         mm(g_work, L->w[2], L->f[3], g_xq, g_xs, kvd, dim, P);
-        for (uint32_t p = 0; p < P; p++)
-            for (uint32_t h = 0; h < KVH; h++) g_vs[p * KVH + h] = quantize(g_vq + p * kvd + h * hs, g_work + p * kvd + h * hs, hs);
+        k32_quantize_i8(g_vq, g_vs, g_work, hs, P * KVH);
     } else if (part == 1) {
         sec(S_ATT);
         for (uint32_t p = 0; p < P; p++) {
@@ -437,18 +389,16 @@ static NOINLINE void layer(uint32_t l, uint32_t part) {
                 k32_softmax_f32(g_att, P);
                 k32_vecmat_f32_i8(g_xb2 + h * hs, &g_vq[kh * hs], &g_vs[kh], g_att, P, hs, kvd, KVH * 4);
             }
-            g_xs[p] = quantize(g_xq + p * dim, g_xb2, dim);
+            k32_quantize_i8(g_xq + p * dim, &g_xs[p], g_xb2, dim, 1);
         }
     } else if (part == 2) {
         sec(S_ATT);
         mm(g_work, L->w[3], L->f[4], g_xq, g_xs, dim, dim, P);
         sec(S_ADD);
-        for (uint32_t i = 0; i < P * dim; i++) g_x[i] += g_work[i];
+        k32_add_f32(g_x, g_work, P * dim);
         sec(S_PRE);
-        for (uint32_t p = 0; p < P; p++) {
-            norm(g_xb, g_x + p * dim, g_rms_ffn[l], dim);
-            g_xs[p] = quantize(g_xq + p * dim, g_xb, dim);
-        }
+        k32_rmsnorm_f32(g_work, g_x, g_rms_ffn[l], dim, P, 1e-5f);
+        k32_quantize_i8(g_xq, g_xs, g_work, dim, P);
     } else {
         const uint32_t c0 = (part - 3) * FFN_CHUNK;
         float* h1 = g_work;
@@ -456,19 +406,11 @@ static NOINLINE void layer(uint32_t l, uint32_t part) {
         mm(h1, L->w[4], L->f[6], g_xq + c0 * dim, g_xs + c0, hid, dim, FFN_CHUNK);
         mm(h3, L->w[6], L->f[8], g_xq + c0 * dim, g_xs + c0, hid, dim, FFN_CHUNK);
         sec(S_FFN);
-        for (uint32_t j = 0; j < FFN_CHUNK; j++) {
-            float* a1 = h1 + j * hid;
-            const float* a3 = h3 + j * hid;
-            for (uint32_t i = 0; i < hid; i++) {
-                float a = a1[i];
-                a = a * (1.0f / (1.0f + expf_fast(-a)));
-                a1[i] = a * a3[i];
-            }
-            g_xsh[j] = quantize(g_xqh + j * hid, a1, hid);
-        }
+        k32_swiglu_f32(h1, h3, FFN_CHUNK * hid);
+        k32_quantize_i8(g_xqh, g_xsh, h1, hid, FFN_CHUNK);
         mm(g_work, L->w[5], L->f[7], g_xqh, g_xsh, dim, hid, FFN_CHUNK);
         sec(S_ADD);
-        for (uint32_t i = 0; i < FFN_CHUNK * dim; i++) g_x[c0 * dim + i] += g_work[i];
+        k32_add_f32(g_x + c0 * dim, g_work, FFN_CHUNK * dim);
     }
     sec(S_OTHER);
 }
@@ -488,8 +430,8 @@ static NOINLINE void classify(void) {
         }
         if (!m) break;
         for (uint32_t j = 0; j < m; j++) {
-            norm(g_xb, g_x + idx[j] * dim, g_rms_final, dim);
-            g_xs[j] = quantize(g_xq + j * dim, g_xb, dim);
+            k32_rmsnorm_f32(g_xb, g_x + idx[j] * dim, g_rms_final, dim, 1, 1e-5f);
+            k32_quantize_i8(g_xq + j * dim, &g_xs[j], g_xb, dim, 1);
         }
         mm(g_work, g_off_tok, g_off_tok_s, g_xq, g_xs, V, dim, m);
         for (uint32_t j = 0; j < m; j++) {
@@ -508,8 +450,7 @@ static NOINLINE void classify(void) {
                 }
                 c = i < V ? i : last;
             } else {
-                for (uint32_t i = 1; i < V; i++)
-                    if (lg[i] > lg[c]) c = i;
+                c = (uint32_t)k32_argmax_f32(lg, V);
                 k32_softmax_f32(lg, V);
             }
             g_cand[idx[j]] = c;
@@ -742,8 +683,8 @@ static NOINLINE void bench(const char* q, uint32_t qlen) {
                 float s = 0.0f;
                 for (uint32_t i = 0; i < cnt; i++) s += (float)(i & 255u) * 0.5f;
                 sink = (uint32_t)s;
-            } else {   /* quantize rows of hidden values */
-                for (uint32_t j = 0; j < n; j++) g_xsh[j] = quantize(g_xqh + j * g_hid, g_work + j * g_hid, g_hid);
+            } else {   /* quantize rows of hidden values (natively) */
+                k32_quantize_i8(g_xqh, g_xsh, g_work, g_hid, n);
             }
         }
         const uint64_t us1 = (uint64_t)(esp32_get_time_us() - t1);
