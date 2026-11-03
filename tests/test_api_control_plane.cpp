@@ -1,5 +1,5 @@
 // API server behaviour kubectl relies on: bearer-token authentication,
-// ?dryRun=All, limit/continue pagination, patch media types, strict field
+// ?dryRun=All, limit/continue pagination, patch media types, JSON Patch, strict field
 // validation of events.k8s.io Events, Endpoints and EndpointSlices computed
 // from Services, metadata.generation, Deployment conditions, Lease renewTime
 // stamping and timestamp backfill.
@@ -169,10 +169,113 @@ static void test_patch_media_types() {
     assert(ssa.status_code == 415);
     assert(ssa.body.find("server-side apply is not supported") != std::string::npos);
     assert(call(h, HttpMethod::Patch, "/api/v1/namespaces/default/configmaps/settings", R"([{"op":"remove","path":"/data"}])", "", "",
-                "application/json-patch+json").status_code == 415);
+                "application/json-patch+json").status_code == 200);
     assert(call(h, HttpMethod::Patch, "/api/v1/namespaces/default/configmaps/settings", R"({"data":{"b":"2"}})", "", "",
                 "application/strategic-merge-patch+json").status_code == 200);
     std::cout << "[PASS] test_patch_media_types" << std::endl;
+}
+
+static HttpResponse jpatch_call(RouteHandler& h, const std::string& path, const std::string& ops, const std::string& query = "") {
+    return call(h, HttpMethod::Patch, path, ops, query, "", "application/json-patch+json");
+}
+
+static void test_json_patch() {
+    std::cout << "[RUN] test_json_patch" << std::endl;
+    auto store = ram_store();
+    RouteHandler h(*store);
+    const char* pod = R"({"apiVersion":"v1","kind":"Pod","metadata":{"name":"p","labels":{"app":"web"}},"spec":{"containers":[{"name":"c","image":"wasm://x"}]}})";
+    assert(call(h, HttpMethod::Post, "/api/v1/namespaces/default/pods", pod).status_code == 201);
+    const std::string pod_path = "/api/v1/namespaces/default/pods/p";
+
+    // kubectl patch --type json: labels added, replaced and removed, an annotation key with a slash
+    HttpResponse r = jpatch_call(h, pod_path,
+        R"([{"op":"add","path":"/metadata/labels/tier","value":"front"},{"op":"replace","path":"/metadata/labels/app","value":"api"},)"
+        R"({"op":"add","path":"/metadata/annotations","value":{"example.io/owner":"a"}},)"
+        R"({"op":"add","path":"/metadata/annotations/example.io~1note","value":"b"}])");
+    assert(r.status_code == 200);
+    models::JsonValue meta = parse(r.body);
+    assert(meta.get("metadata")->get("labels")->get_string("app", "") == "api");
+    assert(meta.get("metadata")->get("labels")->get_string("tier", "") == "front");
+    assert(meta.get("metadata")->get("annotations")->get_string("example.io/note", "") == "b");
+    // identity and the rest of the object survive
+    assert(!meta.get("metadata")->get_string("uid", "").empty() && meta.get("metadata")->get_string("name", "") == "p");
+    assert(meta.get("spec")->get("containers")->arr_val.size() == 1);
+
+    // A failing test leaves the stored object untouched, and answers 422 Invalid
+    std::string before, after;
+    store->get("/registry/pods/default/p", before);
+    const uint64_t version = store->current_version();
+    HttpResponse failed = jpatch_call(h, pod_path,
+        R"([{"op":"remove","path":"/metadata/labels/tier"},{"op":"test","path":"/metadata/labels/app","value":"db"}])");
+    assert(failed.status_code == 422);
+    models::JsonValue status = parse(failed.body);
+    assert(status.get_string("kind", "") == "Status" && status.get_string("reason", "") == "Invalid" && status.get_int("code", 0) == 422);
+    assert(status.get_string("message", "").find("/metadata/labels/app") != std::string::npos);
+    store->get("/registry/pods/default/p", after);
+    assert(after == before && store->current_version() == version);
+    // A test that holds lets the rest apply (the optimistic-concurrency idiom)
+    models::JsonValue stored = parse(before);
+    const std::string rv = stored.get("metadata")->get_string("resourceVersion", "");
+    assert(!rv.empty());
+    assert(jpatch_call(h, pod_path, R"([{"op":"test","path":"/metadata/resourceVersion","value":")" + rv +
+                                    R"("},{"op":"remove","path":"/metadata/labels/tier"}])").status_code == 200);
+    assert(jpatch_call(h, pod_path, R"([{"op":"test","path":"/metadata/resourceVersion","value":")" + rv +
+                                    R"("},{"op":"remove","path":"/metadata/labels/app"}])").status_code == 422);
+    // Malformed: not an array, not JSON, a missing path, a missing pod
+    assert(jpatch_call(h, pod_path, R"({"op":"remove","path":"/metadata/labels"})").status_code == 400);
+    assert(jpatch_call(h, pod_path, "[{").status_code == 400);
+    assert(jpatch_call(h, pod_path, R"([{"op":"remove","path":"/spec/nothing"}])").status_code == 422);
+    assert(jpatch_call(h, "/api/v1/namespaces/default/pods/none", R"([{"op":"remove","path":"/metadata/labels"}])").status_code == 404);
+    // dryRun answers with the result and stores nothing
+    store->get("/registry/pods/default/p", before);
+    HttpResponse dry = jpatch_call(h, pod_path, R"([{"op":"add","path":"/metadata/labels/dry","value":"1"}])", "dryRun=All");
+    assert(dry.status_code == 200 && dry.body.find("\"dry\":\"1\"") != std::string::npos);
+    store->get("/registry/pods/default/p", after);
+    assert(after == before);
+
+    // Deployment: replicas on the object and on the scale subresource
+    const char* dep = R"({"apiVersion":"apps/v1","kind":"Deployment","metadata":{"name":"web"},
+        "spec":{"replicas":2,"selector":{"matchLabels":{"app":"web"}},"template":{"metadata":{"labels":{"app":"web"}},
+        "spec":{"containers":[{"name":"c","image":"wasm://embedded/echo:v1"}]}}}})";
+    assert(call(h, HttpMethod::Post, "/apis/apps/v1/namespaces/default/deployments", dep).status_code == 201);
+    const std::string dep_path = "/apis/apps/v1/namespaces/default/deployments/web";
+    HttpResponse d1 = jpatch_call(h, dep_path, R"([{"op":"replace","path":"/spec/replicas","value":4}])");
+    assert(d1.status_code == 200);
+    models::JsonValue d1doc = parse(d1.body);
+    assert(d1doc.get("spec")->get_int("replicas", 0) == 4 && d1doc.get("metadata")->get_int("generation", 0) == 2);
+    HttpResponse d2 = jpatch_call(h, dep_path + "/scale", R"([{"op":"test","path":"/spec/replicas","value":4},{"op":"replace","path":"/spec/replicas","value":6}])");
+    assert(d2.status_code == 200);
+    models::JsonValue scale = parse(d2.body);
+    assert(scale.get_string("kind", "") == "Scale" && scale.get("spec")->get_int("replicas", 0) == 6);
+    std::string dstored;
+    store->get("/registry/deployments/default/web", dstored);
+    assert(parse(dstored).get("spec")->get_int("replicas", 0) == 6);
+    // A failing test on the scale subresource changes nothing
+    assert(jpatch_call(h, dep_path + "/scale", R"([{"op":"test","path":"/spec/replicas","value":1},{"op":"replace","path":"/spec/replicas","value":9}])").status_code == 422);
+    store->get("/registry/deployments/default/web", dstored);
+    assert(parse(dstored).get("spec")->get_int("replicas", 0) == 6);
+    // replicas must remain on the Scale object, and only the Scale's fields are there
+    assert(jpatch_call(h, dep_path + "/scale", R"([{"op":"remove","path":"/spec/replicas"}])").status_code == 422);
+    assert(jpatch_call(h, dep_path + "/scale", R"([{"op":"replace","path":"/spec/nothing","value":1}])").status_code == 422);
+    // A failing test on the main resource
+    assert(jpatch_call(h, dep_path, R"([{"op":"test","path":"/spec/replicas","value":1},{"op":"replace","path":"/spec/replicas","value":9}])").status_code == 422);
+    store->get("/registry/deployments/default/web", dstored);
+    assert(parse(dstored).get("spec")->get_int("replicas", 0) == 6);
+
+    // Generic kinds, and status subresources
+    assert(call(h, HttpMethod::Post, "/api/v1/namespaces/default/configmaps", kConfigMap).status_code == 201);
+    HttpResponse cm = jpatch_call(h, "/api/v1/namespaces/default/configmaps/settings",
+                                  R"([{"op":"add","path":"/data/b","value":"2"},{"op":"remove","path":"/data/a"}])");
+    assert(cm.status_code == 200 && parse(cm.body).get("data")->get_string("b", "") == "2" && !parse(cm.body).get("data")->get("a"));
+    assert(jpatch_call(h, "/api/v1/namespaces/default/configmaps/settings", R"([{"op":"test","path":"/data/b","value":"3"}])").status_code == 422);
+    assert(jpatch_call(h, pod_path + "/status", R"([{"op":"add","path":"/status","value":{"phase":"Running"}}])").status_code == 200);
+    std::string pod_json;
+    store->get("/registry/pods/default/p", pod_json);
+    assert(parse(pod_json).get("status")->get_string("phase", "") == "Running");
+    // Server-side apply is still refused, and its answer lists JSON patch
+    HttpResponse ssa = call(h, HttpMethod::Patch, "/api/v1/namespaces/default/configmaps/settings", "apiVersion: v1\n", "", "", "application/apply-patch+yaml");
+    assert(ssa.status_code == 415 && ssa.body.find("application/json-patch+json") != std::string::npos);
+    std::cout << "[PASS] test_json_patch" << std::endl;
 }
 
 static void test_events_v1_strict_fields() {
@@ -528,6 +631,7 @@ int main() {
     test_dry_run_stores_nothing();
     test_list_pagination();
     test_patch_media_types();
+    test_json_patch();
     test_events_v1_strict_fields();
     test_endpoints_from_services();
     test_endpoints_at_node_pod_ports();

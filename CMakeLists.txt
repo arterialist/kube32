@@ -124,6 +124,7 @@ else()
         src/storage/persist_policy.cpp
         src/storage/store.cpp
         src/models/kube_models.cpp
+        src/models/json_patch.cpp
         src/models/kube_lease.cpp
         src/models/tolerations.cpp
         src/models/device.cpp

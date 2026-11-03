@@ -177,10 +177,15 @@ const char* status_reason(int code) {
     switch (code) {
         case 400: return "BadRequest";
         case 404: return "NotFound";
+        case 413: return "RequestEntityTooLarge";
         case 422: return "Invalid";
         default: return "InternalError";
     }
 }
+
+// The answer for a patch that does not apply: 400 for a malformed JSON patch,
+// 422 for an operation that fails
+HttpResponse patch_failure(int status, const std::string& message) { return RouteHandler::make_status(status, status_reason(status), message); }
 
 // Lists are streamed straight to the socket (no full copy in RAM) on plain
 // connections when the page is complete. A TLS connection is kept alive
@@ -863,6 +868,14 @@ static std::string escape_json(std::string_view input) {
     return out;
 }
 
+// The Scale object of a Deployment's scale subresource
+static std::string scale_json(const std::string& name, std::string_view ns, int64_t replicas, int64_t observed) {
+    return "{\"kind\":\"Scale\",\"apiVersion\":\"autoscaling/v1\","
+           "\"metadata\":{\"name\":\"" + escape_json(name) + "\",\"namespace\":\"" + escape_json(std::string(ns)) + "\"},"
+           "\"spec\":{\"replicas\":" + std::to_string(replicas) + "},"
+           "\"status\":{\"replicas\":" + std::to_string(observed) + "}}";
+}
+
 static HttpResponse list_response(const HttpRequest& req, const ResourceInfo& info, const std::vector<std::string>& jsons,
                                   const std::string& plain_list_json, uint64_t rv);
 
@@ -1059,20 +1072,15 @@ HttpResponse RouteHandler::dispatch(const HttpRequest& req, const RouteMatch& ma
         return resp;
     }
 
-    // Patches are JSON merge patches or strategic merge patches
+    // Patches are JSON patches, JSON merge patches or strategic merge patches
     // (models::apply_patch). Server-side apply needs field ownership tracking
-    // and JSON patch an RFC 6902 engine; both are refused with the media
-    // types that are accepted, as kube-apiserver answers an unknown patch type.
-    if (req.method == HttpMethod::Patch) {
-        const std::string& ct = req.content_type;
-        if (ct.rfind("application/apply-patch", 0) == 0 || ct.rfind("application/json-patch+json", 0) == 0) {
-            const bool apply = ct.rfind("application/apply-patch", 0) == 0;
-            return make_status(415, "UnsupportedMediaType",
-                               std::string(apply ? "server-side apply is not supported, use client-side apply (kubectl apply without --server-side)"
-                                                 : "JSON patch is not supported") +
-                               ": the body of the request was in an unknown format - accepted media types include: "
-                               "application/merge-patch+json, application/strategic-merge-patch+json");
-        }
+    // and is refused with the media types that are accepted, as
+    // kube-apiserver answers an unknown patch type.
+    if (req.method == HttpMethod::Patch && req.content_type.rfind("application/apply-patch", 0) == 0) {
+        return make_status(415, "UnsupportedMediaType",
+                           "server-side apply is not supported, use client-side apply (kubectl apply without --server-side)"
+                           ": the body of the request was in an unknown format - accepted media types include: "
+                           "application/json-patch+json, application/merge-patch+json, application/strategic-merge-patch+json");
     }
 
     // fieldValidation=Strict (what kubectl apply/create send by default, see
@@ -1621,7 +1629,7 @@ HttpResponse RouteHandler::handle_nodes(const HttpRequest& req, const RouteMatch
             }
             const models::JsonValue* stored = models::node_conditions(target_doc);
             const models::JsonValue stored_conditions = stored ? *stored : models::JsonValue{};
-            models::apply_patch(target_doc, patch_doc, req.content_type);
+            if (int code = models::apply_patch(target_doc, patch_doc, req.content_type, &err)) return patch_failure(code, err);
             models::settle_node_condition_times(target_doc, stored ? &stored_conditions : nullptr, models::node_conditions(patch_doc),
                                                 osal::System::get_unix_time_ms());
             updated_json = target_doc.to_string();
@@ -1935,7 +1943,7 @@ HttpResponse RouteHandler::handle_pods(const HttpRequest& req, const RouteMatch&
             if (!models::parse_json(existing_json, target_doc, err)) {
                 return make_status(500, "InternalError", "Failed to parse existing resource");
             }
-            models::apply_patch(target_doc, patch_doc, req.content_type);
+            if (int code = models::apply_patch(target_doc, patch_doc, req.content_type, &err)) return patch_failure(code, err);
             if (match.category != RouteCategory::PodStatus) {
                 if (models::JsonValue* pspec = target_doc.get_mut("spec"); pspec && pspec->is_object()) models::add_default_tolerations(*pspec);
                 runtime::set_pod_overhead(target_doc);
@@ -2177,8 +2185,18 @@ HttpResponse RouteHandler::handle_deployments(const HttpRequest& req, const Rout
             // deployment controller does the rest
             models::JsonValue in;
             std::string perr;
-            if (req.body.empty() || !models::parse_json(req.body, in, perr) || !in.is_object()) {
+            const bool json_patch = req.method == HttpMethod::Patch && models::is_json_patch(req.content_type);
+            if (req.body.empty() || !models::parse_json(req.body, in, perr) || !(in.is_object() || json_patch)) {
                 return make_status(400, "BadRequest", "Failed to parse request body: " + perr);
+            }
+            if (json_patch) {
+                // A JSON patch addresses the Scale object the client reads
+                models::JsonValue scale;
+                if (!models::parse_json(scale_json(name, ns, replicas, observed), scale, perr)) {
+                    return make_status(500, "InternalError", "Failed to build the Scale object");
+                }
+                if (int code = models::apply_patch(scale, in, req.content_type, &perr)) return patch_failure(code, perr);
+                in = std::move(scale);
             }
             const models::JsonValue* in_spec = in.get("spec");
             if (!in_spec || !in_spec->get("replicas")) {
@@ -2204,10 +2222,7 @@ HttpResponse RouteHandler::handle_deployments(const HttpRequest& req, const Rout
         if (req.method == HttpMethod::Head) {
             resp.body = "";
         } else {
-            resp.body = "{\"kind\":\"Scale\",\"apiVersion\":\"autoscaling/v1\","
-                        "\"metadata\":{\"name\":\"" + escape_json(name) + "\",\"namespace\":\"" + escape_json(ns) + "\"},"
-                        "\"spec\":{\"replicas\":" + std::to_string(replicas) + "},"
-                        "\"status\":{\"replicas\":" + std::to_string(observed) + "}}";
+            resp.body = scale_json(name, ns, replicas, observed);
         }
         return resp;
     }
@@ -2252,7 +2267,7 @@ HttpResponse RouteHandler::handle_deployments(const HttpRequest& req, const Rout
             return make_status(500, "InternalError", "Failed to parse existing resource");
         }
         const models::JsonValue old_doc = target_doc;
-        models::apply_patch(target_doc, patch_doc, req.content_type);
+        if (int code = models::apply_patch(target_doc, patch_doc, req.content_type, &err)) return patch_failure(code, err);
         if (match.category != RouteCategory::DeploymentStatus) carry_server_fields(old_doc, target_doc, false);
         std::string updated_json = target_doc.to_string();
         if (storage::Status ps = store_.put(key, updated_json, true); !ps.ok()) return store_failure(ps, "deployments.apps", name);
@@ -2416,13 +2431,13 @@ HttpResponse RouteHandler::handle_leases(const HttpRequest& req, const RouteMatc
             }
             models::JsonValue orig_doc, patch_doc;
             std::string err;
-            if (!models::parse_json(req.body, patch_doc, err) || !patch_doc.is_object()) {
+            if (!models::parse_json(req.body, patch_doc, err) || !(patch_doc.is_object() || models::is_json_patch(req.content_type))) {
                 return make_status(400, "BadRequest", "Failed to parse JSON: " + err);
             }
             if (!models::parse_json(existing_json, orig_doc, err) || !orig_doc.is_object()) {
                 return make_status(500, "InternalError", "Failed to parse existing resource");
             }
-            models::apply_patch(orig_doc, patch_doc, req.content_type);
+            if (int code = models::apply_patch(orig_doc, patch_doc, req.content_type, &err)) return patch_failure(code, err);
             fill_renew_time(orig_doc);
             std::string final_json = orig_doc.to_string();
             store_.put(key, final_json, true);
@@ -2968,7 +2983,8 @@ HttpResponse RouteHandler::handle_generic(const HttpRequest& req, const RouteMat
         if (req.body.empty()) return make_status(400, "BadRequest", "Failed to parse request body: empty body");
         models::JsonValue in;
         std::string err;
-        if (!models::parse_json(req.body, in, err) || !in.is_object()) {
+        const bool json_patch = req.method == HttpMethod::Patch && models::is_json_patch(req.content_type);
+        if (!models::parse_json(req.body, in, err) || !(in.is_object() || json_patch)) {
             return make_status(400, "BadRequest", "Failed to parse request body: " + err);
         }
         if (!exists) return make_status(404, "NotFound", plural + " \"" + name + "\" not found", name, plural);
@@ -2976,7 +2992,7 @@ HttpResponse RouteHandler::handle_generic(const HttpRequest& req, const RouteMat
         if (!models::parse_json(existing, target, err)) return make_status(500, "InternalError", "Failed to parse existing resource");
         const models::JsonValue old_doc = target;
         if (req.method == HttpMethod::Patch) {
-            models::apply_patch(target, in, req.content_type);
+            if (int code = models::apply_patch(target, in, req.content_type, &err)) return patch_failure(code, err);
             carry_server_fields(old_doc, target, false);
         } else {
             target = std::move(in);
@@ -3125,15 +3141,24 @@ HttpResponse RouteHandler::handle_events(const HttpRequest& req, const RouteMatc
     if (req.method == HttpMethod::Patch || req.method == HttpMethod::Put) {
         models::JsonValue in, target;
         std::string err;
-        if (req.body.empty() || !models::parse_json(req.body, in, err) || !in.is_object()) {
+        const bool json_patch = req.method == HttpMethod::Patch && models::is_json_patch(req.content_type);
+        if (req.body.empty() || !models::parse_json(req.body, in, err) || !(in.is_object() || json_patch)) {
             return make_status(400, "BadRequest", "Failed to parse request body: " + err);
         }
-        if (projection) {
+        // A JSON patch addresses the form the client reads, so it applies to the projection
+        if (projection && !json_patch) {
             std::string core = events_v1_to_core(in);
             models::parse_json(core, in, err);
         }
-        if (!models::parse_json(existing, target, err)) return make_status(500, "InternalError", "Failed to parse existing resource");
-        if (req.method == HttpMethod::Patch) models::apply_patch(target, in, req.content_type); else target = std::move(in);
+        if (!models::parse_json(projection && json_patch ? EventRecorder::to_events_v1(existing) : existing, target, err)) {
+            return make_status(500, "InternalError", "Failed to parse existing resource");
+        }
+        if (req.method == HttpMethod::Patch) {
+            if (int code = models::apply_patch(target, in, req.content_type, &err)) return patch_failure(code, err);
+            if (projection && json_patch) models::parse_json(events_v1_to_core(target), target, err);
+        } else {
+            target = std::move(in);
+        }
         std::string updated = target.to_string();
         store_.put_extended(key, updated, true, false);
         HttpResponse resp;

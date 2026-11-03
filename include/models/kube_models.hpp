@@ -60,8 +60,19 @@ void merge_json(JsonValue& target, const JsonValue& patch);
 // by containerPort or port, ...), and the $patch, $setElementOrder,
 // $deleteFromPrimitiveList and $retainKeys directives apply.
 void strategic_merge_json(JsonValue& target, const JsonValue& patch);
-// The patch semantics a request's Content-Type selects
-void apply_patch(JsonValue& target, const JsonValue& patch, std::string_view content_type);
+// JSON Patch (RFC 6902, application/json-patch+json): add, remove, replace,
+// move, copy and test over JSON Pointer paths (RFC 6901). `patch` is the
+// array of operations. Returns 0 on success. Otherwise the HTTP status to
+// answer with and a message in `error`: 400 when the patch is not an array,
+// 413 past 10000 operations, 422 when an operation fails, a `test`
+// included. The patch applies whole or not at all: after a failure `target`
+// is as it was.
+int apply_json_patch(JsonValue& target, const JsonValue& patch, std::string& error);
+bool is_json_patch(std::string_view content_type);
+// The patch semantics a request's Content-Type selects. Returns 0, or what
+// apply_json_patch returns for a JSON patch (with the message in `error`
+// when given).
+int apply_patch(JsonValue& target, const JsonValue& patch, std::string_view content_type, std::string* error = nullptr);
 // Node condition times as Kubernetes defines them, whoever writes the
 // conditions (the kubelet, the node lifecycle controller, kubectl): a
 // condition's lastTransitionTime changes only when its status does, and its

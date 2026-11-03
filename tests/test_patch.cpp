@@ -150,11 +150,164 @@ static void test_node_condition_times() {
     std::cout << "[PASS] test_node_condition_times" << std::endl;
 }
 
+// JSON Patch: the patched document, or the failure with the document left as
+// it was
+static std::string jpatch(const std::string& target, const std::string& ops, int want_status = 0) {
+    JsonValue t = parse(target);
+    const std::string before = t.to_string();
+    std::string err;
+    const int status = kube32::models::apply_patch(t, parse(ops), "application/json-patch+json", &err);
+    if (status != want_status) std::cerr << "status " << status << " (" << err << ") for " << ops << std::endl;
+    assert(status == want_status);
+    if (status != 0) {
+        assert(!err.empty());
+        if (t.to_string() != before) std::cerr << "after " << t.to_string() << "\nbefore " << before << "\nops " << ops << std::endl;
+        assert(t.to_string() == before);
+    }
+    return t.to_string();
+}
+
+static void test_json_patch_operations() {
+    std::cout << "[RUN] test_json_patch_operations" << std::endl;
+    const std::string doc = R"({"metadata":{"labels":{"app":"web"}},"spec":{"replicas":2,"ports":[80,443]}})";
+    // add: a new member, an existing member (replaced), an element, the end of an array
+    expect(jpatch(doc, R"([{"op":"add","path":"/metadata/labels/tier","value":"front"}])"),
+           R"({"metadata":{"labels":{"app":"web","tier":"front"}},"spec":{"replicas":2,"ports":[80,443]}})");
+    expect(jpatch(doc, R"([{"op":"add","path":"/metadata/labels/app","value":"api"}])"),
+           R"({"metadata":{"labels":{"app":"api"}},"spec":{"replicas":2,"ports":[80,443]}})");
+    expect(jpatch(doc, R"([{"op":"add","path":"/spec/ports/1","value":8080}])"),
+           R"({"metadata":{"labels":{"app":"web"}},"spec":{"replicas":2,"ports":[80,8080,443]}})");
+    expect(jpatch(doc, R"([{"op":"add","path":"/spec/ports/-","value":8443},{"op":"add","path":"/spec/ports/2","value":9}])"),
+           R"({"metadata":{"labels":{"app":"web"}},"spec":{"replicas":2,"ports":[80,443,9,8443]}})");
+    // add of an object value, and of the root
+    expect(jpatch(doc, R"([{"op":"add","path":"/status","value":{"phase":"Running"}}])"),
+           R"({"metadata":{"labels":{"app":"web"}},"spec":{"replicas":2,"ports":[80,443]},"status":{"phase":"Running"}})");
+    expect(jpatch(doc, R"([{"op":"add","path":"","value":{"a":1}}])"), R"({"a":1})");
+    // remove: a member, an element
+    expect(jpatch(doc, R"([{"op":"remove","path":"/metadata/labels/app"},{"op":"remove","path":"/spec/ports/0"}])"),
+           R"({"metadata":{"labels":{}},"spec":{"replicas":2,"ports":[443]}})");
+    // replace: a member, an element, the root
+    expect(jpatch(doc, R"([{"op":"replace","path":"/spec/replicas","value":5},{"op":"replace","path":"/spec/ports/1","value":"x"}])"),
+           R"({"metadata":{"labels":{"app":"web"}},"spec":{"replicas":5,"ports":[80,"x"]}})");
+    expect(jpatch(doc, R"([{"op":"replace","path":"","value":[1]}])"), "[1]");
+    // move and copy
+    expect(jpatch(doc, R"([{"op":"move","path":"/spec/replicas2","from":"/spec/replicas"}])"),
+           R"({"metadata":{"labels":{"app":"web"}},"spec":{"ports":[80,443],"replicas2":2}})");
+    expect(jpatch(doc, R"([{"op":"move","path":"/spec/ports/0","from":"/spec/ports/1"}])"),
+           R"({"metadata":{"labels":{"app":"web"}},"spec":{"replicas":2,"ports":[443,80]}})");
+    expect(jpatch(doc, R"([{"op":"copy","path":"/metadata/annotations","from":"/metadata/labels"},)"
+                       R"({"op":"add","path":"/metadata/annotations/extra","value":"1"}])"),
+           R"({"metadata":{"labels":{"app":"web"},"annotations":{"app":"web","extra":"1"}},"spec":{"replicas":2,"ports":[80,443]}})");
+    expect(jpatch(doc, R"([{"op":"move","path":"/spec/replicas","from":"/spec/replicas"}])"), doc);
+    // test: equal values pass whatever the member order or number spelling
+    expect(jpatch(doc, R"([{"op":"test","path":"/spec","value":{"ports":[80,443],"replicas":2.0}},)"
+                       R"({"op":"test","path":"/metadata/labels/app","value":"web"}])"), doc);
+    jpatch(doc, R"([{"op":"test","path":"/spec","value":{"ports":[443,80],"replicas":2}}])", 422);
+    jpatch(doc, R"([{"op":"test","path":"/spec/replicas","value":"2"}])", 422);
+    std::cout << "[PASS] test_json_patch_operations" << std::endl;
+}
+
+static void test_json_patch_pointers() {
+    std::cout << "[RUN] test_json_patch_pointers" << std::endl;
+    // ~1 is "/" and ~0 is "~", as in annotation keys; "" is a member name, "-" on an object is a key
+    const std::string doc = R"({"metadata":{"annotations":{"a/b":"1","c~d":"2","":"3"}},"list":[]})";
+    expect(jpatch(doc, R"([{"op":"replace","path":"/metadata/annotations/a~1b","value":"x"},)"
+                       R"({"op":"remove","path":"/metadata/annotations/c~0d"},{"op":"replace","path":"/metadata/annotations/","value":"y"},)"
+                       R"({"op":"add","path":"/metadata/annotations/-","value":"z"},{"op":"add","path":"/metadata/annotations/~01","value":"w"}])"),
+           R"({"metadata":{"annotations":{"a/b":"x","":"y","-":"z","~1":"w"}},"list":[]})");
+    // ~ not followed by 0 or 1, a pointer without a leading slash
+    jpatch(doc, R"([{"op":"add","path":"/metadata/annotations/a~2","value":"1"}])", 422);
+    jpatch(doc, R"([{"op":"add","path":"/metadata/annotations/a~","value":"1"}])", 422);
+    jpatch(doc, R"([{"op":"add","path":"metadata","value":"1"}])", 422);
+    // array indices: no leading zero, no sign, no text, in range; "-" only appends
+    const std::string arr = R"({"list":[10,20,30]})";
+    expect(jpatch(arr, R"([{"op":"add","path":"/list/3","value":40},{"op":"replace","path":"/list/0","value":11}])"), R"({"list":[11,20,30,40]})");
+    for (const char* bad : {"/list/01", "/list/+1", "/list/-1", "/list/x", "/list/4", "/list/", "/list/99999999999"}) {
+        jpatch(arr, std::string(R"([{"op":"add","path":")") + bad + R"(","value":1}])", 422);
+    }
+    jpatch(arr, R"([{"op":"remove","path":"/list/3"}])", 422);
+    jpatch(arr, R"([{"op":"remove","path":"/list/-"}])", 422);
+    jpatch(arr, R"([{"op":"replace","path":"/list/-","value":1}])", 422);
+    jpatch(arr, R"([{"op":"test","path":"/list/-","value":1}])", 422);
+    // a pointer through a scalar or a missing parent
+    jpatch(arr, R"([{"op":"add","path":"/list/0/x","value":1}])", 422);
+    jpatch(arr, R"([{"op":"add","path":"/missing/x","value":1}])", 422);
+    // a deep path is a loop, not a chain of calls
+    std::string ptr, open, close;
+    for (int i = 0; i < 28; ++i) {   // the parser's nesting limit is 32
+        open += "{\"k\":";
+        close += "}";
+        ptr += "/k";
+    }
+    expect(jpatch(open + "0" + close, "[{\"op\":\"replace\",\"path\":\"" + ptr + "\",\"value\":1}]"), open + "1" + close);
+    std::cout << "[PASS] test_json_patch_pointers" << std::endl;
+}
+
+static void test_json_patch_failures_leave_the_document() {
+    std::cout << "[RUN] test_json_patch_failures_leave_the_document" << std::endl;
+    const std::string doc = R"({"metadata":{"labels":{"app":"web","x":"1"}},"spec":{"replicas":2,"ports":[80,443]}})";
+    // A failure after changes of every kind: the document is whole
+    const std::string changes =
+        R"({"op":"add","path":"/metadata/labels/new","value":"1"},{"op":"add","path":"/metadata/labels/app","value":"api"},)"
+        R"({"op":"remove","path":"/metadata/labels/x"},{"op":"remove","path":"/spec/ports/0"},{"op":"add","path":"/spec/ports/0","value":7},)"
+        R"({"op":"replace","path":"/spec/replicas","value":9},{"op":"move","path":"/spec/moved","from":"/spec/ports"},)"
+        R"({"op":"copy","path":"/spec/copied","from":"/spec/moved"},{"op":"move","path":"/metadata/labels","from":"/spec/copied"},)"
+        R"({"op":"replace","path":"","value":{"a":1}})";
+    // the same changes alone do apply
+    jpatch(doc, "[" + changes + "]");
+    for (const char* failing : {
+             R"({"op":"test","path":"/a","value":2})",
+             R"({"op":"test","path":"/nope","value":1})",
+             R"({"op":"remove","path":"/nope"})",
+             R"({"op":"replace","path":"/nope","value":1})",
+             R"({"op":"add","path":"/nope/deeper","value":1})",
+             R"({"op":"move","from":"/nope","path":"/a"})",
+             R"({"op":"move","from":"/a","path":"/nope/x"})",
+             R"({"op":"copy","from":"/nope","path":"/a"})",
+             R"({"op":"frobnicate","path":"/a"})",
+             R"({"path":"/a","value":1})",
+             R"({"op":"add","value":1})",
+             R"({"op":"add","path":"/a"})",
+             R"({"op":"move","path":"/a"})",
+             R"(7)"}) {
+        jpatch(doc, "[" + changes + "," + failing + "]", 422);
+    }
+    // A change that does not apply midway: the first operations are undone
+    jpatch(doc, R"([{"op":"remove","path":"/spec/ports/0"},{"op":"move","from":"/spec/replicas","path":"/spec/ports/5"}])", 422);
+    jpatch(doc, R"([{"op":"move","from":"/spec/ports","path":"/spec/nope/x"}])", 422);
+    // A failed test is a 422 that names the path
+    JsonValue t = parse(doc);
+    std::string err;
+    assert(kube32::models::apply_patch(t, parse(R"([{"op":"test","path":"/spec/replicas","value":3}])"), "application/json-patch+json", &err) == 422);
+    assert(err.find("/spec/replicas") != std::string::npos && err.find("test failed") != std::string::npos);
+    // A test on a missing path fails; a test of null on a null member passes
+    jpatch(doc, R"([{"op":"test","path":"/spec/nothing","value":null}])", 422);
+    expect(jpatch(R"({"a":null})", R"([{"op":"test","path":"/a","value":null}])"), R"({"a":null})");
+    // Moving a value into itself, and removing the root
+    jpatch(doc, R"([{"op":"move","from":"/spec","path":"/spec/inside"}])", 422);
+    jpatch(doc, R"([{"op":"remove","path":""}])", 422);
+    // The patch itself: not an array (400), too long (413)
+    jpatch(doc, R"({"op":"remove","path":"/spec"})", 400);
+    jpatch(doc, R"("x")", 400);
+    std::string many = "[";
+    for (int i = 0; i < 10001; ++i) many += (i ? "," : "") + std::string(R"({"op":"test","path":"/spec/replicas","value":2})");
+    jpatch(doc, many + "]", 413);
+    // An empty patch changes nothing
+    expect(jpatch(doc, "[]"), doc);
+    // The merge patch types never fail
+    JsonValue m = parse(doc);
+    assert(kube32::models::apply_patch(m, parse(R"({"spec":{"replicas":4}})"), "application/merge-patch+json") == 0);
+    std::cout << "[PASS] test_json_patch_failures_leave_the_document" << std::endl;
+}
+
 int main() {
     test_apply_changes_one_container_field();
     test_keyed_lists_add_delete_order();
     test_null_and_directives_on_maps();
     test_node_condition_times();
+    test_json_patch_operations();
+    test_json_patch_pointers();
+    test_json_patch_failures_leave_the_document();
     std::cout << "All patch tests passed" << std::endl;
     return 0;
 }

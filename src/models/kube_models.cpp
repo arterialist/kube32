@@ -846,9 +846,16 @@ void strategic_merge_json(JsonValue& target, const JsonValue& patch) {
     }
 }
 
-void apply_patch(JsonValue& target, const JsonValue& patch, std::string_view content_type) {
+int apply_patch(JsonValue& target, const JsonValue& patch, std::string_view content_type, std::string* error) {
+    if (is_json_patch(content_type)) {
+        std::string why;
+        const int status = apply_json_patch(target, patch, why);
+        if (error) *error = std::move(why);
+        return status;
+    }
     if (content_type.rfind("application/strategic-merge-patch+json", 0) == 0) strategic_merge_json(target, patch);
     else merge_json(target, patch);
+    return 0;
 }
 
 static const JsonValue* condition_of_type(const JsonValue* conditions, const std::string& type) {

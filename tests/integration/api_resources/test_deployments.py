@@ -236,3 +236,44 @@ class TestDeployments(BaseTestCase):
         self.assertEqual(resp.status_code, 200, resp.text)
         container = self.http.get(path).json()["spec"]["template"]["spec"]["containers"][0]
         self.assertNotIn("env", container)
+
+    def test_json_patch_scales_and_is_all_or_nothing(self):
+        """
+        Verify a JSON patch (kubectl patch --type json) changes the Deployment
+        and its scale subresource, and that a failing test operation answers
+        422 and changes nothing.
+        """
+        deploy_name = self.unique_name("deploy-jp")
+        manifest = {
+            "apiVersion": "apps/v1",
+            "kind": "Deployment",
+            "metadata": {"name": deploy_name, "namespace": "default"},
+            "spec": {
+                "replicas": 0,
+                "selector": {"matchLabels": {"app": deploy_name}},
+                "template": {
+                    "metadata": {"labels": {"app": deploy_name}},
+                    "spec": {"containers": [{"name": "app", "image": "wasm://embedded/echo"}]},
+                },
+            },
+        }
+        self.register_cleanup("deployment", "default", deploy_name)
+        resp = self.http.post("/apis/apps/v1/namespaces/default/deployments", body=manifest)
+        self.assertEqual(resp.status_code, 201, resp.text)
+
+        path = f"/apis/apps/v1/namespaces/default/deployments/{deploy_name}"
+        headers = {"Content-Type": "application/json-patch+json"}
+        resp = self.http.patch(path, body=[{"op": "add", "path": "/metadata/labels", "value": {"tier": "web"}}], headers=headers)
+        self.assertEqual(resp.status_code, 200, resp.text)
+        self.assertEqual(self.http.get(path).json()["metadata"]["labels"].get("tier"), "web")
+
+        resp = self.http.patch(path + "/scale", body=[{"op": "test", "path": "/spec/replicas", "value": 0},
+                                                      {"op": "replace", "path": "/spec/replicas", "value": 0}], headers=headers)
+        self.assertEqual(resp.status_code, 200, resp.text)
+        self.assertEqual(resp.json()["kind"], "Scale")
+
+        resp = self.http.patch(path, body=[{"op": "remove", "path": "/metadata/labels/tier"},
+                                           {"op": "test", "path": "/spec/replicas", "value": 7}], headers=headers)
+        self.assertEqual(resp.status_code, 422, resp.text)
+        self.assertEqual(resp.json()["reason"], "Invalid")
+        self.assertEqual(self.http.get(path).json()["metadata"]["labels"].get("tier"), "web")

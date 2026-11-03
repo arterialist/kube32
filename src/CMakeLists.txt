@@ -65,6 +65,7 @@ set(KUBE32_APP_SRCS
     mem/monotonic_arena.cpp
     models/kube_lease.cpp
     models/kube_models.cpp
+    models/json_patch.cpp
     models/tolerations.cpp
     models/device.cpp
     models/migration.cpp
