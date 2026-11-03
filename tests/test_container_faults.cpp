@@ -403,6 +403,48 @@ void test_uncooperative_guest_wasm_termination() {
     std::cout << "[PASS] Uncooperative guest loop terminated cleanly without blocking host." << std::endl;
 }
 
+// =============================================================================
+// Imports the Runtime Does Not Provide
+// =============================================================================
+void test_missing_import_traps_on_every_call() {
+    std::cout << "\n=== [imports] A Call to a Missing Import Traps on Every Call ===" << std::endl;
+
+    // k32_tick calls env.k32_does_not_exist; k32_tail tail-calls it
+    static const uint8_t wasm_missing_import[] = {
+        0x00, 'a', 's', 'm', 0x01, 0x00, 0x00, 0x00,                 // Magic & Version
+        0x01, 0x08, 0x02, 0x60, 0x00, 0x00, 0x60, 0x00, 0x01, 0x7f,  // Type: () -> (), () -> i32
+        0x02, 0x1a, 0x01, 0x03, 'e', 'n', 'v', 0x12, 'k', '3', '2', '_', 'd', 'o', 'e', 's', '_', 'n', 'o', 't', '_', 'e', 'x', 'i', 's', 't', 0x00, 0x00,  // Import: type 0
+        0x03, 0x03, 0x02, 0x01, 0x00,                                // Function: type 1, type 0
+        0x07, 0x17, 0x02, 0x08, 'k', '3', '2', '_', 't', 'i', 'c', 'k', 0x00, 0x01,
+        0x08, 'k', '3', '2', '_', 't', 'a', 'i', 'l', 0x00, 0x02,    // Export: k32_tick, k32_tail
+        0x0a, 0x0d, 0x02, 0x06, 0x00, 0x10, 0x00, 0x41, 0x00, 0x0b,  // Code: call 0, i32.const 0
+        0x04, 0x00, 0x12, 0x00, 0x0b                                 //       return_call 0
+    };
+
+    ContainerConfig cfg;
+    cfg.pod_id = "missing-import-pod";
+    cfg.container_name = "missing-import";
+    cfg.memory_limit_bytes = 64 * 1024;
+    cfg.restart_policy = RestartPolicy::Never;
+
+    ContainerLifecycleController controller(cfg);
+    assert(controller.deploy(wasm_missing_import, sizeof(wasm_missing_import)));
+
+    // A pod's k32_tick, k32_handle and k32_event run again after a trap: each
+    // call traps the same way, the call site left as it was
+    for (const char* fn : {"k32_tick", "k32_tail"}) {
+        for (int call = 0; call < 3; ++call) {
+            const int32_t rc = controller.call_function(fn);
+            const ContainerStatus s = controller.get_status();
+            assert(rc < 0);
+            assert(s.phase == ContainerPhase::Failed);
+            assert(s.exit_message.find("missing imported function") != std::string::npos);
+        }
+    }
+
+    std::cout << "[PASS] Every call to a missing import traps; none runs the import." << std::endl;
+}
+
 int main() {
     std::cout << "================================================================" << std::endl;
     std::cout << " Kube32 Container Fault Containment Tests                     " << std::endl;
@@ -414,6 +456,7 @@ int main() {
     test_thread_lifecycle_and_starvation();
     test_crashloop_backoff_resilience();
     test_uncooperative_guest_wasm_termination();
+    test_missing_import_traps_on_every_call();
 
     std::cout << "\n================================================================" << std::endl;
     std::cout << " ALL CONTAINER FAULT TESTS PASSED                            " << std::endl;

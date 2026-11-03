@@ -1739,10 +1739,13 @@ d_m3Op(TableFill)
 // has be left dangling or it's just a stub that jumps to a newly acquired page.  In Gestalt, I opted
 // for the stub approach. Stubbing makes it easier to dynamically free the compilation. You can also
 // do both.
+//
+// Kube32: the call site becomes op_Call only once the callee has compiled. A
+// callee that does not compile (an import nothing provides) leaves it as it
+// was, its operand still the function, so the next call traps the same way
+// instead of op_Call running the function's struct as code.
 d_m3Op(Compile)
 {
-    rewrite_op(op_Call);
-
     IM3Function function = immediate(IM3Function);
 
     m3ret_t     result = m3Err_none;
@@ -1754,6 +1757,7 @@ d_m3Op(Compile)
     if (not result) {
         // patch up compiled pc and call rewritten op_Call
         *((void**)--_pc) = (void*)(function->compiled);
+        rewrite_op(op_Call);
         --_pc;
         nextOpDirect();
     }
@@ -1765,8 +1769,6 @@ d_m3Op(Compile)
 // same as op_Compile, for a call site that was emitted as a tail call
 d_m3Op(CompileReturnCall)
 {
-    rewrite_op(op_ReturnCall);
-
     IM3Function function = immediate(IM3Function);
 
     m3ret_t     result = m3Err_none;
@@ -1778,6 +1780,7 @@ d_m3Op(CompileReturnCall)
     if (not result) {
         // patch up compiled pc and call rewritten op_ReturnCall
         *((void**)--_pc) = (void*)(function->compiled);
+        rewrite_op(op_ReturnCall);
         --_pc;
         nextOpDirect();
     }
