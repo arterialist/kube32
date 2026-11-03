@@ -47,4 +47,9 @@ int32_t k32_softmax_f32(float* x, uint32_t n) {
     return 0;
 }
 
+int32_t k32_fft_q15(int32_t* re, int32_t* im, uint32_t n, const int16_t* tw_re, const int16_t* tw_im) {
+    fft_q15(b(re), b(im), n, cb(tw_re), cb(tw_im));
+    return 0;
+}
+
 }  // extern "C"

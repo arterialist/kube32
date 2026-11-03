@@ -19,6 +19,7 @@ int32_t k32_matvec_f32_i8(float* out, const int8_t* w, const float* w_scale, con
 int32_t k32_vecmat_f32_i8(float* out, const int8_t* w, const float* w_scale, const float* x, uint32_t rows, uint32_t cols,
                           uint32_t row_stride, uint32_t scale_stride);
 int32_t k32_softmax_f32(float* x, uint32_t n);
+int32_t k32_fft_q15(int32_t* re, int32_t* im, uint32_t n, const int16_t* tw_re, const int16_t* tw_im);
 #ifdef __cplusplus
 }
 #endif

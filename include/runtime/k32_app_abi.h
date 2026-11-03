@@ -329,7 +329,8 @@ K32_IMPORT("k32_http_status") int32_t k32_http_status(void);
  * per unit of work before the call runs: rows x (cols + 1) units for a
  * matrix (n times that for k32_matmul_*), 32 per element for
  * k32_softmax_f32 and k32_swiglu_f32, 4 for k32_rmsnorm_f32 and
- * k32_quantize_i8, 3 for k32_rope_f32, 1 for k32_add_f32 and k32_argmax_f32.
+ * k32_quantize_i8, 3 for k32_rope_f32, 1 for k32_add_f32 and k32_argmax_f32,
+ * 8 per butterfly for k32_fft_q15.
  *
  * w is a matrix of rows x cols weights, row r starting row_stride bytes
  * after row r - 1 (0: the rows follow each other); w_scale holds one float
@@ -414,6 +415,16 @@ K32_IMPORT("k32_rope_f32") int32_t k32_rope_f32(float* x, const float* cs, uint3
 K32_IMPORT("k32_swiglu_f32") int32_t k32_swiglu_f32(float* x, const float* g, uint32_t n);
 K32_IMPORT("k32_add_f32") int32_t k32_add_f32(float* x, const float* y, uint32_t n);
 K32_IMPORT("k32_argmax_f32") int32_t k32_argmax_f32(const float* x, uint32_t n);
+
+/* k32_fft_q15: the butterflies of an n-point radix-2 FFT (n a power of two,
+ * 2..4096) in place over re[n] and im[n], int32 in bit-reversed order, with
+ * n / 2 Q15 twiddles tw_re[k], tw_im[k] (usually cos and -sin of 2 pi k / n).
+ * Each butterfly takes t = W x[b] with each part an int64 sum of products
+ * rounded as (p + 16384) >> 15, then x[b] = x[a] - t, x[a] = x[a] + t in
+ * int32; no scaling between stages. Returns K32_OK, or K32_ERR_INVAL for an
+ * n out of range; operands outside the linear memory trap. A metered pod
+ * pays for n / 2 x log2 n butterflies, 8 units each. */
+K32_IMPORT("k32_fft_q15")    int32_t k32_fft_q15(int32_t* re, int32_t* im, uint32_t n, const int16_t* tw_re, const int16_t* tw_im);
 
 /* ---- Hardware imports, gated by the capability firewall ---------------
  * The pod manifest must request the matching resource:

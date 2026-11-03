@@ -470,6 +470,38 @@ void rope_f32(uint8_t* x, const uint8_t* cs, uint32_t n, uint32_t head_size, uin
     }
 }
 
+static inline int32_t load_i32(const uint8_t* p) {
+    int32_t v;
+    __builtin_memcpy(&v, p, 4);
+    return v;
+}
+static inline void store_i32(uint8_t* p, int32_t v) { __builtin_memcpy(p, &v, 4); }
+static inline int64_t load_i16(const uint8_t* p) {
+    int16_t v;
+    __builtin_memcpy(&v, p, 2);
+    return v;
+}
+
+void fft_q15(uint8_t* re, uint8_t* im, uint32_t n, const uint8_t* tw_re, const uint8_t* tw_im) {
+    for (uint32_t size = 2; size <= n; size *= 2) {
+        const uint32_t half = size / 2, step = n / size;
+        for (uint32_t j = 0; j < half; j++) {
+            const int64_t wr = load_i16(tw_re + 2 * j * step), wi = load_i16(tw_im + 2 * j * step);
+            for (uint32_t a = j; a < n; a += size) {
+                const uint32_t b = a + half;
+                const int64_t rb = load_i32(re + 4 * b), ib = load_i32(im + 4 * b);
+                const int32_t tr = static_cast<int32_t>((rb * wr - ib * wi + 16384) >> 15);
+                const int32_t ti = static_cast<int32_t>((rb * wi + ib * wr + 16384) >> 15);
+                const int32_t ra = load_i32(re + 4 * a), ia = load_i32(im + 4 * a);
+                store_i32(re + 4 * b, static_cast<int32_t>(static_cast<uint32_t>(ra) - static_cast<uint32_t>(tr)));
+                store_i32(im + 4 * b, static_cast<int32_t>(static_cast<uint32_t>(ia) - static_cast<uint32_t>(ti)));
+                store_i32(re + 4 * a, static_cast<int32_t>(static_cast<uint32_t>(ra) + static_cast<uint32_t>(tr)));
+                store_i32(im + 4 * a, static_cast<int32_t>(static_cast<uint32_t>(ia) + static_cast<uint32_t>(ti)));
+            }
+        }
+    }
+}
+
 void swiglu_f32(uint8_t* x, const uint8_t* g, uint32_t n) {
     for (uint32_t i = 0; i < n; i++) {
         float a = load_f32(x + 4 * i);
@@ -526,6 +558,10 @@ static const MatrixImport kMatrixImports[] = {
     K32_MATRIX("k32_vecmat_f32_i8", "i(iiiiiiii)", kVecmat),
 };
 static const char kTrapSoftmax[] = K32_OOB("k32_softmax_f32", "x");
+static const char kTrapFftRe[] = K32_OOB("k32_fft_q15", "re");
+static const char kTrapFftIm[] = K32_OOB("k32_fft_q15", "im");
+static const char kTrapFftTwRe[] = K32_OOB("k32_fft_q15", "tw_re");
+static const char kTrapFftTwIm[] = K32_OOB("k32_fft_q15", "tw_im");
 
 static inline uint32_t arg(const uint64_t* sp, int i) { return static_cast<uint32_t>(sp[i]); }
 static const void* result(uint64_t* sp, int32_t rc) {
@@ -764,6 +800,23 @@ static const void* raw_argmax(IM3Runtime rt, IM3ImportContext, uint64_t* sp, voi
     return result(sp, static_cast<int32_t>(argmax_f32(static_cast<uint8_t*>(mem) + x, n)));
 }
 
+// "i(iiiii)": re, im, n, tw_re, tw_im
+static const void* raw_fft(IM3Runtime rt, IM3ImportContext, uint64_t* sp, void* mem) {
+    const uint32_t re = arg(sp, 1), im = arg(sp, 2), n = arg(sp, 3), twr = arg(sp, 4), twi = arg(sp, 5);
+    if (n < 2 || n > 4096 || (n & (n - 1))) return result(sp, K32_ERR_INVAL);
+    const uint64_t size = m3_GetMemorySizeAt(mem);
+    if (!fits(size, re, n, 4, 4)) return kTrapFftRe;
+    if (!fits(size, im, n, 4, 4)) return kTrapFftIm;
+    if (!fits(size, twr, n / 2, 2, 2)) return kTrapFftTwRe;
+    if (!fits(size, twi, n / 2, 2, 2)) return kTrapFftTwIm;
+    uint32_t stages = 0;
+    while ((1u << stages) < n) stages++;
+    if (M3Result r = charge(rt, kFftUnits * (n / 2) * stages)) return r;
+    uint8_t* base = static_cast<uint8_t*>(mem);
+    fft_q15(base + re, base + im, n, base + twr, base + twi);
+    return result(sp, K32_OK);
+}
+
 void link_linalg_host_functions(IM3Module module) {
     for (const MatrixImport& im : kMatrixImports) m3_LinkRawFunctionEx(module, "env", im.name, im.signature, &raw_matrix, &im);
     for (const MatmulImport& im : kMatmulImports) m3_LinkRawFunctionEx(module, "env", im.name, im.signature, &raw_matmul, &im);
@@ -774,6 +827,7 @@ void link_linalg_host_functions(IM3Module module) {
     m3_LinkRawFunction(module, "env", "k32_swiglu_f32", "i(iii)", &raw_pairwise<true>);
     m3_LinkRawFunction(module, "env", "k32_add_f32", "i(iii)", &raw_pairwise<false>);
     m3_LinkRawFunction(module, "env", "k32_argmax_f32", "i(ii)", &raw_argmax);
+    m3_LinkRawFunction(module, "env", "k32_fft_q15", "i(iiiii)", &raw_fft);
 }
 
 }  // namespace kube32::runtime

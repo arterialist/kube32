@@ -92,6 +92,16 @@ void add_f32(uint8_t* x, const uint8_t* y, uint32_t n);
 
 // The index of the first largest of n floats (0 for n = 0)
 uint32_t argmax_f32(const uint8_t* x, uint32_t n);
+// The radix-2 decimation-in-time butterflies of an n-point FFT (n a power of
+// two) in place over re and im (int32, in bit-reversed order), with the n / 2
+// Q15 twiddles tw_re, tw_im (int16): at size 2, 4, .., n, butterfly (a, b =
+// a + size / 2) with twiddle k = (a % size) x n / size takes t = W x[b], each
+// part an int64 sum of products rounded as (p + 16384) >> 15, then x[b] =
+// x[a] - t and x[a] = x[a] + t in int32. No scaling between stages. Operands
+// may be unaligned.
+void fft_q15(uint8_t* re, uint8_t* im, uint32_t n, const uint8_t* tw_re, const uint8_t* tw_im);
+// A call's units of work: n / 2 x log2 n butterflies, kFftUnits each
+constexpr uint64_t kFftUnits = 8;
 
 // Links the imports into a pod's module
 void link_linalg_host_functions(IM3Module module);

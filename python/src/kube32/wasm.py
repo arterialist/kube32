@@ -61,6 +61,7 @@ APP_IMPORTS = {
     "k32_swiglu_f32": "i(iii)",
     "k32_add_f32": "i(iii)",
     "k32_argmax_f32": "i(ii)",
+    "k32_fft_q15": "i(iiiii)",
     "k32_blob_open": "i(ii)",
     "k32_blob_size": "i(i)",
     "k32_blob_read": "i(iiii)",

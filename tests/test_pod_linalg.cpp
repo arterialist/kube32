@@ -927,7 +927,56 @@ static void test_elementwise_imports() {
     std::printf("[PASS] test_elementwise_imports\n");
 }
 
+// k32_fft_q15: the kernel against the butterflies written out in the order the
+// header states them, at unaligned addresses; a DC input comes out at bin 0
+static void test_fft() {
+    for (uint32_t n : {2u, 8u, 64u, 512u}) {
+        std::vector<int32_t> re(n), im(n), rr(n), ri(n);
+        std::vector<int16_t> twr(n / 2), twi(n / 2);
+        for (uint32_t k = 0; k < n / 2; k++) {
+            twr[k] = static_cast<int16_t>(rnd() >> 16);
+            twi[k] = static_cast<int16_t>(rnd() >> 16);
+        }
+        for (uint32_t i = 0; i < n; i++) {
+            re[i] = static_cast<int32_t>(rnd()) >> 8;
+            im[i] = static_cast<int32_t>(rnd()) >> 8;
+        }
+        rr = re;
+        ri = im;
+        for (uint32_t size = 2; size <= n; size *= 2)
+            for (uint32_t a0 = 0; a0 < n; a0 += size)
+                for (uint32_t j = 0; j < size / 2; j++) {
+                    const uint32_t a = a0 + j, b = a + size / 2;
+                    const int64_t wr = twr[j * (n / size)], wi = twi[j * (n / size)];
+                    const int32_t tr = static_cast<int32_t>((static_cast<int64_t>(rr[b]) * wr - static_cast<int64_t>(ri[b]) * wi + 16384) >> 15);
+                    const int32_t ti = static_cast<int32_t>((static_cast<int64_t>(rr[b]) * wi + static_cast<int64_t>(ri[b]) * wr + 16384) >> 15);
+                    rr[b] = static_cast<int32_t>(static_cast<uint32_t>(rr[a]) - static_cast<uint32_t>(tr));
+                    ri[b] = static_cast<int32_t>(static_cast<uint32_t>(ri[a]) - static_cast<uint32_t>(ti));
+                    rr[a] = static_cast<int32_t>(static_cast<uint32_t>(rr[a]) + static_cast<uint32_t>(tr));
+                    ri[a] = static_cast<int32_t>(static_cast<uint32_t>(ri[a]) + static_cast<uint32_t>(ti));
+                }
+        std::vector<uint8_t> mem(1 + 8 * n + 2 * n);
+        uint8_t *pre = mem.data() + 1, *pim = pre + 4 * n, *ptr = pim + 4 * n, *pti = ptr + n;
+        std::memcpy(pre, re.data(), 4 * n);
+        std::memcpy(pim, im.data(), 4 * n);
+        std::memcpy(ptr, twr.data(), n);
+        std::memcpy(pti, twi.data(), n);
+        fft_q15(pre, pim, n, ptr, pti);
+        assert(std::memcmp(pre, rr.data(), 4 * n) == 0 && std::memcmp(pim, ri.data(), 4 * n) == 0);
+    }
+    // 8 points of 1000 with cos/sin twiddles in Q15: bin 0 is 8000, the rest 0
+    int32_t re[8], im[8];
+    int16_t twr[4] = {32767, 23170, 0, -23170}, twi[4] = {0, -23170, -32767, -23170};
+    for (int i = 0; i < 8; i++) re[i] = 1000, im[i] = 0;
+    fft_q15(reinterpret_cast<uint8_t*>(re), reinterpret_cast<uint8_t*>(im), 8, reinterpret_cast<uint8_t*>(twr),
+            reinterpret_cast<uint8_t*>(twi));
+    assert(re[0] == 8000 && im[0] == 0);
+    for (int i = 1; i < 8; i++) assert(re[i] >= -2 && re[i] <= 2 && im[i] >= -2 && im[i] <= 2);
+    std::printf("[PASS] test_fft\n");
+}
+
 int main() {
+    test_fft();
     test_kernels_match_reference();
     test_matmul_kernels();
     test_float_kernels();
