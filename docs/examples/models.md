@@ -7,7 +7,7 @@
 | [Target LM](https://github.com/arterialist/kube32/tree/main/models/target-lm) | TinyStories text; the target of speculative decoding | 3.57 M | validation loss 0.875 (stories260K: 1.333) |
 | [Masked diffusion LM](https://github.com/arterialist/kube32/tree/main/models/mdlm) | TinyStories text, 64 tokens a window in 8 to 32 steps | 0.82 M (855 KB) | 1.91 nats a token |
 | [Doodle denoiser](https://github.com/arterialist/kube32/tree/main/models/doodle) | Quick, Draw! drawings at 28x28 for six classes | 29 K and 294 K | class accuracy 73 to 79 % and 96 to 98 % |
-| [Keyword spotter](https://github.com/arterialist/kube32/tree/main/models/kws) | Speech Commands v2, eight classes | 25 K | 94.3 % on the test split |
+| [Keyword spotter](https://github.com/arterialist/kube32/tree/main/models/kws) | Speech Commands v2, eight classes | 25 K | 93.9 % on the test split |
 
 The checkpoints of the keyword spotter, the doodle denoisers and the diffusion model are in the repository. The target LM's weights come from `models/lm/train.py` and `apps/llm-pipeline/tools/spec.py blobs`. `make -C models check` builds the C inference of the first three with the node's kernels and compares it with their test vectors, and `models/playground.py` runs all of them on the host.
 

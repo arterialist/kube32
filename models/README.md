@@ -7,7 +7,7 @@ Small neural networks for kube32 pods, trained on public datasets and exported i
 | Target LM | [target-lm](target-lm/) | TinyStories text, the target of speculative decoding with stories260K as draft | 3.57 M (3.8 MB int8, 2.1 MB int4) | validation loss 0.875 int8 (stories260K 1.333); 3.21 tokens a pass at k = 4 | control plane, weights streamed from flash |
 | Masked diffusion LM | [mdlm](mdlm/) | TinyStories text, 64 tokens a window, 8-32 denoising steps | 0.82 M (855 KB int8) | bound 1.91 nats a token | control plane (PSRAM) |
 | Doodle denoiser | [doodle](doodle/) | Quick, Draw! cat, dog, bird, house, tree, bed at 28x28, DDIM in 8 or 16 steps | 29 K (35.6 KB) / 294 K (313 KB) | class accuracy 73-79 % / 96-98 % | Cardputer / control plane |
-| Keyword spotter | [kws](kws/) | Speech Commands v2: cat, dog, bird, house, tree, bed, unknown, silence | 25 K (30 KB blob) | 94.3 % on the test split | Cardputer |
+| Keyword spotter | [kws](kws/) | Speech Commands v2: cat, dog, bird, house, tree, bed, unknown, silence | 25 K (30 KB blob) | 93.9 % on the test split | Cardputer |
 
 ## Layout
 

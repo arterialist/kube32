@@ -103,14 +103,21 @@ def main():
     p.add_argument("--qat-epochs", type=int, default=0)
     p.add_argument("--batch", type=int, default=128)
     p.add_argument("--lr", type=float, default=3e-3)
+    p.add_argument("--far", action="store_true", help="train on farfield.py's copies (far-field, noise, babble)")
     a = p.parse_args()
     torch.set_num_threads(4)
     torch.manual_seed(0)
     device = "mps" if torch.backends.mps.is_available() else "cpu"
     os.makedirs(a.out, exist_ok=True)
     d = data.load()
-    tx, ty = d["train"]
-    _, vx, vy = d["val"]
+    if a.far:
+        import farfield
+        tx, ty, fvx, fvy = farfield.load_train()
+        _, vx, vy = d["val"]
+        vx, vy = np.concatenate([vx, fvx]), np.concatenate([vy, fvy])
+    else:
+        tx, ty = d["train"]
+        _, vx, vy = d["val"]
     offset = int(np.round(np.mean(tx)))
     top = float(np.percentile(np.abs(tx.astype(np.int64) - offset), 99.99))
     in_scale = top / 127.0
