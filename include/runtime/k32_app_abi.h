@@ -327,7 +327,8 @@ K32_IMPORT("k32_http_status") int32_t k32_http_status(void);
  * integer sums are exact int32 values (wrapping beyond that range), so every
  * node computes the same bits. A metered pod pays 10,000 gas units plus 45
  * per unit of work before the call runs: rows x (cols + 1) units for a
- * matrix, 32 per element for k32_softmax_f32.
+ * matrix (n times that for k32_matmul_*), 32 per element for
+ * k32_softmax_f32.
  *
  * w is a matrix of rows x cols weights, row r starting row_stride bytes
  * after row r - 1 (0: the rows follow each other); w_scale holds one float
@@ -347,6 +348,14 @@ K32_IMPORT("k32_http_status") int32_t k32_http_status(void);
  * and 2j + 1 in the high nibble, each a signed value -8..7; with an odd cols
  * a row ends in an unused high nibble.
  *
+ * k32_matmul_i8, k32_matmul_i4: the same product for n vectors at once, x
+ * holding n vectors of cols int8 values one after another and x_scale n
+ * floats, into n vectors of rows floats:
+ *   out[p * rows + r] = (float)(sum over c of w[r][c] * x[p * cols + c]) * (w_scale[r] * x_scale[p])
+ * the bits of n k32_matvec calls. The node reads each row of w once for all
+ * n vectors, so weights that stream from flash are read once a call instead
+ * of once a vector. w_scale is packed (4 bytes apart).
+ *
  * k32_matvec_f32_i8: int8 rows times a float vector x of cols values, the
  * sum from 0 in column order (attention scores over an int8 key cache):
  *   out[r] = ((sum over c of x[c] * (float)w[r][c]) * w_scale[r]) * alpha
@@ -361,6 +370,10 @@ K32_IMPORT("k32_matvec_i8") int32_t k32_matvec_i8(float* out, const int8_t* w, c
                                                   uint32_t rows, uint32_t cols, uint32_t row_stride);
 K32_IMPORT("k32_matvec_i4") int32_t k32_matvec_i4(float* out, const void* w, const float* w_scale, const int8_t* x, float x_scale,
                                                   uint32_t rows, uint32_t cols, uint32_t row_stride);
+K32_IMPORT("k32_matmul_i8") int32_t k32_matmul_i8(float* out, const int8_t* w, const float* w_scale, const int8_t* x, const float* x_scale,
+                                                  uint32_t rows, uint32_t cols, uint32_t row_stride, uint32_t n);
+K32_IMPORT("k32_matmul_i4") int32_t k32_matmul_i4(float* out, const void* w, const float* w_scale, const int8_t* x, const float* x_scale,
+                                                  uint32_t rows, uint32_t cols, uint32_t row_stride, uint32_t n);
 K32_IMPORT("k32_matvec_f32_i8") int32_t k32_matvec_f32_i8(float* out, const int8_t* w, const float* w_scale, const float* x, float alpha,
                                                           uint32_t rows, uint32_t cols, uint32_t row_stride, uint32_t scale_stride);
 K32_IMPORT("k32_vecmat_f32_i8") int32_t k32_vecmat_f32_i8(float* out, const int8_t* w, const float* w_scale, const float* x,

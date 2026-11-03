@@ -85,6 +85,106 @@ void matvec_i4(uint8_t* out, const int8_t* w, size_t row_stride, const uint8_t* 
     }
 }
 
+// ---- products for several vectors ---------------------------------------------
+
+// The sums of one row with G vectors (x + g * cols), each weight loaded and
+// unpacked once: the G sums and the G vector pointers stay in registers
+template <uint32_t G>
+static inline void dots_i8(const int8_t* w, const int8_t* x, uint32_t cols, uint32_t* acc) {
+    uint32_t a[G] = {};
+    for (uint32_t c = 0; c < cols; c++) {
+        const int32_t wv = w[c];
+        for (uint32_t g = 0; g < G; g++) a[g] += static_cast<uint32_t>(wv * x[g * cols + c]);
+    }
+    for (uint32_t g = 0; g < G; g++) acc[g] = a[g];
+}
+
+template <uint32_t G>
+static inline void dots_i4(const int8_t* w, const int8_t* x, uint32_t cols, uint32_t* acc) {
+    uint32_t a[G] = {};
+    const uint32_t pairs = cols / 2;
+    for (uint32_t j = 0; j < pairs; j++) {
+        const int32_t b = w[j], lo = lo4(b), hi = hi4(b);
+        for (uint32_t g = 0; g < G; g++)
+            a[g] += static_cast<uint32_t>(lo * x[g * cols + 2 * j]) + static_cast<uint32_t>(hi * x[g * cols + 2 * j + 1]);
+    }
+    if (cols & 1) {
+        const int32_t lo = lo4(w[pairs]);
+        for (uint32_t g = 0; g < G; g++) a[g] += static_cast<uint32_t>(lo * x[g * cols + cols - 1]);
+    }
+    for (uint32_t g = 0; g < G; g++) acc[g] = a[g];
+}
+
+// Four vectors: written out, since the compiler keeps an array of four sums
+// on the stack
+static inline void dots4_i8(const int8_t* w, const int8_t* x, uint32_t cols, uint32_t* acc) {
+    const int8_t *x0 = x, *x1 = x + cols, *x2 = x + 2 * cols, *x3 = x + 3 * cols;
+    uint32_t a0 = 0, a1 = 0, a2 = 0, a3 = 0;
+    for (uint32_t c = 0; c < cols; c++) {
+        const int32_t wv = w[c];
+        a0 += static_cast<uint32_t>(wv * x0[c]);
+        a1 += static_cast<uint32_t>(wv * x1[c]);
+        a2 += static_cast<uint32_t>(wv * x2[c]);
+        a3 += static_cast<uint32_t>(wv * x3[c]);
+    }
+    acc[0] = a0; acc[1] = a1; acc[2] = a2; acc[3] = a3;
+}
+
+static inline void dots4_i4(const int8_t* w, const int8_t* x, uint32_t cols, uint32_t* acc) {
+    const int8_t *x0 = x, *x1 = x + cols, *x2 = x + 2 * cols, *x3 = x + 3 * cols;
+    uint32_t a0 = 0, a1 = 0, a2 = 0, a3 = 0;
+    const uint32_t pairs = cols / 2;
+    for (uint32_t j = 0; j < pairs; j++, x0 += 2, x1 += 2, x2 += 2, x3 += 2) {
+        const int32_t b = w[j], lo = lo4(b), hi = hi4(b);
+        a0 += static_cast<uint32_t>(lo * x0[0]) + static_cast<uint32_t>(hi * x0[1]);
+        a1 += static_cast<uint32_t>(lo * x1[0]) + static_cast<uint32_t>(hi * x1[1]);
+        a2 += static_cast<uint32_t>(lo * x2[0]) + static_cast<uint32_t>(hi * x2[1]);
+        a3 += static_cast<uint32_t>(lo * x3[0]) + static_cast<uint32_t>(hi * x3[1]);
+    }
+    if (cols & 1) {
+        const int32_t lo = lo4(w[pairs]);
+        a0 += static_cast<uint32_t>(lo * x0[0]);
+        a1 += static_cast<uint32_t>(lo * x1[0]);
+        a2 += static_cast<uint32_t>(lo * x2[0]);
+        a3 += static_cast<uint32_t>(lo * x3[0]);
+    }
+    acc[0] = a0; acc[1] = a1; acc[2] = a2; acc[3] = a3;
+}
+
+// Row after row; the groups of a row (4, then 2, then 1 vector) read it
+// from the cache after the first
+template <bool I4>
+static void matmul(uint8_t* out, const int8_t* w, size_t row_stride, const uint8_t* w_scale, const int8_t* x, const uint8_t* x_scale,
+                   uint32_t rows, uint32_t cols, uint32_t n) {
+    static_assert(kMatmulGroup == 4, "dots4");
+    for (uint32_t r = 0; r < rows; r++, w += row_stride) {
+        const float ws = load_f32(w_scale + 4 * r);
+        for (uint32_t p = 0; p < n;) {
+            uint32_t acc[kMatmulGroup];
+            const uint32_t g = n - p >= 4 ? 4 : n - p >= 2 ? 2 : 1;
+            const int8_t* xp = x + static_cast<size_t>(p) * cols;
+            if (g == 4) I4 ? dots4_i4(w, xp, cols, acc) : dots4_i8(w, xp, cols, acc);
+            else if (g == 2) I4 ? dots_i4<2>(w, xp, cols, acc) : dots_i8<2>(w, xp, cols, acc);
+            else I4 ? dots_i4<1>(w, xp, cols, acc) : dots_i8<1>(w, xp, cols, acc);
+            for (uint32_t i = 0; i < g; i++) {
+                const float acc_f = static_cast<float>(static_cast<int32_t>(acc[i]));
+                store_f32(out + 4 * (static_cast<size_t>(p + i) * rows + r), acc_f * (ws * load_f32(x_scale + 4 * (p + i))));
+            }
+            p += g;
+        }
+    }
+}
+
+void matmul_i8(uint8_t* out, const int8_t* w, size_t row_stride, const uint8_t* w_scale, const int8_t* x, const uint8_t* x_scale,
+               uint32_t rows, uint32_t cols, uint32_t n) {
+    matmul<false>(out, w, row_stride, w_scale, x, x_scale, rows, cols, n);
+}
+
+void matmul_i4(uint8_t* out, const int8_t* w, size_t row_stride, const uint8_t* w_scale, const int8_t* x, const uint8_t* x_scale,
+               uint32_t rows, uint32_t cols, uint32_t n) {
+    matmul<true>(out, w, row_stride, w_scale, x, x_scale, rows, cols, n);
+}
+
 // ---- float products ------------------------------------------------------------
 
 // Columns a float block holds: 256 bytes of the interpreter's native stack
@@ -264,6 +364,56 @@ static const void* raw_matrix(IM3Runtime rt, IM3ImportContext ctx, uint64_t* sp,
     return result(sp, K32_OK);
 }
 
+// "i(iiiiiiiii)": out, w, w_scale, x, x_scale, rows, cols, row_stride, n
+struct MatmulImport {
+    const char* name;
+    const char* signature;
+    bool i4;
+    const char* trap_out;
+    const char* trap_w;
+    const char* trap_w_scale;
+    const char* trap_x;
+    const char* trap_x_scale;
+    const char* trap_blob_w;
+    const char* trap_blob_w_scale;
+};
+#define K32_MATMUL(fn, sig, i4) \
+    {fn, sig, i4, K32_OOB(fn, "out"), K32_OOB(fn, "w"), K32_OOB(fn, "w_scale"), K32_OOB(fn, "x"), K32_OOB(fn, "x_scale"), \
+     K32_BLOB_OOB(fn, "w"), K32_BLOB_OOB(fn, "w_scale")}
+static const MatmulImport kMatmulImports[] = {
+    K32_MATMUL("k32_matmul_i8", "i(iiiiiiiii)", false),
+    K32_MATMUL("k32_matmul_i4", "i(iiiiiiiii)", true),
+};
+
+static const void* raw_matmul(IM3Runtime rt, IM3ImportContext ctx, uint64_t* sp, void* mem) {
+    const MatmulImport& im = *static_cast<const MatmulImport*>(ctx->userdata);
+    const uint32_t out = arg(sp, 1), w = arg(sp, 2), w_scale = arg(sp, 3), x = arg(sp, 4), x_scale = arg(sp, 5);
+    const uint32_t rows = arg(sp, 6), cols = arg(sp, 7), row_arg = arg(sp, 8), n = arg(sp, 9);
+    const uint64_t row_bytes = im.i4 ? (static_cast<uint64_t>(cols) + 1) / 2 : cols;
+    const uint64_t row_stride = row_arg ? row_arg : row_bytes;
+    if (row_stride < row_bytes) return result(sp, K32_ERR_INVAL);
+    // out: n vectors of rows floats; x: n vectors of cols values; x_scale: n floats
+    const uint64_t size = m3_GetMemorySizeAt(mem);
+    uint8_t* base = static_cast<uint8_t*>(mem);
+    if (!fits(size, out, 1, 0, 4ull * n * rows)) return im.trap_out;
+    bool w_blob = false, s_blob = false;
+    int32_t rc = K32_OK;
+    const uint8_t* wb = operand(rt, base, size, w, rows, row_stride, row_bytes, w_blob, rc);
+    if (rc == K32_ERR_NOTSUP) return result(sp, rc);
+    if (!wb) return w_blob ? im.trap_blob_w : im.trap_w;
+    const uint8_t* sb = operand(rt, base, size, w_scale, rows, 4, 4, s_blob, rc);
+    if (rc == K32_ERR_NOTSUP) return result(sp, rc);
+    if (!sb) return s_blob ? im.trap_blob_w_scale : im.trap_w_scale;
+    if (!fits(size, x, 1, 0, static_cast<uint64_t>(n) * cols)) return im.trap_x;
+    if (!fits(size, x_scale, 1, 0, 4ull * n)) return im.trap_x_scale;
+    if (M3Result r = charge(rt, n * matrix_units(rows, cols))) return r;
+
+    const int8_t* wp = reinterpret_cast<const int8_t*>(wb);
+    const int8_t* xp = reinterpret_cast<const int8_t*>(base + x);
+    (im.i4 ? matmul_i4 : matmul_i8)(base + out, wp, static_cast<size_t>(row_stride), sb, xp, base + x_scale, rows, cols, n);
+    return result(sp, K32_OK);
+}
+
 // "i(ii)": x, n
 static const void* raw_softmax(IM3Runtime rt, IM3ImportContext, uint64_t* sp, void* mem) {
     const uint32_t x = arg(sp, 1), n = arg(sp, 2);
@@ -275,6 +425,7 @@ static const void* raw_softmax(IM3Runtime rt, IM3ImportContext, uint64_t* sp, vo
 
 void link_linalg_host_functions(IM3Module module) {
     for (const MatrixImport& im : kMatrixImports) m3_LinkRawFunctionEx(module, "env", im.name, im.signature, &raw_matrix, &im);
+    for (const MatmulImport& im : kMatmulImports) m3_LinkRawFunctionEx(module, "env", im.name, im.signature, &raw_matmul, &im);
     m3_LinkRawFunction(module, "env", "k32_softmax_f32", "i(ii)", &raw_softmax);
 }
 

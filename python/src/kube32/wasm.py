@@ -50,6 +50,8 @@ APP_IMPORTS = {
     "k32_fs_remove": "i(ii)",
     "k32_matvec_i8": "i(iiiifiii)",
     "k32_matvec_i4": "i(iiiifiii)",
+    "k32_matmul_i8": "i(iiiiiiiii)",
+    "k32_matmul_i4": "i(iiiiiiiii)",
     "k32_matvec_f32_i8": "i(iiiifiiii)",
     "k32_vecmat_f32_i8": "i(iiiiiiii)",
     "k32_softmax_f32": "i(ii)",

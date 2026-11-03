@@ -168,14 +168,14 @@ class TestUnits(unittest.TestCase):
 
     def test_abi_signatures_match_the_host(self):
         # The signatures are the ones the host links with m3_LinkRawFunction,
-        # and the linear algebra imports from their table (K32_MATRIX).
+        # and the linear algebra imports from their tables (K32_MATRIX, K32_MATMUL).
         linked = {}
         for src in ("src/runtime/app_pod.cpp", "src/runtime/host_functions.cpp", "src/runtime/pod_linalg.cpp", "src/runtime/pod_blobs.cpp"):
             with open(os.path.join(REPO, src)) as f:
                 text = f.read()
             for n, sig in re.findall(r'm3_LinkRawFunction\(module, "env", "([a-z0-9_]+)",\s*"([^"]+)"', text):
                 linked[n] = sig
-            for n, sig in re.findall(r'K32_MATRIX\("([a-z0-9_]+)", "([^"]+)"', text):
+            for n, sig in re.findall(r'K32_MAT(?:RIX|MUL)\("([a-z0-9_]+)", "([^"]+)"', text):
                 linked[n] = sig
         self.assertEqual(linked, wasm.KNOWN_IMPORTS)
 

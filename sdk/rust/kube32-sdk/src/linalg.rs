@@ -1,6 +1,6 @@
 //! Native products for quantized neural networks (`k32_matvec_i8`,
-//! `k32_matvec_i4`, `k32_matvec_f32_i8`, `k32_vecmat_f32_i8`,
-//! `k32_softmax_f32`, feature `linalg`).
+//! `k32_matvec_i4`, `k32_matmul_i8`, `k32_matmul_i4`, `k32_matvec_f32_i8`,
+//! `k32_vecmat_f32_i8`, `k32_softmax_f32`, feature `linalg`).
 //!
 //! The node computes them in native code, with the same bits on every node
 //! (`docs/app-development.md`, Linear algebra). Weights are rows of int8 or
@@ -58,6 +58,64 @@ pub fn matvec_i4(out: &mut [f32], w: &[u8], w_scale: &[f32], x: &[i8], x_scale: 
     }
     let rc = unsafe {
         abi::k32_matvec_i4(out.as_mut_ptr(), w.as_ptr(), w_scale.as_ptr(), x.as_ptr(), x_scale, u32_of(rows)?, u32_of(cols)?, u32_of(stride)?)
+    };
+    Error::from_rc(rc).map(|_| ())
+}
+
+/// [`matvec_i8`] for `n = x_scale.len()` vectors at once: `x` holds them one
+/// after another (`x.len() / n` columns each) and `out` the `n` results
+/// (`out.len() / n` rows each), the bits of `n` [`matvec_i8`] calls. The node
+/// reads each row of `w` once for all of them.
+pub fn matmul_i8(out: &mut [f32], w: &[i8], w_scale: &[f32], x: &[i8], x_scale: &[f32], row_stride: usize) -> Result<(), Error> {
+    let n = x_scale.len();
+    if n == 0 || out.len() % n != 0 || x.len() % n != 0 {
+        return Err(Error::Invalid);
+    }
+    let (rows, cols) = (out.len() / n, x.len() / n);
+    let stride = if row_stride == 0 { cols } else { row_stride };
+    if stride < cols || !fits(w.len(), rows, stride, cols) || w_scale.len() < rows {
+        return Err(Error::Invalid);
+    }
+    let rc = unsafe {
+        abi::k32_matmul_i8(
+            out.as_mut_ptr(),
+            w.as_ptr(),
+            w_scale.as_ptr(),
+            x.as_ptr(),
+            x_scale.as_ptr(),
+            u32_of(rows)?,
+            u32_of(cols)?,
+            u32_of(stride)?,
+            u32_of(n)?,
+        )
+    };
+    Error::from_rc(rc).map(|_| ())
+}
+
+/// [`matmul_i8`] for int4 weights, packed as for [`matvec_i4`].
+pub fn matmul_i4(out: &mut [f32], w: &[u8], w_scale: &[f32], x: &[i8], x_scale: &[f32], row_stride: usize) -> Result<(), Error> {
+    let n = x_scale.len();
+    if n == 0 || out.len() % n != 0 || x.len() % n != 0 {
+        return Err(Error::Invalid);
+    }
+    let (rows, cols) = (out.len() / n, x.len() / n);
+    let row_bytes = cols.div_ceil(2);
+    let stride = if row_stride == 0 { row_bytes } else { row_stride };
+    if stride < row_bytes || !fits(w.len(), rows, stride, row_bytes) || w_scale.len() < rows {
+        return Err(Error::Invalid);
+    }
+    let rc = unsafe {
+        abi::k32_matmul_i4(
+            out.as_mut_ptr(),
+            w.as_ptr(),
+            w_scale.as_ptr(),
+            x.as_ptr(),
+            x_scale.as_ptr(),
+            u32_of(rows)?,
+            u32_of(cols)?,
+            u32_of(stride)?,
+            u32_of(n)?,
+        )
     };
     Error::from_rc(rc).map(|_| ())
 }
