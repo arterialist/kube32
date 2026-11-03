@@ -65,6 +65,8 @@ int32_t audio_play(const int16_t* samples, uint32_t count, uint32_t sample_rate,
 // timeout_ms: the count, or -16 while the speaker still plays, -5 on an
 // I2S error. max_samples 0 stops the microphone.
 int32_t mic_read(int16_t* out, uint32_t max_samples, uint32_t timeout_ms);
+// Digital gain of k32_mic_read after the DC offset is removed (1 to 64, 16 by default)
+void mic_set_gain(uint32_t gain);
 
 // GPIOs driven by the display, speaker and keyboard drivers above, for the
 // board profile's reserved pins.

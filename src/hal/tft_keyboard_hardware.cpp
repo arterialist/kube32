@@ -270,6 +270,19 @@ static constexpr uint32_t kMicDmaDescs = 4;
 static constexpr uint32_t kMicDmaFrames = 256;            // 64 ms at 16 kHz
 static constexpr uint32_t kMicRate = 16000;
 static constexpr uint64_t kMicIdleUs = 1000000;           // the microphone stops 1 s after the last read
+// The PDM decimator's output sits at a DC offset of about -1,650 and speech
+// at 30 cm peaks at a few hundred (the SPM1423 is -22 dBFS at 94 dB SPL).
+// k32_mic_read returns it with the offset removed (a one-pole high-pass at
+// 2.5 Hz) and 24 dB of gain, saturating: speech at 30 cm peaks at several
+// thousand, a quiet room's floor is about 270 rms. The decimator settles
+// after the microphone starts: its first 100 ms read as silence while the
+// offset is found quickly.
+static constexpr int32_t kMicDcShift = 10;                // offset tracking: 1/1024 of each sample
+static constexpr int32_t kMicSettleShift = 6;             // while settling: 1/64
+static constexpr uint32_t kMicSettleSamples = 1600;       // 100 ms
+static uint32_t s_mic_gain = 16;
+static int32_t s_mic_dc_q8 = 0;
+static uint32_t s_mic_settle = 0;                         // samples left to settle
 static constexpr uint64_t kSpeakerTailUs = 30000;         // the amplifier stops this long after the last sample
 
 enum class AudioMode : uint8_t { Off, Speaker, Mic };
@@ -490,7 +503,30 @@ static bool mic_on_locked() {
         return false;
     }
     s_audio_mode = AudioMode::Mic;
+    s_mic_settle = kMicSettleSamples;
     return true;
+}
+
+static void mic_condition(int16_t* pcm, size_t n) {
+    const int32_t gain = static_cast<int32_t>(s_mic_gain);
+    int32_t dc = s_mic_dc_q8;
+    for (size_t i = 0; i < n; ++i) {
+        const int32_t x = pcm[i];
+        if (s_mic_settle) {
+            if (s_mic_settle-- == kMicSettleSamples) dc = x << 8;
+            dc += ((x << 8) - dc) >> kMicSettleShift;
+            pcm[i] = 0;
+            continue;
+        }
+        dc += ((x << 8) - dc) >> kMicDcShift;
+        const int32_t y = (x - (dc >> 8)) * gain;
+        pcm[i] = static_cast<int16_t>(y > 32767 ? 32767 : y < -32768 ? -32768 : y);
+    }
+    s_mic_dc_q8 = dc;
+}
+
+void mic_set_gain(uint32_t gain) {
+    s_mic_gain = gain < 1 ? 1 : gain > 64 ? 64 : gain;
 }
 
 int32_t mic_read(int16_t* out, uint32_t max_samples, uint32_t timeout_ms) {
@@ -525,6 +561,7 @@ int32_t mic_read(int16_t* out, uint32_t max_samples, uint32_t timeout_ms) {
     size_t got = 0;
     // i2s_channel_read copies out of its DMA buffers: any destination address works
     esp_err_t err = i2s_channel_read(s_rx_chan, out, max_samples * sizeof(int16_t), &got, wait_ms);   // timeout in ms
+    mic_condition(out, got / sizeof(int16_t));
     if (got == 0) {
         static uint32_t s_empty_reads = 0;
         if (s_empty_reads++ < 4) ESP_LOGW(TAG, "microphone: no samples in %u ms (%s)", (unsigned)wait_ms, esp_err_to_name(err));

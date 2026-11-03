@@ -100,7 +100,7 @@ The speaker never plays louder than `K32_SPEAKER_MAX_PCT` (25) percent of full s
 
 `k32_audio_play` returns once its samples are in the output buffer; the last 96 ms or so play after it returns. A call that follows before they have played continues the sound without a gap, so a pod streams audio a buffer at a time. The amplifier gets no clock once the samples have played out.
 
-`k32_mic_read` starts the microphone, which records into a 64 ms buffer between calls and stops one second after the last one; `max_samples` `0` stops it at once. The samples are raw from the PDM decimator, with its DC offset. Pods that hold the grant share one stream of samples.
+`k32_mic_read` starts the microphone, which records into a 64 ms buffer between calls and stops one second after the last one; `max_samples` `0` stops it at once. The samples come with the PDM decimator's DC offset removed (a high-pass at 2.5 Hz) and 24 dB of gain, saturating at full scale: speech at 30 cm peaks at several thousand, and a quiet room's floor is about 270 RMS. The first 100 ms after the microphone starts read as silence while the offset settles. `K32_CMD:MICGAIN:<n>` sets the gain factor (1 to 64, 16 by default) until the next boot. Pods that hold the grant share one stream of samples.
 
 The microphone's clock (GPIO 43) is the speaker's word clock, and the microphone's data line is GPIO 46. Only I2S0 has a PDM receiver, so the two share one controller and one runs at a time. The speaker comes first: playback stops a recording, and `k32_mic_read` waits for playback to end and returns `K32_ERR_BUSY` (`-16`) when it is still playing after `timeout_ms`. A channel exists only while sound moves; between sounds the node holds the speaker's pins low and keeps no audio buffers.
 

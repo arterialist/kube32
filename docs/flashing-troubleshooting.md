@@ -81,6 +81,8 @@ Profile commands write to the `k32` NVS namespace, return `K32_OK ..., rebooting
 | `K32_CMD:BTALL` | Every task's backtrace for `addr2line`. |
 | `K32_CMD:THROW` | The housekeeping loop raises `std::bad_alloc` on its next pass and logs `[CLUSTER] housekeeping pass skipped: std::bad_alloc`; the node keeps running. |
 | `K32_CMD:HEAP` | `K32_HEAP used\|free <=<size> <blocks> <bytes>` lines: internal heap blocks grouped by size. |
+| `K32_CMD:HEAPMIN:start` / `K32_CMD:HEAPMIN` | `start` begins tracking the internal heap's lowest free size; `K32_CMD:HEAPMIN` prints `K32_OK heapmin <bytes>, internal free <bytes>, largest <bytes>` for the time since and stops. The `[MEM]` lines' minimum counts from boot. |
+| `K32_CMD:HEAPWATCH:on` / `dump` / `off` | Firmware built with `CONFIG_HEAP_USE_HOOKS` only: `on` records every internal allocation with the task that made it; `dump` prints `K32_HEAPWATCH` lines with each task's bytes at the moment the recorded bytes peaked and now; `off` dumps and stops. |
 | `K32_CMD:POOL` | `K32_POOL <offset> <size> used\|free` lines list the chunks of the pod pool block's small heap in address order. |
 | `K32_CMD:BENCH:<kernel>:<n>:<runs>` | `K32_BENCH kernel=<kernel> n=<n> runs=<runs> us_min=<µs> us_total=<µs> sum=<checksum>`: runs a benchmark kernel natively: `fib`, `crc32`, `sieve`, `sort`, `mandel` or `json` (see [Benchmarks](benchmarks.md)). `K32_CMD:BENCH:hostcall:<calls>` times that many `esp_timer_get_time()` calls. |
 | `K32_CMD:TCP` | One `K32_TCP` line per lwIP TCP connection with its state, local port, peer, and bytes unsent, unacknowledged, unread by the application, or out of order. |
@@ -89,6 +91,7 @@ Profile commands write to the `k32` NVS namespace, return `K32_OK ..., rebooting
 | `K32_CMD:BLOBS` | `K32_BLOBS medium=... location=... available=... capacity=... free=...` per blob store and `K32_BLOB` lines for its blobs. See [Blobs](storage.md#blobs). |
 | `K32_CMD:BLOBREAD:<name>[:<chunk>]` | `K32_BLOBREAD <name> <medium> mapped\|read chunk=... bytes=... us=... kB_per_s=... sum=...`: reads a blob natively from start to end, through its mapping or in file reads of `<chunk>` bytes (512 to 16384, default 4096), and prints the throughput and a sum of its 32-bit words. |
 | `K32_CMD:MIC:<ms>` | Records the microphone for 100 to 10000 ms and prints `K32_MIC window=... mean=... rms=... peak=...` for every 250 ms. See [Peripherals](peripherals.md#speaker-and-microphone). |
+| `K32_CMD:MICGAIN:<n>` | The microphone's digital gain factor, 1 to 64 (16 by default), until the next boot. |
 | `K32_CMD:KEY:<text>` | Queue keystrokes `\n`, `\b`, `\t`, and characters. |
 | `K32_CMD:KEYPOP` | Pop one key from the queue. |
 | `K32_CMD:TONE:<count>` | Play 1 to 200 short tones. |

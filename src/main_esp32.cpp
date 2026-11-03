@@ -610,6 +610,141 @@ static void console_bench(Console& con, const std::string& args) {
     con.write(l, static_cast<size_t>(ll));
 }
 
+#if CONFIG_HEAP_USE_HOOKS
+// Heap watch (CONFIG_HEAP_USE_HOOKS builds): while armed, every internal
+// allocation is recorded with the task that made it, until it is freed. The
+// moment the recorded bytes peak (the heap's low point when the watch
+// started at a quiet moment) is kept per task, with a size histogram, for
+// K32_CMD:HEAPWATCH:dump. The table exists only while armed; disarmed, a
+// hook is one load and a branch.
+namespace heapwatch {
+constexpr size_t kSlots = 384;
+constexpr size_t kTasks = 24;
+constexpr uintptr_t kTomb = 1;
+struct Slot { uintptr_t ptr; uint16_t size; uint8_t task; };
+struct TaskRow { TaskHandle_t h; char name[16]; int32_t bytes, count; int16_t bucket[4]; };
+struct Watch {
+    Slot slots[kSlots];
+    TaskRow tasks[kTasks], peak[kTasks];
+    size_t ntasks, npeak;
+    int32_t live, peak_live, dropped;
+    int64_t peak_us;
+};
+Watch* volatile s_watch = nullptr;
+portMUX_TYPE s_mux = portMUX_INITIALIZER_UNLOCKED;
+
+static IRAM_ATTR inline int bucket_of(size_t n) { return n <= 128 ? 0 : n <= 512 ? 1 : n <= 1700 ? 2 : 3; }
+static IRAM_ATTR inline size_t hash_of(uintptr_t p) { return (p >> 3) * 2654435761u % kSlots; }
+}  // namespace heapwatch
+
+extern "C" IRAM_ATTR void esp_heap_trace_alloc_hook(void* ptr, size_t size, uint32_t caps) {
+    using namespace heapwatch;
+    Watch* w = s_watch;
+    if (!w || !ptr || !esp_ptr_internal(ptr)) return;
+    portENTER_CRITICAL_SAFE(&s_mux);
+    if ((w = s_watch) == nullptr) { portEXIT_CRITICAL_SAFE(&s_mux); return; }
+    TaskHandle_t h = xTaskGetCurrentTaskHandle();
+    size_t t = 0;
+    while (t < w->ntasks && w->tasks[t].h != h) ++t;
+    if (t == w->ntasks && t < kTasks) {
+        TaskRow& r = w->tasks[w->ntasks++];
+        r.h = h;
+        const char* n = h ? pcTaskGetName(h) : "-";
+        size_t i = 0;
+        for (; i < sizeof(r.name) - 1 && n[i]; ++i) r.name[i] = n[i];
+        r.name[i] = 0;
+    }
+    size_t i = hash_of(reinterpret_cast<uintptr_t>(ptr)), probes = 0;
+    while (w->slots[i].ptr > kTomb && probes < kSlots) { i = (i + 1) % kSlots; ++probes; }
+    if (t < kTasks && probes < kSlots) {
+        w->slots[i] = Slot{reinterpret_cast<uintptr_t>(ptr), static_cast<uint16_t>(size > 65535 ? 65535 : size), static_cast<uint8_t>(t)};
+        TaskRow& r = w->tasks[t];
+        r.bytes += static_cast<int32_t>(size);
+        r.count++;
+        r.bucket[bucket_of(size)]++;
+        w->live += static_cast<int32_t>(size);
+        if (w->live > w->peak_live) {
+            w->peak_live = w->live;
+            w->peak_us = esp_timer_get_time();
+            for (size_t k = 0; k < w->ntasks; ++k) w->peak[k] = w->tasks[k];
+            w->npeak = w->ntasks;
+        }
+    } else {
+        w->dropped++;
+    }
+    portEXIT_CRITICAL_SAFE(&s_mux);
+}
+
+extern "C" IRAM_ATTR void esp_heap_trace_free_hook(void* ptr) {
+    using namespace heapwatch;
+    Watch* w = s_watch;
+    if (!w || !ptr) return;
+    portENTER_CRITICAL_SAFE(&s_mux);
+    if ((w = s_watch) == nullptr) { portEXIT_CRITICAL_SAFE(&s_mux); return; }
+    size_t i = hash_of(reinterpret_cast<uintptr_t>(ptr));
+    for (size_t probes = 0; probes < kSlots && w->slots[i].ptr; ++probes, i = (i + 1) % kSlots) {
+        if (w->slots[i].ptr != reinterpret_cast<uintptr_t>(ptr)) continue;
+        TaskRow& r = w->tasks[w->slots[i].task];
+        r.bytes -= w->slots[i].size;
+        r.count--;
+        r.bucket[bucket_of(w->slots[i].size)]--;
+        w->live -= w->slots[i].size;
+        w->slots[i].ptr = kTomb;
+        break;
+    }
+    portEXIT_CRITICAL_SAFE(&s_mux);
+}
+
+static void console_heapwatch(Console& con, const std::string& arg) {
+    using namespace heapwatch;
+    char l[160];
+    int ll;
+    if (arg == "on") {
+        if (!s_watch) {
+            auto* w = static_cast<Watch*>(heap_caps_calloc(1, sizeof(Watch), MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
+            if (!w) { con.write("K32_ERR heapwatch: no memory\n", 29); return; }
+            s_watch = w;
+        }
+        heap_caps_monitor_local_minimum_free_size_start();   // min in the dump: since now
+        ll = snprintf(l, sizeof(l), "K32_OK heapwatch on (%u bytes)\n", (unsigned)sizeof(Watch));
+        con.write(l, static_cast<size_t>(ll));
+        return;
+    }
+    Watch* w = s_watch;
+    if (!w) { con.write("K32_ERR heapwatch is off\n", 25); return; }
+    // Printed outside the critical section, from a copy of the rows
+    struct Rows { TaskRow tasks[kTasks], peak[kTasks]; size_t ntasks, npeak; int32_t live, peak_live, dropped; int64_t peak_us; };
+    std::unique_ptr<Rows> rows(new (std::nothrow) Rows);
+    if (!rows) { con.write("K32_ERR heapwatch: no memory\n", 29); return; }
+    Rows& copy = *rows;
+    portENTER_CRITICAL(&s_mux);
+    copy.ntasks = w->ntasks; copy.npeak = w->npeak; copy.live = w->live; copy.peak_live = w->peak_live;
+    copy.dropped = w->dropped; copy.peak_us = w->peak_us;
+    std::memcpy(copy.tasks, w->tasks, sizeof(copy.tasks));
+    std::memcpy(copy.peak, w->peak, sizeof(copy.peak));
+    portEXIT_CRITICAL(&s_mux);
+    ll = snprintf(l, sizeof(l), "K32_HEAPWATCH peak %d bytes at %lld ms, now %d, not recorded %d, internal free %u min %u\n", (int)copy.peak_live,
+                  (long long)(copy.peak_us / 1000), (int)copy.live, (int)copy.dropped,
+                  (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL), (unsigned)heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL));
+    con.write(l, static_cast<size_t>(ll));
+    for (size_t k = 0; k < copy.ntasks; ++k) {
+        const TaskRow& p = k < copy.npeak ? copy.peak[k] : TaskRow{};
+        const TaskRow& c = copy.tasks[k];
+        ll = snprintf(l, sizeof(l), "K32_HEAPWATCH %-16s at_peak %6d in %3d (<=128 %d, <=512 %d, <=1700 %d, more %d)  now %6d in %3d\n", c.name,
+                      (int)p.bytes, (int)p.count, p.bucket[0], p.bucket[1], p.bucket[2], p.bucket[3], (int)c.bytes, (int)c.count);
+        con.write(l, static_cast<size_t>(ll));
+    }
+    if (arg == "off") {
+        portENTER_CRITICAL(&s_mux);   // a hook on the other core finishes first
+        s_watch = nullptr;
+        portEXIT_CRITICAL(&s_mux);
+        heap_caps_free(w);
+        heap_caps_monitor_local_minimum_free_size_stop();
+    }
+    con.write("K32_OK heapwatch\n", 17);
+}
+#endif
+
 static void console_heap_histogram(Console& con) {
     std::memset(&s_heap_buckets, 0, sizeof(s_heap_buckets));
     heap_caps_walk(MALLOC_CAP_INTERNAL, [](walker_heap_into_t, walker_block_info_t b, void*) {
@@ -1212,6 +1347,10 @@ void console_task(void* arg) {
                 console_run_deep(con, [&] { console_blobs(con); });
             } else if (line.rfind("K32_CMD:BLOBREAD:", 0) == 0) {
                 console_run_deep(con, [&] { console_blobread(con, line.substr(17)); });
+            } else if (line.rfind("K32_CMD:MICGAIN:", 0) == 0) {
+                // The microphone's digital gain until the next boot (1 to 64)
+                kube32::hal::mic_set_gain(static_cast<uint32_t>(std::strtoul(line.c_str() + 16, nullptr, 10)));
+                con.write("K32_OK mic gain\n", 16);
             } else if (line.rfind("K32_CMD:MIC:", 0) == 0) {
                 console_run_deep(con, [&] { console_mic(con, line.substr(12)); });
             } else if (line == "K32_CMD:SD") {
@@ -1236,6 +1375,29 @@ void console_task(void* arg) {
                 char l[48];
                 int ll = snprintf(l, sizeof(l), "K32_OK keypop=%d\n", k);
                 con.write(l, static_cast<size_t>(ll));
+#if CONFIG_HEAP_USE_HOOKS
+            } else if (line.rfind("K32_CMD:HEAPWATCH:", 0) == 0) {
+                // on: record internal allocations per task; dump: the peak and
+                // now; off: dump and stop
+                console_heapwatch(con, line.substr(18));
+#endif
+            } else if (line == "K32_CMD:HEAPMIN:start" || line == "K32_CMD:HEAPMIN") {
+                // The internal heap's lowest free size between start and the
+                // next K32_CMD:HEAPMIN (the [MEM] minimum counts from boot)
+                const bool start = line.size() > 16;
+                char l[96];
+                int ll;
+                if (start) {
+                    heap_caps_monitor_local_minimum_free_size_stop();
+                    heap_caps_monitor_local_minimum_free_size_start();
+                    ll = snprintf(l, sizeof(l), "K32_OK heapmin start, internal free %u\n", (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
+                } else {
+                    const unsigned low = (unsigned)heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL);
+                    heap_caps_monitor_local_minimum_free_size_stop();
+                    ll = snprintf(l, sizeof(l), "K32_OK heapmin %u, internal free %u, largest %u\n", low,
+                                  (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL), (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
+                }
+                con.write(l, static_cast<size_t>(ll));
             } else if (line == "K32_CMD:HEAP") {
                 // Internal heap blocks by size, used and free: what holds the
                 // memory on a board without PSRAM
@@ -1251,6 +1413,12 @@ void console_task(void* arg) {
                     static_cast<Console*>(ctx)->write(l, static_cast<size_t>(ll));
                 }, &con);
                 con.write("K32_OK pool\n", 12);
+#if CONFIG_HEAP_USE_HOOKS
+            } else if (line == "K32_CMD:WIFISTATS") {
+                // The Wi-Fi driver's buffer and RX/TX counters, in its own log format
+                console_run_deep(con, [&] { esp_wifi_statis_dump(WIFI_STATIS_BUFFER | WIFI_STATIS_RXTX); });
+                con.write("K32_OK wifistats\n", 17);
+#endif
             } else if (line == "K32_CMD:TCP") {
                 // lwIP's TCP connections and the bytes each one holds
                 console_tcp_pcbs(con);
@@ -1384,16 +1552,21 @@ void print_banner(const NodeIdentity& id) {
 std::atomic<uint32_t> s_alloc_fail_bytes{0};
 std::atomic<uint32_t> s_alloc_fail_count{0};
 std::atomic<uint32_t> s_alloc_fail_caps{0};
+char s_alloc_fail_task[configMAX_TASK_NAME_LEN];
 std::atomic<bool> s_alloc_trace_armed{true};
 
 void on_alloc_failed(size_t size, uint32_t caps, const char* function_name) {
     (void)function_name;
     s_alloc_fail_bytes.store(static_cast<uint32_t>(size));
     s_alloc_fail_caps.store(caps);
+    const char* name = pcTaskGetName(nullptr);
+    std::strncpy(s_alloc_fail_task, name ? name : "-", sizeof(s_alloc_fail_task) - 1);
     s_alloc_fail_count.fetch_add(1);
     // The first block of 1 KiB or more refused since the last [MEM] line:
-    // where it was asked for, and what the heap had then
-    if (size >= 1024 && s_alloc_trace_armed.exchange(false)) {
+    // where it was asked for, and what the heap had then. Not from a task
+    // whose stack has no room for printf (the Wi-Fi driver's has ~200 bytes
+    // left when its receive buffers cannot be allocated)
+    if (size >= 1024 && uxTaskGetStackHighWaterMark(nullptr) >= 2048 && s_alloc_trace_armed.exchange(false)) {
         printf("[MEM] refused %u bytes (caps 0x%x), psram free %u (largest %u)\n", (unsigned)size, (unsigned)caps,
                (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM), (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM));
         esp_backtrace_print(12);
@@ -1401,11 +1574,11 @@ void on_alloc_failed(size_t size, uint32_t caps, const char* function_name) {
 }
 
 void log_memory(const char* stage) {
-    char failed[64] = "";
+    char failed[96] = "";
     s_alloc_trace_armed.store(true);
     if (const uint32_t n = s_alloc_fail_count.exchange(0)) {
-        snprintf(failed, sizeof(failed), "  %u failed alloc(s), last %u bytes (caps 0x%x)", (unsigned)n, (unsigned)s_alloc_fail_bytes.load(),
-                 (unsigned)s_alloc_fail_caps.load());
+        snprintf(failed, sizeof(failed), "  %u failed alloc(s), last %u bytes (caps 0x%x) in %s", (unsigned)n, (unsigned)s_alloc_fail_bytes.load(),
+                 (unsigned)s_alloc_fail_caps.load(), s_alloc_fail_task);
     }
     char large[80] = "";
     const kube32::mem::LargeBlockStats lb = kube32::mem::large_blocks_stats();
@@ -2250,7 +2423,13 @@ void cluster_task(void* pv) {
                 static bool rejoined = false;
                 static int restarts = 0;
                 const uint64_t now = kube32::osal::System::get_uptime_ms();
-                if (kubelet->last_sync_ok_ms() > quiet_since) {   // answered since
+                // The control plane's HELLOs still arrive over the access
+                // point: the link carries traffic, and joining again cannot
+                // make an API server that is busy or restarting answer
+                const uint64_t hello = kube32::ipc::ChannelManager::instance().last_ip_hello_ms(api_host);
+                const bool link_carries = hello && now - hello < 15000;
+                if (link_carries) quiet_since = std::max(quiet_since, hello);
+                if (kubelet->last_sync_ok_ms() > quiet_since || link_carries) {   // answered since
                     rejoined = false;
                     restarts = 0;
                 }
