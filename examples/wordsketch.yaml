@@ -90,8 +90,8 @@ spec:
             - {name: GUIDANCE, value: "20"}       # classifier-free guidance in tenths
           resources:
             # PSRAM places it: a node with room for the drawing's maps
-            requests: {memory: 64Ki, esp32.io/psram: 64Ki, hardware.kube32.io/ipc: "1"}
-            limits: {memory: 64Ki, esp32.io/psram: 64Ki}
+            requests: {memory: 192Ki, esp32.io/psram: 192Ki, hardware.kube32.io/ipc: "1"}
+            limits: {memory: 192Ki, esp32.io/psram: 192Ki}
           securityContext:
             capabilities: {add: ["CHANNEL_IPC"]}
 ---

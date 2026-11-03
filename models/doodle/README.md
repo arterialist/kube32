@@ -9,7 +9,7 @@ Class-conditional diffusion on Google Quick, Draw! 28x28 bitmaps of six words th
 | Blob (weights, scales, step and class tables for 8 and 16 steps) | 35,596 B | 313,108 B |
 | Multiply-adds per network pass | 3.56 M | 27.1 M |
 | Per image, 16 steps with guidance (2 passes a step) | 114 M | 868 M |
-| Maps of `doodle_infer.c` (image, two guidance outputs included) | 21.2 KB | 38.4 KB |
+| Memory of `doodle_infer.c` (maps of both conditions, a chunk of convolution output, v) | 49.8 KB | 113.4 KB |
 
 ## Quality
 
@@ -26,7 +26,7 @@ Training: 60,000 drawings a class (the first ones of each Quick, Draw! file; the
 
 ## Network and sampler
 
-The image goes in as a 14x14 map of 4 channels (each 2x2 block), through seven or eight 3x3 convolutions (`in`, `e1`, stride-2 `down`, `mid` blocks at 7x7, `up` from the 7x7 map repeated 2x2 plus `e1`'s output, `d1` plus `in`'s output, `out`), and comes back as v at 28x28. Each convolution is one `k32_matvec_i8` per output pixel over its int8 patch at a fixed input scale, then the bias, a per-channel bias for the step and the class (int8 tables), the skip, and SiLU with `k32_expf`. The step's alpha and sigma are tables in the blob, the starting noise twelve xorshift32 uniforms per pixel. `doodle.py` documents the blob layout and every operation's order.
+The image goes in as a 14x14 map of 4 channels (each 2x2 block), through seven or eight 3x3 convolutions (`in`, `e1`, stride-2 `down`, `mid` blocks at 7x7, `up` from the 7x7 map repeated 2x2 plus `e1`'s output, `d1` plus `in`'s output, `out`), and comes back as v at 28x28. Each convolution is `k32_conv3x3_i8` over the int8 maps of both conditions of a guided step at once, at a fixed input scale, then the bias, a per-channel bias for the step and the class (int8 tables), the skip, and SiLU with `k32_expf`; the sampler runs the bias, skip, SiLU and the next quantization as `k32_add_f32`, `k32_add_f32_i8`, `k32_swiglu_f32` and `k32_quantize_i8_static` over one output row at a time. The step's alpha and sigma are tables in the blob, the starting noise twelve xorshift32 uniforms per pixel. `doodle.py` documents the blob layout and every operation's order.
 
 ## Files
 

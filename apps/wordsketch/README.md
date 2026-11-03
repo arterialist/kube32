@@ -5,7 +5,7 @@ wordsketch turns a word spoken to the Cardputer into a doodle and a short story.
 | Pod | Node | What it runs | Memory |
 | --- | --- | --- | ---: |
 | `wordsketch-listen` | Cardputer (`kube32.io/board: cardputer`) | microphone, keyword spotter, screen, chime | 20 KiB + 59 KiB overhead |
-| `wordsketch-draw` | a node with PSRAM (`esp32.io/psram`) | doodle diffusion, 8 DDIM steps, one a tick | 64 KiB + 33 KiB overhead |
+| `wordsketch-draw` | a node with PSRAM (`esp32.io/psram`) | doodle diffusion, 8 DDIM steps, one a tick | 192 KiB + 33 KiB overhead |
 | `wordsketch-story` | a node with PSRAM | stories260K, five layers (`llm-shard`, weights read in place from a blob) | 64 KiB + 40 KiB overhead |
 | `wordsketch-teller` | a node with PSRAM | tokenizer, generation loop (`llm-coordinator`) | 64 KiB + 58 KiB overhead |
 | `wordsketch-store` | a node with PSRAM | the tokenizer blob over HTTP | 8 KiB + 6 KiB overhead |
@@ -33,7 +33,7 @@ The Cardputer admits pods on its 80 KiB pool block. `wordsketch-listen` takes 20
 | Shadow stack | 1,024 |
 | Linear memory | 20,160 (limit 20 KiB) |
 
-The 25,280 weights of the spotter stay in the blob `wordsketch-kws` in flash, and `k32_matvec_i8` reads them in place. The draw pod does the same with the 293,760 weights of `doodle-l.bin`: its memory holds the maps, the scales and biases and the step tables.
+The 25,280 weights of the spotter stay in the blob `wordsketch-kws` in flash, and `k32_matvec_i8` reads them in place. The draw pod does the same with the 293,760 weights of `doodle-l.bin` through `k32_conv3x3_i8`: its memory holds the maps of both conditions of a guided step, a chunk of convolution output, the scales and biases and the step tables.
 
 The listen pod needs firmware with `k32_fft_q15`.
 

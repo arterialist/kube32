@@ -31,6 +31,7 @@ constexpr uint64_t kQuantizeUnits = 4;
 constexpr uint64_t kRopeUnits = 3;
 constexpr uint64_t kSwigluUnits = 32;
 constexpr uint64_t kAddUnits = 1;
+constexpr uint64_t kAddI8Units = 2;
 constexpr uint64_t kArgmaxUnits = 1;
 constexpr uint64_t linalg_gas(uint64_t units) { return kLinalgGasPerCall + kLinalgGasPerUnit * units; }
 constexpr uint64_t matrix_units(uint64_t rows, uint64_t cols) { return rows * (cols + 1); }
@@ -89,6 +90,32 @@ void swiglu_f32(uint8_t* x, const uint8_t* g, uint32_t n);
 
 // x = x + y
 void add_f32(uint8_t* x, const uint8_t* y, uint32_t n);
+
+// x = x + (float)q * scale, a residual from an int8 map
+void add_f32_i8(uint8_t* x, const int8_t* q, float scale, uint32_t n);
+
+// q = round(x * inv), half away from zero, clamped to -127..127 (0 for NaN):
+// quantization at a fixed scale
+void quantize_i8_static(int8_t* q, const uint8_t* x, float inv, uint32_t n);
+
+// A 3x3 convolution with padding 1 over n int8 maps of h x w pixels of cin
+// channels (channels innermost), read as their 2x nearest-neighbour upsample
+// when up is 1: output pixel (y, x) takes input pixels stride * y + ky - 1
+// and stride * x + kx - 1 of the (h << up) x (w << up) map (zero outside it)
+// for ky, kx in 0 .. 2. Output rows y0 .. y1 - 1 of the ho x wo map (the
+// input's side << up, divided by stride, rounded up): out holds n x (y1 - y0)
+// x wo pixels of cout floats, pixel after pixel,
+//   out[o] = (float)(sum over ky, kx, c of w[o][ky][kx][c] * in[..][c]) * (w_scale[o] * in_scale) + bias[o]
+// with w a cout x 9 cin matrix: the bits of k32_matvec_i8 over the pixel's
+// patch, then one float add of the bias (none when bias is null). The weights
+// are read once per call in blocks that fit the cache; cin is at most
+// kConvMaxCin.
+constexpr uint32_t kConvMaxCin = 256;
+void conv3x3_i8(uint8_t* out, const int8_t* w, const uint8_t* w_scale, const uint8_t* bias, const int8_t* in, float in_scale,
+                uint32_t cin, uint32_t cout, uint32_t h, uint32_t w_, uint32_t stride, uint32_t up, uint32_t n, uint32_t y0,
+                uint32_t y1);
+// The output map's side for an input side of s
+constexpr uint32_t conv3x3_out(uint32_t s, uint32_t stride, uint32_t up) { return ((s << up) + stride - 1) / stride; }
 
 // The index of the first largest of n floats (0 for n = 0)
 uint32_t argmax_f32(const uint8_t* x, uint32_t n);

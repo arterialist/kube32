@@ -329,8 +329,9 @@ K32_IMPORT("k32_http_status") int32_t k32_http_status(void);
  * per unit of work before the call runs: rows x (cols + 1) units for a
  * matrix (n times that for k32_matmul_*), 32 per element for
  * k32_softmax_f32 and k32_swiglu_f32, 4 for k32_rmsnorm_f32 and
- * k32_quantize_i8, 3 for k32_rope_f32, 1 for k32_add_f32 and k32_argmax_f32,
- * 8 per butterfly for k32_fft_q15.
+ * k32_quantize_i8 and k32_quantize_i8_static, 3 for k32_rope_f32, 2 for
+ * k32_add_f32_i8, 1 for k32_add_f32 and k32_argmax_f32, 8 per butterfly for
+ * k32_fft_q15; a convolution pays for a cout x 9 cin matrix per pixel.
  *
  * w is a matrix of rows x cols weights, row r starting row_stride bytes
  * after row r - 1 (0: the rows follow each other); w_scale holds one float
@@ -395,7 +396,32 @@ K32_IMPORT("k32_http_status") int32_t k32_http_status(void);
  * k32_add_f32: x = x + y over n floats, a residual connection.
  *
  * k32_argmax_f32: the index of the first largest of n floats (0 for n = 0),
- * a greedy pick from logits. */
+ * a greedy pick from logits.
+ *
+ * k32_add_f32_i8: x = x + (float)q * scale over n floats, a residual from
+ * an int8 map.
+ *
+ * k32_quantize_i8_static: q = round(x * inv), half away from zero, clamped
+ * to -127..127 (0 for NaN), over n floats: quantization at a fixed scale,
+ * such as a convolution's input scale.
+ *
+ * k32_conv3x3_i8: a 3x3 convolution with padding 1 over n int8 maps `in`
+ * of h x w pixels of cin channels (channels innermost, pixel after pixel,
+ * map after map), read as their 2x nearest-neighbour upsample when up is 1.
+ * Output pixel (y, x) takes input pixels (stride * y + ky - 1,
+ * stride * x + kx - 1) of the (h << up) x (w << up) map, zero outside it,
+ * for ky, kx in 0 .. 2; the output map is ho x wo with each side the
+ * input's << up, divided by stride, rounded up. A call computes output rows
+ * y0 .. y1 - 1 of every map: out receives n x (y1 - y0) x wo pixels of cout
+ * floats, pixel after pixel,
+ *   out[o] = (float)(sum over ky, kx, c of w[o][ky][kx][c] * in[y', x'][c]) * (w_scale[o] * in_scale) + bias[o]
+ * with w a cout x 9 cin int8 matrix (row o the taps of output channel o,
+ * ky, kx, c innermost): the bits of k32_matvec_i8 over the pixel's patch,
+ * then one float add of the bias (bias 0: none). w and w_scale may be blob
+ * addresses. The weights are read once per call, in blocks that fit the
+ * cache, so a pod computes as many rows per call as its memory holds.
+ * stride is 1 or 2, up 0 or 1, cin at most 256 and y0 <= y1 <= ho
+ * (K32_ERR_INVAL otherwise). */
 K32_IMPORT("k32_matvec_i8") int32_t k32_matvec_i8(float* out, const int8_t* w, const float* w_scale, const int8_t* x, float x_scale,
                                                   uint32_t rows, uint32_t cols, uint32_t row_stride);
 K32_IMPORT("k32_matvec_i4") int32_t k32_matvec_i4(float* out, const void* w, const float* w_scale, const int8_t* x, float x_scale,
@@ -415,6 +441,11 @@ K32_IMPORT("k32_rope_f32") int32_t k32_rope_f32(float* x, const float* cs, uint3
 K32_IMPORT("k32_swiglu_f32") int32_t k32_swiglu_f32(float* x, const float* g, uint32_t n);
 K32_IMPORT("k32_add_f32") int32_t k32_add_f32(float* x, const float* y, uint32_t n);
 K32_IMPORT("k32_argmax_f32") int32_t k32_argmax_f32(const float* x, uint32_t n);
+K32_IMPORT("k32_add_f32_i8") int32_t k32_add_f32_i8(float* x, const int8_t* q, float scale, uint32_t n);
+K32_IMPORT("k32_quantize_i8_static") int32_t k32_quantize_i8_static(int8_t* q, const float* x, float inv, uint32_t n);
+K32_IMPORT("k32_conv3x3_i8") int32_t k32_conv3x3_i8(float* out, const int8_t* w, const float* w_scale, const float* bias, const int8_t* in,
+                                                    float in_scale, uint32_t cin, uint32_t cout, uint32_t h, uint32_t w_, uint32_t stride,
+                                                    uint32_t up, uint32_t n, uint32_t y0, uint32_t y1);
 
 /* k32_fft_q15: the butterflies of an n-point radix-2 FFT (n a power of two,
  * 2..4096) in place over re[n] and im[n], int32 in bit-reversed order, with

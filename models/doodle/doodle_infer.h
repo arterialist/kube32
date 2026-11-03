@@ -1,7 +1,7 @@
 /* The doodle denoiser in C (doodle_infer.c): the blob of doodle.py and its
- * DDIM sampler with the node's linear algebra imports, computing the bits
- * of doodle.py's reference. DOODLE_C0_MAX and DOODLE_C1_MAX size the maps
- * (default: the larger model's 48 and 96). */
+ * DDIM sampler with the node's convolution and element-wise imports,
+ * computing the bits of doodle.py's reference. DOODLE_C0_MAX and
+ * DOODLE_C1_MAX size the maps (default: the larger model's 48 and 96). */
 #ifndef DOODLE_INFER_H
 #define DOODLE_INFER_H
 

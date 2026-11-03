@@ -1,7 +1,14 @@
-/* The doodle denoiser (doodle.py) in C. Each convolution runs one
- * k32_matvec_i8 per output pixel over its 3x3 patch. Maps are int8: the
- * input (14x14x4), A and B (14x14xc0) and two 7x7xc1 maps. `up` writes its
- * output over B, whose pixel it adds first, and d1 over A the same way. */
+/* The doodle denoiser (doodle.py) in C on the node's imports. Each
+ * convolution is one k32_conv3x3_i8 call per chunk of output rows, over
+ * the maps of both conditions of a guided step at once (the class and "no
+ * class", so the weights stream from the blob once a step), then per output
+ * row the step and class bias (k32_add_f32), the skip (k32_add_f32_i8),
+ * SiLU (k32_swiglu_f32 with a gate of ones) and the next convolution's
+ * int8 input (k32_quantize_i8_static). Maps are int8, pixel after pixel,
+ * one map per condition: the input (14x14x4), A and B (14x14xc0) and two
+ * 7x7xc1 maps. `up` writes its output over B, whose pixel it adds first,
+ * and d1 over A the same way. The image and v are kept as 14x14 pixels of
+ * 4 channels (a 2x2 block each) inside a pass. */
 #include "doodle_infer.h"
 
 #include "../../include/runtime/k32_app_abi.h"
@@ -12,6 +19,12 @@
 #define F_SKIP_E1 2u
 #define F_SKIP_IN 4u
 #define F_LAST 8u
+#define NB 2                /* conditions in one pass */
+#define CMAX (DOODLE_C1_MAX > DOODLE_C0_MAX ? DOODLE_C1_MAX : DOODLE_C0_MAX)
+/* floats of a chunk's convolution output: 7 rows of a 14x14 map, or a 7x7 map */
+#define YF (NB * 7 * 14 * DOODLE_C0_MAX > NB * 49 * DOODLE_C1_MAX ? NB * 7 * 14 * DOODLE_C0_MAX : NB * 49 * DOODLE_C1_MAX)
+/* floats of one output row: 14 pixels of c0, or 7 of c1 */
+#define ROWF (14 * DOODLE_C0_MAX > 7 * DOODLE_C1_MAX ? 14 * DOODLE_C0_MAX : 7 * DOODLE_C1_MAX)
 
 static const uint8_t* g_p;
 static uint32_t g_left;
@@ -63,14 +76,7 @@ int doodle_load(struct doodle_model* m, const uint8_t* blob, uint32_t len) {
     return m->class_s && !g_left ? 0 : -1;
 }
 
-/* ---- arithmetic ---------------------------------------------------------- */
-static int8_t q_static(float y, float inv) {
-    const float t = y * inv;
-    if (t >= 127.0f) return 127;
-    if (t <= -127.0f) return -127;
-    return (int8_t)(int32_t)(t + (t >= 0.0f ? 0.5f : -0.5f));
-}
-
+/* ---- the noise ----------------------------------------------------------- */
 static uint32_t g_rng;
 static float uniform(void) {
     uint32_t s = g_rng;
@@ -87,98 +93,79 @@ static float gauss(void) {
 }
 
 /* ---- the network --------------------------------------------------------- */
-static int8_t g_in[14 * 14 * 4], g_a[14 * 14 * DOODLE_C0_MAX], g_b[14 * 14 * DOODLE_C0_MAX];
-static int8_t g_m[2][7 * 7 * DOODLE_C1_MAX];
-static int8_t g_patch[9 * (DOODLE_C1_MAX > DOODLE_C0_MAX ? DOODLE_C1_MAX : DOODLE_C0_MAX)];
-static float g_y[DOODLE_C1_MAX > DOODLE_C0_MAX ? DOODLE_C1_MAX : DOODLE_C0_MAX];
-static float g_cond[4 * DOODLE_C0_MAX + (DOODLE_MAX_CONV - 4) * DOODLE_C1_MAX];
+static int8_t g_in[NB * 14 * 14 * 4], g_a[NB * 14 * 14 * DOODLE_C0_MAX], g_b[NB * 14 * 14 * DOODLE_C0_MAX];
+static int8_t g_m[2][NB * 7 * 7 * DOODLE_C1_MAX];
+static float g_y[YF];                 /* a chunk's convolution output, [condition][row][pixel][channel] */
+static float g_rep[NB][ROWF];         /* a convolution's step and class bias, repeated for a row's pixels */
+static float g_ones[ROWF];
+static float g_v[NB][784];            /* v of each condition, 14x14 pixels of 4 */
+static float g_cond[NB][4 * DOODLE_C0_MAX + (DOODLE_MAX_CONV - 4) * DOODLE_C1_MAX];
 
-/* the 3x3 patch of output pixel (y, x) into g_patch, zero outside the map:
- * a row's three taps are adjacent pixels, one copy (one a tap with F_UP,
- * whose 14x14 pixel (iy, ix) is the 7x7 map's (iy / 2, ix / 2)) */
-static void patch(const struct doodle_conv* c, const int8_t* in, uint32_t H, uint32_t Hin, uint32_t y, uint32_t x) {
-    const uint32_t cin = c->cin;
-    int8_t* dst = g_patch;
-    for (uint32_t ky = 0; ky < 3; ky++, dst += 3 * cin) {
-        const int32_t iy = (int32_t)(c->stride * y + ky) - 1, ix0 = (int32_t)(c->stride * x) - 1;
-        if (iy < 0 || (uint32_t)iy >= Hin) {
-            __builtin_memset(dst, 0, 3 * cin);
-            continue;
-        }
-        const uint32_t lo = ix0 < 0 ? 1u : 0u, hi = (uint32_t)(ix0 + 2) >= Hin ? 2u : 3u;   /* taps lo .. hi - 1 inside */
-        if (lo) __builtin_memset(dst, 0, cin);
-        if (hi < 3) __builtin_memset(dst + 2 * cin, 0, cin);
-        if (c->flags & F_UP) {
-            for (uint32_t k = lo; k < hi; k++)
-                __builtin_memcpy(dst + k * cin, in + (((uint32_t)iy >> 1) * H + ((uint32_t)(ix0 + (int32_t)k) >> 1)) * cin, cin);
-        } else {
-            __builtin_memcpy(dst + lo * cin, in + ((uint32_t)iy * H + (uint32_t)(ix0 + (int32_t)lo)) * cin, (hi - lo) * cin);
-        }
-    }
-}
-
-/* conv c over in (H x W, or 7x7 read as 14x14 with F_UP) into out
- * (quantized with next_inv) or, for the last one, into v (28x28 floats) */
-static void conv(const struct doodle_conv* c, const int8_t* in, uint32_t H, const float* cond, const int8_t* skip,
+/* conv c over the nb maps `in` (H x H, 7x7 read as 14x14 with F_UP) into
+ * out (quantized with next_inv) or, for the last one, into v */
+static void conv(const struct doodle_conv* c, const int8_t* in, uint32_t H, uint32_t nb, const float* cond, const int8_t* skip,
                  float skip_scale, float next_inv, int8_t* out, float* v) {
-    const uint32_t Hin = c->flags & F_UP ? 2 * H : H;
-    const uint32_t Ho = (Hin + c->stride - 1) / c->stride, cin = c->cin;
-    /* The rows of W in blocks of about 8 KB, each block over every output
-     * pixel: the block stays in the data cache, where the whole matrix
-     * (up to 83 KB) would come from flash or PSRAM again for each pixel.
-     * Every output is the same product as row by row. */
-    uint32_t rb = 8192u / (9u * cin);
-    if (rb == 0) rb = 1;
-    for (uint32_t r0 = 0; r0 < c->cout; r0 += rb) {
-        const uint32_t n = c->cout - r0 < rb ? c->cout - r0 : rb;
-        for (uint32_t y = 0; y < Ho; y++)
-            for (uint32_t x = 0; x < Ho; x++) {
-                patch(c, in, H, Hin, y, x);
-                k32_matvec_i8(g_y, c->w + r0 * 9 * cin, c->ws + r0, g_patch, c->scale, n, 9 * cin, 0);
-                const uint32_t p = (y * Ho + x) * c->cout;
-                for (uint32_t k = 0; k < n; k++) {
-                    const uint32_t o = r0 + k;
-                    float t = g_y[k] + c->b[o];
-                    if (c->flags & F_LAST) {
-                        /* channel 2 dy + dx of the 14x14 map is pixel (2y + dy, 2x + dx) */
-                        v[(2 * y + (o >> 1)) * 28 + 2 * x + (o & 1)] = t;
-                        continue;
-                    }
-                    t = t + cond[o];
-                    if (skip) t = t + (float)skip[p + o] * skip_scale;
-                    t = t * (1.0f / (1.0f + k32_expf(-t)));
-                    out[p + o] = q_static(t, next_inv);
-                }
+    const uint32_t up = c->flags & F_UP ? 1u : 0u, cout = c->cout;
+    const uint32_t Ho = ((H << up) + c->stride - 1) / c->stride, rowf = Ho * cout;
+    uint32_t R = YF / (nb * rowf);     /* output rows a chunk */
+    if (R > Ho) R = Ho;
+    if (cond) {
+        for (uint32_t b = 0; b < nb; b++) {
+            float* rep = g_rep[b];
+            for (uint32_t o = 0; o < cout; o++) rep[o] = cond[b * (sizeof g_cond[0] / sizeof(float)) + o];
+            for (uint32_t done = 1; done < Ho; done *= 2) {
+                const uint32_t n = Ho - done < done ? Ho - done : done;
+                __builtin_memcpy(rep + done * cout, rep, n * cout * sizeof(float));
             }
+        }
+    }
+    for (uint32_t y0 = 0; y0 < Ho; y0 += R) {
+        const uint32_t y1 = y0 + R < Ho ? y0 + R : Ho;
+        k32_conv3x3_i8(g_y, c->w, c->ws, c->b, in, c->scale, c->cin, cout, H, H, c->stride, up, nb, y0, y1);
+        for (uint32_t b = 0; b < nb; b++) {
+            if (c->flags & F_LAST) {
+                __builtin_memcpy(v + b * 784 + y0 * rowf, g_y + b * (y1 - y0) * rowf, (y1 - y0) * rowf * sizeof(float));
+                continue;
+            }
+            for (uint32_t y = y0; y < y1; y++) {
+                float* row = g_y + (b * (y1 - y0) + (y - y0)) * rowf;
+                const uint32_t at = (b * Ho + y) * rowf;
+                k32_add_f32(row, g_rep[b], rowf);
+                if (skip) k32_add_f32_i8(row, skip + at, skip_scale, rowf);
+                k32_swiglu_f32(row, g_ones, rowf);
+                k32_quantize_i8_static(out + at, row, next_inv, rowf);
+            }
+        }
     }
 }
 
-/* v of the image x at a step's condition */
-static void forward(const struct doodle_model* m, const float* x, const float* cond, float* v) {
+/* v of the image x at nb conditions (g_cond): v[b] as 14x14 pixels of 4 */
+static void forward(const struct doodle_model* m, const float* x, uint32_t nb, float* v) {
     const struct doodle_conv* c = m->conv;
     for (uint32_t y = 0; y < 14; y++)
         for (uint32_t xx = 0; xx < 14; xx++)
             for (uint32_t k = 0; k < 4; k++)
-                g_in[(y * 14 + xx) * 4 + k] = q_static(x[(2 * y + (k >> 1)) * 28 + 2 * xx + (k & 1)], c[0].inv);
-    const float* cd = cond;
-    conv(&c[0], g_in, 14, cd, 0, 0.0f, c[1].inv, g_a, 0);                 /* in -> A */
+                g_y[(y * 14 + xx) * 4 + k] = x[(2 * y + (k >> 1)) * 28 + 2 * xx + (k & 1)];
+    k32_quantize_i8_static(g_in, g_y, c[0].inv, 784);
+    for (uint32_t b = 1; b < nb; b++) __builtin_memcpy(g_in + b * 784, g_in, 784);
+    for (uint32_t i = 0; i < ROWF; i++) g_ones[i] = 1.0f;
+    const float* cd = g_cond[0];
+    conv(&c[0], g_in, 14, nb, cd, 0, 0.0f, c[1].inv, g_a, 0);                 /* in -> A */
     cd += c[0].cout;
-    conv(&c[1], g_a, 14, cd, 0, 0.0f, c[2].inv, g_b, 0);                  /* e1 -> B */
+    conv(&c[1], g_a, 14, nb, cd, 0, 0.0f, c[2].inv, g_b, 0);                  /* e1 -> B */
     cd += c[1].cout;
-    conv(&c[2], g_b, 14, cd, 0, 0.0f, c[3].inv, g_m[0], 0);               /* down -> 7x7 */
+    conv(&c[2], g_b, 14, nb, cd, 0, 0.0f, c[3].inv, g_m[0], 0);               /* down -> 7x7 */
     cd += c[2].cout;
     uint32_t i = 3, cur = 0;
     for (; i < 3 + m->mids; i++, cur ^= 1) {
-        conv(&c[i], g_m[cur], 7, cd, 0, 0.0f, c[i + 1].inv, g_m[cur ^ 1], 0);
+        conv(&c[i], g_m[cur], 7, nb, cd, 0, 0.0f, c[i + 1].inv, g_m[cur ^ 1], 0);
         cd += c[i].cout;
     }
-    conv(&c[i], g_m[cur], 7, cd, g_b, c[2].scale, c[i + 1].inv, g_b, 0);   /* up + B -> B */
+    conv(&c[i], g_m[cur], 7, nb, cd, g_b, c[2].scale, c[i + 1].inv, g_b, 0);   /* up + B -> B */
     cd += c[i].cout;
-    conv(&c[i + 1], g_b, 14, cd, g_a, c[1].scale, c[i + 2].inv, g_a, 0);   /* d1 + A -> A */
-    conv(&c[i + 2], g_a, 14, 0, 0, 0.0f, 0.0f, 0, v);                      /* out -> v */
+    conv(&c[i + 1], g_b, 14, nb, cd, g_a, c[1].scale, c[i + 2].inv, g_a, 0);   /* d1 + A -> A */
+    conv(&c[i + 2], g_a, 14, nb, 0, 0, 0.0f, 0.0f, 0, v);                      /* out -> v */
 }
-
-static float g_vc[784], g_vu[784];
 
 void (*doodle_on_step)(uint32_t step, uint32_t steps, const float* x);
 
@@ -195,25 +182,31 @@ int doodle_begin(const struct doodle_model* m, uint32_t cls, uint32_t seed, uint
     return 0;
 }
 
+static void condition(const struct doodle_model* m, const struct doodle_sched* s, uint32_t i, uint32_t cls, float* cond) {
+    const int8_t* tq = s->tq + i * m->width;
+    for (uint32_t k = 0; k < m->width; k++)
+        cond[k] = (float)tq[k] * s->ts[i] + (float)m->class_q[cls * m->width + k] * m->class_s[cls];
+}
+
 int doodle_step(const struct doodle_model* m, uint32_t cls, uint32_t steps, uint32_t i, float guidance, float x[784]) {
     const struct doodle_sched* s = schedule(m, steps);
     if (!s || cls >= m->n_cond || i >= steps) return -1;
-    const int8_t* tq = s->tq + i * m->width;
-    for (uint32_t k = 0; k < m->width; k++)
-        g_cond[k] = (float)tq[k] * s->ts[i] + (float)m->class_q[cls * m->width + k] * m->class_s[cls];
-    forward(m, x, g_cond, g_vc);
-    if (guidance != 1.0f) {
-        for (uint32_t k = 0; k < m->width; k++)
-            g_cond[k] = (float)tq[k] * s->ts[i] + (float)m->class_q[DOODLE_NONE * m->width + k] * m->class_s[DOODLE_NONE];
-        forward(m, x, g_cond, g_vu);
-        for (uint32_t p = 0; p < 784; p++) g_vc[p] = g_vu[p] + guidance * (g_vc[p] - g_vu[p]);
-    }
+    const uint32_t nb = guidance != 1.0f ? 2 : 1;
+    condition(m, s, i, cls, g_cond[0]);
+    if (nb == 2) condition(m, s, i, DOODLE_NONE, g_cond[1]);
+    forward(m, x, nb, g_v[0]);
+    const float *vc = g_v[0], *vu = g_v[1];
     const float a = s->alpha[i], sg = s->sigma[i], an = s->alpha[i + 1], sn = s->sigma[i + 1];
     for (uint32_t p = 0; p < 784; p++) {
-        float x0 = a * x[p] - sg * g_vc[p];
+        /* channel k of 14x14 pixel (y, x) is image pixel (2y + k / 2, 2x + k % 2) */
+        const uint32_t k = p & 3, q = p >> 2, py = q / 14, px = q % 14;
+        float* xp = &x[(2 * py + (k >> 1)) * 28 + 2 * px + (k & 1)];
+        float v = vc[p];
+        if (nb == 2) v = vu[p] + guidance * (v - vu[p]);
+        float x0 = a * *xp - sg * v;
         x0 = x0 < -1.0f ? -1.0f : x0 > 1.0f ? 1.0f : x0;
-        const float eps = sg * x[p] + a * g_vc[p];
-        x[p] = an * x0 + sn * eps;
+        const float eps = sg * *xp + a * v;
+        *xp = an * x0 + sn * eps;
     }
     return 0;
 }

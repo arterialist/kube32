@@ -437,6 +437,16 @@ void rmsnorm_f32(uint8_t* out, const uint8_t* x, const uint8_t* w, uint32_t n, u
     }
 }
 
+// round(t) half away from zero, clamped to -127..127, 0 for NaN
+static inline int8_t quantize_value(float t) {
+    int32_t r;
+    if (!(t == t)) r = 0;                // NaN
+    else if (t >= 127.0f) r = 127;       // also an infinite scale
+    else if (t <= -127.0f) r = -127;
+    else r = static_cast<int32_t>(t + (t >= 0.0f ? 0.5f : -0.5f));
+    return static_cast<int8_t>(r > 127 ? 127 : r < -127 ? -127 : r);
+}
+
 void quantize_i8(int8_t* q, uint8_t* scale, const uint8_t* x, uint32_t n, uint32_t count) {
     for (uint32_t p = 0; p < count; p++, x += 4 * n, q += n) {
         float amax = 0.0f;
@@ -445,15 +455,7 @@ void quantize_i8(int8_t* q, uint8_t* scale, const uint8_t* x, uint32_t n, uint32
             if (a > amax) amax = a;
         }
         const float inv = amax == 0.0f ? 0.0f : 127.0f / amax;
-        for (uint32_t i = 0; i < n; i++) {
-            const float t = load_f32(x + 4 * i) * inv;
-            int32_t r;
-            if (!(t == t)) r = 0;                // NaN
-            else if (t >= 127.0f) r = 127;       // also an infinite inv
-            else if (t <= -127.0f) r = -127;
-            else r = static_cast<int32_t>(t + (t >= 0.0f ? 0.5f : -0.5f));
-            q[i] = static_cast<int8_t>(r > 127 ? 127 : r < -127 ? -127 : r);
-        }
+        for (uint32_t i = 0; i < n; i++) q[i] = quantize_value(load_f32(x + 4 * i) * inv);
         store_f32(scale + 4 * p, amax / 127.0f);
     }
 }
@@ -512,6 +514,79 @@ void swiglu_f32(uint8_t* x, const uint8_t* g, uint32_t n) {
 
 void add_f32(uint8_t* x, const uint8_t* y, uint32_t n) {
     for (uint32_t i = 0; i < n; i++) store_f32(x + 4 * i, load_f32(x + 4 * i) + load_f32(y + 4 * i));
+}
+
+void add_f32_i8(uint8_t* x, const int8_t* q, float scale, uint32_t n) {
+    for (uint32_t i = 0; i < n; i++) store_f32(x + 4 * i, load_f32(x + 4 * i) + static_cast<float>(q[i]) * scale);
+}
+
+void quantize_i8_static(int8_t* q, const uint8_t* x, float inv, uint32_t n) {
+    for (uint32_t i = 0; i < n; i++) q[i] = quantize_value(load_f32(x + 4 * i) * inv);
+}
+
+// ---- convolution ------------------------------------------------------------------
+
+// The patch of output pixel (y, x) of one map: the 3 x 3 x cin taps, row by
+// row, a row's three taps adjacent input pixels (one pixel copied up to three
+// times when the input is read upsampled), zero outside the map
+static void conv_patch(int8_t* dst, const int8_t* in, uint32_t cin, uint32_t h, uint32_t w, uint32_t stride, uint32_t up,
+                       uint32_t y, uint32_t x) {
+    const uint32_t hin = h << up, win = w << up;
+    for (uint32_t ky = 0; ky < 3; ky++, dst += 3 * cin) {
+        const int32_t iy = static_cast<int32_t>(stride * y + ky) - 1, ix0 = static_cast<int32_t>(stride * x) - 1;
+        if (iy < 0 || static_cast<uint32_t>(iy) >= hin) {
+            __builtin_memset(dst, 0, 3 * cin);
+            continue;
+        }
+        const int8_t* row = in + static_cast<size_t>(static_cast<uint32_t>(iy) >> up) * w * cin;
+        const uint32_t lo = ix0 < 0 ? 1u : 0u, hi = static_cast<uint32_t>(ix0 + 2) >= win ? 2u : 3u;
+        if (lo) __builtin_memset(dst, 0, cin);
+        if (hi < 3) __builtin_memset(dst + 2 * cin, 0, cin);
+        if (up) {
+            for (uint32_t k = lo; k < hi; k++)
+                __builtin_memcpy(dst + k * cin, row + static_cast<size_t>(static_cast<uint32_t>(ix0 + static_cast<int32_t>(k)) >> 1) * cin, cin);
+        } else {
+            __builtin_memcpy(dst + lo * cin, row + static_cast<size_t>(static_cast<uint32_t>(ix0 + static_cast<int32_t>(lo))) * cin, (hi - lo) * cin);
+        }
+    }
+}
+
+// Blocks of rows of w of about 8 KB, each applied to every pixel of every
+// map: the block stays in the cache while the patches, built on the stack
+// kMatmulGroup pixels at a time, stream through the product of matmul_i8.
+void conv3x3_i8(uint8_t* out, const int8_t* w, const uint8_t* w_scale, const uint8_t* bias, const int8_t* in, float in_scale,
+                uint32_t cin, uint32_t cout, uint32_t h, uint32_t w_, uint32_t stride, uint32_t up, uint32_t n, uint32_t y0,
+                uint32_t y1) {
+    constexpr uint32_t kMaxRows = 64;
+    const uint32_t cols = 9 * cin, wo = conv3x3_out(w_, stride, up);
+    alignas(16) int8_t patch[kMatmulGroup * 9 * kConvMaxCin];
+    uint8_t scales[4 * kMatmulGroup], acc[4 * kMatmulGroup * kMaxRows];
+    for (uint32_t i = 0; i < kMatmulGroup; i++) store_f32(scales + 4 * i, in_scale);
+    uint32_t rb = 8192u / cols;
+    if (rb == 0) rb = 1;
+    if (rb > kMaxRows) rb = kMaxRows;
+    const uint32_t pixels = (y1 - y0) * wo;
+    for (uint32_t r0 = 0; r0 < cout; r0 += rb) {
+        const uint32_t nr = cout - r0 < rb ? cout - r0 : rb;
+        const int8_t* wb = w + static_cast<size_t>(r0) * cols;
+        const uint8_t* sb = w_scale + 4 * r0;
+        for (uint32_t m = 0; m < n; m++) {
+            const int8_t* map = in + static_cast<size_t>(m) * h * w_ * cin;
+            uint8_t* omap = out + 4 * static_cast<size_t>(m) * pixels * cout;
+            for (uint32_t p0 = 0; p0 < pixels; p0 += kMatmulGroup) {
+                const uint32_t g = pixels - p0 < kMatmulGroup ? pixels - p0 : kMatmulGroup;
+                for (uint32_t i = 0; i < g; i++)
+                    conv_patch(patch + static_cast<size_t>(i) * cols, map, cin, h, w_, stride, up, y0 + (p0 + i) / wo, (p0 + i) % wo);
+                matmul_i8(acc, wb, cols, sb, patch, scales, nr, cols, g);
+                for (uint32_t i = 0; i < g; i++) {
+                    uint8_t* op = omap + 4 * (static_cast<size_t>(p0 + i) * cout + r0);
+                    const uint8_t* ap = acc + 4 * static_cast<size_t>(i) * nr;
+                    if (bias) for (uint32_t r = 0; r < nr; r++) store_f32(op + 4 * r, load_f32(ap + 4 * r) + load_f32(bias + 4 * (r0 + r)));
+                    else __builtin_memcpy(op, ap, 4 * nr);
+                }
+            }
+        }
+    }
 }
 
 uint32_t argmax_f32(const uint8_t* x, uint32_t n) {
@@ -726,6 +801,17 @@ static const char kTrapSwigluG[] = K32_OOB("k32_swiglu_f32", "g");
 static const char kTrapAddX[] = K32_OOB("k32_add_f32", "x");
 static const char kTrapAddY[] = K32_OOB("k32_add_f32", "y");
 static const char kTrapArgmax[] = K32_OOB("k32_argmax_f32", "x");
+static const char kTrapAddI8X[] = K32_OOB("k32_add_f32_i8", "x");
+static const char kTrapAddI8Q[] = K32_OOB("k32_add_f32_i8", "q");
+static const char kTrapQuantSQ[] = K32_OOB("k32_quantize_i8_static", "q");
+static const char kTrapQuantSX[] = K32_OOB("k32_quantize_i8_static", "x");
+static const char kTrapConvOut[] = K32_OOB("k32_conv3x3_i8", "out");
+static const char kTrapConvW[] = K32_OOB("k32_conv3x3_i8", "w");
+static const char kTrapConvWScale[] = K32_OOB("k32_conv3x3_i8", "w_scale");
+static const char kTrapConvBias[] = K32_OOB("k32_conv3x3_i8", "bias");
+static const char kTrapConvIn[] = K32_OOB("k32_conv3x3_i8", "in");
+static const char kTrapConvBlobW[] = K32_BLOB_OOB("k32_conv3x3_i8", "w");
+static const char kTrapConvBlobWScale[] = K32_BLOB_OOB("k32_conv3x3_i8", "w_scale");
 
 // bytes bytes at off lie inside the linear memory
 static bool inside(uint64_t size, uint32_t off, uint64_t bytes) { return fits(size, off, 1, 0, bytes); }
@@ -792,6 +878,65 @@ static const void* raw_pairwise(IM3Runtime rt, IM3ImportContext, uint64_t* sp, v
     return result(sp, K32_OK);
 }
 
+// "i(iifi)": x, q, scale, n
+static const void* raw_add_i8(IM3Runtime rt, IM3ImportContext, uint64_t* sp, void* mem) {
+    const uint32_t x = arg(sp, 1), q = arg(sp, 2), n = arg(sp, 4);
+    float scale;
+    __builtin_memcpy(&scale, &sp[3], sizeof scale);
+    const uint64_t size = m3_GetMemorySizeAt(mem);
+    uint8_t* base = static_cast<uint8_t*>(mem);
+    if (!inside(size, x, 4ull * n)) return kTrapAddI8X;
+    if (!inside(size, q, n)) return kTrapAddI8Q;
+    if (M3Result r = charge(rt, kAddI8Units * n)) return r;
+    add_f32_i8(base + x, reinterpret_cast<const int8_t*>(base + q), scale, n);
+    return result(sp, K32_OK);
+}
+
+// "i(iifi)": q, x, inv, n
+static const void* raw_quantize_static(IM3Runtime rt, IM3ImportContext, uint64_t* sp, void* mem) {
+    const uint32_t q = arg(sp, 1), x = arg(sp, 2), n = arg(sp, 4);
+    float inv;
+    __builtin_memcpy(&inv, &sp[3], sizeof inv);
+    const uint64_t size = m3_GetMemorySizeAt(mem);
+    uint8_t* base = static_cast<uint8_t*>(mem);
+    if (!inside(size, q, n)) return kTrapQuantSQ;
+    if (!inside(size, x, 4ull * n)) return kTrapQuantSX;
+    if (M3Result r = charge(rt, kQuantizeUnits * n)) return r;
+    quantize_i8_static(reinterpret_cast<int8_t*>(base + q), base + x, inv, n);
+    return result(sp, K32_OK);
+}
+
+// "i(iiiiifiiiiiiiii)": out, w, w_scale, bias, in, in_scale, cin, cout, h, w, stride, up, n, y0, y1
+static const void* raw_conv(IM3Runtime rt, IM3ImportContext, uint64_t* sp, void* mem) {
+    const uint32_t out = arg(sp, 1), w = arg(sp, 2), w_scale = arg(sp, 3), bias = arg(sp, 4), in = arg(sp, 5);
+    float in_scale;
+    __builtin_memcpy(&in_scale, &sp[6], sizeof in_scale);
+    const uint32_t cin = arg(sp, 7), cout = arg(sp, 8), h = arg(sp, 9), wd = arg(sp, 10), stride = arg(sp, 11), up = arg(sp, 12);
+    const uint32_t n = arg(sp, 13), y0 = arg(sp, 14), y1 = arg(sp, 15);
+    if (cin == 0 || cin > kConvMaxCin || cout == 0 || h == 0 || wd == 0 || stride < 1 || stride > 2 || up > 1)
+        return result(sp, K32_ERR_INVAL);
+    const uint32_t ho = conv3x3_out(h, stride, up), wo = conv3x3_out(wd, stride, up);
+    if (y0 > y1 || y1 > ho) return result(sp, K32_ERR_INVAL);
+    const uint64_t cols = 9ull * cin, pixels = static_cast<uint64_t>(y1 - y0) * wo;
+    const uint64_t size = m3_GetMemorySizeAt(mem);
+    uint8_t* base = static_cast<uint8_t*>(mem);
+    if (!inside(size, out, 4 * pixels * cout * n)) return kTrapConvOut;
+    bool w_blob = false, s_blob = false;
+    int32_t rc = K32_OK;
+    const uint8_t* wb = operand(rt, base, size, w, cout, cols, cols, w_blob, rc);
+    if (rc == K32_ERR_NOTSUP) return result(sp, rc);
+    if (!wb) return w_blob ? kTrapConvBlobW : kTrapConvW;
+    const uint8_t* sb = operand(rt, base, size, w_scale, cout, 4, 4, s_blob, rc);
+    if (rc == K32_ERR_NOTSUP) return result(sp, rc);
+    if (!sb) return s_blob ? kTrapConvBlobWScale : kTrapConvWScale;
+    if (bias && !inside(size, bias, 4ull * cout)) return kTrapConvBias;
+    if (!inside(size, in, static_cast<uint64_t>(n) * h * wd * cin)) return kTrapConvIn;
+    if (M3Result r = charge(rt, pixels * n * matrix_units(cout, cols))) return r;
+    conv3x3_i8(base + out, reinterpret_cast<const int8_t*>(wb), sb, bias ? base + bias : nullptr,
+               reinterpret_cast<const int8_t*>(base + in), in_scale, cin, cout, h, wd, stride, up, n, y0, y1);
+    return result(sp, K32_OK);
+}
+
 // "i(ii)": x, n
 static const void* raw_argmax(IM3Runtime rt, IM3ImportContext, uint64_t* sp, void* mem) {
     const uint32_t x = arg(sp, 1), n = arg(sp, 2);
@@ -827,6 +972,9 @@ void link_linalg_host_functions(IM3Module module) {
     m3_LinkRawFunction(module, "env", "k32_swiglu_f32", "i(iii)", &raw_pairwise<true>);
     m3_LinkRawFunction(module, "env", "k32_add_f32", "i(iii)", &raw_pairwise<false>);
     m3_LinkRawFunction(module, "env", "k32_argmax_f32", "i(ii)", &raw_argmax);
+    m3_LinkRawFunction(module, "env", "k32_add_f32_i8", "i(iifi)", &raw_add_i8);
+    m3_LinkRawFunction(module, "env", "k32_quantize_i8_static", "i(iifi)", &raw_quantize_static);
+    m3_LinkRawFunction(module, "env", "k32_conv3x3_i8", "i(iiiiifiiiiiiiii)", &raw_conv);
     m3_LinkRawFunction(module, "env", "k32_fft_q15", "i(iiiii)", &raw_fft);
 }
 

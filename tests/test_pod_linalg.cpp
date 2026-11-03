@@ -253,17 +253,21 @@ static const std::vector<std::vector<uint8_t>> kParams = {{kI32, kI32, kI32, kI3
                                                           {kI32, kI32, kI32, kI32, kI32, kI32, kI32, kI32, kI32},
                                                           {kI32, kI32, kI32, kI32, kI32, kF32},
                                                           {kI32, kI32, kI32, kI32, kI32},
-                                                          {kI32, kI32, kI32}};
-constexpr uint8_t kNumImports = 13;
+                                                          {kI32, kI32, kI32},
+                                                          {kI32, kI32, kF32, kI32},
+                                                          {kI32, kI32, kI32, kI32, kI32, kF32, kI32, kI32, kI32, kI32, kI32, kI32, kI32, kI32, kI32}};
+constexpr uint8_t kNumImports = 16;
 static const char* const kImports[] = {"k32_matvec_i8",   "k32_matvec_i4",   "k32_matvec_f32_i8", "k32_vecmat_f32_i8", "k32_softmax_f32",
                                        "k32_matmul_i8",   "k32_matmul_i4",   "k32_rmsnorm_f32",   "k32_quantize_i8",   "k32_rope_f32",
-                                       "k32_swiglu_f32",  "k32_add_f32",     "k32_argmax_f32"};
-static const uint8_t kImportType[] = {0, 0, 1, 2, 3, 5, 5, 6, 7, 7, 8, 8, 3};
+                                       "k32_swiglu_f32",  "k32_add_f32",     "k32_argmax_f32",    "k32_add_f32_i8",    "k32_quantize_i8_static",
+                                       "k32_conv3x3_i8"};
+static const uint8_t kImportType[] = {0, 0, 1, 2, 3, 5, 5, 6, 7, 7, 8, 8, 3, 9, 9, 10};
 // The module's functions after the imports, their types, and the import each calls (oob: k32_matvec_i8)
-constexpr uint8_t kNumFns = 14;
-static const char* const kFns[] = {"mv8", "mv4", "mvf", "vm", "sm", "oob", "mm8", "mm4", "rms", "qnt", "rope", "swi", "add", "amax"};
-static const uint8_t kFnType[] = {0, 0, 1, 2, 3, 4, 5, 5, 6, 7, 7, 8, 8, 3};
-static const uint8_t kFnCallee[] = {0, 1, 2, 3, 4, 0, 5, 6, 7, 8, 9, 10, 11, 12};
+constexpr uint8_t kNumFns = 17;
+static const char* const kFns[] = {"mv8", "mv4", "mvf", "vm", "sm", "oob", "mm8", "mm4", "rms", "qnt", "rope", "swi", "add", "amax",
+                                   "addq", "qst", "conv"};
+static const uint8_t kFnType[] = {0, 0, 1, 2, 3, 4, 5, 5, 6, 7, 7, 8, 8, 3, 9, 9, 10};
+static const uint8_t kFnCallee[] = {0, 1, 2, 3, 4, 0, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15};
 
 static std::vector<uint8_t> linalg_module() {
     std::vector<uint8_t> m = {0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00};
@@ -322,7 +326,7 @@ struct Pod {
     IM3Environment env{nullptr};
     IM3Runtime rt{nullptr};
     IM3Module mod{nullptr};
-    IM3Function fn[13]{};   // mv8, mv4, mvf, vm, sm, mm8, mm4, rms, qnt, rope, swi, add, amax
+    IM3Function fn[16]{};   // mv8, mv4, mvf, vm, sm, mm8, mm4, rms, qnt, rope, swi, add, amax, addq, qst, conv
     std::vector<uint8_t> wasm;
     uint8_t* mem{nullptr};
     size_t mem_size{0};
@@ -336,8 +340,9 @@ struct Pod {
         if (!r) r = m3_LoadModule(rt, mod);
         assert(!r);
         link_app_host_functions(mod, "default/linalg");
-        const char* const names[] = {"mv8", "mv4", "mvf", "vm", "sm", "mm8", "mm4", "rms", "qnt", "rope", "swi", "add", "amax"};
-        for (int i = 0; i < 13 && !r; i++) r = m3_FindFunction(&fn[i], rt, names[i]);
+        const char* const names[] = {"mv8", "mv4", "mvf", "vm", "sm", "mm8", "mm4", "rms", "qnt", "rope", "swi", "add", "amax",
+                                     "addq", "qst", "conv"};
+        for (int i = 0; i < 16 && !r; i++) r = m3_FindFunction(&fn[i], rt, names[i]);
         if (r) std::printf("module: %s\n", r);
         assert(!r);
         mem = m3_GetMemory(mod, &mem_size, 0);
@@ -751,6 +756,7 @@ static void ref_rope(float* a, const float* cs, uint32_t n, uint32_t hs) {
 }
 
 static uint8_t* bytes_of(std::vector<float>& v) { return reinterpret_cast<uint8_t*>(v.data()); }
+static const uint8_t* bytes_of(const std::vector<float>& v) { return reinterpret_cast<const uint8_t*>(v.data()); }
 
 static void test_elementwise_kernels() {
     for (uint32_t n : {1u, 2u, 7u, 64u, 172u, 256u})
@@ -975,7 +981,146 @@ static void test_fft() {
     std::printf("[PASS] test_fft\n");
 }
 
+// The convolution kernel against patches written out and k32_matvec_i8's
+// kernel, with the bias added once: maps of several shapes, strides, the
+// upsampled read, row ranges, and row blocks of every size
+struct ConvShape { uint32_t cin, cout, h, w, stride, up, n, y0, y1; };
+static void conv_reference(const ConvShape& s, const std::vector<int8_t>& w, const std::vector<float>& ws, const std::vector<float>& bias,
+                           const std::vector<int8_t>& in, float xs, std::vector<float>& out) {
+    const uint32_t ho = conv3x3_out(s.h, s.stride, s.up), wo = conv3x3_out(s.w, s.stride, s.up), hin = s.h << s.up, win = s.w << s.up;
+    const uint32_t cols = 9 * s.cin;
+    out.assign(static_cast<size_t>(s.n) * (s.y1 - s.y0) * wo * s.cout, 0.0f);
+    std::vector<int8_t> patch(cols);
+    std::vector<float> y(s.cout);
+    for (uint32_t m = 0; m < s.n; m++)
+        for (uint32_t oy = s.y0; oy < s.y1; oy++)
+            for (uint32_t ox = 0; ox < wo; ox++) {
+                for (uint32_t ky = 0; ky < 3; ky++)
+                    for (uint32_t kx = 0; kx < 3; kx++)
+                        for (uint32_t c = 0; c < s.cin; c++) {
+                            const int32_t iy = static_cast<int32_t>(s.stride * oy + ky) - 1, ix = static_cast<int32_t>(s.stride * ox + kx) - 1;
+                            int8_t v = 0;
+                            if (iy >= 0 && ix >= 0 && static_cast<uint32_t>(iy) < hin && static_cast<uint32_t>(ix) < win)
+                                v = in[((m * s.h + (static_cast<uint32_t>(iy) >> s.up)) * s.w + (static_cast<uint32_t>(ix) >> s.up)) * s.cin + c];
+                            patch[(ky * 3 + kx) * s.cin + c] = v;
+                        }
+                matvec_i8(bytes_of(y), w.data(), cols, bytes_of(ws), patch.data(), xs, s.cout, cols);
+                float* o = &out[((m * (s.y1 - s.y0) + (oy - s.y0)) * wo + ox) * s.cout];
+                for (uint32_t r = 0; r < s.cout; r++) o[r] = bias.empty() ? y[r] : y[r] + bias[r];
+            }
+    (void)ho;
+}
+
+static void test_conv() {
+    using namespace kube32;
+    const ConvShape shapes[] = {{4, 48, 14, 14, 1, 0, 2, 0, 7},  {48, 96, 14, 14, 2, 0, 1, 0, 7}, {96, 48, 7, 7, 1, 1, 2, 3, 14},
+                                {3, 5, 5, 6, 1, 0, 1, 0, 5},     {17, 70, 9, 9, 2, 0, 2, 1, 4},   {7, 130, 4, 4, 1, 0, 1, 0, 4},
+                                {1, 1, 1, 1, 2, 1, 3, 0, 1},     {256, 2, 3, 3, 1, 0, 1, 2, 3}};
+    for (const ConvShape& s : shapes) {
+        const uint32_t cols = 9 * s.cin, wo = conv3x3_out(s.w, s.stride, s.up);
+        std::vector<int8_t> w(static_cast<size_t>(s.cout) * cols), in(static_cast<size_t>(s.n) * s.h * s.w * s.cin);
+        std::vector<float> ws(s.cout), bias(s.cout), want, got;
+        for (auto& v : w) v = static_cast<int8_t>(rnd() >> 24);
+        for (auto& v : in) v = static_cast<int8_t>(rnd() >> 24);
+        for (auto& f : ws) f = rnd_f32() * 0.01f;
+        for (auto& f : bias) f = rnd_f32();
+        const float xs = 0.0371f;
+        for (int with_bias = 0; with_bias < 2; with_bias++) {
+            const std::vector<float> b = with_bias ? bias : std::vector<float>();
+            conv_reference(s, w, ws, b, in, xs, want);
+            got.assign(want.size() + 1, 12345.0f);   // one float of margin, untouched
+            conv3x3_i8(bytes_of(got), w.data(), bytes_of(ws), with_bias ? bytes_of(bias) : nullptr, in.data(), xs, s.cin, s.cout, s.h, s.w,
+                       s.stride, s.up, s.n, s.y0, s.y1);
+            assert(std::memcmp(got.data(), want.data(), 4 * want.size()) == 0 && got[want.size()] == 12345.0f);
+        }
+    }
+
+    // add_f32_i8 and quantize_i8_static kernels
+    {
+        std::vector<float> x(100), y(100);
+        std::vector<int8_t> q(100), qq(100);
+        for (uint32_t i = 0; i < 100; i++) { x[i] = rnd_f32() * 4.0f; q[i] = static_cast<int8_t>(rnd() >> 24); }
+        for (uint32_t i = 0; i < 100; i++) y[i] = x[i] + static_cast<float>(q[i]) * 0.0125f;
+        add_f32_i8(bytes_of(x), q.data(), 0.0125f, 100);
+        assert(std::memcmp(x.data(), y.data(), 400) == 0);
+        x[0] = 1e9f; x[1] = -1e9f; x[2] = 0.49999f; x[3] = -0.5f; x[4] = 0.5f; x[5] = 126.5f;
+        quantize_i8_static(qq.data(), bytes_of(x), 1.0f, 100);
+        assert(qq[0] == 127 && qq[1] == -127 && qq[2] == 0 && qq[3] == -1 && qq[4] == 1 && qq[5] == 127);
+        for (uint32_t i = 6; i < 100; i++) {
+            const float t = x[i] * 1.0f;
+            const int32_t r = static_cast<int32_t>(t + (t >= 0.0f ? 0.5f : -0.5f));
+            assert(qq[i] == (r > 127 ? 127 : r < -127 ? -127 : r));
+        }
+    }
+
+    // The imports: the kernels' bits, their gas, operands outside the memory, bad shapes
+    enum { ADDQ = 13, QST = 14, CONV = 15 };
+    constexpr uint32_t kO = 0xA000, kWt = 0x2000, kSc = 0x5001, kBias = 0x5800, kIn = 0x6000, kQv = 0xE000;   // out: 13,440 bytes
+    const ConvShape s = {12, 20, 6, 6, 1, 1, 2, 2, 9};
+    const uint32_t cols = 9 * s.cin, wo = conv3x3_out(s.w, s.stride, s.up), pixels = (s.y1 - s.y0) * wo;
+    Pod p(1000000000ull);
+    std::vector<int8_t> w(static_cast<size_t>(s.cout) * cols), in(static_cast<size_t>(s.n) * s.h * s.w * s.cin);
+    std::vector<float> ws(s.cout), bias(s.cout), want;
+    for (auto& v : w) v = static_cast<int8_t>(rnd() >> 24);
+    for (auto& v : in) v = static_cast<int8_t>(rnd() >> 24);
+    for (auto& f : ws) f = rnd_f32() * 0.01f;
+    for (auto& f : bias) f = rnd_f32();
+    std::memcpy(p.mem + kWt, w.data(), w.size());
+    std::memcpy(p.mem + kSc, ws.data(), 4 * ws.size());
+    std::memcpy(p.mem + kBias, bias.data(), 4 * bias.size());
+    std::memcpy(p.mem + kIn, in.data(), in.size());
+    conv_reference(s, w, ws, bias, in, 0.02f, want);
+    int32_t rc = 1;
+    const auto gas = [&](auto call, uint64_t units) {
+        const uint64_t before = m3_GetResourceUsage(p.rt, c_m3Limit_GasUnits);
+        call();
+        const uint64_t used = m3_GetResourceUsage(p.rt, c_m3Limit_GasUnits) - before;
+        assert(used >= linalg_gas(units) && used - linalg_gas(units) < 2000);   // the wrapper's own 16 instructions
+    };
+    const auto conv = [&](uint32_t out, uint32_t wt, uint32_t sc, uint32_t b, uint32_t i, uint32_t cin, uint32_t cout, uint32_t h, uint32_t wd,
+                          uint32_t stride, uint32_t up, uint32_t n, uint32_t y0, uint32_t y1) {
+        return p.call_fn(CONV, &rc, out, wt, sc, b, i, 0.02, cin, cout, h, wd, stride, up, n, y0, y1);
+    };
+    gas([&] { assert(!conv(kO, kWt, kSc, kBias, kIn, s.cin, s.cout, s.h, s.w, s.stride, s.up, s.n, s.y0, s.y1) && rc == K32_OK); },
+        static_cast<uint64_t>(pixels) * s.n * matrix_units(s.cout, cols));
+    assert(std::memcmp(p.mem + kO, want.data(), 4 * want.size()) == 0);
+    conv_reference(s, w, ws, {}, in, 0.02f, want);
+    assert(!conv(kO, kWt, kSc, 0, kIn, s.cin, s.cout, s.h, s.w, s.stride, s.up, s.n, s.y0, s.y1) && rc == K32_OK);
+    assert(std::memcmp(p.mem + kO, want.data(), 4 * want.size()) == 0);
+    for (int bad = 0; bad < 6; bad++) {
+        const uint32_t cin = bad == 0 ? 0 : bad == 1 ? kConvMaxCin + 1 : s.cin, stride = bad == 2 ? 3 : s.stride, up = bad == 3 ? 2 : s.up;
+        const uint32_t y0 = bad == 4 ? s.y1 + 1 : s.y0, y1 = bad == 5 ? 2 * s.h + 1 : s.y1;
+        assert(!conv(kO, kWt, kSc, kBias, kIn, cin, s.cout, s.h, s.w, stride, up, s.n, y0, y1) && rc == K32_ERR_INVAL);
+    }
+    const uint32_t end = 2 * 65536;
+    const auto trap = [&](M3Result r, const char* operand, const char* fn) {
+        assert(r && std::string(r) == "[trap] out of bounds memory access: " + std::string(operand) + " of " + fn);
+    };
+    trap(conv(end - 4 * want.size() + 1, kWt, kSc, kBias, kIn, s.cin, s.cout, s.h, s.w, s.stride, s.up, s.n, s.y0, s.y1), "out", "k32_conv3x3_i8");
+    trap(conv(kO, end - w.size() + 1, kSc, kBias, kIn, s.cin, s.cout, s.h, s.w, s.stride, s.up, s.n, s.y0, s.y1), "w", "k32_conv3x3_i8");
+    trap(conv(kO, kWt, end - 4 * s.cout + 1, kBias, kIn, s.cin, s.cout, s.h, s.w, s.stride, s.up, s.n, s.y0, s.y1), "w_scale", "k32_conv3x3_i8");
+    trap(conv(kO, kWt, kSc, end - 4 * s.cout + 1, kIn, s.cin, s.cout, s.h, s.w, s.stride, s.up, s.n, s.y0, s.y1), "bias", "k32_conv3x3_i8");
+    trap(conv(kO, kWt, kSc, kBias, end - in.size() + 1, s.cin, s.cout, s.h, s.w, s.stride, s.up, s.n, s.y0, s.y1), "in", "k32_conv3x3_i8");
+
+    // add_f32_i8 over the output, quantize_i8_static of it
+    std::vector<int8_t> q(want.size());
+    for (auto& v : q) v = static_cast<int8_t>(rnd() >> 24);
+    std::memcpy(p.mem + kQv, q.data(), q.size());
+    add_f32_i8(bytes_of(want), q.data(), 0.75f, static_cast<uint32_t>(want.size()));
+    gas([&] { assert(!p.call_fn(ADDQ, &rc, kO, kQv, 0.75, static_cast<uint32_t>(want.size())) && rc == K32_OK); }, kAddI8Units * want.size());
+    assert(std::memcmp(p.mem + kO, want.data(), 4 * want.size()) == 0);
+    quantize_i8_static(q.data(), bytes_of(want), 37.0f, static_cast<uint32_t>(want.size()));
+    gas([&] { assert(!p.call_fn(QST, &rc, kQv, kO, 37.0, static_cast<uint32_t>(want.size())) && rc == K32_OK); }, kQuantizeUnits * want.size());
+    assert(std::memcmp(p.mem + kQv, q.data(), q.size()) == 0);
+    trap(p.call_fn(ADDQ, &rc, end - 4 * 10 + 1, kQv, 0.75, 10u), "x", "k32_add_f32_i8");
+    trap(p.call_fn(ADDQ, &rc, kO, end - 10 + 1, 0.75, 10u), "q", "k32_add_f32_i8");
+    trap(p.call_fn(QST, &rc, end - 10 + 1, kO, 37.0, 10u), "q", "k32_quantize_i8_static");
+    trap(p.call_fn(QST, &rc, kQv, end - 4 * 10 + 1, 37.0, 10u), "x", "k32_quantize_i8_static");
+    std::printf("[PASS] test_conv\n");
+}
+
 int main() {
+    test_conv();
     test_fft();
     test_kernels_match_reference();
     test_matmul_kernels();
