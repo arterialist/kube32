@@ -143,7 +143,7 @@ K32_CMD:API:<control-plane-ip>
 
 After reboot, the Cardputer LCD displays `ready`, its node IP, and `http://<control-plane-ip>/`.
 
-The control plane announces its API server address to workers on the same network over ESP-NOW. A worker whose control plane address gets no answer for 30 seconds while the control plane announces a different one stores the announced address and restarts. After a network change or a new DHCP lease, workers find the control plane again without `K32_CMD:API`.
+The control plane announces its API server address to workers on the same network over ESP-NOW. A worker whose control plane address gets no answer for 30 seconds while the control plane announces a different one stores the announced address and restarts. After a network change or a new DHCP lease, workers find the control plane again without `K32_CMD:API`. A `kube32-sim` worker does the same without a restart.
 
 Without stored Wi-Fi credentials, the control plane starts a WPA2 softAP named `Kube32-Cluster` at `192.168.4.1`. The control plane generates a password on first boot; run `K32_CMD:APPASS` on its console to print it. Send `K32_CMD:APPASS:<password>` to each worker so workers without other Wi-Fi credentials can join the access point.
 

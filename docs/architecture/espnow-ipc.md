@@ -34,6 +34,8 @@ Nodes send a HELLO frame carrying the node ID and name on topic `k32.hello` ever
 - Every known peer.
 - UDP seed addresses on port 7400.
 
+A control plane's HELLO also carries its API server address: the payload is the node ID, the name, a NUL byte and `api=<address>`. A worker that hears no answer from the API server for 30 s and hears another address dials that one (a board stores it and restarts; `kube32-sim` switches in place, see [Following the network](../cli-reference.md#following-the-network)). A `kube32-sim` worker that dials a host other than its own also sends its HELLO to the UDP broadcast address on port 7400, so that a control plane that does not know its address adds it as a peer and sends it the API address.
+
 Workers seed the control plane address at boot. Every 10 s, the control plane reads node objects and seeds the `InternalIP` of each registered node on UDP port 7400. UDP seeding routes traffic when boards sit on different access points or Wi-Fi channels and cannot receive ESP-NOW broadcast frames. On the simulator, pass `--peer name:id:port` to add static UDP peers. Peers never expire. ESP-NOW runs unencrypted at 24 Mbps.
 
 ## Frame format

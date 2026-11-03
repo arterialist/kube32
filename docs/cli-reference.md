@@ -18,7 +18,7 @@ Use `kubectl` and k9s to manage the cluster. Use the tools below to run the host
 | --- | --- | --- |
 | `--role <role>` | `standalone` | Node role: `standalone`, `control-plane`, or `worker`. |
 | `--port <port>` | `6443` | API server port. |
-| `--join <url>` | `""` | Worker: API server URL to register with, or `auto` for mDNS discovery. |
+| `--join <url>` | `""` | Worker: API server URL to register with, or `auto` for mDNS discovery. The worker follows the control plane when it moves ([below](#following-the-network)). |
 | `--token <token>` | `$KUBE32_API_TOKEN` | API bearer token. |
 | `--tls` | off | Serve HTTPS alongside plain HTTP on `--port`; key and certificate are stored in `<data-dir>/kube32/tls/`. |
 | `--egress-ca <file>` | none | PEM roots that pods' `https://` calls trust besides the operating system's (a private CA). Control plane and standalone roles. |
@@ -29,7 +29,7 @@ Use `kubectl` and k9s to manage the cluster. Use the tools below to run the host
 | `--workers <a,b,...>` | `esp32-node-02` | In-process worker node names in `standalone` mode; pass `""` for a single control-plane node with no in-process workers (for a separate worker process or a physical board). |
 | `--board <board>` | `generic` | `kube32.io/board` label for this process's kubelet. |
 | `--worker-board <board>` | `cardputer` | `kube32.io/board` label for in-process workers. |
-| `--node-ip <ip>` | `127.0.0.1` | Pod IP address advertised to other nodes; pass a LAN address so physical boards can reach pods on the simulator. |
+| `--node-ip <ip\|auto>` | `auto` for a worker whose API server is not on this host, else `127.0.0.1` | Address the nodes report, which is the pod IP other nodes dial; pass a LAN address so physical boards can reach pods on the simulator. `auto` is the local address that the system uses to reach the API server, kept current when the network changes ([below](#following-the-network)). |
 | `--psram <size>` | `1284Ki`; workers reserve none | PSRAM pool to model (for example `8Mi`). Passing `0` explicitly models a board without PSRAM (see below). |
 | `--heap-budget <size>` | `51Ki` | General heap available to pods and the system when `--psram 0` is set. With `--psram`, the board's PSRAM besides the pool block (not modelled unless set). |
 | `--sim-i2c <parts>` | none | Simulated I2C parts on bus 0 of this process's node, for example `pahub,bme688@2,miniscale@3,rfid@4`. The format is `<part>[:0x<address>][@<PaHub channel>]`, and the parts are `pahub`, `bme688`, `miniscale` and `rfid`. Discovery finds them and drivers read them ([Devices](devices.md#compute-on-a-laptop)). |
@@ -43,6 +43,14 @@ Use `kubectl` and k9s to manage the cluster. Use the tools below to run the host
 | `--eviction-timeout <ms>` | `30000` | Add `node.kubernetes.io/unreachable:NoExecute` after this many milliseconds without a heartbeat; pods are evicted once their matching `tolerationSeconds` (default `300` s) elapses. |
 | `--reconcile-interval <ms>` | `1000` | Shortest time between two passes of a controller or the scheduler, in milliseconds. They run a pass after a change and every 30 s without one. |
 | `-h`, `--help` | | Print all options with defaults and exit `0`. |
+
+### Following the network
+
+A worker whose machine changes network keeps working without a restart or a new `--join`.
+
+**Node address.** With `--node-ip auto`, and with no `--node-ip` when the worker's API server is not on its own host, the node address is the local address that the system uses to reach the API server. The worker reads it again before each registration and heartbeat and patches the Node's `InternalIP` when it changes, so boards keep reaching the node's pods. When no route exists, as with Wi-Fi down, the previous address stays. A worker that joins `localhost` or a `127.0.0.0/8` address reports `127.0.0.1` unless `--node-ip` says otherwise, and `--node-ip <ip>` fixes the address. On a control plane or a standalone process, `auto` is the local address of the default route.
+
+**API address.** A control plane announces its API server address in its HELLO frames on the IPC channel ([Peer discovery](architecture/espnow-ipc.md#peer-discovery)), as boards do. A `kube32-sim` control plane announces the address of `--node-ip`, or the one it finds with `auto`, and nothing without `--node-ip`, because the loopback default names its own host to no other. A worker that has had no answer from its API server for 30 seconds, and hears a control plane announce another address, dials that address at the same port instead. Its pods keep running, and the worker logs `[NET] no answer from <old>; the control plane announces <new>, switching`. A worker hears the announcements from the peers named with `--peer`, from a board control plane, which sends HELLO to the address of every registered Node, and, when it dials a host other than its own, from a control plane that hears the worker's HELLO frames sent to the UDP broadcast address on port 7400: the control plane adds the worker as a peer and answers it with its API address.
 
 ### Modeling boards without PSRAM
 
