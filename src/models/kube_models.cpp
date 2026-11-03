@@ -130,8 +130,11 @@ std::string JsonValue::get_string(const std::string& key, const std::string& def
 
 int64_t JsonValue::get_int(const std::string& key, int64_t def) const {
     const JsonValue* v = get(key);
-    if (v && v->is_number()) return static_cast<int64_t>(v->num_val);
-    return def;
+    if (!v || !v->is_number() || std::isnan(v->num_val)) return def;
+    // Numbers outside int64_t clamp to its range: casting them is undefined.
+    if (v->num_val >= 9223372036854775808.0) return INT64_MAX;
+    if (v->num_val < -9223372036854775808.0) return INT64_MIN;
+    return static_cast<int64_t>(v->num_val);
 }
 
 bool JsonValue::get_bool(const std::string& key, bool def) const {

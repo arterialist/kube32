@@ -127,8 +127,10 @@ Kubelet::Kubelet(const KubeletConfig& config,
         firmware_ = std::make_unique<FirmwareAgent>(*config_.firmware_slots, *api_client_, fw);
         status_reporter_->set_firmware_version(firmware_->running().version);
     }
-    // Unique per process lifetime: the mirror resets its duplicate filter when it changes
-    log_epoch_ = osal::Thread::get_time_us() ^ (static_cast<uint64_t>(std::hash<std::string>{}(config_.node_name)) << 20);
+    // Unique per process lifetime: the mirror resets its duplicate filter when it changes.
+    // 53 bits, so the value survives a JSON number (a double) exactly.
+    log_epoch_ = (osal::Thread::get_time_us() ^ (static_cast<uint64_t>(std::hash<std::string>{}(config_.node_name)) << 20))
+                 & ((uint64_t{1} << 53) - 1);
     if (log_epoch_ == 0) log_epoch_ = 1;
 }
 

@@ -76,6 +76,7 @@ All notable changes to this project will be documented in this file. The format 
 
 ### Fixed
 
+- A kubelet's log epoch fits in 53 bits, so the control plane reads it exactly from JSON and keeps the logs of a node's next boot instead of dropping them as repeats. A JSON number outside `int64_t`, such as an older node's epoch, clamps to that range instead of converting with undefined behavior.
 - A call to a host function the node does not provide, such as one from a newer SDK, traps every time. The first trap left the calling site in the guest's code pointing at no code, so the next call into the same export (`k32_tick`, `k32_handle`, `k32_event`) took the whole node down, `kube32-sim` with SIGBUS.
 - A pod whose module comes from the API server's image store, the card or an annotation starts on a board without PSRAM whose general heap has no free piece the module's size. The kubelet reads the module into pod memory, placed as the pod's other allocations are (the pool block first), and the container charges it to the pod. Memory admission and Pod Overhead count the module's bytes for such images, so a pod's scheduled memory grows by its module's size; embedded images are mapped from flash and count nothing. A module that finds no room makes the pod wait with `InsufficientMemory` instead of failing with `ErrImagePull`.
 - A node with PSRAM advertises the PSRAM that pods can be given as its allocatable `memory`, not its free internal heap, so pods that request more than a few KiB, such as `examples/echo.yaml`, schedule on the control plane.

@@ -510,6 +510,18 @@ static void test_node_condition_times_through_api() {
     std::cout << "[PASS] test_node_condition_times_through_api" << std::endl;
 }
 
+static void test_json_int_out_of_range() {
+    // A log record's epoch can exceed int64_t; reading it must not be undefined.
+    models::JsonValue v;
+    std::string err;
+    assert(parse_json(R"({"big":18446744073709551615,"neg":-1e30,"ok":9007199254740991,"s":"x"})", v, err));
+    assert(v.get_int("big", 0) == INT64_MAX);
+    assert(v.get_int("neg", 0) == INT64_MIN);
+    assert(v.get_int("ok", 0) == 9007199254740991LL);
+    assert(v.get_int("s", 7) == 7);
+    assert(v.get_int("missing", 5) == 5);
+}
+
 int main() {
     test_node_condition_times_through_api();
     test_bearer_token_authentication();
@@ -523,6 +535,7 @@ int main() {
     test_lease_renew_time();
     test_timestamp_backfill();
     test_full_store_refuses_creates();
+    test_json_int_out_of_range();
     std::cout << "All control plane API tests passed" << std::endl;
     return 0;
 }
