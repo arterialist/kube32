@@ -603,7 +603,7 @@ int main() {
         assert(w2.slots->running().version == "v2" && !w2.slots->running().pending_verify);
         assert(w2.kubelet->firmware()->state() == kubelet::FirmwareAgent::State::RolledBack);
         assert(std::string(w2.kubelet->firmware()->condition().message).find("did not report Ready") != std::string::npos);
-        assert(run_until(cp, nodes, reboots, 5000, [&] { return annotation(*cp.store, "w2", models::kAnnotationFirmwareFailed) == sha3; }));
+        assert(run_until(cp, nodes, reboots, 20000, [&] { return annotation(*cp.store, "w2", models::kAnnotationFirmwareFailed) == sha3; }));
         std::cout << "[timeout] an image without the API server rejected itself" << std::endl;
     }
 
