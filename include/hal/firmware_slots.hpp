@@ -74,6 +74,12 @@ public:
 // The board's slots (ESP-IDF app_update); null on the host
 std::unique_ptr<FirmwareSlots> create_esp_firmware_slots();
 
+// Data kept in the passive slot while no image is written there (the flash
+// blob store, storage/blob_store.hpp). Before an image goes to the slot,
+// begin() asks `yield` to give it up and fails with its reason when it
+// cannot.
+void set_passive_slot_tenant(std::function<bool(std::string& why)> yield);
+
 // The version an image file carries ("kube32-version:<version>" in its
 // constant data), empty when none is found. `read(offset, buf, len)` reads
 // the image, which is `size` bytes long.

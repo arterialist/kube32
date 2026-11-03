@@ -10,6 +10,7 @@
 #include "runtime/pod_log.hpp"
 #include "runtime/app_pod.hpp"
 #include "runtime/pod_snapshot.hpp"
+#include "runtime/pod_blobs.hpp"
 #include "app/pod_checkpoint_api.hpp"
 #include "runtime/pod_memory_pool.h"
 #include "models/kube_models.hpp"
@@ -1342,6 +1343,10 @@ bool Kubelet::deploy_and_start_pod(const models::KubePod& pod_in, const std::str
                 }
             }
         }
+    }
+    // kube32.io/blobs: the node's blobs the pod may open (k32_blob_open)
+    if (auto it = pod.annotations.find("kube32.io/blobs"); it != pod.annotations.end()) {
+        spec.blobs = runtime::PodBlobs::parse_annotation(it->second);
     }
     // kube32.io/tick-interval: k32_tick period, "250ms", "2s" or milliseconds,
     // 50 ms to 1 h (default 1 s)

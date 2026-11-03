@@ -33,6 +33,9 @@
 
 namespace kube32::storage {
 
+// CRC-32 (IEEE 802.3) of `len` bytes continuing `crc` (0 to start)
+uint32_t crc32_update(uint32_t crc, const void* data, size_t len);
+
 // Storage behind the log. On NOR flash (erase_required) write() can only
 // clear bits, so the log writes erased (0xFF) bytes only and erases a sector
 // before reusing it; other regions overwrite in place.

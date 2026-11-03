@@ -126,6 +126,39 @@ extern "C" {
 #define K32_FS_O_TRUNC    0x0200
 #define K32_FS_O_APPEND   0x0400
 
+/* ---- Blobs: large read-only data, read in place ------------------------
+ * A blob is a named, read-only byte string the node keeps for its pods, such
+ * as model weights: in the node's flash blob region (mapped into the address
+ * space) or as a file in kube32/blobs/ on its microSD card (docs/storage.md).
+ * A pod may open the blobs its annotation names, at most K32_BLOB_MAX_OPEN at
+ * once:
+ *
+ *   metadata:
+ *     annotations:
+ *       kube32.io/blobs: stories-weights,stories-tokenizer
+ *
+ * k32_blob_read copies a range into linear memory. A blob that
+ * k32_blob_mapped reports as mapped is also read in place by the linear
+ * algebra imports: pass K32_BLOB_ADDR(blob, offset) as their w or w_scale
+ * operand, and the weights never enter the pod's memory. A blob address is
+ * no linear memory address; any other import rejects it as out of bounds.
+ * The kernels answer K32_ERR_NOTSUP for a blob that is not mapped (a file
+ * on a board's card): read its rows into memory instead.
+ *
+ * Errors: K32_ERR_PERM (the name is not in kube32.io/blobs), K32_ERR_NOENT
+ * (no such blob on this node), K32_ERR_NODEV (the node keeps no blobs),
+ * K32_ERR_MFILE (K32_BLOB_MAX_OPEN open), K32_ERR_BADF (no such handle),
+ * K32_ERR_INVAL, K32_ERR_NAMETOOLONG, K32_ERR_FAULT, K32_ERR_IO. Handles are
+ * closed when the container stops or restarts; a pod restored from a
+ * checkpoint opens its blobs again in k32_restored. */
+#define K32_BLOB_MAX_OPEN      4
+#define K32_BLOB_NAME_MAX      47            /* bytes of [A-Za-z0-9._-] */
+#define K32_BLOB_ADDR_FLAG     0x80000000u
+#define K32_BLOB_HANDLE_SHIFT  28
+#define K32_BLOB_OFFSET_MASK   0x0FFFFFFFu   /* blob addresses reach the first 256 MiB of a blob */
+#define K32_BLOB_ADDR(blob, offset) \
+    ((const void*)(uintptr_t)(K32_BLOB_ADDR_FLAG | ((uint32_t)(blob) << K32_BLOB_HANDLE_SHIFT) | ((uint32_t)(offset) & K32_BLOB_OFFSET_MASK)))
+
 /* Limits enforced by the host */
 #define K32_MAX_REQUEST_BYTES   (16 * 1024)
 #define K32_MAX_EVENT_BYTES     (200)        /* fits one ESP-NOW frame after the K32C header */
@@ -298,11 +331,14 @@ K32_IMPORT("k32_http_status") int32_t k32_http_status(void);
  *
  * w is a matrix of rows x cols weights, row r starting row_stride bytes
  * after row r - 1 (0: the rows follow each other); w_scale holds one float
- * per row, scale_stride bytes apart (0: 4). out must not overlap the other
- * operands. Each call returns K32_OK, or K32_ERR_INVAL for a stride that is
+ * per row, scale_stride bytes apart (0: 4). w and w_scale may also be blob
+ * addresses (K32_BLOB_ADDR): the node reads them from the blob in place, and
+ * a blob that is not mapped makes the call return K32_ERR_NOTSUP. out must
+ * not overlap the other operands. Each call returns K32_OK, or K32_ERR_INVAL for a stride that is
  * not 0 and below a row's bytes (or 4 for scale_stride). An operand outside
- * the linear memory traps (exit code 139) with a message that names it; a
- * call reads and writes nothing outside the linear memory.
+ * the linear memory, or a blob address outside every open blob, traps (exit
+ * code 139) with a message that names it; a call writes nothing outside the
+ * linear memory.
  *
  * k32_matvec_i8, k32_matvec_i4: int8 weights times an int8 vector x of cols
  * values with the scale x_scale, into rows floats:
@@ -351,6 +387,13 @@ K32_IMPORT("k32_fs_close")  int32_t k32_fs_close(int32_t fd);                   
 K32_IMPORT("k32_fs_size")   int32_t k32_fs_size(int32_t fd);                                            /* file size in bytes or error */
 K32_IMPORT("k32_fs_list")   int32_t k32_fs_list(const char* dir, uint32_t dir_len, char* out, uint32_t out_cap); /* bytes written: "name\n" per entry, directories end in "/" */
 K32_IMPORT("k32_fs_remove") int32_t k32_fs_remove(const char* path, uint32_t path_len);                 /* 0 or error; removes a file or an empty directory */
+
+/* ---- Blobs, granted by the annotation kube32.io/blobs (see above) ------- */
+K32_IMPORT("k32_blob_open")   int32_t k32_blob_open(const char* name, uint32_t name_len);                    /* handle (0..3) or error */
+K32_IMPORT("k32_blob_size")   int32_t k32_blob_size(int32_t blob);                                          /* bytes or error */
+K32_IMPORT("k32_blob_read")   int32_t k32_blob_read(int32_t blob, uint32_t offset, void* buf, uint32_t len); /* bytes copied (fewer only at the end, 0 past it) or error */
+K32_IMPORT("k32_blob_mapped") int32_t k32_blob_mapped(int32_t blob);                                        /* 1: the kernels read it through K32_BLOB_ADDR; 0: k32_blob_read only; or error */
+K32_IMPORT("k32_blob_close")  int32_t k32_blob_close(int32_t blob);                                         /* 0 or error */
 
 /* ---- I2C and UART, gated by the capability firewall --------------------
  * The pod claims a bus as a resource and may name its pins in an annotation

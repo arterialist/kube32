@@ -8,6 +8,8 @@
 #include "runtime/container_lifecycle.hpp"
 #include "runtime/wasm_runtime.hpp"
 #include "runtime/k32_app_abi.h"
+#include "runtime/pod_blobs.hpp"
+#include "storage/blob_store.hpp"
 
 #include "wasm3.h"
 #include "m3_env.h"
@@ -505,6 +507,88 @@ static void test_gas() {
     std::printf("[PASS] test_gas\n");
 }
 
+// A region whose bytes are not in the address space (a file on a board's card)
+class UnmappedRegion : public kube32::storage::BlobRegion {
+public:
+    explicit UnmappedRegion(size_t size) : ram_(kube32::storage::create_ram_blob_region(size)) {}
+    size_t size() const override { return ram_->size(); }
+    bool read(size_t o, void* d, size_t n) override { return ram_->read(o, d, n); }
+    bool write(size_t o, const void* s, size_t n) override { return ram_->write(o, s, n); }
+    bool erase(size_t o, size_t n) override { return ram_->erase(o, n); }
+    const uint8_t* data() const override { return nullptr; }
+    std::string name() const override { return "unmapped"; }
+
+private:
+    std::unique_ptr<kube32::storage::BlobRegion> ram_;
+};
+
+static void store_blob(kube32::storage::BlobStore& store, const char* name, const std::vector<uint8_t>& bytes) {
+    int32_t err = 0;
+    std::string why;
+    auto w = store.create(name, bytes.size(), err, why);
+    assert(w && w->write(bytes.data(), bytes.size(), why) == K32_OK && w->commit(why) == K32_OK);
+}
+
+static uint32_t blob_addr(int32_t handle, uint32_t offset) {
+    return K32_BLOB_ADDR_FLAG | (static_cast<uint32_t>(handle) << K32_BLOB_HANDLE_SHIFT) | offset;
+}
+
+// Weights and scales read in place from an open blob (K32_BLOB_ADDR) give
+// the bits they give from linear memory; a blob address outside every open
+// blob traps, and a blob that is not mapped answers K32_ERR_NOTSUP
+static void test_blob_operands() {
+    using namespace kube32;
+    const std::string pod = "default/linalg";
+    storage::FlashBlobStore flash(storage::create_ram_blob_region(512 * 1024), false);
+    storage::FlashBlobStore unmapped(std::make_unique<UnmappedRegion>(512 * 1024), false);
+    Pod p;
+    for (Case k : {Case{8, 64, 172, 172}, Case{4, 172, 64, 32}}) {
+        std::vector<int8_t> w, x;
+        std::vector<float> ws;
+        float xs;
+        fill(k, w, ws, x, xs);
+        // One blob: the rows, then the scales at an odd offset
+        std::vector<uint8_t> bytes(w.size() + 1 + 4 * ws.size());
+        std::memcpy(bytes.data(), w.data(), w.size());
+        std::memcpy(bytes.data() + w.size() + 1, ws.data(), 4 * ws.size());
+        store_blob(flash, "w", bytes);
+        store_blob(unmapped, "w", bytes);
+        storage::set_node_blob_stores(&flash, nullptr);
+        PodBlobs::instance().set_allowed(pod, {"w"});
+        const int32_t h = PodBlobs::instance().open(pod, "w");
+        assert(h == 0 && PodBlobs::instance().mapped(pod, h) == 1);
+        std::memcpy(p.mem + kX, x.data(), x.size());
+        const uint32_t wa = blob_addr(h, 0), sa = blob_addr(h, static_cast<uint32_t>(w.size() + 1));
+        int32_t rc = 1;
+        assert(!p.call(k.bits, kOut, wa, sa, kX, xs, k.rows, k.cols, static_cast<uint32_t>(k.stride), &rc) && rc == K32_OK);
+        const std::vector<float> want = reference(w, k.stride, k.bits, ws, x, xs, k.rows, k.cols);
+        assert(std::memcmp(p.mem + kOut, want.data(), 4 * k.rows) == 0);
+        // Scales from memory, weights from the blob
+        std::memcpy(p.mem + kWs, ws.data(), 4 * ws.size());
+        std::memset(p.mem + kOut, 0, 4 * k.rows);
+        assert(!p.call(k.bits, kOut, wa, kWs, kX, xs, k.rows, k.cols, static_cast<uint32_t>(k.stride), &rc) && rc == K32_OK);
+        assert(std::memcmp(p.mem + kOut, want.data(), 4 * k.rows) == 0);
+        // The last scale one byte past the blob, a handle not open
+        const std::string fn = std::string("k32_matvec_i") + (k.bits == 8 ? "8" : "4");
+        M3Result r = p.call(k.bits, kOut, wa, blob_addr(h, static_cast<uint32_t>(w.size() + 2)), kX, xs, k.rows, k.cols,
+                            static_cast<uint32_t>(k.stride));
+        assert(r && std::string(r) == "[trap] out of bounds memory access: w_scale of " + fn + " (a blob address outside every open blob)");
+        assert(describe_trap(r, TrapContext{}).exit_code == 139);
+        r = p.call(k.bits, kOut, blob_addr(1, 0), kWs, kX, xs, k.rows, k.cols, static_cast<uint32_t>(k.stride));
+        assert(r && std::string(r) == "[trap] out of bounds memory access: w of " + fn + " (a blob address outside every open blob)");
+        PodBlobs::instance().forget_pod(pod);
+        // The same blob where it is not mapped
+        storage::set_node_blob_stores(&unmapped, nullptr);
+        PodBlobs::instance().set_allowed(pod, {"w"});
+        assert(PodBlobs::instance().open(pod, "w") == 0 && PodBlobs::instance().mapped(pod, 0) == 0);
+        rc = 1;
+        assert(!p.call(k.bits, kOut, wa, sa, kX, xs, k.rows, k.cols, static_cast<uint32_t>(k.stride), &rc) && rc == K32_ERR_NOTSUP);
+        PodBlobs::instance().forget_pod(pod);
+    }
+    storage::set_node_blob_stores(nullptr, nullptr);
+    std::printf("[PASS] test_blob_operands\n");
+}
+
 int main() {
     test_kernels_match_reference();
     test_float_kernels();
@@ -512,6 +596,7 @@ int main() {
     test_out_of_bounds_traps();
     test_pod_trap();
     test_gas();
+    test_blob_operands();
     std::printf("All linear algebra tests passed\n");
     return 0;
 }

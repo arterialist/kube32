@@ -9,6 +9,7 @@
 #include "runtime/host_functions.hpp"
 #include "runtime/app_pod.hpp"
 #include "runtime/pod_fs.hpp"
+#include "runtime/pod_blobs.hpp"
 #include "runtime/pod_cpu.hpp"
 #include "osal/system.hpp"
 #include "osal/socket.hpp"
@@ -329,6 +330,7 @@ bool ContainerLifecycleController::deploy(const uint8_t* wasm_bytes, size_t len)
     cleanup_runtime();
     // A fresh instance starts with no SD files open (also on restart)
     PodFs::instance().release_pod(config_.pod_id);
+    PodBlobs::instance().release_pod(config_.pod_id);
 
     if (!wasm_bytes || len == 0) {
         status_.phase = ContainerPhase::Failed;

@@ -51,6 +51,11 @@ APP_IMPORTS = {
     "k32_matvec_f32_i8": "i(iiiifiiii)",
     "k32_vecmat_f32_i8": "i(iiiiiiii)",
     "k32_softmax_f32": "i(ii)",
+    "k32_blob_open": "i(ii)",
+    "k32_blob_size": "i(i)",
+    "k32_blob_read": "i(iiii)",
+    "k32_blob_mapped": "i(i)",
+    "k32_blob_close": "i(i)",
 }
 # src/runtime/host_functions.cpp link_host_functions
 LOW_LEVEL_IMPORTS = {

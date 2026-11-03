@@ -5,6 +5,7 @@
 #include "runtime/pod_log.hpp"
 #include "runtime/pod_fs.hpp"
 #include "runtime/pod_linalg.hpp"
+#include "runtime/pod_blobs.hpp"
 #include "runtime/k32_app_abi.h"
 #include "hal/capability_firewall.hpp"
 #include "ipc/channel.hpp"
@@ -203,6 +204,8 @@ void set_pod_clock_offset(const void* rt, int64_t offset) {
     if (offset != 0) s_clock_offsets.emplace_back(rt, offset);
     s_clock_count.store(s_clock_offsets.size(), std::memory_order_release);
 }
+
+const std::string& app_pod_id(IM3Runtime runtime) { return pod_for(runtime, nullptr); }
 
 static bool guest_range_ok(void* mem, uint32_t off, uint32_t len) {
     size_t size = m3_GetMemorySizeAt(mem);
@@ -676,6 +679,7 @@ void link_app_host_functions(IM3Module module, const std::string& pod_id) {
     m3_LinkRawFunction(module, "env", "k32_fs_list",      "i(iiii)",    &raw_fs_list);
     m3_LinkRawFunction(module, "env", "k32_fs_remove",    "i(ii)",      &raw_fs_remove);
     link_linalg_host_functions(module);
+    link_blob_host_functions(module);
 }
 
 // -----------------------------------------------------------------------------

@@ -144,6 +144,9 @@ const AppPlatformHooks& app_platform_hooks();
 void link_app_host_functions(IM3Module module, const std::string& pod_id);
 // Forgets the pod link_app_host_functions recorded for a runtime about to be freed.
 void unlink_app_host_functions(IM3Runtime runtime);
+// The pod a wasm3 runtime runs, for host calls defined outside app_pod.cpp
+// ("default-pod" for a runtime no pod was linked to)
+const std::string& app_pod_id(IM3Runtime runtime);
 // What a restored pod's clock is ahead of the node's uptime (k32_time_ms,
 // esp32_get_time_us, the k32_tick argument): 0 for a pod that started here.
 int64_t pod_clock_offset_ms(const void* m3_runtime);

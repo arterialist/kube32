@@ -1,5 +1,6 @@
 #include "app/pod_server.hpp"
 #include "app/node_storage_api.hpp"
+#include "app/node_blobs_api.hpp"
 #include "app/pod_checkpoint_api.hpp"
 #include "ipc/channel.hpp"
 #include "osal/thread.hpp"
@@ -112,7 +113,7 @@ runtime::AppRequest app_request_from(const api::HttpRequest& req) {
 // PodServerHandler
 // =============================================================================
 bool PodServerHandler::streams_body(const api::HttpRequest& req) {
-    return req.target_pod.empty() && is_node_storage_path(req.path);
+    return req.target_pod.empty() && (is_node_storage_path(req.path) || is_node_blobs_path(req.path));
 }
 
 bool PodServerHandler::handle(api::HttpConnection& conn) {
@@ -121,6 +122,7 @@ bool PodServerHandler::handle(api::HttpConnection& conn) {
     // The kubelet endpoint: node storage and pod checkpoints, reached through
     // the API server's node proxy
     if (req.target_pod.empty() && is_node_storage_path(req.path)) return serve_node_storage(conn, req.path, token_, max_upload_);
+    if (req.target_pod.empty() && is_node_blobs_path(req.path)) return serve_node_blobs(conn, req.path, token_);
     if (req.target_pod.empty() && is_pod_checkpoint_path(req.path)) return serve_pod_checkpoint(conn, req.path, token_);
     std::string pod = req.target_pod;
     if (pod.empty()) pod = runtime::AppPodHost::instance().default_request_pod();

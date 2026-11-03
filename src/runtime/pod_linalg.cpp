@@ -6,6 +6,8 @@
 // aligned. The build compiles this file with -ffp-contract=off: a multiply
 // followed by an add stays two roundings, as in a Wasm pod.
 #include "runtime/pod_linalg.hpp"
+#include "runtime/app_pod.hpp"
+#include "runtime/pod_blobs.hpp"
 #include "runtime/k32_app_abi.h"
 
 #include "wasm3.h"
@@ -146,6 +148,9 @@ void softmax_f32(uint8_t* x, uint32_t n) {
 // the container reports it as an out-of-bounds access (exit code 139)
 #define K32_OOB(fn, operand) "[trap] out of bounds memory access: " operand " of " fn
 
+// A blob address that names no open blob, or runs past the blob's end
+#define K32_BLOB_OOB(fn, operand) K32_OOB(fn, operand) " (a blob address outside every open blob)"
+
 // The four matrix imports share one implementation; their link carries this
 enum Kind : uint8_t { kI8, kI4, kF32, kVecmat };
 struct MatrixImport {
@@ -156,8 +161,11 @@ struct MatrixImport {
     const char* trap_w;
     const char* trap_w_scale;
     const char* trap_x;
+    const char* trap_blob_w;
+    const char* trap_blob_w_scale;
 };
-#define K32_MATRIX(fn, sig, kind) {fn, sig, kind, K32_OOB(fn, "out"), K32_OOB(fn, "w"), K32_OOB(fn, "w_scale"), K32_OOB(fn, "x")}
+#define K32_MATRIX(fn, sig, kind) \
+    {fn, sig, kind, K32_OOB(fn, "out"), K32_OOB(fn, "w"), K32_OOB(fn, "w_scale"), K32_OOB(fn, "x"), K32_BLOB_OOB(fn, "w"), K32_BLOB_OOB(fn, "w_scale")}
 static const MatrixImport kMatrixImports[] = {
     // out, w, w_scale, x, x_scale, rows, cols, row_stride
     K32_MATRIX("k32_matvec_i8", "i(iiiifiii)", kI8),
@@ -182,6 +190,22 @@ static bool fits(uint64_t size, uint32_t off, uint32_t count, uint64_t stride, u
     if (count == 0) return off <= size;
     const uint64_t span = (count - 1) * stride;
     return span <= size && off + span + last <= size;
+}
+
+// A read-only operand (weights, scales): count items stride bytes apart, the
+// last `last` bytes long, in linear memory or, for a blob address
+// (K32_BLOB_ADDR, never a linear memory address), in a blob the pod has open.
+// Null with rc K32_OK when it lies outside either (the caller traps), or
+// with rc K32_ERR_NOTSUP for a blob that is not mapped.
+static const uint8_t* operand(IM3Runtime rt, uint8_t* base, uint64_t size, uint32_t addr, uint32_t count, uint64_t stride,
+                              uint64_t last, bool& blob, int32_t& rc) {
+    rc = K32_OK;
+    blob = (addr & K32_BLOB_ADDR_FLAG) != 0 && addr >= size;
+    if (!blob) return fits(size, addr, count, stride, last) ? base + addr : nullptr;
+    const uint64_t span = count ? (count - 1) * stride + last : 0;
+    const uint8_t* p = PodBlobs::instance().view(app_pod_id(rt), (addr >> K32_BLOB_HANDLE_SHIFT) & 7, addr & K32_BLOB_OFFSET_MASK, span, rc);
+    if (!p && rc != K32_ERR_NOTSUP) rc = K32_OK;
+    return p;
 }
 
 // Pays for the work before it runs, as wasm3 charges a segment: a metered pod
@@ -216,20 +240,26 @@ static const void* raw_matrix(IM3Runtime rt, IM3ImportContext ctx, uint64_t* sp,
     // out: rows floats (cols for x^T W); x: cols int8 values, or cols floats (rows for x^T W)
     const uint64_t size = m3_GetMemorySizeAt(mem);
     const uint64_t x_bytes = kind <= kI4 ? cols : 4ull * (kind == kVecmat ? rows : cols);
+    uint8_t* base = static_cast<uint8_t*>(mem);
     if (!fits(size, out, kind == kVecmat ? cols : rows, 4, 4)) return im.trap_out;
-    if (!fits(size, w, rows, row_stride, row_bytes)) return im.trap_w;
-    if (!fits(size, w_scale, rows, scale_stride, 4)) return im.trap_w_scale;
+    bool w_blob = false, s_blob = false;
+    int32_t rc = K32_OK;
+    const uint8_t* wb = operand(rt, base, size, w, rows, row_stride, row_bytes, w_blob, rc);
+    if (rc == K32_ERR_NOTSUP) return result(sp, rc);
+    if (!wb) return w_blob ? im.trap_blob_w : im.trap_w;
+    const uint8_t* sb = operand(rt, base, size, w_scale, rows, scale_stride, 4, s_blob, rc);
+    if (rc == K32_ERR_NOTSUP) return result(sp, rc);
+    if (!sb) return s_blob ? im.trap_blob_w_scale : im.trap_w_scale;
     if (!fits(size, x, 1, 0, x_bytes)) return im.trap_x;
     if (M3Result r = charge(rt, matrix_units(rows, cols))) return r;
 
-    uint8_t* base = static_cast<uint8_t*>(mem);
-    const int8_t* wp = reinterpret_cast<const int8_t*>(base + w);
+    const int8_t* wp = reinterpret_cast<const int8_t*>(wb);
     const size_t rs = static_cast<size_t>(row_stride), ss = static_cast<size_t>(scale_stride);
     switch (kind) {
-    case kI8: matvec_i8(base + out, wp, rs, base + w_scale, reinterpret_cast<const int8_t*>(base + x), f, rows, cols); break;
-    case kI4: matvec_i4(base + out, wp, rs, base + w_scale, reinterpret_cast<const int8_t*>(base + x), f, rows, cols); break;
-    case kF32: matvec_f32_i8(base + out, wp, rs, base + w_scale, ss, base + x, f, rows, cols); break;
-    case kVecmat: vecmat_f32_i8(base + out, wp, rs, base + w_scale, ss, base + x, rows, cols); break;
+    case kI8: matvec_i8(base + out, wp, rs, sb, reinterpret_cast<const int8_t*>(base + x), f, rows, cols); break;
+    case kI4: matvec_i4(base + out, wp, rs, sb, reinterpret_cast<const int8_t*>(base + x), f, rows, cols); break;
+    case kF32: matvec_f32_i8(base + out, wp, rs, sb, ss, base + x, f, rows, cols); break;
+    case kVecmat: vecmat_f32_i8(base + out, wp, rs, sb, ss, base + x, rows, cols); break;
     }
     return result(sp, K32_OK);
 }

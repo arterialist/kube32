@@ -21,6 +21,8 @@
 #include "app/service_client.hpp"
 #include "app/egress_gateway.hpp"
 #include "app/node_storage_api.hpp"
+#include "app/node_blobs_api.hpp"
+#include "storage/blob_store.hpp"
 #include "app/pod_checkpoint_api.hpp"
 #include "api/checkpoint_api.hpp"
 #include "api/node_proxy.hpp"
@@ -45,6 +47,7 @@
 #include <csignal>
 #include <thread>
 #include <unistd.h>
+#include <sys/stat.h>
 #include <fstream>
 #include <iterator>
 #include <cstdlib>
@@ -184,6 +187,9 @@ struct SimOptions {
     // board's reservation, except for workers, which model the Cardputer).
     int64_t psram_bytes{-1};
     std::string sim_i2c;                   // simulated I2C parts on this process's bus 0 (MockHal::attach_parts)
+    // A file standing in for the board's flash blob region (<data-dir>/blobs.img):
+    // the size of a board's app slot by default, 0 for none
+    size_t blob_region_bytes{0x340000};
 };
 
 static void print_sim_usage(std::ostream& out) {
@@ -213,6 +219,8 @@ static void print_sim_usage(std::ostream& out) {
            "  --psram <size>              PSRAM to model, e.g. 8Mi; 0 models a board without PSRAM\n"
            "  --heap-budget <size>        heap left for pods and system with --psram 0 (default 51Ki); with\n"
            "                              --psram, the PSRAM besides the pool block (default: not modelled)\n"
+           "  --blob-region <size>        flash blob region of this process's node, a file in <data-dir>\n"
+           "                              (default 3328Ki, a board's app slot; 0 for none)\n"
            "  --sim-i2c <parts>           simulated I2C parts on bus 0 of this process's node, e.g.\n"
            "                              pahub,bme688@2,miniscale@3,rfid@4 (part[:0x<addr>][@<PaHub channel>];\n"
            "                              parts: pahub, bme688, miniscale, rfid)\n"
@@ -280,6 +288,7 @@ static SimOptions parse_sim_args(int argc, char* argv[]) {
             opts.heap_budget_set = true;
         }
         else if (arg == "--sim-i2c" && i + 1 < argc) opts.sim_i2c = argv[++i];
+        else if (arg == "--blob-region" && i + 1 < argc) opts.blob_region_bytes = static_cast<size_t>(kube32::models::parse_quantity(argv[++i]));
         else if (arg == "--psram" && i + 1 < argc) {
             opts.psram_bytes = static_cast<int64_t>(kube32::models::parse_quantity(argv[++i]));
             opts.board_without_psram = (opts.psram_bytes == 0);
@@ -451,6 +460,23 @@ int main(int argc, char* argv[]) {
     } else {
         std::cout << "[STORAGE] none: " << kube32::hal::node_storage_info().error << std::endl;
     }
+    // Blobs (storage/blob_store.hpp): a file in --data-dir standing in for
+    // the board's flash region, and kube32/blobs on the simulated card
+    static std::unique_ptr<kube32::storage::FlashBlobStore> flash_blobs;
+    static kube32::storage::CardBlobStore card_blobs;
+    if (opts.blob_region_bytes > 0) {
+        ::mkdir(opts.data_dir.c_str(), 0755);
+        const std::string path = opts.data_dir + "/blobs.img";
+        const size_t bytes = opts.blob_region_bytes / kube32::storage::kBlobPage * kube32::storage::kBlobPage;
+        if (auto region = kube32::storage::create_file_blob_region(path, bytes)) {
+            flash_blobs = std::make_unique<kube32::storage::FlashBlobStore>(std::move(region), false);
+            std::cout << "[BLOBS] flash region " << path << ": " << flash_blobs->capacity_bytes() << " bytes, "
+                      << flash_blobs->list().size() << " blob(s)" << std::endl;
+        } else {
+            std::cout << "[BLOBS] cannot create the flash region " << path << " (" << bytes << " bytes)" << std::endl;
+        }
+    }
+    kube32::storage::set_node_blob_stores(flash_blobs.get(), &card_blobs);
 
     // The interpreter's speed on this host (Node annotation kube32.io/interp-mops)
     char interp_mops[16];
@@ -734,6 +760,7 @@ int main(int argc, char* argv[]) {
     kube32::api::NodeProxyHandler node_proxy(*store, server->route_handler(), local_node,
         [](kube32::api::HttpConnection& conn, std::string_view path) {
             if (kube32::app::is_pod_checkpoint_path(path)) return kube32::app::serve_pod_checkpoint(conn, path, std::string());
+            if (kube32::app::is_node_blobs_path(path)) return kube32::app::serve_node_blobs(conn, path, std::string());
             if (!kube32::app::is_node_storage_path(path)) return false;
             return kube32::app::serve_node_storage(conn, path, std::string(), 64u * 1024 * 1024);
         });

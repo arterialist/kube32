@@ -6,6 +6,7 @@
 #include "runtime/container_lifecycle.hpp"
 #include "runtime/app_pod.hpp"
 #include "runtime/pod_fs.hpp"
+#include "runtime/pod_blobs.hpp"
 #include "ipc/channel.hpp"
 #include "runtime/k32_app_abi.h"
 #include "runtime/pod_memory_pool.h"
@@ -97,6 +98,7 @@ bool WasmRuntime::deploy_impl(const std::string& pod_id, const uint8_t* wasm_byt
     AppPodHost::instance().set_env(pod_id, spec.env);
     AppPodHost::instance().set_migration_info(pod_id, spec);
     AppPodHost::instance().set_event_topics(pod_id, spec.event_topics);
+    PodBlobs::instance().set_allowed(pod_id, spec.blobs);
     AppPodHost::instance().set_tick_interval(pod_id, spec.tick_interval_ms);
     AppPodHost::instance().set_assets(pod_id, AppAssetSource{spec.asset_bundle, spec.asset_directory});
 
@@ -112,6 +114,7 @@ bool WasmRuntime::deploy_impl(const std::string& pod_id, const uint8_t* wasm_byt
         out_error = controller->get_status().exit_message;
         AppPodHost::instance().unregister_pod(pod_id);
         PodFs::instance().release_pod(pod_id);
+        PodBlobs::instance().forget_pod(pod_id);
         return false;
     }
 
@@ -151,6 +154,7 @@ bool WasmRuntime::deploy_impl(const std::string& pod_id, const uint8_t* wasm_byt
             out_error = spec.restore_from ? why : "k32_init returned " + std::to_string(init_rc);
             AppPodHost::instance().unregister_pod(pod_id);
             PodFs::instance().release_pod(pod_id);
+            PodBlobs::instance().forget_pod(pod_id);
             ipc::ChannelManager::instance().close_all(pod_id);
             auto it = impl_->containers.find(pod_id);
             if (it != impl_->containers.end()) {
@@ -203,6 +207,7 @@ bool WasmRuntime::terminate(const std::string& pod_id) {
     }
     AppPodHost::instance().unregister_pod(pod_id);
     PodFs::instance().release_pod(pod_id);
+    PodBlobs::instance().forget_pod(pod_id);
     ipc::ChannelManager::instance().close_all(pod_id);
     {
         osal::LockGuard guard(impl_->mutex);

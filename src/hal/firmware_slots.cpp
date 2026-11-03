@@ -67,6 +67,10 @@ bool FirmwareSlots::passive_sha256(size_t size, std::string& out_hex) {
     return true;
 }
 
+static std::function<bool(std::string&)> s_passive_slot_tenant;
+
+void set_passive_slot_tenant(std::function<bool(std::string& why)> yield) { s_passive_slot_tenant = std::move(yield); }
+
 #if defined(KUBE32_TARGET_ESP32)
 
 namespace {
@@ -131,6 +135,7 @@ public:
 
     bool begin(std::string& why) override {
         if (!ready(why)) return false;
+        if (s_passive_slot_tenant && !s_passive_slot_tenant(why)) return false;
         abort();
         esp_err_t err = ESP_OK;
         node_storage_call([&] { err = esp_ota_begin(passive_, OTA_WITH_SEQUENTIAL_WRITES, &handle_); });

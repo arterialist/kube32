@@ -120,6 +120,7 @@ else()
         src/storage/radix_tree.cpp
         src/storage/littlefs_journal.cpp
         src/storage/flash_log.cpp
+        src/storage/blob_store.cpp
         src/storage/persist_policy.cpp
         src/storage/store.cpp
         src/models/kube_models.cpp
@@ -167,6 +168,7 @@ else()
         src/runtime/wasm_runtime.cpp
         src/runtime/app_pod.cpp
         src/runtime/pod_linalg.cpp
+        src/runtime/pod_blobs.cpp
         src/runtime/pod_log.cpp
         src/runtime/image_registry.cpp
         src/runtime/pod_fs.cpp
@@ -181,6 +183,7 @@ else()
         src/app/egress_policy.cpp
         src/app/egress_gateway.cpp
         src/app/node_storage_api.cpp
+        src/app/node_blobs_api.cpp
         src/app/pod_checkpoint_api.cpp
         src/app/console_relay.cpp
         src/app/improv_serial.cpp
@@ -366,6 +369,12 @@ else()
     target_link_libraries(test_pod_linalg PRIVATE kube32_core)
     target_compile_options(test_pod_linalg PRIVATE -ffp-contract=off)   # its reference loops round as the kernels do
     add_test(NAME test_pod_linalg COMMAND test_pod_linalg)
+
+    # 10c. Blobs: the flash and card stores, a pod's handles, /blobs over HTTP
+    add_executable(test_blob_store tests/test_blob_store.cpp)
+    target_link_libraries(test_blob_store PRIVATE kube32_core)
+    target_compile_definitions(test_blob_store PRIVATE KUBE32_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}")
+    add_test(NAME test_blob_store COMMAND test_blob_store)
 
     # 11. Kubelet node agent and reconciler
     add_executable(test_kubelet

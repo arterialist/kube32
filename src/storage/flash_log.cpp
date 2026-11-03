@@ -22,6 +22,8 @@ constexpr uint16_t kNoRecordStart = 0xFFFFu;
 constexpr size_t kMaxKey = 1024;
 const std::string kRevisionKey("\x01revision", 9);
 
+} // namespace
+
 // CRC-32 (IEEE 802.3), four bits at a time: a 64-byte table instead of 1 KB.
 uint32_t crc32_update(uint32_t crc, const void* data, size_t len) {
     static constexpr uint32_t kTable[16] = {
@@ -37,6 +39,8 @@ uint32_t crc32_update(uint32_t crc, const void* data, size_t len) {
     }
     return ~crc;
 }
+
+namespace {
 
 void put16(uint8_t* p, uint16_t v) { p[0] = static_cast<uint8_t>(v); p[1] = static_cast<uint8_t>(v >> 8); }
 void put32(uint8_t* p, uint32_t v) { for (int i = 0; i < 4; ++i) p[i] = static_cast<uint8_t>(v >> (8 * i)); }

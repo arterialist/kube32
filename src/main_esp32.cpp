@@ -28,6 +28,7 @@
 #include "controller/checkpoint_controller.hpp"
 #include "api/firmware_api.hpp"
 #include "hal/firmware_slots.hpp"
+#include "storage/blob_store.hpp"
 #include "hal/capability_firewall.hpp"
 #include "hal/i2c_discovery.hpp"
 #include "models/device.hpp"
@@ -49,6 +50,7 @@
 #include "app/service_client.hpp"
 #include "app/egress_gateway.hpp"
 #include "app/node_storage_api.hpp"
+#include "app/node_blobs_api.hpp"
 #include "app/pod_checkpoint_api.hpp"
 #include "api/checkpoint_api.hpp"
 #include "app/console_relay.hpp"
@@ -1274,6 +1276,37 @@ void cluster_task(void* pv) {
                fw.pending_verify ? "unconfirmed" : "confirmed", s_firmware_slots->passive_slot().empty() ? "nowhere (no second app slot)"
                                                                                                      : s_firmware_slots->passive_slot().c_str());
     }
+    // Blobs for pods (storage/blob_store.hpp): the flash region, mapped whole,
+    // and kube32/blobs on the card of a board with a card slot
+    {
+        static std::unique_ptr<kube32::storage::FlashBlobStore> flash_blobs;
+        static kube32::storage::CardBlobStore card_blobs;
+        bool app_slot = false;
+        if (auto region = kube32::storage::create_board_blob_region(app_slot)) {
+            flash_blobs = std::make_unique<kube32::storage::FlashBlobStore>(std::move(region), app_slot);
+            if (app_slot) {
+                // The firmware keeps the slot while it holds a staged image or
+                // the image an unconfirmed update falls back to
+                flash_blobs->set_firmware_claim([]() -> std::string {
+                    if (s_firmware_slots && s_firmware_slots->running().pending_verify) {
+                        return "the running firmware is unconfirmed: " + s_firmware_slots->passive_slot() + " holds the image it falls back to";
+                    }
+                    if (s_firmware_api) {
+                        const std::string phase = s_firmware_api->staged().phase;
+                        if (phase == "Staged" || phase == "Receiving") {
+                            return "a firmware image is " + std::string(phase == "Staged" ? "staged" : "being uploaded") + " in " +
+                                   s_firmware_slots->passive_slot();
+                        }
+                    }
+                    return std::string();
+                });
+                kube32::hal::set_passive_slot_tenant([](std::string& why) { return flash_blobs->yield_to_firmware(why); });
+            }
+            printf("[BLOBS] flash region %s: %llu bytes, %u blob(s)\n", flash_blobs->location().c_str(),
+                   (unsigned long long)flash_blobs->capacity_bytes(), (unsigned)flash_blobs->list().size());
+        }
+        kube32::storage::set_node_blob_stores(flash_blobs.get(), ident.has_display ? &card_blobs : nullptr);
+    }
     install_hardware_hooks(has_display);
     kube32::app::install_default_platform_hooks();   // event_emit through the channel layer
     // What pods may claim: the chip's pins minus those the board's own
@@ -1673,6 +1706,7 @@ void cluster_task(void* pv) {
         node_proxy = std::make_unique<kube32::api::NodeProxyHandler>(*store, api_server->route_handler(), ident.name,
             [](kube32::api::HttpConnection& conn, std::string_view path) {
                 if (kube32::app::is_pod_checkpoint_path(path)) return kube32::app::serve_pod_checkpoint(conn, path, std::string());
+                if (kube32::app::is_node_blobs_path(path)) return kube32::app::serve_node_blobs(conn, path, std::string());
                 if (!kube32::app::is_node_storage_path(path)) return false;
                 return kube32::app::serve_node_storage(conn, path, std::string(), 8u * 1024 * 1024);
             });

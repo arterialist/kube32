@@ -84,6 +84,7 @@ set(KUBE32_APP_SRCS
     runtime/wasm_runtime.cpp
     runtime/app_pod.cpp
     runtime/pod_linalg.cpp
+    runtime/pod_blobs.cpp
     runtime/pod_log.cpp
     runtime/image_registry.cpp
     runtime/pod_fs.cpp
@@ -98,6 +99,7 @@ set(KUBE32_APP_SRCS
     app/egress_policy.cpp
     app/egress_gateway.cpp
     app/node_storage_api.cpp
+    app/node_blobs_api.cpp
     app/pod_checkpoint_api.cpp
     app/console_relay.cpp
     app/improv_serial.cpp
@@ -105,6 +107,7 @@ set(KUBE32_APP_SRCS
     scheduler/scheduler.cpp
     storage/littlefs_journal.cpp
     storage/flash_log.cpp
+    storage/blob_store.cpp
     storage/persist_policy.cpp
     storage/radix_tree.cpp
     storage/store.cpp
@@ -192,6 +195,8 @@ set_source_files_properties(
     ${CMAKE_CURRENT_LIST_DIR}/hal/pod_buses.cpp
     ${CMAKE_CURRENT_LIST_DIR}/hal/pod_rmt.cpp
     ${CMAKE_CURRENT_LIST_DIR}/app/node_storage_api.cpp
+    ${CMAKE_CURRENT_LIST_DIR}/app/node_blobs_api.cpp
+    ${CMAKE_CURRENT_LIST_DIR}/storage/blob_store.cpp
     ${CMAKE_CURRENT_LIST_DIR}/api/node_proxy.cpp
     ${CMAKE_CURRENT_LIST_DIR}/api/protobuf_body.cpp
     ${CMAKE_CURRENT_LIST_DIR}/app/service_client.cpp
