@@ -496,6 +496,10 @@ else()
     add_test(NAME test_sd_card COMMAND test_sd_card)
 
     # 23. Ingress controller: networking.k8s.io/v1 routing, service resolution, static bundles, event streams
+    add_executable(test_event_stream tests/test_event_stream.cpp)
+    target_link_libraries(test_event_stream PRIVATE kube32_core)
+    add_test(NAME test_event_stream COMMAND test_event_stream)
+
     add_executable(test_ingress
         tests/test_ingress.cpp
     )

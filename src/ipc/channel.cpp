@@ -570,7 +570,7 @@ void ChannelManager::deliver_local(uint32_t channel_hash, uint32_t sender_hash, 
         if (len + 4 <= sizeof(tmp) && len + 4 <= dispatch_ring_->slot_size()) {
             std::memcpy(tmp, &channel_hash, 4);
             if (len > 0) std::memcpy(tmp + 4, data, len);
-            dispatch_ring_->push(sender_hash, tmp, len + 4);
+            if (!dispatch_ring_->push(sender_hash, tmp, len + 4)) stats_.dispatch_dropped.fetch_add(1, std::memory_order_relaxed);
         }
     }
 }
@@ -648,8 +648,10 @@ void ChannelManager::dispatch_loop() {
 bool ChannelManager::start_background(uint32_t hello_interval_ms, size_t dispatcher_stack_bytes, bool stack_in_psram) {
     if (background_running_.load()) return true;
     hello_interval_ms_ = hello_interval_ms;
-    // Events are capped at K32_MAX_EVENT_BYTES (200) + 4 bytes of topic hash
-    if (!dispatch_ring_) dispatch_ring_ = std::make_shared<RingBuffer>(8, 256);
+    // Events are capped at K32_MAX_EVENT_BYTES (200) + 4 bytes of topic hash.
+    // With PSRAM the queue holds the bursts of two pod workers publishing at
+    // once (a picture's rows and a story's tokens)
+    if (!dispatch_ring_) dispatch_ring_ = std::make_shared<RingBuffer>(osal::System::get_total_psram_bytes() > 0 ? 32 : 8, 256);
 #if defined(KUBE32_TARGET_ESP32)
     if (!rx_ring_) rx_ring_ = std::make_shared<RingBuffer>(8, 264);
 #endif

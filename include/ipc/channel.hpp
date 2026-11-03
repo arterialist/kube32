@@ -274,6 +274,9 @@ public:
         std::atomic<uint64_t> bad_magic_errors{0};
         std::atomic<uint64_t> reassembled_msgs{0};
         std::atomic<uint64_t> hello_rx{0};
+        // Messages for this node's subscriptions that found the dispatcher's
+        // queue full
+        std::atomic<uint64_t> dispatch_dropped{0};
     };
     ChannelStats& stats() { return stats_; }
 

@@ -93,8 +93,8 @@ backend:
 
 | Annotation | Kind | Format | Behaviour |
 | --- | --- | --- | --- |
-| `kube32.io/event-stream` | Ingress | `"<path>=<topic>[,<topic>...][;<path>=...]"` | Serves `<path>` as a `text/event-stream` Server-Sent Events endpoint. The controller sends each message on a listed channel topic as an SSE frame and takes the `event` name from the payload's `type` or `t` field. Deleting the Ingress closes its streams. |
-| `kube32.io/cluster-telemetry` | Ingress | `"<path>"` | Serves cluster telemetry JSON on `GET <path>`. |
+| `kube32.io/event-stream` | Ingress | `"<path>=<topic>[,<topic>...][;<path>=...]"` | Serves `<path>` as a `text/event-stream` Server-Sent Events endpoint. The controller sends each message on a listed channel topic as an SSE frame and takes the `event` name from the payload's `type` or `t` field. A viewer that reads slowly keeps up to 32 KiB of frames waiting; one that falls further behind, or reads nothing for 10 s, is disconnected and its EventSource reconnects. Deleting the Ingress closes its streams. |
+| `kube32.io/cluster-telemetry` | Ingress | `"<path>"` | Serves cluster telemetry JSON on `GET <path>`, with the event stream counters `sse_received`, `sse_events` (sent) and `sse_dropped`, and `link.dispatch_dropped` (channel messages this node's subscriptions lost to a full queue). |
 | `kube32.io/stats-topic` | Ingress | `"<topic>"` | Publishes `{"t":"stats","ingress":"<ns>/<name>","rps":N,"viewers":N}` once per second on `<topic>`. |
 | `kube32.io/event-topics` | Pod | `<topic>[,<topic>...]` | Delivers messages published on the listed channel topics from any node to the pod's `k32_event` export, from the pod's [pod worker](architecture/wasm-runtime.md#pod-workers) on a board with PSRAM, or the `k32_events` thread (4 KiB of internal RAM) on the shared interpreter stack without PSRAM. |
 

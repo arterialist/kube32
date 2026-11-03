@@ -6,6 +6,7 @@
 #include "osal/system.hpp"
 
 #include <algorithm>
+#include <cerrno>
 #include <cstdio>
 #include <cstring>
 #include <iostream>
@@ -37,9 +38,13 @@ void SseHub::stop() {
         running_.store(false);
         if (thread_) { thread_->join(); thread_.reset(); }
     }
-    osal::LockGuard guard(mutex_);
-    for (auto& c : clients_) c.sock.close();
-    clients_.clear();
+    {
+        osal::LockGuard guard(mutex_);
+        for (auto& c : clients_) c.sock.close();
+        clients_.clear();
+        client_count_.store(0);
+    }
+    osal::LockGuard queue(queue_mutex_);
     pending_.clear();
 }
 
@@ -50,19 +55,25 @@ void SseHub::add(osal::Socket sock, Subscription sub) {
         clients_.front().sock.close();
         clients_.erase(clients_.begin());
     }
-    sock.set_timeout(200, 300);
-    clients_.push_back(Client{std::move(sock), std::move(sub)});
+    sock.set_nonblocking(true);
+    Client c;
+    c.sock = std::move(sock);
+    c.sub = std::move(sub);
+    clients_.push_back(std::move(c));
+    client_count_.store(clients_.size());
 }
 
 void SseHub::broadcast(uint32_t topic_hash, std::string_view event, std::string_view data) {
+    if (client_count_.load() == 0) return;
     Frame f;
     f.topic_hash = topic_hash;
     f.text.reserve(event.size() + data.size() + 16);
     if (!event.empty()) f.text.append("event: ").append(event.data(), event.size()).append("\n");
     f.text.append("data: ").append(data.data(), data.size()).append("\n\n");
-    osal::LockGuard guard(mutex_);
-    if (clients_.empty()) return;
-    if (pending_.size() < 64) pending_.push_back(std::move(f));
+    osal::LockGuard guard(queue_mutex_);
+    events_received_.fetch_add(1, std::memory_order_relaxed);
+    if (pending_.size() < kMaxPending) pending_.push_back(std::move(f));
+    else events_dropped_.fetch_add(1, std::memory_order_relaxed);
 }
 
 void SseHub::retain_streams(const std::vector<uint32_t>& stream_ids) {
@@ -75,6 +86,7 @@ void SseHub::retain_streams(const std::vector<uint32_t>& stream_ids) {
             ++i;
         }
     }
+    client_count_.store(clients_.size());
 }
 
 size_t SseHub::count() const {
@@ -99,22 +111,65 @@ bool SseHub::has_listeners(uint32_t topic_hash) const {
     return false;
 }
 
-void SseHub::send_to(uint32_t topic_hash, const std::string& frame) {
-    // Caller holds mutex_
-    for (size_t i = 0; i < clients_.size();) {
-        Client& c = clients_[i];
-        bool wants = topic_hash == 0 || std::find(c.sub.topics.begin(), c.sub.topics.end(), topic_hash) != c.sub.topics.end();
-        if (wants && !c.sock.send_all(frame.data(), frame.size())) {
-            c.sock.close();
-            clients_.erase(clients_.begin() + static_cast<long>(i));
+void SseHub::queue_to(Client& c, const char* data, size_t len) {
+    if (c.dead) return;
+    if (c.out.size() - c.sent + len > kMaxBacklog) {
+        // Too far behind: the connection closes and its viewer reconnects
+        c.dead = true;
+        events_dropped_.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
+    if (c.sent >= 4096) {
+        c.out.erase(0, c.sent);
+        c.sent = 0;
+    }
+    c.out.append(data, len);
+}
+
+bool SseHub::flush(Client& c, uint64_t now_ms) {
+    while (!c.dead && c.sent < c.out.size()) {
+        const ssize_t n = c.sock.send(c.out.data() + c.sent, c.out.size() - c.sent);
+        if (n > 0) {
+            c.sent += static_cast<size_t>(n);
+            c.stalled_since = 0;
             continue;
         }
-        ++i;
+        if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR)) {
+            // The socket's buffer is full: the rest goes on a later pass
+            if (c.stalled_since == 0) c.stalled_since = now_ms;
+            else if (now_ms - c.stalled_since >= kStallMs) c.dead = true;
+            return !c.dead;
+        }
+        c.dead = true;   // the viewer went away
+    }
+    if (c.out.capacity() > 4096) std::string().swap(c.out);   // a backlog's memory goes back
+    else c.out.clear();
+    c.sent = 0;
+    return false;
+}
+
+void SseHub::remove_dead() {
+    for (size_t i = 0; i < clients_.size();) {
+        if (clients_[i].dead) {
+            clients_[i].sock.close();
+            clients_.erase(clients_.begin() + static_cast<long>(i));
+        } else {
+            ++i;
+        }
+    }
+    client_count_.store(clients_.size());
+}
+
+void SseHub::send_to(uint32_t topic_hash, const std::string& frame) {
+    for (auto& c : clients_) {
+        if (topic_hash == 0 || std::find(c.sub.topics.begin(), c.sub.topics.end(), topic_hash) != c.sub.topics.end()) {
+            queue_to(c, frame.data(), frame.size());
+        }
     }
 }
 
 void SseHub::send_presence() {
-    // Caller holds mutex_. One "presence" event per stream whose viewer count changed.
+    // One "presence" event per stream whose viewer count changed
     std::map<uint32_t, size_t> counts;
     for (const auto& c : clients_) counts[c.sub.stream_id]++;
     for (auto it = presence_sent_.begin(); it != presence_sent_.end();) {
@@ -126,14 +181,8 @@ void SseHub::send_presence() {
         last = kv.second;
         char buf[64];
         int l = snprintf(buf, sizeof(buf), "event: presence\ndata: {\"viewers\":%zu}\n\n", kv.second);
-        for (size_t i = 0; i < clients_.size();) {
-            Client& c = clients_[i];
-            if (c.sub.stream_id == kv.first && c.sub.presence && !c.sock.send_all(buf, static_cast<size_t>(l))) {
-                c.sock.close();
-                clients_.erase(clients_.begin() + static_cast<long>(i));
-                continue;
-            }
-            ++i;
+        for (auto& c : clients_) {
+            if (c.sub.stream_id == kv.first && c.sub.presence) queue_to(c, buf, static_cast<size_t>(l));
         }
     }
 }
@@ -141,32 +190,37 @@ void SseHub::send_presence() {
 void SseHub::run() {
     uint64_t last_ping = 0;
     while (running_.load()) {
+        bool backlog = false;
+        size_t taken = 0;
         try {
             std::vector<Frame> batch;
             {
-                osal::LockGuard guard(mutex_);
+                osal::LockGuard guard(queue_mutex_);
                 batch.swap(pending_);
             }
+            taken = batch.size();
             uint64_t now = osal::System::get_uptime_ms();
-            {
-                osal::LockGuard guard(mutex_);
-                for (const auto& f : batch) {
-                    if (clients_.empty()) break;
-                    send_to(f.topic_hash, f.text);
-                    events_sent_.fetch_add(1, std::memory_order_relaxed);
-                }
-                if (now - last_ping >= 15000) {
-                    last_ping = now;
-                    static const std::string ping = ": ping\n\n";
-                    send_to(0, ping);
-                }
-                send_presence();
+            osal::LockGuard guard(mutex_);
+            for (const auto& f : batch) {
+                send_to(f.topic_hash, f.text);
+                events_sent_.fetch_add(1, std::memory_order_relaxed);
             }
+            taken = 0;
+            if (now - last_ping >= 15000) {
+                last_ping = now;
+                static const std::string ping = ": ping\n\n";
+                send_to(0, ping);
+            }
+            send_presence();
+            for (auto& c : clients_) backlog |= flush(c, now);
+            remove_dead();
         } catch (const std::exception&) {
-            // out of memory: this batch is dropped, the next pass starts in 50 ms
+            // out of memory: what this pass took is lost, the next one starts soon
+            events_dropped_.fetch_add(taken, std::memory_order_relaxed);
         }
         osal::System::feed_watchdog();
-        osal::Thread::sleep_ms(50);
+        // A connection with bytes left is written again soon
+        osal::Thread::sleep_ms(backlog ? 10 : 50);
     }
 }
 
@@ -936,6 +990,8 @@ std::string IngressController::build_cluster_json() {
     }
     out += "\"active_sse\":" + std::to_string(hub_->count());
     out += ",\"sse_events\":" + std::to_string(hub_->events_sent());
+    out += ",\"sse_received\":" + std::to_string(hub_->events_received());
+    out += ",\"sse_dropped\":" + std::to_string(hub_->events_dropped());
     out += ",\"proxied\":" + std::to_string(stats_.proxied.load());
     out += ",\"proxy_errors\":" + std::to_string(stats_.proxy_errors.load());
     out += ",\"local_calls\":" + std::to_string(stats_.local_calls.load());
@@ -946,6 +1002,7 @@ std::string IngressController::build_cluster_json() {
     out += "\"espnow_frames_rx\":" + std::to_string(cs.frames_received.load());
     out += ",\"espnow_frames_tx\":" + std::to_string(cs.frames_sent.load());
     out += ",\"delivered\":" + std::to_string(cs.frames_delivered.load());
+    out += ",\"dispatch_dropped\":" + std::to_string(cs.dispatch_dropped.load());
     out += ",\"crc_errors\":" + std::to_string(cs.crc_errors.load());
     out += ",\"send_errors\":" + std::to_string(cs.send_errors.load());
     out += ",\"reassembled\":" + std::to_string(cs.reassembled_msgs.load());

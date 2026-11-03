@@ -41,10 +41,19 @@
 
 namespace kube32::app {
 
-// Server-Sent Events fan-out. Owns the sockets handed over by the controller;
-// frames are written on the hub thread.
+// Server-Sent Events fan-out. Owns the sockets handed over by the controller.
+// broadcast() only queues the event: it runs on the channel dispatcher, which
+// delivers every subscription of the node and must not wait for a network.
+// The hub thread copies each event into the output of every connection that
+// wants it and writes what each socket takes without blocking. A connection
+// keeps up to kMaxBacklog bytes it could not send yet; one that falls further
+// behind, or takes nothing for kStallMs, is closed.
 class SseHub {
 public:
+    static constexpr size_t kMaxBacklog = 32 * 1024;
+    static constexpr uint32_t kStallMs = 10000;
+    static constexpr size_t kMaxPending = 128;   // events queued for the hub thread
+
     struct Subscription {
         uint32_t stream_id{0};
         std::vector<uint32_t> topics;   // fnv1a_32 of each topic name
@@ -69,28 +78,46 @@ public:
     size_t count_streams(const std::vector<uint32_t>& stream_ids) const;
     bool has_listeners(uint32_t topic_hash) const;
     uint64_t events_sent() const { return events_sent_.load(); }
+    // Events handed to broadcast while a connection listened, and events a
+    // connection lost (queue full, out of memory, or the connection closed
+    // with them unsent)
+    uint64_t events_received() const { return events_received_.load(); }
+    uint64_t events_dropped() const { return events_dropped_.load(); }
     void set_max_clients(size_t n) { max_clients_ = n; }
 
 private:
     struct Client {
         osal::Socket sock;
         Subscription sub;
+        std::string out;          // bytes not sent yet, from `sent` on
+        size_t sent{0};
+        uint64_t stalled_since{0};
+        bool dead{false};
     };
     struct Frame {
         uint32_t topic_hash;
         std::string text;
     };
     void run();
+    // Caller holds mutex_
     void send_to(uint32_t topic_hash, const std::string& frame);
     void send_presence();
+    void queue_to(Client& c, const char* data, size_t len);
+    // Writes what the socket takes; true while bytes are left
+    bool flush(Client& c, uint64_t now_ms);
+    void remove_dead();
 
-    mutable osal::Mutex mutex_;
+    mutable osal::Mutex mutex_;          // clients_, presence_sent_
+    osal::Mutex queue_mutex_;            // pending_
     std::vector<Client> clients_;
+    std::atomic<size_t> client_count_{0};
     std::vector<Frame> pending_;
     std::map<uint32_t, size_t> presence_sent_;   // stream id -> viewer count last announced (hub thread only)
     std::unique_ptr<osal::Thread> thread_;
     std::atomic<bool> running_{false};
     std::atomic<uint64_t> events_sent_{0};
+    std::atomic<uint64_t> events_received_{0};
+    std::atomic<uint64_t> events_dropped_{0};
     size_t max_clients_{6};
 };
 
