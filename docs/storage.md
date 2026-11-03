@@ -30,7 +30,7 @@ On the host simulator, `KUBE32_SD_ROOT=/some/directory` mounts a directory as `/
 | `journal` | `data` | `0x40` | `0x6A0000` | 1 MB (`0x100000`) |
 | `storage` | `data` | `fat` | `0x7A0000` | 384 KB (`0x60000`) |
 
-One app slot holds the running firmware, and the other receives the image written by a [firmware update](firmware-updates.md).
+One app slot holds the running firmware, and the other receives the image written by a [firmware update](firmware-updates.md). Between updates the other slot holds the node's [blobs](#blobs).
 
 ### microSD hardware and mount
 
@@ -177,6 +177,81 @@ Use `kube32 push` to upload a file or directory tree to `<root>/kube32/<path>` v
 kube32 push <file|dir> --node <node> [--path <path>]
 ```
 
+## Blobs
+
+A blob is a named, read-only byte string that a node keeps for its pods, such as the weights of a model. A pod reads a blob in place instead of loading it into its memory, so a blob can be larger than any pod's memory limit. A node has up to two blob stores, searched in this order:
+
+| Store | Where | Read by pods |
+| --- | --- | --- |
+| `flash` | A raw region of the board's own flash: the data partition labelled `blobs` when the partition table has one, otherwise the passive app slot | Mapped into the address space: the [linear algebra](app-development.md#linear-algebra) imports read the weights in place, and `k32_blob_read` copies from the mapping |
+| `sd` | Files in `<card>/kube32/blobs/` on the microSD card | `k32_blob_read` reads the file into the pod's memory |
+
+On `kube32-sim` the flash region is a file, `<data-dir>/blobs.img` (`--blob-region <size>`, 3328 KiB by default, `0` for none), and the card is the `KUBE32_SD_ROOT` directory. Both are mapped there.
+
+### The flash region
+
+The 8 MB partition table has no free space: its two 3.25 MB app slots, the 1 MB journal and the 384 KB `storage` partition fill the flash after the first 128 KB. The slot that does not run the firmware is idle between firmware updates, so it holds the blobs: 3,342,336 bytes (3264 KiB) after the directory. A custom partition table can add a `data` partition labelled `blobs` instead, which kube32 then uses and never shares with the firmware.
+
+On the passive app slot the firmware comes first:
+
+* Staging a firmware image there (`kube32 firmware push` on the control plane, the download of a rollout on a worker) erases the blobs. A pod that has a blob open holds the slot: the staging is refused until the pod closes it or stops.
+* Blobs are written only while the slot holds no staged image (`FirmwareImage` phase `Staged` or `Receiving`) and while the running firmware is confirmed, since an unconfirmed update falls back to the image in that slot. The store reports why it is unavailable.
+* After a firmware update, the node's flash blobs must be uploaded again.
+
+The region starts with two copies of a directory, each in one 4 KiB sector, and each blob starts on a 64 KiB boundary (an MMU page). An upload writes the data, reads it back and compares its CRC-32, and only then writes a new copy of the directory, so a reset during an upload leaves the previous directory in place. The directory holds up to 63 blobs. A blob that is replaced or removed while a pod reads it keeps its old bytes for that pod until the pod closes it.
+
+### Uploading and listing
+
+The API server reaches each node's blobs through the node proxy at `/api/v1/nodes/<node>/proxy/blobs`:
+
+| Request | Result |
+| --- | --- |
+| `GET /blobs` | The stores as JSON: `medium`, `location`, `available` (and `reason`), `capacity`, `free` (the largest blob that fits now) and `blobs` (`name`, `size`, and `crc32` on flash) |
+| `GET /blobs/<name>` | The blob's bytes |
+| `PUT /blobs/<name>` | Stores the body as the blob, replacing one of that name once the whole body is in: `201` new, `200` replaced, `507` no room, `409` busy (the firmware holds the slot, another upload is running, or a pod has the card file open) |
+| `DELETE /blobs/<name>` | Removes the blob |
+
+`?medium=flash` or `?medium=sd` picks the store. A `PUT` goes to the flash region when the node has one, and to the card otherwise; `GET` and `DELETE` use the first store that holds the name. A blob name is 1 to 47 characters of `[A-Za-z0-9._-]`. A `PUT` needs the length up front: `Content-Length`, or `size=<bytes>` in the query with a chunked body (`kubectl replace --raw` sends one):
+
+```
+kubectl --context kube32 replace --raw "/api/v1/nodes/<node>/proxy/blobs/weights?size=<bytes>" -f weights.bin
+kubectl --context kube32 get --raw /api/v1/nodes/<node>/proxy/blobs
+```
+
+The serial gateway accepts request bodies up to 64 KB, so upload larger blobs to the API server's network address. `K32_CMD:BLOBS` on the serial console lists the stores and their blobs.
+
+### Reading blobs from a pod
+
+A pod names the blobs it may open in the annotation `kube32.io/blobs`, separated by commas:
+
+```yaml
+metadata:
+  annotations:
+    kube32.io/blobs: weights,tokenizer
+```
+
+| Import | Returns |
+| --- | --- |
+| `k32_blob_open(name, name_len)` | A handle `0..3`, or `K32_ERR_PERM` (the name is not in the annotation), `K32_ERR_NOENT` (no such blob on this node), `K32_ERR_NODEV` (no blob store), `K32_ERR_MFILE` (4 open) |
+| `k32_blob_size(blob)` | The blob's size in bytes |
+| `k32_blob_read(blob, offset, buf, len)` | Bytes copied to `buf`, fewer only at the end of the blob and `0` past it |
+| `k32_blob_mapped(blob)` | `1` when the linear algebra imports read the blob in place, `0` when only `k32_blob_read` reads it |
+| `k32_blob_close(blob)` | `0` |
+
+`K32_BLOB_ADDR(blob, offset)` in `k32_app_abi.h` is a blob address. The linear algebra imports take one for `w` and `w_scale`, and read a mapped blob there without copying it:
+
+```c
+int32_t w = k32_blob_open("weights", 7);
+/* rows x cols int8 weights at offset 0, then one float scale per row */
+k32_matvec_i8(out, (const int8_t*)K32_BLOB_ADDR(w, 0), (const float*)K32_BLOB_ADDR(w, rows * cols), x, x_scale, rows, cols, 0);
+```
+
+A blob address reaches the first 256 MiB of a blob. An address outside every open blob traps the call with exit code `139`. A blob that is not mapped makes the call return `K32_ERR_NOTSUP`: a pod then reads the rows it needs into its memory with `k32_blob_read`, a few kilobytes at a time, and multiplies them there. Reads from the card are fastest into a 4-byte aligned buffer at offsets that are multiples of 512.
+
+Handles close when the container stops or restarts. A checkpoint does not carry them: a pod restored on another node opens its blobs again in `k32_restored`. Each open card blob holds one of the card's 4 open files.
+
+`apps/blobbench` measures how fast a pod reads a blob on a node: sequential `k32_blob_read` at a given chunk size, `k32_matvec_i8` and `k32_matvec_i4` over a mapped blob in place, and the same products over rows read into memory first.
+
 ## Limitations
 
-* Boards without PSRAM do not run the pod HTTP server on port 7000.
+* A firmware update erases the blobs in a node's passive app slot.

@@ -22,7 +22,8 @@ The firewall reads `resources.requests`, or `resources.limits` when `requests` i
 | `esp32.io/rmt-rx: "1"` | None | One RMT (infrared) receive channel and its pin: `esp32_rmt_receive` |
 | `hardware.kube32.io/tft-display: "1"` | `DISPLAY`, `TFT_DISPLAY` | `k32_display_text`, `k32_display_rect`, `k32_display_bar` |
 | `hardware.kube32.io/keyboard: "1"` | `KEYBOARD` | `k32_key_read` |
-| `hardware.kube32.io/speaker: "1"` | `SPEAKER`, `AUDIO` | `k32_tone` |
+| `hardware.kube32.io/speaker: "1"` | `SPEAKER`, `AUDIO` | `k32_tone`, `k32_audio_play` |
+| `hardware.kube32.io/microphone: "1"` | `MICROPHONE`, `MIC` | `k32_mic_read` |
 | `hardware.kube32.io/ipc: "1"` | `CHANNEL_IPC`, `IPC` | `k32_event_emit`, `kube32_channel_*` |
 | `hardware.kube32.io/sd: "1"` | `SD`, `SD_CARD` | `k32_fs_*` in the pod's volume claim ([storage](storage.md)) |
 | `hardware.kube32.io/chip-temp: "1"` | `CHIP_TEMP` | `esp32_chip_temp_read` |
@@ -37,7 +38,7 @@ Pods share each device that a `hardware.kube32.io/*` resource grants, and a pod 
 | --- | --- |
 | `hardware.kube32.io/ipc` | Every node |
 | `hardware.kube32.io/chip-temp` | Every node: the ESP32-S3's internal sensor, a stand-in in the simulator |
-| `hardware.kube32.io/tft-display`, `keyboard`, `speaker` | Boards with the devices on board (the Cardputer profile) |
+| `hardware.kube32.io/tft-display`, `keyboard`, `speaker`, `microphone` | Boards with the devices on board (the Cardputer profile) |
 | `hardware.kube32.io/sd` | Nodes with a mounted microSD card ([storage](storage.md)) |
 
 A resource that a node no longer has (a card taken out, a board profile changed between boots) is set to `null` in the next status write and leaves the Node. The scheduler does not filter on these resources; the firewall checks the grants at admission.
@@ -77,9 +78,9 @@ Error codes (`include/runtime/k32_app_abi.h`, `include/hal/hal_types.hpp`):
 * `K32_ERR_INVAL`, `-22`, invalid bus, port, or 7-bit address above `0x7f`; empty, overlong, or zero-duration IR frame
 * `K32_ERR_TIMEOUT`, `-110`, transfer timed out
 
-### Cardputer display, keypad, and speaker
+### Cardputer display, keypad, speaker, and microphone
 
-Nodes running the `cardputer` board profile, selected with `K32_CMD:BOARD:cardputer`, expose the M5Stack Cardputer's built-in 240x135 ST7789 display, 56-key matrix, and NS4168 I2S speaker (`src/runtime/app_pod.cpp`, `src/hal/tft_keyboard_hardware.cpp`). On nodes without this profile, these functions return `K32_ERR_NODEV` (`-19`).
+Nodes running the `cardputer` board profile, selected with `K32_CMD:BOARD:cardputer`, expose the M5Stack Cardputer's built-in 240x135 ST7789 display, 56-key matrix, NS4168 I2S speaker, and SPM1423 PDM microphone (`src/runtime/app_pod.cpp`, `src/hal/tft_keyboard_hardware.cpp`). On nodes without this profile, these functions return `K32_ERR_NODEV` (`-19`).
 
 | Import | Wasm signature | C declaration | Behavior |
 | --- | --- | --- | --- |
@@ -87,9 +88,21 @@ Nodes running the `cardputer` board profile, selected with `K32_CMD:BOARD:cardpu
 | `k32_display_rect` | `i(iiiii)` | `int32_t k32_display_rect(int32_t x, int32_t y, int32_t w, int32_t h, uint32_t color565)` | Fills rectangle `x, y, w, h` with RGB565 `color565`. |
 | `k32_display_bar` | `i(iiiiiii)` | `int32_t k32_display_bar(int32_t x, int32_t y, int32_t w, int32_t h, uint32_t pct, uint32_t fg565, uint32_t bg565)` | Draws a horizontal bar at `x, y, w, h` filled to `pct` from `0` to `100`. |
 | `k32_key_read` | `i()` | `int32_t k32_key_read(void)` | Pops the next ASCII key code from the 16-entry scanner queue, or `K32_ERR_AGAIN` (`-11`) when empty. |
-| `k32_tone` | `i(iii)` | `int32_t k32_tone(uint32_t freq_hz, uint32_t duration_ms, uint32_t volume_pct)` | Plays a square-wave tone at `freq_hz` for `duration_ms`, capped at `2000`, and `volume_pct` from `0` to `100`. |
+| `k32_tone` | `i(iii)` | `int32_t k32_tone(uint32_t freq_hz, uint32_t duration_ms, uint32_t volume_pct)` | Plays a square-wave tone at `freq_hz` for `duration_ms`, capped at `2000`, at `volume_pct` (`0` to `100`) of the speaker's ceiling. |
+| `k32_audio_play` | `i(iiii)` | `int32_t k32_audio_play(const int16_t* samples, uint32_t count, uint32_t sample_rate, uint32_t volume_pct)` | Queues `count` signed 16-bit mono samples at `sample_rate` (`8000` to `48000` Hz), at most one second of them per call, at `volume_pct` of the ceiling. Returns the number queued once they are in the output buffer. |
+| `k32_mic_read` | `i(iii)` | `int32_t k32_mic_read(int16_t* out, uint32_t max_samples, uint32_t timeout_ms)` | Copies up to `max_samples` (at most `16000`) samples of 16 kHz signed 16-bit mono PCM from the microphone to `out`, waiting up to `timeout_ms` (at most `1000`). Returns the number copied. |
 
-You can test the keypad and speaker from the serial console with `K32_CMD:KEY:<text>`, `K32_CMD:KEYPOP`, and `K32_CMD:TONE:<n>`.
+You can test the keypad, speaker and microphone from the serial console with `K32_CMD:KEY:<text>`, `K32_CMD:KEYPOP`, `K32_CMD:TONE:<n>` and `K32_CMD:MIC:<ms>`, which records for `<ms>` milliseconds and prints the mean, RMS and peak of every 250 ms.
+
+### Speaker and microphone
+
+The speaker never plays louder than `K32_SPEAKER_MAX_PCT` (25) percent of full scale: the firmware scales every sample of `k32_tone` and `k32_audio_play` to `volume_pct` of that ceiling, so `volume_pct` `100` is the loudest a pod can play.
+
+`k32_audio_play` returns once its samples are in the output buffer; the last 96 ms or so play after it returns. A call that follows before they have played continues the sound without a gap, so a pod streams audio a buffer at a time. The amplifier gets no clock once the samples have played out.
+
+`k32_mic_read` starts the microphone, which records into a 64 ms buffer between calls and stops one second after the last one; `max_samples` `0` stops it at once. The samples are raw from the PDM decimator, with its DC offset. Pods that hold the grant share one stream of samples.
+
+The microphone's clock (GPIO 43) is the speaker's word clock, and the microphone's data line is GPIO 46. Only I2S0 has a PDM receiver, so the two share one controller and one runs at a time. The speaker comes first: playback stops a recording, and `k32_mic_read` waits for playback to end and returns `K32_ERR_BUSY` (`-16`) when it is still playing after `timeout_ms`. A channel exists only while sound moves; between sounds the node holds the speaker's pins low and keeps no audio buffers.
 
 ## Bus configuration and driver lifecycle
 
@@ -289,7 +302,7 @@ The `rfid` [device driver](https://github.com/arterialist/kube32/tree/main/apps/
 The ESP32-S3 provides GPIO 0 to 21 and 26 to 48. The firewall blocks claims on reserved pins (`include/hal/capability_firewall.hpp`):
 
 * Every board (`KUBE32_RESERVED_GPIO_MASK`) reserves GPIO `0` for boot strapping, `19` and `20` for native USB, `26` to `32` for SPI flash and quad PSRAM, and `43` and `44` for the UART0 console. The `cardputer` profile offers GPIO `44` to RMT TX channels for its IR LED. A pod can claim GPIO `0` as an input pin (`esp32.io/gpio-input-0`) to read the boot button.
-* The `cardputer` profile also reserves LCD SPI pins `33` to `38`, I2S speaker pins `41` to `43`, keyboard matrix pins `3` to `9`, `11`, `13`, and `15`, and microSD SPI pins `12`, `14`, `39`, and `40`.
+* The `cardputer` profile also reserves LCD SPI pins `33` to `38`, I2S speaker pins `41` to `43`, microphone data pin `46`, keyboard matrix pins `3` to `9`, `11`, `13`, and `15`, and microSD SPI pins `12`, `14`, `39`, and `40`.
 
 An ADC1 channel `N` from `0` to `9` is claimable only when its pad, GPIO `N + 1`, is claimable by the board profile.
 

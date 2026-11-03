@@ -42,7 +42,9 @@ All imports belong to the `env` module (`src/runtime/app_pod.cpp`, `src/runtime/
 | Node services | `k32_log`, `k32_time_ms`, `k32_unix_time_ms`, `k32_random`, `k32_env_get`, `k32_mem_stats`, `esp32_delay_ms`, `esp32_get_time_us` | `v(ii)`, `I()`, `I()`, `i()`, `i(iiii)`, `i(ii)`, `v(i)`, `I()` | nothing | `include/runtime/k32_app_abi.h` |
 | Linear algebra | `k32_matvec_i8`, `k32_matvec_i4`, `k32_matvec_f32_i8`, `k32_vecmat_f32_i8`, `k32_softmax_f32` | `i(iiiifiii)`, `i(iiiifiii)`, `i(iiiifiiii)`, `i(iiiiiiii)`, `i(ii)` | nothing | [Linear algebra](#linear-algebra) |
 | Storage | `k32_fs_open/read/write/close/size/list/remove` | `i(iii)`, `i(iii)`, `i(iii)`, `i(i)`, `i(i)`, `i(iiii)`, `i(ii)` | `hardware.kube32.io/sd` (`SD`) and a volume claim | [Storage](storage.md), [storage](storage.md) |
+| Blobs | `k32_blob_open`, `k32_blob_size`, `k32_blob_read`, `k32_blob_mapped`, `k32_blob_close` | `i(ii)`, `i(i)`, `i(iiii)`, `i(i)`, `i(i)` | the blob's name in `kube32.io/blobs` | [Blobs](storage.md#blobs) |
 | Cardputer UI | `k32_display_text`, `k32_display_rect`, `k32_display_bar`, `k32_key_read`, `k32_tone` | `i(iiiiii)`, `i(iiiii)`, `i(iiiiiii)`, `i()`, `i(iii)` | `hardware.kube32.io/tft-display` (`DISPLAY`), `keyboard` (`KEYBOARD`), `speaker` (`SPEAKER`) | [Peripherals](peripherals.md), [Capability firewall](architecture/capability-firewall.md) |
+| Cardputer audio | `k32_audio_play`, `k32_mic_read` | `i(iiii)`, `i(iii)` | `hardware.kube32.io/speaker` (`SPEAKER`), `microphone` (`MICROPHONE`) | [Speaker and microphone](peripherals.md#speaker-and-microphone) |
 | ESP32 peripherals | `esp32_gpio_set_mode/write/read`, `esp32_adc_read`, `esp32_i2c_write/read`, `esp32_uart_write/read` | `i(ii)`, `i(ii)`, `i(i)`, `i(i)`, `i(iiii)`, `i(iiii)`, `i(iii)`, `i(iii)` | `esp32.io/*` resources | [Peripherals](peripherals.md), [GPIO and other peripherals](peripherals.md) |
 | Chip temperature | `esp32_chip_temp_read` | `i(i)` | `hardware.kube32.io/chip-temp` (`CHIP_TEMP`) | [Peripherals](peripherals.md) |
 | Infrared (RMT) | `esp32_rmt_send`, `esp32_rmt_receive` | `i(ii)`, `i(ii)` | `esp32.io/rmt-tx`, `esp32.io/rmt-rx` | [Peripherals](peripherals.md#infrared-rmt) |
@@ -68,11 +70,13 @@ The `k32_matvec_*`, `k32_vecmat_f32_i8` and `k32_softmax_f32` imports run the pr
 | `k32_vecmat_f32_i8(out, w, w_scale, x, rows, cols, row_stride, scale_stride)` | `out[c] = sum over r of (x[r] * w_scale[r]) * (float)w[r][c]`, a weighted sum of int8 rows, such as attention over a value cache |
 | `k32_softmax_f32(x, n)` | `x[i] = k32_expf(x[i] - max) / sum` in place |
 
+`w` and `w_scale` may also be blob addresses, `K32_BLOB_ADDR(blob, offset)`: the node then reads the weights from a [blob](storage.md#blobs) in place, and a model larger than the pod's memory never enters it. A blob that is not mapped makes the call return `K32_ERR_NOTSUP` (`-95`).
+
 Row `r` of `w` starts `row_stride` bytes after row `r - 1`, and scale `r` `scale_stride` bytes after scale `r - 1`. A stride of `0` packs the rows, or the scales. Thus a pod passes one head of an interleaved cache without copying it. Each call returns `K32_OK`, or `K32_ERR_INVAL` (`-22`) for a stride that is not `0` and is below a row's bytes (or `4` for `scale_stride`). `out` must not overlap the other operands.
 
 The results are the same bits on every node. Integer sums are exact `int32` values; they wrap beyond that range. Every float step is one IEEE binary32 operation in the order the table shows, sums run from `0` in index order, and the node builds the kernels without fused multiply-adds. `k32_softmax_f32` computes exp with `k32_expf`, an inline function in `k32_app_abi.h`. A pod that computes exp itself with it gets the node's bits.
 
-The node checks every operand against the pod's linear memory before it reads anything. An operand outside the linear memory traps the call with exit code `139` and a message that names the operand and the import, for example `wasm trap: out of bounds memory access: w of k32_matvec_i8`. A metered pod pays for the work before it runs: 10,000 gas units (the cost of a bulk memory instruction), plus 45 (an arithmetic instruction) per unit of work. A matrix call is `rows x (cols + 1)` units and a softmax 32 per element. A call that its budget does not cover traps with exit code `152` and writes nothing.
+The node checks every operand against the pod's linear memory, or a blob address against the blob, before it reads anything. An operand outside the linear memory, or a blob address outside every open blob, traps the call with exit code `139` and a message that names the operand and the import, for example `wasm trap: out of bounds memory access: w of k32_matvec_i8`. A metered pod pays for the work before it runs: 10,000 gas units (the cost of a bulk memory instruction), plus 45 (an arithmetic instruction) per unit of work. A matrix call is `rows x (cols + 1)` units and a softmax 32 per element. A call that its budget does not cover traps with exit code `152` and writes nothing.
 
 ---
 
@@ -535,6 +539,7 @@ Rebuild the firmware with `pio run -e esp32s3`, or reconfigure and build the hos
 | `kube32.io/execution-budget` | Pod | Per-call wasm3 gas limit (`<units>` or `"off"`, default `4000000000`) |
 | `kube32.io/wasm-stack` | Pod | Per-pod wasm3 value stack size (`512` to `64Ki`; default: what the module's calls need, at most `4Ki` for pods up to `64Ki` of linear memory) |
 | `kube32.io/event-topics` | Pod | Comma-separated channel topics delivered to the pod's `k32_event` export |
+| `kube32.io/blobs` | Pod | Comma-separated names of the node's [blobs](storage.md#blobs) that `k32_blob_open` may open |
 | `kube32.io/tick-interval` | Pod | Period of the pod's `k32_tick`: `"250ms"`, `"2s"`, or an integer in milliseconds, from 50 ms to 1 h (default 1 s) |
 | `kube32.io/restore-from` | Pod | A Checkpoint in the pod's namespace: the container starts from its snapshot instead of `k32_init` ([Pod migration](migration.md#kubelet-endpoints)) |
 | `kube32.io/i2c-bus-<N>` | Pod | Bus pins and speed, e.g. `"sda=8,scl=9,hz=100000"` |
