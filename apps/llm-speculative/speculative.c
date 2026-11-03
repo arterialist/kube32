@@ -128,8 +128,12 @@ __attribute__((noinline)) static void fetch(const struct model* m, uint32_t off,
 /* out[p] = W_t of layer l times XQ[p] (cols values each) for n positions:
  * one call reads each row once for all of them (batch 0: a call a position) */
 static void mm_calls(struct model* m, float* out, uint32_t w, uint32_t ws, uint32_t rows, uint32_t cols, uint32_t row_bytes, uint32_t n);
-__attribute__((noinline)) static void mm(struct model* m, float* out, uint32_t l, uint32_t t, uint32_t n) {
-    const uint32_t rows = m->dims[kShape[t] >> 4], cols = m->dims[kShape[t] & 15];
+/* rows 0: the tensor's rows; more take the matrices that follow it in the slice */
+__attribute__((noinline)) static void mm_rows(struct model* m, float* out, uint32_t l, uint32_t t, uint32_t rows, uint32_t n);
+static void mm(struct model* m, float* out, uint32_t l, uint32_t t, uint32_t n) { mm_rows(m, out, l, t, 0, n); }
+__attribute__((noinline)) static void mm_rows(struct model* m, float* out, uint32_t l, uint32_t t, uint32_t rows, uint32_t n) {
+    const uint32_t cols = m->dims[kShape[t] & 15];
+    if (!rows) rows = m->dims[kShape[t] >> 4];
     const uint32_t w = m->base + m->off[l][t], ws = m->base + m->off[l][t - (t >= W1 ? 7 : 8)];
     const uint32_t row_bytes = m->bits == 4 ? (cols + 1) / 2 : cols;
     const uint32_t t0 = now_us();
@@ -168,15 +172,24 @@ __attribute__((noinline)) static void attention(const struct model* m, uint32_t 
 __attribute__((noinline)) static void attention_block(struct model* m, uint32_t l, uint32_t pos0, uint32_t n) {
     const uint32_t dim = m->dim, kvd = m->kvd, hs = m->hs, row = l * g_ctx + pos0;
     norm_quantize(m, X, m->off[l][RMS_ATT], n);
-    mm(m, Q, l, WQ, n);
-    mm(m, K, l, WK, n);
-    mm(m, V, l, WV, n);
     const float* cs = at(m, m->rope_off + 4 * pos0 * hs);
-    k32_rope_f32(Q, cs, dim, hs, n);
-    k32_rope_f32(K, cs, kvd, hs, n);
-    /* K and V of the n positions into the cache, int8 with a scale per KV head */
-    k32_quantize_i8(m->kq + row * kvd, m->ks + row * m->kvh, K, hs, n * m->kvh);
-    k32_quantize_i8(m->vq + row * kvd, m->vs + row * m->kvh, V, hs, n * m->kvh);
+    if (n == 1) {
+        /* one position: q, k and v in one product (Wq, Wk, Wv and their scales follow each other
+         * in the slice) and one rotary call over q and k, the same pairs as two */
+        mm_rows(m, Q, l, WQ, dim + 2 * kvd, 1);
+        k32_rope_f32(Q, cs, dim + kvd, hs, 1);
+        k32_quantize_i8(m->kq + row * kvd, m->ks + row * m->kvh, Q + dim, hs, m->kvh);
+        k32_quantize_i8(m->vq + row * kvd, m->vs + row * m->kvh, Q + dim + kvd, hs, m->kvh);
+    } else {
+        mm(m, Q, l, WQ, n);
+        mm(m, K, l, WK, n);
+        mm(m, V, l, WV, n);
+        k32_rope_f32(Q, cs, dim, hs, n);
+        k32_rope_f32(K, cs, kvd, hs, n);
+        /* K and V of the n positions into the cache, int8 with a scale per KV head */
+        k32_quantize_i8(m->kq + row * kvd, m->ks + row * m->kvh, K, hs, n * m->kvh);
+        k32_quantize_i8(m->vq + row * kvd, m->vs + row * m->kvh, V, hs, n * m->kvh);
+    }
     const uint32_t t0 = now_us();
     attention(m, l, pos0, n, Q, XB2);
     m->att_us += now_us() - t0;
