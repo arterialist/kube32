@@ -1,9 +1,12 @@
 /* micmeter: the microphone's level and a test sound through the speaker
  * (docs/peripherals.md#speaker-and-microphone).
  *
- *   GET /record?ms=<n>          records n ms (at most 10000) and answers the
+ *   GET /record?ms=<n>[&hz=<f>] records n ms (at most 10000) and answers the
  *                               mean (DC offset), RMS and peak around the mean
- *                               of every 250 ms window and of the whole take
+ *                               of every 250 ms window and of the whole take;
+ *                               with hz, also each window's amplitude at f Hz
+ *                               (a Goertzel filter), which picks a test tone
+ *                               out of broadband room noise
  *   GET /play?hz=<f>&ms=<n>&vol=<pct>
  *                               a sine of f Hz for n ms (at most 2000) at pct
  *                               of the speaker's ceiling, streamed as PCM a
@@ -54,11 +57,18 @@ static NOINLINE uint32_t isqrt(uint64_t v) {
     return (uint32_t)r;
 }
 
-struct stats { int64_t sum, sumsq; int32_t min, max; uint32_t n; };
+struct stats { int64_t sum, sumsq; int32_t min, max; uint32_t n; float s1, s2; };
+
+static float g_coeff;     /* 2 cos(2 pi f / RATE), 0 without hz */
 
 static NOINLINE void stats_add(struct stats* s, int32_t v) {
     s->sum += v;
     s->sumsq += (int64_t)v * v;
+    if (g_coeff != 0.0f) {
+        const float s0 = (float)v + g_coeff * s->s1 - s->s2;
+        s->s2 = s->s1;
+        s->s1 = s0;
+    }
     if (v < s->min) s->min = v;
     if (v > s->max) s->max = v;
     s->n++;
@@ -70,12 +80,29 @@ static NOINLINE void stats_put(const struct stats* s) {
     const int64_t peak = s->max - mean > mean - s->min ? s->max - mean : mean - s->min;
     put("{\"mean\":"); put_int(mean);
     put(",\"rms\":"); put_int(var > 0 ? isqrt((uint64_t)var) : 0);
-    put(",\"peak\":"); put_int(peak); put("}");
+    put(",\"peak\":"); put_int(peak);
+    if (g_coeff != 0.0f && s->n) {
+        const float p = s->s1 * s->s1 + s->s2 * s->s2 - g_coeff * s->s1 * s->s2;
+        put(",\"tone\":"); put_int((int64_t)(2u * isqrt(p > 0.0f ? (uint64_t)p : 0) / s->n));
+    }
+    put("}");
 }
 
-static NOINLINE void stats_reset(struct stats* s) { s->sum = s->sumsq = 0; s->min = 32767; s->max = -32768; s->n = 0; }
+static NOINLINE void stats_reset(struct stats* s) { s->sum = s->sumsq = 0; s->min = 32767; s->max = -32768; s->n = 0; s->s1 = s->s2 = 0.0f; }
 
-static NOINLINE void record(uint32_t ms) {
+/* cos(x) for x in [0, pi]: a Taylor series, close enough for a filter coefficient */
+static NOINLINE float cosine(float x) {
+    const float x2 = x * x;
+    float term = 1.0f, sum = 1.0f;
+    for (int k = 1; k <= 6; k++) {
+        term = -term * x2 / (float)((2 * k - 1) * (2 * k));
+        sum += term;
+    }
+    return sum;
+}
+
+static NOINLINE void record(uint32_t ms, uint32_t hz) {
+    g_coeff = hz > 0 && hz < RATE / 2 ? 2.0f * cosine(6.2831853f * (float)hz / (float)RATE) : 0.0f;
     if (ms > 10000) ms = 10000;
     const uint32_t total = ms * (RATE / 1000);
     struct stats all, win;
@@ -172,6 +199,6 @@ K32_EXPORT("k32_handle") int32_t k32_handle(uint32_t ptr, uint32_t len) {
         if (path[k] == '?') { q = path + k + 1; qlen = plen - k - 1; plen = k; break; }
     }
     if (plen == 5 && path[1] == 'p') play(query_uint(q, qlen, "hz", 440), query_uint(q, qlen, "ms", 300), query_uint(q, qlen, "vol", 10));
-    else record(query_uint(q, qlen, "ms", 2000));
+    else record(query_uint(q, qlen, "ms", 2000), query_uint(q, qlen, "hz", 0));
     return 200;
 }
