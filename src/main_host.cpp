@@ -13,6 +13,7 @@
 #include "runtime/pod_memory_pool.h"
 #include "api/http_server.hpp"
 #include "runtime/wasm_runtime.hpp"
+#include "runtime/app_pod.hpp"
 #include "kubelet/kubelet.hpp"
 #include "ipc/channel.hpp"
 #include "net/mdns_discovery.hpp"
@@ -45,6 +46,9 @@
 #include "osal/tls.hpp"
 
 #include <algorithm>
+#include <memory>
+#include <cstring>
+#include <chrono>
 #include <csignal>
 #include <functional>
 #include <thread>
@@ -182,6 +186,83 @@ static bool leave_cluster(const std::string& host, uint16_t port, const std::str
     return false;
 }
 
+// --sim-mic: k32_mic_read hears a recording, as the board's microphone hears
+// the room: the file plays in real time from the first read and loops, the
+// microphone keeps the last 64 ms between reads, and a read with no samples
+// asked for, or the first after a second without reads, starts afresh.
+static bool install_sim_mic(const std::string& path) {
+    std::ifstream f(path, std::ios::binary);
+    if (!f) {
+        std::cerr << "kube32-sim: --sim-mic: cannot read " << path << std::endl;
+        return false;
+    }
+    std::vector<char> raw((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+    size_t begin = 0, end = raw.size();
+    if (raw.size() >= 12 && std::string(raw.data(), 4) == "RIFF" && std::string(raw.data() + 8, 4) == "WAVE") {
+        // the samples are the "data" chunk
+        for (size_t at = 12; at + 8 <= raw.size();) {
+            uint32_t n = 0;
+            std::memcpy(&n, raw.data() + at + 4, 4);
+            if (std::string(raw.data() + at, 4) == "data") {
+                begin = at + 8;
+                end = std::min(raw.size(), begin + n);
+                break;
+            }
+            at += 8 + static_cast<size_t>(n) + (n & 1);
+        }
+    }
+    auto pcm = std::make_shared<std::vector<int16_t>>((end - begin) / 2);
+    if (pcm->empty()) {
+        std::cerr << "kube32-sim: --sim-mic: no samples in " << path << std::endl;
+        return false;
+    }
+    std::memcpy(pcm->data(), raw.data() + begin, pcm->size() * 2);
+    std::cout << "[SIM] microphone: " << path << " (" << pcm->size() / 16 << " ms, looped)" << std::endl;
+
+    struct State {
+        std::mutex mu;
+        bool started = false;
+        std::chrono::steady_clock::time_point t0, last;
+        uint64_t next = 0;   // the next sample a read gets
+    };
+    auto st = std::make_shared<State>();
+    kube32::runtime::AppPlatformHooks hooks = kube32::runtime::app_platform_hooks();
+    hooks.mic_read = [pcm, st](int16_t* out, uint32_t max, uint32_t timeout_ms) -> int32_t {
+        constexpr uint64_t kBuffer = 1024;   // 64 ms
+        using clock = std::chrono::steady_clock;
+        const auto deadline = clock::now() + std::chrono::milliseconds(timeout_ms);
+        std::unique_lock<std::mutex> lock(st->mu);
+        auto heard = [&](clock::time_point t) {
+            return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(t - st->t0).count()) * 16 / 1000;
+        };
+        const auto now = clock::now();
+        if (!st->started) {
+            st->started = true;
+            st->t0 = now;
+        }
+        if (max == 0 || now - st->last > std::chrono::seconds(1)) st->next = heard(now);
+        st->last = now;
+        if (max == 0) return 0;
+        for (;;) {
+            const uint64_t at = heard(clock::now());
+            if (at - st->next > kBuffer) st->next = at - kBuffer;
+            const uint64_t ready = at - st->next;
+            if (ready >= max || clock::now() >= deadline) {
+                const uint32_t n = static_cast<uint32_t>(std::min<uint64_t>(ready, max));
+                for (uint32_t i = 0; i < n; ++i) out[i] = (*pcm)[(st->next + i) % pcm->size()];
+                st->next += n;
+                st->last = clock::now();
+                return static_cast<int32_t>(n);
+            }
+            lock.unlock();
+            std::this_thread::sleep_for(std::chrono::milliseconds(2));
+            lock.lock();
+        }
+    };
+    kube32::runtime::set_app_platform_hooks(hooks);
+    return true;
+}
+
 struct SimOptions {
     std::string role{"standalone"}; // "control-plane", "worker", "standalone"
     std::string node_name{"esp32-master"};
@@ -222,6 +303,7 @@ struct SimOptions {
     // board's reservation, except for workers, which model the Cardputer).
     int64_t psram_bytes{-1};
     std::string sim_i2c;                   // simulated I2C parts on this process's bus 0 (MockHal::attach_parts)
+    std::string sim_mic;                   // 16 kHz mono 16-bit PCM (raw or WAV) the microphone hears, looped
     // A file standing in for the board's flash blob region (<data-dir>/blobs.img):
     // the size of a board's app slot by default, 0 for none
     size_t blob_region_bytes{0x340000};
@@ -266,6 +348,8 @@ static void print_sim_usage(std::ostream& out) {
            "  --sim-i2c <parts>           simulated I2C parts on bus 0 of this process's node, e.g.\n"
            "                              pahub,bme688@2,miniscale@3,rfid@4 (part[:0x<addr>][@<PaHub channel>];\n"
            "                              parts: pahub, bme688, miniscale, rfid)\n"
+           "  --sim-mic <file>            what k32_mic_read hears: 16 kHz mono 16-bit PCM, raw or WAV, played\n"
+           "                              in real time and looped\n"
            "\n"
            "Traffic:\n"
            "  --ingress-port <port>       Ingress controller port (default off)\n"
@@ -334,6 +418,7 @@ static SimOptions parse_sim_args(int argc, char* argv[]) {
             opts.system_reserved_set = true;
         }
         else if (arg == "--sim-i2c" && i + 1 < argc) opts.sim_i2c = argv[++i];
+        else if (arg == "--sim-mic" && i + 1 < argc) opts.sim_mic = argv[++i];
         else if (arg == "--blob-region" && i + 1 < argc) opts.blob_region_bytes = static_cast<size_t>(kube32::models::parse_quantity(argv[++i]));
         else if (arg == "--psram" && i + 1 < argc) {
             opts.psram_bytes = static_cast<int64_t>(kube32::models::parse_quantity(argv[++i]));
@@ -453,6 +538,7 @@ int main(int argc, char* argv[]) {
     kube32::ipc::ChannelManager::instance().start_background(2000);
     // Pods may emit events and print to the stand-in display from their first call
     kube32::app::install_default_platform_hooks();
+    if (!opts.sim_mic.empty() && !install_sim_mic(opts.sim_mic)) return 2;
 
     // Local image registry from the embedded table
     {

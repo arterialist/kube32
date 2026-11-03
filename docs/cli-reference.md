@@ -34,6 +34,7 @@ Use `kubectl` and k9s to manage the cluster. Use the tools below to run the host
 | `--heap-budget <size>` | `51Ki` | General heap available to pods and the system when `--psram 0` is set. With `--psram`, the board's PSRAM besides the pool block (not modelled unless set). |
 | `--system-reserved <size>` | `16Ki` (`24Ki` with `--psram 0`) | Memory the modelled heap keeps back for the system, the equivalent of a board's `K32_CMD:SYSRESERVE`. Pods are never given it: allocatable `memory` and `esp32.io/psram` leave it out, and the Node reports it in the `kube32.io/system-reserved` annotation. It takes effect with `--heap-budget` or `--psram 0`. A control plane board keeps `192Ki`. |
 | `--sim-i2c <parts>` | none | Simulated I2C parts on bus 0 of this process's node, for example `pahub,bme688@2,miniscale@3,rfid@4`. The format is `<part>[:0x<address>][@<PaHub channel>]`, and the parts are `pahub`, `bme688`, `miniscale` and `rfid`. Discovery finds them and drivers read them ([Devices](devices.md#compute-on-a-laptop)). |
+| `--sim-mic <file>` | none | What `k32_mic_read` hears on this process's nodes: 16 kHz mono 16-bit PCM, raw or WAV. The file plays in real time from the first read and loops; as on the board, the microphone keeps the last 64 ms between reads and starts afresh after a read with no samples asked for or a second without reads. |
 | `--ingress-port <port>` | off (`0`) | Ingress controller HTTP port. |
 | `--pod-port <port>` | `7000` | Pod HTTP server port on every node. |
 | `--node-id <id>` | `0` | Node ID for UDP IPC channels. |
