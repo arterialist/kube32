@@ -79,6 +79,7 @@ Profile commands write to the `k32` NVS namespace, return `K32_OK ..., rebooting
 | `K32_CMD:TASKS` | One `K32_TASK` line per FreeRTOS task with state, priority, core, free stack high-water mark, and run time. |
 | `K32_CMD:TASKBT:<task name prefix>` | First 48 words of a blocked task's saved stack for `addr2line`. Exact name matches take precedence over prefix matches. |
 | `K32_CMD:BTALL` | Every task's backtrace for `addr2line`. |
+| `K32_CMD:THROW` | The housekeeping loop raises `std::bad_alloc` on its next pass and logs `[CLUSTER] housekeeping pass skipped: std::bad_alloc`; the node keeps running. |
 | `K32_CMD:HEAP` | `K32_HEAP used\|free <=<size> <blocks> <bytes>` lines: internal heap blocks grouped by size. |
 | `K32_CMD:POOL` | `K32_POOL <offset> <size> used\|free` lines list the chunks of the pod pool block's small heap in address order. |
 | `K32_CMD:BENCH:<kernel>:<n>:<runs>` | `K32_BENCH kernel=<kernel> n=<n> runs=<runs> us_min=<µs> us_total=<µs> sum=<checksum>`: runs a benchmark kernel natively: `fib`, `crc32`, `sieve`, `sort`, `mandel` or `json` (see [Benchmarks](benchmarks.md)). `K32_CMD:BENCH:hostcall:<calls>` times that many `esp_timer_get_time()` calls. |

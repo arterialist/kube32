@@ -10,6 +10,7 @@
 #include <freertos/semphr.h>
 #include <esp_timer.h>
 #include <esp_task_wdt.h>
+#include <cxxabi.h>
 #include <esp_rom_sys.h>
 
 namespace kube32::osal {
@@ -41,9 +42,16 @@ struct Thread::Impl {
     void* arg{nullptr};
     Config config;
 
+    // The entry function runs one frame below the task's first frame: on
+    // Xtensa the unwinder stops at a frame whose return address is zero, which
+    // is how the kernel starts a task, so a catch in the first frame itself is
+    // never reached. The task's exception globals are made here, while memory
+    // is there: a task's first throw otherwise allocates them, and terminates
+    // when it cannot.
     static void freertos_trampoline(void* user_ptr) {
         auto* impl = static_cast<Impl*>(user_ptr);
         bool caps = false;
+        (void)__cxxabiv1::__cxa_get_globals();
         if (impl && impl->entry) {
             impl->entry(impl->arg);
         }
@@ -228,6 +236,7 @@ bool Thread::create(EntryFn entry, void* arg, const Config& config) {
         void* user_arg;
         static void runner(void* p) {
             auto* c = static_cast<TempContext*>(p);
+            (void)__cxxabiv1::__cxa_get_globals();   // see freertos_trampoline
             if (c && c->fn) {
                 c->fn(c->user_arg);
             }

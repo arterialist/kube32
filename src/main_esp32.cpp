@@ -729,6 +729,8 @@ static std::string station_ip() {
 }
 
 static std::atomic<uint32_t> s_join_ip{0};
+// K32_CMD:THROW: the housekeeping loop raises std::bad_alloc on its next pass
+static std::atomic<bool> s_cluster_throw{false};
 
 // Joins `ssid` as a station beside the cluster access point and waits up to
 // `timeout_ms` for an address. Returns the address, or "" after putting the
@@ -882,6 +884,7 @@ static void improv_command(Console& con, const NodeIdentity& ident, const std::s
 //   K32_CMD:FIRMWARE                                     -> the running image and its slot (and what is staged)
 //   K32_CMD:BENCH:<kernel>:<n>:<runs>                    -> the benchmark kernels run natively (docs/benchmarks.md)
 //   K32_CMD:BENCH:hostcall:<calls>                       -> <calls> native esp_timer_get_time calls
+//   K32_CMD:THROW                                        -> the housekeeping loop raises std::bad_alloc once
 //   K32_CMD:REBOOT
 void console_task(void* arg) {
     auto* ctx = static_cast<std::pair<Console*, NodeIdentity*>*>(arg);
@@ -1272,6 +1275,11 @@ void console_task(void* arg) {
                     heap_caps_free(st);
                 }
                 con.write("K32_OK tasks\n", 13);
+            } else if (line == "K32_CMD:THROW") {
+                // The housekeeping loop raises std::bad_alloc on its next pass
+                // and logs "[CLUSTER] housekeeping pass skipped: std::bad_alloc"
+                s_cluster_throw.store(true);
+                con.write("K32_OK throw\n", 13);
             } else if (line.rfind("K32_CMD:KEY:", 0) == 0) {
                 // Inject keystrokes into the matrix keyboard queue ("\\n" = Enter,
                 // "\\b" = Backspace) so the input path can be exercised from a host.
@@ -2155,6 +2163,7 @@ void cluster_task(void* pv) {
         // Out of memory ends the pass, not the task: the next one starts a
         // second later, when pods or requests have let go of some
         try {
+            if (s_cluster_throw.exchange(false)) throw std::bad_alloc();   // K32_CMD:THROW
             if (ingress) ingress->tick();
             if (firmware_rollouts && iter % 3 == 0) {
                 try {
@@ -2289,7 +2298,16 @@ extern "C" void app_main() {
         ret = nvs_flash_init();
     }
     ESP_ERROR_CHECK(ret);
-    xTaskCreatePinnedToCore(cluster_task, "k32_cluster", 9216, nullptr, 5, nullptr, 0);
+    // Through the thread trampoline, never as the task's entry function: on
+    // Xtensa the unwinder stops at a frame whose return address is zero, and
+    // the kernel starts a task with that return address, so a catch written
+    // in the entry function itself is never reached (osal/thread_posix.cpp)
+    kube32::osal::Thread::Config cluster_cfg;
+    cluster_cfg.name = "k32_cluster";
+    cluster_cfg.stack_size = 9216;
+    cluster_cfg.priority = 5;
+    cluster_cfg.core_affinity = 0;
+    kube32::osal::Thread::create(cluster_task, nullptr, cluster_cfg);
 }
 
 #endif

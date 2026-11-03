@@ -81,6 +81,8 @@ All notable changes to this project will be documented in this file. The format 
 
 ### Fixed
 
+- A catch in the housekeeping loop and in the storage task is reached. On Xtensa the unwinder stops at a frame whose return address is zero, which is how FreeRTOS starts a task, so an exception thrown under a task's entry function was never caught there and the node aborted; the control plane did so when its PSRAM ran out. Every task body now runs one frame below the task's entry, and a task's exception globals are set up when it starts, so its first throw allocates nothing. `K32_CMD:THROW` raises `std::bad_alloc` in the housekeeping loop to check this on a board.
+
 - Out of memory in a long-running task ends the pass, not the task. The housekeeping loop of the firmware (ingress, firmware rollouts, peer seeding, journal flush, Wi-Fi supervision), the pod tick thread, the pod event thread, the SSE hub, the IPC receive thread and the pod log writer catch `std::bad_alloc`, log it and run again on their next pass. A control plane whose pods had filled PSRAM aborted in the housekeeping loop and rebooted.
 
 - A kubelet's log epoch fits in 53 bits, so the control plane reads it exactly from JSON and keeps the logs of a node's next boot instead of dropping them as repeats. A JSON number outside `int64_t`, such as an older node's epoch, clamps to that range instead of converting with undefined behavior.

@@ -48,14 +48,21 @@ std::mutex s_call_mutex;
 const mem::FunctionRef<void()>* s_call = nullptr;
 std::exception_ptr s_call_error;
 
+// A frame of its own below the task's entry function: on Xtensa the unwinder
+// stops at a frame whose return address is zero, which is how the kernel
+// starts a task, so a catch in the entry function itself is never reached
+__attribute__((noinline)) void storage_call() {
+    try {
+        (*s_call)();
+    } catch (...) {
+        s_call_error = std::current_exception();
+    }
+}
+
 void storage_task(void*) {
     for (;;) {
         if (xSemaphoreTake(s_call_ready, portMAX_DELAY) != pdTRUE) continue;
-        try {
-            (*s_call)();
-        } catch (...) {
-            s_call_error = std::current_exception();
-        }
+        storage_call();
         xSemaphoreGive(s_call_done);
     }
 }
