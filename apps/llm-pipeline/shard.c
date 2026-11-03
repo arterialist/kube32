@@ -91,30 +91,13 @@ __attribute__((noinline)) static void say(const char* what, int32_t value) {
 }
 
 /* ---- arithmetic: tools/llm.py repeats each operation in this order -------- */
-/* xb = x / rms(x) * w */
-__attribute__((noinline)) static void norm(const float* w) {
-    float ss = 0.0f;
-    for (uint32_t i = 0; i < g_dim; i++) ss += x[i] * x[i];
-    ss = ss / (float)g_dim;
-    ss = ss + 1e-5f;
-    ss = 1.0f / __builtin_sqrtf(ss);
-    for (uint32_t i = 0; i < g_dim; i++) xb[i] = w[i] * (ss * x[i]);
-}
+/* The node computes the products and the element-wise steps natively
+ * (k32_app_abi.h), each float step as one IEEE binary32 operation. */
 
-/* q[0..n) = round(src * 127 / max|src|); returns the scale */
-__attribute__((noinline)) static float quantize(int8_t* qd, const float* src, uint32_t n) {
-    float amax = 0.0f;
-    for (uint32_t i = 0; i < n; i++) {
-        const float a = __builtin_fabsf(src[i]);
-        if (a > amax) amax = a;
-    }
-    const float inv = amax == 0.0f ? 0.0f : 127.0f / amax;
-    for (uint32_t i = 0; i < n; i++) {
-        const float t = src[i] * inv;
-        int32_t r = (int32_t)(t + (t >= 0.0f ? 0.5f : -0.5f));
-        qd[i] = (int8_t)(r > 127 ? 127 : r < -127 ? -127 : r);
-    }
-    return amax / 127.0f;
+/* xb = x / rms(x) * w, then xq and g_xs, its int8 values and their scale */
+__attribute__((noinline)) static void norm_quantize(const float* w) {
+    k32_rmsnorm_f32(xb, x, w, g_dim, 1, 1e-5f);
+    k32_quantize_i8(xq, &g_xs, xb, g_dim, 1);
 }
 
 /* out = W_t xq of layer g_l, with W's row scales and g_xs; the node
@@ -125,16 +108,6 @@ __attribute__((noinline)) static void proj(float* out, uint32_t t) {
     const uint32_t rows = g_dims[kShape[t] >> 4], n = g_dims[kShape[t] & 15];
     if (g_bits == 4) k32_matvec_i4(out, w, ws, xq, g_xs, rows, n, 0);
     else k32_matvec_i8(out, w, ws, xq, g_xs, rows, n, 0);
-}
-
-/* the rotary embedding of every head of a (n floats) for this position */
-__attribute__((noinline)) static void rope(float* a, uint32_t n, const float* cs) {
-    for (uint32_t i = 0; i < n; i += 2) {
-        const float c = cs[i % g_hs], s = cs[i % g_hs + 1];
-        const float a0 = a[i], a1 = a[i + 1];
-        a[i] = a0 * c - a1 * s;
-        a[i + 1] = a0 * s + a1 * c;
-    }
 }
 
 /* The functions on the path of a compute stay short: wasm3 keeps a native
@@ -156,67 +129,51 @@ __attribute__((noinline)) static void attention(uint32_t pos) {
     }
 }
 
-static void residual(void) { for (uint32_t i = 0; i < g_dim; i++) x[i] += xb[i]; }
-
 /* q, k, v of norm(x); k and v into the cache at pos */
 __attribute__((noinline)) static void qkv(uint32_t pos, const float* cs) {
-    norm((const float*)g_t[g_l][RMS_ATT]);
-    g_xs = quantize(xq, xb, g_dim);
+    norm_quantize((const float*)g_t[g_l][RMS_ATT]);
     proj(q, WQ);
     proj(k, WK);
     proj(v, WV);
-    rope(q, g_dim, cs);
-    rope(k, g_kvd, cs);
+    k32_rope_f32(q, cs, g_dim, g_hs, 1);
+    k32_rope_f32(k, cs, g_kvd, g_hs, 1);
+    /* int8 with a scale per KV head */
     const uint32_t row = g_l * g_ctx + pos;
-    for (uint32_t h = 0; h < g_kvh; h++) {
-        const uint32_t o = h * g_hs;
-        g_ks[row * g_kvh + h] = quantize(g_kq + row * g_kvd + o, k + o, g_hs);
-        g_vs[row * g_kvh + h] = quantize(g_vq + row * g_kvd + o, v + o, g_hs);
-    }
+    k32_quantize_i8(g_kq + row * g_kvd, g_ks + row * g_kvh, k, g_hs, g_kvh);
+    k32_quantize_i8(g_vq + row * g_kvd, g_vs + row * g_kvh, v, g_hs, g_kvh);
 }
 
 /* x += Wo attention(q, k, v) */
 __attribute__((noinline)) static void attention_block(uint32_t pos, const float* cs) {
     qkv(pos, cs);
     attention(pos);
-    g_xs = quantize(xq, xb2, g_dim);
+    k32_quantize_i8(xq, &g_xs, xb2, g_dim, 1);
     proj(xb, WO);
-    residual();
-}
-
-/* hb = silu(hb) * hb2 */
-__attribute__((noinline)) static void silu(void) {
-    for (uint32_t i = 0; i < g_hidden; i++) {
-        float a = hb[i];
-        a = a * (1.0f / (1.0f + llm_exp(-a)));
-        hb[i] = a * hb2[i];
-    }
+    k32_add_f32(x, xb, g_dim);
 }
 
 /* x += W2 (silu(W1 norm(x)) * W3 norm(x)) */
 __attribute__((noinline)) static void ffn_block(void) {
-    norm((const float*)g_t[g_l][RMS_FFN]);
-    g_xs = quantize(xq, xb, g_dim);
+    norm_quantize((const float*)g_t[g_l][RMS_FFN]);
     proj(hb, W1);
     proj(hb2, W3);
-    silu();
-    g_xs = quantize(xq, hb, g_hidden);
+    k32_swiglu_f32(hb, hb2, g_hidden);   /* hb = silu(hb) * hb2 */
+    k32_quantize_i8(xq, &g_xs, hb, g_hidden, 1);
     proj(xb, W2);
-    residual();
+    k32_add_f32(x, xb, g_dim);
 }
 
 /* the most likely next token, the first of equal ones; the logits go
  * through hb, g_hidden at a time */
 __attribute__((noinline)) static uint32_t classify(void) {
-    norm(g_rms_final);
-    const float s = quantize(xq, xb, g_dim);
+    norm_quantize(g_rms_final);
     uint32_t best = 0;
     float best_logit = 0.0f;
     for (uint32_t r0 = 0; r0 < g_vocab; r0 += g_hidden) {
         const uint32_t n = g_vocab - r0 < g_hidden ? g_vocab - r0 : g_hidden;
-        k32_matvec_i8(hb, g_cls_q + r0 * g_dim, g_cls_s + r0, xq, s, n, g_dim, 0);
-        for (uint32_t r = 0; r < n; r++)
-            if (r0 + r == 0 || hb[r] > best_logit) { best = r0 + r; best_logit = hb[r]; }
+        k32_matvec_i8(hb, g_cls_q + r0 * g_dim, g_cls_s + r0, xq, g_xs, n, g_dim, 0);
+        const uint32_t r = (uint32_t)k32_argmax_f32(hb, n);
+        if (r0 == 0 || hb[r] > best_logit) { best = r0 + r; best_logit = hb[r]; }
     }
     return best;
 }

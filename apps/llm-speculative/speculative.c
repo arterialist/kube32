@@ -1,7 +1,7 @@
 /* llm-speculative: greedy speculative decoding in one pod. The target model's
  * weights stay in a flash blob and the node's kernels read them in place;
- * so do the draft model's, in a blob of their own. The pod's memory holds
- * the activations, both KV caches and the norm and rotary tables.
+ * so do the draft model's, in a blob of their own, and their norm weights and
+ * rotary tables. The pod's memory holds the activations and both KV caches.
  *
  * A pass drafts k tokens with the draft model, then runs the target over the
  * newest token and the k drafts at once: k32_matmul_* reads each weight row
@@ -54,13 +54,12 @@ struct model {
     uint32_t dims[4];
     uint32_t off[LLM_MAX_LAYERS][TENSORS];   /* tensor offsets in the slice */
     uint32_t tok_q, tok_s, rope_off, rms_final, cls_s, cls_q;
-    float* norm;               /* in memory: rms_att, rms_ffn of each layer, then rms_final */
-    float* rope;               /* in memory: [context][head_size] */
     int8_t *kq, *vq;           /* [layer][position][kv_dim] */
     float *ks, *vs;            /* [layer][position][kv_heads] */
     uint32_t valid;            /* cache positions 0..valid-1 hold the current text */
     uint32_t bytes;            /* bytes of weights read since the counter was cleared */
     uint64_t mm_us;            /* time in the matrix products since then */
+    uint64_t att_us;           /* time in attention since then */
 };
 static struct model g_target, g_draft;
 
@@ -108,52 +107,17 @@ __attribute__((noinline)) static void say(const char* what, int32_t value) {
 static uint32_t now_us(void) { return (uint32_t)esp32_get_time_us(); }
 
 /* ---- arithmetic: tools/llm.py repeats each operation in this order -------- */
-/* out = x / rms(x) * w */
-__attribute__((noinline)) static void norm(float* out, const float* x, const float* w, uint32_t n) {
-    float ss = 0.0f;
-    for (uint32_t i = 0; i < n; i++) ss += x[i] * x[i];
-    ss = ss / (float)n;
-    ss = ss + 1e-5f;
-    ss = 1.0f / __builtin_sqrtf(ss);
-    for (uint32_t i = 0; i < n; i++) out[i] = w[i] * (ss * x[i]);
-}
+/* The node's element-wise imports compute each step as llm-shard does
+ * (k32_app_abi.h), for all positions of a pass in one call. */
 
-/* q[0..n) = round(src * 127 / max|src|); returns the scale */
-__attribute__((noinline)) static float quantize(int8_t* qd, const float* src, uint32_t n) {
-    float amax = 0.0f;
-    for (uint32_t i = 0; i < n; i++) {
-        const float a = __builtin_fabsf(src[i]);
-        if (a > amax) amax = a;
-    }
-    const float inv = amax == 0.0f ? 0.0f : 127.0f / amax;
-    for (uint32_t i = 0; i < n; i++) {
-        const float t = src[i] * inv;
-        int32_t r = (int32_t)(t + (t >= 0.0f ? 0.5f : -0.5f));
-        qd[i] = (int8_t)(r > 127 ? 127 : r < -127 ? -127 : r);
-    }
-    return amax / 127.0f;
-}
+/* a float vector of the slice: a blob address the imports read in place */
+static const float* at(const struct model* m, uint32_t off) { return (const float*)(uintptr_t)(m->base + off); }
 
-/* the rotary embedding of every head of a (n floats) at one position */
-__attribute__((noinline)) static void rope(float* a, uint32_t n, const float* cs, uint32_t hs) {
-    for (uint32_t i = 0; i < n; i += 2) {
-        const float c = cs[i % hs], s = cs[i % hs + 1];
-        const float a0 = a[i], a1 = a[i + 1];
-        a[i] = a0 * c - a1 * s;
-        a[i + 1] = a0 * s + a1 * c;
-    }
+/* XQ, XS = the int8 vectors and scales of norm(src[p]) by the weights at off, n positions */
+static void norm_quantize(const struct model* m, const float* src, uint32_t off, uint32_t n) {
+    k32_rmsnorm_f32(XB, src, at(m, off), m->dim, n, 1e-5f);
+    k32_quantize_i8(XQ, XS, XB, m->dim, n);
 }
-
-/* hb = silu(hb) * hb2 */
-__attribute__((noinline)) static void silu(float* hb, const float* hb2, uint32_t n) {
-    for (uint32_t i = 0; i < n; i++) {
-        float a = hb[i];
-        a = a * (1.0f / (1.0f + llm_exp(-a)));
-        hb[i] = a * hb2[i];
-    }
-}
-
-static void residual(float* x, const float* d, uint32_t n) { for (uint32_t i = 0; i < n; i++) x[i] += d[i]; }
 
 /* bytes of the slice at off into dst */
 __attribute__((noinline)) static void fetch(const struct model* m, uint32_t off, void* dst, uint32_t n) {
@@ -204,65 +168,43 @@ __attribute__((noinline)) static void attention(const struct model* m, uint32_t 
     }
 }
 
-/* K and V of one position into the cache, int8 with a scale per KV head */
-__attribute__((noinline)) static void store_kv(struct model* m, uint32_t l, uint32_t pos, const float* k, const float* v) {
-    const uint32_t row = l * g_ctx + pos;
-    for (uint32_t h = 0; h < m->kvh; h++) {
-        const uint32_t o = h * m->hs;
-        m->ks[row * m->kvh + h] = quantize(m->kq + row * m->kvd + o, k + o, m->hs);
-        m->vs[row * m->kvh + h] = quantize(m->vq + row * m->kvd + o, v + o, m->hs);
-    }
-}
-
 /* x += Wo attention(q, k, v) for positions pos0..pos0+n-1 */
 __attribute__((noinline)) static void attention_block(struct model* m, uint32_t l, uint32_t pos0, uint32_t n) {
-    const uint32_t dim = m->dim, kvd = m->kvd;
-    const float* rms_att = m->norm + 2 * l * dim;
-    for (uint32_t i = 0; i < n; i++) {
-        norm(XB + i * dim, X + i * dim, rms_att, dim);
-        XS[i] = quantize(XQ + i * dim, XB + i * dim, dim);
-    }
+    const uint32_t dim = m->dim, kvd = m->kvd, hs = m->hs, row = l * g_ctx + pos0;
+    norm_quantize(m, X, m->off[l][RMS_ATT], n);
     mm(m, Q, l, WQ, n);
     mm(m, K, l, WK, n);
     mm(m, V, l, WV, n);
-    for (uint32_t i = 0; i < n; i++) {
-        const float* cs = m->rope + (pos0 + i) * m->hs;
-        rope(Q + i * dim, dim, cs, m->hs);
-        rope(K + i * kvd, kvd, cs, m->hs);
-        store_kv(m, l, pos0 + i, K + i * kvd, V + i * kvd);
-    }
+    const float* cs = at(m, m->rope_off + 4 * pos0 * hs);
+    k32_rope_f32(Q, cs, dim, hs, n);
+    k32_rope_f32(K, cs, kvd, hs, n);
+    /* K and V of the n positions into the cache, int8 with a scale per KV head */
+    k32_quantize_i8(m->kq + row * kvd, m->ks + row * m->kvh, K, hs, n * m->kvh);
+    k32_quantize_i8(m->vq + row * kvd, m->vs + row * m->kvh, V, hs, n * m->kvh);
+    const uint32_t t0 = now_us();
     for (uint32_t i = 0; i < n; i++) attention(m, l, pos0 + i, Q + i * dim, XB2 + i * dim);
-    for (uint32_t i = 0; i < n; i++) XS[i] = quantize(XQ + i * dim, XB2 + i * dim, dim);
+    m->att_us += now_us() - t0;
+    k32_quantize_i8(XQ, XS, XB2, dim, n);
     mm(m, XB, l, WO, n);
-    for (uint32_t i = 0; i < n; i++) residual(X + i * dim, XB + i * dim, dim);
+    k32_add_f32(X, XB, n * dim);
 }
 
 /* x += W2 (silu(W1 norm(x)) * W3 norm(x)) */
 __attribute__((noinline)) static void ffn_block(struct model* m, uint32_t l, uint32_t n) {
-    const uint32_t dim = m->dim, hidden = m->hidden;
-    const float* rms_ffn = m->norm + (2 * l + 1) * dim;
-    for (uint32_t i = 0; i < n; i++) {
-        norm(XB + i * dim, X + i * dim, rms_ffn, dim);
-        XS[i] = quantize(XQ + i * dim, XB + i * dim, dim);
-    }
+    norm_quantize(m, X, m->off[l][RMS_FFN], n);
     mm(m, HB, l, W1, n);
     mm(m, HB2, l, W3, n);
-    for (uint32_t i = 0; i < n; i++) {
-        silu(HB + i * hidden, HB2 + i * hidden, hidden);
-        XS[i] = quantize(XQ + i * hidden, HB + i * hidden, hidden);
-    }
+    k32_swiglu_f32(HB, HB2, n * m->hidden);
+    k32_quantize_i8(XQ, XS, HB, m->hidden, n);
     mm(m, XB, l, W2, n);
-    for (uint32_t i = 0; i < n; i++) residual(X + i * dim, XB + i * dim, dim);
+    k32_add_f32(X, XB, n * m->dim);
 }
 
 /* The most likely token after positions first..n-1 (the first of equal
  * ones) into next[0..n-first) */
 __attribute__((noinline)) static void classify(struct model* m, uint32_t first, uint32_t n, uint16_t* next) {
     const uint32_t dim = m->dim, cnt = n - first;
-    for (uint32_t i = 0; i < cnt; i++) {
-        norm(XB + i * dim, X + (first + i) * dim, m->norm + 2 * m->nl * dim, dim);
-        XS[i] = quantize(XQ + i * dim, XB + i * dim, dim);
-    }
+    norm_quantize(m, X + first * dim, m->rms_final, cnt);
     const uint32_t w = m->base + m->cls_q, ws = m->base + m->cls_s;
     const uint32_t t0 = now_us();
     if (g_batch) {
@@ -275,13 +217,7 @@ __attribute__((noinline)) static void classify(struct model* m, uint32_t first, 
         }
     }
     m->mm_us += now_us() - t0;
-    for (uint32_t i = 0; i < cnt; i++) {
-        const float* lg = LOGITS + i * m->vocab;
-        uint32_t best = 0;
-        for (uint32_t r = 1; r < m->vocab; r++)
-            if (lg[r] > lg[best]) best = r;
-        next[i] = (uint16_t)best;
-    }
+    for (uint32_t i = 0; i < cnt; i++) next[i] = (uint16_t)k32_argmax_f32(LOGITS + i * m->vocab, m->vocab);
 }
 
 /* Positions pos0..pos0+n-1 (n <= PMAX) with input tokens toks[0..n) into the
@@ -364,21 +300,13 @@ __attribute__((noinline)) static uint32_t open_blob(const char* name, int32_t* h
     return size;
 }
 
-/* the cache and the in-memory norms and rotary table of a model */
+/* the KV cache of a model */
 static void place(struct model* m) {
     const uint32_t kvn = m->nl * m->kvd * g_ctx, ksn = 4 * m->nl * m->kvh * g_ctx;
     m->kq = (int8_t*)take(kvn);
     m->vq = (int8_t*)take(kvn);
     m->ks = (float*)take(ksn);
     m->vs = (float*)take(ksn);
-    m->norm = (float*)take(4 * (2 * m->nl + 1) * m->dim);
-    for (uint32_t l = 0; l < m->nl; l++) {
-        fetch(m, m->off[l][RMS_ATT], m->norm + 2 * l * m->dim, 4 * m->dim);
-        fetch(m, m->off[l][RMS_FFN], m->norm + (2 * l + 1) * m->dim, 4 * m->dim);
-    }
-    fetch(m, m->rms_final, m->norm + 2 * m->nl * m->dim, 4 * m->dim);
-    m->rope = (float*)take(4 * g_ctx * m->hs);
-    fetch(m, m->rope_off, m->rope, 4 * g_ctx * m->hs);
 }
 
 /* A model read in place from its blob; its size, 0 when it is none */
@@ -398,7 +326,7 @@ __attribute__((noinline)) static uint32_t in_place(struct model* m, const char* 
     return n;
 }
 
-static uint32_t per_position(const struct model* m) { return 2 * m->nl * (m->kvd + 4 * m->kvh) + 4 * m->hs; }
+static uint32_t per_position(const struct model* m) { return 2 * m->nl * (m->kvd + 4 * m->kvh); }
 
 __attribute__((noinline)) static void load(uint32_t ctx_limit) {
     uint32_t used, limit;
@@ -423,8 +351,8 @@ __attribute__((noinline)) static void load(uint32_t ctx_limit) {
     const uint32_t fn[] = {dim, dim, dim, dim, dim, dim, hidden, hidden, g_target.vocab};
     for (uint32_t i = 0; i < 9; i++) *f[i] = (float*)take(4 * PMAX * fn[i]);
     XQ = (int8_t*)take(PMAX * (dim > hidden ? dim : hidden));
-    /* the rest: both caches, the rotary tables and the scores, a position at a time */
-    const uint32_t fixed = 4 * (2 * g_target.nl + 1) * g_target.dim + 4 * (2 * g_draft.nl + 1) * g_draft.dim + 256;
+    /* the rest: both caches and the scores, a position at a time */
+    const uint32_t fixed = 256;
     const uint32_t left = g_heap_end - (uint32_t)(uintptr_t)g_heap;
     g_ctx = left > fixed ? (left - fixed) / (per_position(&g_target) + per_position(&g_draft) + 4) : 0;
     if (g_ctx > g_target.seq_len) g_ctx = g_target.seq_len;
@@ -513,6 +441,7 @@ static void prefill(void) {
         g_t0 = (uint64_t)esp32_get_time_us();
         g_target.bytes = g_draft.bytes = 0;
         g_target.mm_us = g_draft.mm_us = 0;
+        g_target.att_us = g_draft.att_us = 0;
     }
 }
 
@@ -696,6 +625,8 @@ __attribute__((noinline)) static void status(void) {
     field("target_positions", g_target_positions, 0);
     field("target_matmul_ms", g_target.mm_us / 1000, 0);
     field("draft_matmul_ms", g_draft.mm_us / 1000, 0);
+    field("target_attention_ms", g_target.att_us / 1000, 0);
+    field("draft_attention_ms", g_draft.att_us / 1000, 0);
     field("target_bytes", tbytes, 0);
     field("target_bytes_per_token", gen ? tbytes / gen : 0, 0);
     put(",\"tokens_list\":[");
@@ -704,6 +635,7 @@ __attribute__((noinline)) static void status(void) {
         if (i) put(",");
         put_u(g_toks[i]);
     }
+    flush();   /* the token list can fill the line */
     put("],\"text\":\"");
     text_out(g_text, g_text_len);
     put("\"}\n");
