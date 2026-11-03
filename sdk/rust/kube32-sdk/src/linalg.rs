@@ -1,6 +1,8 @@
 //! Native products for quantized neural networks (`k32_matvec_i8`,
 //! `k32_matvec_i4`, `k32_matmul_i8`, `k32_matmul_i4`, `k32_matvec_f32_i8`,
-//! `k32_vecmat_f32_i8`, `k32_softmax_f32`, feature `linalg`).
+//! `k32_vecmat_f32_i8`, `k32_softmax_f32`) and their element-wise steps
+//! (`k32_rmsnorm_f32`, `k32_quantize_i8`, `k32_rope_f32`, `k32_swiglu_f32`,
+//! `k32_add_f32`, `k32_argmax_f32`), feature `linalg`.
 //!
 //! The node computes them in native code, with the same bits on every node
 //! (`docs/app-development.md`, Linear algebra). Weights are rows of int8 or
@@ -185,6 +187,83 @@ pub fn softmax_f32(x: &mut [f32]) -> Result<(), Error> {
     Error::from_rc(rc).map(|_| ())
 }
 
+/// `out = w * (x * r)` with `r = 1 / sqrt(sum of x^2 / n + eps)`, for each
+/// of the `x.len() / w.len()` vectors of `n = w.len()` values in `x`; the sum
+/// runs from 0 in order.
+pub fn rmsnorm_f32(out: &mut [f32], x: &[f32], w: &[f32], eps: f32) -> Result<(), Error> {
+    let n = w.len();
+    if n == 0 || x.len() % n != 0 || out.len() != x.len() {
+        return Err(Error::Invalid);
+    }
+    let rc = unsafe { abi::k32_rmsnorm_f32(out.as_mut_ptr(), x.as_ptr(), w.as_ptr(), u32_of(n)?, u32_of(x.len() / n)?, eps) };
+    Error::from_rc(rc).map(|_| ())
+}
+
+/// [`rmsnorm_f32`] in place.
+pub fn rmsnorm_f32_in_place(x: &mut [f32], w: &[f32], eps: f32) -> Result<(), Error> {
+    let n = w.len();
+    if n == 0 || x.len() % n != 0 {
+        return Err(Error::Invalid);
+    }
+    let p = x.as_mut_ptr();
+    let rc = unsafe { abi::k32_rmsnorm_f32(p, p, w.as_ptr(), u32_of(n)?, u32_of(x.len() / n)?, eps) };
+    Error::from_rc(rc).map(|_| ())
+}
+
+/// int8 values and a scale for each of the `scale.len()` vectors of `x`:
+/// `q = round(x * (127 / max |x|))`, half away from zero, clamped to
+/// -127..127 (0 for NaN), and `scale = max |x| / 127`, the `x_scale` of
+/// [`matvec_i8`] and [`matmul_i8`].
+pub fn quantize_i8(q: &mut [i8], scale: &mut [f32], x: &[f32]) -> Result<(), Error> {
+    let count = scale.len();
+    if count == 0 || x.len() % count != 0 || q.len() != x.len() {
+        return Err(Error::Invalid);
+    }
+    let rc = unsafe { abi::k32_quantize_i8(q.as_mut_ptr(), scale.as_mut_ptr(), x.as_ptr(), u32_of(x.len() / count)?, u32_of(count)?) };
+    Error::from_rc(rc).map(|_| ())
+}
+
+/// The rotary embedding of the vectors of `n` values in `x`, in place: vector
+/// `p` turns each pair `(x[i], x[i + 1])` by row `p` of `cs`, `head_size`
+/// values of (cos, sin) pairs taken at `i % head_size`. `n` and `head_size`
+/// are even.
+pub fn rope_f32(x: &mut [f32], cs: &[f32], n: usize, head_size: usize) -> Result<(), Error> {
+    if n == 0 || n % 2 != 0 || head_size == 0 || head_size % 2 != 0 || x.len() % n != 0 {
+        return Err(Error::Invalid);
+    }
+    let count = x.len() / n;
+    if cs.len() < count.checked_mul(head_size).ok_or(Error::Invalid)? {
+        return Err(Error::Invalid);
+    }
+    let rc = unsafe { abi::k32_rope_f32(x.as_mut_ptr(), cs.as_ptr(), u32_of(n)?, u32_of(head_size)?, u32_of(count)?) };
+    Error::from_rc(rc).map(|_| ())
+}
+
+/// `x = (x * (1 / (1 + expf(-x)))) * g`, the gate of a SwiGLU feed-forward
+/// block.
+pub fn swiglu_f32(x: &mut [f32], g: &[f32]) -> Result<(), Error> {
+    if g.len() != x.len() {
+        return Err(Error::Invalid);
+    }
+    let rc = unsafe { abi::k32_swiglu_f32(x.as_mut_ptr(), g.as_ptr(), u32_of(x.len())?) };
+    Error::from_rc(rc).map(|_| ())
+}
+
+/// `x = x + y`.
+pub fn add_f32(x: &mut [f32], y: &[f32]) -> Result<(), Error> {
+    if y.len() != x.len() {
+        return Err(Error::Invalid);
+    }
+    let rc = unsafe { abi::k32_add_f32(x.as_mut_ptr(), y.as_ptr(), u32_of(x.len())?) };
+    Error::from_rc(rc).map(|_| ())
+}
+
+/// The index of the first largest value (0 for an empty slice).
+pub fn argmax_f32(x: &[f32]) -> Result<usize, Error> {
+    let rc = unsafe { abi::k32_argmax_f32(x.as_ptr(), u32_of(x.len())?) };
+    Error::from_rc(rc).map(|i| i as usize)
+}
+
 /// e^x as `k32_softmax_f32` computes it on every node (`k32_expf` in
 /// `k32_app_abi.h`): x = n ln2 + r, then a degree-6 polynomial for e^r, each
 /// step one `f32` operation. 0 below -87, e^88 above 88.
@@ -226,6 +305,23 @@ mod tests {
         for (x, bits) in cases {
             assert_eq!(expf(x).to_bits(), bits, "expf({x})");
         }
+    }
+
+    #[test]
+    fn vectors_that_do_not_fit_their_slices_are_refused() {
+        let mut out = [0.0f32; 8];
+        let mut x = [0.0f32; 8];
+        let mut q = [0i8; 8];
+        assert_eq!(rmsnorm_f32(&mut out, &x, &[1.0; 3], 1e-5), Err(Error::Invalid));
+        assert_eq!(rmsnorm_f32(&mut out[..4], &x, &[1.0; 4], 1e-5), Err(Error::Invalid));
+        assert_eq!(rmsnorm_f32_in_place(&mut x, &[], 1e-5), Err(Error::Invalid));
+        assert_eq!(quantize_i8(&mut q, &mut [0.0; 3], &x), Err(Error::Invalid));
+        assert_eq!(quantize_i8(&mut q[..4], &mut [0.0; 2], &x), Err(Error::Invalid));
+        assert_eq!(rope_f32(&mut x, &[0.0; 8], 3, 2), Err(Error::Invalid));
+        assert_eq!(rope_f32(&mut x, &[0.0; 8], 4, 3), Err(Error::Invalid));
+        assert_eq!(rope_f32(&mut x, &[0.0; 7], 4, 4), Err(Error::Invalid));
+        assert_eq!(swiglu_f32(&mut x, &[0.0; 7]), Err(Error::Invalid));
+        assert_eq!(add_f32(&mut x, &[0.0; 9]), Err(Error::Invalid));
     }
 
     #[test]

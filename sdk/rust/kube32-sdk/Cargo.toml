@@ -30,6 +30,7 @@ hardware = []
 # k32_fs_* wrappers (pod storage on the microSD card). Calls need
 # hardware.kube32.io/sd: "1" and a volume claim in the pod manifest.
 fs = []
-# k32_matvec_*, k32_vecmat_f32_i8 and k32_softmax_f32 wrappers: native
+# k32_matvec_*, k32_matmul_*, k32_vecmat_f32_i8, k32_softmax_f32 and the
+# element-wise wrappers (rmsnorm, quantize, rope, swiglu, add, argmax): native
 # products for quantized neural networks. They need no manifest resource.
 linalg = []

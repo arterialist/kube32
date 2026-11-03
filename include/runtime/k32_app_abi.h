@@ -328,7 +328,8 @@ K32_IMPORT("k32_http_status") int32_t k32_http_status(void);
  * node computes the same bits. A metered pod pays 10,000 gas units plus 45
  * per unit of work before the call runs: rows x (cols + 1) units for a
  * matrix (n times that for k32_matmul_*), 32 per element for
- * k32_softmax_f32.
+ * k32_softmax_f32 and k32_swiglu_f32, 4 for k32_rmsnorm_f32 and
+ * k32_quantize_i8, 3 for k32_rope_f32, 1 for k32_add_f32 and k32_argmax_f32.
  *
  * w is a matrix of rows x cols weights, row r starting row_stride bytes
  * after row r - 1 (0: the rows follow each other); w_scale holds one float
@@ -365,7 +366,35 @@ K32_IMPORT("k32_http_status") int32_t k32_http_status(void);
  *   out[c] = sum over r of (x[r] * w_scale[r]) * (float)w[r][c]
  *
  * k32_softmax_f32: x[i] = k32_expf(x[i] - max) / sum, in place over n
- * floats, the sum from 0 in order. */
+ * floats, the sum from 0 in order.
+ *
+ * Element-wise operations, over count vectors of n floats one after another
+ * (the positions of a batch, or the heads of one), each element as one
+ * IEEE binary32 operation per step in the order written:
+ *
+ * k32_rmsnorm_f32: out = w * (x * r) with r = 1 / sqrt(ss / n + eps), ss the
+ * sum of x^2 from 0 in order; w holds n floats for every vector. out may be
+ * x; w may be a blob address.
+ *
+ * k32_quantize_i8: q = round(x * (127 / max |x|)), half away from zero,
+ * clamped to -127..127 (0 for NaN), and scale = max |x| / 127, for each
+ * vector: q receives count x n values, scale count floats. A vector of zeros
+ * gets q 0 and scale 0. Its scale is the x_scale of k32_matvec and
+ * k32_matmul, or of a KV cache row.
+ *
+ * k32_rope_f32: the rotary embedding in place. Vector p turns each pair
+ * (x[i], x[i + 1]) by the angle of cs row p, head_size floats of (cos, sin)
+ * pairs taken at i % head_size: x[i] = x[i] * c - x[i + 1] * s and
+ * x[i + 1] = x[i] * s + x[i + 1] * c. cs may be a blob address. n and
+ * head_size must be even (K32_ERR_INVAL otherwise).
+ *
+ * k32_swiglu_f32: x = (x * (1 / (1 + k32_expf(-x)))) * g over n floats, the
+ * gate of a SwiGLU feed-forward block.
+ *
+ * k32_add_f32: x = x + y over n floats, a residual connection.
+ *
+ * k32_argmax_f32: the index of the first largest of n floats (0 for n = 0),
+ * a greedy pick from logits. */
 K32_IMPORT("k32_matvec_i8") int32_t k32_matvec_i8(float* out, const int8_t* w, const float* w_scale, const int8_t* x, float x_scale,
                                                   uint32_t rows, uint32_t cols, uint32_t row_stride);
 K32_IMPORT("k32_matvec_i4") int32_t k32_matvec_i4(float* out, const void* w, const float* w_scale, const int8_t* x, float x_scale,
@@ -379,6 +408,12 @@ K32_IMPORT("k32_matvec_f32_i8") int32_t k32_matvec_f32_i8(float* out, const int8
 K32_IMPORT("k32_vecmat_f32_i8") int32_t k32_vecmat_f32_i8(float* out, const int8_t* w, const float* w_scale, const float* x,
                                                           uint32_t rows, uint32_t cols, uint32_t row_stride, uint32_t scale_stride);
 K32_IMPORT("k32_softmax_f32") int32_t k32_softmax_f32(float* x, uint32_t n);
+K32_IMPORT("k32_rmsnorm_f32") int32_t k32_rmsnorm_f32(float* out, const float* x, const float* w, uint32_t n, uint32_t count, float eps);
+K32_IMPORT("k32_quantize_i8") int32_t k32_quantize_i8(int8_t* q, float* scale, const float* x, uint32_t n, uint32_t count);
+K32_IMPORT("k32_rope_f32") int32_t k32_rope_f32(float* x, const float* cs, uint32_t n, uint32_t head_size, uint32_t count);
+K32_IMPORT("k32_swiglu_f32") int32_t k32_swiglu_f32(float* x, const float* g, uint32_t n);
+K32_IMPORT("k32_add_f32") int32_t k32_add_f32(float* x, const float* y, uint32_t n);
+K32_IMPORT("k32_argmax_f32") int32_t k32_argmax_f32(const float* x, uint32_t n);
 
 /* ---- Hardware imports, gated by the capability firewall ---------------
  * The pod manifest must request the matching resource:

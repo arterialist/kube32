@@ -2,7 +2,9 @@
 //!
 //! Signatures mirror the `m3_LinkRawFunction` calls in
 //! `src/runtime/app_pod.cpp` (`k32_*`), `src/runtime/pod_linalg.cpp`
-//! (`k32_matvec_*`, `k32_vecmat_f32_i8`, `k32_softmax_f32`) and `src/runtime/host_functions.cpp`
+//! (`k32_matvec_*`, `k32_matmul_*`, `k32_vecmat_f32_i8`, `k32_softmax_f32`, the element-wise
+//! `k32_rmsnorm_f32`, `k32_quantize_i8`, `k32_rope_f32`, `k32_swiglu_f32`, `k32_add_f32`,
+//! `k32_argmax_f32`) and `src/runtime/host_functions.cpp`
 //! (`esp32_delay_ms`, `esp32_rmt_*`, `kube32_channel_*`): pointers and
 //! lengths are `i32`/`u32` in wasm, `k32_time_ms` returns `i64`. The GPIO,
 //! ADC, I2C and UART imports of host_functions.cpp are not wrapped by this
@@ -91,6 +93,12 @@ extern "C" {
     ) -> i32;
     pub fn k32_vecmat_f32_i8(out: *mut f32, w: *const i8, w_scale: *const f32, x: *const f32, rows: u32, cols: u32, row_stride: u32, scale_stride: u32) -> i32;
     pub fn k32_softmax_f32(x: *mut f32, n: u32) -> i32;
+    pub fn k32_rmsnorm_f32(out: *mut f32, x: *const f32, w: *const f32, n: u32, count: u32, eps: f32) -> i32;
+    pub fn k32_quantize_i8(q: *mut i8, scale: *mut f32, x: *const f32, n: u32, count: u32) -> i32;
+    pub fn k32_rope_f32(x: *mut f32, cs: *const f32, n: u32, head_size: u32, count: u32) -> i32;
+    pub fn k32_swiglu_f32(x: *mut f32, g: *const f32, n: u32) -> i32;
+    pub fn k32_add_f32(x: *mut f32, y: *const f32, n: u32) -> i32;
+    pub fn k32_argmax_f32(x: *const f32, n: u32) -> i32;
 
     // Low-level imports from host_functions.cpp that app pods use
     pub fn esp32_delay_ms(ms: u32);
@@ -145,6 +153,12 @@ mod stubs {
     pub unsafe fn k32_matvec_f32_i8(out: *mut f32, w: *const i8, w_scale: *const f32, x: *const f32, alpha: f32, rows: u32, cols: u32, row_stride: u32, scale_stride: u32) -> i32 { no_host() }
     pub unsafe fn k32_vecmat_f32_i8(out: *mut f32, w: *const i8, w_scale: *const f32, x: *const f32, rows: u32, cols: u32, row_stride: u32, scale_stride: u32) -> i32 { no_host() }
     pub unsafe fn k32_softmax_f32(x: *mut f32, n: u32) -> i32 { no_host() }
+    pub unsafe fn k32_rmsnorm_f32(out: *mut f32, x: *const f32, w: *const f32, n: u32, count: u32, eps: f32) -> i32 { no_host() }
+    pub unsafe fn k32_quantize_i8(q: *mut i8, scale: *mut f32, x: *const f32, n: u32, count: u32) -> i32 { no_host() }
+    pub unsafe fn k32_rope_f32(x: *mut f32, cs: *const f32, n: u32, head_size: u32, count: u32) -> i32 { no_host() }
+    pub unsafe fn k32_swiglu_f32(x: *mut f32, g: *const f32, n: u32) -> i32 { no_host() }
+    pub unsafe fn k32_add_f32(x: *mut f32, y: *const f32, n: u32) -> i32 { no_host() }
+    pub unsafe fn k32_argmax_f32(x: *const f32, n: u32) -> i32 { no_host() }
     pub unsafe fn esp32_delay_ms(ms: u32) { no_host() }
     pub unsafe fn kube32_channel_open(name: *const u8, flags: u32) -> i32 { no_host() }
     pub unsafe fn kube32_channel_send(handle: i32, data: *const u8, len: u32) -> i32 { no_host() }

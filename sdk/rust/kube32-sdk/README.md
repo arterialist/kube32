@@ -31,7 +31,7 @@ RUSTFLAGS="-C link-arg=-zstack-size=16384 -C link-arg=--initial-memory=65536 -C 
 - `panic-handler` (default): a `#[panic_handler]` that logs through `k32_log` and traps.
 - `hardware`: the display, keypad, speaker and infrared imports.
 - `fs`: the `k32_fs_*` imports for pod volumes.
-- `linalg`: native products for quantized neural networks (`k32_matvec_*`, `k32_vecmat_f32_i8`, `k32_softmax_f32`).
+- `linalg`: native products for quantized neural networks (`k32_matvec_*`, `k32_matmul_*`, `k32_vecmat_f32_i8`, `k32_softmax_f32`) and their element-wise steps (`k32_rmsnorm_f32`, `k32_quantize_i8`, `k32_rope_f32`, `k32_swiglu_f32`, `k32_add_f32`, `k32_argmax_f32`).
 
 The [pod guide](https://arterialist.github.io/kube32/app-development/) covers the request format, limits, entry-point pods and manifests.
 

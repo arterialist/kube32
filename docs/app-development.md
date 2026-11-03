@@ -40,7 +40,7 @@ All imports belong to the `env` module (`src/runtime/app_pod.cpp`, `src/runtime/
 | HTTP calls | `k32_http_call`, `k32_http_status` | `i(iiiiiiiiiiii)`, `i()` | `securityContext.capabilities.add: ["SERVICE_CALL"]` | [Networking](networking.md) |
 | Events and channels | `k32_event_emit`, `kube32_channel_open/send/recv/close` | `i(iiii)`, `i(ii)`, `i(iii)`, `i(iiii)`, `i(i)` | `hardware.kube32.io/ipc` (`CHANNEL_IPC`) | [Networking](networking.md) |
 | Node services | `k32_log`, `k32_time_ms`, `k32_unix_time_ms`, `k32_random`, `k32_env_get`, `k32_mem_stats`, `esp32_delay_ms`, `esp32_get_time_us` | `v(ii)`, `I()`, `I()`, `i()`, `i(iiii)`, `i(ii)`, `v(i)`, `I()` | nothing | `include/runtime/k32_app_abi.h` |
-| Linear algebra | `k32_matvec_i8`, `k32_matvec_i4`, `k32_matmul_i8`, `k32_matmul_i4`, `k32_matvec_f32_i8`, `k32_vecmat_f32_i8`, `k32_softmax_f32` | `i(iiiifiii)`, `i(iiiifiii)`, `i(iiiiiiiii)`, `i(iiiiiiiii)`, `i(iiiifiiii)`, `i(iiiiiiii)`, `i(ii)` | nothing | [Linear algebra](#linear-algebra) |
+| Linear algebra | `k32_matvec_i8`, `k32_matvec_i4`, `k32_matmul_i8`, `k32_matmul_i4`, `k32_matvec_f32_i8`, `k32_vecmat_f32_i8`, `k32_softmax_f32`, `k32_rmsnorm_f32`, `k32_quantize_i8`, `k32_rope_f32`, `k32_swiglu_f32`, `k32_add_f32`, `k32_argmax_f32` | `i(iiiifiii)`, `i(iiiifiii)`, `i(iiiiiiiii)`, `i(iiiiiiiii)`, `i(iiiifiiii)`, `i(iiiiiiii)`, `i(ii)`, `i(iiiiif)`, `i(iiiii)`, `i(iiiii)`, `i(iii)`, `i(iii)`, `i(ii)` | nothing | [Linear algebra](#linear-algebra) |
 | Storage | `k32_fs_open/read/write/close/size/list/remove` | `i(iii)`, `i(iii)`, `i(iii)`, `i(i)`, `i(i)`, `i(iiii)`, `i(ii)` | `hardware.kube32.io/sd` (`SD`) and a volume claim | [Storage](storage.md), [storage](storage.md) |
 | Blobs | `k32_blob_open`, `k32_blob_size`, `k32_blob_read`, `k32_blob_mapped`, `k32_blob_close` | `i(ii)`, `i(i)`, `i(iiii)`, `i(i)`, `i(i)` | the blob's name in `kube32.io/blobs` | [Blobs](storage.md#blobs) |
 | Cardputer UI | `k32_display_text`, `k32_display_rect`, `k32_display_bar`, `k32_key_read`, `k32_tone` | `i(iiiiii)`, `i(iiiii)`, `i(iiiiiii)`, `i()`, `i(iii)` | `hardware.kube32.io/tft-display` (`DISPLAY`), `keyboard` (`KEYBOARD`), `speaker` (`SPEAKER`) | [Peripherals](peripherals.md), [Capability firewall](architecture/capability-firewall.md) |
@@ -60,7 +60,7 @@ Calls without the required resource or capability return `K32_ERR_PERM` (`-1`) a
 
 ### Linear algebra
 
-The `k32_matvec_*`, `k32_matmul_*`, `k32_vecmat_f32_i8` and `k32_softmax_f32` imports run the products of small quantized neural networks in native code instead of the interpreter. Any pod can call them; a pod that does not import them does not get them. Weights are rows of int8 (or int4) values with one float scale per row:
+The `k32_matvec_*`, `k32_matmul_*`, `k32_vecmat_f32_i8` and `k32_softmax_f32` imports run the products of small quantized neural networks in native code instead of the interpreter, and the element-wise imports below run the steps between them. Any pod can call them; a pod that does not import them does not get them. Weights are rows of int8 (or int4) values with one float scale per row:
 
 | Import | Computes |
 | --- | --- |
@@ -72,15 +72,26 @@ The `k32_matvec_*`, `k32_matmul_*`, `k32_vecmat_f32_i8` and `k32_softmax_f32` im
 | `k32_vecmat_f32_i8(out, w, w_scale, x, rows, cols, row_stride, scale_stride)` | `out[c] = sum over r of (x[r] * w_scale[r]) * (float)w[r][c]`, a weighted sum of int8 rows, such as attention over a value cache |
 | `k32_softmax_f32(x, n)` | `x[i] = k32_expf(x[i] - max) / sum` in place |
 
-`w` and `w_scale` may also be blob addresses, `K32_BLOB_ADDR(blob, offset)`: the node then reads the weights from a [blob](storage.md#blobs) in place, and a model larger than the pod's memory never enters it. A blob that is not mapped makes the call return `K32_ERR_NOTSUP` (`-95`).
+The element-wise imports work on `count` vectors of `n` floats that follow each other, such as the positions of a batch or the heads of one position, in one call:
+
+| Import | Computes |
+| --- | --- |
+| `k32_rmsnorm_f32(out, x, w, n, count, eps)` | `out = w * (x * r)` with `r = 1 / sqrt(ss / n + eps)` and `ss` the sum of `x^2` from `0` in order, for each vector; `w` holds `n` floats. `out` may be `x` |
+| `k32_quantize_i8(q, scale, x, n, count)` | `q = round(x * (127 / max abs x))`, half away from zero, clamped to `-127..127` (`0` for NaN), and `scale = max abs x / 127`, for each vector: `q` receives `count x n` int8 values, `scale` `count` floats, the `x_scale` of the products. A vector of zeros gets `q = 0`, `scale = 0` |
+| `k32_rope_f32(x, cs, n, head_size, count)` | The rotary embedding in place: vector `p` turns each pair `(x[i], x[i + 1])` by row `p` of `cs`, `head_size` floats of (cos, sin) pairs taken at `i % head_size`: `x[i] * c - x[i + 1] * s`, `x[i] * s + x[i + 1] * c`. `n` and `head_size` are even (`K32_ERR_INVAL` otherwise) |
+| `k32_swiglu_f32(x, g, n)` | `x = (x * (1 / (1 + k32_expf(-x)))) * g` over `n` floats, the gate of a SwiGLU feed-forward block |
+| `k32_add_f32(x, y, n)` | `x = x + y` over `n` floats, a residual connection |
+| `k32_argmax_f32(x, n)` | Returns the index of the first largest of `n` floats (`0` for `n = 0`), a greedy pick from logits |
+
+`w` and `w_scale` may also be blob addresses, `K32_BLOB_ADDR(blob, offset)`, and so may `w` of `k32_rmsnorm_f32` and `cs` of `k32_rope_f32`: the node then reads the weights from a [blob](storage.md#blobs) in place, and a model larger than the pod's memory never enters it. A blob that is not mapped makes the call return `K32_ERR_NOTSUP` (`-95`).
 
 `k32_matmul_*` gives the bits of `n` `k32_matvec_*` calls, and reads each row of `w` once for all `n` vectors. A pod that applies one matrix to several vectors, such as a language model that checks several drafted tokens in one pass, thus reads weights that stream from flash once instead of once a vector. Its scales are packed.
 
-Row `r` of `w` starts `row_stride` bytes after row `r - 1`, and scale `r` `scale_stride` bytes after scale `r - 1`. A stride of `0` packs the rows, or the scales. Thus a pod passes one head of an interleaved cache without copying it. Each call returns `K32_OK`, or `K32_ERR_INVAL` (`-22`) for a stride that is not `0` and is below a row's bytes (or `4` for `scale_stride`). `out` must not overlap the other operands.
+Row `r` of `w` starts `row_stride` bytes after row `r - 1`, and scale `r` `scale_stride` bytes after scale `r - 1`. A stride of `0` packs the rows, or the scales. Thus a pod passes one head of an interleaved cache without copying it. Each call returns `K32_OK`, or `K32_ERR_INVAL` (`-22`) for a stride that is not `0` and is below a row's bytes (or `4` for `scale_stride`). `out` must not overlap the other operands, except where the table allows it.
 
-The results are the same bits on every node. Integer sums are exact `int32` values; they wrap beyond that range. Every float step is one IEEE binary32 operation in the order the table shows, sums run from `0` in index order, and the node builds the kernels without fused multiply-adds. `k32_softmax_f32` computes exp with `k32_expf`, an inline function in `k32_app_abi.h`. A pod that computes exp itself with it gets the node's bits.
+The results are the same bits on every node. Integer sums are exact `int32` values; they wrap beyond that range. Every float step is one IEEE binary32 operation in the order the table shows, sums run from `0` in index order, and the node builds the kernels without fused multiply-adds. `k32_softmax_f32` and `k32_swiglu_f32` compute exp with `k32_expf`, an inline function in `k32_app_abi.h`. A pod that computes exp itself with it gets the node's bits.
 
-The node checks every operand against the pod's linear memory, or a blob address against the blob, before it reads anything. An operand outside the linear memory, or a blob address outside every open blob, traps the call with exit code `139` and a message that names the operand and the import, for example `wasm trap: out of bounds memory access: w of k32_matvec_i8`. A metered pod pays for the work before it runs: 10,000 gas units (the cost of a bulk memory instruction), plus 45 (an arithmetic instruction) per unit of work. A matrix call is `rows x (cols + 1)` units (`n` times that for `k32_matmul_*`) and a softmax 32 per element. A call that its budget does not cover traps with exit code `152` and writes nothing.
+The node checks every operand against the pod's linear memory, or a blob address against the blob, before it reads anything. An operand outside the linear memory, or a blob address outside every open blob, traps the call with exit code `139` and a message that names the operand and the import, for example `wasm trap: out of bounds memory access: w of k32_matvec_i8`. A metered pod pays for the work before it runs: 10,000 gas units (the cost of a bulk memory instruction), plus 45 (an arithmetic instruction) per unit of work. A matrix call is `rows x (cols + 1)` units (`n` times that for `k32_matmul_*`), a softmax and a SwiGLU gate 32 per element, a norm and a quantization 4, a rotary embedding 3, an addition and an argmax 1. A call that its budget does not cover traps with exit code `152` and writes nothing.
 
 ---
 

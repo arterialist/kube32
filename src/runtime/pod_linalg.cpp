@@ -15,6 +15,7 @@
 
 #include <cstdint>
 
+
 namespace kube32::runtime {
 
 // Float operands are 4-byte aligned in practice: one load or store then,
@@ -36,6 +37,11 @@ static inline void store_f32(uint8_t* p, float f) {
 
 // ---- integer products ----------------------------------------------------------
 
+// The low and the high nibble of a byte as signed 4-bit values
+static inline int32_t lo4(int32_t b) { return static_cast<int32_t>(static_cast<uint32_t>(b) << 28) >> 28; }
+static inline int32_t hi4(int32_t b) { return b >> 4; }
+
+
 // Sum of w[c] * x[c]; unsigned so that a sum beyond int32 wraps
 static inline int32_t dot_i8(const int8_t* w, const int8_t* x, uint32_t n) {
     uint32_t s0 = 0, s1 = 0, c = 0;
@@ -46,10 +52,6 @@ static inline int32_t dot_i8(const int8_t* w, const int8_t* x, uint32_t n) {
     for (; c < n; c++) s0 += static_cast<uint32_t>(w[c] * x[c]);
     return static_cast<int32_t>(s0 + s1);
 }
-
-// The low and the high nibble of a byte as signed 4-bit values
-static inline int32_t lo4(int32_t b) { return static_cast<int32_t>(static_cast<uint32_t>(b) << 28) >> 28; }
-static inline int32_t hi4(int32_t b) { return b >> 4; }
 
 static inline int32_t dot_i4(const int8_t* w, const int8_t* x, uint32_t n) {
     uint32_t s0 = 0, s1 = 0, j = 0;
@@ -242,6 +244,78 @@ void softmax_f32(uint8_t* x, uint32_t n) {
     for (uint32_t i = 0; i < n; i++) store_f32(x + 4 * i, load_f32(x + 4 * i) / sum);
 }
 
+// ---- element-wise operations -------------------------------------------------------
+
+void rmsnorm_f32(uint8_t* out, const uint8_t* x, const uint8_t* w, uint32_t n, uint32_t count, float eps) {
+    if (n == 0) return;
+    for (uint32_t p = 0; p < count; p++, x += 4 * n, out += 4 * n) {
+        float ss = 0.0f;
+        for (uint32_t i = 0; i < n; i++) {
+            const float v = load_f32(x + 4 * i);
+            ss = ss + v * v;
+        }
+        ss = ss / static_cast<float>(n);
+        ss = ss + eps;
+        ss = 1.0f / __builtin_sqrtf(ss);
+        for (uint32_t i = 0; i < n; i++) store_f32(out + 4 * i, load_f32(w + 4 * i) * (ss * load_f32(x + 4 * i)));
+    }
+}
+
+void quantize_i8(int8_t* q, uint8_t* scale, const uint8_t* x, uint32_t n, uint32_t count) {
+    for (uint32_t p = 0; p < count; p++, x += 4 * n, q += n) {
+        float amax = 0.0f;
+        for (uint32_t i = 0; i < n; i++) {
+            const float a = __builtin_fabsf(load_f32(x + 4 * i));
+            if (a > amax) amax = a;
+        }
+        const float inv = amax == 0.0f ? 0.0f : 127.0f / amax;
+        for (uint32_t i = 0; i < n; i++) {
+            const float t = load_f32(x + 4 * i) * inv;
+            int32_t r;
+            if (!(t == t)) r = 0;                // NaN
+            else if (t >= 127.0f) r = 127;       // also an infinite inv
+            else if (t <= -127.0f) r = -127;
+            else r = static_cast<int32_t>(t + (t >= 0.0f ? 0.5f : -0.5f));
+            q[i] = static_cast<int8_t>(r > 127 ? 127 : r < -127 ? -127 : r);
+        }
+        store_f32(scale + 4 * p, amax / 127.0f);
+    }
+}
+
+void rope_f32(uint8_t* x, const uint8_t* cs, uint32_t n, uint32_t head_size, uint32_t count) {
+    for (uint32_t p = 0; p < count; p++, x += 4 * n, cs += 4 * head_size) {
+        for (uint32_t i = 0; i + 1 < n; i += 2) {
+            const uint32_t j = i % head_size;
+            const float c = load_f32(cs + 4 * j), s = load_f32(cs + 4 * j + 4);
+            const float a0 = load_f32(x + 4 * i), a1 = load_f32(x + 4 * i + 4);
+            store_f32(x + 4 * i, a0 * c - a1 * s);
+            store_f32(x + 4 * i + 4, a0 * s + a1 * c);
+        }
+    }
+}
+
+void swiglu_f32(uint8_t* x, const uint8_t* g, uint32_t n) {
+    for (uint32_t i = 0; i < n; i++) {
+        float a = load_f32(x + 4 * i);
+        a = a * (1.0f / (1.0f + k32_expf(-a)));
+        store_f32(x + 4 * i, a * load_f32(g + 4 * i));
+    }
+}
+
+void add_f32(uint8_t* x, const uint8_t* y, uint32_t n) {
+    for (uint32_t i = 0; i < n; i++) store_f32(x + 4 * i, load_f32(x + 4 * i) + load_f32(y + 4 * i));
+}
+
+uint32_t argmax_f32(const uint8_t* x, uint32_t n) {
+    uint32_t best = 0;
+    float top = n ? load_f32(x) : 0.0f;
+    for (uint32_t i = 1; i < n; i++) {
+        const float v = load_f32(x + 4 * i);
+        if (v > top) { top = v; best = i; }
+    }
+    return best;
+}
+
 // ---- the imports -------------------------------------------------------------
 
 // An operand outside the linear memory traps with a message that names it;
@@ -423,10 +497,107 @@ static const void* raw_softmax(IM3Runtime rt, IM3ImportContext, uint64_t* sp, vo
     return result(sp, K32_OK);
 }
 
+// ---- element-wise imports: float vectors in linear memory -----------------------
+
+static const char kTrapNormOut[] = K32_OOB("k32_rmsnorm_f32", "out");
+static const char kTrapNormX[] = K32_OOB("k32_rmsnorm_f32", "x");
+static const char kTrapNormW[] = K32_OOB("k32_rmsnorm_f32", "w");
+static const char kTrapNormBlobW[] = K32_BLOB_OOB("k32_rmsnorm_f32", "w");
+static const char kTrapQuantQ[] = K32_OOB("k32_quantize_i8", "q");
+static const char kTrapQuantScale[] = K32_OOB("k32_quantize_i8", "scale");
+static const char kTrapQuantX[] = K32_OOB("k32_quantize_i8", "x");
+static const char kTrapRopeX[] = K32_OOB("k32_rope_f32", "x");
+static const char kTrapRopeCs[] = K32_OOB("k32_rope_f32", "cs");
+static const char kTrapRopeBlobCs[] = K32_BLOB_OOB("k32_rope_f32", "cs");
+static const char kTrapSwigluX[] = K32_OOB("k32_swiglu_f32", "x");
+static const char kTrapSwigluG[] = K32_OOB("k32_swiglu_f32", "g");
+static const char kTrapAddX[] = K32_OOB("k32_add_f32", "x");
+static const char kTrapAddY[] = K32_OOB("k32_add_f32", "y");
+static const char kTrapArgmax[] = K32_OOB("k32_argmax_f32", "x");
+
+// bytes bytes at off lie inside the linear memory
+static bool inside(uint64_t size, uint32_t off, uint64_t bytes) { return fits(size, off, 1, 0, bytes); }
+
+// "i(iiiiif)": out, x, w, n, count, eps
+static const void* raw_rmsnorm(IM3Runtime rt, IM3ImportContext, uint64_t* sp, void* mem) {
+    const uint32_t out = arg(sp, 1), x = arg(sp, 2), w = arg(sp, 3), n = arg(sp, 4), count = arg(sp, 5);
+    float eps;
+    __builtin_memcpy(&eps, &sp[6], sizeof eps);
+    const uint64_t size = m3_GetMemorySizeAt(mem), bytes = 4ull * n * count;
+    uint8_t* base = static_cast<uint8_t*>(mem);
+    if (!inside(size, out, bytes)) return kTrapNormOut;
+    if (!inside(size, x, bytes)) return kTrapNormX;
+    bool blob = false;
+    int32_t rc = K32_OK;
+    const uint8_t* wb = operand(rt, base, size, w, 1, 0, 4ull * n, blob, rc);
+    if (rc == K32_ERR_NOTSUP) return result(sp, rc);
+    if (!wb) return blob ? kTrapNormBlobW : kTrapNormW;
+    if (M3Result r = charge(rt, kRmsnormUnits * n * count)) return r;
+    rmsnorm_f32(base + out, base + x, wb, n, count, eps);
+    return result(sp, K32_OK);
+}
+
+// "i(iiiii)": q, scale, x, n, count
+static const void* raw_quantize(IM3Runtime rt, IM3ImportContext, uint64_t* sp, void* mem) {
+    const uint32_t q = arg(sp, 1), scale = arg(sp, 2), x = arg(sp, 3), n = arg(sp, 4), count = arg(sp, 5);
+    const uint64_t size = m3_GetMemorySizeAt(mem), values = static_cast<uint64_t>(n) * count;
+    uint8_t* base = static_cast<uint8_t*>(mem);
+    if (!inside(size, q, values)) return kTrapQuantQ;
+    if (!inside(size, scale, 4ull * count)) return kTrapQuantScale;
+    if (!inside(size, x, 4 * values)) return kTrapQuantX;
+    if (M3Result r = charge(rt, kQuantizeUnits * values)) return r;
+    quantize_i8(reinterpret_cast<int8_t*>(base + q), base + scale, base + x, n, count);
+    return result(sp, K32_OK);
+}
+
+// "i(iiiii)": x, cs, n, head_size, count
+static const void* raw_rope(IM3Runtime rt, IM3ImportContext, uint64_t* sp, void* mem) {
+    const uint32_t x = arg(sp, 1), cs = arg(sp, 2), n = arg(sp, 3), hs = arg(sp, 4), count = arg(sp, 5);
+    if ((n & 1) || (hs & 1) || hs == 0) return result(sp, K32_ERR_INVAL);
+    const uint64_t size = m3_GetMemorySizeAt(mem);
+    uint8_t* base = static_cast<uint8_t*>(mem);
+    if (!inside(size, x, 4ull * n * count)) return kTrapRopeX;
+    bool blob = false;
+    int32_t rc = K32_OK;
+    const uint8_t* cb = operand(rt, base, size, cs, 1, 0, 4ull * hs * count, blob, rc);
+    if (rc == K32_ERR_NOTSUP) return result(sp, rc);
+    if (!cb) return blob ? kTrapRopeBlobCs : kTrapRopeCs;
+    if (M3Result r = charge(rt, kRopeUnits * n * count)) return r;
+    rope_f32(base + x, cb, n, hs, count);
+    return result(sp, K32_OK);
+}
+
+// "i(iii)": x, g or y, n
+template <bool Swiglu>
+static const void* raw_pairwise(IM3Runtime rt, IM3ImportContext, uint64_t* sp, void* mem) {
+    const uint32_t x = arg(sp, 1), y = arg(sp, 2), n = arg(sp, 3);
+    const uint64_t size = m3_GetMemorySizeAt(mem);
+    uint8_t* base = static_cast<uint8_t*>(mem);
+    if (!inside(size, x, 4ull * n)) return Swiglu ? kTrapSwigluX : kTrapAddX;
+    if (!inside(size, y, 4ull * n)) return Swiglu ? kTrapSwigluG : kTrapAddY;
+    if (M3Result r = charge(rt, (Swiglu ? kSwigluUnits : kAddUnits) * n)) return r;
+    (Swiglu ? swiglu_f32 : add_f32)(base + x, base + y, n);
+    return result(sp, K32_OK);
+}
+
+// "i(ii)": x, n
+static const void* raw_argmax(IM3Runtime rt, IM3ImportContext, uint64_t* sp, void* mem) {
+    const uint32_t x = arg(sp, 1), n = arg(sp, 2);
+    if (!inside(m3_GetMemorySizeAt(mem), x, 4ull * n)) return kTrapArgmax;
+    if (M3Result r = charge(rt, kArgmaxUnits * n)) return r;
+    return result(sp, static_cast<int32_t>(argmax_f32(static_cast<uint8_t*>(mem) + x, n)));
+}
+
 void link_linalg_host_functions(IM3Module module) {
     for (const MatrixImport& im : kMatrixImports) m3_LinkRawFunctionEx(module, "env", im.name, im.signature, &raw_matrix, &im);
     for (const MatmulImport& im : kMatmulImports) m3_LinkRawFunctionEx(module, "env", im.name, im.signature, &raw_matmul, &im);
     m3_LinkRawFunction(module, "env", "k32_softmax_f32", "i(ii)", &raw_softmax);
+    m3_LinkRawFunction(module, "env", "k32_rmsnorm_f32", "i(iiiiif)", &raw_rmsnorm);
+    m3_LinkRawFunction(module, "env", "k32_quantize_i8", "i(iiiii)", &raw_quantize);
+    m3_LinkRawFunction(module, "env", "k32_rope_f32", "i(iiiii)", &raw_rope);
+    m3_LinkRawFunction(module, "env", "k32_swiglu_f32", "i(iii)", &raw_pairwise<true>);
+    m3_LinkRawFunction(module, "env", "k32_add_f32", "i(iii)", &raw_pairwise<false>);
+    m3_LinkRawFunction(module, "env", "k32_argmax_f32", "i(ii)", &raw_argmax);
 }
 
 }  // namespace kube32::runtime

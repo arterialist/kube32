@@ -34,7 +34,9 @@
 //! * `fs`: [`fs`] wraps the `k32_fs_*` imports (pod storage on the microSD card).
 //! * `linalg`: [`linalg`] wraps the native products for quantized neural
 //!   networks (`k32_matvec_*`, `k32_matmul_*`, `k32_vecmat_f32_i8`,
-//!   `k32_softmax_f32`).
+//!   `k32_softmax_f32`) and their element-wise steps (`k32_rmsnorm_f32`,
+//!   `k32_quantize_i8`, `k32_rope_f32`, `k32_swiglu_f32`, `k32_add_f32`,
+//!   `k32_argmax_f32`).
 //!
 //! An import is only linked into the module when the app calls it, so the
 //! module's import list tells which manifest resources it needs;

@@ -1,8 +1,8 @@
 // The pods' linear algebra imports (k32_matvec_*, k32_matmul_*,
-// k32_vecmat_f32_i8, k32_softmax_f32): the native kernels against plain reference loops and the
-// reference's bits, and the imports as a pod calls them: results, strides,
-// operands outside the linear memory, a trapped container, and the gas they
-// charge.
+// k32_vecmat_f32_i8, k32_softmax_f32 and the element-wise ones): the native
+// kernels against plain reference loops and the reference's bits, and the
+// imports as a pod calls them: results, strides, operands outside the linear
+// memory, a trapped container, and the gas they charge.
 #include "runtime/pod_linalg.hpp"
 #include "runtime/app_pod.hpp"
 #include "runtime/container_lifecycle.hpp"
@@ -14,7 +14,9 @@
 #include "wasm3.h"
 #include "m3_env.h"
 
+#include <algorithm>
 #include <cassert>
+#include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <string>
@@ -238,25 +240,30 @@ static void section(std::vector<uint8_t>& m, uint8_t id, const std::vector<uint8
     m.insert(m.end(), body.begin(), body.end());
 }
 
-// The imports, with functions "mv8", "mv4", "mvf", "vm", "sm", "mm8" and
-// "mm4" that pass their arguments on, "oob" that calls k32_matvec_i8 with w
-// past the end of memory, and two pages of memory
+// The imports, with functions "mv8", "mv4", "mvf", "vm", "sm", "mm8", "mm4",
+// "rms", "qnt", "rope", "swi", "add" and "amax" that pass their arguments on,
+// "oob" that calls k32_matvec_i8 with w past the end of memory, and two pages
+// of memory
 constexpr uint8_t kI32 = 0x7f, kF32 = 0x7d;
 static const std::vector<std::vector<uint8_t>> kParams = {{kI32, kI32, kI32, kI32, kF32, kI32, kI32, kI32},
                                                           {kI32, kI32, kI32, kI32, kF32, kI32, kI32, kI32, kI32},
                                                           {kI32, kI32, kI32, kI32, kI32, kI32, kI32, kI32},
                                                           {kI32, kI32},
                                                           {},
-                                                          {kI32, kI32, kI32, kI32, kI32, kI32, kI32, kI32, kI32}};
-constexpr uint8_t kNumImports = 7;
-static const char* const kImports[] = {"k32_matvec_i8",   "k32_matvec_i4", "k32_matvec_f32_i8", "k32_vecmat_f32_i8",
-                                       "k32_softmax_f32", "k32_matmul_i8", "k32_matmul_i4"};
-static const uint8_t kImportType[] = {0, 0, 1, 2, 3, 5, 5};
+                                                          {kI32, kI32, kI32, kI32, kI32, kI32, kI32, kI32, kI32},
+                                                          {kI32, kI32, kI32, kI32, kI32, kF32},
+                                                          {kI32, kI32, kI32, kI32, kI32},
+                                                          {kI32, kI32, kI32}};
+constexpr uint8_t kNumImports = 13;
+static const char* const kImports[] = {"k32_matvec_i8",   "k32_matvec_i4",   "k32_matvec_f32_i8", "k32_vecmat_f32_i8", "k32_softmax_f32",
+                                       "k32_matmul_i8",   "k32_matmul_i4",   "k32_rmsnorm_f32",   "k32_quantize_i8",   "k32_rope_f32",
+                                       "k32_swiglu_f32",  "k32_add_f32",     "k32_argmax_f32"};
+static const uint8_t kImportType[] = {0, 0, 1, 2, 3, 5, 5, 6, 7, 7, 8, 8, 3};
 // The module's functions after the imports, their types, and the import each calls (oob: k32_matvec_i8)
-constexpr uint8_t kNumFns = 8;
-static const char* const kFns[] = {"mv8", "mv4", "mvf", "vm", "sm", "oob", "mm8", "mm4"};
-static const uint8_t kFnType[] = {0, 0, 1, 2, 3, 4, 5, 5};
-static const uint8_t kFnCallee[] = {0, 1, 2, 3, 4, 0, 5, 6};
+constexpr uint8_t kNumFns = 14;
+static const char* const kFns[] = {"mv8", "mv4", "mvf", "vm", "sm", "oob", "mm8", "mm4", "rms", "qnt", "rope", "swi", "add", "amax"};
+static const uint8_t kFnType[] = {0, 0, 1, 2, 3, 4, 5, 5, 6, 7, 7, 8, 8, 3};
+static const uint8_t kFnCallee[] = {0, 1, 2, 3, 4, 0, 5, 6, 7, 8, 9, 10, 11, 12};
 
 static std::vector<uint8_t> linalg_module() {
     std::vector<uint8_t> m = {0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00};
@@ -315,7 +322,7 @@ struct Pod {
     IM3Environment env{nullptr};
     IM3Runtime rt{nullptr};
     IM3Module mod{nullptr};
-    IM3Function fn[7]{};   // mv8, mv4, mvf, vm, sm, mm8, mm4
+    IM3Function fn[13]{};   // mv8, mv4, mvf, vm, sm, mm8, mm4, rms, qnt, rope, swi, add, amax
     std::vector<uint8_t> wasm;
     uint8_t* mem{nullptr};
     size_t mem_size{0};
@@ -329,8 +336,8 @@ struct Pod {
         if (!r) r = m3_LoadModule(rt, mod);
         assert(!r);
         link_app_host_functions(mod, "default/linalg");
-        const char* const names[] = {"mv8", "mv4", "mvf", "vm", "sm", "mm8", "mm4"};
-        for (int i = 0; i < 7 && !r; i++) r = m3_FindFunction(&fn[i], rt, names[i]);
+        const char* const names[] = {"mv8", "mv4", "mvf", "vm", "sm", "mm8", "mm4", "rms", "qnt", "rope", "swi", "add", "amax"};
+        for (int i = 0; i < 13 && !r; i++) r = m3_FindFunction(&fn[i], rt, names[i]);
         if (r) std::printf("module: %s\n", r);
         assert(!r);
         mem = m3_GetMemory(mod, &mem_size, 0);
@@ -709,6 +716,217 @@ static void test_matmul_import() {
     std::printf("[PASS] test_matmul_import\n");
 }
 
+// ---- element-wise operations ----------------------------------------------------
+
+// The steps as llm-shard wrote them in Wasm before the imports (and as
+// tools/llm.py repeats them)
+static void ref_rmsnorm(float* o, const float* x, const float* w, uint32_t n, float eps) {
+    float ss = 0.0f;
+    for (uint32_t i = 0; i < n; i++) ss += x[i] * x[i];
+    ss = ss / static_cast<float>(n);
+    ss = ss + eps;
+    ss = 1.0f / std::sqrt(ss);
+    for (uint32_t i = 0; i < n; i++) o[i] = w[i] * (ss * x[i]);
+}
+
+static float ref_quantize(int8_t* q, const float* x, uint32_t n) {
+    float amax = 0.0f;
+    for (uint32_t i = 0; i < n; i++) amax = std::fabs(x[i]) > amax ? std::fabs(x[i]) : amax;
+    const float inv = amax == 0.0f ? 0.0f : 127.0f / amax;
+    for (uint32_t i = 0; i < n; i++) {
+        const float t = x[i] * inv;
+        const int32_t r = static_cast<int32_t>(t + (t >= 0.0f ? 0.5f : -0.5f));
+        q[i] = static_cast<int8_t>(r > 127 ? 127 : r < -127 ? -127 : r);
+    }
+    return amax / 127.0f;
+}
+
+static void ref_rope(float* a, const float* cs, uint32_t n, uint32_t hs) {
+    for (uint32_t i = 0; i < n; i += 2) {
+        const float c = cs[i % hs], s = cs[i % hs + 1];
+        const float a0 = a[i], a1 = a[i + 1];
+        a[i] = a0 * c - a1 * s;
+        a[i + 1] = a0 * s + a1 * c;
+    }
+}
+
+static uint8_t* bytes_of(std::vector<float>& v) { return reinterpret_cast<uint8_t*>(v.data()); }
+
+static void test_elementwise_kernels() {
+    for (uint32_t n : {1u, 2u, 7u, 64u, 172u, 256u})
+        for (uint32_t count : {1u, 3u}) {
+            const uint32_t m = n * count;
+            std::vector<float> x(m), w(n), got(m), want(m), g(m);
+            for (uint32_t i = 0; i < m; i++) x[i] = rnd_f32() * (i % 3 ? 1.0f : 37.0f);
+            for (uint32_t i = 0; i < n; i++) w[i] = rnd_f32();
+            for (float& v : g) v = rnd_f32() * 4.0f;
+            // rmsnorm, then in place
+            rmsnorm_f32(bytes_of(got), bytes_of(x), bytes_of(w), n, count, 1e-5f);
+            for (uint32_t p = 0; p < count; p++) ref_rmsnorm(want.data() + p * n, x.data() + p * n, w.data(), n, 1e-5f);
+            assert(std::memcmp(got.data(), want.data(), 4 * m) == 0);
+            got = x;
+            rmsnorm_f32(bytes_of(got), bytes_of(got), bytes_of(w), n, count, 1e-5f);
+            assert(std::memcmp(got.data(), want.data(), 4 * m) == 0);
+            // quantize: each vector with its scale
+            std::vector<int8_t> q(m), qr(m);
+            std::vector<float> s(count);
+            quantize_i8(q.data(), reinterpret_cast<uint8_t*>(s.data()), bytes_of(x), n, count);
+            for (uint32_t p = 0; p < count; p++) {
+                const float sr = ref_quantize(qr.data() + p * n, x.data() + p * n, n);
+                assert(std::memcmp(&s[p], &sr, 4) == 0);
+            }
+            assert(q == qr);
+            // rope with head size 2 (any even n) and n itself
+            if (n % 2 == 0)
+                for (uint32_t hs : {2u, n}) {
+                    std::vector<float> cs(hs * count);
+                    for (float& v : cs) v = rnd_f32();
+                    got = want = x;
+                    rope_f32(bytes_of(got), bytes_of(cs), n, hs, count);
+                    for (uint32_t p = 0; p < count; p++) ref_rope(want.data() + p * n, cs.data() + p * hs, n, hs);
+                    assert(std::memcmp(got.data(), want.data(), 4 * m) == 0);
+                }
+            // swiglu, add
+            got = x;
+            swiglu_f32(bytes_of(got), bytes_of(g), m);
+            for (uint32_t i = 0; i < m; i++) {
+                float a = x[i];
+                a = a * (1.0f / (1.0f + k32_expf(-a)));
+                want[i] = a * g[i];
+            }
+            assert(std::memcmp(got.data(), want.data(), 4 * m) == 0);
+            add_f32(bytes_of(got), bytes_of(g), m);
+            for (uint32_t i = 0; i < m; i++) want[i] += g[i];
+            assert(std::memcmp(got.data(), want.data(), 4 * m) == 0);
+            // argmax: the first of equal ones
+            x[m / 2] = x[m - 1] = 1000.0f;
+            assert(argmax_f32(bytes_of(x), m) == m / 2);
+        }
+    // A vector of zeros: q 0, scale 0; NaN gives 0, an infinite factor the clamp
+    std::vector<float> z(8, 0.0f), s(2);
+    std::vector<int8_t> q(16, 5);
+    quantize_i8(q.data(), reinterpret_cast<uint8_t*>(s.data()), bytes_of(z), 8, 1);
+    assert(s[0] == 0.0f && std::count(q.begin(), q.begin() + 8, 0) == 8);
+    std::vector<float> odd = {std::nanf(""), 1.0f, -2.0f, 1e-40f};
+    quantize_i8(q.data(), reinterpret_cast<uint8_t*>(s.data()), bytes_of(odd), 4, 1);
+    assert(q[0] == 0 && q[1] == 64 && q[2] == -127 && q[3] == 0);
+    std::vector<float> tiny = {1e-40f, -1e-40f};   // 127 / max|x| is infinite
+    quantize_i8(q.data(), reinterpret_cast<uint8_t*>(s.data()), bytes_of(tiny), 2, 1);
+    assert(q[0] == 127 && q[1] == -127);
+    assert(argmax_f32(bytes_of(z), 0) == 0);
+    std::printf("[PASS] test_elementwise_kernels\n");
+}
+
+// The element-wise imports through a pod: the kernels' bits, operands
+// outside the memory, a rope of odd sizes, gas, and the weights of rmsnorm
+// and the table of rope read in place from a blob
+static void test_elementwise_imports() {
+    using namespace kube32;
+    enum { RMS = 7, QNT = 8, ROPE = 9, SWI = 10, ADD = 11, AMAX = 12 };
+    constexpr uint32_t kA = 0x1000, kB = 0x3000, kC = 0x5000, kQ = 0x7000, kS = 0x7800;
+    constexpr uint32_t n = 64, count = 3, hs = 16, m = n * count;
+    Pod p(1000000000ull);
+    std::vector<float> x(m), w(n), cs(hs * count), g(m);
+    for (float& v : x) v = rnd_f32() * 8.0f;
+    for (float& v : w) v = rnd_f32();
+    for (float& v : cs) v = rnd_f32();
+    for (float& v : g) v = rnd_f32();
+    std::memcpy(p.mem + kA, x.data(), 4 * m);
+    std::memcpy(p.mem + kB, w.data(), 4 * n);
+    std::memcpy(p.mem + kC + 1, g.data(), 4 * m);   // unaligned
+    int32_t rc = 1;
+    const auto gas = [&](auto call, uint64_t units) {
+        const uint64_t before = m3_GetResourceUsage(p.rt, c_m3Limit_GasUnits);
+        call();
+        const uint64_t used = m3_GetResourceUsage(p.rt, c_m3Limit_GasUnits) - before;
+        assert(used >= linalg_gas(units) && used - linalg_gas(units) < 1000);
+    };
+    // rmsnorm into kC + 1 + 4 m
+    std::vector<float> want(m);
+    rmsnorm_f32(bytes_of(want), bytes_of(x), bytes_of(w), n, count, 1e-5f);
+    const uint32_t out = kC + 1 + 4 * m;
+    gas([&] { assert(!p.call_fn(RMS, &rc, out, kA, kB, n, count, 1e-5) && rc == K32_OK); }, kRmsnormUnits * m);
+    assert(std::memcmp(p.mem + out, want.data(), 4 * m) == 0);
+    // quantize of the same vectors
+    std::vector<int8_t> qw(m);
+    std::vector<float> sw(count);
+    quantize_i8(qw.data(), reinterpret_cast<uint8_t*>(sw.data()), bytes_of(x), n, count);
+    gas([&] { assert(!p.call_fn(QNT, &rc, kQ, kS, kA, n, count) && rc == K32_OK); }, kQuantizeUnits * m);
+    assert(std::memcmp(p.mem + kQ, qw.data(), m) == 0 && std::memcmp(p.mem + kS, sw.data(), 4 * count) == 0);
+    // rope, in place at kA, with the table at kB + 4 n
+    std::memcpy(p.mem + kB + 4 * n, cs.data(), 4 * cs.size());
+    want = x;
+    rope_f32(bytes_of(want), bytes_of(cs), n, hs, count);
+    gas([&] { assert(!p.call_fn(ROPE, &rc, kA, kB + 4 * n, n, hs, count) && rc == K32_OK); }, kRopeUnits * m);
+    assert(std::memcmp(p.mem + kA, want.data(), 4 * m) == 0);
+    for (uint32_t bad : {0u, 1u})
+        assert(!p.call_fn(ROPE, &rc, kA, kB, bad ? n + 1 : n, bad ? hs : 0u, count) && rc == K32_ERR_INVAL);
+    assert(!p.call_fn(ROPE, &rc, kA, kB, n, hs + 1, count) && rc == K32_ERR_INVAL);
+    // swiglu and add over the rotated vectors, the gate unaligned
+    std::vector<float> h = want;
+    swiglu_f32(bytes_of(h), bytes_of(g), m);
+    gas([&] { assert(!p.call_fn(SWI, &rc, kA, kC + 1, m) && rc == K32_OK); }, kSwigluUnits * m);
+    assert(std::memcmp(p.mem + kA, h.data(), 4 * m) == 0);
+    add_f32(bytes_of(h), bytes_of(g), m);
+    gas([&] { assert(!p.call_fn(ADD, &rc, kA, kC + 1, m) && rc == K32_OK); }, kAddUnits * m);
+    assert(std::memcmp(p.mem + kA, h.data(), 4 * m) == 0);
+    // argmax answers the index
+    const uint32_t best = argmax_f32(bytes_of(h), m);
+    gas([&] { assert(!p.call_fn(AMAX, &rc, kA, m) && rc == static_cast<int32_t>(best)); }, kArgmaxUnits * m);
+
+    // Each operand one float past the end of the memory
+    const uint32_t end = 2 * 65536;
+    const auto trap = [&](M3Result r, const char* operand, const char* fn) {
+        assert(r && std::string(r) == "[trap] out of bounds memory access: " + std::string(operand) + " of " + fn);
+        assert(describe_trap(r, TrapContext{}).exit_code == 139);
+    };
+    trap(p.call_fn(RMS, &rc, end - 4 * m + 1, kA, kB, n, count, 1e-5), "out", "k32_rmsnorm_f32");
+    trap(p.call_fn(RMS, &rc, out, end - 4 * m + 1, kB, n, count, 1e-5), "x", "k32_rmsnorm_f32");
+    trap(p.call_fn(RMS, &rc, out, kA, end - 4 * n + 1, n, count, 1e-5), "w", "k32_rmsnorm_f32");
+    trap(p.call_fn(QNT, &rc, end - m + 1, kS, kA, n, count), "q", "k32_quantize_i8");
+    trap(p.call_fn(QNT, &rc, kQ, end - 4 * count + 1, kA, n, count), "scale", "k32_quantize_i8");
+    trap(p.call_fn(QNT, &rc, kQ, kS, end - 4 * m + 1, n, count), "x", "k32_quantize_i8");
+    trap(p.call_fn(ROPE, &rc, end - 4 * m + 1, kB, n, hs, count), "x", "k32_rope_f32");
+    trap(p.call_fn(ROPE, &rc, kA, end - 4 * hs * count + 1, n, hs, count), "cs", "k32_rope_f32");
+    trap(p.call_fn(SWI, &rc, end - 4 * m + 1, kC, m), "x", "k32_swiglu_f32");
+    trap(p.call_fn(SWI, &rc, kA, end - 4 * m + 1, m), "g", "k32_swiglu_f32");
+    trap(p.call_fn(ADD, &rc, end - 4 * m + 1, kC, m), "x", "k32_add_f32");
+    trap(p.call_fn(ADD, &rc, kA, end - 4 * m + 1, m), "y", "k32_add_f32");
+    trap(p.call_fn(AMAX, &rc, end - 4 * m + 1, m), "x", "k32_argmax_f32");
+    // A call its budget does not cover traps before it writes
+    m3_SetResourceLimit(p.rt, c_m3Limit_GasUnits, linalg_gas(kRmsnormUnits * m) - 1);
+    std::memset(p.mem + out, 0x5a, 4 * m);
+    assert(p.call_fn(RMS, &rc, out, kA, kB, n, count, 1e-5) == m3Err_trapOutOfGas);
+    for (uint32_t i = 0; i < 4 * m; i++) assert(p.mem[out + i] == 0x5a);
+
+    // The norm's weights and the rotary table in place from a blob
+    Pod b;
+    storage::FlashBlobStore flash(storage::create_ram_blob_region(512 * 1024), false);
+    std::vector<uint8_t> blob(3 + 4 * n + 4 * cs.size());
+    std::memcpy(blob.data() + 3, w.data(), 4 * n);
+    std::memcpy(blob.data() + 3 + 4 * n, cs.data(), 4 * cs.size());
+    store_blob(flash, "norms", blob);
+    storage::set_node_blob_stores(&flash, nullptr);
+    const std::string pod = "default/linalg";
+    PodBlobs::instance().set_allowed(pod, {"norms"});
+    const int32_t hd = PodBlobs::instance().open(pod, "norms");
+    assert(hd == 0);
+    std::memcpy(b.mem + kA, x.data(), 4 * m);
+    rmsnorm_f32(bytes_of(want), bytes_of(x), bytes_of(w), n, count, 1e-5f);
+    assert(!b.call_fn(RMS, &rc, kC, kA, blob_addr(hd, 3), n, count, 1e-5) && rc == K32_OK);
+    assert(std::memcmp(b.mem + kC, want.data(), 4 * m) == 0);
+    rope_f32(bytes_of(want), bytes_of(cs), n, hs, count);
+    assert(!b.call_fn(ROPE, &rc, kC, blob_addr(hd, 3 + 4 * n), n, hs, count) && rc == K32_OK);
+    assert(std::memcmp(b.mem + kC, want.data(), 4 * m) == 0);
+    M3Result r = b.call_fn(ROPE, &rc, kC, blob_addr(hd, 4 + 4 * n), n, hs, count);
+    assert(r && std::string(r) == "[trap] out of bounds memory access: cs of k32_rope_f32 (a blob address outside every open blob)");
+    r = b.call_fn(RMS, &rc, kC, kA, blob_addr(1, 0), n, count, 1e-5);
+    assert(r && std::string(r) == "[trap] out of bounds memory access: w of k32_rmsnorm_f32 (a blob address outside every open blob)");
+    PodBlobs::instance().forget_pod(pod);
+    storage::set_node_blob_stores(nullptr, nullptr);
+    std::printf("[PASS] test_elementwise_imports\n");
+}
+
 int main() {
     test_kernels_match_reference();
     test_matmul_kernels();
@@ -719,6 +937,8 @@ int main() {
     test_gas();
     test_blob_operands();
     test_matmul_import();
+    test_elementwise_kernels();
+    test_elementwise_imports();
     std::printf("All linear algebra tests passed\n");
     return 0;
 }
