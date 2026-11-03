@@ -121,11 +121,26 @@ jobs:
   integration:
     name: Integration suites (kube32-sim)
     runs-on: ubuntu-24.04
+    env:
+      # A suite that needs clang, wasm-ld, kubectl or numpy fails without it instead of skipping
+      KUBE32_REQUIRE_TOOLS: "1"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: "3.12"
+      # The llm suite builds C pod modules for wasm32 and runs the model tool with numpy;
+      # kubectl comes with the runner image
+      - name: Install clang and lld (wasm-ld)
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends clang lld
+      - name: Install numpy
+        run: python3 -m pip install numpy==1.26.4
+      - name: Check the tools
+        run: |
+          clang --version | head -1
+          wasm-ld --version
+          kubectl version --client
+          python3 -c 'import numpy; print("numpy", numpy.__version__)'
       - name: Build the simulator
         run: |
           cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
@@ -152,12 +167,13 @@ jobs:
             python3 tests/integration/runner.py --suite "$suite"
           done
           python3 tests/integration/test_api_client_compat.py
-      - name: Suites that start their own clusters (cluster, federation, devices)
+      - name: Suites that start their own clusters (cluster, federation, devices, llm)
         run: |
           python3 tests/integration/runner.py --suite cluster
           python3 tests/integration/runner.py --suite federation
           python3 tests/integration/runner.py --suite devices
-      # kubectl, clang and rust-lld come with the runner image; the test skips itself without them
+          python3 tests/integration/runner.py --suite llm
+      # The test skips itself without kubectl, clang and a wasm linker
       - name: kube32 mcp against the simulator
         run: KUBE32_SIM=build/kube32-sim python3 -m unittest discover -s tools/tests -p test_kube32_mcp_sim.py -v
       - name: Stress scripts (each starts its own simulator)
@@ -165,6 +181,15 @@ jobs:
           for script in test_api_chunked_stream_stress test_api_malformed_requests test_api_socket_disconnect test_sim_wasm_sandbox; do
             python3 "tests/integration/$script.py"
           done
+
+  ci-image:
+    name: Integration toolchain image (tools/ci)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      # The build verifies the pinned kubectl checksum and runs each tool
+      - name: Build the image
+        run: docker build -t kube32-ci:24.04 -f tools/ci/Dockerfile tools/ci
 
   rust-sdk:
     name: Rust SDK (wasm32-unknown-unknown)

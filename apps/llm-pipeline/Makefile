@@ -17,7 +17,7 @@ BITS ?= 8,4,8
 PROMPT ?= Once upon a time
 
 CFLAGS = --target=wasm32 -Oz -nostdlib -ffreestanding -fno-exceptions -mcpu=mvp -msign-ext -mbulk-memory -Wall -Wextra
-LDFLAGS = $(if $(findstring rust-lld,$(WASM_LD)),-flavor wasm) --no-entry --allow-undefined -Map=$@.map
+LDFLAGS = $(if $(findstring rust-lld,$(WASM_LD)),-flavor wasm) --no-entry --allow-undefined --stack-first -Map=$@.map
 
 # stack (shadow stack for C locals), linear memory: initial and most pages,
 # and the pod memory limit the data must fit below

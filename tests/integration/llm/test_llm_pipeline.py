@@ -15,7 +15,8 @@ generation, which then ends with the same tokens.
 
 Needs clang and a wasm linker (the modules), uv or numpy (the model tool),
 the model files (downloaded once into apps/llm-pipeline/build/model) and
-kubectl; without them the tests are skipped.
+kubectl; without them the tests are skipped locally and fail where
+KUBE32_REQUIRE_TOOLS=1 or CI=true is set.
 """
 
 import json
@@ -29,7 +30,7 @@ import time
 import urllib.error
 import urllib.request
 
-from tests.integration.framework import BaseTestCase, HTTPClient
+from tests.integration.framework import BaseTestCase, HTTPClient, skip_missing
 from tests.integration.cluster_harness import BIN_PATH, PROJECT_ROOT, SimulatedNode, node_ready_condition
 
 APP = os.path.join(PROJECT_ROOT, "apps", "llm-pipeline")
@@ -100,7 +101,7 @@ class LlmClusterCase(BaseTestCase):
 
     def _skip(self) -> bool:
         if self.skip_reason:
-            print(f"[SKIP] {self.skip_reason}")
+            skip_missing(self.skip_reason)
             return True
         return False
 

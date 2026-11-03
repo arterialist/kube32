@@ -165,6 +165,22 @@ class KubectlClient:
         return KubectlResult(proc.returncode, proc.stdout, proc.stderr)
 
 
+def require_tools() -> bool:
+    """True when a missing tool must fail a test: KUBE32_REQUIRE_TOOLS=1, or CI=true unless KUBE32_REQUIRE_TOOLS=0"""
+    flag = os.environ.get("KUBE32_REQUIRE_TOOLS")
+    if flag is not None:
+        return flag.lower() in ("1", "true", "yes")
+    return os.environ.get("CI", "").lower() in ("1", "true")
+
+
+def skip_missing(reason: str) -> None:
+    """Report that a test cannot run here. Locally this prints a [SKIP] line and the test returns;
+    where tools are required (see require_tools) it fails the test."""
+    if require_tools():
+        raise AssertionError(f"required tool missing: {reason}")
+    print(f"[SKIP] {reason}")
+
+
 class BaseTestCase:
     """
     Standard base class for all Kube32 test cases.

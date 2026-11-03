@@ -15,7 +15,7 @@ import shutil
 import subprocess
 import time
 
-from tests.integration.framework import BaseTestCase, HTTPClient
+from tests.integration.framework import BaseTestCase, HTTPClient, skip_missing
 from tests.integration.cluster_harness import BIN_PATH, PROJECT_ROOT, SimulatedNode, node_ready_condition
 
 KIB = 1024
@@ -123,7 +123,7 @@ class TestExamplePlacement(BaseTestCase):
         self.assertEqual(self._memory("cardputer"), cardputer)
 
         if shutil.which("kubectl") is None:
-            print("[SKIP] kubectl not found: the examples are not applied")
+            skip_missing("kubectl not found: the examples are not applied")
             return
         examples = os.path.join(PROJECT_ROOT, "examples")
         files = ["echo.yaml", "webhook.yaml", "tessera.yaml", "oversized-pod.yaml"]

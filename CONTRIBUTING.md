@@ -103,11 +103,18 @@ done
 
 ### Integration suites
 
-Start a single-node simulator that models a board without PSRAM, as CI does, then run `tests/integration/runner.py`. Use `--target sim|hw` to select a simulator or board cluster. Available `--suite` values are `api`, `validation`, `resources`, `workloads`, `cluster`, `federation`, and `all`. The `federation` suite requires `make -C federation build` first:
+Start a single-node simulator that models a board without PSRAM, as CI does, then run `tests/integration/runner.py`. Use `--target sim|hw` to select a simulator or board cluster. Available `--suite` values are `api`, `validation`, `resources`, `workloads`, `cluster`, `federation`, `devices`, `llm`, and `all`. The `federation` suite requires `make -C federation build` first:
 
 ```bash
 ./build/kube32-sim --role standalone --workers "" --psram 0 &
 python3 tests/integration/runner.py --target sim --server http://127.0.0.1:6443 --suite api
+```
+
+The `llm` suite and parts of the `cluster` suite need clang with lld (wasm-ld), kubectl and numpy. A suite that lacks one of them prints `[SKIP]` locally and fails when `CI=true` or `KUBE32_REQUIRE_TOOLS=1` is set. `tools/ci/Dockerfile` builds an image with the full toolchain:
+
+```bash
+docker build -t kube32-ci:24.04 -f tools/ci/Dockerfile tools/ci
+docker run --rm -e CI=true -v "$PWD":/src -w /src kube32-ci:24.04 python3 tests/integration/runner.py --suite llm
 ```
 
 ## Testing on boards

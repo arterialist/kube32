@@ -19,7 +19,7 @@ import time
 import urllib.error
 import urllib.request
 
-from tests.integration.framework import BaseTestCase, HTTPClient
+from tests.integration.framework import BaseTestCase, HTTPClient, skip_missing
 from tests.integration.cluster_harness import BIN_PATH, PROJECT_ROOT, SimulatedNode, node_ready_condition
 
 API_PORT = 17043
@@ -88,7 +88,7 @@ class TestDrain(BaseTestCase):
 
     def test_cordon_uncordon_drain(self):
         if shutil.which("kubectl") is None:
-            print("[SKIP] kubectl not found")
+            skip_missing("kubectl not found")
             return
         self._sim("cp-drain", ["--role", "control-plane", "--node-id", "0", "--port", str(API_PORT), "--ipc-port", "18040",
                                "--lease-interval", "500", "--not-ready-timeout", "4000", "--eviction-timeout", "120000",
