@@ -66,6 +66,16 @@ typedef u8 m3type_t;       // only plain M3ValueType values exist
 
 typedef i64 m3reg_t;
 
+// The float register. An f32 value lives in the low word as f32 bits and an
+// f64 value in all eight bytes, each operation reading and writing the member
+// of its own width. Holding an f32 as a promoted f64 instead would cost the
+// widening and the narrowing on every f32 operation, a soft-float call each
+// on a core with only single-precision hardware.
+typedef union m3fpreg_t {
+    f64 f64_;
+    f32 f32_;
+} m3fpreg_t;
+
 #if d_m3Use32BitSlots
 typedef u32 m3slot_t;
 #else

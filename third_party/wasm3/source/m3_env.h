@@ -294,7 +294,7 @@ typedef struct M3Frame {
             IM3Function function;
             m3reg_t     r0;
 #  if d_m3HasFloat
-            f64 fp0;
+            m3fpreg_t fp0;
 #  endif
         } call;
 #  if d_m3HasExceptionHandling
@@ -361,7 +361,7 @@ typedef struct M3Continuation {
     u8                     suspendPoint;    // M3SafePointKind: what left pc where it is
     m3reg_t                r0;              // saved accumulator
 #  if d_m3HasFloat
-    f64 fp0;
+    m3fpreg_t fp0;
 #  endif
 
     // Bound args count (for cont.bind)

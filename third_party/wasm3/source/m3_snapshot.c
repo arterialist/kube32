@@ -271,7 +271,7 @@ bool ReturnsWhat (IM3FuncType i_type, IM3FuncType i_expected)
 typedef struct M3FrameRegisters {
     m3reg_t* r0;
 #  if d_m3HasFloat
-    f64* fp0;
+    m3fpreg_t* fp0;
 #  endif
 } M3FrameRegisters;
 
@@ -347,7 +347,7 @@ M3Result ReadValue (u8* i_where, const M3FrameRegisters* i_registers, const M3Sl
         _throwif("a value is kept in a register the frame does not hold", not i_registers or not i_registers->fp0);
 
         if (type == c_m3Type_f32) {
-            f32 narrow = (f32)*i_registers->fp0;
+            f32 narrow = i_registers->fp0->f32_;
             u32 bits;
             memcpy(&bits, &narrow, sizeof(bits));
             *o_bits = bits;
@@ -400,7 +400,8 @@ M3Result WriteValue (u8* o_where, const M3FrameRegisters* i_registers, const M3S
             u32 bits = (u32)i_bits;
             f32 narrow;
             memcpy(&narrow, &bits, sizeof(narrow));
-            *i_registers->fp0 = narrow;
+            i_registers->fp0->f64_ = 0.;
+            i_registers->fp0->f32_ = narrow;
         } else {
             _throwif(m3Err_wasmMalformed, type != c_m3Type_f64);
             memcpy(i_registers->fp0, &i_bits, sizeof(u64));
@@ -1349,7 +1350,7 @@ M3Result NextActivation (IM3Module i_module, IM3Continuation i_cont, IM3Function
             o_act->kind         = safepoint_call;
             o_act->registers.r0 = (m3reg_t*)&frame->call.r0;
 #  if d_m3HasFloat
-            o_act->registers.fp0 = (f64*)&frame->call.fp0;
+            o_act->registers.fp0 = &frame->call.fp0;
 #  endif
             break;
         } else if (frame->kind == frame_resume) {
@@ -2483,7 +2484,7 @@ _   (GetLEB_u32(l, &numActivations));
     io_cont->numSuspendResults = 0;
     io_cont->suspendPoint      = safepoint_op;
 #  if d_m3HasFloat
-    io_cont->fp0 = 0.;
+    io_cont->fp0.f64_ = 0.;
 #  endif
 
     sp = base;

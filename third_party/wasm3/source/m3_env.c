@@ -492,7 +492,7 @@ IM3Continuation Continuation_New (IM3Runtime i_runtime, IM3FuncType i_type, IM3F
     cont->pc = i_function ? i_function->compiled : NULL;
     cont->r0 = 0;
 #  if d_m3HasFloat
-    cont->fp0 = 0;
+    cont->fp0.f64_ = 0.;
 #  endif
     cont->boundArgsCount    = 0;
     cont->numSuspendResults = 0;

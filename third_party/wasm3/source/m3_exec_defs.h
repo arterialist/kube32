@@ -30,11 +30,14 @@ d_m3BeginExternC
 #define d_m3ExpClearRegisters(...)  d_m3BaseClearRegisters; __VA_ARGS__
 
 #if d_m3HasFloat
-#  define d_m3OpSig                 d_m3ExpOpSig            (f64 _fp0)
+static inline m3fpreg_t m3_FpRegZero (void) { m3fpreg_t r; r.f64_ = 0.; return r; }
+// The float register's view at a width: d_m3Fp(f32) is the f32 it holds, d_m3Fp(f64) the f64
+#  define d_m3Fp(TYPE)              _fp0.TYPE##_
+#  define d_m3OpSig                 d_m3ExpOpSig            (m3fpreg_t _fp0)
 #  define d_m3OpArgs                d_m3ExpOpArgs           (_fp0)
 #  define d_m3OpAllArgs             d_m3ExpOpAllArgs        (_fp0)
-#  define d_m3OpDefaultArgs         d_m3ExpOpDefaultArgs    (0.)
-#  define d_m3ClearRegisters        d_m3ExpClearRegisters   (_fp0 = 0.;)
+#  define d_m3OpDefaultArgs         d_m3ExpOpDefaultArgs    (m3_FpRegZero ())
+#  define d_m3ClearRegisters        d_m3ExpClearRegisters   (_fp0.f64_ = 0.;)
 #else
 #  define d_m3OpSig                 d_m3BaseOpSig
 #  define d_m3OpArgs                d_m3BaseOpArgs
