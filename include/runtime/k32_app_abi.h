@@ -331,7 +331,9 @@ K32_IMPORT("k32_http_status") int32_t k32_http_status(void);
  * k32_softmax_f32 and k32_swiglu_f32, 4 for k32_rmsnorm_f32 and
  * k32_quantize_i8 and k32_quantize_i8_static, 3 for k32_rope_f32, 2 for
  * k32_add_f32_i8, 1 for k32_add_f32 and k32_argmax_f32, 8 per butterfly for
- * k32_fft_q15; a convolution pays for a cout x 9 cin matrix per pixel.
+ * k32_fft_q15; a convolution pays for a cout x 9 cin matrix per pixel,
+ * and k32_attention_f32_i8 for the two products and the softmax of every
+ * head of every position.
  *
  * w is a matrix of rows x cols weights, row r starting row_stride bytes
  * after row r - 1 (0: the rows follow each other); w_scale holds one float
@@ -398,6 +400,19 @@ K32_IMPORT("k32_http_status") int32_t k32_http_status(void);
  * k32_argmax_f32: the index of the first largest of n floats (0 for n = 0),
  * a greedy pick from logits.
  *
+ * k32_attention_f32_i8: the attention of n query positions pos0 .. pos0 +
+ * n - 1 over an int8 KV cache in linear memory, every head in one call. q
+ * holds n vectors of heads x hs floats and out receives the same. For
+ * position p and head h, with KV head kh = h / (heads / kvh): the scores
+ * against key rows 0 .. p, row r at kq + r x kv_stride + kh x hs (hs int8
+ * values) with the scale ks[r x kvh + kh], as k32_matvec_f32_i8 with alpha
+ * = scale into att; k32_softmax_f32 over them; the weighted sum of the
+ * value rows (vq, vs, the same layout) as k32_vecmat_f32_i8 into head h of
+ * the position's out: the bits of those three calls per head. kv_stride 0
+ * packs the rows (kvh x hs bytes). att is scratch of pos0 + n floats.
+ * heads must be a multiple of kvh and kv_stride at least kvh x hs
+ * (K32_ERR_INVAL otherwise).
+ *
  * k32_add_f32_i8: x = x + (float)q * scale over n floats, a residual from
  * an int8 map.
  *
@@ -441,6 +456,9 @@ K32_IMPORT("k32_rope_f32") int32_t k32_rope_f32(float* x, const float* cs, uint3
 K32_IMPORT("k32_swiglu_f32") int32_t k32_swiglu_f32(float* x, const float* g, uint32_t n);
 K32_IMPORT("k32_add_f32") int32_t k32_add_f32(float* x, const float* y, uint32_t n);
 K32_IMPORT("k32_argmax_f32") int32_t k32_argmax_f32(const float* x, uint32_t n);
+K32_IMPORT("k32_attention_f32_i8") int32_t k32_attention_f32_i8(float* out, const int8_t* kq, const float* ks, const int8_t* vq, const float* vs,
+                                                                const float* q, float scale, uint32_t heads, uint32_t kvh, uint32_t hs,
+                                                                uint32_t kv_stride, uint32_t pos0, uint32_t n, float* att);
 K32_IMPORT("k32_add_f32_i8") int32_t k32_add_f32_i8(float* x, const int8_t* q, float scale, uint32_t n);
 K32_IMPORT("k32_quantize_i8_static") int32_t k32_quantize_i8_static(int8_t* q, const float* x, float inv, uint32_t n);
 K32_IMPORT("k32_conv3x3_i8") int32_t k32_conv3x3_i8(float* out, const int8_t* w, const float* w_scale, const float* bias, const int8_t* in,

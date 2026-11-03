@@ -66,6 +66,22 @@ void matvec_f32_i8(uint8_t* out, const int8_t* w, size_t row_stride, const uint8
 void vecmat_f32_i8(uint8_t* out, const int8_t* w, size_t row_stride, const uint8_t* w_scale, size_t scale_stride,
                    const uint8_t* x, uint32_t rows, uint32_t cols);
 
+// Attention of n query positions pos0 .. pos0 + n - 1 over an int8 KV cache:
+// for position p and head h (KV head h / (heads / kvh)), the scores of q
+// (heads x hs floats a position) against key rows 0 .. p (row r at
+// kq + r x kv_stride + kh x hs, scale ks[r x kvh + kh]) as matvec_f32_i8
+// with alpha = scale into att, softmax_f32 over them, and the weighted sum
+// of the value rows (vq, vs, the same layout) as vecmat_f32_i8 into head h
+// of out: the bits of those three calls per head. att holds pos0 + n floats.
+void attention_f32_i8(uint8_t* out, const int8_t* kq, const uint8_t* ks, const int8_t* vq, const uint8_t* vs, const uint8_t* q,
+                      float scale, uint32_t heads, uint32_t kvh, uint32_t hs, size_t kv_stride, uint32_t pos0, uint32_t n, uint8_t* att);
+// Its units of work: the two products and the softmax of every head of every position
+constexpr uint64_t attention_units(uint64_t heads, uint64_t hs, uint64_t pos0, uint64_t n) {
+    uint64_t u = 0;
+    for (uint64_t i = 0; i < n; i++) u += heads * (2 * matrix_units(pos0 + i + 1, hs) + kSoftmaxUnits * (pos0 + i + 1));
+    return u;
+}
+
 // x = e^(x - max x) / their sum, with k32_expf and the sum in order
 void softmax_f32(uint8_t* x, uint32_t n);
 

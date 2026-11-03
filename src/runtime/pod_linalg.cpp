@@ -404,6 +404,21 @@ void vecmat_f32_i8(uint8_t* out, const int8_t* w, size_t row_stride, const uint8
     }
 }
 
+void attention_f32_i8(uint8_t* out, const int8_t* kq, const uint8_t* ks, const int8_t* vq, const uint8_t* vs, const uint8_t* q,
+                      float scale, uint32_t heads, uint32_t kvh, uint32_t hs, size_t kv_stride, uint32_t pos0, uint32_t n, uint8_t* att) {
+    const uint32_t per_kv = heads / kvh, dim = heads * hs;
+    for (uint32_t i = 0; i < n; i++) {
+        const uint32_t rows = pos0 + i + 1;
+        for (uint32_t h = 0; h < heads; h++) {
+            const uint32_t kh = h / per_kv;
+            const uint8_t* qh = q + 4 * (static_cast<size_t>(i) * dim + h * hs);
+            matvec_f32_i8(att, kq + kh * hs, kv_stride, ks + 4 * kh, 4 * kvh, qh, scale, rows, hs);
+            softmax_f32(att, rows);
+            vecmat_f32_i8(out + 4 * (static_cast<size_t>(i) * dim + h * hs), vq + kh * hs, kv_stride, vs + 4 * kh, 4 * kvh, att, rows, hs);
+        }
+    }
+}
+
 void softmax_f32(uint8_t* x, uint32_t n) {
     if (n == 0) return;
     float m = load_f32(x);
@@ -805,6 +820,13 @@ static const char kTrapAddI8X[] = K32_OOB("k32_add_f32_i8", "x");
 static const char kTrapAddI8Q[] = K32_OOB("k32_add_f32_i8", "q");
 static const char kTrapQuantSQ[] = K32_OOB("k32_quantize_i8_static", "q");
 static const char kTrapQuantSX[] = K32_OOB("k32_quantize_i8_static", "x");
+static const char kTrapAttOut[] = K32_OOB("k32_attention_f32_i8", "out");
+static const char kTrapAttKq[] = K32_OOB("k32_attention_f32_i8", "kq");
+static const char kTrapAttKs[] = K32_OOB("k32_attention_f32_i8", "ks");
+static const char kTrapAttVq[] = K32_OOB("k32_attention_f32_i8", "vq");
+static const char kTrapAttVs[] = K32_OOB("k32_attention_f32_i8", "vs");
+static const char kTrapAttQ[] = K32_OOB("k32_attention_f32_i8", "q");
+static const char kTrapAttAtt[] = K32_OOB("k32_attention_f32_i8", "att");
 static const char kTrapConvOut[] = K32_OOB("k32_conv3x3_i8", "out");
 static const char kTrapConvW[] = K32_OOB("k32_conv3x3_i8", "w");
 static const char kTrapConvWScale[] = K32_OOB("k32_conv3x3_i8", "w_scale");
@@ -937,6 +959,32 @@ static const void* raw_conv(IM3Runtime rt, IM3ImportContext, uint64_t* sp, void*
     return result(sp, K32_OK);
 }
 
+// "i(iiiiiifiiiiiii)": out, kq, ks, vq, vs, q, scale, heads, kvh, hs, kv_stride, pos0, n, att
+static const void* raw_attention(IM3Runtime rt, IM3ImportContext, uint64_t* sp, void* mem) {
+    const uint32_t out = arg(sp, 1), kq = arg(sp, 2), ks = arg(sp, 3), vq = arg(sp, 4), vs = arg(sp, 5), q = arg(sp, 6);
+    float scale;
+    __builtin_memcpy(&scale, &sp[7], sizeof scale);
+    const uint32_t heads = arg(sp, 8), kvh = arg(sp, 9), hs = arg(sp, 10), stride_arg = arg(sp, 11), pos0 = arg(sp, 12), n = arg(sp, 13);
+    const uint32_t att = arg(sp, 14);
+    if (heads == 0 || kvh == 0 || heads % kvh || hs == 0) return result(sp, K32_ERR_INVAL);
+    const uint64_t kvd = static_cast<uint64_t>(kvh) * hs, kv_stride = stride_arg ? stride_arg : kvd;
+    if (kv_stride < kvd) return result(sp, K32_ERR_INVAL);
+    const uint64_t rows = static_cast<uint64_t>(pos0) + n, dim = static_cast<uint64_t>(heads) * hs;
+    const uint64_t size = m3_GetMemorySizeAt(mem);
+    uint8_t* base = static_cast<uint8_t*>(mem);
+    if (!inside(size, out, 4 * dim * n)) return kTrapAttOut;
+    if (!fits(size, kq, static_cast<uint32_t>(rows), kv_stride, kvd)) return kTrapAttKq;
+    if (!inside(size, ks, 4 * rows * kvh)) return kTrapAttKs;
+    if (!fits(size, vq, static_cast<uint32_t>(rows), kv_stride, kvd)) return kTrapAttVq;
+    if (!inside(size, vs, 4 * rows * kvh)) return kTrapAttVs;
+    if (!inside(size, q, 4 * dim * n)) return kTrapAttQ;
+    if (!inside(size, att, 4 * rows)) return kTrapAttAtt;
+    if (M3Result r = charge(rt, attention_units(heads, hs, pos0, n))) return r;
+    attention_f32_i8(base + out, reinterpret_cast<const int8_t*>(base + kq), base + ks, reinterpret_cast<const int8_t*>(base + vq), base + vs,
+                     base + q, scale, heads, kvh, hs, static_cast<size_t>(kv_stride), pos0, n, base + att);
+    return result(sp, K32_OK);
+}
+
 // "i(ii)": x, n
 static const void* raw_argmax(IM3Runtime rt, IM3ImportContext, uint64_t* sp, void* mem) {
     const uint32_t x = arg(sp, 1), n = arg(sp, 2);
@@ -975,6 +1023,7 @@ void link_linalg_host_functions(IM3Module module) {
     m3_LinkRawFunction(module, "env", "k32_add_f32_i8", "i(iifi)", &raw_add_i8);
     m3_LinkRawFunction(module, "env", "k32_quantize_i8_static", "i(iifi)", &raw_quantize_static);
     m3_LinkRawFunction(module, "env", "k32_conv3x3_i8", "i(iiiiifiiiiiiiii)", &raw_conv);
+    m3_LinkRawFunction(module, "env", "k32_attention_f32_i8", "i(iiiiiifiiiiiii)", &raw_attention);
     m3_LinkRawFunction(module, "env", "k32_fft_q15", "i(iiiii)", &raw_fft);
 }
 

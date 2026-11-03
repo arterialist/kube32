@@ -156,16 +156,12 @@ __attribute__((noinline)) static void mm_calls(struct model* m, float* out, uint
 
 /* Each head of q attends to the cached positions 0..pos of its KV head
  * (scores, their softmax, the weighted values) into out */
-__attribute__((noinline)) static void attention(const struct model* m, uint32_t l, uint32_t pos, const float* q, float* out) {
+/* every head of positions pos0..pos0+n-1 over layer l's cache, in one call */
+__attribute__((noinline)) static void attention(const struct model* m, uint32_t l, uint32_t pos0, uint32_t n, const float* q, float* out) {
     const float scale = 1.0f / __builtin_sqrtf((float)m->hs);
     const uint32_t base = l * g_ctx;
-    for (uint32_t h = 0; h < m->heads; h++) {
-        const uint32_t kh = h / (m->heads / m->kvh);
-        const uint32_t kv = base * m->kvd + kh * m->hs, ks = base * m->kvh + kh;
-        k32_matvec_f32_i8(ATT, m->kq + kv, m->ks + ks, q + h * m->hs, scale, pos + 1, m->hs, m->kvd, 4 * m->kvh);
-        k32_softmax_f32(ATT, pos + 1);
-        k32_vecmat_f32_i8(out + h * m->hs, m->vq + kv, m->vs + ks, ATT, pos + 1, m->hs, m->kvd, 4 * m->kvh);
-    }
+    k32_attention_f32_i8(out, m->kq + base * m->kvd, m->ks + base * m->kvh, m->vq + base * m->kvd, m->vs + base * m->kvh, q, scale,
+                         m->heads, m->kvh, m->hs, m->kvd, pos0, n, ATT);
 }
 
 /* x += Wo attention(q, k, v) for positions pos0..pos0+n-1 */
@@ -182,7 +178,7 @@ __attribute__((noinline)) static void attention_block(struct model* m, uint32_t 
     k32_quantize_i8(m->kq + row * kvd, m->ks + row * m->kvh, K, hs, n * m->kvh);
     k32_quantize_i8(m->vq + row * kvd, m->vs + row * m->kvh, V, hs, n * m->kvh);
     const uint32_t t0 = now_us();
-    for (uint32_t i = 0; i < n; i++) attention(m, l, pos0 + i, Q + i * dim, XB2 + i * dim);
+    attention(m, l, pos0, n, Q, XB2);
     m->att_us += now_us() - t0;
     k32_quantize_i8(XQ, XS, XB2, dim, n);
     mm(m, XB, l, WO, n);

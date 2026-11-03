@@ -255,19 +255,20 @@ static const std::vector<std::vector<uint8_t>> kParams = {{kI32, kI32, kI32, kI3
                                                           {kI32, kI32, kI32, kI32, kI32},
                                                           {kI32, kI32, kI32},
                                                           {kI32, kI32, kF32, kI32},
-                                                          {kI32, kI32, kI32, kI32, kI32, kF32, kI32, kI32, kI32, kI32, kI32, kI32, kI32, kI32, kI32}};
-constexpr uint8_t kNumImports = 16;
+                                                          {kI32, kI32, kI32, kI32, kI32, kF32, kI32, kI32, kI32, kI32, kI32, kI32, kI32, kI32, kI32},
+                                                          {kI32, kI32, kI32, kI32, kI32, kI32, kF32, kI32, kI32, kI32, kI32, kI32, kI32, kI32}};
+constexpr uint8_t kNumImports = 17;
 static const char* const kImports[] = {"k32_matvec_i8",   "k32_matvec_i4",   "k32_matvec_f32_i8", "k32_vecmat_f32_i8", "k32_softmax_f32",
                                        "k32_matmul_i8",   "k32_matmul_i4",   "k32_rmsnorm_f32",   "k32_quantize_i8",   "k32_rope_f32",
                                        "k32_swiglu_f32",  "k32_add_f32",     "k32_argmax_f32",    "k32_add_f32_i8",    "k32_quantize_i8_static",
-                                       "k32_conv3x3_i8"};
-static const uint8_t kImportType[] = {0, 0, 1, 2, 3, 5, 5, 6, 7, 7, 8, 8, 3, 9, 9, 10};
+                                       "k32_conv3x3_i8",  "k32_attention_f32_i8"};
+static const uint8_t kImportType[] = {0, 0, 1, 2, 3, 5, 5, 6, 7, 7, 8, 8, 3, 9, 9, 10, 11};
 // The module's functions after the imports, their types, and the import each calls (oob: k32_matvec_i8)
-constexpr uint8_t kNumFns = 17;
+constexpr uint8_t kNumFns = 18;
 static const char* const kFns[] = {"mv8", "mv4", "mvf", "vm", "sm", "oob", "mm8", "mm4", "rms", "qnt", "rope", "swi", "add", "amax",
-                                   "addq", "qst", "conv"};
-static const uint8_t kFnType[] = {0, 0, 1, 2, 3, 4, 5, 5, 6, 7, 7, 8, 8, 3, 9, 9, 10};
-static const uint8_t kFnCallee[] = {0, 1, 2, 3, 4, 0, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15};
+                                   "addq", "qst", "conv", "attn"};
+static const uint8_t kFnType[] = {0, 0, 1, 2, 3, 4, 5, 5, 6, 7, 7, 8, 8, 3, 9, 9, 10, 11};
+static const uint8_t kFnCallee[] = {0, 1, 2, 3, 4, 0, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16};
 
 static std::vector<uint8_t> linalg_module() {
     std::vector<uint8_t> m = {0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00};
@@ -326,7 +327,7 @@ struct Pod {
     IM3Environment env{nullptr};
     IM3Runtime rt{nullptr};
     IM3Module mod{nullptr};
-    IM3Function fn[16]{};   // mv8, mv4, mvf, vm, sm, mm8, mm4, rms, qnt, rope, swi, add, amax, addq, qst, conv
+    IM3Function fn[17]{};   // mv8, mv4, mvf, vm, sm, mm8, mm4, rms, qnt, rope, swi, add, amax, addq, qst, conv, attn
     std::vector<uint8_t> wasm;
     uint8_t* mem{nullptr};
     size_t mem_size{0};
@@ -341,8 +342,8 @@ struct Pod {
         assert(!r);
         link_app_host_functions(mod, "default/linalg");
         const char* const names[] = {"mv8", "mv4", "mvf", "vm", "sm", "mm8", "mm4", "rms", "qnt", "rope", "swi", "add", "amax",
-                                     "addq", "qst", "conv"};
-        for (int i = 0; i < 16 && !r; i++) r = m3_FindFunction(&fn[i], rt, names[i]);
+                                     "addq", "qst", "conv", "attn"};
+        for (int i = 0; i < 17 && !r; i++) r = m3_FindFunction(&fn[i], rt, names[i]);
         if (r) std::printf("module: %s\n", r);
         assert(!r);
         mem = m3_GetMemory(mod, &mem_size, 0);
@@ -1119,7 +1120,65 @@ static void test_conv() {
     std::printf("[PASS] test_conv\n");
 }
 
+// k32_attention_f32_i8 against the three calls per head and position, through
+// the kernel and through a pod (its gas, operands outside the memory, bad shapes)
+static void test_attention() {
+    using namespace kube32;
+    constexpr uint32_t heads = 4, kvh = 2, hs = 8, ctx = 10, pos0 = 3, n = 4, dim = heads * hs, kvd = kvh * hs, stride = kvd + 6;
+    std::vector<int8_t> kq(ctx * stride), vq(ctx * stride);
+    std::vector<float> ks(ctx * kvh), vs(ctx * kvh), q(n * dim), want(n * dim), got(n * dim), att(ctx);
+    for (auto& v : kq) v = static_cast<int8_t>(rnd() >> 24);
+    for (auto& v : vq) v = static_cast<int8_t>(rnd() >> 24);
+    for (auto& f : ks) f = rnd_f32() * 0.01f;
+    for (auto& f : vs) f = rnd_f32() * 0.01f;
+    for (auto& f : q) f = rnd_f32();
+    const float scale = 0.3535f;
+    for (uint32_t i = 0; i < n; i++)
+        for (uint32_t h = 0; h < heads; h++) {
+            const uint32_t kh = h / (heads / kvh), rows = pos0 + i + 1;
+            matvec_f32_i8(bytes_of(att), kq.data() + kh * hs, stride, bytes_of(ks) + 4 * kh, 4 * kvh, bytes_of(q) + 4 * (i * dim + h * hs), scale, rows, hs);
+            softmax_f32(bytes_of(att), rows);
+            vecmat_f32_i8(bytes_of(want) + 4 * (i * dim + h * hs), vq.data() + kh * hs, stride, bytes_of(vs) + 4 * kh, 4 * kvh, bytes_of(att), rows, hs);
+        }
+    attention_f32_i8(bytes_of(got), kq.data(), bytes_of(ks), vq.data(), bytes_of(vs), bytes_of(q), scale, heads, kvh, hs, stride, pos0, n, bytes_of(att));
+    assert(std::memcmp(got.data(), want.data(), 4 * want.size()) == 0);
+
+    enum { ATTN = 16 };
+    constexpr uint32_t kO = 0x100, kKq = 0x1000, kKs = 0x1801, kVq = 0x2000, kVs = 0x2800, kQ = 0x3000, kAtt = 0x3800;
+    Pod p(1000000000ull);
+    std::memcpy(p.mem + kKq, kq.data(), kq.size());
+    std::memcpy(p.mem + kKs, ks.data(), 4 * ks.size());
+    std::memcpy(p.mem + kVq, vq.data(), vq.size());
+    std::memcpy(p.mem + kVs, vs.data(), 4 * vs.size());
+    std::memcpy(p.mem + kQ, q.data(), 4 * q.size());
+    int32_t rc = 1;
+    const auto call = [&](uint32_t out, uint32_t a, uint32_t b, uint32_t c, uint32_t d, uint32_t e, uint32_t hd, uint32_t kh, uint32_t h,
+                          uint32_t st, uint32_t p0, uint32_t cnt, uint32_t sc) {
+        return p.call_fn(ATTN, &rc, out, a, b, c, d, e, static_cast<double>(scale), hd, kh, h, st, p0, cnt, sc);
+    };
+    const uint64_t before = m3_GetResourceUsage(p.rt, c_m3Limit_GasUnits);
+    assert(!call(kO, kKq, kKs, kVq, kVs, kQ, heads, kvh, hs, stride, pos0, n, kAtt) && rc == K32_OK);
+    const uint64_t used = m3_GetResourceUsage(p.rt, c_m3Limit_GasUnits) - before, units = attention_units(heads, hs, pos0, n);
+    assert(used >= linalg_gas(units) && used - linalg_gas(units) < 2000);
+    assert(std::memcmp(p.mem + kO, want.data(), 4 * want.size()) == 0);
+    assert(!call(kO, kKq, kKs, kVq, kVs, kQ, heads, 3, hs, stride, pos0, n, kAtt) && rc == K32_ERR_INVAL);
+    assert(!call(kO, kKq, kKs, kVq, kVs, kQ, heads, kvh, hs, kvd - 1, pos0, n, kAtt) && rc == K32_ERR_INVAL);
+    const uint32_t end = 2 * 65536, rows = pos0 + n;
+    const auto trap = [&](M3Result r, const char* operand) {
+        assert(r && std::string(r) == "[trap] out of bounds memory access: " + std::string(operand) + " of k32_attention_f32_i8");
+    };
+    trap(call(end - 4 * n * dim + 1, kKq, kKs, kVq, kVs, kQ, heads, kvh, hs, stride, pos0, n, kAtt), "out");
+    trap(call(kO, end - (rows - 1) * stride - kvd + 1, kKs, kVq, kVs, kQ, heads, kvh, hs, stride, pos0, n, kAtt), "kq");
+    trap(call(kO, kKq, end - 4 * rows * kvh + 1, kVq, kVs, kQ, heads, kvh, hs, stride, pos0, n, kAtt), "ks");
+    trap(call(kO, kKq, kKs, end - (rows - 1) * stride - kvd + 1, kVs, kQ, heads, kvh, hs, stride, pos0, n, kAtt), "vq");
+    trap(call(kO, kKq, kKs, kVq, end - 4 * rows * kvh + 1, kQ, heads, kvh, hs, stride, pos0, n, kAtt), "vs");
+    trap(call(kO, kKq, kKs, kVq, kVs, end - 4 * n * dim + 1, heads, kvh, hs, stride, pos0, n, kAtt), "q");
+    trap(call(kO, kKq, kKs, kVq, kVs, kQ, heads, kvh, hs, stride, pos0, n, end - 4 * rows + 1), "att");
+    std::printf("[PASS] test_attention\n");
+}
+
 int main() {
+    test_attention();
     test_conv();
     test_fft();
     test_kernels_match_reference();

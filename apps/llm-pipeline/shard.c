@@ -139,17 +139,13 @@ __attribute__((noinline)) static void proj(float* out, uint32_t t) {
 
 /* Each head of q attends to the cached positions 0..pos of its KV head: the
  * node computes the scores q_h . k_t / sqrt(head_size), their softmax and
- * the sum of the values they weigh, into head h of xb2 */
+ * the sum of the values they weigh, into head h of xb2, every head in one
+ * call */
 __attribute__((noinline)) static void attention(uint32_t pos) {
     const float scale = 1.0f / __builtin_sqrtf((float)g_hs);
     const uint32_t base = g_l * g_ctx;
-    for (uint32_t h = 0; h < g_heads; h++) {
-        const uint32_t kh = h / (g_heads / g_kvh);
-        const uint32_t kv = base * g_kvd + kh * g_hs, ks = base * g_kvh + kh;
-        k32_matvec_f32_i8(att, g_kq + kv, g_ks + ks, q + h * g_hs, scale, pos + 1, g_hs, g_kvd, 4 * g_kvh);
-        k32_softmax_f32(att, pos + 1);
-        k32_vecmat_f32_i8(xb2 + h * g_hs, g_vq + kv, g_vs + ks, att, pos + 1, g_hs, g_kvd, 4 * g_kvh);
-    }
+    k32_attention_f32_i8(xb2, g_kq + base * g_kvd, g_ks + base * g_kvh, g_vq + base * g_kvd, g_vs + base * g_kvh, q, scale, g_heads, g_kvh,
+                         g_hs, g_kvd, pos, 1, att);
 }
 
 /* q, k, v of norm(x); k and v into the cache at pos */
