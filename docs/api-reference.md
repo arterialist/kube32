@@ -126,7 +126,7 @@ Error from server (BadRequest): error when creating "typo.yaml": strict decoding
 
 Write requests honour `dryRun=All` in the query string or in a `DeleteOptions` request body. The server validates the request and checks preconditions without writing to the store or firing watch events.
 
-`application/merge-patch+json` applies a recursive JSON merge where objects merge and arrays or scalars replace. `application/strategic-merge-patch+json` also merges the lists of the core types by their key, for example containers by `name` and conditions by `type`. `PUT` and `PATCH` preserve `uid`, `creationTimestamp` and `status`, and increment `metadata.generation` when `spec` changes.
+`application/merge-patch+json` applies a recursive JSON merge where objects merge and arrays or scalars replace. `application/strategic-merge-patch+json` also merges the lists of the core types by their key, for example containers by `name` and conditions by `type`. `application/json-patch+json` applies an RFC 6902 list of `add`, `remove`, `replace`, `move`, `copy` and `test` operations at RFC 6901 JSON Pointer paths (`kubectl patch --type json`), on every resource that accepts a patch, including `status` and the Deployment `scale` subresource, where the paths address the `Scale` object. A JSON Patch applies whole or not at all: an operation that fails, a `test` that does not hold included, answers `422 Invalid` with the operation's message and stores nothing. A body that is not an array answers `400 BadRequest`, and more than 10000 operations `413 RequestEntityTooLarge`. A `test` of `/metadata/resourceVersion` makes the patch conditional on the version the client read. `PUT` and `PATCH` preserve `uid`, `creationTimestamp` and `status`, and increment `metadata.generation` when `spec` changes.
 
 `fieldSelector` supports `=`, `==` and `!=` on any dotted path. `labelSelector` supports `=`, `==`, `!=`, `in`, `notin`, `key` and `!key`. List endpoints honour `limit` and `continue` and set `remainingItemCount` in the list metadata. Pod list endpoints accept `?inlineImages=omit` (used by the kubelet) to omit `kube32.io/wasm-base64` annotation payloads.
 
@@ -147,7 +147,7 @@ Write requests honour `dryRun=All` in the query string or in a `DeleteOptions` r
 
 ## Limitations
 
-- Server-side apply and JSON Patch return `415 UnsupportedMediaType`; use `kubectl apply` without `--server-side`.
+- Server-side apply returns `415 UnsupportedMediaType`; use `kubectl apply` without `--server-side`.
 - Request bodies must be JSON, except `ConfigMap`, `Secret`, `Namespace`, `Service`, `Deployment`, `Job`, `SelfSubjectAccessReview` and `SelfSubjectRulesReview`, which also accept protobuf (`kubectl create configmap|secret|namespace|deployment|job|service` works); other kinds in protobuf return `415 UnsupportedMediaType` with the reason.
 - A persisted create or update that exceeds the object store capacity returns `500 InternalError` (`object store is full: X of Y bytes in use, N more needed`), checked before writing; shrinking writes always pass, and a lost create race returns `409 AlreadyExists`.
 - There is no RBAC; authenticated callers have full access to all resources.

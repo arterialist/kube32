@@ -25,7 +25,7 @@ kubectl label device bme688-cardputer-b0-m70c2-77 location=kitchen
 
 ## The Device resource
 
-`kube32.io/v1` `Device` is a namespaced resource. Its plural is `devices` and its short name is `dev`. It supports `get`, `list`, `watch`, `create`, `update`, `patch` (JSON merge and strategic merge) and `delete`. It also has the `status` subresource.
+`kube32.io/v1` `Device` is a namespaced resource. Its plural is `devices` and its short name is `dev`. It supports `get`, `list`, `watch`, `create`, `update`, `patch` (JSON patch, JSON merge and strategic merge) and `delete`. It also has the `status` subresource.
 
 ```yaml
 apiVersion: kube32.io/v1
