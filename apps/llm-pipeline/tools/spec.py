@@ -271,11 +271,13 @@ def board(url, method="GET", body=None, tries=5):
 def board_run(a, prompt, mode, k):
     """One generation on llm-speculative; its final status"""
     q = "%s/generate?mode=%s&k=%d&steps=%d" % (a.url.rstrip("/"), mode, k, a.steps)
+    t0 = time.time()
     board(q, "POST", prompt.encode())
     while True:
-        time.sleep(2)
+        time.sleep(0.5)
         st = board(a.url)
         if st["state"] in ("done", "failed"):
+            st["wall_s"] = time.time() - t0   # the whole generation by this host's clock, prefill included
             return st
 
 
@@ -304,9 +306,10 @@ def cmd_bench(a):
                     sys.exit("k=%d, prompt %r: %d passes / %d accepted on the board, %d / %d in the reference" %
                              (k, p, st["passes"], st["accepted"], len(passes), sum(q["accepted"] for q in passes)))
             rows[(mode, k)].append(st)
-            print("%-11s k=%d %6.3f tok/s  %3d tokens  passes %3d  acceptance %.3f  verify %7.1f ms  draft %5.1f ms/token  "
-                  "%7d B/token  prompt %r" % (mode, k, st["tokens_per_s"], st["tokens"], st["passes"], st["acceptance"],
-                                              st["verify_ms_per_pass"], st["draft_ms_per_token"], st["target_bytes_per_token"], p),
+            print("%-11s k=%d %6.3f tok/s (wall %6.3f)  %3d tokens  passes %3d  acceptance %.3f  verify %7.1f ms  draft %5.1f ms/token  "
+                  "%7d B/token  prompt %r" % (mode, k, st["tokens_per_s"], st["tokens"] / st["wall_s"], st["tokens"], st["passes"],
+                                              st["acceptance"], st["verify_ms_per_pass"], st["draft_ms_per_token"],
+                                              st["target_bytes_per_token"], p),
                   flush=True)
     print("\nmean over %d prompts, %d tokens each at most, same tokens as the reference in every run:" % (len(prompts), a.steps))
     out = []
@@ -316,8 +319,10 @@ def cmd_bench(a):
         decode_ms = sum(s["decode_ms"] for s in sts)
         passes = sum(s["passes"] for s in sts)
         proposed = sum(s["proposed"] for s in sts)
+        wall_s = sum(s["wall_s"] for s in sts)
         row = {"mode": mode, "k": k, "prompts": n, "tokens": tokens,
                "tokens_per_s_mean": sum(s["tokens_per_s"] for s in sts) / n,
+               "tokens_per_s_wall": tokens / wall_s if wall_s else 0.0,
                "tokens_per_s_pooled": tokens * 1000.0 / decode_ms if decode_ms else 0.0,
                "acceptance": sum(s["accepted"] for s in sts) / proposed if proposed else 0.0,
                "tokens_per_pass": tokens / passes if passes else 0.0,
@@ -327,9 +332,9 @@ def cmd_bench(a):
                "target_bytes_per_token": sum(s["target_bytes"] for s in sts) / tokens if tokens else 0.0,
                "runs": sts}
         out.append(row)
-        print("%-11s k=%d  %6.3f tok/s (pooled %6.3f)  acceptance %.3f  %.2f tokens/pass  verify %7.1f ms/pass  "
+        print("%-11s k=%d  %6.3f tok/s (pooled %6.3f, wall %6.3f)  acceptance %.3f  %.2f tokens/pass  verify %7.1f ms/pass  "
               "draft %5.1f ms/token  %9.0f B/token from flash" % (mode, k, row["tokens_per_s_mean"], row["tokens_per_s_pooled"],
-                                                              row["acceptance"], row["tokens_per_pass"], row["verify_ms_per_pass"],
+                                                              row["tokens_per_s_wall"], row["acceptance"], row["tokens_per_pass"], row["verify_ms_per_pass"],
                                                               row["draft_ms_per_token"], row["target_bytes_per_token"]))
     if a.out:
         with open(a.out, "w") as f:
