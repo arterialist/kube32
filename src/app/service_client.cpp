@@ -792,9 +792,22 @@ int32_t ServiceClient::call_https_here(const runtime::ServiceCallRequest& req, r
     return call_external(req, t, out);
 }
 
+void ServiceClient::set_gateway(const std::string& host, uint16_t port) {
+    osal::LockGuard guard(gateway_mutex_);
+    opts_.gateway_host = host;
+    opts_.gateway_port = port;
+}
+
+std::string ServiceClient::gateway(uint16_t& port) const {
+    osal::LockGuard guard(gateway_mutex_);
+    port = opts_.gateway_port;
+    return opts_.gateway_host;
+}
+
 int32_t ServiceClient::call_https(const runtime::ServiceCallRequest& req, const Target& t, ResponseBody& out) {
     if (!opts_.tls) {
-        if (!opts_.gateway_host.empty()) return call_gateway(req, t, out);
+        uint16_t gateway_port = 0;
+        if (!gateway(gateway_port).empty()) return call_gateway(req, t, out);
         stats_.failed.fetch_add(1, std::memory_order_relaxed);
         return K32_ERR_NOTSUP;
     }
@@ -1071,9 +1084,11 @@ int32_t ServiceClient::call_gateway(const runtime::ServiceCallRequest& req, cons
     message.append("\r\n");
 
     osal::Socket sock;
+    uint16_t gateway_port = 0;
+    const std::string gateway_host = gateway(gateway_port);
     const uint32_t ct = left_ms() < opts_.connect_timeout_ms ? left_ms() : opts_.connect_timeout_ms;
     if (ct == 0) return fail(K32_ERR_TIMEOUT);
-    if (!sock.create(osal::SocketType::Tcp) || !sock.connect(opts_.gateway_host.c_str(), opts_.gateway_port, ct)) {
+    if (!sock.create(osal::SocketType::Tcp) || !sock.connect(gateway_host.c_str(), gateway_port, ct)) {
         return fail(left_ms() == 0 ? K32_ERR_TIMEOUT : K32_ERR_IO);
     }
     sock.set_tcp_nodelay(true);
@@ -1084,7 +1099,7 @@ int32_t ServiceClient::call_gateway(const runtime::ServiceCallRequest& req, cons
     // answer (a timeout included) arrives while the pod still waits
     const uint32_t left = left_ms();
     head.append("&timeout=").append(std::to_string(left > 400 ? left - 200 : left)).append("&limit=").append(std::to_string(out.limit));
-    head.append(" HTTP/1.1\r\nHost: ").append(opts_.gateway_host).append(":").append(std::to_string(opts_.gateway_port)).append("\r\n");
+    head.append(" HTTP/1.1\r\nHost: ").append(gateway_host).append(":").append(std::to_string(gateway_port)).append("\r\n");
     if (!opts_.gateway_token.empty()) head.append("Authorization: Bearer ").append(opts_.gateway_token).append("\r\n");
     head.append("Content-Type: message/http\r\nContent-Length: ").append(std::to_string(message.size() + req.body.size()));
     head.append("\r\nConnection: close\r\n\r\n");

@@ -394,6 +394,13 @@ else()
     target_link_libraries(test_network_policy PRIVATE kube32_core)
     add_test(NAME test_network_policy COMMAND test_network_policy)
 
+    # A worker that loses its API server: the local address toward a host,
+    # following the control plane's announced API address (HELLO frames), and
+    # the clients that are pointed at the new address
+    add_executable(test_api_follow tests/test_api_follow.cpp)
+    target_link_libraries(test_api_follow PRIVATE kube32_core)
+    add_test(NAME test_api_follow COMMAND test_api_follow)
+
     # Service calls, https calls and the egress gateway, the webhook example,
     # bundle files, sub-page memory limits, what a pod takes of the pod pool,
     # the kubelet's streamed API reads, node storage over HTTP, the device

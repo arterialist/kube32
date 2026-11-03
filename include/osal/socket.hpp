@@ -70,6 +70,8 @@ public:
     bool set_timeout(uint32_t recv_timeout_ms, uint32_t send_timeout_ms);
     bool set_reuse_addr(bool reuse);
     bool set_tcp_nodelay(bool nodelay);
+    // Lets a UDP socket send to a broadcast address (SO_BROADCAST)
+    bool set_broadcast(bool broadcast);
     // The peer closed its side and nothing is left to read: a request that
     // was read in full but whose client has gone. Does not block. Always
     // false on TLS sessions (the descriptor carries ciphertext).
@@ -106,6 +108,13 @@ public:
     // `stop` is asked every few ms whether to give up. Returns 0, ENOENT (no
     // such name, or no answer from the name server), ETIMEDOUT or ECANCELED.
     static int resolve_ipv4(const char* host, uint32_t timeout_ms, mem::FunctionRef<bool()> stop, uint32_t& out);
+
+    // The local IPv4 address (dotted decimal) the system sends from when it
+    // talks to `host` (an IPv4 address or a name): the source address of the
+    // route to it, found by connecting a UDP socket, which sends nothing.
+    // "" when there is no route (no network, Wi-Fi down) or `host` is not
+    // found.
+    static std::string local_address_toward(const char* host, uint16_t port);
 
     // Platform networking initialization
     static bool init_networking();

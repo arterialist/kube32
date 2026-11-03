@@ -280,10 +280,10 @@ kubectl annotate device kitchen-env kube32.io/notes='On the shelf above the kett
 A `kube32-sim` worker can join a cluster of boards and run app pods. Driver pods stay on the boards that have their parts:
 
 ```
-kube32-sim --role worker --join http://<control-plane-ip>:6443 --node-ip <laptop-ip> --node-name laptop --pod-port 17000
+kube32-sim --role worker --join http://<control-plane-ip>:6443 --node-name laptop --pod-port 17000
 ```
 
-`--node-ip` must be an address that the boards can reach. An app on the laptop calls a driver at its board's address. Drivers and Services reach the laptop's pod server at the laptop's address.
+The laptop reports the address that its route to the control plane uses, an address that the boards can reach. An app on the laptop calls a driver at its board's address. Drivers and Services reach the laptop's pod server at the laptop's address. When the laptop changes network, the Node's address follows, and the worker dials the control plane at the address it announces after 30 seconds without an answer ([Following the network](cli-reference.md#following-the-network)). `--node-ip <ip>` fixes the address.
 
 The pod server uses the node's own port. Endpoints, Ingress routes and Service calls reach a pod on the laptop at the port that the laptop reports, whatever its `containerPort` is.
 

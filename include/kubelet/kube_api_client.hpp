@@ -3,6 +3,7 @@
 #include "models/kube_models.hpp"
 #include "mem/function_ref.hpp"
 #include "runtime/image_registry.hpp"
+#include "osal/mutex.hpp"
 #include <string>
 #include <string_view>
 #include <vector>
@@ -82,6 +83,9 @@ public:
     // The value of annotation `key` on Node `node` ("" when it has none).
     // Returns the HTTP status of the read. The default reads the Node through get().
     virtual int get_node_annotation(const std::string& node, std::string_view key, std::string& out);
+    // Sends the requests that follow to another API server address. False
+    // for a client that talks to one fixed server.
+    virtual bool set_server(const std::string& /*host*/, uint16_t /*port*/) { return false; }
 };
 
 // Standard HTTP/1.1 REST Client implementation for Kubelet
@@ -114,6 +118,9 @@ public:
     int stream_get(const std::string& path, mem::FunctionRef<bool(const char*, size_t)> on_data, long* out_length = nullptr) override;
     // Scans the Node as it streams in: nothing but the value is kept
     int get_node_annotation(const std::string& node, std::string_view key, std::string& out) override;
+    // Requests that start after this call go to host:port; one in flight
+    // finishes at the address it began with. Safe to call from any thread.
+    bool set_server(const std::string& host, uint16_t port) override;
     // Restricts list_pods_raw to pods bound to this node (server-side fieldSelector).
     // The list asks the server to leave inline image annotations empty
     // (?inlineImages=omit) and is split into pods as it streams in, so a
@@ -160,8 +167,16 @@ private:
                        mem::FunctionRef<bool(int, std::string_view)>* on_head = nullptr,
                        const char* content_type = "application/json");
 
-    std::string host_;
-    uint16_t port_;
+    // Where requests go, replaced as a whole by set_server. A request takes
+    // a reference under the lock and uses it to the end, without a copy.
+    struct Endpoint {
+        std::string host;
+        uint16_t port;
+    };
+    std::shared_ptr<const Endpoint> endpoint() const;
+
+    mutable osal::Mutex endpoint_mutex_;
+    std::shared_ptr<const Endpoint> endpoint_;
     std::string node_filter_;
     std::string token_;
     size_t max_body_{0};

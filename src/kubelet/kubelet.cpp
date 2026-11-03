@@ -440,6 +440,14 @@ void Kubelet::drop_stale_node_labels() {
     if (!patch.empty()) api_client_->patch_node_status(config_.node_name, patch + "}}}");
 }
 
+bool Kubelet::set_api_server(const std::string& host, uint16_t port) {
+    if (!api_client_->set_server(host, port)) return false;
+    osal::LockGuard guard(api_server_mutex_);
+    config_.api_server_host = host;
+    config_.api_server_port = port;
+    return true;
+}
+
 void Kubelet::refresh_node_ip() {
     if (config_.node_ip_provider) {
         std::string ip = config_.node_ip_provider();
@@ -1140,8 +1148,11 @@ bool Kubelet::deploy_and_start_pod(const models::KubePod& pod_in, const std::str
         ectx.node_port = config_.kubelet_port;
         // The control plane's kubelet reaches the API on loopback; pods are
         // given the address the rest of the network uses.
-        ectx.api_host = (config_.api_server_host == "127.0.0.1" || config_.api_server_host == "localhost") ? config_.node_ip : config_.api_server_host;
-        ectx.api_port = config_.api_server_port;
+        {
+            osal::LockGuard guard(api_server_mutex_);
+            ectx.api_host = (config_.api_server_host == "127.0.0.1" || config_.api_server_host == "localhost") ? config_.node_ip : config_.api_server_host;
+            ectx.api_port = config_.api_server_port;
+        }
         std::string env_err;
         if (!build_container_env(manifest_json, ectx, container_env, env_err)) {
             hal::CapabilityFirewall::instance().unregister_pod(pod_key);

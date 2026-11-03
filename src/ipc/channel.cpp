@@ -159,6 +159,12 @@ public:
         if (running_.load()) return true;
         if (!sock_.create(osal::SocketType::Udp)) return false;
         sock_.set_reuse_addr(true);
+#if !defined(KUBE32_TARGET_ESP32)
+        // A simulated worker sends its HELLO to the broadcast address
+        // (ChannelManager::add_seed_peer) to be found by a control plane
+        // that does not know its address
+        sock_.set_broadcast(true);
+#endif
         bool bound = false;
         for (int attempt = 0; attempt < 20 && !bound; ++attempt) {
             bound = sock_.bind("0.0.0.0", port_);

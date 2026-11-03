@@ -185,6 +185,10 @@ public:
     bool get_pod_record(const std::string& pod_key, LocalPodRecord& out_record) const;
     // Uptime of the last pod sync pass that listed pods from the API server, 0 before the first
     uint64_t last_sync_ok_ms() const { return last_sync_ok_ms_.load(); }
+    // The API server moved: requests from now on go to host:port. Pods keep
+    // running; only a container created later gets the new address in its
+    // environment. False when the kubelet's client has one fixed server.
+    bool set_api_server(const std::string& host, uint16_t port);
 
     // Ships new log records of every local pod to the API server (called from
     // the status loop; public for tests).
@@ -288,6 +292,9 @@ private:
     static constexpr size_t kRegistrationBufBytes = 2048;
     std::unique_ptr<char[]> registration_buf_;
     std::atomic<uint64_t> last_sync_ok_ms_{0};     // end of the last pod sync pass that listed pods
+    // config_.api_server_host and api_server_port change in set_api_server
+    // while containers are created on the worker thread
+    osal::Mutex api_server_mutex_;
     std::atomic<bool> heartbeat_due_{false};       // send the next heartbeat without waiting
     std::atomic<bool> sync_due_{false};            // list the node's pods without waiting (request_sync)
 
