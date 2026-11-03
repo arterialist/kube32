@@ -19,6 +19,11 @@
  * Environment:
  *   STAGE      this stage's index in the pipeline (0 = first)
  *   MODEL_URL  the slice (http://llm-store/shard-0.bin)
+ *   MODEL_BLOB instead, a blob of the node that holds the slice (named in
+ *              kube32.io/blobs): the matrices and their scales stay in it and
+ *              the node's products read them in place; the norms and the
+ *              token scales come into memory, embedding rows and rotary
+ *              coefficients are read per position
  *   NEXT_URL   the next stage (http://llm-shard-1/x), or for the last stage
  *              the coordinator (http://llm-coordinator/result)
  *   NODE_NAME  reported in each position's trace (fieldRef spec.nodeName)
@@ -57,6 +62,24 @@ static uint32_t g_nl, g_dim, g_hidden, g_heads, g_kvh, g_hs, g_kvd, g_vocab, g_l
 static const int8_t *g_tok_q, *g_cls_q;
 static const float *g_tok_s, *g_rope, *g_rms_final, *g_cls_s;
 static uint32_t g_loaded, g_load_at;
+static char g_blob_name[48];
+static uint32_t g_blob_len, g_tok_off, g_rope_off;
+static int32_t g_blob = -1;
+
+/* The next part of the slice, the walk at offset *off: in memory (copy) or,
+ * for a slice in a blob, as a blob address (the products read it there) */
+static const uint8_t* g_slice;
+static uint8_t* g_mem;
+__attribute__((noinline)) static const uint8_t* part(uint32_t* off, uint32_t bytes, int copy) {
+    const uint32_t at = *off;
+    *off += bytes;
+    if (!g_blob_len) return g_slice + at;
+    if (!copy) return (const uint8_t*)K32_BLOB_ADDR(g_blob, at);
+    uint8_t* q = g_mem;
+    k32_blob_read(g_blob, at, q, bytes);
+    g_mem += (bytes + 3u) & ~3u;
+    return q;
+}
 
 /* activations and the cache */
 static float *x, *xb, *xb2, *q, *k, *v, *hb, *hb2, *att, g_xs;
@@ -193,8 +216,15 @@ __attribute__((noinline)) static void load(void) {
     const uint32_t end = limit && limit < pages * 65536u ? limit : pages * 65536u;
     uint8_t* p = (uint8_t*)(((uintptr_t)&__heap_base + 15u) & ~(uintptr_t)15u);
     uint32_t n = 0;
-    const int32_t rc = k32_http_call("GET", 3, g_url, g_url_len, "", 0, 0, 0, p, end - (uint32_t)(uintptr_t)p, &n, 30000);
-    if (rc != 200) { say("fetching the model slice: ", rc); return; }
+    if (g_blob_len) {
+        if (g_blob < 0) g_blob = k32_blob_open(g_blob_name, g_blob_len);
+        if (g_blob < 0) { say("opening the model blob: ", g_blob); return; }
+        n = (uint32_t)k32_blob_size(g_blob);
+        if (k32_blob_read(g_blob, 0, p, sizeof *B) != (int32_t)sizeof *B) { say("reading the model blob: ", -5); return; }
+    } else {
+        const int32_t rc = k32_http_call("GET", 3, g_url, g_url_len, "", 0, 0, 0, p, end - (uint32_t)(uintptr_t)p, &n, 30000);
+        if (rc != 200) { say("fetching the model slice: ", rc); return; }
+    }
     B = (const struct llm_blob*)p;
     g_dim = B->dim; g_hidden = B->hidden; g_heads = B->n_heads; g_kvh = B->n_kv_heads; g_vocab = B->vocab;
     g_nl = B->layer_end - B->layer_begin;
@@ -207,23 +237,29 @@ __attribute__((noinline)) static void load(void) {
     g_hs = g_dim / g_heads;
     g_kvd = g_kvh * g_hs;
     g_dims[0] = 1; g_dims[1] = g_dim; g_dims[2] = g_kvd; g_dims[3] = g_hidden;
-    const uint8_t* c = p + sizeof *B;
+    /* in memory the slice is followed by what the shard computes; with a
+     * blob, the copied parts are */
+    g_slice = p;
+    g_mem = p + ((sizeof *B + 15u) & ~15u);
+    uint32_t o = sizeof *B;
     if (B->flags & LLM_BLOB_EMBED) {
-        g_tok_q = (const int8_t*)c; c += g_vocab * g_dim;
-        g_tok_s = (const float*)c; c += 4 * g_vocab;
-        g_rope = (const float*)c; c += 4 * B->seq_len * g_hs;
+        g_tok_off = o;
+        g_tok_q = (const int8_t*)part(&o, g_vocab * g_dim, 0);
+        g_tok_s = (const float*)part(&o, 4 * g_vocab, 1);
+        g_rope_off = o;
+        g_rope = (const float*)part(&o, 4 * B->seq_len * g_hs, 0);
     }
     for (uint32_t l = 0; l < g_nl; l++)
-        for (uint32_t t = 0; t < TENSORS; t++) {
-            g_t[l][t] = c;
-            c += g_dims[kShape[t] >> 4] * g_dims[kShape[t] & 15] * (t < WQ ? 32 : g_bits) / 8;
-        }
+        for (uint32_t t = 0; t < TENSORS; t++)
+            g_t[l][t] = part(&o, g_dims[kShape[t] >> 4] * g_dims[kShape[t] & 15] * (t < WQ ? 32 : g_bits) / 8,
+                             t == RMS_ATT || t == RMS_FFN);
     if (B->flags & LLM_BLOB_HEAD) {
-        g_rms_final = (const float*)c; c += 4 * g_dim;
-        g_cls_s = (const float*)c; c += 4 * g_vocab;
-        g_cls_q = (const int8_t*)c; c += g_vocab * g_dim;
+        g_rms_final = (const float*)part(&o, 4 * g_dim, 1);
+        g_cls_s = (const float*)part(&o, 4 * g_vocab, 0);
+        g_cls_q = (const int8_t*)part(&o, g_vocab * g_dim, 0);
     }
-    if (c != p + n || (g_dim | g_hidden) & 3) { say("not a model slice for this shard, bytes: ", (int32_t)n); return; }
+    if (o != n || (g_dim | g_hidden) & 3) { say("not a model slice for this shard, bytes: ", (int32_t)n); return; }
+    uint8_t* c = g_blob_len ? g_mem : p + n;
     /* After the slice: activations, the queue, then the cache: per position
      * and layer K and V as int8 with a scale per KV head, and one score */
     float** f[] = {&x, &xb, &xb2, &q, &k, &v, &hb, &hb2};
@@ -295,7 +331,12 @@ __attribute__((noinline)) static void screen(const struct llm_msg* m) {
 __attribute__((noinline)) static struct llm_msg* begin(void) {
     struct llm_msg* m = (struct llm_msg*)(g_queue + g_qhead * g_msg_bytes);
     float* f = llm_msg_floats(m);
-    if (B->flags & LLM_BLOB_EMBED) {
+    if (B->flags & LLM_BLOB_EMBED && g_blob_len) {
+        /* the token's row into xq, free until the first layer quantizes */
+        k32_blob_read(g_blob, g_tok_off + m->token * g_dim, xq, g_dim);
+        for (uint32_t i = 0; i < g_dim; i++) x[i] = (float)xq[i] * g_tok_s[m->token];
+        k32_blob_read(g_blob, g_rope_off + 4 * m->pos * g_hs, f, 4 * g_hs);
+    } else if (B->flags & LLM_BLOB_EMBED) {
         for (uint32_t i = 0; i < g_dim; i++) x[i] = (float)g_tok_q[m->token * g_dim + i] * g_tok_s[m->token];
         __builtin_memcpy(f, g_rope + m->pos * g_hs, 4 * g_hs);
     } else {
@@ -364,6 +405,8 @@ K32_EXPORT("k32_init") int32_t k32_init(void) {
     char num[4];
     g_stage = llm_atou(num, llm_env("STAGE", num, sizeof num));
     g_url_len = llm_env("MODEL_URL", g_url, sizeof g_url);
+    g_blob_len = llm_env("MODEL_BLOB", g_blob_name, sizeof g_blob_name);
+    g_blob = -1;
     g_next_len = llm_env("NEXT_URL", g_next, sizeof g_next);
     llm_env("NODE_NAME", g_trace.node, sizeof g_trace.node);
     g_screen = llm_env("SCREEN", num, sizeof num) && num[0] == '1';

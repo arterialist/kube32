@@ -9,7 +9,7 @@
 #   wordsketch-story   control plane: stories260K, all five layers (llm-shard)
 #   wordsketch-teller  control plane: tokenizer and generation loop
 #                      (llm-coordinator), tokens on wordsketch.text
-#   wordsketch-store   control plane: serves the story's blobs to the two above
+#   wordsketch-store   control plane: serves the tokenizer blob to the teller
 #
 # The modules travel inline, the weights as blobs on the nodes:
 #   make -C apps/wordsketch
@@ -109,6 +109,7 @@ spec:
       labels: {app: wordsketch, tier: story}
       annotations:
         kube32.io/wasm-base64: "@llm-shard.wasm"
+        kube32.io/blobs: wordsketch-story
         kube32.io/wasm-stack: "1536"
         kube32.io/execution-budget: "off"
         kube32.io/tick-interval: "100ms"
@@ -119,14 +120,15 @@ spec:
           ports: [{name: http, containerPort: 7000}]
           env:
             - {name: STAGE, value: "0"}
-            - {name: MODEL_URL, value: "http://wordsketch-store/wordsketch-story"}
+            - {name: MODEL_BLOB, value: "wordsketch-story"}   # read in place
             - {name: NEXT_URL, value: "http://wordsketch-teller/result"}
             - name: NODE_NAME
               valueFrom: {fieldRef: {fieldPath: spec.nodeName}}
           resources:
-            # the 327 KB model, a KV cache of 118 positions (6 pages)
-            requests: {memory: 384Ki, esp32.io/psram: 384Ki}
-            limits: {memory: 384Ki, esp32.io/psram: 384Ki}
+            # norms and token scales, a KV cache of 110 positions; the
+            # 327 KB model stays in its blob
+            requests: {memory: 64Ki, esp32.io/psram: 64Ki}
+            limits: {memory: 64Ki, esp32.io/psram: 64Ki}
           securityContext:
             capabilities: {add: ["SERVICE_CALL"]}
 ---
@@ -183,7 +185,7 @@ spec:
       annotations:
         kube32.io/wasm-base64: "@wordsketch-store.wasm"
         kube32.io/wasm-stack: "512"
-        kube32.io/blobs: wordsketch-story,wordsketch-tokenizer
+        kube32.io/blobs: wordsketch-tokenizer
     spec:
       containers:
         - name: store

@@ -6,9 +6,9 @@ wordsketch turns a word spoken to the Cardputer into a doodle and a short story.
 | --- | --- | --- | ---: |
 | `wordsketch-listen` | Cardputer (`kube32.io/board: cardputer`) | microphone, keyword spotter, screen, chime | 20 KiB + 56 KiB overhead |
 | `wordsketch-draw` | a node with PSRAM (`esp32.io/psram`), own thread | doodle diffusion, 8 DDIM steps | 64 KiB + 33 KiB overhead |
-| `wordsketch-story` | a node with PSRAM | stories260K, five layers (`llm-shard`) | 384 KiB + 40 KiB overhead |
+| `wordsketch-story` | a node with PSRAM | stories260K, five layers (`llm-shard`, weights read in place from a blob) | 64 KiB + 40 KiB overhead |
 | `wordsketch-teller` | a node with PSRAM | tokenizer, generation loop (`llm-coordinator`) | 64 KiB + 58 KiB overhead |
-| `wordsketch-store` | a node with PSRAM | the story's blobs over HTTP | 8 KiB + 6 KiB overhead |
+| `wordsketch-store` | a node with PSRAM | the tokenizer blob over HTTP | 8 KiB + 6 KiB overhead |
 
 The words are the six the two models share: cat, dog, bird, house, tree, bed.
 
@@ -17,7 +17,7 @@ The words are the six the two models share: cat, dog, bird, house, tree, bed.
 1. **Listening.** `k32_tick` reads the microphone every 10 ms. Every 20 ms of audio becomes a frame of 40 log-mel values with the keyword spotter's integer front end (`models/kws/frontend.c`, its 512-point FFT in `k32_fft_q15`), quantized at once to the network's int8 input; the last 49 frames are one second. A frame costs the interpreter about 30,000 operations, 5 ms at the Cardputer's 6.3 M operations a second. A frame's mean log energy against the room's floor marks where a word starts and ends. When the word sits in the middle of the window, or a quarter second after its end, the network (`models/kws/kws_infer.c`) classifies the window: 1.66 M multiply-adds in `k32_matvec_i8` and 711,000 interpreter operations, about 115 ms on the Cardputer.
 2. **A keyword.** With at least `THRESHOLD` percent, the pod stops the microphone, publishes `W <id> <class> <seed> <steps>` on the topic `wordsketch.word`, posts `Once upon a time there was a <word>.` to the teller, and plays a two-note chime. The speaker and the microphone share the I2S clock pin (GPIO 43), so they take turns.
 3. **The drawing.** `wordsketch-draw` is an entry-point pod: it runs on its own thread, beside the request pods of its node, and waits on the channel `wordsketch.word`. It samples the class with `models/doodle/doodle_infer.c` (`doodle-l.bin`, 27.1 M multiply-adds a pass, two passes a step for classifier-free guidance; 77 M interpreter operations for 8 steps). The starting noise and the image after every step go out on `wordsketch.frame` as four events of 7 rows, each pixel one of 64 levels as a character, 200 bytes an event.
-4. **The story.** `wordsketch-teller` encodes the prompt and feeds it through `wordsketch-story`, which holds all five layers of stories260K, and publishes every token on `wordsketch.text` (llm-pipeline's coordinator and shard, configured by environment).
+4. **The story.** `wordsketch-teller` encodes the prompt and feeds it through `wordsketch-story`, which runs all five layers of stories260K with the weights read in place from the blob `wordsketch-story` (`MODEL_BLOB`), and publishes every token on `wordsketch.text` (llm-pipeline's coordinator and shard, configured by environment).
 5. **The screen.** `wordsketch-listen` subscribes to both topics. It draws the picture at 4x (112 x 112 pixels) on the left, one rectangle per run of pixels whose level changed, and the story on the right, 20 columns wrapped at words, the prompt in grey. When the drawing and the story are done it logs the word's timing and listens again.
 
 ### Memory on the Cardputer
