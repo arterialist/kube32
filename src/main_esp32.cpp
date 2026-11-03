@@ -524,7 +524,11 @@ static void console_mic(Console& con, const std::string& args) {
     int32_t err = 0;
     char l[160];
     // The decimator settles in its first few milliseconds: not counted
-    kube32::hal::mic_read(buf, 500, 200);
+    const int32_t first = kube32::hal::mic_read(buf, 500, 200);
+    if (first <= 0) {
+        char e[64];
+        con.write(e, static_cast<size_t>(snprintf(e, sizeof(e), "K32_MIC first read: %d\n", (int)first)));
+    }
     while (got_total < total) {
         const int32_t n = kube32::hal::mic_read(buf, std::min<uint32_t>(500, total - got_total), 200);
         if (n <= 0) { err = n; break; }
