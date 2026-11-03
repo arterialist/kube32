@@ -25,7 +25,8 @@ struct NodeTelemetry {
     size_t memory_capacity_bytes{0};     // capacity.memory: the board's RAM, PSRAM included
     size_t memory_allocatable_bytes{0};  // allocatable.memory: what pods can be given with no pod running (kube32_pool_node_room)
     size_t memory_free_bytes{0};         // what pods can be given now (kube32_pool_pod_room): annotation kube32.io/memory-free
-    size_t psram_allocatable_bytes{0};   // allocatable esp32.io/psram (kube32_pool_node_room)
+    size_t system_reserved_bytes{0};     // kept back for the system, never offered to pods (kube32_pool_system_reserved): annotation kube32.io/system-reserved
+    size_t psram_allocatable_bytes{0};  // allocatable esp32.io/psram (kube32_pool_node_room)
     size_t free_psram_bytes{0};      // free PSRAM: annotation kube32.io/psram-free
     size_t total_psram_bytes{0};     // capacity esp32.io/psram
     uint32_t cpu_cores{0};

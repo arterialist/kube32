@@ -157,7 +157,11 @@ private:
                 if (ops_.empty()) {
                     lock.unlock();
                     // Lines of quiet pods reach the disk after 10 s
-                    collect_();
+                    try {
+                        collect_();
+                    } catch (const std::exception&) {
+                        // out of memory: the lines stay buffered for the next pass
+                    }
                     lock.lock();
                     if (ops_.empty()) {
                         if (osal::System::get_uptime_ms() - idle_since > 30000) {
@@ -173,7 +177,17 @@ private:
                 busy_ = true;
             }
             idle_since = osal::System::get_uptime_ms();
-            hal::node_storage_call([&]() { execute(op); });
+            hal::node_storage_call([&]() {
+                try {
+                    execute(op);
+                } catch (const std::exception&) {
+                    // out of memory: this operation is dropped; a waiting read answers false
+                    if (op.slot) {
+                        osal::LockGuard guard(mutex_);
+                        if (!op.slot->abandoned) op.slot->done = true;
+                    }
+                }
+            });
             {
                 osal::LockGuard guard(mutex_);
                 busy_ = false;

@@ -8,6 +8,7 @@
 #include <cstdint>
 #include <cstring>
 #include <cstdio>
+#include <exception>
 #include <string_view>
 
 namespace kube32::api {
@@ -51,7 +52,11 @@ public:
         : socket_sink_(nullptr), sink_(&sink), pos_(0), finished_(false), has_error_(false) {}
 
     ~ChunkedStreamWriter() {
-        if (!finished_ && !has_error_) {
+        // A response cut short by an exception (out of memory while it is
+        // built) does not end with the terminating chunk: that would present
+        // a truncated body as complete, and before the headers it would put
+        // a stray chunk ahead of the error response the server sends
+        if (!finished_ && !has_error_ && std::uncaught_exceptions() == 0) {
             finish();
         }
     }

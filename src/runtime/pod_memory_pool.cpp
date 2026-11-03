@@ -305,6 +305,7 @@ static const size_t k_system_reserve_default = 16 * 1024;
 // plane the API server, the object store, the console relay and firmware
 // staging (kube32_pool_set_psram_reserve)
 static std::atomic<size_t> s_psram_reserve{16 * 1024};
+static std::atomic<bool> s_psram_reserve_set{false};
 
 // A pod allocation in the general heap or PSRAM starts with the account it
 // is charged to; the pointer handed out follows, 8-byte aligned as in the
@@ -344,6 +345,11 @@ static void* adopt(void* base, bool psram) {
 // its general heap also absorbs the network's bursts (lwIP send buffers and
 // Wi-Fi frames, measured near 25 KB while a pod streams a large response)
 static size_t system_reserve() {
+#if !defined(ESP_PLATFORM)
+    // The simulator models the system's use of its heap budget with the
+    // reserve it is given (kube32-sim --system-reserved)
+    if (s_psram_reserve_set.load()) return s_psram_reserve.load();
+#endif
     if (s_block && !s_external) return 24 * 1024;
     return k_system_reserve_default;
 }
@@ -395,8 +401,18 @@ size_t kube32_pool_heap_budget(void) { return s_heap_budget; }
 size_t kube32_pool_general_bytes(void) { return s_general_bytes.load(); }
 size_t kube32_pool_general_allocations(void) { return s_general_allocs.load(); }
 size_t kube32_pool_system_reserve(void) { return system_reserve(); }
-void kube32_pool_set_psram_reserve(size_t bytes) { s_psram_reserve.store(bytes); }
+void kube32_pool_set_psram_reserve(size_t bytes) {
+    s_psram_reserve.store(bytes);
+    s_psram_reserve_set.store(true);
+}
 size_t kube32_pool_psram_reserve(void) { return s_psram_reserve.load(); }
+size_t kube32_pool_reserved_for_system(void) {
+#if defined(ESP_PLATFORM)
+    return board_psram() ? s_psram_reserve.load() : system_reserve();
+#else
+    return system_reserve();
+#endif
+}
 
 int kube32_pod_account_open(void) {
     for (int i = 1; i <= kAccounts; ++i) {

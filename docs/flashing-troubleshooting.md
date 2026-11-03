@@ -64,6 +64,7 @@ Profile commands write to the `k32` NVS namespace, return `K32_OK ..., rebooting
 | `K32_CMD:TOKEN:<token>` | Set the API server and kubelet bearer token, 16 to 128 printable characters without spaces. `off` disables authentication. |
 | `K32_CMD:REBOOT` | Reboot without changing settings. |
 | `K32_CMD:BOOTLOADER` | Reboot into ROM download mode for flashing with `KUBE32_FLASH_BEFORE=no-reset`. |
+| `K32_CMD:SYSRESERVE:<size>` | Set the PSRAM that the node keeps back for the system, from 16Ki to 1Mi (for example `256Ki`), from the next boot on and reboot. `auto` returns to the default of 192 KiB on a control plane and 64 KiB on a worker. See [hardware spec](hardware-spec.md#node-and-pod-memory-figures). |
 | `K32_CMD:SDKHZ:<khz>` | Set the microSD card's SPI clock from the next boot on and reboot. `0` returns to the 20 MHz default. See [storage](storage.md#microsd-hardware-and-mount). |
 
 ### Diagnostics

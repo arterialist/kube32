@@ -645,7 +645,7 @@ void test_heartbeat_patch_in_fixed_buffer() {
     assert(buf.find("\"capacity\"") == std::string::npos);   // unchanged: allocatable only
     // What is free now rides along as annotations, exact bytes
     assert(buf.find("{\"metadata\":{\"annotations\":{\"kube32.io/memory-free\":\"1048000\",\"kube32.io/heap-free\":\"61236\","
-                    "\"kube32.io/psram-free\":\"417532\"}},\"status\":{") == 0);
+                    "\"kube32.io/psram-free\":\"417532\",\"kube32.io/system-reserved\":\"16Ki\"}},\"status\":{") == 0);
     char small[64];
     kube32::mem::FixedText cut(small);
     assert(!reporter.write_heartbeat_patch_json(cut, t, false) && cut.overflowed() && cut.size() <= sizeof(small));

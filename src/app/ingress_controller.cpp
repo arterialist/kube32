@@ -141,25 +141,29 @@ void SseHub::send_presence() {
 void SseHub::run() {
     uint64_t last_ping = 0;
     while (running_.load()) {
-        std::vector<Frame> batch;
-        {
-            osal::LockGuard guard(mutex_);
-            batch.swap(pending_);
-        }
-        uint64_t now = osal::System::get_uptime_ms();
-        {
-            osal::LockGuard guard(mutex_);
-            for (const auto& f : batch) {
-                if (clients_.empty()) break;
-                send_to(f.topic_hash, f.text);
-                events_sent_.fetch_add(1, std::memory_order_relaxed);
+        try {
+            std::vector<Frame> batch;
+            {
+                osal::LockGuard guard(mutex_);
+                batch.swap(pending_);
             }
-            if (now - last_ping >= 15000) {
-                last_ping = now;
-                static const std::string ping = ": ping\n\n";
-                send_to(0, ping);
+            uint64_t now = osal::System::get_uptime_ms();
+            {
+                osal::LockGuard guard(mutex_);
+                for (const auto& f : batch) {
+                    if (clients_.empty()) break;
+                    send_to(f.topic_hash, f.text);
+                    events_sent_.fetch_add(1, std::memory_order_relaxed);
+                }
+                if (now - last_ping >= 15000) {
+                    last_ping = now;
+                    static const std::string ping = ": ping\n\n";
+                    send_to(0, ping);
+                }
+                send_presence();
             }
-            send_presence();
+        } catch (const std::exception&) {
+            // out of memory: this batch is dropped, the next pass starts in 50 ms
         }
         osal::System::feed_watchdog();
         osal::Thread::sleep_ms(50);

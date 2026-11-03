@@ -50,11 +50,16 @@ Check free internal RAM and PSRAM on the serial console with `K32_CMD:STATUS`.
 | --- | --- | --- |
 | `capacity` `memory` | Internal heap plus PSRAM | Internal heap |
 | `capacity` `esp32.io/psram` | PSRAM | not reported |
-| `allocatable` `memory` | The pool block plus the PSRAM that was free above the system reserve when the kubelet first reported | The pool block |
+| `allocatable` `memory` | The pool block plus the PSRAM that was free above the system-reserved PSRAM when the kubelet first reported | The pool block |
 | `allocatable` `esp32.io/psram` | Same as `allocatable` `memory` | not reported |
-| `kube32.io/memory-free` annotation | Free part of the pool block plus PSRAM above the system reserve | Free part of the pool block |
+| `kube32.io/memory-free` annotation | Free part of the pool block plus PSRAM above the system-reserved PSRAM | Free part of the pool block |
+| `kube32.io/system-reserved` annotation | The system-reserved PSRAM | The system reserve of internal RAM |
 | `kube32.io/heap-free` annotation | Free internal RAM | Free internal RAM |
 | `kube32.io/psram-free` annotation | Free PSRAM | not reported |
+
+The system-reserved PSRAM is what the node keeps for its own allocations and never offers to pods: the object store, the JSON of list and watch responses, the controllers' working sets, the console relay and firmware staging. `capacity` less `allocatable` covers it, as `system-reserved` and `kube-reserved` do in Kubernetes. A control plane keeps 192 KiB and a worker with PSRAM keeps 64 KiB. `K32_CMD:SYSRESERVE:<size>` sets another figure from the next boot on (16 KiB to 1 MiB), and `kube32-sim --system-reserved` sets it for the modelled heap.
+
+The 192 KiB come from the control plane's peak use of PSRAM above its boot level. A list copies every object it returns and the controllers each hold a working set of that size, so the peak grows with the number of pods: it measured 109 KiB with a few pods and passed 122 KiB with the node full. 192 KiB leave half again as much as that peak, and a node that needs more raises the figure. When PSRAM runs out anyway, a controller pass or an API request that cannot allocate ends with a log line (`pass skipped: std::bad_alloc`, or a `503` Status for the request) and the next pass runs a second later.
 
 Allocatable figures stay the same while pods start and stop. The scheduler subtracts what bound pods request, and the kubelet admits each pod against what is free now. The kubelet writes the annotations with each heartbeat, in bytes. `MemoryPressure` compares free internal RAM with 24 KiB.
 

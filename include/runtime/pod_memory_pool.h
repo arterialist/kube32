@@ -70,6 +70,12 @@ size_t kube32_pool_system_reserve(void);
  * console relay and firmware staging. Set at boot. */
 void  kube32_pool_set_psram_reserve(size_t bytes);
 size_t kube32_pool_psram_reserve(void);
+/* What the node keeps back for the system and never offers pods: the PSRAM
+ * reserve on a board with PSRAM, the internal-RAM reserve otherwise. The
+ * simulator takes the reserve it is given (kube32-sim --system-reserved), or
+ * its default heap reserve. The node reports it as the
+ * kube32.io/system-reserved annotation. */
+size_t kube32_pool_reserved_for_system(void);
 void  kube32_pool_set_heap_budget(size_t bytes);
 size_t kube32_pool_heap_budget(void);
 /* Bytes a pod could be given now: the pool block's free part, and PSRAM

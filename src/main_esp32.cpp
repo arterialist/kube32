@@ -877,6 +877,7 @@ static void improv_command(Console& con, const NodeIdentity& ident, const std::s
 //   K32_CMD:TOKEN:<API bearer token>|off                 -> stored in NVS, reboot
 //   K32_CMD:APPASS:<cluster access point password>       -> stored in NVS, reboot
 //   K32_CMD:APPASS                                       -> K32_APPASS <password>
+//   K32_CMD:SYSRESERVE:<size>|auto                       -> PSRAM kept back for the system, stored in NVS, reboot
 //   K32_CMD:CERT                                         -> the API server's TLS certificate (PEM)
 //   K32_CMD:FIRMWARE                                     -> the running image and its slot (and what is staged)
 //   K32_CMD:BENCH:<kernel>:<n>:<runs>                    -> the benchmark kernels run natively (docs/benchmarks.md)
@@ -1161,6 +1162,25 @@ void console_task(void* arg) {
                 if (s_api_server) s_api_server->set_access_log(on);
                 if (s_ingress_server) s_ingress_server->set_access_log(on);
                 con.write(on ? "K32_OK access log on\n" : "K32_OK access log off\n", on ? 21 : 22);
+            } else if (line.rfind("K32_CMD:SYSRESERVE:", 0) == 0) {
+                // PSRAM kept back for the system, from the next boot on:
+                // K32_CMD:SYSRESERVE:<size, e.g. 192Ki>, or auto for the default
+                const std::string value = line.substr(19);
+                const int64_t bytes = value == "auto" ? 0 : kube32::models::parse_quantity(value);
+                if (value != "auto" && (bytes < 16 * 1024 || bytes > 1024 * 1024)) {
+                    con.write("K32_ERR system reserve must be 16Ki to 1Mi, or auto\n", 52);
+                } else {
+                    nvs_handle_t h;
+                    if (nvs_open("k32", NVS_READWRITE, &h) == ESP_OK) {
+                        if (bytes) nvs_set_u32(h, "sysres", static_cast<uint32_t>(bytes));
+                        else nvs_erase_key(h, "sysres");
+                        nvs_commit(h);
+                        nvs_close(h);
+                    }
+                    con.write("K32_OK system reserve stored, rebooting\n", 40);
+                    vTaskDelay(pdMS_TO_TICKS(200));
+                    esp_restart();
+                }
             } else if (line == "K32_CMD:BOOTLOADER") {
                 // Reboot into the ROM serial bootloader so a host can flash with
                 // "--before no-reset" when the USB auto-reset does not work.
@@ -1415,10 +1435,23 @@ void cluster_task(void* pv) {
             kube32_interp_stack_set(interp, interp_size);
             kube32::runtime::AppPodHost::instance().set_event_thread_stack(8192, true);
         }
-        // PSRAM pods' code and structures may not take. A control plane's
-        // own use peaked 109 KiB above its boot level (API lists and a watch,
-        // the store, the console relay, NAT and staging a 3 MB image)
-        kube32_pool_set_psram_reserve(ident.is_control_plane ? 128 * 1024 : 64 * 1024);
+        // The node's system-reserved PSRAM, which pods' code and structures
+        // may not take and allocatable memory leaves out. A control plane
+        // allocates there for the store, API lists and watches (a list copies
+        // every object it returns), the controllers' working sets, the
+        // console relay and firmware staging: its peak above the boot level
+        // is 109 KiB with a few pods and over 122 KiB with the node full, and
+        // 192 KiB keep half again as much. K32_CMD:SYSRESERVE:<size> overrides.
+        size_t system_reserved = ident.is_control_plane ? 192 * 1024 : 64 * 1024;
+        {
+            nvs_handle_t rh;
+            uint32_t stored = 0;
+            if (nvs_open("k32", NVS_READONLY, &rh) == ESP_OK) {
+                if (nvs_get_u32(rh, "sysres", &stored) == ESP_OK && stored >= 16 * 1024) system_reserved = stored;
+                nvs_close(rh);
+            }
+        }
+        kube32_pool_set_psram_reserve(system_reserved);
     }
     printf("[MEM] reserved %u bytes for pod linear memory, %u bytes of PSRAM for the system\n", (unsigned)kube32_pool_block_size(),
            (unsigned)kube32_pool_psram_reserve());
@@ -2102,7 +2135,12 @@ void cluster_task(void* pv) {
         t_cfg.core_affinity = 1;
         kube32::osal::Thread::create([](void*) {
             while (true) {
-                const uint32_t wait = kube32::runtime::AppPodHost::instance().tick_due(kube32::osal::System::get_uptime_ms());
+                uint32_t wait = 1000;   // out of memory: the next pass is a second away
+                try {
+                    wait = kube32::runtime::AppPodHost::instance().tick_due(kube32::osal::System::get_uptime_ms());
+                } catch (const std::exception& e) {
+                    printf("[POD] tick pass skipped: %s\n", e.what());
+                }
                 vTaskDelay(pdMS_TO_TICKS(std::max<uint32_t>(wait, 10)));
             }
         }, nullptr, t_cfg);
@@ -2114,122 +2152,128 @@ void cluster_task(void* pv) {
     while (true) {
         vTaskDelay(pdMS_TO_TICKS(1000));
         iter++;
-        if (ingress) ingress->tick();
-        if (firmware_rollouts && iter % 3 == 0) {
-            try {
-                firmware_rollouts->reconcile();
+        // Out of memory ends the pass, not the task: the next one starts a
+        // second later, when pods or requests have let go of some
+        try {
+            if (ingress) ingress->tick();
+            if (firmware_rollouts && iter % 3 == 0) {
+                try {
+                    firmware_rollouts->reconcile();
+                } catch (const std::exception& e) {
+                    printf("[FIRMWARE] rollout pass skipped: %s\n", e.what());
+                }
+            }
+            if (store) {
+                // Changes no API request waited for (controllers, Node
+                // heartbeats) reach the journal here
+                store->flush(false);
+                // Objects made before the clock was set get their timestamps once
+                // it is; one that could not be written is tried again a minute later
+                static bool backfilled = false;
+                if (backfill && kube32::osal::System::get_unix_time_ms() != 0 && (!backfilled || iter % 60 == 0)) {
+                    backfilled = true;
+                    const size_t n = backfill->run();
+                    if (n) printf("[CLOCK] timestamps set on %u object(s) created before the clock synchronized\n", (unsigned)n);
+                    if (backfill->pending() == 0) backfill.reset();
+                }
+            }
+            if (ident.is_control_plane && store && iter % 10 == 0) try {
+                // Workers register their InternalIP; seed them as UDP peers so the
+                // channel fabric works across access points, not only over ESP-NOW.
+                std::vector<std::string> nodes;
+                store->list("/registry/nodes/", nodes);
+                for (const auto& nj : nodes) {
+                    kube32::models::JsonValue doc;
+                    std::string err;
+                    if (!kube32::models::parse_json(nj, doc, err)) continue;
+                    const auto* meta = doc.get("metadata");
+                    if (meta && meta->get_string("name", "") == ident.name) continue;
+                    const auto* status = doc.get("status");
+                    const auto* addrs = status ? status->get("addresses") : nullptr;
+                    if (!addrs || !addrs->is_array()) continue;
+                    for (const auto& a : addrs->arr_val) {
+                        if (a.get_string("type", "") == "InternalIP") kube32::ipc::ChannelManager::instance().add_seed_peer(a.get_string("address", ""), 7400);
+                    }
+                }
             } catch (const std::exception& e) {
-                printf("[FIRMWARE] rollout pass skipped: %s\n", e.what());
+                printf("[IPC] peer seeding skipped: %s\n", e.what());
             }
-        }
-        if (store) {
-            // Changes no API request waited for (controllers, Node
-            // heartbeats) reach the journal here
-            store->flush(false);
-            // Objects made before the clock was set get their timestamps once
-            // it is; one that could not be written is tried again a minute later
-            static bool backfilled = false;
-            if (backfill && kube32::osal::System::get_unix_time_ms() != 0 && (!backfilled || iter % 60 == 0)) {
-                backfilled = true;
-                const size_t n = backfill->run();
-                if (n) printf("[CLOCK] timestamps set on %u object(s) created before the clock synchronized\n", (unsigned)n);
-                if (backfill->pending() == 0) backfill.reset();
-            }
-        }
-        if (ident.is_control_plane && store && iter % 10 == 0) try {
-            // Workers register their InternalIP; seed them as UDP peers so the
-            // channel fabric works across access points, not only over ESP-NOW.
-            std::vector<std::string> nodes;
-            store->list("/registry/nodes/", nodes);
-            for (const auto& nj : nodes) {
-                kube32::models::JsonValue doc;
-                std::string err;
-                if (!kube32::models::parse_json(nj, doc, err)) continue;
-                const auto* meta = doc.get("metadata");
-                if (meta && meta->get_string("name", "") == ident.name) continue;
-                const auto* status = doc.get("status");
-                const auto* addrs = status ? status->get("addresses") : nullptr;
-                if (!addrs || !addrs->is_array()) continue;
-                for (const auto& a : addrs->arr_val) {
-                    if (a.get_string("type", "") == "InternalIP") kube32::ipc::ChannelManager::instance().add_seed_peer(a.get_string("address", ""), 7400);
+            if (!ident.is_control_plane && kubelet && iter % 10 == 0) {
+                // A station can stay associated with an access point that no
+                // longer knows it: a control plane that restarts its AP within
+                // the beacon timeout drops the worker's frames while its beacons
+                // keep the link up. Join again when the API server has not
+                // answered a pod sync for a minute on a link that looks up.
+                // When that does not help within another minute (an AP that
+                // restarted answers a station still holding its 802.11w keys
+                // with SA queries and handshakes the station never finishes,
+                // linked or not), restart the Wi-Fi driver, at most once a minute.
+                // After five restarts without an answer the board reboots: a
+                // station whose heap fragmented can associate and lose the link
+                // again every few seconds until it does. By then the control
+                // plane has marked the node NotReady and evicts its pods.
+                static uint64_t quiet_since = kube32::osal::System::get_uptime_ms();
+                static bool rejoined = false;
+                static int restarts = 0;
+                const uint64_t now = kube32::osal::System::get_uptime_ms();
+                if (kubelet->last_sync_ok_ms() > quiet_since) {   // answered since
+                    rejoined = false;
+                    restarts = 0;
                 }
-            }
-        } catch (const std::exception& e) {
-            printf("[IPC] peer seeding skipped: %s\n", e.what());
-        }
-        if (!ident.is_control_plane && kubelet && iter % 10 == 0) {
-            // A station can stay associated with an access point that no
-            // longer knows it: a control plane that restarts its AP within
-            // the beacon timeout drops the worker's frames while its beacons
-            // keep the link up. Join again when the API server has not
-            // answered a pod sync for a minute on a link that looks up.
-            // When that does not help within another minute (an AP that
-            // restarted answers a station still holding its 802.11w keys
-            // with SA queries and handshakes the station never finishes,
-            // linked or not), restart the Wi-Fi driver, at most once a minute.
-            // After five restarts without an answer the board reboots: a
-            // station whose heap fragmented can associate and lose the link
-            // again every few seconds until it does. By then the control
-            // plane has marked the node NotReady and evicts its pods.
-            static uint64_t quiet_since = kube32::osal::System::get_uptime_ms();
-            static bool rejoined = false;
-            static int restarts = 0;
-            const uint64_t now = kube32::osal::System::get_uptime_ms();
-            if (kubelet->last_sync_ok_ms() > quiet_since) {   // answered since
-                rejoined = false;
-                restarts = 0;
-            }
-            const uint64_t heard = std::max(kubelet->last_sync_ok_ms(), quiet_since);
-            // A control plane that announces another address than the one
-            // this worker dials (it joined another network, or its DHCP
-            // lease changed): store that address and start again with it
-            const std::string announced = kube32::ipc::ChannelManager::instance().announced_api();
-            if (now - heard > 30000 && !announced.empty() && announced != api_host) {
-                nvs_handle_t h;
-                if (nvs_open("k32", NVS_READWRITE, &h) == ESP_OK) {
-                    nvs_set_str(h, "api", announced.c_str());
-                    nvs_commit(h);
-                    nvs_close(h);
-                }
-                printf("[NET] no answer from %s; the control plane announces %s, restarting with it\n", api_host.c_str(), announced.c_str());
-                fflush(stdout);
-                esp_restart();
-            }
-            if (now - heard > 60000 && !rejoined && net_mgr->station_has_ip()) {
-                printf("[NET] no answer from the control plane for %u s on a connected link, joining the access point again\n",
-                       (unsigned)((now - heard) / 1000));
-                net_mgr->rejoin();
-                rejoined = true;
-                quiet_since = now;
-            } else if (now - heard > 60000 && (rejoined || !net_mgr->station_has_ip())) {
-                if (++restarts > 5) {
-                    log_memory("before reboot");
-                    printf("[NET] no answer from the control plane after 5 Wi-Fi restarts, rebooting\n");
+                const uint64_t heard = std::max(kubelet->last_sync_ok_ms(), quiet_since);
+                // A control plane that announces another address than the one
+                // this worker dials (it joined another network, or its DHCP
+                // lease changed): store that address and start again with it
+                const std::string announced = kube32::ipc::ChannelManager::instance().announced_api();
+                if (now - heard > 30000 && !announced.empty() && announced != api_host) {
+                    nvs_handle_t h;
+                    if (nvs_open("k32", NVS_READWRITE, &h) == ESP_OK) {
+                        nvs_set_str(h, "api", announced.c_str());
+                        nvs_commit(h);
+                        nvs_close(h);
+                    }
+                    printf("[NET] no answer from %s; the control plane announces %s, restarting with it\n", api_host.c_str(), announced.c_str());
                     fflush(stdout);
                     esp_restart();
                 }
-                printf("[NET] no answer from the control plane for %u s, restarting Wi-Fi\n", (unsigned)((now - heard) / 1000));
-                net_mgr->restart_radio();
-                quiet_since = now;
+                if (now - heard > 60000 && !rejoined && net_mgr->station_has_ip()) {
+                    printf("[NET] no answer from the control plane for %u s on a connected link, joining the access point again\n",
+                           (unsigned)((now - heard) / 1000));
+                    net_mgr->rejoin();
+                    rejoined = true;
+                    quiet_since = now;
+                } else if (now - heard > 60000 && (rejoined || !net_mgr->station_has_ip())) {
+                    if (++restarts > 5) {
+                        log_memory("before reboot");
+                        printf("[NET] no answer from the control plane after 5 Wi-Fi restarts, rebooting\n");
+                        fflush(stdout);
+                        esp_restart();
+                    }
+                    printf("[NET] no answer from the control plane for %u s, restarting Wi-Fi\n", (unsigned)((now - heard) / 1000));
+                    net_mgr->restart_radio();
+                    quiet_since = now;
+                }
             }
-        }
-        if (ident.is_control_plane && uplink && iter % 10 == 0) {
-            // Workers on this network learn the API server's address from HELLO
-            kube32::ipc::ChannelManager::instance().set_announced_api(net_mgr->station_has_ip() ? net_mgr->get_ip_address() : std::string());
-            // A control plane whose station has had no address for a minute
-            // restarts its Wi-Fi driver, at most once a minute: a join can
-            // stall in "connecting" with no event that would retry it.
-            static uint64_t addressless_since = 0;
-            const uint64_t now = kube32::osal::System::get_uptime_ms();
-            if (net_mgr->station_has_ip()) {
-                addressless_since = 0;
-            } else if (addressless_since == 0) {
-                addressless_since = now;
-            } else if (now - addressless_since > 60000) {
-                printf("[NET] station without an address for %u s, restarting Wi-Fi\n", (unsigned)((now - addressless_since) / 1000));
-                net_mgr->restart_radio();
-                addressless_since = now;
+            if (ident.is_control_plane && uplink && iter % 10 == 0) {
+                // Workers on this network learn the API server's address from HELLO
+                kube32::ipc::ChannelManager::instance().set_announced_api(net_mgr->station_has_ip() ? net_mgr->get_ip_address() : std::string());
+                // A control plane whose station has had no address for a minute
+                // restarts its Wi-Fi driver, at most once a minute: a join can
+                // stall in "connecting" with no event that would retry it.
+                static uint64_t addressless_since = 0;
+                const uint64_t now = kube32::osal::System::get_uptime_ms();
+                if (net_mgr->station_has_ip()) {
+                    addressless_since = 0;
+                } else if (addressless_since == 0) {
+                    addressless_since = now;
+                } else if (now - addressless_since > 60000) {
+                    printf("[NET] station without an address for %u s, restarting Wi-Fi\n", (unsigned)((now - addressless_since) / 1000));
+                    net_mgr->restart_radio();
+                    addressless_since = now;
+                }
             }
+        } catch (const std::exception& e) {
+            printf("[CLUSTER] housekeeping pass skipped: %s\n", e.what());
         }
         if (iter % 30 == 0) log_memory("steady state");
         kube32::osal::System::feed_watchdog();

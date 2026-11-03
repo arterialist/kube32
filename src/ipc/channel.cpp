@@ -221,7 +221,11 @@ private:
                 src.is_espnow = false;
                 src.ip_address = sender_ip;
                 src.udp_port = sender_port;
-                ChannelManager::instance().on_frame_received(buffer, static_cast<size_t>(n), &src);
+                try {
+                    ChannelManager::instance().on_frame_received(buffer, static_cast<size_t>(n), &src);
+                } catch (const std::exception&) {
+                    // out of memory: the frame is dropped like a lost datagram
+                }
             }
         }
     }

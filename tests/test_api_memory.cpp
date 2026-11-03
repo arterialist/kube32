@@ -668,6 +668,94 @@ static void test_out_of_memory_leaves_nothing_half_done(uint16_t port) {
     std::cout << "[PASS] test_out_of_memory_leaves_nothing_half_done" << std::endl;
 }
 
+// =============================================================================
+// Lists under memory pressure: every answer is a complete list or a 503
+// Status, and the server answers a full list again once memory is back
+// =============================================================================
+
+static void test_list_under_memory_pressure(uint16_t port) {
+    std::cout << "[RUN] test_list_under_memory_pressure" << std::endl;
+    ControlPlane cp(port);
+    const std::vector<uint8_t> m = module_bytes(256, 7);
+    for (int i = 0; i < 16; ++i) {
+        const std::string body = inline_pod("list-" + std::to_string(i), m);
+        assert(call(port, "POST", "/api/v1/namespaces/default/pods", &body).status == 201);
+    }
+    size_t complete = 0, refused = 0;
+    for (size_t budget = 2048; budget <= 96 * 1024; budget += 2048) {
+        board::limit(budget / 4, budget - budget / 4);
+        Reply r = call(port, "GET", "/api/v1/pods");
+        board::unlimit();
+        if (r.status == 200) ++complete;
+        else if (r.status == 503) {
+            ++refused;
+            assert(std::strstr(r.start, "node is out of memory") != nullptr);
+        }
+        // Never an answer other than a list or the out-of-memory Status
+        assert(r.status == 200 || r.status == 503 || r.status == 0);
+    }
+    std::printf("  %zu budgets answered a list, %zu answered 503\n", complete, refused);
+    assert(refused > 0 && complete > 0);
+    assert(call(port, "GET", "/api/v1/pods").status == 200);
+    std::cout << "[PASS] test_list_under_memory_pressure" << std::endl;
+}
+
+// =============================================================================
+// Out of memory in a controller pass ends the pass, not the thread: with no
+// room at all the loops keep running, and when memory is back they work
+// =============================================================================
+
+static void test_controller_loops_survive_exhaustion(uint16_t port) {
+    std::cout << "[RUN] test_controller_loops_survive_exhaustion" << std::endl;
+    ControlPlane cp(port);
+    controller::DeploymentControllerConfig dcfg;
+    dcfg.reconcile_interval_ms = 20;
+    dcfg.resync_interval_ms = 40;
+    controller::DeploymentController deployments(*cp.store, cp.sched.get(), dcfg);
+    controller::WorkloadControllerConfig wcfg;
+    wcfg.reconcile_interval_ms = 20;
+    wcfg.resync_interval_ms = 40;
+    controller::WorkloadController workloads(*cp.store, cp.sched.get(), wcfg);
+    controller::NodeLifecycleConfig lcfg;
+    lcfg.check_interval_ms = 20;
+    controller::NodeLifecycleController lifecycle(*cp.store, lcfg);
+    controller::DeviceControllerConfig ccfg;
+    ccfg.reconcile_interval_ms = 20;
+    ccfg.resync_interval_ms = 40;
+    controller::DeviceController devices(*cp.store, cp.sched.get(), ccfg);
+    assert(deployments.start() && workloads.start() && lifecycle.start() && devices.start());
+
+    const uint64_t refused0 = board::refused.load();
+    const uint64_t passes0 = deployments.passes();
+    board::limit(0, 0);
+    osal::Thread::sleep_ms(600);
+    board::unlimit();
+    // The passes ran into the limit: allocations were refused, and every
+    // thread is still here
+    assert(board::refused.load() > refused0);
+    std::printf("  %llu allocations refused, deployment passes %llu -> %llu\n",
+                static_cast<unsigned long long>(board::refused.load() - refused0), static_cast<unsigned long long>(passes0),
+                static_cast<unsigned long long>(deployments.passes()));
+
+    const std::string dep = "{\"apiVersion\":\"apps/v1\",\"kind\":\"Deployment\",\"metadata\":{\"name\":\"web\"},\"spec\":{\"replicas\":2,"
+                            "\"selector\":{\"matchLabels\":{\"app\":\"web\"}},\"template\":{\"metadata\":{\"labels\":{\"app\":\"web\"}},"
+                            "\"spec\":{\"containers\":[{\"name\":\"c\",\"image\":\"wasm://embedded/echo\"}]}}}}";
+    assert(call(port, "POST", "/apis/apps/v1/namespaces/default/deployments", &dep).status == 201);
+    bool created = false;
+    for (int i = 0; i < 200 && !created; ++i) {
+        std::vector<std::string> pods;
+        cp.store->list("/registry/pods/", pods);
+        created = pods.size() == 2;
+        if (!created) osal::Thread::sleep_ms(20);
+    }
+    assert(created);
+    deployments.stop();
+    workloads.stop();
+    lifecycle.stop();
+    devices.stop();
+    std::cout << "[PASS] test_controller_loops_survive_exhaustion" << std::endl;
+}
+
 int main() {
     std::cout << "=== API server memory with inline images ===" << std::endl;
     osal::Socket::init_networking();
@@ -706,6 +794,8 @@ int main() {
     std::cout << "[PASS] deploys on a 2 MB control plane" << std::endl;
 
     test_out_of_memory_leaves_nothing_half_done(port++);
+    test_list_under_memory_pressure(port++);
+    test_controller_loops_survive_exhaustion(port++);
     std::cout << "All API memory tests passed" << std::endl;
     return 0;
 }

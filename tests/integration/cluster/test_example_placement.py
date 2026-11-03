@@ -150,3 +150,21 @@ class TestExamplePlacement(BaseTestCase):
         cond = next(c for c in oversized["status"]["conditions"] if c["type"] == "PodScheduled")
         self.assertEqual((cond["status"], cond["reason"]), ("False", "Unschedulable"))
         self.assertIn("Insufficient memory", cond["message"])
+
+    def test_system_reserved_is_left_out_of_allocatable(self):
+        """--system-reserved keeps memory back for the control plane: allocatable is capacity less that figure, and the Node reports it"""
+        devkit_dir = self._dir("reserved")
+        self._start("devkit", ["--role", "standalone", "--workers", "", "--node-name", "cp-0", "--kubelet-name", "devkit",
+                               "--port", str(self.API_PORT), "--ipc-port", "17800", "--pod-port", str(self.POD_PORTS[0]),
+                               "--psram", "1284Ki", "--heap-budget", "448Ki", "--system-reserved", "192Ki",
+                               "--reconcile-interval", "500"], devkit_dir)
+        self.wait_for_condition(lambda: self._get("/version") is not None, timeout=10.0, description="API server")
+        self.wait_for_condition(lambda: (node_ready_condition(self.api.base_url, "devkit") or {}).get("status") == "True",
+                                timeout=15.0, description="devkit Ready")
+        memory = self._memory("devkit")
+        self.assertEqual(memory[("allocatable", "memory")], 1284 + 448 - 192, f"devkit: {memory}")
+        self.assertEqual(memory[("allocatable", "esp32.io/psram")], 1284 + 448 - 192, f"devkit: {memory}")
+        self.assertEqual(memory[("capacity", "esp32.io/psram")], 1284 + 448, f"devkit: {memory}")
+        annotations = self._get("/api/v1/nodes/devkit")["metadata"].get("annotations", {})
+        self.assertEqual(kib(annotations.get("kube32.io/system-reserved", "0")), 192)
+        self.assertEqual(self._memory_free("devkit"), 1284 + 448 - 192)

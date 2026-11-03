@@ -53,6 +53,7 @@ NodeTelemetry NodeStatusReporter::collect_telemetry() const {
     // pod running (allocatable), and now
     kube32_pool_node_room(&t.memory_allocatable_bytes, &t.psram_allocatable_bytes);
     t.memory_free_bytes = kube32_pool_pod_room(0, nullptr);
+    t.system_reserved_bytes = kube32_pool_reserved_for_system();
     t.memory_capacity_bytes = t.total_heap_bytes + t.total_psram_bytes;
 #if !defined(ESP_PLATFORM)
     // The simulator's PSRAM is the external pool block it reserved
@@ -258,7 +259,9 @@ static void append_condition_times(Out& json, const NodeTelemetry& t, uint64_t t
 
 // What is free now, as annotations: kube32.io/memory-free (what pods can be
 // given now, on the base of allocatable.memory), kube32.io/heap-free (free
-// internal RAM) and kube32.io/psram-free (free PSRAM)
+// internal RAM) and kube32.io/psram-free (free PSRAM). kube32.io/system-reserved
+// is the memory the node keeps back for itself (the control plane's store, API
+// server and controllers): the part of capacity that allocatable leaves out.
 template <typename Out>
 static void append_memory_annotations(Out& json, const NodeTelemetry& t) {
     json += "\"kube32.io/memory-free\":\"";
@@ -269,6 +272,11 @@ static void append_memory_annotations(Out& json, const NodeTelemetry& t) {
     if (t.total_psram_bytes > 0) {
         json += ",\"kube32.io/psram-free\":\"";
         append_bytes_quantity(json, t.free_psram_bytes);
+        json += "\"";
+    }
+    if (t.system_reserved_bytes > 0) {
+        json += ",\"kube32.io/system-reserved\":\"";
+        append_bytes_quantity(json, t.system_reserved_bytes);
         json += "\"";
     }
 }

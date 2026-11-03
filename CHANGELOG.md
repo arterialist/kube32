@@ -65,6 +65,9 @@ All notable changes to this project will be documented in this file. The format 
 
 ### Changed
 
+- Allocatable `memory` and `esp32.io/psram` on a control plane leave out 192 KiB of PSRAM for the system (64 KiB on a worker with PSRAM), up from 128 KiB: the object store, the JSON of list and watch responses, the controllers' working sets, the console relay and firmware staging allocate there, and a node whose pods filled the rest ran out of memory in them. `K32_CMD:SYSRESERVE:<size>` sets another figure from the next boot on, `kube32-sim --system-reserved <size>` sets it for the modelled heap, and the Node reports it in the `kube32.io/system-reserved` annotation. `capacity` less `allocatable` covers it ([docs/hardware-spec.md](docs/hardware-spec.md#node-and-pod-memory-figures)).
+- A list response that fails for memory before its headers are sent answers with a 503 Status. The stream no longer ends with a terminating chunk when the response is cut short by an exception, so a client sees a failed transfer instead of a list that looks complete.
+
 - The firmware version drops the `v` of a release tag: a build of tag `v0.4.0` reports `0.4.0`.
 - `K32_CMD:SCAN` scans on a control plane that runs only its cluster access point.
 - `kube32-sim` trusts the CA bundle of the system it runs on (Debian, Ubuntu, Fedora, Alpine, openSUSE and macOS locations) for pods' `https://` calls, besides OpenSSL's default paths.
@@ -77,6 +80,8 @@ All notable changes to this project will be documented in this file. The format 
 - Allocatable `memory` and `esp32.io/psram` are fixed at what pods can be given with no pod running, and the scheduler subtracts the requests and Pod Overhead of every bound pod that has not terminated, as kube-scheduler does. A pod without a memory request counts as the 64 KiB page the kubelet gives it. What is free now is in the Node's `kube32.io/memory-free`, `kube32.io/heap-free` and `kube32.io/psram-free` annotations. The kubelet rejects a pod whose linear memory cannot be placed in one piece.
 
 ### Fixed
+
+- Out of memory in a long-running task ends the pass, not the task. The housekeeping loop of the firmware (ingress, firmware rollouts, peer seeding, journal flush, Wi-Fi supervision), the pod tick thread, the pod event thread, the SSE hub, the IPC receive thread and the pod log writer catch `std::bad_alloc`, log it and run again on their next pass. A control plane whose pods had filled PSRAM aborted in the housekeeping loop and rebooted.
 
 - A kubelet's log epoch fits in 53 bits, so the control plane reads it exactly from JSON and keeps the logs of a node's next boot instead of dropping them as repeats. A JSON number outside `int64_t`, such as an older node's epoch, clamps to that range instead of converting with undefined behavior.
 - A call to a host function the node does not provide, such as one from a newer SDK, traps every time. The first trap left the calling site in the guest's code pointing at no code, so the next call into the same export (`k32_tick`, `k32_handle`, `k32_event`) took the whole node down, `kube32-sim` with SIGBUS.

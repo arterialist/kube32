@@ -520,6 +520,7 @@ else()
     target_link_libraries(test_node_memory PRIVATE kube32_core)
     add_test(NAME test_node_memory_psram COMMAND test_node_memory psram)
     add_test(NAME test_node_memory_internal COMMAND test_node_memory internal)
+    add_test(NAME test_node_memory_reserved COMMAND test_node_memory reserved)
 
     # 25. Pipeline memory pooling, K32C wire fuzzing, watchdog and yield behaviour
     add_executable(test_ipc_pipeline

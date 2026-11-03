@@ -213,6 +213,8 @@ struct SimOptions {
     // shared interpreter stack and this much heap left for pods and the
     // system (a Cardputer has about 51 KiB at idle)
     size_t heap_budget{51 * 1024};
+    size_t system_reserved{0};             // --system-reserved: memory the node keeps back for the system
+    bool system_reserved_set{false};
     bool heap_budget_set{false};           // --heap-budget given: with --psram it models the board's PSRAM besides the block
     bool board_without_psram{false};       // --psram 0 given
     // Stand-in for PSRAM: a block of host memory reserved like the control
@@ -257,6 +259,8 @@ static void print_sim_usage(std::ostream& out) {
            "  --psram <size>              PSRAM to model, e.g. 8Mi; 0 models a board without PSRAM\n"
            "  --heap-budget <size>        heap left for pods and system with --psram 0 (default 51Ki); with\n"
            "                              --psram, the PSRAM besides the pool block (default: not modelled)\n"
+           "  --system-reserved <size>    memory kept back for the system in the modelled heap budget\n"
+           "                              (default 16Ki, 24Ki with --psram 0); a control plane board keeps 192Ki\n"
            "  --blob-region <size>        flash blob region of this process's node, a file in <data-dir>\n"
            "                              (default 3328Ki, a board's app slot; 0 for none)\n"
            "  --sim-i2c <parts>           simulated I2C parts on bus 0 of this process's node, e.g.\n"
@@ -324,6 +328,10 @@ static SimOptions parse_sim_args(int argc, char* argv[]) {
         else if (arg == "--heap-budget" && i + 1 < argc) {
             opts.heap_budget = static_cast<size_t>(kube32::models::parse_quantity(argv[++i]));
             opts.heap_budget_set = true;
+        }
+        else if (arg == "--system-reserved" && i + 1 < argc) {
+            opts.system_reserved = static_cast<size_t>(kube32::models::parse_quantity(argv[++i]));
+            opts.system_reserved_set = true;
         }
         else if (arg == "--sim-i2c" && i + 1 < argc) opts.sim_i2c = argv[++i];
         else if (arg == "--blob-region" && i + 1 < argc) opts.blob_region_bytes = static_cast<size_t>(kube32::models::parse_quantity(argv[++i]));
@@ -457,6 +465,10 @@ int main(int argc, char* argv[]) {
     // The host has no PSRAM. The simulator reserves a block of host memory as
     // its stand-in, the way the control plane board reserves its PSRAM pod
     // pool; nodes report it as esp32.io/psram.
+    if (opts.system_reserved_set) {
+        kube32_pool_set_psram_reserve(opts.system_reserved);
+        std::cout << "[SIM] system reserve: " << (opts.system_reserved / 1024) << " KiB (--system-reserved)" << std::endl;
+    }
     if (opts.psram_bytes > 0) {
         kube32_pool_reserve_external(static_cast<size_t>(opts.psram_bytes));
         std::cout << "[SIM] PSRAM stand-in: " << (kube32_pool_block_size() / 1024) << " KiB of host memory (--psram)" << std::endl;

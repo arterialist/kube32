@@ -283,6 +283,41 @@ void test_chunked_stream_writer_framing() {
     std::cout << "[PASS] test_chunked_stream_writer_framing" << std::endl;
 }
 
+// A response cut short by an exception (out of memory while it is built) does
+// not end with the terminating chunk: that would present a truncated body as
+// complete, and ahead of the headers it would precede the error response
+void test_chunked_stream_writer_unwinding() {
+    std::cout << "[RUN] test_chunked_stream_writer_unwinding" << std::endl;
+    TestBufferSink sink;
+    try {
+        ChunkedStreamWriter writer(sink);
+        writer.send_headers();
+        writer.write("{\"items\":[", 10);
+        throw std::bad_alloc();
+    } catch (const std::bad_alloc&) {
+    }
+    assert(sink.data.find("HTTP/1.1 200") == 0);
+    assert(sink.data.find("0\r\n\r\n") == std::string::npos);
+
+    TestBufferSink before_headers;
+    try {
+        ChunkedStreamWriter writer(before_headers);
+        throw std::bad_alloc();
+    } catch (const std::bad_alloc&) {
+    }
+    assert(before_headers.data.empty());
+
+    // Without an exception the writer ends the stream as before
+    TestBufferSink done;
+    {
+        ChunkedStreamWriter writer(done);
+        writer.send_headers();
+        writer.write("{}", 2);
+    }
+    assert(done.data.size() >= 5 && done.data.compare(done.data.size() - 5, 5, "0\r\n\r\n") == 0);
+    std::cout << "[PASS] test_chunked_stream_writer_unwinding" << std::endl;
+}
+
 void test_table_serialization_columns() {
     std::cout << "[RUN] test_table_serialization_columns" << std::endl;
     std::vector<std::string> node_jsons = {
@@ -417,6 +452,7 @@ int main() {
     test_route_pattern_matching();
     test_discovery_and_method_enforcement();
     test_chunked_stream_writer_framing();
+    test_chunked_stream_writer_unwinding();
     test_table_serialization_columns();
     test_json_recursion_depth_limit();
     test_concurrent_updates_keep_every_change();

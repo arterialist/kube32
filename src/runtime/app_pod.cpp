@@ -863,7 +863,12 @@ void AppPodHost::event_thread_main() {
             ev = std::move(event_queue_.front());
             event_queue_.pop_front();
         }
-        event(ev.pod_id, ev.topic, reinterpret_cast<const uint8_t*>(ev.data.data()), ev.data.size());
+        try {
+            event(ev.pod_id, ev.topic, reinterpret_cast<const uint8_t*>(ev.data.data()), ev.data.size());
+        } catch (const std::exception& e) {
+            // out of memory: this event is dropped, the next one is delivered
+            printf("[POD] event delivery skipped: %s\n", e.what());
+        }
         osal::System::feed_watchdog();
     }
 }

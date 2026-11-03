@@ -13,7 +13,8 @@
 // In both, allocatable stays the same while pods load and go; the scheduler
 // subtracts what bound pods request, and kube32.io/memory-free follows what
 // pods take. The pool is reserved once per process: run as
-// `test_node_memory psram` or `test_node_memory internal`.
+// `test_node_memory psram`, `test_node_memory internal` or
+// `test_node_memory reserved`.
 
 #include "embedded/embedded_blobs.hpp"
 #include "kubelet/node_status_reporter.hpp"
@@ -114,6 +115,7 @@ void test_psram_node() {
     // What is free now: all of it, nothing runs
     assert(annotation(node, "kube32.io/memory-free") == memory);
     assert(annotation(node, "kube32.io/psram-free") == 320 * 1024 + block);
+    assert(annotation(node, "kube32.io/system-reserved") == kube32_pool_system_reserve());
     assert(kube32_pool_linear_max() == block);
 
     // The examples' control-plane pods are bound to it: their requests count
@@ -169,6 +171,40 @@ void test_psram_node() {
     std::cout << "[PASS] test_psram_node (allocatable memory and psram " << memory / 1024 << " KiB)" << std::endl;
 }
 
+// A control plane keeps part of its PSRAM for itself (the store, the API
+// server, the controllers): allocatable memory leaves it out, the Node says
+// how much, and the scheduler places pods on what is left
+void test_system_reserved() {
+    std::cout << "[RUN] test_system_reserved" << std::endl;
+    kube32_pool_reserve_external(20 * 64 * 1024 + 4096);
+    kube32_pool_set_heap_budget(640 * 1024);
+    kube32_pool_set_psram_reserve(192 * 1024);
+    const size_t block = kube32_pool_block_size();
+    assert(kube32_pool_reserved_for_system() == 192 * 1024);
+
+    auto store = ram_store();
+    const models::JsonValue node = parse(register_node(*store, "devkit", true, "generic"));
+    const uint64_t capacity = quantity(node, "capacity", "memory");
+    const uint64_t allocatable = quantity(node, "allocatable", "memory");
+    assert(capacity == 640 * 1024 + block);
+    assert(allocatable == capacity - 192 * 1024);
+    assert(quantity(node, "allocatable", "esp32.io/psram") == allocatable);
+    assert(quantity(node, "capacity", "esp32.io/psram") == capacity);
+    assert(annotation(node, "kube32.io/system-reserved") == 192 * 1024);
+    // Pods are admitted on what is left of it, as the scheduler counts
+    size_t room_capacity = 0;
+    assert(kube32_pool_pod_room(64 * 1024, &room_capacity) == allocatable && room_capacity == allocatable);
+
+    auto sched = scheduler::create_scheduler(*store);
+    const std::string cp = R"({"node-role.kubernetes.io/control-plane":""})";
+    const std::string fits = std::to_string(allocatable / 1024) + "Ki";
+    const std::string over = std::to_string(allocatable / 1024 + 1) + "Ki";
+    assert(schedule(*sched, *store, "fills", "{\"memory\":\"" + fits + "\"}", cp) == "devkit");
+    assert(schedule(*sched, *store, "over", "{\"memory\":\"" + over + "\"}", cp) ==
+           "Unschedulable: 0/1 nodes are available: 1 Insufficient memory.");
+    std::cout << "[PASS] test_system_reserved (capacity " << capacity / 1024 << " KiB, allocatable " << allocatable / 1024 << " KiB)" << std::endl;
+}
+
 void test_internal_pool_node() {
     std::cout << "[RUN] test_internal_pool_node" << std::endl;
     kube32_pool_reserve(80 * 1024);
@@ -216,8 +252,9 @@ int main(int argc, char** argv) {
     const std::string mode = argc > 1 ? argv[1] : "";
     if (mode == "psram") test_psram_node();
     else if (mode == "internal") test_internal_pool_node();
+    else if (mode == "reserved") test_system_reserved();
     else {
-        std::cerr << "usage: test_node_memory psram|internal" << std::endl;
+        std::cerr << "usage: test_node_memory psram|internal|reserved" << std::endl;
         return 2;
     }
     std::cout << "Node memory tests passed (" << mode << ")" << std::endl;
