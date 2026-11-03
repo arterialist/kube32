@@ -37,6 +37,27 @@ To enter ROM download mode from the serial console when USB auto-reset fails, se
 
 Flash a board running the single-app partition table once with a current build to move it to the A/B layout; see [Firmware updates](firmware-updates.md#moving-a-board-to-this-layout). After that, update boards through the cluster with `kube32 firmware push` and `kube32 firmware rollout`.
 
+### Quad I/O flash
+
+The firmware builds for dual I/O (`dio`) flash reads, which every ESP32-S3 module supports. Many flash chips also read in quad I/O (`qio`), which doubles the bandwidth from flash to the cache: blobs read in place and code that runs from flash get faster. To build for it, set the mode in `sdkconfig.esp32s3` before `pio run`:
+
+```
+# CONFIG_ESPTOOLPY_FLASHMODE_DIO is not set
+CONFIG_ESPTOOLPY_FLASHMODE_QIO=y
+CONFIG_ESPTOOLPY_FLASHMODE="qio"
+```
+
+or pick *Serial flasher config > Flash SPI mode > QIO* in `pio run -e esp32s3 -t menuconfig`. The second-stage bootloader sets the chip's quad enable bit and switches to quad reads, so the image header stays `dio` and `scripts/flash.sh` writes the image as usual.
+
+A chip reads in QIO only if ESP-IDF knows how to set its quad enable bit. `esptool.py --port <serial port> flash_id` prints the chip's manufacturer and device IDs. These chips run kube32 in QIO, with the read speed of a mapped blob as `K32_CMD:BLOBREAD` reports it:
+
+| Board | Flash chip | `dio` | `qio` |
+| --- | --- | ---: | ---: |
+| M5Stack Cardputer | GigaDevice | 3.9 MB/s | 7.0 MB/s |
+| ESP32-S3 devkit, 8 MB | Puya, manufacturer `0x85`, device `0x2017` | 13 MB/s | 21 MB/s |
+
+ESP-IDF drives the Puya chip as a generic chip, whose quad enable method works for it. A board whose chip does not boot a `qio` image takes the `dio` build again through download mode.
+
 ## Serial console
 
 `kube32 console [--port <serial port>]` opens a board's console without resetting the board. It prints what the board writes and sends each line typed.
