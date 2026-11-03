@@ -389,14 +389,20 @@ void test_retries_on_changes() {
 
     // Changes keep coming: attempts wait for the back-off (100, 200, 400 ms).
     // The pods have completed: they take nothing from the node
+    const uint64_t changes_from = kube32::osal::System::get_uptime_ms();
     for (int i = 0; i < 20; ++i) {
         store->put("/registry/pods/default/other-" + std::to_string(i),
                    "{\"kind\":\"Pod\",\"metadata\":{\"name\":\"o\"},\"spec\":{\"nodeName\":\"node-a\"},\"status\":{\"phase\":\"Succeeded\"}}", true);
         kube32::osal::Thread::sleep_ms(50);
     }
     const uint64_t during = failed_attempts(*store, "waiting") - attempts;
-    std::cout << "  " << during << " attempts in 1 s of changes" << std::endl;
-    assert(during >= 1 && during <= 5);
+    const uint64_t took = kube32::osal::System::get_uptime_ms() - changes_from;
+    // The back-off doubles from 100 ms, so n attempts take at least 100 * (2^(n-1) - 1) ms.
+    // A slow host stretches the 1 s of changes and allows more of them.
+    uint64_t most = 1;
+    while (100 * ((uint64_t{1} << most) - 1) <= took) ++most;
+    std::cout << "  " << during << " attempts in " << took << " ms of changes (at most " << most << ")" << std::endl;
+    assert(during >= 1 && during <= most);
 
     // The cordon lifted: bound once the back-off ends
     const uint64_t t0 = kube32::osal::System::get_uptime_ms();

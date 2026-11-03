@@ -242,6 +242,7 @@ void test_deployment_loop() {
         real->get("/registry/deployments/default/web", d);
         return parse(d).get("status")->get_int("readyReplicas", 0) == 1;
     }));
+    const uint64_t ready_at = osal::System::get_uptime_ms();
 
     // Quiet: no pass, whatever else the cluster writes (the resync is
     // 1.5 s away: no longer wait to settle)
@@ -253,7 +254,10 @@ void test_deployment_loop() {
         osal::Thread::sleep_ms(30);
     }
     osal::Thread::sleep_ms(200);
-    assert(dc.passes() == quiet);
+    // A host slow enough to reach the resync allows its one pass. The resync
+    // counts from the pass that wrote readyReplicas, a poll before ready_at.
+    const bool resync_due = osal::System::get_uptime_ms() - ready_at + 200 >= cfg.resync_interval_ms;
+    assert(dc.passes() == quiet || (resync_due && dc.passes() == quiet + 1));
     assert(real->current_version() == revision + 30);   // the background writes, nothing of the controller
 
     // Scaled: the pods come within one reconcile interval (and a margin for a slow host)
