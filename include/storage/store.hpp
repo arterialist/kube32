@@ -16,7 +16,8 @@ enum class StatusCode {
     InvalidArgument = 3,
     StorageFull = 4,
     VersionConflict = 5,
-    InternalError = 6
+    InternalError = 6,
+    OutOfMemory = 7     // the write did not happen for lack of memory; it may succeed later
 };
 
 struct Status {
@@ -43,6 +44,9 @@ struct Status {
     }
     static Status InternalError(std::string msg) { 
         return {StatusCode::InternalError, std::move(msg)}; 
+    }
+    static Status OutOfMemory(std::string msg = "out of memory") {
+        return {StatusCode::OutOfMemory, std::move(msg)};
     }
 };
 
@@ -95,6 +99,13 @@ struct PersistenceStats {
     uint64_t sectors_erased{0};
     uint64_t unchanged_skipped{0};  // flushes of a value identical to the one on flash
     uint64_t write_errors{0};
+    uint64_t records_through_ram{0};  // moved through RAM: the free sectors could not take them
+    // Journal appends refused, by cause
+    uint64_t refused_full{0};
+    uint64_t refused_no_space{0};
+    uint64_t refused_io{0};
+    uint64_t refused_out_of_memory{0};
+    const char* last_error{"none"};   // cause of the last refused append
 };
 
 class Store {

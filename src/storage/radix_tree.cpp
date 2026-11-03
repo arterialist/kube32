@@ -125,6 +125,16 @@ bool RadixTree::get(const std::string& key, std::string& out_value,
     return false;
 }
 
+const std::string* RadixTree::value_of(const std::string& key, uint64_t* out_version, bool* out_is_ephemeral,
+                                      bool* out_on_flash) const {
+    const RadixNode* node = find_node(root_.get(), key);
+    if (!node || !node->is_leaf) return nullptr;
+    if (out_version) *out_version = node->resource_version;
+    if (out_is_ephemeral) *out_is_ephemeral = node->is_ephemeral;
+    if (out_on_flash) *out_on_flash = node->on_flash;
+    return &node->value;
+}
+
 bool RadixTree::stat(const std::string& key, size_t* out_value_bytes, uint64_t* out_version,
                      bool* out_is_ephemeral, bool* out_on_flash) const {
     const RadixNode* node = find_node(root_.get(), key);

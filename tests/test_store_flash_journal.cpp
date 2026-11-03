@@ -1,7 +1,9 @@
 // Object store persistence on raw flash: the log-structured journal
 // (storage/flash_log.hpp), its recovery after power cuts, reclamation, the
 // store's write coalescing and key classes (storage/persist_policy.hpp), and
-// commit(): API writes are in the journal before the API answers.
+// commit(): API writes are in the journal before the API answers. Journal
+// writes on a fragmented heap and a journal with no free sector run with the
+// allocator below.
 
 #include "storage/store.hpp"
 #include "storage/flash_log.hpp"
@@ -26,6 +28,26 @@
 
 using namespace kube32::storage;
 namespace api = kube32::api;
+
+// Allocations larger than this fail, as on a fragmented heap whose largest
+// free block has this size
+static std::atomic<size_t> g_largest_block{~static_cast<size_t>(0)};
+
+void* operator new(size_t n) {
+    if (n > g_largest_block.load(std::memory_order_relaxed)) throw std::bad_alloc();
+    if (void* p = std::malloc(n ? n : 1)) return p;
+    throw std::bad_alloc();
+}
+void* operator new[](size_t n) { return operator new(n); }
+void operator delete(void* p) noexcept { std::free(p); }
+void operator delete[](void* p) noexcept { std::free(p); }
+void operator delete(void* p, size_t) noexcept { std::free(p); }
+void operator delete[](void* p, size_t) noexcept { std::free(p); }
+
+struct LargestBlock {
+    explicit LargestBlock(size_t n) { g_largest_block = n; }
+    ~LargestBlock() { g_largest_block = ~static_cast<size_t>(0); }
+};
 
 static std::string pod_json(const std::string& name, const std::string& payload) {
     return "{\"kind\":\"Pod\",\"metadata\":{\"name\":\"" + name + "\",\"namespace\":\"default\"},\"spec\":{\"x\":\"" + payload + "\"}}";
@@ -794,7 +816,173 @@ static void test_out_of_memory_writes_change_nothing() {
     std::cout << "[PASS] test_out_of_memory_writes_change_nothing" << std::endl;
 }
 
+// Journal writes and reclamation take no block the size of a value: with no
+// free block above 2 KiB, values of 18 KB are written, and moved when their
+// sector is reclaimed
+static void test_writes_on_a_fragmented_heap() {
+    std::cout << "[RUN] test_writes_on_a_fragmented_heap" << std::endl;
+    RamFlashRegion flash(40 * 4096);
+    StoreOptions o = log_options(flash);
+    o.max_value_size_bytes = 24 * 1024;
+    std::map<std::string, std::string> expect;
+    {
+        auto store = create_radix_store(o);
+        assert(store->recover().ok());
+        for (int round = 0; round < 120; ++round) {
+            const std::string big = "/registry/pods/default/big-" + std::to_string(round % 2);
+            const std::string small = "/registry/pods/default/small-" + std::to_string(round % 5);
+            const std::string big_payload = std::string(18000, static_cast<char>('a' + round % 26)) + std::to_string(round);
+            const std::string small_payload = std::string(700, 'q') + std::to_string(round);
+            // A big value is rewritten every tenth round only: most reclaimed
+            // sectors hold one that is still live
+            if (round < 2 || round % 10 == 0) {
+                assert(store->put(big, pod_json("big", big_payload), true).ok());
+                expect[big] = big_payload;
+            }
+            assert(store->put(small, pod_json("small", small_payload), true).ok());
+            expect[small] = small_payload;
+            LargestBlock heap(2048);
+            Status s = store->flush(false);
+            if (!s.ok()) std::cout << "  round " << round << ": " << s.message << std::endl;
+            assert(s.ok());
+        }
+        PersistenceStats ps;
+        store->persistence_stats(ps);
+        assert(ps.records_moved > 0);
+        assert(ps.write_errors == 0);
+        std::cout << "  " << ps.records_written << " records, " << ps.records_moved << " moved, " << ps.sectors_erased
+                  << " erases" << std::endl;
+    }
+    auto store = create_radix_store(o);
+    assert(store->recover().ok());
+    for (const auto& kv : expect) {
+        std::string json;
+        assert(store->get(kv.first, json).ok());
+        assert(spec_x(json) == kv.second);
+    }
+    std::cout << "[PASS] test_writes_on_a_fragmented_heap" << std::endl;
+}
+
+// A journal whose every sector is in use (the reserve for reclamation used
+// up), its oldest sector holding a live 20 KB value that no free sector can
+// take: writes still succeed, the oldest records move through RAM, and every
+// key keeps its value. With no memory for them, the write is refused as out
+// of memory and the journal is left as it was.
+static void test_journal_with_no_free_sector() {
+    std::cout << "[RUN] test_journal_with_no_free_sector" << std::endl;
+    const size_t sectors = 32;
+    const std::string tail_payload(20000, 't');
+    std::string churn_payload;
+    // The log is written in a region twice as large and stops when it spans
+    // `sectors` sectors; copied into a region of that size, it fills it
+    RamFlashRegion wide(2 * sectors * 4096);
+    {
+        FlashLog log(wide, 25 * 1024);
+        uint64_t max_rev = 0;
+        assert(log.recover([](FlashLog::RecordType, const std::string&, std::string&, uint64_t) {}, max_rev));
+        uint64_t rev = 1;
+        auto put = [&](const std::string& key, const std::string& json) {
+            assert(log.append_put(key, json, rev++, value_fingerprint(json)));
+        };
+        put("/registry/pods/default/tail", pod_json("tail", tail_payload));
+        put("/registry/namespaces/default", R"({"kind":"Namespace","metadata":{"name":"default"}})");
+        for (int i = 0; log.stats().head_seq < sectors; ++i) {
+            churn_payload = std::string(1500, 'c') + std::to_string(i);
+            put("/registry/pods/default/churn", pod_json("churn", churn_payload));
+        }
+        assert(log.stats().tail_seq == 1);
+    }
+    RamFlashRegion flash(sectors * 4096);
+    for (size_t seq = 1; seq <= sectors; ++seq) {
+        std::copy(wide.bytes().begin() + seq * 4096, wide.bytes().begin() + (seq + 1) * 4096,
+                  flash.bytes().begin() + (seq % sectors) * 4096);
+    }
+    StoreOptions o = log_options(flash);
+    o.max_value_size_bytes = 24 * 1024;
+    {
+        auto store = create_radix_store(o);
+        assert(store->recover().ok());
+        PersistenceStats ps;
+        store->persistence_stats(ps);
+        assert(ps.used_sectors == sectors && ps.sector_count == sectors);
+        assert(store->put("/registry/configmaps/default/after", config_map("after", "1"), false).ok());
+        // No memory for the oldest records: refused as such, nothing erased
+        const std::vector<uint8_t> before = flash.bytes();
+        {
+            LargestBlock heap(4096);
+            Status s = store->flush(false);
+            assert(s.code == StatusCode::OutOfMemory);
+        }
+        assert(flash.bytes() == before);
+        store->persistence_stats(ps);
+        assert(ps.refused_out_of_memory >= 1 && std::string(ps.last_error) == "out-of-memory");
+        assert(ps.pending_keys >= 1);
+        // With memory, the write goes through
+        assert(store->flush(true).ok());
+        store->persistence_stats(ps);
+        assert(ps.records_through_ram >= 1);
+        assert(ps.used_sectors < sectors);
+        // and the journal keeps working
+        for (int i = 0; i < 40; ++i) {
+            assert(store->put("/registry/configmaps/default/after", config_map("after", std::to_string(i) + std::string(900, 'a')), true).ok());
+            assert(store->commit().ok());
+        }
+        std::cout << "  " << ps.records_through_ram << " record(s) through RAM, " << ps.used_sectors << " of " << sectors
+                  << " sectors in use after" << std::endl;
+    }
+    auto store = create_radix_store(o);
+    assert(store->recover().ok());
+    std::string json;
+    assert(store->get("/registry/pods/default/tail", json).ok() && spec_x(json) == tail_payload);
+    assert(store->get("/registry/pods/default/churn", json).ok() && spec_x(json) == churn_payload);
+    assert(store->get("/registry/namespaces/default", json).ok());
+    assert(store->get("/registry/configmaps/default/after", json).ok());
+    assert(json.find(std::string("39") + std::string(900, 'a')) != std::string::npos);
+    std::cout << "[PASS] test_journal_with_no_free_sector" << std::endl;
+}
+
+// An allocation that fails inside the journal's append is reported as out of
+// memory, not as a full journal; the change stays pending and is written once
+// memory is back
+static void test_journal_out_of_memory_is_reported() {
+    std::cout << "[RUN] test_journal_out_of_memory_is_reported" << std::endl;
+    RamFlashRegion flash(64 * 4096);
+    auto store = create_radix_store(log_options(flash));
+    assert(store->recover().ok());
+    Status refused = Status::Ok();
+    int key = 0;
+    for (; key < 64 && refused.ok(); ++key) {
+        assert(store->put("/registry/configmaps/default/k" + std::to_string(key), config_map("k", "v"), false).ok());
+        // The journal's index grows by 16 entries of 32 bytes at a time: its
+        // second growth (1 KiB) is refused
+        LargestBlock heap(800);
+        refused = store->commit();
+    }
+    assert(refused.code == StatusCode::OutOfMemory);
+    PersistenceStats ps;
+    store->persistence_stats(ps);
+    assert(ps.refused_out_of_memory == 1 && ps.refused_no_space == 0 && ps.refused_full == 0 && ps.refused_io == 0);
+    assert(std::string(ps.last_error) == "out-of-memory");
+    assert(ps.pending_keys == 1);
+    const std::string last = "/registry/configmaps/default/k" + std::to_string(key - 1);
+    {
+        RamFlashRegion copy(64 * 4096);
+        copy.bytes() = flash.bytes();
+        auto other = create_radix_store(log_options(copy));
+        std::string json;
+        assert(other->recover().ok() && other->get(last, json).code == StatusCode::NotFound);
+    }
+    assert(store->commit().ok());
+    auto again = create_radix_store(log_options(flash));
+    std::string json;
+    assert(again->recover().ok() && again->get(last, json).ok());
+    std::cout << "[PASS] test_journal_out_of_memory_is_reported (refused at key " << key - 1 << ")" << std::endl;
+}
+
 int main() {
+    test_writes_on_a_fragmented_heap();
+    test_journal_with_no_free_sector();
+    test_journal_out_of_memory_is_reported();
     test_flash_only_values_leave_ram();
     test_out_of_memory_writes_change_nothing();
     test_store_survives_restart();

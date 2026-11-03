@@ -1002,20 +1002,23 @@ void console_task(void* arg) {
                 con.write(buf, static_cast<size_t>(l));
             } else if (line == "K32_CMD:STORE") {
                 kube32::storage::PersistenceStats ps;
-                char buf[320];
+                char buf[448];
                 int l;
                 if (s_store && s_store->persistence_stats(ps)) {
                     l = snprintf(buf, sizeof(buf),
-                        "K32_STORE journal=%s keys=%u live_bytes=%u capacity_bytes=%u sectors=%u/%u pending=%u records=%llu bytes=%llu moved=%llu unchanged=%llu errors=%llu revision=%llu\n",
+                        "K32_STORE journal=%s keys=%u live_bytes=%u capacity_bytes=%u sectors=%u/%u pending=%u records=%llu bytes=%llu moved=%llu via_ram=%llu unchanged=%llu errors=%llu refused_full=%llu refused_no_space=%llu refused_io=%llu refused_oom=%llu last_error=%s revision=%llu\n",
                         s_journal_location.c_str(), (unsigned)ps.live_keys, (unsigned)ps.live_bytes,
                         (unsigned)ps.capacity_bytes, (unsigned)ps.used_sectors, (unsigned)ps.sector_count, (unsigned)ps.pending_keys,
                         (unsigned long long)ps.records_written, (unsigned long long)ps.bytes_written, (unsigned long long)ps.records_moved,
-                        (unsigned long long)ps.unchanged_skipped, (unsigned long long)ps.write_errors,
+                        (unsigned long long)ps.records_through_ram, (unsigned long long)ps.unchanged_skipped,
+                        (unsigned long long)ps.write_errors, (unsigned long long)ps.refused_full,
+                        (unsigned long long)ps.refused_no_space, (unsigned long long)ps.refused_io,
+                        (unsigned long long)ps.refused_out_of_memory, ps.last_error,
                         (unsigned long long)s_store->current_version());
                 } else {
                     l = snprintf(buf, sizeof(buf), "K32_STORE journal=none\n");
                 }
-                con.write(buf, static_cast<size_t>(l));
+                con.write(buf, std::min(static_cast<size_t>(l), sizeof(buf) - 1));
             } else if (line == "K32_CMD:CERT") {
                 if (s_tls) {
                     const std::string& pem = s_tls->certificate_pem();

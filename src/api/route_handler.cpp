@@ -1004,6 +1004,10 @@ HttpResponse RouteHandler::handle_request(const HttpRequest& req, mem::Monotonic
     if (mutation && !scope.state.dry_run && resp.status_code >= 200 && resp.status_code < 300) {
         storage::Status durable = store_.commit();
         if (!durable.ok()) {
+            // Out of memory passes: a 503 tells the client to try again
+            if (durable.code == storage::StatusCode::OutOfMemory) {
+                return make_status(503, "ServiceUnavailable", "node is out of memory: the change could not be written to the object store journal yet");
+            }
             return make_status(500, "InternalError", "the change could not be written to the object store journal: " + durable.message);
         }
         // An image the deleted object was the last to refer to goes with it

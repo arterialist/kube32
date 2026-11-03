@@ -428,7 +428,7 @@ public:
                 commit_cv_.wait(lock);
                 continue;
             }
-            Status s = Status::InternalError("out of memory");
+            Status s = Status::OutOfMemory();
             committing_ = true;
             lock.unlock();
             // Whatever happens to the batch, the next caller may write: a
@@ -461,6 +461,12 @@ public:
         out.sectors_erased = ls.sectors_erased;
         out.unchanged_skipped = unchanged_skipped_;
         out.write_errors = write_errors_;
+        out.records_through_ram = ls.records_through_ram;
+        out.refused_full = ls.refused_full;
+        out.refused_no_space = ls.refused_no_space;
+        out.refused_io = ls.refused_io;
+        out.refused_out_of_memory = ls.refused_out_of_memory;
+        out.last_error = FlashLog::error_name(last_refusal_);
         std::lock_guard<std::recursive_mutex> lock(rw_mutex_);
         out.pending_keys = pending_.size();
         return true;
@@ -480,8 +486,9 @@ private:
     // The pending changes a journal write takes: the due ones (the periodic
     // flush), every one but deferred heartbeats (commit), or all
     enum class Batch { Due, Urgent, All };
-    // One change a batch writes
-    struct Item { std::string key; bool present; std::string value; uint64_t rev; bool flash_only; };
+    // One change a batch writes. The value stays in the tree: it is written
+    // from there, so a write needs no second block of the value's size
+    struct Item { std::string key; bool present; uint64_t rev; bool flash_only; };
 
     StoreOptions options_;
     mutable std::recursive_mutex rw_mutex_;
@@ -500,6 +507,7 @@ private:
     size_t durable_bytes_{0};   // journal bytes the durable keys take once flushed
     uint64_t unchanged_skipped_{0};
     uint64_t write_errors_{0};
+    FlashLog::Error last_refusal_{FlashLog::Error::None};
     uint64_t current_version_{0};
     uint32_t next_watch_id_{0};
     std::vector<Watcher> watchers_;
@@ -560,14 +568,38 @@ private:
             // Out of memory: what the batch took is pending again, for a later batch
             std::lock_guard<std::recursive_mutex> lock(rw_mutex_);
             for (Item& item : items) {
-                std::string().swap(item.value);
                 try {
                     schedule_flush_locked(item.key, 1000);
                 } catch (const std::bad_alloc&) {
                 }
             }
             write_errors_++;
-            return Status::InternalError("out of memory");
+            return Status::OutOfMemory("out of memory while writing to the flash journal");
+        }
+    }
+
+    // The status of an append the journal refused, by its cause
+    Status refusal(const std::string& what) {
+        const FlashLog::Error e = log_->last_error();
+        last_refusal_ = e;
+        switch (e) {
+            case FlashLog::Error::Full:
+                return Status::StorageFull("flash journal is full: " + std::to_string(log_->live_bytes()) + " of " +
+                                           std::to_string(log_->capacity_bytes()) + " bytes live, " + what + " does not fit");
+            case FlashLog::Error::TooLarge:
+                return Status::StorageFull(what + " is larger than a flash journal record");
+            case FlashLog::Error::OutOfMemory:
+                return Status::OutOfMemory("out of memory while writing " + what + " to the flash journal");
+            case FlashLog::Error::NoSpace: {
+                const FlashLogStats ls = log_->stats();
+                return Status::InternalError("flash journal could not free a sector for " + what + " (" +
+                                             std::to_string(ls.used_sectors) + " of " + std::to_string(ls.sector_count) +
+                                             " sectors in use)");
+            }
+            case FlashLog::Error::Unreadable:
+                return Status::InternalError("the flash journal could not be read at boot; nothing is written to it");
+            default:
+                return Status::InternalError("flash I/O error while writing " + what + " to the journal");
         }
     }
 
@@ -589,7 +621,7 @@ private:
                 item.key = it->first;
                 bool ephemeral = false;
                 bool on_flash = false;
-                item.present = tree_.get(item.key, item.value, &item.rev, &ephemeral, &on_flash) && !ephemeral;
+                item.present = tree_.stat(item.key, nullptr, &item.rev, &ephemeral, &on_flash) && !ephemeral;
                 // A released value is in the journal already
                 if (item.present && on_flash) { it = pending_.erase(it); continue; }
                 if (!item.present) item.rev = current_version_;
@@ -612,7 +644,7 @@ private:
                 revision_reserved_ = mark;
             } else {
                 write_errors_++;
-                result = Status::StorageFull("flash journal refused the revision mark");
+                result = refusal("the revision mark");
             }
         }
         std::vector<size_t> on_flash;   // FlashOnly values the journal now holds
@@ -621,27 +653,35 @@ private:
             Item& item = items[i];
             bool ok = true;
             if (item.present) {
-                const uint64_t fp = value_fingerprint(item.value);
+                // The append reads the value in the tree, so the tree holds
+                // still until it is written
+                std::lock_guard<std::recursive_mutex> lock(rw_mutex_);
+                bool ephemeral = false;
+                bool released = false;
+                const std::string* value = tree_.value_of(item.key, &item.rev, &ephemeral, &released);
+                // Removed since (its delete is pending), or written already
+                if (!value || ephemeral || released) continue;
+                const uint64_t fp = value_fingerprint(*value);
                 if (log_->has_value(item.key, fp)) {
                     unchanged_skipped_++;
                     if (item.flash_only) on_flash.push_back(i);
                     continue;
                 }
-                ok = log_->append_put(item.key, item.value, item.rev, fp);
+                ok = log_->append_put(item.key, *value, item.rev, fp);
             } else {
                 ok = log_->append_delete(item.key, item.rev);
             }
             if (!ok) {
                 write_errors_++;
-                result = Status::StorageFull("flash journal refused " + item.key);
+                result = refusal(item.key);
+                // Out of memory may pass soon; the other causes do not
+                const uint32_t retry_ms = result.code == StatusCode::OutOfMemory ? 1000 : 5000;
                 std::lock_guard<std::recursive_mutex> lock(rw_mutex_);
-                schedule_flush_locked(item.key, 5000);
+                schedule_flush_locked(item.key, retry_ms);
             } else {
                 wrote = true;
                 if (item.present && item.flash_only) on_flash.push_back(i);
             }
-            // Written: the copy is not needed any more
-            std::string().swap(item.value);
         }
         if (wrote && !log_->sync()) {
             write_errors_++;

@@ -37,6 +37,10 @@ public:
              bool ephemeral, bool overwrite, bool* out_is_new = nullptr);
     bool get(const std::string& key, std::string& out_value, 
              uint64_t* out_version = nullptr, bool* out_is_ephemeral = nullptr, bool* out_on_flash = nullptr) const;
+    // The stored value itself, valid until the tree next changes; nullptr
+    // when the key is absent
+    const std::string* value_of(const std::string& key, uint64_t* out_version = nullptr,
+                                bool* out_is_ephemeral = nullptr, bool* out_on_flash = nullptr) const;
     // What get() would report, without copying the value
     bool stat(const std::string& key, size_t* out_value_bytes, uint64_t* out_version = nullptr,
               bool* out_is_ephemeral = nullptr, bool* out_on_flash = nullptr) const;

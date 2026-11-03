@@ -4,6 +4,7 @@
 #include <cstdio>
 #include <cstring>
 #include <fcntl.h>
+#include <new>
 #include <sys/stat.h>
 #include <unistd.h>
 
@@ -313,10 +314,31 @@ bool FlashLog::ensure_space(size_t record_bytes) {
         size_t extra = record_bytes > avail ? (record_bytes - avail + payload_ - 1) / payload_ : 0;
         size_t free_sectors = sectors_ - used_sectors();
         size_t want = extra + (reclaiming_ ? 0 : reserve_sectors_);
-        if (free_sectors >= want && free_sectors >= extra) return true;
-        if (reclaiming_ || !reclaim_tail()) return false;
+        if (free_sectors >= want) return true;
+        if (reclaiming_) return fail(Error::NoSpace);
+        if (reclaim_tail()) continue;
+        // The free sectors cannot take what the oldest one holds
+        if (error_ != Error::NoSpace || !reclaim_through_ram()) return false;
     }
-    return false;
+    return fail(Error::NoSpace);
+}
+
+bool FlashLog::place_record(size_t total, uint32_t& start_seq, size_t& start_off) {
+    if (!ensure_space(total)) return false;
+    // A record starts at the beginning of a sector when the head one is full
+    if (!have_head_ || head_off_ >= sector_) {
+        if (!open_sector(have_head_ ? head_seq_ + 1 : 1, kSectorHeader)) return fail(Error::Io);
+    }
+    start_seq = head_seq_;
+    start_off = head_off_;
+    return true;
+}
+
+// After a write that stopped part way: the next record starts in a fresh
+// sector, since recovery reads no further into a sector than its first
+// unreadable record
+void FlashLog::abandon_head() {
+    if (have_head_) head_off_ = sector_;
 }
 
 bool FlashLog::stream_read(uint32_t& seq, size_t& off, void* dst, size_t len) {
@@ -356,21 +378,24 @@ bool FlashLog::stream_write(const void* src, size_t len, size_t record_remaining
 
 bool FlashLog::append_record(RecordType type, const std::string& key, const std::string& value, uint64_t revision,
                              uint64_t fingerprint, bool moving) {
-    if (unreadable_ || key.size() > kMaxKey || key.size() + value.size() > max_record_) return false;
+    if (unreadable_) return fail(Error::Unreadable);
+    if (key.size() > kMaxKey || key.size() + value.size() > max_record_) return fail(Error::TooLarge);
     const size_t body = kRecordHeader + key.size() + value.size();
     const size_t total = align4(body);
-    if (!moving && type == RecordType::Put) {
-        const IndexEntry* old = find(hash_key(key));
-        size_t old_bytes = (old && old->type != static_cast<uint8_t>(RecordType::Delete)) ? old->bytes : 0;
-        if (live_bytes_ - old_bytes + total > capacity_bytes()) return false;
+    const uint64_t kh = hash_key(key);
+    if (!moving) {
+        const IndexEntry* old = find(kh);
+        if (type == RecordType::Put) {
+            size_t old_bytes = (old && old->type != static_cast<uint8_t>(RecordType::Delete)) ? old->bytes : 0;
+            if (live_bytes_ - old_bytes + total > capacity_bytes()) return fail(Error::Full);
+        }
+        // The index has room for the entry before anything is written: a
+        // record on flash always has one (throws std::bad_alloc otherwise)
+        if (!old && index_.size() == index_.capacity()) index_.reserve(index_.size() + 16);
     }
-    if (!ensure_space(total)) return false;
-    // A record starts at the beginning of a sector when the head one is full
-    if (!have_head_ || head_off_ >= sector_) {
-        if (!open_sector(have_head_ ? head_seq_ + 1 : 1, kSectorHeader)) return false;
-    }
-    const uint32_t start_seq = head_seq_;
-    const size_t start_off = head_off_;
+    uint32_t start_seq = 0;
+    size_t start_off = 0;
+    if (!place_record(total, start_seq, start_off)) return false;
 
     uint8_t h[kRecordHeader];
     put16(h, kRecordMagic);
@@ -389,21 +414,25 @@ bool FlashLog::append_record(RecordType type, const std::string& key, const std:
     put32(h + 20, crc);
 
     size_t remaining = total;
-    if (!stream_write(h, sizeof(h), remaining)) return false;
+    bool ok = stream_write(h, sizeof(h), remaining);
     remaining -= sizeof(h);
-    if (!stream_write(key.data(), key.size(), remaining)) return false;
+    ok = ok && stream_write(key.data(), key.size(), remaining);
     remaining -= key.size();
-    if (!value.empty()) {
-        if (!stream_write(value.data(), value.size(), remaining)) return false;
+    if (ok && !value.empty()) {
+        ok = stream_write(value.data(), value.size(), remaining);
         remaining -= value.size();
     }
-    if (remaining > 0) {
+    if (ok && remaining > 0) {
         static const uint8_t kPad[4] = {0, 0, 0, 0};
-        if (!stream_write(kPad, remaining, remaining)) return false;
+        ok = stream_write(kPad, remaining, remaining);
+    }
+    if (!ok) {
+        abandon_head();
+        return fail(Error::Io);
     }
 
     IndexEntry e;
-    e.key_hash = hash_key(key);
+    e.key_hash = kh;
     e.pos = pos_of(start_seq, start_off);
     e.fingerprint = fingerprint;
     e.bytes = static_cast<uint32_t>(total);
@@ -412,6 +441,95 @@ bool FlashLog::append_record(RecordType type, const std::string& key, const std:
     counters_.records_written++;
     counters_.bytes_written += total;
     if (moving) counters_.records_moved++;
+    return true;
+}
+
+// Reads the record at (seq, off) in small pieces and checks its CRC, without
+// a buffer the size of the record. `crc_at` receives the CRC the record has
+// when it starts in sector `crc_seq` instead.
+bool FlashLog::check_record(uint32_t seq, size_t off, RecordRef& r, uint32_t crc_seq, uint32_t& crc_at) {
+    uint8_t seqb[4];
+    put32(seqb, seq);
+    if (!stream_read(seq, off, r.header, kRecordHeader)) return false;
+    if (get16(r.header) != kRecordMagic) return false;
+    const uint8_t t = r.header[2];
+    if (t < 1 || t > 3) return false;
+    r.key_len = get16(r.header + 4);
+    r.value_len = get32(r.header + 8);
+    if (r.key_len > kMaxKey || r.key_len + r.value_len > max_record_) return false;
+    r.type = static_cast<RecordType>(t);
+    r.total = align4(kRecordHeader + r.key_len + r.value_len);
+    r.body_seq = seq;
+    r.body_off = off;
+    uint32_t crc = crc32_update(crc32_update(0, seqb, 4), r.header, 20);
+    put32(seqb, crc_seq);
+    uint32_t moved = crc32_update(crc32_update(0, seqb, 4), r.header, 20);
+    uint64_t kh = 1469598103934665603ull;
+    uint8_t buf[128];
+    for (size_t done = 0, len = r.key_len + r.value_len; done < len;) {
+        const size_t n = std::min(sizeof(buf), len - done);
+        if (!stream_read(seq, off, buf, n)) return false;
+        crc = crc32_update(crc, buf, n);
+        moved = crc32_update(moved, buf, n);
+        if (done < r.key_len) kh = fnv1a(kh, reinterpret_cast<const char*>(buf), std::min(n, r.key_len - done));
+        done += n;
+    }
+    if (crc != get32(r.header + 20)) return false;
+    const size_t pad = r.total - (kRecordHeader + r.key_len + r.value_len);
+    if (pad && !stream_read(seq, off, buf, pad)) return false;
+    if (off >= sector_ && seq < head_seq_) { ++seq; off = kSectorHeader; }
+    r.key_hash = kh;
+    r.end_seq = seq;
+    r.end_off = off;
+    crc_at = moved;
+    return true;
+}
+
+// Copies a record that check_record() found to the head, piece by piece.
+// `crc` is its CRC at the head (from check_record() with the head's sector).
+bool FlashLog::move_record(const RecordRef& r, uint32_t crc, uint64_t fingerprint) {
+    uint32_t start_seq = 0;
+    size_t start_off = 0;
+    if (!place_record(r.total, start_seq, start_off)) return false;
+    uint8_t h[kRecordHeader];
+    std::memcpy(h, r.header, 20);
+    put32(h + 20, crc);
+    uint8_t seqb[4];
+    put32(seqb, start_seq);
+    uint32_t check = crc32_update(crc32_update(0, seqb, 4), h, 20);
+    size_t remaining = r.total;
+    bool ok = stream_write(h, sizeof(h), remaining);
+    remaining -= sizeof(h);
+    uint32_t seq = r.body_seq;
+    size_t off = r.body_off;
+    uint8_t buf[128];
+    for (size_t done = 0, len = r.key_len + r.value_len; ok && done < len;) {
+        const size_t n = std::min(sizeof(buf), len - done);
+        ok = stream_read(seq, off, buf, n) && stream_write(buf, n, remaining);
+        check = crc32_update(check, buf, n);
+        remaining -= n;
+        done += n;
+    }
+    if (ok && remaining > 0) {
+        static const uint8_t kPad[4] = {0, 0, 0, 0};
+        ok = stream_write(kPad, remaining, remaining);
+    }
+    // The bytes copied are the ones checked, and the CRC was made for the
+    // sector the copy starts in
+    if (!ok || check != crc) {
+        abandon_head();
+        return fail(Error::Io);
+    }
+    IndexEntry e;
+    e.key_hash = r.key_hash;
+    e.pos = pos_of(start_seq, start_off);
+    e.fingerprint = fingerprint;
+    e.bytes = static_cast<uint32_t>(r.total);
+    e.type = static_cast<uint8_t>(r.type);
+    index_set(e);
+    counters_.records_written++;
+    counters_.bytes_written += r.total;
+    counters_.records_moved++;
     return true;
 }
 
@@ -448,49 +566,56 @@ bool FlashLog::read_record_at(uint32_t seq, size_t off, RecordType& type, std::s
     return true;
 }
 
+namespace {
+
+// Sets a flag for the life of a scope, cleared on every way out
+struct FlagScope {
+    bool& flag;
+    explicit FlagScope(bool& f) : flag(f) { flag = true; }
+    ~FlagScope() { flag = false; }
+};
+
+} // namespace
+
 bool FlashLog::reclaim_tail() {
-    if (!have_head_ || tail_seq_ >= head_seq_) return false;
-    reclaiming_ = true;
+    if (!have_head_ || tail_seq_ >= head_seq_) return fail(Error::NoSpace);
+    FlagScope scope(reclaiming_);
     read_error_ = false;
     const uint32_t seq = tail_seq_;
     bool moved = false;
     SectorHeader hdr;
     if (read_header(phys(seq), hdr) && hdr.seq == seq && hdr.first != kNoRecordStart) {
         size_t off = hdr.first;
-        std::string key, value;
         while (off < sector_) {
-            RecordType type;
-            uint64_t revision = 0;
-            size_t total = 0;
-            uint32_t end_seq = 0;
-            size_t end_off = 0;
-            if (!read_record_at(seq, off, type, key, value, revision, total, end_seq, end_off)) break;
-            const uint64_t kh = hash_key(key);
-            const IndexEntry* e = find(kh);
+            RecordRef r;
+            uint32_t crc = 0;
+            // Where a copy would start: the head does not move until it is made
+            const uint32_t to = head_off_ < sector_ ? head_seq_ : head_seq_ + 1;
+            if (!check_record(seq, off, r, to, crc)) break;
+            const IndexEntry* e = find(r.key_hash);
             if (e && e->pos == pos_of(seq, off)) {
-                if (type == RecordType::Delete) {
+                if (r.type == RecordType::Delete) {
                     // Nothing older than the oldest sector remains to be shadowed
-                    index_erase(kh);
-                } else if (!append_record(type, key, value, revision, e->fingerprint, true)) {
-                    reclaiming_ = false;
+                    index_erase(r.key_hash);
+                } else if (!move_record(r, crc, e->fingerprint)) {
                     return false;
                 } else {
                     moved = true;
                 }
             }
-            if (end_seq != seq) break;   // the record ran into the next sector
-            off = end_off;
+            if (r.end_seq != seq) break;   // the record ran into the next sector
+            off = r.end_off;
         }
     }
     // A record that could not be read was not moved: the sector stays
-    if (read_error_) { reclaiming_ = false; return false; }
+    if (read_error_) return fail(Error::Io);
     // The copies are durable before the sector they replace can be erased or
     // written over (a file may reach the disk out of order)
-    if (moved && !region_.sync()) { reclaiming_ = false; return false; }
+    if (moved && !region_.sync()) return fail(Error::Io);
     // On NOR flash a reclaimed sector is erased at once, so recovery never
     // finds it; elsewhere its stale records are older than every copy made
     if (region_.erase_required()) {
-        if (!region_.erase_sector(phys(seq))) { reclaiming_ = false; return false; }
+        if (!region_.erase_sector(phys(seq))) return fail(Error::Io);
         counters_.sectors_erased++;
     }
     tail_seq_ = seq + 1;
@@ -504,7 +629,90 @@ bool FlashLog::reclaim_tail() {
         }
         ++tail_seq_;
     }
-    reclaiming_ = false;
+    return true;
+}
+
+// For a log whose free sectors cannot take the live records of the oldest
+// one: those records, and the ones of the sectors after it until the sectors
+// freed can take them all, are read into RAM, the sectors are erased, and the
+// records are appended again. A reset between the erase and the appends loses
+// them, so this runs only when nothing else frees space. Throws
+// std::bad_alloc, before anything is erased, when the records do not fit in
+// memory.
+bool FlashLog::reclaim_through_ram() {
+    if (!have_head_ || tail_seq_ >= head_seq_) return fail(Error::NoSpace);
+    struct Staged {
+        RecordType type;
+        std::string key;
+        std::string value;
+        uint64_t revision;
+        uint64_t fingerprint;
+    };
+    std::vector<Staged> staged;
+    std::vector<uint64_t> deletes;   // live delete records in the sectors freed
+    size_t staged_bytes = 0;
+    const size_t free_sectors = sectors_ - used_sectors();
+    const size_t avail = sector_ - head_off_;
+    auto fits = [&](size_t freed) {
+        const size_t extra = staged_bytes > avail ? (staged_bytes - avail + payload_ - 1) / payload_ : 0;
+        return extra <= free_sectors + freed;
+    };
+    read_error_ = false;
+    uint32_t end = tail_seq_;
+    while (end < head_seq_) {
+        SectorHeader hdr;
+        if (read_header(phys(end), hdr) && hdr.seq == end && hdr.first != kNoRecordStart) {
+            size_t off = hdr.first;
+            while (off < sector_) {
+                Staged s;
+                size_t total = 0;
+                uint32_t end_seq = 0;
+                size_t end_off = 0;
+                if (!read_record_at(end, off, s.type, s.key, s.value, s.revision, total, end_seq, end_off)) break;
+                const uint64_t kh = hash_key(s.key);
+                const IndexEntry* e = find(kh);
+                if (e && e->pos == pos_of(end, off)) {
+                    if (s.type == RecordType::Delete) {
+                        deletes.push_back(kh);
+                    } else {
+                        s.fingerprint = e->fingerprint;
+                        staged_bytes += total;
+                        staged.push_back(std::move(s));
+                    }
+                }
+                if (end_seq != end) break;
+                off = end_off;
+            }
+        }
+        if (read_error_) return fail(Error::Io);
+        ++end;
+        while (end < head_seq_) {
+            SectorHeader next;
+            if (read_header(phys(end), next) && next.first != kNoRecordStart) break;
+            ++end;
+        }
+        if (fits(end - tail_seq_)) break;
+    }
+    if (!fits(end - tail_seq_)) return fail(Error::NoSpace);
+    if (region_.erase_required()) {
+        for (uint32_t seq = tail_seq_; seq < end; ++seq) {
+            if (!region_.erase_sector(phys(seq))) return fail(Error::Io);
+            counters_.sectors_erased++;
+        }
+    }
+    tail_seq_ = end;
+    for (uint64_t kh : deletes) index_erase(kh);
+    FlagScope scope(reclaiming_);
+    for (size_t i = 0; i < staged.size(); ++i) {
+        const Staged& s = staged[i];
+        if (!append_record(s.type, s.key, s.value, s.revision, s.fingerprint, true)) {
+            // What could not be written again is not on flash any more
+            for (size_t j = i; j < staged.size(); ++j) index_erase(hash_key(staged[j].key));
+            return false;
+        }
+        counters_.records_through_ram++;
+    }
+    if (!staged.empty() && !region_.sync()) return fail(Error::Io);
     return true;
 }
 
@@ -629,21 +837,63 @@ bool FlashLog::copy_log(FlashRegion& from, FlashRegion& to, bool& copied) {
     return true;
 }
 
+const char* FlashLog::error_name(Error e) {
+    switch (e) {
+        case Error::None: return "none";
+        case Error::TooLarge: return "too-large";
+        case Error::Full: return "full";
+        case Error::NoSpace: return "no-space";
+        case Error::Io: return "io";
+        case Error::OutOfMemory: return "out-of-memory";
+        case Error::Unreadable: return "unreadable";
+    }
+    return "unknown";
+}
+
+// Counts a refused append by its cause
+bool FlashLog::refused() {
+    switch (error_) {
+        case Error::Full: case Error::TooLarge: counters_.refused_full++; break;
+        case Error::NoSpace: counters_.refused_no_space++; break;
+        case Error::OutOfMemory: counters_.refused_out_of_memory++; break;
+        default: counters_.refused_io++; break;
+    }
+    return false;
+}
+
 bool FlashLog::append_put(const std::string& key, const std::string& value, uint64_t revision, uint64_t fingerprint) {
     std::lock_guard<std::recursive_mutex> lock(mutex_);
-    return append_record(RecordType::Put, key, value, revision, fingerprint, false);
+    error_ = Error::None;
+    try {
+        return append_record(RecordType::Put, key, value, revision, fingerprint, false) || refused();
+    } catch (const std::bad_alloc&) {
+        error_ = Error::OutOfMemory;
+        return refused();
+    }
 }
 
 bool FlashLog::append_delete(const std::string& key, uint64_t revision) {
     std::lock_guard<std::recursive_mutex> lock(mutex_);
+    error_ = Error::None;
     const IndexEntry* e = find(hash_key(key));
     if (!e || e->type == static_cast<uint8_t>(RecordType::Delete)) return true;   // nothing on flash to shadow
-    return append_record(RecordType::Delete, key, std::string(), revision, 0, false);
+    try {
+        return append_record(RecordType::Delete, key, std::string(), revision, 0, false) || refused();
+    } catch (const std::bad_alloc&) {
+        error_ = Error::OutOfMemory;
+        return refused();
+    }
 }
 
 bool FlashLog::append_revision_mark(uint64_t revision) {
     std::lock_guard<std::recursive_mutex> lock(mutex_);
-    if (!append_record(RecordType::RevisionMark, kRevisionKey, std::string(), revision, 0, false)) return false;
+    error_ = Error::None;
+    try {
+        if (!append_record(RecordType::RevisionMark, kRevisionKey, std::string(), revision, 0, false)) return refused();
+    } catch (const std::bad_alloc&) {
+        error_ = Error::OutOfMemory;
+        return refused();
+    }
     revision_mark_ = revision;
     return true;
 }

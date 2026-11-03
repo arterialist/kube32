@@ -72,7 +72,7 @@ Profile commands write to the `k32` NVS namespace, return `K32_OK ..., rebooting
 | Command | Output |
 | --- | --- |
 | `K32_CMD:STATUS` | `K32_STATUS node=... role=... mac=... free_heap=... min_free_heap=... free_psram=... uptime_ms=... pods=... storage=... auth=... tls=...` |
-| `K32_CMD:STORE` | `K32_STORE journal=... keys=... live_bytes=... capacity_bytes=... sectors=.../... pending=... records=... bytes=... moved=... unchanged=... errors=... revision=...` on the control plane, or `K32_STORE journal=none`. |
+| `K32_CMD:STORE` | `K32_STORE journal=... keys=... live_bytes=... capacity_bytes=... sectors=.../... pending=... records=... bytes=... moved=... via_ram=... unchanged=... errors=... refused_full=... refused_no_space=... refused_io=... refused_oom=... last_error=... revision=...` on the control plane, or `K32_STORE journal=none`. `refused_*` count journal appends refused by cause and `last_error` names the last cause (`none`, `full`, `too-large`, `no-space`, `io`, `out-of-memory`, `unreadable`). |
 | `K32_CMD:CERT` | The API server's self-signed TLS certificate in PEM format as `K32_CERT <line>` lines followed by `K32_OK cert`. |
 | `K32_CMD:FIRMWARE` | `K32_FIRMWARE version=... sha256=... slot=... state=Confirmed\|Verifying update_slot=... staged=... staged_sha256=... staged_version=...`: reports the running image and, on the control plane, the staged image. See [Firmware updates](firmware-updates.md). |
 | `K32_CMD:SCAN` | Up to 20 `K32_AP ssid="..." rssi=... ch=... auth=...` lines for 2.4 GHz networks. |

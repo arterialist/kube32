@@ -71,7 +71,8 @@ The control plane persists cluster objects in a log-structured journal. When the
 * Journal size is 1 MiB on internal flash (~480 KB of live objects) and 4 MiB on a microSD card.
 * At boot, an existing `/data/kube32/store/journal.img` is copied into the `journal` partition, verified by readback, and deleted; an interrupted copy is redone on the next boot without overwriting a newer log in the partition.
 * If the journal cannot be read at boot, recovery fails and nothing is written to it.
-* API writes (`POST`, `PUT`, `PATCH`, and `DELETE` that are not dry-run) commit to the journal before the API server responds, or return `500` if the write fails. Concurrent writers share one journal write and sync (group commit).
+* API writes (`POST`, `PUT`, `PATCH`, and `DELETE` that are not dry-run) commit to the journal before the API server responds, or return `500` if the write fails (`503 ServiceUnavailable` when the node is out of memory; the write is retried). Concurrent writers share one journal write and sync (group commit).
+* Journal writes need no allocation the size of an object: values are written from the store and reclamation copies records in 128-byte pieces. A journal whose free sectors cannot take the live records of its oldest sector reads them into RAM, erases the sector and writes them again.
 * When the journal is full, any persisted create or update that cannot fit returns `500 InternalError` (`object store is full: X of Y bytes in use, N more needed`). Shrinking updates and deletes continue to work.
 * Leases and Events stay in RAM.
 * Node heartbeat status writes at most every 10 minutes. Controller writes batch and flush within 1 s. Unchanged content is skipped.

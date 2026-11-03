@@ -15,9 +15,13 @@
 // as records, and a region that cannot erase (a file) needs no erasing.
 //
 // Space is reclaimed from the oldest sector: records in it that are still the
-// latest version of their key are appended again at the head, and the sector
-// becomes free. Writes therefore rotate through the whole region and a write
-// costs appends rather than rewrites in place.
+// latest version of their key are copied to the head in small pieces (no
+// buffer the size of a record), and the sector becomes free. Writes therefore
+// rotate through the whole region and a write costs appends rather than
+// rewrites in place. A log whose free sectors cannot take the live records of
+// the oldest one (the reserve kept for that was used up) frees it through RAM:
+// those records are read into memory, the sector is erased, and they are
+// appended again.
 //
 // On the ESP32-S3, internal flash access disables the instruction cache, so
 // a region backed by internal flash must be used from a task whose stack is
@@ -106,6 +110,12 @@ struct FlashLogStats {
     uint64_t bytes_written{0};
     uint64_t records_moved{0};    // rewritten by reclamation
     uint64_t sectors_erased{0};
+    uint64_t records_through_ram{0};  // moved through RAM: no free sector could take them
+    // Appends refused, by cause
+    uint64_t refused_full{0};
+    uint64_t refused_no_space{0};
+    uint64_t refused_io{0};
+    uint64_t refused_out_of_memory{0};
     uint32_t head_seq{0};
     uint32_t tail_seq{0};
 };
@@ -135,7 +145,20 @@ public:
     // differ in size or sector size.
     static bool copy_log(FlashRegion& from, FlashRegion& to, bool& copied);
 
-    // Appends one record. False when the region is full or the flash fails.
+    // Why the last append was refused
+    enum class Error : uint8_t {
+        None,
+        TooLarge,      // the key or value exceeds max_record_bytes
+        Full,          // the live records would pass capacity_bytes()
+        NoSpace,       // no sector could be freed for the record
+        Io,            // the region failed a read, write or erase
+        OutOfMemory,   // an allocation failed; nothing was written
+        Unreadable,    // recover() could not read the region
+    };
+    static const char* error_name(Error e);
+
+    // Appends one record. False when it was refused (last_error() says why);
+    // a refused append leaves the log as it was. Never throws.
     bool append_put(const std::string& key, const std::string& value, uint64_t revision, uint64_t fingerprint);
     bool append_delete(const std::string& key, uint64_t revision);
     bool append_revision_mark(uint64_t revision);
@@ -151,6 +174,8 @@ public:
     bool read_value(const std::string& key, std::string& out);
     // Bytes the key's latest put takes in the region, 0 without one.
     size_t record_bytes(const std::string& key) const;
+
+    Error last_error() const { std::lock_guard<std::recursive_mutex> lock(mutex_); return error_; }
 
     FlashLogStats stats() const;
     size_t live_bytes() const { std::lock_guard<std::recursive_mutex> lock(mutex_); return live_bytes_; }
@@ -177,6 +202,19 @@ private:
     };
     static constexpr size_t kSectorHeader = 16;
     static constexpr size_t kRecordHeader = 24;
+    // A record found in the region: its header, where its key starts, where it ends
+    struct RecordRef {
+        uint8_t header[kRecordHeader];
+        RecordType type;
+        size_t key_len;
+        size_t value_len;
+        size_t total;
+        uint64_t key_hash;
+        uint32_t body_seq;
+        size_t body_off;
+        uint32_t end_seq;
+        size_t end_off;
+    };
 
     FlashRegion& region_;
     size_t sector_;
@@ -192,6 +230,7 @@ private:
     bool reclaiming_{false};
     bool read_error_{false};   // a region read failed since it was last cleared
     bool unreadable_{false};   // recover() could not read the region
+    Error error_{Error::None};
     std::vector<IndexEntry> index_;   // sorted by key_hash
     size_t live_bytes_{0};
     uint64_t revision_mark_{0};
@@ -203,8 +242,15 @@ private:
     bool read_header(size_t index, SectorHeader& out);
     bool newest_sector(uint32_t& head);
     bool open_sector(uint32_t seq, size_t first);
+    bool fail(Error e) { error_ = e; return false; }
+    bool refused();
     bool ensure_space(size_t record_bytes);
+    bool place_record(size_t total, uint32_t& start_seq, size_t& start_off);
+    void abandon_head();
     bool reclaim_tail();
+    bool reclaim_through_ram();
+    bool check_record(uint32_t seq, size_t off, RecordRef& r, uint32_t crc_seq, uint32_t& crc_at);
+    bool move_record(const RecordRef& r, uint32_t crc, uint64_t fingerprint);
     bool stream_read(uint32_t& seq, size_t& off, void* dst, size_t len);
     bool stream_write(const void* src, size_t len, size_t record_remaining);
     bool append_record(RecordType type, const std::string& key, const std::string& value, uint64_t revision,
