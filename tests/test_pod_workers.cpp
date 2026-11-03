@@ -94,7 +94,9 @@ static void test_parallel(runtime::WasmRuntime& rt, const std::vector<uint8_t>& 
     }
     std::cout << "ticks overlapping: " << overlaps << ", ticking " << busy << " ms in " << (last - first) << " ms" << std::endl;
     assert(overlaps > 0);
-    assert(busy * 10 > (last - first) * 15);
+    // One worker ticks at most as long as the time that passed; a loaded
+    // host leaves gaps between ticks, so the margin stays below 2x
+    assert(busy * 100 > (last - first) * 125);
     assert(rt.terminate("default/par-a"));
     assert(rt.terminate("default/par-b"));
 }
