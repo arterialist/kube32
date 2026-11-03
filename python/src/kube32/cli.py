@@ -165,7 +165,7 @@ def build_parser(prog="kube32"):
     d.add_argument("--namespace", default="default")
     d.add_argument("--memory", default="64Ki", help="resources memory request and limit (default 64Ki)")
     d.add_argument("--psram", help="esp32.io/psram request and limit; the Wasm sandbox is max(memory, psram)")
-    d.add_argument("--hardware", help="comma list of ipc, display, keyboard, speaker, sd, service-call, chip-temp, or 'none' (default: inferred from the module's imports)")
+    d.add_argument("--hardware", help="comma list of ipc, display, keyboard, speaker, microphone, sd, service-call, chip-temp, or 'none' (default: inferred from the module's imports)")
     d.add_argument("--sd-claim", help="volume claim for the sd hardware (default: the pod name)")
     d.add_argument("--env", action="append", metavar="K=V", help="container environment variable (repeatable)")
     d.add_argument("--image", help="use this wasm:// reference (wasm://sd/<name>, wasm://embedded/<name>:v1) instead of carrying the module inline")

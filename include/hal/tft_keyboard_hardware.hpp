@@ -21,6 +21,8 @@ constexpr int PIN_I2S_BCLK      = 41;
 constexpr int PIN_I2S_DATA      = 42;
 constexpr int PIN_I2S_LRCK      = 43;
 constexpr int PIN_SPEAKER       = 42;
+constexpr int PIN_MIC_CLK       = 43;   // SPM1423 PDM clock: shares the speaker's LRCK pin
+constexpr int PIN_MIC_DATA      = 46;
 
 constexpr int PIN_KB_A0         = 8;
 constexpr int PIN_KB_A1         = 9;
@@ -49,9 +51,20 @@ void display_draw_string_n(int x, int y, const char* str, size_t len, uint16_t c
 void display_draw_bar(int x, int y, int w, int h, uint32_t pct, uint16_t fg, uint16_t bg);
 bool display_available();
 
-// Speaker (NS4168 over I2S)
+// Speaker (NS4168 over I2S) and microphone (SPM1423, PDM). They share
+// GPIO 43 and I2S0, so one runs at a time; the speaker comes first. Every
+// sample reaches the amplifier at most at a quarter of full scale.
+// init_speaker() sets up both; the channels exist only while sound moves.
 bool init_speaker();
 void play_tone(uint32_t freq_hz, uint32_t duration_ms, uint8_t volume_pct = 20);
+// Queues `count` mono samples at `sample_rate` (8000..48000 Hz, at most one
+// second a call) at volume_pct of the ceiling: count, or -22 (bad rate),
+// -16 (busy), -5 (I2S error)
+int32_t audio_play(const int16_t* samples, uint32_t count, uint32_t sample_rate, uint32_t volume_pct);
+// Up to max_samples of 16 kHz mono PCM from the microphone, waiting up to
+// timeout_ms: the count, or -16 while the speaker still plays, -5 on an
+// I2S error. max_samples 0 stops the microphone.
+int32_t mic_read(int16_t* out, uint32_t max_samples, uint32_t timeout_ms);
 
 // GPIOs driven by the display, speaker and keyboard drivers above, for the
 // board profile's reserved pins.

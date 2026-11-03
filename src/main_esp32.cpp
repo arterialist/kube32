@@ -1151,6 +1151,12 @@ void install_hardware_hooks(bool has_display) {
             kube32::hal::play_tone(f, ms, static_cast<uint8_t>(vol));
             return 0;
         };
+        hooks.audio_play = [](const int16_t* samples, uint32_t count, uint32_t rate, uint32_t vol) -> int32_t {
+            return kube32::hal::audio_play(samples, count, rate, vol);
+        };
+        hooks.mic_read = [](int16_t* out, uint32_t max, uint32_t timeout_ms) -> int32_t {
+            return kube32::hal::mic_read(out, max, timeout_ms);
+        };
     }
     kube32::runtime::set_app_platform_hooks(hooks);
 }
@@ -1330,8 +1336,9 @@ void cluster_task(void* pv) {
             profile.uart_pins[1] = {2, 1};    // Grove TX, RX
             profile.rmt_tx_pin_mask = 1ULL << 44;
             profile.rmt_tx_default_pin = 44;  // IR LED
-            // ST7789 panel, matrix keyboard, I2S speaker
-            profile.onboard_devices = kube32::hal::KUBE32_CAP_DISPLAY | kube32::hal::KUBE32_CAP_KEYBOARD | kube32::hal::KUBE32_CAP_SPEAKER;
+            // ST7789 panel, matrix keyboard, I2S speaker, PDM microphone
+            profile.onboard_devices = kube32::hal::KUBE32_CAP_DISPLAY | kube32::hal::KUBE32_CAP_KEYBOARD | kube32::hal::KUBE32_CAP_SPEAKER |
+                                      kube32::hal::KUBE32_CAP_MICROPHONE;
         }
         kube32::hal::CapabilityFirewall::instance().set_board_profile(profile);
     }

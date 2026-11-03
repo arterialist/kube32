@@ -552,6 +552,48 @@ static const void* raw_tone(IM3Runtime rt, IM3ImportContext ictx, uint64_t* sp, 
     return m3Err_none;
 }
 
+// k32_audio_play(samples, count, sample_rate, volume_pct) -> count or K32_ERR_*
+static const void* raw_audio_play(IM3Runtime rt, IM3ImportContext ictx, uint64_t* sp, void* mem) {
+    const std::string& pod_id = pod_for(rt, ictx);
+    if (!hal::CapabilityFirewall::instance().check_permission(pod_id, hal::PeripheralType::Speaker, 0, hal::AccessMode::Write)) {
+        *reinterpret_cast<int32_t*>(sp) = hal::HAL_ERR_PERM;
+        return m3Err_none;
+    }
+    const uint32_t off = static_cast<uint32_t>(sp[1]), count = static_cast<uint32_t>(sp[2]);
+    const uint32_t rate = static_cast<uint32_t>(sp[3]), vol = static_cast<uint32_t>(sp[4]);
+    if (count > 48000 || !guest_range_ok(mem, off, count * 2)) {
+        *reinterpret_cast<int32_t*>(sp) = K32_ERR_FAULT;
+        return m3Err_none;
+    }
+    if (runtime_stop_requested(rt)) return m3Err_trapOutOfGas;   // being stopped: end here, no new sound
+    *reinterpret_cast<int32_t*>(sp) = s_hooks.audio_play
+        ? s_hooks.audio_play(reinterpret_cast<const int16_t*>(static_cast<uint8_t*>(mem) + off), count, rate, vol)
+        : hal::HAL_ERR_NODEV;
+    return m3Err_none;
+}
+
+// k32_mic_read(out, max_samples, timeout_ms) -> samples or K32_ERR_*
+static const void* raw_mic_read(IM3Runtime rt, IM3ImportContext ictx, uint64_t* sp, void* mem) {
+    const std::string& pod_id = pod_for(rt, ictx);
+    if (!hal::CapabilityFirewall::instance().check_permission(pod_id, hal::PeripheralType::Microphone, 0, hal::AccessMode::Read)) {
+        *reinterpret_cast<int32_t*>(sp) = hal::HAL_ERR_PERM;
+        return m3Err_none;
+    }
+    const uint32_t off = static_cast<uint32_t>(sp[1]);
+    uint32_t max = static_cast<uint32_t>(sp[2]);
+    const uint32_t timeout = static_cast<uint32_t>(sp[3]);
+    if (max > 16000) max = 16000;
+    if (!guest_range_ok(mem, off, max * 2)) {
+        *reinterpret_cast<int32_t*>(sp) = K32_ERR_FAULT;
+        return m3Err_none;
+    }
+    if (runtime_stop_requested(rt)) return m3Err_trapOutOfGas;
+    *reinterpret_cast<int32_t*>(sp) = s_hooks.mic_read
+        ? s_hooks.mic_read(reinterpret_cast<int16_t*>(static_cast<uint8_t*>(mem) + off), max, timeout)
+        : hal::HAL_ERR_NODEV;
+    return m3Err_none;
+}
+
 // Pod storage imports ----------------------------------------------------------
 // Permission is checked inside PodFs on every call; these only marshal guest
 // memory. Guest pointers are validated against linear memory before use.
@@ -671,6 +713,8 @@ void link_app_host_functions(IM3Module module, const std::string& pod_id) {
     m3_LinkRawFunction(module, "env", "k32_display_bar",  "i(iiiiiii)", &raw_display_bar);
     m3_LinkRawFunction(module, "env", "k32_key_read",     "i()",        &raw_key_read);
     m3_LinkRawFunction(module, "env", "k32_tone",         "i(iii)",     &raw_tone);
+    m3_LinkRawFunction(module, "env", "k32_audio_play",   "i(iiii)",    &raw_audio_play);
+    m3_LinkRawFunction(module, "env", "k32_mic_read",     "i(iii)",     &raw_mic_read);
     m3_LinkRawFunction(module, "env", "k32_fs_open",      "i(iii)",     &raw_fs_open);
     m3_LinkRawFunction(module, "env", "k32_fs_read",      "i(iii)",     &raw_fs_read);
     m3_LinkRawFunction(module, "env", "k32_fs_write",     "i(iii)",     &raw_fs_write);

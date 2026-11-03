@@ -128,6 +128,10 @@ struct AppPlatformHooks {
     std::function<int32_t(int32_t x, int32_t y, int32_t w, int32_t h, uint32_t pct, uint32_t fg, uint32_t bg)> display_bar;
     std::function<int32_t()> key_read;
     std::function<int32_t(uint32_t freq, uint32_t ms, uint32_t vol)> tone;
+    // k32_audio_play: count samples (the pod's memory, any alignment) at rate
+    std::function<int32_t(const int16_t* samples, uint32_t count, uint32_t rate, uint32_t vol)> audio_play;
+    // k32_mic_read: up to max samples into out (any alignment)
+    std::function<int32_t(int16_t* out, uint32_t max, uint32_t timeout_ms)> mic_read;
     std::function<uint32_t()> random;
     std::function<int32_t(const std::string& pod_id, std::string_view topic, const uint8_t* data, size_t len)> event_emit;
     // k32_http_call: resolves the Service and performs the call. Returns the

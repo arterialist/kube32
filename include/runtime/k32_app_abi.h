@@ -371,13 +371,37 @@ K32_IMPORT("k32_softmax_f32") int32_t k32_softmax_f32(float* x, uint32_t n);
  * The pod manifest must request the matching resource:
  *   hardware.kube32.io/tft-display: "1"  -> k32_display_*
  *   hardware.kube32.io/keyboard: "1"     -> k32_key_read
- *   hardware.kube32.io/speaker: "1"      -> k32_tone
- * Calls without the grant return K32_ERR_PERM and are logged as violations. */
+ *   hardware.kube32.io/speaker: "1"      -> k32_tone, k32_audio_play
+ *   hardware.kube32.io/microphone: "1"   -> k32_mic_read
+ * Calls without the grant return K32_ERR_PERM and are logged as violations.
+ *
+ * The speaker plays at most K32_SPEAKER_MAX_PCT percent of full scale:
+ * volume_pct 100 is that ceiling, never more. On the Cardputer the speaker
+ * and the microphone share a clock pin (GPIO 43), so one of them runs at a
+ * time and the speaker comes first: k32_mic_read waits for playback to end.
+ *
+ * k32_audio_play queues count signed 16-bit mono samples at sample_rate
+ * (8000 to 48000 Hz), at most one second of them per call, and returns the
+ * number queued once they are in the output buffer; the last 100 ms or so
+ * play after it returns. A call that follows before they have played
+ * continues the sound without a gap. The amplifier is switched off once the
+ * sound has played out.
+ *
+ * k32_mic_read starts the microphone (16 kHz, signed 16-bit mono PCM, raw
+ * from the PDM decimator) and copies up to max_samples samples (at most
+ * 16000) to out, waiting up to timeout_ms (at most 1000) for them. It
+ * returns the number copied, or K32_ERR_BUSY when the speaker still plays
+ * after timeout_ms. The microphone keeps recording between calls into a
+ * 64 ms buffer and stops one second after the last call; max_samples 0
+ * stops it at once. Pods that hold the grant share one sample stream. */
+#define K32_SPEAKER_MAX_PCT 25
 K32_IMPORT("k32_display_text") int32_t k32_display_text(int32_t x, int32_t y, const char* text, uint32_t len, uint32_t fg565, uint32_t bg565);
 K32_IMPORT("k32_display_rect") int32_t k32_display_rect(int32_t x, int32_t y, int32_t w, int32_t h, uint32_t color565);
 K32_IMPORT("k32_display_bar")  int32_t k32_display_bar(int32_t x, int32_t y, int32_t w, int32_t h, uint32_t pct, uint32_t fg565, uint32_t bg565);
 K32_IMPORT("k32_key_read")     int32_t k32_key_read(void);    /* next key code (ASCII), K32_ERR_AGAIN when empty */
 K32_IMPORT("k32_tone")         int32_t k32_tone(uint32_t freq_hz, uint32_t duration_ms, uint32_t volume_pct);
+K32_IMPORT("k32_audio_play")   int32_t k32_audio_play(const int16_t* samples, uint32_t count, uint32_t sample_rate, uint32_t volume_pct);
+K32_IMPORT("k32_mic_read")     int32_t k32_mic_read(int16_t* out, uint32_t max_samples, uint32_t timeout_ms);
 
 /* ---- Pod storage imports, gated by hardware.kube32.io/sd -------------- */
 K32_IMPORT("k32_fs_open")   int32_t k32_fs_open(const char* path, uint32_t path_len, uint32_t flags);   /* fd (0..3) or error */

@@ -7,6 +7,9 @@
 #include "driver/spi_master.h"
 #include "driver/gpio.h"
 #include "driver/i2s_std.h"
+#include "driver/i2s_pdm.h"
+#include "esp_timer.h"
+#include "esp_rom_gpio.h"
 #include "esp_lcd_panel_io.h"
 #include "esp_lcd_panel_vendor.h"
 #include "esp_lcd_panel_ops.h"
@@ -15,6 +18,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/semphr.h"
+#include <algorithm>
 #include <cstring>
 #include <cstdio>
 
@@ -247,23 +251,124 @@ void display_draw_bar(int x, int y, int w, int h, uint32_t pct, uint16_t fg, uin
 }
 
 // ---------------------------------------------------------------------------
-// Speaker
+// Audio: the NS4168 speaker (I2S) and the SPM1423 microphone (PDM)
 // ---------------------------------------------------------------------------
+// GPIO 43 is the speaker's word clock and the microphone's PDM clock, so the
+// one I2S controller with a PDM receiver (I2S0) runs either the speaker or
+// the microphone. A channel is created when it is needed and deleted when the
+// other one takes over or it goes idle: its DMA buffers take internal RAM
+// only while sound moves, and the amplifier gets no clock between sounds.
+// The speaker comes first: playback stops a recording, and a recording waits
+// for playback to end.
+//
+// Every sample the amplifier receives is scaled to at most kSpeakerMaxPct
+// percent of full scale.
+static constexpr uint32_t kSpeakerMaxPct = 25;            // K32_SPEAKER_MAX_PCT
+static constexpr uint32_t kSpeakerDmaDescs = 6;
+static constexpr uint32_t kSpeakerDmaFrames = 256;        // 1536 samples in the ring
+static constexpr uint32_t kMicDmaDescs = 4;
+static constexpr uint32_t kMicDmaFrames = 256;            // 64 ms at 16 kHz
+static constexpr uint32_t kMicRate = 16000;
+static constexpr uint64_t kMicIdleUs = 1000000;           // the microphone stops 1 s after the last read
+static constexpr uint64_t kSpeakerTailUs = 30000;         // the amplifier stops this long after the last sample
+
+enum class AudioMode : uint8_t { Off, Speaker, Mic };
+static SemaphoreHandle_t s_audio_mutex = nullptr;
+static AudioMode s_audio_mode = AudioMode::Off;
+static i2s_chan_handle_t s_rx_chan = nullptr;
+static uint32_t s_tx_rate = 0;
+static uint64_t s_play_until_us = 0;     // when the samples queued so far have played
+static uint64_t s_mic_last_read_us = 0;
+static esp_timer_handle_t s_audio_idle = nullptr;
+static int16_t s_audio_scratch[256];     // samples on their way to the speaker (under s_audio_mutex)
+
+// The pins the channels drive, held low while neither runs (GPIO 43 is
+// also the UART0 TX pad: it leaves the UART here)
+static void audio_pins_low() {
+    for (int pin : {PIN_I2S_BCLK, PIN_I2S_DATA, PIN_I2S_LRCK}) {
+        esp_rom_gpio_pad_select_gpio(static_cast<uint32_t>(pin));
+        gpio_set_direction(static_cast<gpio_num_t>(pin), GPIO_MODE_OUTPUT);
+        gpio_set_level(static_cast<gpio_num_t>(pin), 0);
+    }
+}
+
+static void audio_off_locked() {
+    if (s_tx_chan) {
+        i2s_channel_disable(s_tx_chan);
+        i2s_del_channel(s_tx_chan);
+        s_tx_chan = nullptr;
+        s_tx_rate = 0;
+    }
+    if (s_rx_chan) {
+        i2s_channel_disable(s_rx_chan);
+        i2s_del_channel(s_rx_chan);
+        s_rx_chan = nullptr;
+    }
+    if (s_audio_mode != AudioMode::Off) audio_pins_low();
+    s_audio_mode = AudioMode::Off;
+}
+
+static void arm_audio_idle(uint64_t after_us) {
+    if (!s_audio_idle) return;
+    esp_timer_stop(s_audio_idle);
+    esp_timer_start_once(s_audio_idle, after_us);
+}
+
+// Stops whichever channel has nothing left to do
+static void audio_idle_cb(void*) {
+    if (xSemaphoreTake(s_audio_mutex, 0) != pdTRUE) {
+        arm_audio_idle(20000);   // busy: a call is moving samples
+        return;
+    }
+    const uint64_t now = esp_timer_get_time();
+    if (s_audio_mode == AudioMode::Speaker) {
+        if (now >= s_play_until_us + kSpeakerTailUs) audio_off_locked();
+        else arm_audio_idle(s_play_until_us + kSpeakerTailUs - now);
+    } else if (s_audio_mode == AudioMode::Mic) {
+        if (now >= s_mic_last_read_us + kMicIdleUs) audio_off_locked();
+        else arm_audio_idle(s_mic_last_read_us + kMicIdleUs - now);
+    }
+    xSemaphoreGive(s_audio_mutex);
+}
+
 bool init_speaker() {
+    s_audio_mutex = xSemaphoreCreateMutex();
+    esp_timer_create_args_t args = {};
+    args.callback = &audio_idle_cb;
+    args.dispatch_method = ESP_TIMER_TASK;
+    args.name = "k32_audio";
+    if (!s_audio_mutex || esp_timer_create(&args, &s_audio_idle) != ESP_OK) {
+        ESP_LOGE(TAG, "audio: no mutex or timer");
+        return false;
+    }
+    audio_pins_low();
+    ESP_LOGI(TAG, "speaker on I2S0 (BCLK %d, LRCK %d, DOUT %d, at most %u%% of full scale), microphone PDM (CLK %d, DATA %d)",
+             PIN_I2S_BCLK, PIN_I2S_LRCK, PIN_I2S_DATA, (unsigned)kSpeakerMaxPct, PIN_MIC_CLK, PIN_MIC_DATA);
+    return true;
+}
+
+// The speaker's channel at `rate`, running
+static bool speaker_on_locked(uint32_t rate) {
+    if (s_audio_mode == AudioMode::Mic) audio_off_locked();
+    if (s_tx_chan && s_tx_rate == rate) return true;
+    if (s_tx_chan) {
+        // Another sample rate: the queued samples play out first
+        const uint64_t now = esp_timer_get_time();
+        if (s_play_until_us > now) vTaskDelay(pdMS_TO_TICKS((s_play_until_us - now) / 1000 + 1));
+        audio_off_locked();
+    }
     i2s_chan_config_t chan_cfg = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_0, I2S_ROLE_MASTER);
-    chan_cfg.dma_desc_num = 4;
-    chan_cfg.dma_frame_num = 128;
-    // Zero a descriptor once the DMA has sent it. Without this the ring replays
-    // its stale contents on underrun and the amplifier hums forever after the
-    // first beep.
+    chan_cfg.dma_desc_num = kSpeakerDmaDescs;
+    chan_cfg.dma_frame_num = kSpeakerDmaFrames;
+    // Zero a descriptor once the DMA has sent it. Without this the ring
+    // replays its stale contents on underrun and the amplifier hums.
     chan_cfg.auto_clear = true;
-    esp_err_t err = i2s_new_channel(&chan_cfg, &s_tx_chan, nullptr);
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "i2s_new_channel failed: %s", esp_err_to_name(err));
+    if (i2s_new_channel(&chan_cfg, &s_tx_chan, nullptr) != ESP_OK) {
+        s_tx_chan = nullptr;
         return false;
     }
     i2s_std_config_t std_cfg = {
-        .clk_cfg = I2S_STD_CLK_DEFAULT_CONFIG(16000),
+        .clk_cfg = I2S_STD_CLK_DEFAULT_CONFIG(rate),
         .slot_cfg = I2S_STD_PHILIPS_SLOT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_16BIT, I2S_SLOT_MODE_MONO),
         .gpio_cfg = {
             .mclk = I2S_GPIO_UNUSED,
@@ -274,69 +379,157 @@ bool init_speaker() {
             .invert_flags = { .mclk_inv = false, .bclk_inv = false, .ws_inv = false },
         },
     };
-    err = i2s_channel_init_std_mode(s_tx_chan, &std_cfg);
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "i2s_channel_init_std_mode failed: %s", esp_err_to_name(err));
+    if (i2s_channel_init_std_mode(s_tx_chan, &std_cfg) != ESP_OK || i2s_channel_enable(s_tx_chan) != ESP_OK) {
+        i2s_del_channel(s_tx_chan);
+        s_tx_chan = nullptr;
+        audio_pins_low();
         return false;
     }
-    // The channel stays disabled while idle: no bit clock, so the class-D
-    // amplifier is silent and draws nothing between tones.
-    ESP_LOGI(TAG, "I2S speaker ready (BCLK %d, LRCK %d, DOUT %d)", PIN_I2S_BCLK, PIN_I2S_LRCK, PIN_I2S_DATA);
+    s_tx_rate = rate;
+    s_audio_mode = AudioMode::Speaker;
+    s_play_until_us = esp_timer_get_time();
     return true;
 }
 
-static SemaphoreHandle_t s_tone_mutex = nullptr;
+// Queues the samples in s_audio_scratch[0, n), already scaled
+static bool speaker_write_locked(uint32_t n) {
+    size_t written = 0;
+    if (i2s_channel_write(s_tx_chan, s_audio_scratch, n * sizeof(int16_t), &written, pdMS_TO_TICKS(1000)) != ESP_OK) return false;
+    const uint64_t now = esp_timer_get_time();
+    const uint64_t ring_us = 1000000ull * kSpeakerDmaDescs * kSpeakerDmaFrames / s_tx_rate;
+    const uint64_t queued_us = 1000000ull * n / s_tx_rate;
+    // What is in the ring plays within its length from now
+    s_play_until_us = std::min(std::max(s_play_until_us, now) + queued_us, now + ring_us);
+    return true;
+}
+
+static int32_t audio_lock(uint32_t timeout_ms) {
+    if (!s_audio_mutex) return -19;   // K32_ERR_NODEV: no speaker on this board
+    return xSemaphoreTake(s_audio_mutex, pdMS_TO_TICKS(timeout_ms)) == pdTRUE ? 0 : -16;   // K32_ERR_BUSY
+}
+
+int32_t audio_play(const int16_t* samples, uint32_t count, uint32_t sample_rate, uint32_t volume_pct) {
+    if (sample_rate < 8000 || sample_rate > 48000) return -22;   // K32_ERR_INVAL
+    if (count > sample_rate) count = sample_rate;               // one second per call
+    if (volume_pct > 100) volume_pct = 100;
+    if (count == 0) return 0;
+    if (int32_t rc = audio_lock(2000)) return rc;
+    if (!speaker_on_locked(sample_rate)) {
+        xSemaphoreGive(s_audio_mutex);
+        return -5;   // K32_ERR_IO
+    }
+    // Q15 gain: volume_pct of the ceiling
+    const int32_t gain = static_cast<int32_t>((32768u * kSpeakerMaxPct * volume_pct) / 10000u);
+    const uint8_t* src = reinterpret_cast<const uint8_t*>(samples);
+    bool ok = true;
+    for (uint32_t done = 0; ok && done < count;) {
+        const uint32_t n = std::min<uint32_t>(count - done, sizeof(s_audio_scratch) / sizeof(s_audio_scratch[0]));
+        // The pod's buffer may sit at any address: copy it whole first
+        std::memcpy(s_audio_scratch, src + 2 * done, n * sizeof(int16_t));
+        for (uint32_t i = 0; i < n; ++i) s_audio_scratch[i] = static_cast<int16_t>((s_audio_scratch[i] * gain) >> 15);
+        ok = speaker_write_locked(n);
+        done += n;
+    }
+    arm_audio_idle(s_play_until_us - std::min(s_play_until_us, (uint64_t)esp_timer_get_time()) + kSpeakerTailUs);
+    xSemaphoreGive(s_audio_mutex);
+    return ok ? static_cast<int32_t>(count) : -5;
+}
 
 void play_tone(uint32_t freq_hz, uint32_t duration_ms, uint8_t volume_pct) {
-    if (!s_tx_chan) return;
-    if (!s_tone_mutex) s_tone_mutex = xSemaphoreCreateMutex();
-    if (xSemaphoreTake(s_tone_mutex, pdMS_TO_TICKS(200)) != pdTRUE) return;
-
-    int16_t silence[128];
-    std::memset(silence, 0, sizeof(silence));
-    size_t bytes_written = 0;
-
-    if (freq_hz == 0 || duration_ms == 0 || volume_pct == 0) {
-        xSemaphoreGive(s_tone_mutex);
-        return;
-    }
-    if (i2s_channel_enable(s_tx_chan) != ESP_OK) {
-        xSemaphoreGive(s_tone_mutex);
-        return;
-    }
+    if (freq_hz == 0 || duration_ms == 0 || volume_pct == 0) return;
     if (duration_ms > 2000) duration_ms = 2000;
     if (volume_pct > 100) volume_pct = 100;
-
-    const uint32_t sample_rate = 16000;
-    int period = static_cast<int>(sample_rate / freq_hz);
+    if (audio_lock(2000) != 0) return;
+    const uint32_t rate = 16000;
+    if (!speaker_on_locked(rate)) {
+        xSemaphoreGive(s_audio_mutex);
+        return;
+    }
+    int period = static_cast<int>(rate / freq_hz);
     if (period < 2) period = 2;
-    int total = static_cast<int>((sample_rate * duration_ms) / 1000);
-    int16_t amplitude = static_cast<int16_t>((12000L * volume_pct) / 100L);
-    if (amplitude < 300) amplitude = 300;
-
-    int16_t buf[128];
-    int phase = 0;
-    int remaining = total;
+    const int total = static_cast<int>((rate * duration_ms) / 1000);
+    const int amplitude = static_cast<int>((32767u * kSpeakerMaxPct * volume_pct) / 10000u);
     int ramp = total / 8 > 64 ? 64 : total / 8;
     if (ramp < 1) ramp = 1;
-    int produced = 0;
-    while (remaining > 0) {
-        int chunk = remaining > 128 ? 128 : remaining;
-        for (int i = 0; i < chunk; ++i) {
+    int phase = 0, produced = 0;
+    while (produced < total) {
+        const int n = std::min<int>(total - produced, sizeof(s_audio_scratch) / sizeof(s_audio_scratch[0]));
+        for (int i = 0; i < n; ++i, ++produced) {
             int a = amplitude;
             if (produced < ramp) a = amplitude * produced / ramp;
             else if (total - produced < ramp) a = amplitude * (total - produced) / ramp;
-            buf[i] = static_cast<int16_t>((phase < period / 2) ? a : -a);
+            s_audio_scratch[i] = static_cast<int16_t>((phase < period / 2) ? a : -a);
             phase = (phase + 1) % period;
-            produced++;
         }
-        i2s_channel_write(s_tx_chan, buf, chunk * sizeof(int16_t), &bytes_written, pdMS_TO_TICKS(100));
-        remaining -= chunk;
+        if (!speaker_write_locked(static_cast<uint32_t>(n))) break;
     }
-    // Flush the ring with silence, then stop the clock.
-    for (int k = 0; k < 4; ++k) i2s_channel_write(s_tx_chan, silence, sizeof(silence), &bytes_written, pdMS_TO_TICKS(50));
-    i2s_channel_disable(s_tx_chan);
-    xSemaphoreGive(s_tone_mutex);
+    arm_audio_idle(s_play_until_us - std::min(s_play_until_us, (uint64_t)esp_timer_get_time()) + kSpeakerTailUs);
+    xSemaphoreGive(s_audio_mutex);
+}
+
+static bool mic_on_locked() {
+    i2s_chan_config_t chan_cfg = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_0, I2S_ROLE_MASTER);
+    chan_cfg.dma_desc_num = kMicDmaDescs;
+    chan_cfg.dma_frame_num = kMicDmaFrames;
+    if (i2s_new_channel(&chan_cfg, nullptr, &s_rx_chan) != ESP_OK) {
+        s_rx_chan = nullptr;
+        return false;
+    }
+    i2s_pdm_rx_config_t pdm = {
+        .clk_cfg = I2S_PDM_RX_CLK_DEFAULT_CONFIG(kMicRate),
+        .slot_cfg = I2S_PDM_RX_SLOT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_16BIT, I2S_SLOT_MODE_MONO),
+        .gpio_cfg = {},
+    };
+    pdm.gpio_cfg.clk = static_cast<gpio_num_t>(PIN_MIC_CLK);
+    pdm.gpio_cfg.din = static_cast<gpio_num_t>(PIN_MIC_DATA);
+    pdm.gpio_cfg.invert_flags.clk_inv = false;
+    if (i2s_channel_init_pdm_rx_mode(s_rx_chan, &pdm) != ESP_OK || i2s_channel_enable(s_rx_chan) != ESP_OK) {
+        i2s_del_channel(s_rx_chan);
+        s_rx_chan = nullptr;
+        audio_pins_low();
+        return false;
+    }
+    s_audio_mode = AudioMode::Mic;
+    return true;
+}
+
+int32_t mic_read(int16_t* out, uint32_t max_samples, uint32_t timeout_ms) {
+    if (max_samples > kMicRate) max_samples = kMicRate;
+    if (timeout_ms > 1000) timeout_ms = 1000;
+    const uint64_t deadline = esp_timer_get_time() + 1000ull * timeout_ms;
+    if (int32_t rc = audio_lock(timeout_ms)) return rc;
+    if (max_samples == 0) {
+        if (s_audio_mode == AudioMode::Mic) audio_off_locked();
+        xSemaphoreGive(s_audio_mutex);
+        return 0;
+    }
+    // Playback keeps the pins until its samples have played
+    while (s_audio_mode == AudioMode::Speaker && esp_timer_get_time() < s_play_until_us) {
+        if (esp_timer_get_time() >= deadline) {
+            xSemaphoreGive(s_audio_mutex);
+            return -16;   // K32_ERR_BUSY
+        }
+        xSemaphoreGive(s_audio_mutex);
+        vTaskDelay(pdMS_TO_TICKS(10));
+        if (xSemaphoreTake(s_audio_mutex, pdMS_TO_TICKS(timeout_ms)) != pdTRUE) return -16;
+    }
+    if (s_audio_mode != AudioMode::Mic) {
+        audio_off_locked();
+        if (!mic_on_locked()) {
+            xSemaphoreGive(s_audio_mutex);
+            return -5;   // K32_ERR_IO
+        }
+    }
+    const uint64_t now = esp_timer_get_time();
+    const uint32_t wait_ms = deadline > now ? static_cast<uint32_t>((deadline - now) / 1000) : 0;
+    size_t got = 0;
+    // i2s_channel_read copies out of its DMA buffers: any destination address works
+    esp_err_t err = i2s_channel_read(s_rx_chan, out, max_samples * sizeof(int16_t), &got, pdMS_TO_TICKS(wait_ms));
+    s_mic_last_read_us = esp_timer_get_time();
+    arm_audio_idle(kMicIdleUs);
+    xSemaphoreGive(s_audio_mutex);
+    if (err != ESP_OK && err != ESP_ERR_TIMEOUT) return -5;
+    return static_cast<int32_t>(got / sizeof(int16_t));
 }
 
 // ---------------------------------------------------------------------------
@@ -461,7 +654,7 @@ static void keyboard_task(void* pvParameters) {
 uint64_t peripheral_gpio_mask() {
     uint64_t mask = 0;
     for (int pin : {PIN_LCD_MOSI, PIN_LCD_SCLK, PIN_LCD_CS, PIN_LCD_DC, PIN_LCD_RST, PIN_LCD_BACKLIGHT,
-                    PIN_I2S_BCLK, PIN_I2S_DATA, PIN_I2S_LRCK, PIN_SPEAKER, PIN_KB_A0, PIN_KB_A1, PIN_KB_A2}) {
+                    PIN_I2S_BCLK, PIN_I2S_DATA, PIN_I2S_LRCK, PIN_SPEAKER, PIN_MIC_CLK, PIN_MIC_DATA, PIN_KB_A0, PIN_KB_A1, PIN_KB_A2}) {
         mask |= 1ULL << pin;
     }
     for (gpio_num_t row : KB_ROWS) mask |= 1ULL << static_cast<int>(row);

@@ -54,6 +54,7 @@ struct NodeTelemetry {
     bool has_display{false};
     bool has_keyboard{false};
     bool has_speaker{false};
+    bool has_microphone{false};
     bool has_chip_temp{false};
     // Ready condition, from the kubelet's own health (Kubelet::fill_ready_condition).
     // Fixed storage: telemetry is collected every heartbeat.
