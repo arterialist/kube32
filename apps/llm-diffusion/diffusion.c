@@ -74,7 +74,7 @@ static uint16_t g_hash[HASH_SIZE];
 /* ---- activations --------------------------------------------------------- */
 static float g_x[P * MAX_DIM], g_q[P * MAX_DIM];
 static float g_work[WORK_FLOATS];
-static float g_att[P], g_xs[P], g_xsh[FFN_CHUNK], g_xsc[CLS_CHUNK], g_ks[P * 8], g_vs[P * 8];
+static float g_xs[P], g_xsh[FFN_CHUNK], g_xsc[CLS_CHUNK], g_ks[P * 8], g_vs[P * 8];
 static int8_t g_xq[P * MAX_DIM], g_xqh[FFN_CHUNK * MAX_HID], g_kq[P * MAX_DIM], g_vq[P * MAX_DIM];
 static uint32_t g_cand[P];
 static float g_conf[P];
@@ -85,14 +85,14 @@ enum { IDLE, RUNNING, DONE };
 static uint32_t g_state, g_run, g_steps, g_step, g_phase, g_n_reveal, g_seed, g_masked0, g_prompt_len;
 static float g_temp;
 static uint32_t g_win[P];
-static int64_t g_t_start;
-static uint64_t g_wall_us, g_compute_us, g_rev_total;
+/* microsecond counters of a generation, 32 bits: a generation of 64 steps stays under 2^32 */
+static uint32_t g_t_start, g_wall_us, g_compute_us, g_rev_total;
 static uint32_t g_log_n;
 static uint16_t g_log_tok[MAX_STEPS][P];
 static uint32_t g_log_us[MAX_STEPS], g_log_mm_us[MAX_STEPS];
 static uint8_t g_log_rev[MAX_STEPS];
 static uint32_t g_step_us_acc;
-static uint64_t g_mm_base;
+static uint32_t g_mm_base;
 
 static unsigned char g_req[1024];
 K32_EXPORT("k32_alloc") uint32_t k32_alloc(uint32_t size) {
@@ -319,11 +319,11 @@ static NOINLINE float uniform(void) {
 /* where the time goes: the section the pod is in, and the microseconds each took */
 enum { S_OTHER, S_MM, S_PRE, S_ATT, S_ADD, S_FFN, S_CLS, S_EMB, S_COUNT };
 static uint32_t g_cur;
-static int64_t g_lap;
-static uint64_t g_part[S_COUNT];
+static uint32_t g_lap;
+static uint32_t g_part[S_COUNT];
 static NOINLINE void sec(uint32_t i) {
-    const int64_t t = esp32_get_time_us();
-    g_part[g_cur] += (uint64_t)(t - g_lap);
+    const uint32_t t = (uint32_t)esp32_get_time_us();
+    g_part[g_cur] += t - g_lap;
     g_lap = t;
     g_cur = i;
 }
@@ -382,8 +382,9 @@ static NOINLINE void layer(uint32_t l, uint32_t part) {
         k32_quantize_i8(g_vq, g_vs, g_work, hs, P * KVH);
     } else if (part == 1) {
         sec(S_ATT);
-        /* every position over the whole window, all heads in one call */
-        k32_attention_full_f32_i8(g_work, g_kq, g_ks, g_vq, g_vs, g_q, scale, H, KVH, hs, kvd, P, P, g_att);
+        /* every position over the whole window, all heads in one call; the scores of a KV head's
+         * positions (P x P floats) follow the output in the work buffer */
+        k32_attention_full_f32_i8(g_work, g_kq, g_ks, g_vq, g_vs, g_q, scale, H, KVH, hs, kvd, P, P, g_work + P * dim);
         k32_quantize_i8(g_xq, g_xs, g_work, dim, P);
     } else if (part == 2) {
         sec(S_ATT);
@@ -485,7 +486,7 @@ K32_EXPORT("k32_tick") int32_t k32_tick(uint32_t uptime_ms) {
     (void)uptime_ms;
     if (g_state != RUNNING) return 0;
     const int64_t t0 = esp32_get_time_us();
-    g_lap = t0;
+    g_lap = (uint32_t)t0;
     g_cur = S_OTHER;
     if (g_phase == 0) {
         g_mm_base = g_part[S_MM];
@@ -518,7 +519,7 @@ K32_EXPORT("k32_tick") int32_t k32_tick(uint32_t uptime_ms) {
     g_step_us_acc += (uint32_t)(esp32_get_time_us() - t0);
     return 1;
 finished:
-    g_wall_us = (uint64_t)(esp32_get_time_us() - g_t_start);
+    g_wall_us = (uint32_t)esp32_get_time_us() - g_t_start;
     g_state = DONE;
     return 0;
 }
@@ -598,7 +599,7 @@ static NOINLINE void generate(const char* q, uint32_t qlen) {
     g_compute_us = g_rev_total = g_wall_us = 0;
     for (uint32_t i = 0; i < S_COUNT; i++) g_part[i] = 0;
     g_run++;
-    g_t_start = esp32_get_time_us();
+    g_t_start = (uint32_t)esp32_get_time_us();
     g_state = RUNNING;
     reply_begin(200);
     put("{\"run\":"); put_u(g_run); put(",\"state\":\"running\",\"steps\":"); put_u(steps);

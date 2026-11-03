@@ -83,7 +83,7 @@ constexpr uint64_t attention_units(uint64_t heads, uint64_t hs, uint64_t pos0, u
 
 // The same with every one of the n positions attending to key rows 0 ..
 // rows - 1 (a window every position sees whole): the bits of the three
-// calls per head over rows rows. att holds rows floats.
+// calls per head over rows rows. att holds n x (heads / kvh) x rows floats.
 void attention_full_f32_i8(uint8_t* out, const int8_t* kq, const uint8_t* ks, const int8_t* vq, const uint8_t* vs, const uint8_t* q,
                            float scale, uint32_t heads, uint32_t kvh, uint32_t hs, size_t kv_stride, uint32_t rows, uint32_t n, uint8_t* att);
 constexpr uint64_t attention_full_units(uint64_t heads, uint64_t hs, uint64_t rows, uint64_t n) {

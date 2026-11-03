@@ -14,9 +14,11 @@
 #include "m3_env.h"
 
 #include <cstdint>
+#include <cstdlib>
 
 #if defined(ESP_PLATFORM)
 #include "sdkconfig.h"
+#include "esp_heap_caps.h"
 #endif
 #if defined(CONFIG_IDF_TARGET_ESP32S3)
 #define K32_PIE 1
@@ -25,6 +27,26 @@
 #endif
 
 namespace kube32::runtime {
+
+// Scratch for a call's operands in internal RAM (the stack of the interpreter
+// lies in PSRAM on a board with PSRAM, behind the cache): 16-byte aligned,
+// null when none is free, and a kernel then works from the stack or the
+// operands in place
+static void* scratch_alloc(size_t bytes) {
+#if defined(ESP_PLATFORM)
+    return heap_caps_aligned_alloc(16, bytes, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+#else
+    void* p = nullptr;
+    return posix_memalign(&p, 16, bytes) == 0 ? p : nullptr;
+#endif
+}
+static void scratch_free(void* p) {
+#if defined(ESP_PLATFORM)
+    heap_caps_free(p);
+#else
+    std::free(p);
+#endif
+}
 
 // Float operands are 4-byte aligned in practice: one load or store then,
 // bytes otherwise (Xtensa faults on an unaligned 32-bit access). ESP-IDF
@@ -236,7 +258,9 @@ static void matmul(uint8_t* out, const int8_t* w, size_t row_stride, const uint8
                                    x_scale + 4 * p, rows, cols, 1);
         return;
     }
-    alignas(16) int8_t xb[kXBlock];
+    alignas(16) int8_t xb_stack[kXBlock];
+    int8_t* scratch = static_cast<int8_t*>(scratch_alloc(kXBlock));
+    int8_t* xb = scratch ? scratch : xb_stack;
     uint32_t per = static_cast<uint32_t>(kXBlock / xs);
     if (per > kVecMax) per = kVecMax;
     for (uint32_t p0 = 0; p0 < n; p0 += per) {
@@ -244,6 +268,7 @@ static void matmul(uint8_t* out, const int8_t* w, size_t row_stride, const uint8
         for (uint32_t v = 0; v < nv; v++) __builtin_memcpy(xb + v * xs, x + static_cast<size_t>(p0 + v) * cols, cols);
         matmul_core<I4, true>(out + 4 * static_cast<size_t>(p0) * rows, w, row_stride, w_scale, xb, xs, x_scale + 4 * p0, rows, cols, nv);
     }
+    if (scratch) scratch_free(scratch);
 }
 
 // n int8 vectors already on the stack, xs bytes apart at 16-byte aligned addresses
@@ -477,18 +502,80 @@ void attention_f32_i8(uint8_t* out, const int8_t* kq, const uint8_t* ks, const i
     }
 }
 
-// KV head by KV head, so that its rows stay in the cache over the positions
+// KV head by KV head. With scratch in internal RAM, the head's key and value
+// rows are converted to floats kAttRows rows at a time, once for every
+// position: the scores of all positions over a row block, then every
+// position's softmax, then the weighted values row block by row block with
+// out as the running sum, each float step the one of the three calls.
+// att holds n x (heads / kvh) x rows floats: a position's scores for every
+// head of the KV head.
+constexpr uint32_t kAttRows = 16, kAttScratch = 16384;
 void attention_full_f32_i8(uint8_t* out, const int8_t* kq, const uint8_t* ks, const int8_t* vq, const uint8_t* vs, const uint8_t* q,
                            float scale, uint32_t heads, uint32_t kvh, uint32_t hs, size_t kv_stride, uint32_t rows, uint32_t n, uint8_t* att) {
     const uint32_t per_kv = heads / kvh, dim = heads * hs;
-    for (uint32_t kh = 0; kh < kvh; kh++)
-        for (uint32_t i = 0; i < n; i++)
-            for (uint32_t h = kh * per_kv; h < (kh + 1) * per_kv; h++) {
-                const uint8_t* qh = q + 4 * (static_cast<size_t>(i) * dim + h * hs);
-                matvec_f32_i8(att, kq + kh * hs, kv_stride, ks + 4 * kh, 4 * kvh, qh, scale, rows, hs);
-                softmax_f32(att, rows);
-                vecmat_f32_i8(out + 4 * (static_cast<size_t>(i) * dim + h * hs), vq + kh * hs, kv_stride, vs + 4 * kh, 4 * kvh, att, rows, hs);
+    const size_t block_floats = static_cast<size_t>(kAttRows) * hs;
+    const size_t scratch_bytes = 4 * (2 * block_floats + rows);
+    float* f = scratch_bytes <= kAttScratch ? static_cast<float*>(scratch_alloc(scratch_bytes)) : nullptr;
+    if (!f) {
+        for (uint32_t kh = 0; kh < kvh; kh++)
+            for (uint32_t i = 0; i < n; i++)
+                for (uint32_t h = kh * per_kv; h < (kh + 1) * per_kv; h++) {
+                    const uint8_t* qh = q + 4 * (static_cast<size_t>(i) * dim + h * hs);
+                    matvec_f32_i8(att, kq + kh * hs, kv_stride, ks + 4 * kh, 4 * kvh, qh, scale, rows, hs);
+                    softmax_f32(att, rows);
+                    vecmat_f32_i8(out + 4 * (static_cast<size_t>(i) * dim + h * hs), vq + kh * hs, kv_stride, vs + 4 * kh, 4 * kvh, att, rows, hs);
+                }
+        return;
+    }
+    float* kf = f;
+    float* vf = f + block_floats;
+    float* sm = vf + block_floats;
+    for (uint32_t kh = 0; kh < kvh; kh++) {
+        for (uint32_t r0 = 0; r0 < rows; r0 += kAttRows) {
+            const uint32_t nr = rows - r0 < kAttRows ? rows - r0 : kAttRows;
+            for (uint32_t r = 0; r < nr; r++) {
+                const int8_t* row = kq + static_cast<size_t>(r0 + r) * kv_stride + kh * hs;
+                for (uint32_t c = 0; c < hs; c++) kf[r * hs + c] = static_cast<float>(row[c]);
             }
+            for (uint32_t i = 0; i < n; i++)
+                for (uint32_t g = 0; g < per_kv; g++) {
+                    const uint8_t* qh = q + 4 * (static_cast<size_t>(i) * dim + (kh * per_kv + g) * hs);
+                    uint8_t* ap = att + 4 * ((static_cast<size_t>(i) * per_kv + g) * rows + r0);
+                    for (uint32_t r = 0; r < nr; r++) {
+                        const float* kr = kf + r * hs;
+                        float d = 0.0f;
+                        for (uint32_t c = 0; c < hs; c++) d = d + load_f32(qh + 4 * c) * kr[c];
+                        store_f32(ap + 4 * r, d * load_f32(ks + 4 * (static_cast<size_t>(r0 + r) * kvh + kh)) * scale);
+                    }
+                }
+        }
+        for (uint32_t i = 0; i < n; i++)
+            for (uint32_t g = 0; g < per_kv; g++) {
+                uint8_t* ap = att + 4 * ((static_cast<size_t>(i) * per_kv + g) * rows);
+                __builtin_memcpy(sm, ap, 4 * rows);
+                softmax_f32(reinterpret_cast<uint8_t*>(sm), rows);
+                __builtin_memcpy(ap, sm, 4 * rows);
+            }
+        for (uint32_t r0 = 0; r0 < rows; r0 += kAttRows) {
+            const uint32_t nr = rows - r0 < kAttRows ? rows - r0 : kAttRows;
+            for (uint32_t r = 0; r < nr; r++) {
+                const int8_t* row = vq + static_cast<size_t>(r0 + r) * kv_stride + kh * hs;
+                for (uint32_t c = 0; c < hs; c++) vf[r * hs + c] = static_cast<float>(row[c]);
+            }
+            for (uint32_t i = 0; i < n; i++)
+                for (uint32_t g = 0; g < per_kv; g++) {
+                    const uint8_t* ap = att + 4 * ((static_cast<size_t>(i) * per_kv + g) * rows + r0);
+                    uint8_t* op = out + 4 * (static_cast<size_t>(i) * dim + (kh * per_kv + g) * hs);
+                    if (r0 == 0) for (uint32_t c = 0; c < hs; c++) store_f32(op + 4 * c, 0.0f);
+                    for (uint32_t r = 0; r < nr; r++) {
+                        const float a = load_f32(ap + 4 * r) * load_f32(vs + 4 * (static_cast<size_t>(r0 + r) * kvh + kh));
+                        const float* vr = vf + r * hs;
+                        for (uint32_t c = 0; c < hs; c++) store_f32(op + 4 * c, load_f32(op + 4 * c) + a * vr[c]);
+                    }
+                }
+        }
+    }
+    scratch_free(f);
 }
 
 void softmax_f32(uint8_t* x, uint32_t n) {
@@ -1064,7 +1151,7 @@ static const void* raw_attention(IM3Runtime rt, IM3ImportContext ctx, uint64_t* 
     if (!fits(size, vq, static_cast<uint32_t>(rows), kv_stride, kvd)) return im.trap_vq;
     if (!inside(size, vs, 4 * rows * kvh)) return im.trap_vs;
     if (!inside(size, q, 4 * dim * n)) return im.trap_q;
-    if (!inside(size, att, 4 * rows)) return im.trap_att;
+    if (!inside(size, att, 4 * rows * (im.full ? static_cast<uint64_t>(n) * (heads / kvh) : 1))) return im.trap_att;
     if (M3Result r = charge(rt, im.full ? attention_full_units(heads, hs, pos0, n) : attention_units(heads, hs, pos0, n))) return r;
     (im.full ? attention_full_f32_i8 : attention_f32_i8)(base + out, reinterpret_cast<const int8_t*>(base + kq), base + ks,
                                                          reinterpret_cast<const int8_t*>(base + vq), base + vs, base + q, scale, heads, kvh,

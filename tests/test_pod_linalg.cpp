@@ -1183,7 +1183,7 @@ static void test_attention_full() {
     using namespace kube32;
     constexpr uint32_t heads = 4, kvh = 2, hs = 8, rows = 12, n = 5, dim = heads * hs, kvd = kvh * hs, stride = kvd + 6;
     std::vector<int8_t> kq(rows * stride), vq(rows * stride);
-    std::vector<float> ks(rows * kvh), vs(rows * kvh), q(n * dim), want(n * dim), got(n * dim), att(rows);
+    std::vector<float> ks(rows * kvh), vs(rows * kvh), q(n * dim), want(n * dim), got(n * dim), att(rows), scratch(n * (heads / kvh) * rows);
     for (auto& v : kq) v = static_cast<int8_t>(rnd() >> 24);
     for (auto& v : vq) v = static_cast<int8_t>(rnd() >> 24);
     for (auto& f : ks) f = rnd_f32() * 0.01f;
@@ -1197,7 +1197,7 @@ static void test_attention_full() {
             softmax_f32(bytes_of(att), rows);
             vecmat_f32_i8(bytes_of(want) + 4 * (i * dim + h * hs), vq.data() + kh * hs, stride, bytes_of(vs) + 4 * kh, 4 * kvh, bytes_of(att), rows, hs);
         }
-    attention_full_f32_i8(bytes_of(got), kq.data(), bytes_of(ks), vq.data(), bytes_of(vs), bytes_of(q), scale, heads, kvh, hs, stride, rows, n, bytes_of(att));
+    attention_full_f32_i8(bytes_of(got), kq.data(), bytes_of(ks), vq.data(), bytes_of(vs), bytes_of(q), scale, heads, kvh, hs, stride, rows, n, bytes_of(scratch));
     assert(std::memcmp(got.data(), want.data(), 4 * want.size()) == 0);
 
     enum { ATTNF = 17 };
@@ -1224,7 +1224,7 @@ static void test_attention_full() {
         assert(r && std::string(r) == "[trap] out of bounds memory access: " + std::string(operand) + " of k32_attention_full_f32_i8");
     };
     trap(call(kO, end - (rows - 1) * stride - kvd + 1, kKs, kVq, kVs, kQ, heads, kvh, hs, stride, rows, n, kAtt), "kq");
-    trap(call(kO, kKq, kKs, kVq, kVs, kQ, heads, kvh, hs, stride, rows, n, end - 4 * rows + 1), "att");
+    trap(call(kO, kKq, kKs, kVq, kVs, kQ, heads, kvh, hs, stride, rows, n, end - 4 * rows * n * (heads / kvh) + 1), "att");
     std::printf("[PASS] test_attention_full\n");
 }
 

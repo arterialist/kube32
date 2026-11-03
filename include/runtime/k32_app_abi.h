@@ -416,7 +416,7 @@ K32_IMPORT("k32_http_status") int32_t k32_http_status(void);
  * k32_attention_full_f32_i8: the same with every one of the n positions
  * attending to key rows 0 .. rows - 1, for a model whose positions see the
  * whole window: the bits of the three calls per head over rows rows. att
- * is scratch of rows floats.
+ * is scratch of n x (heads / kvh) x rows floats.
  *
  * k32_add_f32_i8: x = x + (float)q * scale over n floats, a residual from
  * an int8 map.
