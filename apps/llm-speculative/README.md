@@ -15,30 +15,35 @@ Both blobs and the tokenizer (`tok512`, 6,227 B) fit the 3,342,336 B of a board'
 ## How it works
 
 - **Weights in place.** The pod opens its blobs (`kube32.io/blobs`) and passes `K32_BLOB_ADDR` addresses of the weight rows, their scales, the norm vectors and the rotary table to the [linear algebra](../../docs/app-development.md#linear-algebra) imports. It reads one embedding row per position with `k32_blob_read`.
-- **Native steps.** The norms, the int8 quantization of activations and of the keys and values, the rotary embedding, the SwiGLU gate, the residual additions and the pick of the next token are element-wise imports, each one call for all positions of a pass. The interpreter runs the control flow, the embedding lookup and the attention loop over the heads.
+- **Native steps.** The norms, the int8 quantization of activations and of the keys and values, the rotary embedding, the SwiGLU gate, the residual additions and the pick of the next token are element-wise imports, each one call for all positions of a pass. `k32_attention_f32_i8` computes the attention of every head and position of a pass in one call per layer. The interpreter runs the control flow and the embedding lookup.
 - **A pass.** stories260K catches up on the text and drafts k tokens, one position at a time. The target then computes the newest token and the k drafts as k + 1 positions at once: `k32_matmul_i4` (`k32_matmul_i8` for the classifier) reads each weight row once and applies it to every position. The positions write their keys and values into the cache before any of them attends, and each attends up to itself. The pass keeps the drafts up to the first one the target disagrees with, plus the target's own token after them.
 - **Same tokens.** Each position is computed operation for operation as `llm-shard` computes it ([llm-pipeline](../llm-pipeline/README.md)), so the text is the target's greedy text, token for token, at every k. `tools/spec.py` gives the tokens and every pass's drafts and accepted count.
 - **Ticks.** `k32_tick` runs the prompt (8 positions a tick) and then one pass a tick, so the node serves requests between passes. The pod is unmetered (`kube32.io/execution-budget: "off"`): a pass over 8 positions costs more than a call's default budget.
 
 ## Speed
 
-Measured on the control plane, an ESP32-S3 devkit at 240 MHz with its flash in DIO mode at 80 MHz: 2 prompts ("Lily and Tom went to the park", "Once upon a time, there was a little girl named"), 64 tokens each, int4 target, int8 draft. Every run gives the reference's tokens, and every pass the reference's accepted count. The tokens/s count the pod's own calls; the node ran other pods between them, and the tokens/s by the wall clock are in parentheses.
+Measured on the control plane, an ESP32-S3 devkit at 240 MHz with its flash in [quad I/O mode](../../docs/flashing-troubleshooting.md#quad-io-flash) at 80 MHz: 4 prompts ("Lily and Tom went to the park", "Once upon a time, there was a little girl named", "One day, a little boy named Tim went to the", "The sun was shining and the birds were singing"), 64 tokens each, int4 target, int8 draft. Every run gives the reference's tokens, and every pass the reference's accepted count. The tokens/s count the pod's own calls; the node ran other pods between them, and the tokens/s by the wall clock are in parentheses.
 
 | Run | tokens/s | acceptance | tokens a pass | verify pass | draft a token | target weights read a token |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| target alone | 3.56 (3.09) | | 1.00 | 281 ms | | 1.90 MB |
-| speculative, k = 2 | 4.00 (3.67) | 0.599 | 2.17 | 398 ms | 74 ms | 0.88 MB |
-| speculative, k = 4 | 3.60 (3.29) | 0.442 | 2.72 | 510 ms | 63 ms | 0.70 MB |
-| speculative, k = 6 | 2.96 (2.77) | 0.333 | 2.91 | 610 ms | 65 ms | 0.65 MB |
-| stories260K alone | 15.0 (10.9) | | | | 67 ms | |
+| target alone | 4.98 (4.12) | | 1.00 | 201 ms | | 1.90 MB |
+| speculative, k = 2 | 5.31 (4.76) | 0.614 | 2.21 | 297 ms | 60 ms | 0.86 MB |
+| speculative, k = 4 | 4.72 (4.39) | 0.478 | 2.84 | 393 ms | 54 ms | 0.67 MB |
+| speculative, k = 6 | 4.16 (3.49) | 0.387 | 3.20 | 463 ms | 54 ms | 0.59 MB |
+| stories260K alone | 20.8 (7.7) | | | | 48 ms | |
 
-With two drafts a pass the pod is 12% faster than the target alone; at k = 4 the two are even, and at k = 6 the drafts that the target rejects cost more than the reads they save. A verify pass costs about 225 ms plus 55 ms a position:
+With two drafts a pass the pod is 7% faster than the target alone; at k = 4 and k = 6 the drafts that the target rejects cost more than the reads they save. A verify pass costs about 160 ms plus 44 ms a position:
 
-- The fixed part is mostly the read of the target's 1.9 MB of int4 weights, which stream from flash at about 12 MB/s.
-- A position adds its multiply-adds, which run on the core's vector instructions, its attention over the cache, and the element-wise steps, which run natively over all positions of the pass in one call each.
-- A drafted token takes 63 to 74 ms, about 22 ms of it the read of stories260K's 0.27 MB.
+| Per position of a verify pass | target alone | k = 2 | k = 6 |
+| --- | ---: | ---: | ---: |
+| Matrix products (`k32_matmul_i4`, `k32_matmul_i8`), weights from flash | 156 ms | 70 ms | 41 ms |
+| Attention (`k32_attention_f32_i8`) | 17 ms | 15 ms | 15 ms |
+| Element-wise steps and the interpreter | 28 ms | 16 ms | 13 ms |
 
-Acceptance decides the best k: the second prompt accepts 71% of two drafts and runs 4.24 tokens/s at k = 2 and 4.32 at k = 4, against 3.45 for the target alone.
+- The products of a single position are mostly the read of the target's 1.9 MB of int4 weights, which stream from flash at about 20 MB/s; more positions a pass share that read.
+- A drafted token takes 48 to 60 ms: 27 to 34 ms of matrix products, including the read of stories260K's 0.27 MB, 9 to 13 ms of attention, and the element-wise steps.
+
+Acceptance decides the best k: the second prompt accepts 71% of two drafts and runs 5.81 tokens/s at k = 2 and 5.61 at k = 4, against 4.58 for the target alone, and the third runs 5.42 at k = 4 against 5.08.
 
 ## Build
 
