@@ -1380,6 +1380,7 @@ void cluster_task(void* pv) {
         static std::unique_ptr<kube32::storage::FlashBlobStore> flash_blobs;
         static kube32::storage::CardBlobStore card_blobs;
         bool app_slot = false;
+        const size_t ram0 = heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
         if (auto region = kube32::storage::create_board_blob_region(app_slot)) {
             flash_blobs = std::make_unique<kube32::storage::FlashBlobStore>(std::move(region), app_slot);
             if (app_slot) {
@@ -1400,8 +1401,11 @@ void cluster_task(void* pv) {
                 });
                 kube32::hal::set_passive_slot_tenant([](std::string& why) { return flash_blobs->yield_to_firmware(why); });
             }
-            printf("[BLOBS] flash region %s: %llu bytes, %u blob(s)\n", flash_blobs->location().c_str(),
-                   (unsigned long long)flash_blobs->capacity_bytes(), (unsigned)flash_blobs->list().size());
+            printf("[BLOBS] flash region %s: %llu bytes, %u blob(s), %d bytes of internal RAM\n", flash_blobs->location().c_str(),
+                   (unsigned long long)flash_blobs->capacity_bytes(), (unsigned)flash_blobs->list().size(),
+                   (int)((long)ram0 - (long)heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT)));
+        } else {
+            printf("[BLOBS] no flash region: no \"blobs\" partition and no second app slot that maps\n");
         }
         kube32::storage::set_node_blob_stores(flash_blobs.get(), ident.has_display ? &card_blobs : nullptr);
     }
