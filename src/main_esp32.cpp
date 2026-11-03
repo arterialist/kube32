@@ -29,6 +29,7 @@
 #include "api/firmware_api.hpp"
 #include "hal/firmware_slots.hpp"
 #include "storage/blob_store.hpp"
+#include "mem/function_ref.hpp"
 #include "hal/capability_firewall.hpp"
 #include "hal/i2c_discovery.hpp"
 #include "models/device.hpp"
@@ -410,6 +411,156 @@ static void console_list_sd(Console& con, const std::string& path, int depth, in
 struct HeapBuckets { uint32_t count[2][7]; uint32_t bytes[2][7]; };
 static HeapBuckets s_heap_buckets;
 static const size_t k_heap_bucket_max[] = {32, 128, 512, 1024, 1700, 4096, SIZE_MAX};
+
+// Runs a console command on a task of its own, for commands that go deeper
+// than the console task's stack (file systems, drivers): the stack exists only
+// while the command runs
+static void console_run_deep(Console& con, kube32::mem::FunctionRef<void()> fn, uint32_t stack_bytes = 6144) {
+    struct Job {
+        kube32::mem::FunctionRef<void()>* fn;
+        SemaphoreHandle_t done;
+    } job{&fn, xSemaphoreCreateBinary()};
+    auto entry = [](void* arg) {
+        Job* j = static_cast<Job*>(arg);
+        (*j->fn)();
+        xSemaphoreGive(j->done);
+        vTaskDelete(nullptr);
+    };
+    if (!job.done || xTaskCreatePinnedToCore(entry, "k32_con_job", stack_bytes, &job, 10, nullptr, 0) != pdPASS) {
+        if (job.done) vSemaphoreDelete(job.done);
+        con.write("K32_ERR no memory for the command's stack\n", 41);
+        return;
+    }
+    xSemaphoreTake(job.done, portMAX_DELAY);
+    vSemaphoreDelete(job.done);
+}
+
+// The node's blob stores and what each holds
+static void console_blobs(Console& con) {
+    for (kube32::storage::BlobStore* store : {static_cast<kube32::storage::BlobStore*>(kube32::storage::node_flash_blobs()),
+                                              kube32::storage::node_card_blobs()}) {
+        if (!store) continue;
+        std::string why;
+        const bool up = store->available(&why);
+        char l[200];
+        int ll = snprintf(l, sizeof(l), "K32_BLOBS medium=%s location=\"%s\" available=%d capacity=%llu free=%llu%s%s\n", store->medium(),
+                          store->location().c_str(), up ? 1 : 0, (unsigned long long)store->capacity_bytes(),
+                          (unsigned long long)(up ? store->free_bytes() : 0), up ? "" : " reason=", up ? "" : why.c_str());
+        con.write(l, static_cast<size_t>(ll));
+        for (const auto& b : store->list()) {
+            ll = snprintf(l, sizeof(l), "K32_BLOB %s %s size=%llu offset=%llu crc32=0x%08x\n", store->medium(), b.name.c_str(),
+                          (unsigned long long)b.size, (unsigned long long)b.offset, (unsigned)b.crc32);
+            con.write(l, static_cast<size_t>(ll));
+        }
+    }
+    con.write("K32_OK blobs\n", 13);
+}
+
+// Reads a blob natively, start to end: a sum of its 32-bit words through the
+// mapping, or file reads of <chunk> bytes (512 to 16384, default 4096) into a
+// buffer. args: <name>[:<chunk>]
+static void console_blobread(Console& con, std::string args) {
+    std::string name = args;
+    uint32_t chunk = 4096;
+    if (size_t colon = name.find(':'); colon != std::string::npos) {
+        chunk = static_cast<uint32_t>(std::strtoul(name.c_str() + colon + 1, nullptr, 10));
+        name.resize(colon);
+    }
+    chunk = std::max<uint32_t>(512, std::min<uint32_t>(chunk, 16384));
+    std::shared_ptr<kube32::storage::BlobReader> r;
+    const char* medium = "";
+    for (kube32::storage::BlobStore* store : kube32::storage::node_blob_stores()) {
+        int32_t err = 0;
+        r = store->open(name, err);
+        if (r) { medium = store->medium(); break; }
+    }
+    char l[160];
+    int ll;
+    if (!r) {
+        ll = snprintf(l, sizeof(l), "K32_ERR no blob %s\n", name.c_str());
+    } else {
+        uint32_t sum = 0;
+        uint64_t bytes = 0;
+        const int64_t t0 = esp_timer_get_time();
+        if (r->view()) {
+            const uint32_t* w = reinterpret_cast<const uint32_t*>(r->view());
+            const size_t words = static_cast<size_t>(r->size() / 4);
+            for (size_t i = 0; i < words; ++i) sum += w[i];
+            bytes = words * 4;
+        } else if (uint8_t* buf = static_cast<uint8_t*>(heap_caps_malloc(chunk, MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA))) {
+            for (uint64_t off = 0; off < r->size();) {
+                const int32_t n = r->read(off, buf, chunk);
+                if (n <= 0) break;
+                for (int32_t i = 0; i + 4 <= n; i += 4) sum += *reinterpret_cast<const uint32_t*>(buf + i);
+                off += static_cast<uint64_t>(n);
+                bytes += static_cast<uint64_t>(n);
+            }
+            heap_caps_free(buf);
+        }
+        const int64_t us = esp_timer_get_time() - t0;
+        ll = snprintf(l, sizeof(l), "K32_BLOBREAD %s %s %s chunk=%u bytes=%llu us=%lld kB_per_s=%llu sum=%08x\n", name.c_str(),
+                      medium, r->view() ? "mapped" : "read", r->view() ? 0u : (unsigned)chunk, (unsigned long long)bytes,
+                      (long long)us, (unsigned long long)(us > 0 ? bytes * 1000 / static_cast<uint64_t>(us) : 0), (unsigned)sum);
+    }
+    con.write(l, static_cast<size_t>(ll));
+}
+
+// Records the microphone for args ms (100..10000) and prints its level per
+// 250 ms: the mean (DC offset), the RMS and the peak around that mean
+static void console_mic(Console& con, const std::string& args) {
+    int ms = std::atoi(args.c_str());
+    if (ms < 100) ms = 100;
+    if (ms > 10000) ms = 10000;
+    int16_t* buf = static_cast<int16_t*>(heap_caps_malloc(500 * sizeof(int16_t), MALLOC_CAP_INTERNAL));
+    if (!buf) {
+        con.write("K32_ERR no memory\n", 18);
+        return;
+    }
+    const uint32_t window = 4000;   // 250 ms at 16 kHz
+    const uint32_t total = static_cast<uint32_t>(ms) * 16;
+    uint32_t got_total = 0, in_window = 0, w = 0;
+    int64_t sum = 0, sumsq = 0, wsum = 0, wsumsq = 0;
+    int32_t wmin = 32767, wmax = -32768;
+    int32_t err = 0;
+    char l[160];
+    // The decimator settles in its first few milliseconds: not counted
+    kube32::hal::mic_read(buf, 500, 200);
+    while (got_total < total) {
+        const int32_t n = kube32::hal::mic_read(buf, std::min<uint32_t>(500, total - got_total), 200);
+        if (n <= 0) { err = n; break; }
+        for (int32_t i = 0; i < n; ++i) {
+            const int32_t v = buf[i];
+            wsum += v;
+            wsumsq += static_cast<int64_t>(v) * v;
+            wmin = std::min(wmin, v);
+            wmax = std::max(wmax, v);
+            if (++in_window == window) {
+                const double mean = static_cast<double>(wsum) / window;
+                const double var = static_cast<double>(wsumsq) / window - mean * mean;
+                const double peak = std::max(wmax - mean, mean - wmin);
+                int ll = snprintf(l, sizeof(l), "K32_MIC window=%u mean=%.1f rms=%.1f peak=%.0f\n", (unsigned)w++, mean,
+                                  var > 0 ? std::sqrt(var) : 0.0, peak);
+                con.write(l, static_cast<size_t>(ll));
+                sum += wsum;
+                sumsq += wsumsq;
+                wsum = wsumsq = 0;
+                wmin = 32767;
+                wmax = -32768;
+                in_window = 0;
+            }
+        }
+        got_total += static_cast<uint32_t>(n);
+    }
+    kube32::hal::mic_read(buf, 0, 0);
+    const uint32_t counted = got_total - in_window;
+    const double mean = counted ? static_cast<double>(sum) / counted : 0.0;
+    const double var = counted ? static_cast<double>(sumsq) / counted - mean * mean : 0.0;
+    int ll = err ? snprintf(l, sizeof(l), "K32_ERR mic error=%d after %u samples\n", (int)err, (unsigned)got_total)
+                 : snprintf(l, sizeof(l), "K32_OK mic samples=%u mean=%.1f rms=%.1f\n", (unsigned)got_total, mean,
+                            var > 0 ? std::sqrt(var) : 0.0);
+    con.write(l, static_cast<size_t>(ll));
+    heap_caps_free(buf);
+}
 
 // The kernels the bench pod runs, run natively on the console task, for
 // comparison with the pod's timings
@@ -1027,122 +1178,11 @@ void console_task(void* arg) {
                 vTaskDelay(pdMS_TO_TICKS(200));
                 esp_restart();
             } else if (line == "K32_CMD:BLOBS") {
-                // The node's blob stores and what each holds
-                for (kube32::storage::BlobStore* store : {static_cast<kube32::storage::BlobStore*>(kube32::storage::node_flash_blobs()),
-                                                          kube32::storage::node_card_blobs()}) {
-                    if (!store) continue;
-                    std::string why;
-                    const bool up = store->available(&why);
-                    char l[200];
-                    int ll = snprintf(l, sizeof(l), "K32_BLOBS medium=%s location=\"%s\" available=%d capacity=%llu free=%llu%s%s\n", store->medium(),
-                                      store->location().c_str(), up ? 1 : 0, (unsigned long long)store->capacity_bytes(),
-                                      (unsigned long long)(up ? store->free_bytes() : 0), up ? "" : " reason=", up ? "" : why.c_str());
-                    con.write(l, static_cast<size_t>(ll));
-                    for (const auto& b : store->list()) {
-                        ll = snprintf(l, sizeof(l), "K32_BLOB %s %s size=%llu offset=%llu crc32=0x%08x\n", store->medium(), b.name.c_str(),
-                                      (unsigned long long)b.size, (unsigned long long)b.offset, (unsigned)b.crc32);
-                        con.write(l, static_cast<size_t>(ll));
-                    }
-                }
-                con.write("K32_OK blobs\n", 13);
+                console_run_deep(con, [&] { console_blobs(con); });
             } else if (line.rfind("K32_CMD:BLOBREAD:", 0) == 0) {
-                // Reads a blob natively, start to end: a sum of its 32-bit words
-                // through the mapping, or file reads of <chunk> bytes (512 to
-                // 16384, default 4096) into a buffer: K32_CMD:BLOBREAD:<name>[:<chunk>]
-                std::string name = line.substr(17);
-                uint32_t chunk = 4096;
-                if (size_t colon = name.find(':'); colon != std::string::npos) {
-                    chunk = static_cast<uint32_t>(std::strtoul(name.c_str() + colon + 1, nullptr, 10));
-                    name.resize(colon);
-                }
-                chunk = std::max<uint32_t>(512, std::min<uint32_t>(chunk, 16384));
-                std::shared_ptr<kube32::storage::BlobReader> r;
-                const char* medium = "";
-                for (kube32::storage::BlobStore* store : kube32::storage::node_blob_stores()) {
-                    int32_t err = 0;
-                    r = store->open(name, err);
-                    if (r) { medium = store->medium(); break; }
-                }
-                char l[160];
-                int ll;
-                if (!r) {
-                    ll = snprintf(l, sizeof(l), "K32_ERR no blob %s\n", name.c_str());
-                } else {
-                    uint32_t sum = 0;
-                    uint64_t bytes = 0;
-                    const int64_t t0 = esp_timer_get_time();
-                    if (r->view()) {
-                        const uint32_t* w = reinterpret_cast<const uint32_t*>(r->view());
-                        const size_t words = static_cast<size_t>(r->size() / 4);
-                        for (size_t i = 0; i < words; ++i) sum += w[i];
-                        bytes = words * 4;
-                    } else if (uint8_t* buf = static_cast<uint8_t*>(heap_caps_malloc(chunk, MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA))) {
-                        for (uint64_t off = 0; off < r->size();) {
-                            const int32_t n = r->read(off, buf, chunk);
-                            if (n <= 0) break;
-                            for (int32_t i = 0; i + 4 <= n; i += 4) sum += *reinterpret_cast<const uint32_t*>(buf + i);
-                            off += static_cast<uint64_t>(n);
-                            bytes += static_cast<uint64_t>(n);
-                        }
-                        heap_caps_free(buf);
-                    }
-                    const int64_t us = esp_timer_get_time() - t0;
-                    ll = snprintf(l, sizeof(l), "K32_BLOBREAD %s %s %s chunk=%u bytes=%llu us=%lld kB_per_s=%llu sum=%08x\n", name.c_str(),
-                                  medium, r->view() ? "mapped" : "read", r->view() ? 0u : (unsigned)chunk, (unsigned long long)bytes,
-                                  (long long)us, (unsigned long long)(us > 0 ? bytes * 1000 / static_cast<uint64_t>(us) : 0), (unsigned)sum);
-                }
-                con.write(l, static_cast<size_t>(ll));
+                console_run_deep(con, [&] { console_blobread(con, line.substr(17)); });
             } else if (line.rfind("K32_CMD:MIC:", 0) == 0) {
-                // Records the microphone for <ms> (100..10000) and prints its
-                // level per 250 ms: the mean (DC offset), the RMS and the peak
-                // around that mean
-                int ms = std::atoi(line.c_str() + 12);
-                if (ms < 100) ms = 100;
-                if (ms > 10000) ms = 10000;
-                static int16_t buf[500];
-                const uint32_t window = 4000;   // 250 ms at 16 kHz
-                const uint32_t total = static_cast<uint32_t>(ms) * 16;
-                uint32_t got_total = 0, in_window = 0, w = 0;
-                int64_t sum = 0, sumsq = 0, wsum = 0, wsumsq = 0;
-                int32_t wmin = 32767, wmax = -32768;
-                int32_t err = 0;
-                char l[160];
-                // The decimator settles in its first few milliseconds: not counted
-                kube32::hal::mic_read(buf, 500, 200);
-                while (got_total < total) {
-                    const int32_t n = kube32::hal::mic_read(buf, std::min<uint32_t>(500, total - got_total), 200);
-                    if (n <= 0) { err = n; break; }
-                    for (int32_t i = 0; i < n; ++i) {
-                        const int32_t v = buf[i];
-                        wsum += v;
-                        wsumsq += static_cast<int64_t>(v) * v;
-                        wmin = std::min(wmin, v);
-                        wmax = std::max(wmax, v);
-                        if (++in_window == window) {
-                            const double mean = static_cast<double>(wsum) / window;
-                            const double var = static_cast<double>(wsumsq) / window - mean * mean;
-                            const double peak = std::max(wmax - mean, mean - wmin);
-                            int ll = snprintf(l, sizeof(l), "K32_MIC window=%u mean=%.1f rms=%.1f peak=%.0f\n", (unsigned)w++, mean,
-                                              var > 0 ? std::sqrt(var) : 0.0, peak);
-                            con.write(l, static_cast<size_t>(ll));
-                            sum += wsum;
-                            sumsq += wsumsq;
-                            wsum = wsumsq = 0;
-                            wmin = 32767;
-                            wmax = -32768;
-                            in_window = 0;
-                        }
-                    }
-                    got_total += static_cast<uint32_t>(n);
-                }
-                kube32::hal::mic_read(buf, 0, 0);
-                const uint32_t counted = got_total - in_window;
-                const double mean = counted ? static_cast<double>(sum) / counted : 0.0;
-                const double var = counted ? static_cast<double>(sumsq) / counted - mean * mean : 0.0;
-                int ll = err ? snprintf(l, sizeof(l), "K32_ERR mic error=%d after %u samples\n", (int)err, (unsigned)got_total)
-                             : snprintf(l, sizeof(l), "K32_OK mic samples=%u mean=%.1f rms=%.1f\n", (unsigned)got_total, mean,
-                                        var > 0 ? std::sqrt(var) : 0.0);
-                con.write(l, static_cast<size_t>(ll));
+                console_run_deep(con, [&] { console_mic(con, line.substr(12)); });
             } else if (line == "K32_CMD:SD") {
                 // Card state, measured figures and what is on it under /sd/kube32
                 kube32::hal::SdInfo si = kube32::hal::sd_info();
