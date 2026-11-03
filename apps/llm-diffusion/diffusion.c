@@ -74,7 +74,7 @@ static uint16_t g_hash[HASH_SIZE];
 /* ---- activations --------------------------------------------------------- */
 static float g_x[P * MAX_DIM], g_q[P * MAX_DIM];
 static float g_work[WORK_FLOATS];
-static float g_xb[MAX_DIM], g_xb2[MAX_DIM], g_att[P], g_xs[P], g_xsh[FFN_CHUNK], g_ks[P * 8], g_vs[P * 8];
+static float g_att[P], g_xs[P], g_xsh[FFN_CHUNK], g_xsc[CLS_CHUNK], g_ks[P * 8], g_vs[P * 8];
 static int8_t g_xq[P * MAX_DIM], g_xqh[FFN_CHUNK * MAX_HID], g_kq[P * MAX_DIM], g_vq[P * MAX_DIM];
 static uint32_t g_cand[P];
 static float g_conf[P];
@@ -348,15 +348,15 @@ static NOINLINE void fail_run(const char* why) {
 }
 
 /* ---- one step, a layer at a time -------------------------------------------- */
+/* The token table read once into the work buffer; x[p] = 0 + row * scale, the bits of row * scale
+ * (a zero row has scale 0, so no product is a negative zero) */
 static NOINLINE void embed(void) {
     const uint32_t dim = g_dim;
-    int8_t row[MAX_DIM];
     sec(S_EMB);
-    for (uint32_t p = 0; p < P; p++) {
-        if (!blob_get(g_off_tok + g_win[p] * dim, row, dim)) { fail_run("llm-diffusion: embedding read"); return; }
-        const float s = g_tok_s[g_win[p]];
-        for (uint32_t i = 0; i < dim; i++) g_x[p * dim + i] = (float)row[i] * s;
-    }
+    const int8_t* table = (const int8_t*)g_work;
+    if (!blob_get(g_off_tok, g_work, g_vocab * dim)) { fail_run("llm-diffusion: embedding read"); return; }
+    __builtin_memset(g_x, 0, sizeof(float) * P * dim);
+    for (uint32_t p = 0; p < P; p++) k32_add_f32_i8(g_x + p * dim, table + g_win[p] * dim, g_tok_s[g_win[p]], dim);
     sec(S_OTHER);
 }
 
@@ -382,15 +382,9 @@ static NOINLINE void layer(uint32_t l, uint32_t part) {
         k32_quantize_i8(g_vq, g_vs, g_work, hs, P * KVH);
     } else if (part == 1) {
         sec(S_ATT);
-        for (uint32_t p = 0; p < P; p++) {
-            for (uint32_t h = 0; h < H; h++) {
-                const uint32_t kh = h / (H / KVH);
-                k32_matvec_f32_i8(g_att, &g_kq[kh * hs], &g_ks[kh], g_q + p * dim + h * hs, scale, P, hs, kvd, KVH * 4);
-                k32_softmax_f32(g_att, P);
-                k32_vecmat_f32_i8(g_xb2 + h * hs, &g_vq[kh * hs], &g_vs[kh], g_att, P, hs, kvd, KVH * 4);
-            }
-            k32_quantize_i8(g_xq + p * dim, &g_xs[p], g_xb2, dim, 1);
-        }
+        /* every position over the whole window, all heads in one call */
+        k32_attention_full_f32_i8(g_work, g_kq, g_ks, g_vq, g_vs, g_q, scale, H, KVH, hs, kvd, P, P, g_att);
+        k32_quantize_i8(g_xq, g_xs, g_work, dim, P);
     } else if (part == 2) {
         sec(S_ATT);
         mm(g_work, L->w[3], L->f[4], g_xq, g_xs, dim, dim, P);
@@ -420,6 +414,10 @@ static NOINLINE void classify(void) {
     const uint32_t dim = g_dim, V = g_vocab - 1, MASK = g_vocab - 1;
     sec(S_CLS);
     const float inv_t = g_temp > 0.0f ? 1.0f / g_temp : 0.0f;
+    /* the final norm and the quantization of every position in two calls; the masked positions'
+     * vectors are gathered for the product */
+    k32_rmsnorm_f32(g_work, g_x, g_rms_final, dim, P, 1e-5f);
+    k32_quantize_i8(g_xq, g_xs, g_work, dim, P);
     uint32_t idx[CLS_CHUNK];
     uint32_t p = 0;
     for (;;) {
@@ -430,10 +428,10 @@ static NOINLINE void classify(void) {
         }
         if (!m) break;
         for (uint32_t j = 0; j < m; j++) {
-            k32_rmsnorm_f32(g_xb, g_x + idx[j] * dim, g_rms_final, dim, 1, 1e-5f);
-            k32_quantize_i8(g_xq + j * dim, &g_xs[j], g_xb, dim, 1);
+            __builtin_memcpy(g_xqh + j * dim, g_xq + idx[j] * dim, dim);
+            g_xsc[j] = g_xs[idx[j]];
         }
-        mm(g_work, g_off_tok, g_off_tok_s, g_xq, g_xs, V, dim, m);
+        mm(g_work, g_off_tok, g_off_tok_s, g_xqh, g_xsc, V, dim, m);
         for (uint32_t j = 0; j < m; j++) {
             float* lg = g_work + j * V;
             uint32_t c = 0;
