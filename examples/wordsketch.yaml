@@ -48,7 +48,7 @@ spec:
           env:
             - {name: STORY_URL, value: "http://wordsketch-teller/generate"}
             - {name: STORY_STEPS, value: "80"}
-            - {name: STEPS, value: "16"}           # DDIM steps of the drawing: 8 or 16
+            - {name: STEPS, value: "8"}            # DDIM steps of the drawing: 8 or 16
             - {name: THRESHOLD, value: "60"}       # percent a keyword needs
             - {name: VOLUME, value: "30"}          # chime, percent of the speaker's ceiling
           resources:

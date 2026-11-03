@@ -25,7 +25,7 @@
  * k32_matvec_i8); the tables, scales and biases come into memory.
  *
  * Environment: STORY_URL (default http://wordsketch-teller/generate),
- * STORY_STEPS (80), STEPS of the drawing, 8 or 16 (16), THRESHOLD (60),
+ * STORY_STEPS (80), STEPS of the drawing, 8 or 16 (8), THRESHOLD (60),
  * VOLUME of the chime in percent of the speaker's ceiling (30; 0 is none),
  * VAD, a word's mean log2 energy above the floor in Q8 (512).
  *
@@ -436,7 +436,7 @@ K32_EXPORT("k32_init") int32_t k32_init(void) {
     const int32_t n = k32_env_get(LIT("STORY_URL"), g_url, sizeof g_url);
     if (n > 0) g_url_len = (uint32_t)n;
     g_story_steps = env_u(LIT("STORY_STEPS"), 80);
-    g_steps = env_u(LIT("STEPS"), 16);
+    g_steps = env_u(LIT("STEPS"), 8);
     g_threshold = env_u(LIT("THRESHOLD"), 60);
     g_volume = env_u(LIT("VOLUME"), 30);
     g_vad = (int32_t)env_u(LIT("VAD"), 512);
