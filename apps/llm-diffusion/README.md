@@ -22,7 +22,7 @@ kubectl --context kube32 replace --raw \
 kubectl --context kube32 apply -f apps/llm-diffusion/build/llm-diffusion.yaml
 ```
 
-`make` builds the module, `build/mdlm-blob.bin` (the model without its rotary table) and `build/llm-diffusion.yaml` (`examples/llm-diffusion.yaml` with the module inline). `tools/pack.py` writes the rotary table and the tokenizer into the module's data. The pod needs a node with PSRAM and about 13 free flash blocks. Upload the blob to the node's API server address when the request body exceeds the serial gateway's 64 KB.
+`make` builds the module, `build/mdlm-blob.bin` (the model without its rotary table), `build/llm-diffusion.yaml` (`examples/llm-diffusion.yaml` with the module inline) and the [viewer](#viewer-on-the-cardputer)'s `build/llm-diffusion-viewer.yaml`. `tools/pack.py` writes the rotary table and the tokenizer into the module's data. The pod needs a node with PSRAM and about 13 free flash blocks. Upload the blob to the node's API server address when the request body exceeds the serial gateway's 64 KB.
 
 ## API
 
@@ -49,6 +49,31 @@ Once upon a time, there_ a______________________________________________________
 Once upon a time, there was a little girl named Lily. She loved to play with hers a the the the_ysss_______________________________
 Once upon a time, there was a little girl named Lily. She loved to play with hers a the the the toysss. One day, shessked her to toyy of she wantould too to to at the heros..
 ```
+
+## Viewer on the Cardputer
+
+`llm-diffusion-viewer` (`viewer.c`) shows the text forming on the Cardputer's 240 x 135 screen. It starts a generation through the Service `llm-diffusion` with `k32_http_call`, reads `/state?from=<step>` every 400 ms while it runs, and draws the window after every step in 40 columns: revealed tokens in white, each masked position as a grey block, and a title line with the step and its time. A finished generation shows the time a step and the tokens a second, and stays on the screen for `PAUSE` ms before the next one starts with a fresh seed.
+
+```sh
+make -C apps/llm-diffusion
+kubectl --context kube32 apply -f apps/llm-diffusion/build/llm-diffusion-viewer.yaml
+kubectl --context kube32 logs llm-diffusion-viewer     # a line per step drawn, a line per generation
+```
+
+| Key | Action, when no generation runs |
+| --- | --- |
+| `1`, `2`, `3` | Starts 8, 16 or 32 steps |
+| any other | Starts the next generation of `STEPS` |
+
+| Variable | Meaning |
+| --- | --- |
+| `URL` | The diffusion pod's Service (`http://llm-diffusion`) |
+| `STEPS` | Steps of each generation, in turn (`8,16,32`) |
+| `TEMP` | Temperature x 100 (80; 0 is greedy) |
+| `PAUSE` | Milliseconds the finished text stays (10000) |
+| `PROMPT` | The start of the text (none) |
+
+The pod holds 20 KiB of linear memory, its 6.6 KB module and the display, keyboard and `SERVICE_CALL` capabilities. The screen serves one pod at a time: on a board that runs wordsketch, scale `wordsketch-listen` to 0 first.
 
 ## Measurements
 

@@ -1,0 +1,41 @@
+# llm-diffusion-viewer: the text of llm-diffusion forming on the Cardputer's
+# screen. It starts a generation, reads every step from the diffusion pod's
+# Service and draws the window: revealed tokens in white, masked positions
+# as grey blocks. Keys 1, 2 and 3 start 8, 16 or 32 steps; otherwise the
+# generations follow STEPS, each with a fresh seed.
+#
+# The screen belongs to one pod at a time: scale wordsketch-listen to 0 first
+# when wordsketch runs on the same board.
+#   make -C apps/llm-diffusion
+#   kubectl --context kube32 apply -f apps/llm-diffusion/build/llm-diffusion-viewer.yaml
+#   kubectl --context kube32 logs llm-diffusion-viewer
+apiVersion: v1
+kind: Pod
+metadata:
+  name: llm-diffusion-viewer
+  namespace: default
+  labels: {app: llm-diffusion-viewer}
+  annotations:
+    kube32.io/wasm-base64: "__WASM_BASE64__"
+    kube32.io/tick-interval: "200ms"
+spec:
+  nodeSelector:
+    kube32.io/board: cardputer
+  restartPolicy: Always
+  containers:
+    - name: viewer
+      image: wasm://inline/llm-diffusion-viewer
+      ports: [{name: http, containerPort: 7000}]
+      env:
+        - {name: URL, value: "http://llm-diffusion"}
+        - {name: STEPS, value: "8,16,32"}   # steps of each generation, in turn
+        - {name: TEMP, value: "80"}         # temperature x 100; 0 is greedy
+        - {name: PAUSE, value: "10000"}     # ms the finished text stays before the next one
+      resources:
+        requests:
+          memory: 20Ki
+          hardware.kube32.io/tft-display: "1"
+          hardware.kube32.io/keyboard: "1"
+        limits: {memory: 20Ki}
+      securityContext:
+        capabilities: {add: ["DISPLAY", "KEYBOARD", "SERVICE_CALL"]}
