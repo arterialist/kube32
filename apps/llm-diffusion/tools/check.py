@@ -78,6 +78,11 @@ def main():
         got = [e["revealed"] for e in log if e["revealed"]]
         text = log[-1]["text"] if log else ""
         ok = st["tokens"] == v["window"] and got == want and text == v["text"]
+        # the totals agree with the per-step log
+        totals = st["generated"] == 64 - st["prompt_tokens"] and st["compute_us"] == sum(e["us"] for e in log)
+        if not totals:
+            print("   totals differ from the log: generated %r, compute_us %r, step us sum %d" % (st["generated"], st["compute_us"], sum(e["us"] for e in log)))
+        ok = ok and totals
         bad += not ok
         r = {"vector": i, "prompt": v["prompt"], "steps": v["steps"], "seed": v["seed"], "temperature": v["temperature"],
              "ok": ok, "ms_per_step": st["us_per_step"] / 1000.0, "compute_ms": st["compute_us"] / 1000.0,
