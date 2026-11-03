@@ -98,6 +98,15 @@ bool sd_mount() {
     for (int i = static_cast<int>(sizeof(s_card->cid.name)) - 1; i >= 0 && (name[i] == ' ' || name[i] == 0); --i) name[i] = 0;
     s_info.name = name;
     s_info.type = s_card->is_mmc ? "MMC" : ((s_card->ocr & SD_OCR_SDHC_CAP) ? "SDHC/SDXC" : "SDSC");
+    // A card that does not switch to high speed in SPI mode stays at its
+    // default-speed 25 MHz; a faster clock set with sd_set_max_khz is applied
+    // beyond that. The bus runs with CRC checks (CMD59), so a clock the card
+    // cannot follow fails transfers instead of corrupting them.
+    if (s_max_khz > static_cast<uint32_t>(s_card->max_freq_khz) &&
+        sdspi_host_set_card_clk(static_cast<sdspi_dev_handle_t>(s_card->host.slot), s_max_khz) == ESP_OK) {
+        int real = 0;
+        if (sdspi_host_get_real_freq(static_cast<sdspi_dev_handle_t>(s_card->host.slot), &real) == ESP_OK) s_card->real_freq_khz = real;
+    }
     s_info.bus_khz = static_cast<uint32_t>(s_card->real_freq_khz);
     s_info.mounted = true;
     refresh_space_locked();
