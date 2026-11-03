@@ -60,7 +60,7 @@ kubectl --context kube32 logs deploy/wordsketch-listen
 kubectl --context kube32 logs deploy/wordsketch-draw      # per drawing: steps, time, slowest step, image hash
 ```
 
-The Ingress `wordsketch` routes `POST /wordsketch/word?w=<word>[&seed=<n>]` to the listen pod, which starts the drawing and the story as if it had heard the word, and serves the story's tokens as Server-Sent Events at `/wordsketch/events`. The draw pod logs each drawing's time and a hash of the image; with `seed` 1 to 6 for cat to bed and 16 steps the hash is the one of `models/doodle/vectors/doodle-l.json`'s samples.
+The Ingress `wordsketch` routes `POST /wordsketch/word?w=<word>[&seed=<n>]` to the listen pod, which starts the drawing and the story as if it had heard the word, and serves the three topics as Server-Sent Events at `/wordsketch/events`: each event's data is a `wordsketch.word` message (`W <id> <class> <seed> <steps>`), a band of the drawing (`wordsketch.frame`, the format in `draw.c`) or the story's text (`wordsketch.text`). The draw pod logs each drawing's time and a hash of the image; with `seed` 1 to 6 for cat to bed and 16 steps the hash is the one of `models/doodle/vectors/doodle-l.json`'s samples.
 
 | Listen variable | Meaning |
 | --- | --- |

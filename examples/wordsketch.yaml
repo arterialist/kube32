@@ -231,7 +231,7 @@ metadata:
   name: wordsketch
   namespace: default
   annotations:
-    kube32.io/event-stream: "/wordsketch/events=wordsketch.text"
+    kube32.io/event-stream: "/wordsketch/events=wordsketch.word,wordsketch.frame,wordsketch.text"
 spec:
   rules:
     - http:
