@@ -413,6 +413,11 @@ K32_IMPORT("k32_http_status") int32_t k32_http_status(void);
  * heads must be a multiple of kvh and kv_stride at least kvh x hs
  * (K32_ERR_INVAL otherwise).
  *
+ * k32_attention_full_f32_i8: the same with every one of the n positions
+ * attending to key rows 0 .. rows - 1, for a model whose positions see the
+ * whole window: the bits of the three calls per head over rows rows. att
+ * is scratch of rows floats.
+ *
  * k32_add_f32_i8: x = x + (float)q * scale over n floats, a residual from
  * an int8 map.
  *
@@ -459,6 +464,10 @@ K32_IMPORT("k32_argmax_f32") int32_t k32_argmax_f32(const float* x, uint32_t n);
 K32_IMPORT("k32_attention_f32_i8") int32_t k32_attention_f32_i8(float* out, const int8_t* kq, const float* ks, const int8_t* vq, const float* vs,
                                                                 const float* q, float scale, uint32_t heads, uint32_t kvh, uint32_t hs,
                                                                 uint32_t kv_stride, uint32_t pos0, uint32_t n, float* att);
+K32_IMPORT("k32_attention_full_f32_i8") int32_t k32_attention_full_f32_i8(float* out, const int8_t* kq, const float* ks, const int8_t* vq,
+                                                                          const float* vs, const float* q, float scale, uint32_t heads,
+                                                                          uint32_t kvh, uint32_t hs, uint32_t kv_stride, uint32_t rows,
+                                                                          uint32_t n, float* att);
 K32_IMPORT("k32_add_f32_i8") int32_t k32_add_f32_i8(float* x, const int8_t* q, float scale, uint32_t n);
 K32_IMPORT("k32_quantize_i8_static") int32_t k32_quantize_i8_static(int8_t* q, const float* x, float inv, uint32_t n);
 K32_IMPORT("k32_conv3x3_i8") int32_t k32_conv3x3_i8(float* out, const int8_t* w, const float* w_scale, const float* bias, const int8_t* in,

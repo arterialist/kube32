@@ -67,54 +67,53 @@ static inline int32_t hi4(int32_t b) { return b >> 4; }
 
 static inline bool aligned16(const void* p) { return (reinterpret_cast<uintptr_t>(p) & 15) == 0; }
 
-// ACCX += the products of 16 * blocks bytes of w and x (blocks > 0); WA, XA:
-// w, x aligned
-template <bool WA, bool XA>
-static inline void pie_mac(const int8_t* w, const int8_t* x, uint32_t blocks) {
-    if (WA && XA) {
-        do asm volatile("ee.vld.128.ip q0, %0, 16\n\t"
-                        "ee.vld.128.ip q1, %1, 16\n\t"
-                        "ee.vmulas.s8.accx q0, q1" : "+r"(w), "+r"(x) : : "memory");
-        while (--blocks);
-    } else if (XA) {
-        asm volatile("ee.ld.128.usar.ip q0, %0, 16" : "+r"(w) : : "memory");
-        do asm volatile("ee.ld.128.usar.ip q1, %0, 16\n\t"
-                        "ee.src.q.qup q2, q0, q1\n\t"
-                        "ee.vld.128.ip q3, %1, 16\n\t"
-                        "ee.vmulas.s8.accx q2, q3" : "+r"(w), "+r"(x) : : "memory");
-        while (--blocks);
-    } else if (WA) {
-        asm volatile("ee.ld.128.usar.ip q0, %0, 16" : "+r"(x) : : "memory");
-        do asm volatile("ee.ld.128.usar.ip q1, %1, 16\n\t"
-                        "ee.src.q.qup q2, q0, q1\n\t"
-                        "ee.vld.128.ip q3, %0, 16\n\t"
-                        "ee.vmulas.s8.accx q2, q3" : "+r"(w), "+r"(x) : : "memory");
-        while (--blocks);
+// q0 .. q(nb - 1) = nb blocks of 16 int8 weights from w (1 to 4). An
+// unaligned stream goes through q4 and q5.
+template <bool WA>
+static inline void pie_load_w(const int8_t* w, uint32_t nb) {
+    if (WA) {
+        asm volatile("ee.vld.128.ip q0, %0, 16" : "+r"(w) : : "memory");
+        if (nb > 1) asm volatile("ee.vld.128.ip q1, %0, 16" : "+r"(w) : : "memory");
+        if (nb > 2) asm volatile("ee.vld.128.ip q2, %0, 16" : "+r"(w) : : "memory");
+        if (nb > 3) asm volatile("ee.vld.128.ip q3, %0, 16" : "+r"(w) : : "memory");
     } else {
-        // each EE.SRC.Q follows the load of its own stream, which sets SAR_BYTE
-        asm volatile("ee.ld.128.usar.ip q0, %0, 16\n\t"
-                     "ee.ld.128.usar.ip q3, %1, 16" : "+r"(w), "+r"(x) : : "memory");
-        do asm volatile("ee.ld.128.usar.ip q1, %0, 16\n\t"
-                        "ee.src.q.qup q2, q0, q1\n\t"
-                        "ee.ld.128.usar.ip q4, %1, 16\n\t"
-                        "ee.src.q.qup q5, q3, q4\n\t"
-                        "ee.vmulas.s8.accx q2, q5" : "+r"(w), "+r"(x) : : "memory");
-        while (--blocks);
+        asm volatile("ee.ld.128.usar.ip q4, %0, 16\n\t"
+                     "ee.ld.128.usar.ip q5, %0, 16\n\t"
+                     "ee.src.q.qup q0, q4, q5" : "+r"(w) : : "memory");
+        if (nb > 1) asm volatile("ee.ld.128.usar.ip q5, %0, 16\n\tee.src.q.qup q1, q4, q5" : "+r"(w) : : "memory");
+        if (nb > 2) asm volatile("ee.ld.128.usar.ip q5, %0, 16\n\tee.src.q.qup q2, q4, q5" : "+r"(w) : : "memory");
+        if (nb > 3) asm volatile("ee.ld.128.usar.ip q5, %0, 16\n\tee.src.q.qup q3, q4, q5" : "+r"(w) : : "memory");
     }
 }
 
-// Sum of w[c] * x[c]: 16 columns a step, the rest one at a time
-static inline int32_t dot_i8(const int8_t* w, const int8_t* x, uint32_t n) {
-    const uint32_t blocks = n / 16;
-    uint32_t s = 0;
-    if (blocks) {
-        asm volatile("ee.zero.accx");
-        if (aligned16(w)) aligned16(x) ? pie_mac<true, true>(w, x, blocks) : pie_mac<true, false>(w, x, blocks);
-        else aligned16(x) ? pie_mac<false, true>(w, x, blocks) : pie_mac<false, false>(w, x, blocks);
-        asm volatile("rur.accx_0 %0" : "=r"(s));
+// The sum of the products of q0 .. q(NB - 1) with the NB blocks at x, as
+// ACCX_0 wraps it. XA: x aligned, loaded a block at a time; otherwise the
+// stream goes through q4 .. q6.
+#define K32_PIE_XA_BLOCK(q) "ee.vld.128.ip q4, %1, 16\n\tee.vmulas.s8.accx " q ", q4\n\t"
+#define K32_PIE_XU_BLOCK(q) "ee.ld.128.usar.ip q5, %1, 16\n\tee.src.q.qup q6, q4, q5\n\tee.vmulas.s8.accx " q ", q6\n\t"
+template <bool XA, uint32_t NB>
+static inline uint32_t pie_dot(const int8_t* x) {
+    uint32_t s;
+    if (XA) {
+        if (NB == 1) asm volatile("ee.zero.accx\n\t" K32_PIE_XA_BLOCK("q0") "rur.accx_0 %0" : "=r"(s), "+r"(x) : : "memory");
+        if (NB == 2) asm volatile("ee.zero.accx\n\t" K32_PIE_XA_BLOCK("q0") K32_PIE_XA_BLOCK("q1") "rur.accx_0 %0" : "=r"(s), "+r"(x) : : "memory");
+        if (NB == 3) asm volatile("ee.zero.accx\n\t" K32_PIE_XA_BLOCK("q0") K32_PIE_XA_BLOCK("q1") K32_PIE_XA_BLOCK("q2") "rur.accx_0 %0" : "=r"(s), "+r"(x) : : "memory");
+        if (NB == 4) asm volatile("ee.zero.accx\n\t" K32_PIE_XA_BLOCK("q0") K32_PIE_XA_BLOCK("q1") K32_PIE_XA_BLOCK("q2") K32_PIE_XA_BLOCK("q3") "rur.accx_0 %0" : "=r"(s), "+r"(x) : : "memory");
+    } else {
+        if (NB == 1) asm volatile("ee.zero.accx\n\tee.ld.128.usar.ip q4, %1, 16\n\t" K32_PIE_XU_BLOCK("q0") "rur.accx_0 %0" : "=r"(s), "+r"(x) : : "memory");
+        if (NB == 2) asm volatile("ee.zero.accx\n\tee.ld.128.usar.ip q4, %1, 16\n\t" K32_PIE_XU_BLOCK("q0") K32_PIE_XU_BLOCK("q1") "rur.accx_0 %0" : "=r"(s), "+r"(x) : : "memory");
+        if (NB == 3) asm volatile("ee.zero.accx\n\tee.ld.128.usar.ip q4, %1, 16\n\t" K32_PIE_XU_BLOCK("q0") K32_PIE_XU_BLOCK("q1") K32_PIE_XU_BLOCK("q2") "rur.accx_0 %0" : "=r"(s), "+r"(x) : : "memory");
+        if (NB == 4) asm volatile("ee.zero.accx\n\tee.ld.128.usar.ip q4, %1, 16\n\t" K32_PIE_XU_BLOCK("q0") K32_PIE_XU_BLOCK("q1") K32_PIE_XU_BLOCK("q2") K32_PIE_XU_BLOCK("q3") "rur.accx_0 %0" : "=r"(s), "+r"(x) : : "memory");
     }
-    for (uint32_t c = 16 * blocks; c < n; c++) s += static_cast<uint32_t>(w[c] * x[c]);
-    return static_cast<int32_t>(s);
+    return s;
+}
+#undef K32_PIE_XA_BLOCK
+#undef K32_PIE_XU_BLOCK
+
+// acc[v] += the chunk in q0 .. q(NB - 1) times vector v (xs bytes apart)
+template <bool XA, uint32_t NB>
+static inline void pie_dots(const int8_t* x, size_t xs, uint32_t nv, uint32_t* acc) {
+    for (uint32_t v = 0; v < nv; v++, x += xs) acc[v] += pie_dot<XA, NB>(x);
 }
 
 static const uint8_t kNibble = 0x0F, kNibbleSign = 0x08, kNibbleBias = 0xF8;
@@ -147,7 +146,8 @@ static inline void pie_unpack_i4(const int8_t* w, int8_t* buf, uint32_t blocks) 
     } while (--blocks);
 }
 
-// Columns of an int4 row unpacked at a time, into a buffer on the stack
+// Columns of a row taken at a time: an int4 row is unpacked into a buffer
+// on the stack this many columns at a time
 constexpr uint32_t kUnpackCols = 256;
 
 // Columns c0..c0 + len of the int4 row at row (c0 even) as int8 values at buf
@@ -163,55 +163,103 @@ static inline void unpack_i4(const int8_t* row, uint32_t c0, uint32_t len, int8_
     if (len & 1) buf[len - 1] = static_cast<int8_t>(lo4(p[pairs]));
 }
 
-// The sums of an int4 row with g vectors x + i * cols, the row unpacked once
-// for all of them
-static inline void dots_i4(const int8_t* row, const int8_t* x, uint32_t cols, uint32_t g, uint32_t* acc) {
+// Vectors a product takes at a time, and the rows whose results wait on
+// the stack before they are stored: the n results of a row lie rows floats
+// apart in out, so a row block's results go out vector by vector, kRowBlock
+// floats in a row. kXBlock bytes of vectors are copied to the stack first,
+// each at a 16-byte aligned address.
+constexpr uint32_t kVecMax = 64, kRowBlock = 8, kXBlock = 8192;
+
+// The products of rows of w with nv vectors xs bytes apart at x (XA: each
+// at a 16-byte aligned address). A row goes 64 columns at a time: the
+// weights of the chunk are loaded once into q0 .. q3 (an int4 row unpacked
+// kUnpackCols columns at a time first) and multiplied with every vector; the
+// chunk sums add up in int32 as the scalar loops wrap, and the columns past
+// the last block of 16 are summed one at a time.
+template <bool I4, bool XA>
+static void matmul_core(uint8_t* out, const int8_t* w, size_t row_stride, const uint8_t* w_scale, const int8_t* x, size_t xs,
+                        const uint8_t* x_scale, uint32_t rows, uint32_t cols, uint32_t nv) {
     alignas(16) int8_t buf[kUnpackCols];
-    for (uint32_t i = 0; i < g; i++) acc[i] = 0;
-    for (uint32_t c0 = 0; c0 < cols; c0 += kUnpackCols) {
-        const uint32_t len = cols - c0 < kUnpackCols ? cols - c0 : kUnpackCols;
-        unpack_i4(row, c0, len, buf);
-        for (uint32_t i = 0; i < g; i++) acc[i] += static_cast<uint32_t>(dot_i8(buf, x + static_cast<size_t>(i) * cols + c0, len));
+    float tmp[kRowBlock * kVecMax];
+    uint32_t acc[kVecMax];
+    for (uint32_t r0 = 0; r0 < rows; r0 += kRowBlock) {
+        const uint32_t nr = rows - r0 < kRowBlock ? rows - r0 : kRowBlock;
+        for (uint32_t r = 0; r < nr; r++) {
+            const int8_t* row = w + static_cast<size_t>(r0 + r) * row_stride;
+            for (uint32_t v = 0; v < nv; v++) acc[v] = 0;
+            for (uint32_t c0 = 0; c0 < cols; c0 += kUnpackCols) {
+                const uint32_t len = cols - c0 < kUnpackCols ? cols - c0 : kUnpackCols;
+                const int8_t* wr = row + c0;
+                if (I4) {
+                    unpack_i4(row, c0, len, buf);
+                    wr = buf;
+                }
+                const bool wa = I4 || aligned16(wr);
+                const uint32_t blocks = len / 16;
+                for (uint32_t b0 = 0; b0 < blocks; b0 += 4) {
+                    const uint32_t nb = blocks - b0 < 4 ? blocks - b0 : 4;
+                    wa ? pie_load_w<true>(wr + 16 * b0, nb) : pie_load_w<false>(wr + 16 * b0, nb);
+                    const int8_t* xp = x + c0 + 16 * b0;
+                    switch (nb) {
+                    case 4: pie_dots<XA, 4>(xp, xs, nv, acc); break;
+                    case 3: pie_dots<XA, 3>(xp, xs, nv, acc); break;
+                    case 2: pie_dots<XA, 2>(xp, xs, nv, acc); break;
+                    default: pie_dots<XA, 1>(xp, xs, nv, acc); break;
+                    }
+                }
+                for (uint32_t c = 16 * blocks; c < len; c++) {
+                    const int32_t wv = wr[c];
+                    const int8_t* xp = x + c0 + c;
+                    for (uint32_t v = 0; v < nv; v++) acc[v] += static_cast<uint32_t>(wv * xp[v * xs]);
+                }
+            }
+            const float ws = load_f32(w_scale + 4 * (r0 + r));
+            for (uint32_t v = 0; v < nv; v++)
+                tmp[r * nv + v] = static_cast<float>(static_cast<int32_t>(acc[v])) * (ws * load_f32(x_scale + 4 * v));
+        }
+        for (uint32_t v = 0; v < nv; v++) {
+            uint8_t* op = out + 4 * (static_cast<size_t>(v) * rows + r0);
+            for (uint32_t r = 0; r < nr; r++) store_f32(op + 4 * r, tmp[r * nv + v]);
+        }
     }
+}
+
+// Vectors in blocks copied to the stack; a vector longer than the block is
+// multiplied in place
+template <bool I4>
+static void matmul(uint8_t* out, const int8_t* w, size_t row_stride, const uint8_t* w_scale, const int8_t* x, const uint8_t* x_scale,
+                   uint32_t rows, uint32_t cols, uint32_t n) {
+    const size_t xs = (static_cast<size_t>(cols) + 15) & ~static_cast<size_t>(15);
+    if (xs > kXBlock) {
+        for (uint32_t p = 0; p < n; p++)
+            matmul_core<I4, false>(out + 4 * static_cast<size_t>(p) * rows, w, row_stride, w_scale, x + static_cast<size_t>(p) * cols, cols,
+                                   x_scale + 4 * p, rows, cols, 1);
+        return;
+    }
+    alignas(16) int8_t xb[kXBlock];
+    uint32_t per = static_cast<uint32_t>(kXBlock / xs);
+    if (per > kVecMax) per = kVecMax;
+    for (uint32_t p0 = 0; p0 < n; p0 += per) {
+        const uint32_t nv = n - p0 < per ? n - p0 : per;
+        for (uint32_t v = 0; v < nv; v++) __builtin_memcpy(xb + v * xs, x + static_cast<size_t>(p0 + v) * cols, cols);
+        matmul_core<I4, true>(out + 4 * static_cast<size_t>(p0) * rows, w, row_stride, w_scale, xb, xs, x_scale + 4 * p0, rows, cols, nv);
+    }
+}
+
+// n int8 vectors already on the stack, xs bytes apart at 16-byte aligned addresses
+static void matmul_i8_aligned(uint8_t* out, const int8_t* w, size_t row_stride, const uint8_t* w_scale, const int8_t* x, size_t xs,
+                              const uint8_t* x_scale, uint32_t rows, uint32_t cols, uint32_t n) {
+    matmul_core<false, true>(out, w, row_stride, w_scale, x, xs, x_scale, rows, cols, n);
 }
 
 void matvec_i8(uint8_t* out, const int8_t* w, size_t row_stride, const uint8_t* w_scale, const int8_t* x, float x_scale,
                uint32_t rows, uint32_t cols) {
-    for (uint32_t r = 0; r < rows; r++, w += row_stride) {
-        const float acc = static_cast<float>(dot_i8(w, x, cols));
-        store_f32(out + 4 * r, acc * (load_f32(w_scale + 4 * r) * x_scale));
-    }
+    matmul<false>(out, w, row_stride, w_scale, x, reinterpret_cast<const uint8_t*>(&x_scale), rows, cols, 1);
 }
 
 void matvec_i4(uint8_t* out, const int8_t* w, size_t row_stride, const uint8_t* w_scale, const int8_t* x, float x_scale,
                uint32_t rows, uint32_t cols) {
-    for (uint32_t r = 0; r < rows; r++, w += row_stride) {
-        uint32_t acc;
-        dots_i4(w, x, cols, 1, &acc);
-        store_f32(out + 4 * r, static_cast<float>(static_cast<int32_t>(acc)) * (load_f32(w_scale + 4 * r) * x_scale));
-    }
-}
-
-// Row after row, each applied to every vector: an int8 row from the cache
-// after the first, an int4 row unpacked once for kGroup vectors
-template <bool I4>
-static void matmul(uint8_t* out, const int8_t* w, size_t row_stride, const uint8_t* w_scale, const int8_t* x, const uint8_t* x_scale,
-                   uint32_t rows, uint32_t cols, uint32_t n) {
-    constexpr uint32_t kGroup = 8;
-    for (uint32_t r = 0; r < rows; r++, w += row_stride) {
-        const float ws = load_f32(w_scale + 4 * r);
-        for (uint32_t p = 0; p < n; p += kGroup) {
-            const uint32_t g = n - p < kGroup ? n - p : kGroup;
-            const int8_t* xp = x + static_cast<size_t>(p) * cols;
-            uint32_t acc[kGroup];
-            if (I4) dots_i4(w, xp, cols, g, acc);
-            else for (uint32_t i = 0; i < g; i++) acc[i] = static_cast<uint32_t>(dot_i8(w, xp + static_cast<size_t>(i) * cols, cols));
-            for (uint32_t i = 0; i < g; i++) {
-                const float acc_f = static_cast<float>(static_cast<int32_t>(acc[i]));
-                store_f32(out + 4 * (static_cast<size_t>(p + i) * rows + r), acc_f * (ws * load_f32(x_scale + 4 * (p + i))));
-            }
-        }
-    }
+    matmul<true>(out, w, row_stride, w_scale, x, reinterpret_cast<const uint8_t*>(&x_scale), rows, cols, 1);
 }
 
 #else   // K32_PIE
@@ -266,35 +314,35 @@ void matvec_i4(uint8_t* out, const int8_t* w, size_t row_stride, const uint8_t* 
 // The sums of one row with G vectors (x + g * cols), each weight loaded and
 // unpacked once: the G sums and the G vector pointers stay in registers
 template <uint32_t G>
-static inline void dots_i8(const int8_t* w, const int8_t* x, uint32_t cols, uint32_t* acc) {
+static inline void dots_i8(const int8_t* w, const int8_t* x, uint32_t cols, size_t xs, uint32_t* acc) {
     uint32_t a[G] = {};
     for (uint32_t c = 0; c < cols; c++) {
         const int32_t wv = w[c];
-        for (uint32_t g = 0; g < G; g++) a[g] += static_cast<uint32_t>(wv * x[g * cols + c]);
+        for (uint32_t g = 0; g < G; g++) a[g] += static_cast<uint32_t>(wv * x[g * xs + c]);
     }
     for (uint32_t g = 0; g < G; g++) acc[g] = a[g];
 }
 
 template <uint32_t G>
-static inline void dots_i4(const int8_t* w, const int8_t* x, uint32_t cols, uint32_t* acc) {
+static inline void dots_i4(const int8_t* w, const int8_t* x, uint32_t cols, size_t xs, uint32_t* acc) {
     uint32_t a[G] = {};
     const uint32_t pairs = cols / 2;
     for (uint32_t j = 0; j < pairs; j++) {
         const int32_t b = w[j], lo = lo4(b), hi = hi4(b);
         for (uint32_t g = 0; g < G; g++)
-            a[g] += static_cast<uint32_t>(lo * x[g * cols + 2 * j]) + static_cast<uint32_t>(hi * x[g * cols + 2 * j + 1]);
+            a[g] += static_cast<uint32_t>(lo * x[g * xs + 2 * j]) + static_cast<uint32_t>(hi * x[g * xs + 2 * j + 1]);
     }
     if (cols & 1) {
         const int32_t lo = lo4(w[pairs]);
-        for (uint32_t g = 0; g < G; g++) a[g] += static_cast<uint32_t>(lo * x[g * cols + cols - 1]);
+        for (uint32_t g = 0; g < G; g++) a[g] += static_cast<uint32_t>(lo * x[g * xs + cols - 1]);
     }
     for (uint32_t g = 0; g < G; g++) acc[g] = a[g];
 }
 
 // Four vectors: written out, since the compiler keeps an array of four sums
 // on the stack
-static inline void dots4_i8(const int8_t* w, const int8_t* x, uint32_t cols, uint32_t* acc) {
-    const int8_t *x0 = x, *x1 = x + cols, *x2 = x + 2 * cols, *x3 = x + 3 * cols;
+static inline void dots4_i8(const int8_t* w, const int8_t* x, uint32_t cols, size_t xs, uint32_t* acc) {
+    const int8_t *x0 = x, *x1 = x + xs, *x2 = x + 2 * xs, *x3 = x + 3 * xs;
     uint32_t a0 = 0, a1 = 0, a2 = 0, a3 = 0;
     for (uint32_t c = 0; c < cols; c++) {
         const int32_t wv = w[c];
@@ -306,8 +354,8 @@ static inline void dots4_i8(const int8_t* w, const int8_t* x, uint32_t cols, uin
     acc[0] = a0; acc[1] = a1; acc[2] = a2; acc[3] = a3;
 }
 
-static inline void dots4_i4(const int8_t* w, const int8_t* x, uint32_t cols, uint32_t* acc) {
-    const int8_t *x0 = x, *x1 = x + cols, *x2 = x + 2 * cols, *x3 = x + 3 * cols;
+static inline void dots4_i4(const int8_t* w, const int8_t* x, uint32_t cols, size_t xs, uint32_t* acc) {
+    const int8_t *x0 = x, *x1 = x + xs, *x2 = x + 2 * xs, *x3 = x + 3 * xs;
     uint32_t a0 = 0, a1 = 0, a2 = 0, a3 = 0;
     const uint32_t pairs = cols / 2;
     for (uint32_t j = 0; j < pairs; j++, x0 += 2, x1 += 2, x2 += 2, x3 += 2) {
@@ -327,21 +375,20 @@ static inline void dots4_i4(const int8_t* w, const int8_t* x, uint32_t cols, uin
     acc[0] = a0; acc[1] = a1; acc[2] = a2; acc[3] = a3;
 }
 
-// Row after row; the groups of a row (4, then 2, then 1 vector) read it
-// from the cache after the first
+// Row after row; the groups of a row (4, then 2, then 1 vector, xs bytes
+// apart) read it from the cache after the first
 template <bool I4>
-static void matmul(uint8_t* out, const int8_t* w, size_t row_stride, const uint8_t* w_scale, const int8_t* x, const uint8_t* x_scale,
-                   uint32_t rows, uint32_t cols, uint32_t n) {
-    static_assert(kMatmulGroup == 4, "dots4");
+static void matmul_core(uint8_t* out, const int8_t* w, size_t row_stride, const uint8_t* w_scale, const int8_t* x, size_t xs,
+                        const uint8_t* x_scale, uint32_t rows, uint32_t cols, uint32_t n) {
     for (uint32_t r = 0; r < rows; r++, w += row_stride) {
         const float ws = load_f32(w_scale + 4 * r);
         for (uint32_t p = 0; p < n;) {
-            uint32_t acc[kMatmulGroup];
+            uint32_t acc[4];
             const uint32_t g = n - p >= 4 ? 4 : n - p >= 2 ? 2 : 1;
-            const int8_t* xp = x + static_cast<size_t>(p) * cols;
-            if (g == 4) I4 ? dots4_i4(w, xp, cols, acc) : dots4_i8(w, xp, cols, acc);
-            else if (g == 2) I4 ? dots_i4<2>(w, xp, cols, acc) : dots_i8<2>(w, xp, cols, acc);
-            else I4 ? dots_i4<1>(w, xp, cols, acc) : dots_i8<1>(w, xp, cols, acc);
+            const int8_t* xp = x + static_cast<size_t>(p) * xs;
+            if (g == 4) I4 ? dots4_i4(w, xp, cols, xs, acc) : dots4_i8(w, xp, cols, xs, acc);
+            else if (g == 2) I4 ? dots_i4<2>(w, xp, cols, xs, acc) : dots_i8<2>(w, xp, cols, xs, acc);
+            else I4 ? dots_i4<1>(w, xp, cols, xs, acc) : dots_i8<1>(w, xp, cols, xs, acc);
             for (uint32_t i = 0; i < g; i++) {
                 const float acc_f = static_cast<float>(static_cast<int32_t>(acc[i]));
                 store_f32(out + 4 * (static_cast<size_t>(p + i) * rows + r), acc_f * (ws * load_f32(x_scale + 4 * (p + i))));
@@ -349,6 +396,17 @@ static void matmul(uint8_t* out, const int8_t* w, size_t row_stride, const uint8
             p += g;
         }
     }
+}
+
+template <bool I4>
+static void matmul(uint8_t* out, const int8_t* w, size_t row_stride, const uint8_t* w_scale, const int8_t* x, const uint8_t* x_scale,
+                   uint32_t rows, uint32_t cols, uint32_t n) {
+    matmul_core<I4>(out, w, row_stride, w_scale, x, cols, x_scale, rows, cols, n);
+}
+
+static void matmul_i8_aligned(uint8_t* out, const int8_t* w, size_t row_stride, const uint8_t* w_scale, const int8_t* x, size_t xs,
+                              const uint8_t* x_scale, uint32_t rows, uint32_t cols, uint32_t n) {
+    matmul_core<false>(out, w, row_stride, w_scale, x, xs, x_scale, rows, cols, n);
 }
 
 #endif  // K32_PIE
@@ -417,6 +475,20 @@ void attention_f32_i8(uint8_t* out, const int8_t* kq, const uint8_t* ks, const i
             vecmat_f32_i8(out + 4 * (static_cast<size_t>(i) * dim + h * hs), vq + kh * hs, kv_stride, vs + 4 * kh, 4 * kvh, att, rows, hs);
         }
     }
+}
+
+// KV head by KV head, so that its rows stay in the cache over the positions
+void attention_full_f32_i8(uint8_t* out, const int8_t* kq, const uint8_t* ks, const int8_t* vq, const uint8_t* vs, const uint8_t* q,
+                           float scale, uint32_t heads, uint32_t kvh, uint32_t hs, size_t kv_stride, uint32_t rows, uint32_t n, uint8_t* att) {
+    const uint32_t per_kv = heads / kvh, dim = heads * hs;
+    for (uint32_t kh = 0; kh < kvh; kh++)
+        for (uint32_t i = 0; i < n; i++)
+            for (uint32_t h = kh * per_kv; h < (kh + 1) * per_kv; h++) {
+                const uint8_t* qh = q + 4 * (static_cast<size_t>(i) * dim + h * hs);
+                matvec_f32_i8(att, kq + kh * hs, kv_stride, ks + 4 * kh, 4 * kvh, qh, scale, rows, hs);
+                softmax_f32(att, rows);
+                vecmat_f32_i8(out + 4 * (static_cast<size_t>(i) * dim + h * hs), vq + kh * hs, kv_stride, vs + 4 * kh, 4 * kvh, att, rows, hs);
+            }
 }
 
 void softmax_f32(uint8_t* x, uint32_t n) {
@@ -568,13 +640,14 @@ static void conv_patch(int8_t* dst, const int8_t* in, uint32_t cin, uint32_t h, 
 
 // Blocks of rows of w of about 8 KB, each applied to every pixel of every
 // map: the block stays in the cache while the patches, built on the stack
-// kMatmulGroup pixels at a time, stream through the product of matmul_i8.
+// kMatmulGroup pixels at a time (each at a 16-byte aligned address), stream
+// through the product.
 void conv3x3_i8(uint8_t* out, const int8_t* w, const uint8_t* w_scale, const uint8_t* bias, const int8_t* in, float in_scale,
                 uint32_t cin, uint32_t cout, uint32_t h, uint32_t w_, uint32_t stride, uint32_t up, uint32_t n, uint32_t y0,
                 uint32_t y1) {
     constexpr uint32_t kMaxRows = 64;
-    const uint32_t cols = 9 * cin, wo = conv3x3_out(w_, stride, up);
-    alignas(16) int8_t patch[kMatmulGroup * 9 * kConvMaxCin];
+    const uint32_t cols = 9 * cin, xs = (cols + 15) & ~15u, wo = conv3x3_out(w_, stride, up);
+    alignas(16) int8_t patch[kMatmulGroup * ((9 * kConvMaxCin + 15) & ~15u)];
     uint8_t scales[4 * kMatmulGroup], acc[4 * kMatmulGroup * kMaxRows];
     for (uint32_t i = 0; i < kMatmulGroup; i++) store_f32(scales + 4 * i, in_scale);
     uint32_t rb = 8192u / cols;
@@ -591,8 +664,8 @@ void conv3x3_i8(uint8_t* out, const int8_t* w, const uint8_t* w_scale, const uin
             for (uint32_t p0 = 0; p0 < pixels; p0 += kMatmulGroup) {
                 const uint32_t g = pixels - p0 < kMatmulGroup ? pixels - p0 : kMatmulGroup;
                 for (uint32_t i = 0; i < g; i++)
-                    conv_patch(patch + static_cast<size_t>(i) * cols, map, cin, h, w_, stride, up, y0 + (p0 + i) / wo, (p0 + i) % wo);
-                matmul_i8(acc, wb, cols, sb, patch, scales, nr, cols, g);
+                    conv_patch(patch + static_cast<size_t>(i) * xs, map, cin, h, w_, stride, up, y0 + (p0 + i) / wo, (p0 + i) % wo);
+                matmul_i8_aligned(acc, wb, cols, sb, patch, xs, scales, nr, cols, g);
                 for (uint32_t i = 0; i < g; i++) {
                     uint8_t* op = omap + 4 * (static_cast<size_t>(p0 + i) * cout + r0);
                     const uint8_t* ap = acc + 4 * static_cast<size_t>(i) * nr;
@@ -820,13 +893,24 @@ static const char kTrapAddI8X[] = K32_OOB("k32_add_f32_i8", "x");
 static const char kTrapAddI8Q[] = K32_OOB("k32_add_f32_i8", "q");
 static const char kTrapQuantSQ[] = K32_OOB("k32_quantize_i8_static", "q");
 static const char kTrapQuantSX[] = K32_OOB("k32_quantize_i8_static", "x");
-static const char kTrapAttOut[] = K32_OOB("k32_attention_f32_i8", "out");
-static const char kTrapAttKq[] = K32_OOB("k32_attention_f32_i8", "kq");
-static const char kTrapAttKs[] = K32_OOB("k32_attention_f32_i8", "ks");
-static const char kTrapAttVq[] = K32_OOB("k32_attention_f32_i8", "vq");
-static const char kTrapAttVs[] = K32_OOB("k32_attention_f32_i8", "vs");
-static const char kTrapAttQ[] = K32_OOB("k32_attention_f32_i8", "q");
-static const char kTrapAttAtt[] = K32_OOB("k32_attention_f32_i8", "att");
+// The two attention imports share one implementation; their link carries this
+struct AttentionImport {
+    const char* name;
+    bool full;   // every position attends to the same rows
+    const char* trap_out;
+    const char* trap_kq;
+    const char* trap_ks;
+    const char* trap_vq;
+    const char* trap_vs;
+    const char* trap_q;
+    const char* trap_att;
+};
+#define K32_ATTENTION(fn, full) \
+    {fn, full, K32_OOB(fn, "out"), K32_OOB(fn, "kq"), K32_OOB(fn, "ks"), K32_OOB(fn, "vq"), K32_OOB(fn, "vs"), K32_OOB(fn, "q"), K32_OOB(fn, "att")}
+static const AttentionImport kAttentionImports[] = {
+    K32_ATTENTION("k32_attention_f32_i8", false),
+    K32_ATTENTION("k32_attention_full_f32_i8", true),
+};
 static const char kTrapConvOut[] = K32_OOB("k32_conv3x3_i8", "out");
 static const char kTrapConvW[] = K32_OOB("k32_conv3x3_i8", "w");
 static const char kTrapConvWScale[] = K32_OOB("k32_conv3x3_i8", "w_scale");
@@ -959,8 +1043,10 @@ static const void* raw_conv(IM3Runtime rt, IM3ImportContext, uint64_t* sp, void*
     return result(sp, K32_OK);
 }
 
-// "i(iiiiiifiiiiiii)": out, kq, ks, vq, vs, q, scale, heads, kvh, hs, kv_stride, pos0, n, att
-static const void* raw_attention(IM3Runtime rt, IM3ImportContext, uint64_t* sp, void* mem) {
+// "i(iiiiiifiiiiiii)": out, kq, ks, vq, vs, q, scale, heads, kvh, hs, kv_stride, pos0 (rows for the full
+// variant), n, att
+static const void* raw_attention(IM3Runtime rt, IM3ImportContext ctx, uint64_t* sp, void* mem) {
+    const AttentionImport& im = *static_cast<const AttentionImport*>(ctx->userdata);
     const uint32_t out = arg(sp, 1), kq = arg(sp, 2), ks = arg(sp, 3), vq = arg(sp, 4), vs = arg(sp, 5), q = arg(sp, 6);
     float scale;
     __builtin_memcpy(&scale, &sp[7], sizeof scale);
@@ -969,19 +1055,20 @@ static const void* raw_attention(IM3Runtime rt, IM3ImportContext, uint64_t* sp, 
     if (heads == 0 || kvh == 0 || heads % kvh || hs == 0) return result(sp, K32_ERR_INVAL);
     const uint64_t kvd = static_cast<uint64_t>(kvh) * hs, kv_stride = stride_arg ? stride_arg : kvd;
     if (kv_stride < kvd) return result(sp, K32_ERR_INVAL);
-    const uint64_t rows = static_cast<uint64_t>(pos0) + n, dim = static_cast<uint64_t>(heads) * hs;
+    const uint64_t rows = im.full ? pos0 : static_cast<uint64_t>(pos0) + n, dim = static_cast<uint64_t>(heads) * hs;
     const uint64_t size = m3_GetMemorySizeAt(mem);
     uint8_t* base = static_cast<uint8_t*>(mem);
-    if (!inside(size, out, 4 * dim * n)) return kTrapAttOut;
-    if (!fits(size, kq, static_cast<uint32_t>(rows), kv_stride, kvd)) return kTrapAttKq;
-    if (!inside(size, ks, 4 * rows * kvh)) return kTrapAttKs;
-    if (!fits(size, vq, static_cast<uint32_t>(rows), kv_stride, kvd)) return kTrapAttVq;
-    if (!inside(size, vs, 4 * rows * kvh)) return kTrapAttVs;
-    if (!inside(size, q, 4 * dim * n)) return kTrapAttQ;
-    if (!inside(size, att, 4 * rows)) return kTrapAttAtt;
-    if (M3Result r = charge(rt, attention_units(heads, hs, pos0, n))) return r;
-    attention_f32_i8(base + out, reinterpret_cast<const int8_t*>(base + kq), base + ks, reinterpret_cast<const int8_t*>(base + vq), base + vs,
-                     base + q, scale, heads, kvh, hs, static_cast<size_t>(kv_stride), pos0, n, base + att);
+    if (!inside(size, out, 4 * dim * n)) return im.trap_out;
+    if (!fits(size, kq, static_cast<uint32_t>(rows), kv_stride, kvd)) return im.trap_kq;
+    if (!inside(size, ks, 4 * rows * kvh)) return im.trap_ks;
+    if (!fits(size, vq, static_cast<uint32_t>(rows), kv_stride, kvd)) return im.trap_vq;
+    if (!inside(size, vs, 4 * rows * kvh)) return im.trap_vs;
+    if (!inside(size, q, 4 * dim * n)) return im.trap_q;
+    if (!inside(size, att, 4 * rows)) return im.trap_att;
+    if (M3Result r = charge(rt, im.full ? attention_full_units(heads, hs, pos0, n) : attention_units(heads, hs, pos0, n))) return r;
+    (im.full ? attention_full_f32_i8 : attention_f32_i8)(base + out, reinterpret_cast<const int8_t*>(base + kq), base + ks,
+                                                         reinterpret_cast<const int8_t*>(base + vq), base + vs, base + q, scale, heads, kvh,
+                                                         hs, static_cast<size_t>(kv_stride), pos0, n, base + att);
     return result(sp, K32_OK);
 }
 
@@ -1023,7 +1110,7 @@ void link_linalg_host_functions(IM3Module module) {
     m3_LinkRawFunction(module, "env", "k32_add_f32_i8", "i(iifi)", &raw_add_i8);
     m3_LinkRawFunction(module, "env", "k32_quantize_i8_static", "i(iifi)", &raw_quantize_static);
     m3_LinkRawFunction(module, "env", "k32_conv3x3_i8", "i(iiiiifiiiiiiiii)", &raw_conv);
-    m3_LinkRawFunction(module, "env", "k32_attention_f32_i8", "i(iiiiiifiiiiiii)", &raw_attention);
+    for (const AttentionImport& im : kAttentionImports) m3_LinkRawFunctionEx(module, "env", im.name, "i(iiiiiifiiiiiii)", &raw_attention, &im);
     m3_LinkRawFunction(module, "env", "k32_fft_q15", "i(iiiii)", &raw_fft);
 }
 

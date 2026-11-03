@@ -48,9 +48,8 @@ void matvec_i4(uint8_t* out, const int8_t* w, size_t row_stride, const uint8_t* 
 // The same products for n vectors at once: x holds n vectors of cols int8
 // values one after another and x_scale n floats, and
 // out[p * rows + r] = (float)(sum over c of w[r][c] * x[p * cols + c]) * (w_scale[r] * x_scale[p]),
-// the bits of n matvec calls. Each row of w is read once for kMatmulGroup
-// vectors (from the weights' memory once for all n: the next group finds it
-// in the cache).
+// the bits of n matvec calls. Each row of w is read from the weights' memory
+// once for all n vectors (kMatmulGroup vectors a group on a host).
 constexpr uint32_t kMatmulGroup = 4;
 void matmul_i8(uint8_t* out, const int8_t* w, size_t row_stride, const uint8_t* w_scale, const int8_t* x, const uint8_t* x_scale,
                uint32_t rows, uint32_t cols, uint32_t n);
@@ -80,6 +79,15 @@ constexpr uint64_t attention_units(uint64_t heads, uint64_t hs, uint64_t pos0, u
     uint64_t u = 0;
     for (uint64_t i = 0; i < n; i++) u += heads * (2 * matrix_units(pos0 + i + 1, hs) + kSoftmaxUnits * (pos0 + i + 1));
     return u;
+}
+
+// The same with every one of the n positions attending to key rows 0 ..
+// rows - 1 (a window every position sees whole): the bits of the three
+// calls per head over rows rows. att holds rows floats.
+void attention_full_f32_i8(uint8_t* out, const int8_t* kq, const uint8_t* ks, const int8_t* vq, const uint8_t* vs, const uint8_t* q,
+                           float scale, uint32_t heads, uint32_t kvh, uint32_t hs, size_t kv_stride, uint32_t rows, uint32_t n, uint8_t* att);
+constexpr uint64_t attention_full_units(uint64_t heads, uint64_t hs, uint64_t rows, uint64_t n) {
+    return n * heads * (2 * matrix_units(rows, hs) + kSoftmaxUnits * rows);
 }
 
 // x = e^(x - max x) / their sum, with k32_expf and the sum in order

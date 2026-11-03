@@ -4,7 +4,7 @@
 //! `src/runtime/app_pod.cpp` (`k32_*`), `src/runtime/pod_linalg.cpp`
 //! (`k32_matvec_*`, `k32_matmul_*`, `k32_vecmat_f32_i8`, `k32_softmax_f32`, the element-wise
 //! `k32_rmsnorm_f32`, `k32_quantize_i8`, `k32_rope_f32`, `k32_swiglu_f32`, `k32_add_f32`,
-//! `k32_argmax_f32`, and `k32_attention_f32_i8`, the convolution `k32_conv3x3_i8`,
+//! `k32_argmax_f32`, `k32_attention_f32_i8` and `k32_attention_full_f32_i8`, the convolution `k32_conv3x3_i8`,
 //! `k32_add_f32_i8` and `k32_quantize_i8_static`, raw here only) and `src/runtime/host_functions.cpp`
 //! (`esp32_delay_ms`, `esp32_rmt_*`, `kube32_channel_*`): pointers and
 //! lengths are `i32`/`u32` in wasm, `k32_time_ms` returns `i64`. The GPIO,
@@ -102,6 +102,7 @@ extern "C" {
     pub fn k32_argmax_f32(x: *const f32, n: u32) -> i32;
     pub fn k32_add_f32_i8(x: *mut f32, q: *const i8, scale: f32, n: u32) -> i32;
     pub fn k32_attention_f32_i8(out: *mut f32, kq: *const i8, ks: *const f32, vq: *const i8, vs: *const f32, q: *const f32, scale: f32, heads: u32, kvh: u32, hs: u32, kv_stride: u32, pos0: u32, n: u32, att: *mut f32) -> i32;
+    pub fn k32_attention_full_f32_i8(out: *mut f32, kq: *const i8, ks: *const f32, vq: *const i8, vs: *const f32, q: *const f32, scale: f32, heads: u32, kvh: u32, hs: u32, kv_stride: u32, rows: u32, n: u32, att: *mut f32) -> i32;
     pub fn k32_quantize_i8_static(q: *mut i8, x: *const f32, inv: f32, n: u32) -> i32;
     pub fn k32_conv3x3_i8(out: *mut f32, w: *const i8, w_scale: *const f32, bias: *const f32, input: *const i8, in_scale: f32, cin: u32, cout: u32, h: u32, w_: u32, stride: u32, up: u32, n: u32, y0: u32, y1: u32) -> i32;
 
@@ -166,6 +167,7 @@ mod stubs {
     pub unsafe fn k32_argmax_f32(x: *const f32, n: u32) -> i32 { no_host() }
     pub unsafe fn k32_add_f32_i8(x: *mut f32, q: *const i8, scale: f32, n: u32) -> i32 { no_host() }
     pub unsafe fn k32_attention_f32_i8(out: *mut f32, kq: *const i8, ks: *const f32, vq: *const i8, vs: *const f32, q: *const f32, scale: f32, heads: u32, kvh: u32, hs: u32, kv_stride: u32, pos0: u32, n: u32, att: *mut f32) -> i32 { no_host() }
+    pub unsafe fn k32_attention_full_f32_i8(out: *mut f32, kq: *const i8, ks: *const f32, vq: *const i8, vs: *const f32, q: *const f32, scale: f32, heads: u32, kvh: u32, hs: u32, kv_stride: u32, rows: u32, n: u32, att: *mut f32) -> i32 { no_host() }
     pub unsafe fn k32_quantize_i8_static(q: *mut i8, x: *const f32, inv: f32, n: u32) -> i32 { no_host() }
     pub unsafe fn k32_conv3x3_i8(out: *mut f32, w: *const i8, w_scale: *const f32, bias: *const f32, input: *const i8, in_scale: f32, cin: u32, cout: u32, h: u32, w_: u32, stride: u32, up: u32, n: u32, y0: u32, y1: u32) -> i32 { no_host() }
     pub unsafe fn esp32_delay_ms(ms: u32) { no_host() }

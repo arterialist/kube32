@@ -66,6 +66,7 @@ APP_IMPORTS = {
     "k32_quantize_i8_static": "i(iifi)",
     "k32_conv3x3_i8": "i(iiiiifiiiiiiiii)",
     "k32_attention_f32_i8": "i(iiiiiifiiiiiii)",
+    "k32_attention_full_f32_i8": "i(iiiiiifiiiiiii)",
     "k32_blob_open": "i(ii)",
     "k32_blob_size": "i(i)",
     "k32_blob_read": "i(iiii)",
