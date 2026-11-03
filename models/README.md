@@ -22,6 +22,14 @@ Small neural networks for kube32 pods, trained on public datasets and exported i
 make -C models check
 ```
 
-builds the C inference of the keyword spotter and the doodle denoiser with the node's kernels and compares it with the test vectors, value for value.
+builds the C inference of the keyword spotter, the doodle denoiser and the diffusion model with the node's kernels and compares it with the test vectors, value for value.
 
 Training data downloads into `~/.cache/kube32-models` (`lm/tinystories.py`, `doodle/fetch.py`, `kws/fetch.py`); the scripts run with any Python that has torch, numpy and sentencepiece.
+
+## Playground
+
+`models/playground.py` runs every model on the host with the pods' math and serves a page at `http://127.0.0.1:8765`: the keyword spotter on a recording from the browser or a word spoken by `say`, the doodle model's denoising steps, the story model alone or with a draft model, and the diffusion model's refinement steps. The same input, seed and step count give the same output as a board.
+
+```sh
+python models/playground.py
+```
