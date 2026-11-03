@@ -238,11 +238,17 @@ osal::Socket HttpConnection::take_socket() {
 // =============================================================================
 // HttpServer
 // =============================================================================
+// A request's handler takes at most two 128-byte store keys from the scratch
+constexpr size_t kWorkerScratchBytes = 1024;
+
 struct HttpServer::Worker {
     HttpServer* server{nullptr};
     uint32_t index{0};
     std::unique_ptr<osal::Thread> thread;
     std::vector<char> rx_buf;
+    // The route handler's scratch (store keys), made with the worker: a
+    // request takes nothing from the heap for it
+    std::vector<uint8_t> scratch;
 };
 
 HttpServer::HttpServer(HttpServerOptions options, storage::Store& store, scheduler::Scheduler* scheduler)
@@ -305,6 +311,7 @@ bool HttpServer::start() {
         w->server = this;
         w->index = i;
         w->rx_buf.resize(options_.rx_buffer_size);
+        w->scratch.resize(kWorkerScratchBytes);
         w->thread = std::make_unique<osal::Thread>();
         osal::Thread::Config cfg;
         static char names[8][16];
@@ -821,9 +828,8 @@ size_t HttpServer::serve_one(Worker& w, osal::Socket& sock, const std::string& c
         if (route_handler_) {
             HttpResponse resp;
             try {
-                mem::MonotonicArena arena;
+                mem::MonotonicArena arena(w.scratch.data(), w.scratch.size());
                 resp = route_handler_->handle_request(req, arena, &sock);
-                arena.reset();
             } catch (const std::exception& e) {
                 printf("[HTTP] %s %.*s failed: %s\n", http_method_str(req.method), (int)(req.path.size() > 60 ? 60 : req.path.size()), req.path.data(), e.what());
                 resp = RouteHandler::make_status(503, "ServiceUnavailable", "node is out of memory");

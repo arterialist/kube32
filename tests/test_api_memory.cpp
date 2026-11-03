@@ -62,6 +62,9 @@ Pool internal_ram, psram;
 size_t total_peak = 0;
 size_t largest = 0;
 std::atomic<uint64_t> refused{0};
+// The largest block either pool can place: a fragmented heap has bytes free
+// in pieces no larger than this
+size_t max_block = kUnlimited;
 
 // 16 bytes in front of every block: its size and pool
 struct alignas(16) Header {
@@ -83,6 +86,10 @@ void* allocate(size_t n) {
         const bool small = n <= kAlwaysInternal;
         Pool& first = small ? internal_ram : psram;
         Pool& second = small ? psram : internal_ram;
+        if (n > max_block) {
+            refused.fetch_add(1);
+            throw std::bad_alloc();
+        }
         if (take(first, n)) {
             pool = small ? 0 : 1;
         } else if (take(second, n)) {
@@ -157,6 +164,11 @@ void limit(size_t internal_free, size_t psram_free) {
 }
 
 void unlimit() { limit(kUnlimited, kUnlimited); }
+
+void fragment(size_t largest_block) {
+    std::lock_guard<std::mutex> lock(mu());
+    max_block = largest_block;
+}
 
 } // namespace board
 
@@ -756,6 +768,82 @@ static void test_controller_loops_survive_exhaustion(uint16_t port) {
     std::cout << "[PASS] test_controller_loops_survive_exhaustion" << std::endl;
 }
 
+// =============================================================================
+// A fragmented heap: bytes enough, but no free block over 4 KiB. Lists, gets,
+// creates the scheduler binds, status updates, lease renewals, the kubelet's
+// pass and deletes all succeed: no request needs a larger block.
+// =============================================================================
+
+static void test_fragmented_heap(uint16_t port) {
+    std::cout << "[RUN] test_fragmented_heap" << std::endl;
+    ControlPlane cp(port);
+    std::vector<std::unique_ptr<Watcher>> watches;
+    cp.watch(watches, 2);
+    // Pods deployed while the heap was whole, their modules in the image store
+    constexpr int kDeployed = 12, kCreated = 4;
+    for (int i = 0; i < kDeployed; ++i) {
+        const std::string body = inline_pod("app-" + std::to_string(i), module_bytes(10 * 1024 + 400, i));
+        assert(call(port, "POST", "/api/v1/namespaces/default/pods", &body).status == 201);
+    }
+    const std::string lease = "{\"apiVersion\":\"coordination.k8s.io/v1\",\"kind\":\"Lease\",\"metadata\":{\"name\":\"n1\","
+                              "\"namespace\":\"kube-node-lease\"},\"spec\":{\"holderIdentity\":\"n1\",\"leaseDurationSeconds\":40}}";
+    const std::string running = "{\"status\":{\"phase\":\"Running\",\"podIP\":\"10.0.0.2\",\"conditions\":[{\"type\":\"Ready\",\"status\":\"True\"}]}}";
+    const std::string node_status = "{\"status\":{\"conditions\":[{\"type\":\"Ready\",\"status\":\"True\",\"reason\":\"KubeletReady\"}]}}";
+    const char* table = "application/json;as=Table;v=v1;g=meta.k8s.io";
+    kubelet::HttpKubeClient kubelet("127.0.0.1", port);
+    kubelet.set_node_filter("n1");
+
+    const uint64_t refused0 = board::refused.load();
+    board::fragment(4096);
+    bool ok = true;
+    auto expect = [&](const char* what, int got, int want) {
+        if (got == want) return;
+        std::printf("    %s: %d, wanted %d\n", what, got, want);
+        ok = false;
+    };
+    const char* lease_path = "/apis/coordination.k8s.io/v1/namespaces/kube-node-lease/leases/n1";
+    expect("lease create", call(port, "PUT", lease_path, &lease).status, 200);
+    for (int i = 0; i < kCreated; ++i) {
+        // Bound at admission (the scheduler runs on the API worker)
+        const std::string body = inline_pod("new-" + std::to_string(i), {});
+        expect("create", call(port, "POST", "/api/v1/namespaces/default/pods", &body).status, 201);
+    }
+    try {
+        cp.sched->reconcile_cluster();
+    } catch (const std::bad_alloc&) {
+        expect("scheduler pass", 0, 1);
+    }
+    expect("list", call(port, "GET", "/api/v1/pods").status, 200);
+    expect("list (Table)", call(port, "GET", "/api/v1/pods", nullptr, "application/json", table).status, 200);
+    expect("namespace list", call(port, "GET", "/api/v1/namespaces/default/pods?limit=500").status, 200);
+    int seen = 0;
+    try {
+        expect("kubelet sync pass", kubelet.for_each_node_pod([&](const kubelet::PodListEntry&) { ++seen; }) ? 1 : 0, 1);
+    } catch (const std::bad_alloc&) {
+        expect("kubelet sync pass", 0, 1);
+    }
+    expect("pods the kubelet saw", seen, kDeployed + kCreated);
+    for (int i = 0; i < kDeployed; ++i) {
+        const std::string path = "/api/v1/namespaces/default/pods/app-" + std::to_string(i);
+        expect("get", call(port, "GET", path.c_str()).status, 200);
+        expect("get (Table)", call(port, "GET", path.c_str(), nullptr, "application/json", table).status, 200);
+        expect("status update", call(port, "PATCH", (path + "/status").c_str(), &running, "application/merge-patch+json").status, 200);
+    }
+    expect("lease renewal", call(port, "PUT", lease_path, &lease).status, 200);
+    expect("node status", call(port, "PATCH", "/api/v1/nodes/n1/status", &node_status, "application/merge-patch+json").status, 200);
+    for (int i = 0; i < kCreated; ++i) {
+        const std::string path = "/api/v1/namespaces/default/pods/new-" + std::to_string(i);
+        expect("delete", call(port, "DELETE", path.c_str()).status, 200);
+        expect("final delete", call(port, "DELETE", (path + "?gracePeriodSeconds=0").c_str()).status, 200);
+    }
+    board::fragment(board::kUnlimited);
+    const uint64_t refused = board::refused.load() - refused0;
+    std::printf("  %d pods, no block over 4 KiB: %s, %llu allocations refused\n", kDeployed + kCreated,
+                ok ? "every request succeeded" : "requests failed", static_cast<unsigned long long>(refused));
+    assert(ok && refused == 0);
+    std::cout << "[PASS] test_fragmented_heap" << std::endl;
+}
+
 int main() {
     std::cout << "=== API server memory with inline images ===" << std::endl;
     osal::Socket::init_networking();
@@ -795,6 +883,7 @@ int main() {
 
     test_out_of_memory_leaves_nothing_half_done(port++);
     test_list_under_memory_pressure(port++);
+    test_fragmented_heap(port++);
     test_controller_loops_survive_exhaustion(port++);
     std::cout << "All API memory tests passed" << std::endl;
     return 0;

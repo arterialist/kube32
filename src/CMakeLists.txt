@@ -61,6 +61,7 @@ set(KUBE32_APP_SRCS
     kubelet/metrics_provider.cpp
     kubelet/node_status_reporter.cpp
     kubelet/firmware_agent.cpp
+    mem/large_blocks.cpp
     mem/memory_tier.cpp
     mem/monotonic_arena.cpp
     models/kube_lease.cpp

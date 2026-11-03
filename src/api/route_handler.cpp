@@ -1029,38 +1029,6 @@ HttpResponse RouteHandler::handle_request(const HttpRequest& req, mem::Monotonic
 }
 
 HttpResponse RouteHandler::dispatch(const HttpRequest& req, const RouteMatch& match, mem::MonotonicArena& arena, osal::Socket* client_sock) {
-    // Arena Scratchpad Allocation 1: Normalized URI & Path Tokens
-    size_t uri_len = req.raw_uri.empty() ? req.path.size() : req.raw_uri.size();
-    char* uri_scratch = static_cast<char*>(arena.allocate(uri_len + 16, 4));
-    if (uri_scratch) {
-        std::memcpy(uri_scratch, req.path.data(), req.path.size());
-        uri_scratch[req.path.size()] = '\0';
-    }
-
-    // Arena Scratchpad Allocation 2: Query String Parameter Parsing
-    struct QueryParamView {
-        std::string_view key;
-        std::string_view value;
-    };
-    constexpr size_t MAX_PARAMS = 16;
-    auto* params = static_cast<QueryParamView*>(arena.allocate(sizeof(QueryParamView) * MAX_PARAMS, alignof(QueryParamView)));
-    size_t param_count = 0;
-    if (params && !req.query_string.empty()) {
-        std::string_view qs = req.query_string;
-        while (!qs.empty() && param_count < MAX_PARAMS) {
-            size_t ampersand = qs.find('&');
-            std::string_view token = (ampersand == std::string_view::npos) ? qs : qs.substr(0, ampersand);
-            size_t eq = token.find('=');
-            if (eq != std::string_view::npos) {
-                params[param_count++] = {token.substr(0, eq), token.substr(eq + 1)};
-            } else {
-                params[param_count++] = {token, ""};
-            }
-            if (ampersand == std::string_view::npos) break;
-            qs = qs.substr(ampersand + 1);
-        }
-    }
-
     // Bodies are JSON; protobuf ones of the kinds handle_request converts
     // arrive here as JSON already. Access reviews are the exception: k9s posts
     // them as protobuf on every view and does not retry, and the answer does

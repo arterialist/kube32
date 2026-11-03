@@ -30,6 +30,7 @@
 #include "hal/firmware_slots.hpp"
 #include "storage/blob_store.hpp"
 #include "mem/function_ref.hpp"
+#include "mem/large_blocks.hpp"
 #include "hal/capability_firewall.hpp"
 #include "hal/i2c_discovery.hpp"
 #include "models/device.hpp"
@@ -1388,7 +1389,11 @@ void on_alloc_failed(size_t size, uint32_t caps, const char* function_name) {
     (void)function_name;
     s_alloc_fail_bytes.store(static_cast<uint32_t>(size));
     s_alloc_fail_caps.store(caps);
-    s_alloc_fail_count.fetch_add(1);
+    // The first large block refused since the last [MEM] line: where it was asked for
+    if (s_alloc_fail_count.fetch_add(1) == 0 && size > kube32::mem::kLargeBlockMin) {
+        printf("[MEM] refused %u bytes (caps 0x%x)\n", (unsigned)size, (unsigned)caps);
+        esp_backtrace_print(12);
+    }
 }
 
 void log_memory(const char* stage) {
@@ -1397,12 +1402,19 @@ void log_memory(const char* stage) {
         snprintf(failed, sizeof(failed), "  %u failed alloc(s), last %u bytes (caps 0x%x)", (unsigned)n, (unsigned)s_alloc_fail_bytes.load(),
                  (unsigned)s_alloc_fail_caps.load());
     }
-    printf("[MEM] %-22s internal free %6u (min %6u, largest %6u)  psram free %7u (min %7u)%s\n", stage,
+    char large[80] = "";
+    const kube32::mem::LargeBlockStats lb = kube32::mem::large_blocks_stats();
+    if (lb.size) {
+        snprintf(large, sizeof(large), "  large blocks free %6u (min %6u, largest %6u, %u overflowed)", (unsigned)lb.free,
+                 (unsigned)lb.min_free, (unsigned)lb.largest, (unsigned)lb.overflows);
+    }
+    printf("[MEM] %-22s internal free %6u (min %6u, largest %6u)  psram free %7u (min %7u, largest %7u)%s%s\n", stage,
            (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
            (unsigned)heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
            (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
            (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM),
-           (unsigned)heap_caps_get_minimum_free_size(MALLOC_CAP_SPIRAM), failed);
+           (unsigned)heap_caps_get_minimum_free_size(MALLOC_CAP_SPIRAM),
+           (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM), large, failed);
 }
 
 void cluster_task(void* pv) {
@@ -1436,6 +1448,11 @@ void cluster_task(void* pv) {
         // pod's linear memory from its start, small pods from its end down.
         // The PSRAM besides it is the system's.
         kube32_pool_reserve_external(20 * 64 * 1024 + 4096);   // 20 Wasm pages plus wasm3's memory header
+        // A control plane sets 64 KiB of its PSRAM aside, while it is whole,
+        // for its large allocations (mem/large_blocks.hpp): lists, object
+        // copies and controller working sets of 4 to 60 KB, which its heap
+        // stops holding in one piece once small objects are spread over it
+        if (ident.is_control_plane && !kube32::mem::large_blocks_reserve(64 * 1024)) printf("[MEM] no PSRAM for the large-block region\n");
         // One shared interpreter stack here too: the interpreter recursion
         // peaks near 56 KB, and a stack that size on each thread that calls
         // into pods (kubelet, ticks, events, ingress, pod server) would take
@@ -1464,8 +1481,8 @@ void cluster_task(void* pv) {
         }
         kube32_pool_set_psram_reserve(system_reserved);
     }
-    printf("[MEM] reserved %u bytes for pod linear memory, %u bytes of PSRAM for the system\n", (unsigned)kube32_pool_block_size(),
-           (unsigned)kube32_pool_psram_reserve());
+    printf("[MEM] reserved %u bytes for pod linear memory, %u bytes of PSRAM for the system, %u for its large blocks\n",
+           (unsigned)kube32_pool_block_size(), (unsigned)kube32_pool_psram_reserve(), (unsigned)kube32::mem::large_blocks_stats().size);
 
     // Peripherals of the integrated display board
     bool has_display = false;
@@ -1654,9 +1671,9 @@ void cluster_task(void* pv) {
     // Channels and peer discovery
     kube32::ipc::ChannelManager::instance().init(ident.id, 7400);
     kube32::ipc::ChannelManager::instance().set_local_identity(ident.id, ident.name);
-    // The dispatcher delivers events into Wasm pods (interpreter recursion):
-    // generous when the stack can live in PSRAM.
-    kube32::ipc::ChannelManager::instance().start_background(3000, ident.has_psram ? 32768 : 4096, ident.has_psram);
+    // The dispatcher queues messages for the pods' event thread and runs no
+    // pod code: its stack holds about 3 KB of native frames
+    kube32::ipc::ChannelManager::instance().start_background(3000, ident.has_psram ? 8192 : 4096, ident.has_psram);
 
     // Local image registry
     {
