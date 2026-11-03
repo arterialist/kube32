@@ -394,7 +394,7 @@ static bool speaker_on_locked(uint32_t rate) {
 // Queues the samples in s_audio_scratch[0, n), already scaled
 static bool speaker_write_locked(uint32_t n) {
     size_t written = 0;
-    if (i2s_channel_write(s_tx_chan, s_audio_scratch, n * sizeof(int16_t), &written, pdMS_TO_TICKS(1000)) != ESP_OK) return false;
+    if (i2s_channel_write(s_tx_chan, s_audio_scratch, n * sizeof(int16_t), &written, 1000) != ESP_OK) return false;   // timeout in ms
     const uint64_t now = esp_timer_get_time();
     const uint64_t ring_us = 1000000ull * kSpeakerDmaDescs * kSpeakerDmaFrames / s_tx_rate;
     const uint64_t queued_us = 1000000ull * n / s_tx_rate;
@@ -524,7 +524,11 @@ int32_t mic_read(int16_t* out, uint32_t max_samples, uint32_t timeout_ms) {
     const uint32_t wait_ms = deadline > now ? static_cast<uint32_t>((deadline - now) / 1000) : 0;
     size_t got = 0;
     // i2s_channel_read copies out of its DMA buffers: any destination address works
-    esp_err_t err = i2s_channel_read(s_rx_chan, out, max_samples * sizeof(int16_t), &got, pdMS_TO_TICKS(wait_ms));
+    esp_err_t err = i2s_channel_read(s_rx_chan, out, max_samples * sizeof(int16_t), &got, wait_ms);   // timeout in ms
+    if (got == 0) {
+        static uint32_t s_empty_reads = 0;
+        if (s_empty_reads++ < 4) ESP_LOGW(TAG, "microphone: no samples in %u ms (%s)", (unsigned)wait_ms, esp_err_to_name(err));
+    }
     s_mic_last_read_us = esp_timer_get_time();
     arm_audio_idle(kMicIdleUs);
     xSemaphoreGive(s_audio_mutex);
