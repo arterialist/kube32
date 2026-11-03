@@ -29,11 +29,9 @@
  *   POST /generate   {"prompt":"Once upon a time","steps":64} (or the prompt as text)
  *   GET  /           state, tokens, text, speed and per-stage timing (JSON)
  *   GET  /text       the text so far */
-#include "llm.h"
+#include "tokenizer.h"
 
 #define CTX_MAX 512
-#define VOCAB_MAX 1024
-#define HASH_SIZE 2048
 #define TOK_BYTES_MAX 16384
 #define WINDOW 4
 #define RETRY_MS 200
@@ -51,12 +49,7 @@ static char g_line[192];
 static uint32_t g_line_len;
 
 /* tokenizer */
-static uint8_t* g_tok_raw;
-static uint32_t g_vocab, g_max_len, g_tok_loaded, g_tok_at;
-static uint32_t g_off[VOCAB_MAX];
-static uint8_t g_len[VOCAB_MAX];
-static float g_score[VOCAB_MAX];
-static uint16_t g_hash[HASH_SIZE];
+static uint32_t g_tok_loaded, g_tok_at;
 
 /* the generation */
 enum { IDLE, RUNNING, DONE, FAILED };
@@ -115,35 +108,15 @@ static void out(void) { k32_resp_write(g_line, g_line_len); g_line_len = 0; }
 static uint32_t now_ms(void) { return (uint32_t)k32_time_ms(); }
 
 /* ---- tokenizer ----------------------------------------------------------- */
-static uint32_t hash(const uint8_t* s, uint32_t n) {
-    uint32_t h = 0x811c9dc5u;
-    for (uint32_t i = 0; i < n; i++) { h ^= s[i]; h *= 0x01000193u; }
-    return h;
-}
-
-static int32_t lookup(const uint8_t* s, uint32_t n) {
-    for (uint32_t h = hash(s, n) & (HASH_SIZE - 1);; h = (h + 1) & (HASH_SIZE - 1)) {
-        const uint16_t id = g_hash[h];
-        if (id == 0xffff) return -1;
-        if (g_len[id] == n) {
-            const uint8_t* p = g_tok_raw + g_off[id];
-            uint32_t i = 0;
-            while (i < n && p[i] == s[i]) i++;
-            if (i == n) return id;
-        }
-    }
-}
-
-/* tokenizer.bin as llama2.c writes it: int max_len, then per token
- * float score, int len, len bytes */
+/* tokenizer.bin from llm-store, parsed where it lands (tokenizer.h) */
 static void load_tokenizer(void) {
-    g_tok_raw = (uint8_t*)(((uintptr_t)&__heap_base + 15u) & ~(uintptr_t)15u);
+    uint8_t* raw = (uint8_t*)(((uintptr_t)&__heap_base + 15u) & ~(uintptr_t)15u);
     char url[160];
     uint32_t ul = 0, n = 0;
     for (uint32_t i = 0; g_store[i] && ul < 120; i++) url[ul++] = g_store[i];
     url[ul++] = '/';
     for (uint32_t i = 0; g_tok_file[i] && ul < sizeof url; i++) url[ul++] = g_tok_file[i];
-    int32_t rc = k32_http_call("GET", 3, url, ul, "", 0, 0, 0, g_tok_raw, TOK_BYTES_MAX, &n, 10000);
+    int32_t rc = k32_http_call("GET", 3, url, ul, "", 0, 0, 0, raw, TOK_BYTES_MAX, &n, 10000);
     g_line_len = 0;
     put("llm-coordinator: ");
     if (rc != 200) {
@@ -151,86 +124,14 @@ static void load_tokenizer(void) {
         log_line();
         return;
     }
-    uint32_t p = 4, v = 0;
-    __builtin_memcpy(&g_max_len, g_tok_raw, 4);
-    for (uint32_t i = 0; i < HASH_SIZE; i++) g_hash[i] = 0xffff;
-    while (p + 8 <= n && v < VOCAB_MAX) {
-        uint32_t len;
-        __builtin_memcpy(&g_score[v], g_tok_raw + p, 4);
-        __builtin_memcpy(&len, g_tok_raw + p + 4, 4);
-        p += 8;
-        if (len > 255 || p + len > n) break;
-        g_off[v] = p;
-        g_len[v] = (uint8_t)len;
-        uint32_t h = hash(g_tok_raw + p, len) & (HASH_SIZE - 1);
-        while (g_hash[h] != 0xffff) h = (h + 1) & (HASH_SIZE - 1);
-        g_hash[h] = (uint16_t)v;
-        p += len;
-        v++;
-    }
-    if (p != n || v < 3) {
+    if (!tok_parse(raw, n)) {
         put("bad tokenizer "); put_n(url, ul);
         log_line();
         return;
     }
-    g_vocab = v;
     g_tok_loaded = 1;
-    put("tokenizer: "); put_u(v); put(" tokens");
+    put("tokenizer: "); put_u(g_vocab); put(" tokens");
     log_line();
-}
-
-/* llama2.c's encode: BOS, a space in front, one token per UTF-8 character
- * (bytes + 3 where there is none), then the best-scored merges */
-static uint32_t encode(const char* text, uint32_t n, uint16_t* toks, uint32_t cap) {
-    uint32_t nt = 0;
-    toks[nt++] = (uint16_t)LLM_BOS;
-    if (n) {
-        int32_t sp = lookup((const uint8_t*)" ", 1);
-        if (sp >= 0) toks[nt++] = (uint16_t)sp;
-    }
-    for (uint32_t i = 0; i < n && nt < cap;) {
-        uint32_t cl = 1;
-        while (i + cl < n && cl < 4 && ((uint8_t)text[i + cl] & 0xc0) == 0x80) cl++;
-        int32_t id = lookup((const uint8_t*)text + i, cl);
-        if (id >= 0) toks[nt++] = (uint16_t)id;
-        else for (uint32_t b = 0; b < cl && nt < cap; b++) toks[nt++] = (uint16_t)((uint8_t)text[i + b] + 3);
-        i += cl;
-    }
-    uint8_t pair[512];
-    for (;;) {
-        float best = -1e10f;
-        int32_t best_id = -1, best_at = -1;
-        for (uint32_t i = 0; i + 1 < nt; i++) {
-            const uint32_t a = g_len[toks[i]], b = g_len[toks[i + 1]];
-            if (a + b > sizeof pair) continue;
-            __builtin_memcpy(pair, g_tok_raw + g_off[toks[i]], a);
-            __builtin_memcpy(pair + a, g_tok_raw + g_off[toks[i + 1]], b);
-            const int32_t id = lookup(pair, a + b);
-            if (id >= 0 && g_score[id] > best) { best = g_score[id]; best_id = id; best_at = (int32_t)i; }
-        }
-        if (best_at < 0) break;
-        toks[best_at] = (uint16_t)best_id;
-        for (uint32_t i = (uint32_t)best_at + 1; i + 1 < nt; i++) toks[i] = toks[i + 1];
-        nt--;
-    }
-    return nt;
-}
-
-/* The text of token `tok` after `prev`: no space right after BOS, <0xHH>
- * as its byte, unprintable bytes left out */
-static uint32_t piece(uint32_t prev, uint32_t tok, char* out) {
-    const uint8_t* p = g_tok_raw + g_off[tok];
-    uint32_t n = g_len[tok];
-    if (prev == LLM_BOS && n && p[0] == ' ') { p++; n--; }
-    if (n == 6 && p[0] == '<' && p[1] == '0' && p[2] == 'x' && p[5] == '>') {
-        uint32_t b = 0;
-        for (int i = 3; i < 5; i++) b = b * 16 + (uint32_t)(p[i] <= '9' ? p[i] - '0' : (p[i] | 0x20) - 'a' + 10);
-        if (b < 0x20 && b != '\n') return 0;
-        out[0] = (char)b;
-        return 1;
-    }
-    for (uint32_t i = 0; i < n; i++) out[i] = (char)p[i];
-    return n;
 }
 
 /* ---- events -------------------------------------------------------------- */
@@ -302,7 +203,7 @@ static int start(const char* prompt, uint32_t n, uint32_t steps) {
     if (!g_tok_loaded) return 503;
     if (n > sizeof g_prompt) n = sizeof g_prompt;
     g_ctx = g_stage_ctx && g_stage_ctx < g_ctx_limit ? g_stage_ctx : g_ctx_limit;
-    g_nprompt = encode(prompt, n, g_toks, g_ctx);
+    g_nprompt = tok_encode(prompt, n, g_toks, g_ctx);
     if (g_nprompt >= g_ctx) return 413;
     for (uint32_t i = 0; i < n; i++) g_prompt[i] = prompt[i];
     g_prompt_len = n;
@@ -327,7 +228,7 @@ static int start(const char* prompt, uint32_t n, uint32_t steps) {
     char pc[256];
     uint32_t pn = 0;
     for (uint32_t i = 1; i < g_nprompt; i++) {
-        uint32_t m = piece(g_toks[i - 1], g_toks[i], pc + pn);
+        uint32_t m = tok_piece(g_toks[i - 1], g_toks[i], pc + pn);
         text_add(pc + pn, m);
         pn += m;
         if (pn >= 40 || i + 1 == g_nprompt) {
@@ -402,7 +303,7 @@ static void result(const struct llm_msg* m) {
     if (tok == LLM_BOS) { finish("end of text"); return; }
     g_toks[g_ntok++] = (uint16_t)tok;
     char pc[64];
-    const uint32_t pn = piece(g_toks[g_ntok - 2], tok, pc);
+    const uint32_t pn = tok_piece(g_toks[g_ntok - 2], tok, pc);
     text_add(pc, pn);
     emit_text("g", pc, pn);
     if (((g_ntok - g_nprompt) & 3) == 0) emit_stats();
@@ -425,7 +326,7 @@ static int32_t post(uint32_t pos, uint32_t flags, uint32_t* us) {
         m.flags |= LLM_MSG_SHOW | (pos < g_nprompt ? LLM_MSG_PROMPT : 0) | (pos == 0 ? LLM_MSG_CLEAR : 0);
         if (pos) {
             char pc[64];
-            const uint32_t n = piece(g_toks[pos - 1], g_toks[pos], pc);
+            const uint32_t n = tok_piece(g_toks[pos - 1], g_toks[pos], pc);
             m.text_len = (uint8_t)(n < sizeof m.text ? n : sizeof m.text);
             __builtin_memcpy(m.text, pc, m.text_len);
         }
