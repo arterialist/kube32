@@ -18,7 +18,8 @@ import json
 from typing import Dict, List, Optional, Any, Tuple
 
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-BIN_PATH = os.path.join(PROJECT_ROOT, "build", "kube32-sim")
+# The simulator of the build in build/, or the one named by KUBE32_SIM
+BIN_PATH = os.path.abspath(os.environ.get("KUBE32_SIM") or os.path.join(PROJECT_ROOT, "build", "kube32-sim"))
 
 logger = logging.getLogger("kube32_cluster")
 

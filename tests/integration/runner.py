@@ -56,6 +56,7 @@ SUITE_MAPPING = {
         "tests.integration.cluster.test_example_placement",
         "tests.integration.cluster.test_drain",
         "tests.integration.cluster.test_pod_migration",
+        "tests.integration.cluster.test_api_follow",
     ],
     "federation": [
         "tests.integration.federation.test_upstream_federation",
