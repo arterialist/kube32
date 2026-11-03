@@ -69,6 +69,8 @@ A board with PSRAM runs two pod workers, one per core. Each worker ticks the pod
 - **Balance.** Every 2 s, the busier worker gives one group of auto-placed pods to the other worker when its pods used a quarter of the window more CPU and the move lowers the busier figure. A group that moved stays where it is for 10 s. The node logs every placement and move: `[POD] <namespace>/<name>: core <n> (<reason>)`.
 - **Order.** Events reach each pod in the order they arrived, also across a move.
 
+On the devkit, with `wordsketch` drawing and writing a story at once, the story's 80 tokens end 15.8 to 17.4 s after the drawing starts with two workers, against 20.4 to 21.1 s with one, and 35 of them arrive during the drawing instead of none. With `llm-diffusion` generating at the same time, the story runs at 4.9 tokens a second instead of 3.6 and ends at 17.9 s instead of 30.5 s, while a diffusion step takes 2.08 s instead of 1.93 s. Pods that read weights from flash share its bus and the cache, so each runs slower beside a busy pod on the other core: `llm-diffusion` alone takes 1.78 s a step with two workers and 1.72 s with one.
+
 Boards without PSRAM keep one `k32_tick` thread and one `k32_events` thread on core 1, which leaves internal RAM for Wi-Fi. `K32_CMD:PODCORES:1` gives a board with PSRAM these two threads from its next boot on, and `K32_CMD:PODCORES:2` restores the two workers. `kube32-sim` runs two workers, or one with `--psram 0` or `--pod-cores 1`.
 
 ## CPU usage
