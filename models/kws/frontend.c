@@ -21,7 +21,12 @@ static int32_t log2_q8(int64_t e) {
 }
 
 void kws_frame(const struct kws_tables* t, const int16_t* s, int32_t out[KWS_MELS]) {
-    int32_t re[KWS_NFFT], im[KWS_NFFT];
+    int32_t buf[2 * KWS_NFFT];
+    kws_frame_buf(t, s, out, buf);
+}
+
+void kws_frame_buf(const struct kws_tables* t, const int16_t* s, int32_t out[KWS_MELS], int32_t* re) {
+    int32_t* im = re + KWS_NFFT;
     for (uint32_t i = 0; i < KWS_NFFT; i++) {
         const uint32_t j = bitrev9(i);
         re[i] = j < KWS_WIN ? (int32_t)(((int64_t)s[j] * t->hann[j] + 16384) >> 15) : 0;
@@ -42,12 +47,14 @@ void kws_frame(const struct kws_tables* t, const int16_t* s, int32_t out[KWS_MEL
             }
         }
     }
-    int64_t p[KWS_BINS];
-    for (uint32_t k = 0; k < KWS_BINS; k++) p[k] = ((int64_t)re[k] * re[k] + (int64_t)im[k] * im[k]) >> 8;
+    /* each bin's power where a filter takes it: no array of 257 powers on the stack */
     const int16_t* w = t->mel_w;
     for (uint32_t m = 0; m < KWS_MELS; m++) {
         int64_t e = 0;
-        for (uint32_t k = 0; k < t->mel_len[m]; k++) e += p[t->mel_start[m] + k] * w[k];
+        for (uint32_t k = 0; k < t->mel_len[m]; k++) {
+            const uint32_t b = t->mel_start[m] + k;
+            e += (((int64_t)re[b] * re[b] + (int64_t)im[b] * im[b]) >> 8) * w[k];
+        }
         w += t->mel_len[m];
         out[m] = log2_q8(e);
     }

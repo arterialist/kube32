@@ -35,6 +35,9 @@ static inline void kws_tables_from_blob(struct kws_tables* t, const uint8_t* blo
 /* 40 log-mel values (log2 in Q8) of the 480 samples at s */
 void kws_frame(const struct kws_tables* t, const int16_t* s, int32_t out[KWS_MELS]);
 
+/* The same with the FFT's 2 x 512 int32 in buf instead of on the stack */
+void kws_frame_buf(const struct kws_tables* t, const int16_t* s, int32_t out[KWS_MELS], int32_t* buf);
+
 /* 49 x 40 values of one second (16000 samples) */
 void kws_features(const struct kws_tables* t, const int16_t* audio, int32_t* out);
 

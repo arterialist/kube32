@@ -42,6 +42,11 @@ int doodle_load(struct doodle_model* m, const uint8_t* blob, uint32_t len);
 
 /* One image: 784 floats in [-1, 1], row-major. Returns 0, or -1 for a
  * schedule the blob does not have. */
+/* When set, doodle_sample calls it with the starting noise (step 0) and
+ * with the image after each step (1 .. steps), so a pod can show the
+ * drawing as it forms. */
+extern void (*doodle_on_step)(uint32_t step, uint32_t steps, const float* x);
+
 int doodle_sample(const struct doodle_model* m, uint32_t cls, uint32_t seed, uint32_t steps, float guidance, float x[784]);
 
 #endif

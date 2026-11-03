@@ -10,7 +10,7 @@ Recognizes six words of Google Speech Commands v2 (cat, dog, bird, house, tree, 
 | Weights | 25,280 (int8) |
 | Blob (`kws.bin`, with the front end tables) | 30,000 B |
 | Multiply-adds per second of audio | 1.66 M, plus 49 FFTs |
-| Maps of `kws_infer.c` | int8 input 1,960 B, two maps of at most 5,760 B |
+| Maps of `kws_infer.c` | int8 input 1,960 B, maps of 5,760 B and 1,920 B (`-DKWS_MAP_MAX=5760 -DKWS_MAP_B_MAX=1920`) |
 
 ## Accuracy
 
@@ -50,7 +50,7 @@ The features minus `offset`, quantized with the first convolution's scale; each 
 - `kws.bin` - model and front end tables.
 - `vectors/` - one test clip of each class: `kws-audio.bin` (8 x 16,000 int16), `kws-features.bin` (8 x 49 x 40 int32), `kws-logits.bin` (8 x 8 float), and `kws.json` with the same values, hashes of every layer's output and the classes.
 - `test.json` - accuracy and confusion matrix.
-- `kws_infer.c`, `frontend.c` - inference for a pod; `make -C models check` runs them on the vectors.
+- `kws_infer.c`, `frontend.c` - inference for a pod; `make -C models check` runs them on the vectors. `kws_frame_buf()` computes a frame with its FFT in a buffer the caller gives, such as the network's first map between classifications (`kws_scratch()`), and `kws_quantize()` with `kws_classify_q()` lets a pod keep the last second as int8 frames.
 
 ```sh
 python models/kws/fetch.py                      # the six words, a quarter of the other speakers, noise

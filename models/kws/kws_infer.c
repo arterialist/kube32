@@ -70,7 +70,9 @@ static int8_t q_static(float y, float inv) {
     return (int8_t)(int32_t)(t + (t >= 0.0f ? 0.5f : -0.5f));
 }
 
-static int8_t g_in[KWS_FRAMES * KWS_MELS], g_a[KWS_MAP_MAX], g_b[KWS_MAP_MAX];
+static int8_t g_a[KWS_MAP_MAX] __attribute__((aligned(4))), g_b[KWS_MAP_B_MAX];
+
+int32_t* kws_scratch(void) { return KWS_MAP_MAX >= 8 * KWS_NFFT ? (int32_t*)(void*)g_a : 0; }
 static int8_t g_patch[512];
 static float g_y[64], g_z[64], g_acc[64];
 
@@ -99,16 +101,24 @@ static void conv_pixel(const struct kws_conv* c, const int8_t* x, float* y) {
     }
 }
 
+void kws_quantize(const struct kws_model* m, const int32_t* features, uint32_t n, int8_t* out) {
+    for (uint32_t i = 0; i < n; i++) out[i] = q_static((float)(features[i] - m->offset), m->conv[0].inv);
+}
+
 int kws_classify(const struct kws_model* m, const int32_t* features, float logits[KWS_CLASSES]) {
-    for (uint32_t i = 0; i < KWS_FRAMES * KWS_MELS; i++) g_in[i] = q_static((float)(features[i] - m->offset), m->conv[0].inv);
-    const int8_t* in = g_in;
+    static int8_t in[KWS_FRAMES * KWS_MELS];
+    kws_quantize(m, features, KWS_FRAMES * KWS_MELS, in);
+    return kws_classify_q(m, in, logits);
+}
+
+int kws_classify_q(const struct kws_model* m, const int8_t* in, float logits[KWS_CLASSES]) {
     uint32_t H = KWS_FRAMES, W = KWS_MELS;
     int8_t* out = g_a;
     /* every convolution but the last pair: whole maps */
     for (uint32_t i = 0; i + 2 < m->n_conv; i++) {
         const struct kws_conv* c = &m->conv[i];
         const uint32_t Ho = (H + 2 * c->ph - c->kh) / c->sh + 1, Wo = (W + 2 * c->pw - c->kw) / c->sw + 1;
-        if (Ho * Wo * c->co > KWS_MAP_MAX) return -1;
+        if (Ho * Wo * c->co > (out == g_a ? KWS_MAP_MAX : KWS_MAP_B_MAX)) return -1;
         const float next_inv = m->conv[i + 1].inv;
         for (uint32_t y = 0; y < Ho; y++)
             for (uint32_t x = 0; x < Wo; x++) {

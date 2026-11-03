@@ -158,6 +158,8 @@ static void forward(const struct doodle_model* m, const float* x, const float* c
 
 static float g_vc[784], g_vu[784];
 
+void (*doodle_on_step)(uint32_t step, uint32_t steps, const float* x);
+
 int doodle_sample(const struct doodle_model* m, uint32_t cls, uint32_t seed, uint32_t steps, float guidance, float x[784]) {
     const struct doodle_sched* s = 0;
     for (uint32_t k = 0; k < m->n_sched; k++)
@@ -165,6 +167,7 @@ int doodle_sample(const struct doodle_model* m, uint32_t cls, uint32_t seed, uin
     if (!s || cls >= m->n_cond) return -1;
     g_rng = seed ? seed : 0x6D2B79F5u;
     for (uint32_t i = 0; i < 784; i++) x[i] = gauss();
+    if (doodle_on_step) doodle_on_step(0, steps, x);
     for (uint32_t i = 0; i < steps; i++) {
         const int8_t* tq = s->tq + i * m->width;
         for (uint32_t k = 0; k < m->width; k++)
@@ -183,6 +186,7 @@ int doodle_sample(const struct doodle_model* m, uint32_t cls, uint32_t seed, uin
             const float eps = sg * x[p] + a * g_vc[p];
             x[p] = an * x0 + sn * eps;
         }
+        if (doodle_on_step) doodle_on_step(i + 1, steps, x);
     }
     return 0;
 }

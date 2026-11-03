@@ -32,7 +32,7 @@ The image goes in as a 14x14 map of 4 channels (each 2x2 block), through seven o
 
 - `doodle-s.bin`, `doodle-l.bin` - the models.
 - `vectors/doodle-{s,l}.json` - one sample per class (16 steps, guidance 2, seeds 1-6): the final image as float bits and u8 pixels, a hash of the image after every step, and one network pass from the first noise with its input and output. `vectors/doodle-{s,l}-samples.bin` hold the same images for `doodle_test.c`.
-- `doodle_infer.c` - the sampler for a pod (build the small model with `-DDOODLE_C0_MAX=20 -DDOODLE_C1_MAX=32`); `make -C models check` compares its images with the reference's.
+- `doodle_infer.c` - the sampler for a pod (build the small model with `-DDOODLE_C0_MAX=20 -DDOODLE_C1_MAX=32`); `make -C models check` compares its images with the reference's. `doodle_on_step`, when set, receives the starting noise and the image after every step.
 
 ```sh
 python models/doodle/fetch.py
