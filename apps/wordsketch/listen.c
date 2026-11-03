@@ -153,10 +153,10 @@ static uint32_t g_col, g_row, g_pcols;   /* g_pcols: the prompt's characters at 
 
 static NOINLINE void status(const char* s) {
     g_out_len = 0;
-    if (g_id) { put(kNames[g_cls]); put(" "); put_i((int32_t)g_p); put("%  "); }
+    if (g_p) { put(kNames[g_cls]); put(" "); put_i((int32_t)g_p); put("%  "); }
     put(s);
     while (g_out_len < 40) g_out[g_out_len++] = ' ';
-    k32_display_text(0, 1, g_out, 40, g_id ? ACCENT : GREY, BLACK);
+    k32_display_text(0, 1, g_out, 40, g_p ? ACCENT : GREY, BLACK);
     g_out_len = 0;
 }
 
@@ -492,6 +492,9 @@ K32_EXPORT("k32_init") int32_t k32_init(void) {
     g_threshold = env_u(LIT("THRESHOLD"), 60);
     g_volume = env_u(LIT("VOLUME"), 30);
     g_vad = (int32_t)env_u(LIT("VAD"), 512);
+    /* words are numbered from a random start: the draw pod skips a number it
+     * just drew, and a restarted pod must not repeat the last one */
+    g_id = k32_random() & 0x3fffffffu;
     const int32_t rc = load_model();
     put("wordsketch-listen: model "); put(rc < 0 ? "not loaded: " : "loaded, tables "); put_i(rc); put(rc < 0 ? "" : " B");
     say();
