@@ -33,6 +33,7 @@
 #include "hal/firmware_slots.hpp"
 #include "osal/sha256.hpp"
 #include "kubelet/kube_api_client.hpp"
+#include "net/api_follow.hpp"
 #include "osal/system.hpp"
 #include "runtime/image_registry.hpp"
 #include "embedded/embedded_blobs.hpp"
@@ -43,6 +44,7 @@
 
 #include <algorithm>
 #include <csignal>
+#include <functional>
 #include <thread>
 #include <unistd.h>
 #include <fstream>
@@ -50,6 +52,7 @@
 #include <cstdlib>
 #include <iostream>
 #include <atomic>
+#include <mutex>
 #include <string>
 #include <vector>
 
@@ -63,6 +66,35 @@ static void signal_handler(int sig) {
     if (g_signals.fetch_add(1) >= 1) _exit(130);
     g_sim_running.store(false);
 }
+
+// The API server a worker dials. The kubelet's threads and the main loop read
+// it; the main loop replaces it when the control plane announces another
+// address.
+class ApiEndpoint {
+public:
+    ApiEndpoint(std::string host, uint16_t port) : host_(std::move(host)), port_(port) {}
+    std::string host() const {
+        std::lock_guard<std::mutex> guard(mutex_);
+        return host_;
+    }
+    uint16_t port() const {
+        std::lock_guard<std::mutex> guard(mutex_);
+        return port_;
+    }
+    void set_host(const std::string& host) {
+        std::lock_guard<std::mutex> guard(mutex_);
+        host_ = host;
+    }
+
+private:
+    mutable std::mutex mutex_;
+    std::string host_;
+    uint16_t port_;
+};
+
+// An address no packet is ever sent to (documentation range): the system's
+// choice of source address toward it is that of the default route
+static constexpr const char* kRouteProbeHost = "192.0.2.1";
 
 // One request to the API server whose answer is only its status
 static int api_call(const std::string& host, uint16_t port, const std::string& token, const char* method, const std::string& path,
@@ -172,7 +204,8 @@ struct SimOptions {
     std::string token;                     // API bearer token (also KUBE32_API_TOKEN)
     bool tls{false};                       // HTTPS on the API port next to plain HTTP
     std::string egress_ca;                 // PEM file of further roots pods' https calls trust
-    std::string node_ip{"127.0.0.1"};      // address the nodes report (pod IPs): a LAN address lets boards reach their pods
+    std::string node_ip{"127.0.0.1"};      // address the nodes report (pod IPs): a LAN address lets boards reach their pods, "auto" follows the network
+    bool node_ip_set{false};               // --node-ip given
     // --psram 0 models a board without PSRAM: the internal pod pool, the
     // shared interpreter stack and this much heap left for pods and the
     // system (a Cardputer has about 51 KiB at idle)
@@ -195,7 +228,8 @@ static void print_sim_usage(std::ostream& out) {
            "Cluster:\n"
            "  --role <role>               standalone (default), control-plane or worker\n"
            "  --port <port>               API server port (default 6443)\n"
-           "  --join <url>                worker: API server to register with\n"
+           "  --join <url>                worker: API server to register with; the worker follows the control\n"
+           "                              plane's announced API address when the server stays silent for 30 s\n"
            "  --token <token>             API bearer token (also KUBE32_API_TOKEN)\n"
            "  --tls                       serve HTTPS next to plain HTTP on the API port\n"
            "  --egress-ca <file>          PEM roots that pods' https:// calls trust besides the system's\n"
@@ -209,7 +243,11 @@ static void print_sim_usage(std::ostream& out) {
            "  --workers <a,b,...>         in-process worker nodes (default esp32-node-02, \"\" for none)\n"
            "  --board <board>             kube32.io/board label of this process's kubelet (default generic)\n"
            "  --worker-board <board>      kube32.io/board label of in-process workers (default cardputer)\n"
-           "  --node-ip <ip>              address nodes report for their pods (default 127.0.0.1)\n"
+           "  --node-ip <ip|auto>         address nodes report for their pods (default 127.0.0.1; auto for a\n"
+           "                              worker whose API server is on another host). auto: the local address\n"
+           "                              toward the API server (for a control plane, of the default route),\n"
+           "                              kept current when the network changes. A control plane with this set\n"
+           "                              announces its address to workers over the IPC channel\n"
            "  --psram <size>              PSRAM to model, e.g. 8Mi; 0 models a board without PSRAM\n"
            "  --heap-budget <size>        heap left for pods and system with --psram 0 (default 51Ki); with\n"
            "                              --psram, the PSRAM besides the pool block (default: not modelled)\n"
@@ -274,7 +312,7 @@ static SimOptions parse_sim_args(int argc, char* argv[]) {
         else if (arg == "--token" && i + 1 < argc) opts.token = argv[++i];
         else if (arg == "--tls") opts.tls = true;
         else if (arg == "--egress-ca" && i + 1 < argc) opts.egress_ca = argv[++i];
-        else if (arg == "--node-ip" && i + 1 < argc) opts.node_ip = argv[++i];
+        else if (arg == "--node-ip" && i + 1 < argc) { opts.node_ip = argv[++i]; opts.node_ip_set = true; }
         else if (arg == "--heap-budget" && i + 1 < argc) {
             opts.heap_budget = static_cast<size_t>(kube32::models::parse_quantity(argv[++i]));
             opts.heap_budget_set = true;
@@ -478,12 +516,37 @@ int main(int argc, char* argv[]) {
             }
         }
 
+        // The API server is read through `api` from here on: the worker
+        // dials another address when the control plane announces one
+        ApiEndpoint api(master_host, master_port);
+
+        // The address the node reports follows the network: with --node-ip
+        // auto, and without --node-ip when the API server is not on this
+        // host, it is the local address the system uses toward the API
+        // server, read again before every registration and heartbeat. A
+        // failed read (no route) leaves the address as it was.
+        const bool node_ip_auto = opts.node_ip == "auto" || (!opts.node_ip_set && !kube32::net::is_loopback_host(master_host));
+        std::string node_ip = opts.node_ip == "auto" ? "127.0.0.1" : opts.node_ip;
+        std::function<std::string()> node_ip_now;
+        if (node_ip_auto) {
+            node_ip_now = [&api] { return kube32::osal::Socket::local_address_toward(api.host().c_str(), api.port()); };
+            const std::string found = node_ip_now();
+            node_ip = found.empty() ? "127.0.0.1" : found;
+            std::cout << "[NET] node address " << node_ip << " (follows the route to " << master_host << ")" << std::endl;
+        }
+        // A control plane sends HELLO to the peers it knows and to the
+        // addresses of its Nodes, which are out of date after a move. The
+        // broadcast reaches it where it is now: it adds this worker as a
+        // peer and its next HELLO, with its API address, comes back.
+        if (!kube32::net::is_loopback_host(master_host)) kube32::ipc::ChannelManager::instance().add_seed_peer("255.255.255.255", 7400);
+
         auto wasm_runtime = kube32::runtime::create_wasm_runtime();
         kube32::kubelet::KubeletConfig kubelet_cfg;
         kubelet_cfg.node_name = opts.node_name;
         kubelet_cfg.api_server_host = master_host;
         kubelet_cfg.api_server_port = master_port;
-        kubelet_cfg.node_ip = opts.node_ip;
+        kubelet_cfg.node_ip = node_ip;
+        kubelet_cfg.node_ip_provider = node_ip_now;
         kubelet_cfg.heartbeat_interval_ms = opts.lease_interval_ms;
         kubelet_cfg.api_token = opts.token;
         kubelet_cfg.node_labels["kube32.io/board"] = opts.board;
@@ -544,7 +607,7 @@ int main(int argc, char* argv[]) {
             const int st = api_client->get_node_annotation(opts.node_name, "kube32.io/left", left);
             if (st == 200 && left.empty()) {
                 left_checked = true;
-            } else if (st == 200 && api_call(master_host, master_port, opts.token, "PATCH", "/api/v1/nodes/" + opts.node_name,
+            } else if (st == 200 && api_call(api.host(), api.port(), opts.token, "PATCH", "/api/v1/nodes/" + opts.node_name,
                                              "{\"spec\":{\"unschedulable\":null},\"metadata\":{\"annotations\":{\"kube32.io/left\":null}}}",
                                              "application/merge-patch+json") == 200) {
                 std::cout << "[SIM] " << opts.node_name << " is schedulable again" << std::endl;
@@ -553,6 +616,28 @@ int main(int argc, char* argv[]) {
 
         std::cout << "[READY] Kubelet worker agent running for " << opts.node_name
                   << " -> connected to http://" << master_host << ":" << master_port << std::endl;
+
+        // As on the boards: an API server that has not answered for
+        // kApiSilenceBeforeFollowMs while the control plane announces another
+        // address (it joined another network, or its address changed) is
+        // dialed at that address, at the same port. Pods keep running.
+        uint64_t quiet_since = kube32::osal::System::get_uptime_ms();
+        uint64_t next_follow_check = 0;
+        auto follow_announced_api = [&] {
+            const uint64_t now = kube32::osal::System::get_uptime_ms();
+            if (now < next_follow_check) return;
+            next_follow_check = now + 1000;
+            const std::string announced = kube32::ipc::ChannelManager::instance().announced_api();
+            const std::string current = api.host();
+            if (!kube32::net::should_follow_announced_api(now, std::max(kubelet->last_sync_ok_ms(), quiet_since), announced, current)) return;
+            std::cout << "[NET] no answer from " << current << "; the control plane announces " << announced << ", switching" << std::endl;
+            const uint16_t port = api.port();
+            api.set_host(announced);
+            api_client->set_server(announced, port);
+            kubelet->set_api_server(announced, port);
+            service_client.set_gateway(announced, port);
+            quiet_since = now;
+        };
 
         kube32::app::PodServerOptions po;
         po.port = opts.pod_port;
@@ -573,6 +658,7 @@ int main(int argc, char* argv[]) {
         while (g_sim_running.load()) {
             tick();
             rejoin();
+            follow_announced_api();
             if (worker_slots->reboot_requested()) {
                 std::cout << "[SIM] " << opts.node_name << " switched firmware slots: start kube32-sim again to boot it" << std::endl;
                 rebooting = true;
@@ -585,7 +671,7 @@ int main(int argc, char* argv[]) {
         if (!rebooting) {
             std::atomic<bool> left{false};
             std::thread leave([&] {
-                emptied = leave_cluster(master_host, master_port, opts.token, opts.node_name);
+                emptied = leave_cluster(api.host(), api.port(), opts.token, opts.node_name);
                 left.store(true);
             });
             while (!left.load()) tick();
@@ -598,9 +684,9 @@ int main(int argc, char* argv[]) {
         kubelet->stop();
         // After the kubelet stops, so no heartbeat registers the Node again
         if (emptied) {
-            const int node_st = api_call(master_host, master_port, opts.token, "DELETE", "/api/v1/nodes/" + opts.node_name, "",
+            const int node_st = api_call(api.host(), api.port(), opts.token, "DELETE", "/api/v1/nodes/" + opts.node_name, "",
                                          "application/json");
-            api_call(master_host, master_port, opts.token, "DELETE",
+            api_call(api.host(), api.port(), opts.token, "DELETE",
                      "/apis/coordination.k8s.io/v1/namespaces/kube-node-lease/leases/" + opts.node_name, "", "application/json");
             std::cout << "[LEAVE] deleted Node " << opts.node_name << ": HTTP " << node_st << std::endl;
         }
@@ -814,6 +900,28 @@ int main(int argc, char* argv[]) {
     mdns->start_service_announcement("_kube32-api._tcp", opts.port, txt_records);
     std::cout << "[M4-NET] ZeroConf mDNS announcing service _kube32-api._tcp on port " << opts.port << std::endl;
 
+    // --node-ip auto: the local address of the default route, read again
+    // while the process runs (the network may change). Its nodes' kubelets
+    // read it through node_ip_provider; "" (no route) keeps the last address.
+    const bool node_ip_auto = opts.node_ip == "auto";
+    auto route_address = [] { return kube32::osal::Socket::local_address_toward(kRouteProbeHost, 9); };
+    std::function<std::string()> node_ip_now;
+    std::string node_ip = opts.node_ip;
+    if (node_ip_auto) {
+        node_ip_now = route_address;
+        node_ip = route_address();
+        if (node_ip.empty()) node_ip = "127.0.0.1";
+        std::cout << "[NET] node address " << node_ip << " (follows the default route)" << std::endl;
+    }
+    // Workers learn where the API server answers from the HELLO frames of
+    // the IPC channel. A control plane announces the address it was given
+    // (--node-ip) or finds (auto), and nothing without one: the default
+    // loopback address names this host to no other.
+    auto announce_api = [&] {
+        kube32::ipc::ChannelManager::instance().set_announced_api(node_ip_auto ? route_address() : (opts.node_ip_set ? opts.node_ip : std::string()));
+    };
+    announce_api();
+
     std::unique_ptr<kube32::kubelet::Kubelet> local_kubelet;
     std::vector<std::unique_ptr<kube32::kubelet::Kubelet>> worker_kubelets;
     std::vector<kube32::kubelet::KubeletConfig> worker_configs;
@@ -836,7 +944,8 @@ int main(int argc, char* argv[]) {
         kubelet_cfg.control_plane = true;
         kubelet_cfg.api_server_host = "127.0.0.1";
         kubelet_cfg.api_server_port = opts.port;
-        kubelet_cfg.node_ip = opts.node_ip;
+        kubelet_cfg.node_ip = node_ip;
+        kubelet_cfg.node_ip_provider = node_ip_now;
         kubelet_cfg.heartbeat_interval_ms = opts.lease_interval_ms;
         kubelet_cfg.api_token = opts.token;
         kubelet_cfg.node_labels["kube32.io/board"] = opts.board;
@@ -884,7 +993,10 @@ int main(int argc, char* argv[]) {
         kube32::app::IngressControllerOptions io;
         io.store = store.get();
         io.local_node_name = (opts.role == "standalone") ? opts.kubelet_name : opts.node_name;
-        io.address = [ip = opts.node_ip]() { return ip; };
+        io.address = [node_ip, node_ip_now]() {
+            const std::string found = node_ip_now ? node_ip_now() : std::string();
+            return found.empty() ? node_ip : found;
+        };
         io.port = opts.ingress_port;
         io.workers = 4;
         io.worker_stack = 262144;
@@ -907,6 +1019,7 @@ int main(int argc, char* argv[]) {
             store->flush(false);
             static uint32_t seconds = 0;
             if (++seconds % 3 == 0) firmware_rollouts.reconcile();
+            if (seconds % 5 == 0) announce_api();
             // A worker that switched firmware slots boots again
             for (size_t i = 0; i < worker_kubelets.size(); ++i) {
                 auto* slots = static_cast<kube32::hal::FileFirmwareSlots*>(worker_configs[i].firmware_slots.get());
