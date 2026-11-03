@@ -1,0 +1,240 @@
+# wordsketch: a word spoken to the Cardputer becomes a doodle and a short
+# story. Five pods on two boards:
+#
+#   wordsketch-listen  Cardputer: microphone, keyword spotter (cat, dog, bird,
+#                      house, tree, bed), the screen; publishes the word on
+#                      wordsketch.word and asks the teller for a story
+#   wordsketch-draw    control plane (PSRAM, own thread): the doodle diffusion
+#                      model, every step's image on wordsketch.frame
+#   wordsketch-story   control plane: stories260K, all five layers (llm-shard)
+#   wordsketch-teller  control plane: tokenizer and generation loop
+#                      (llm-coordinator), tokens on wordsketch.text
+#   wordsketch-store   control plane: serves the story's blobs to the two above
+#
+# The modules travel inline, the weights as blobs on the nodes:
+#   make -C apps/wordsketch
+#   make -C apps/wordsketch upload SERVER=http://<control-plane-ip>:6443
+#   kubectl --context kube32 apply -f apps/wordsketch/build/wordsketch.yaml
+#   curl -s http://<control-plane-ip>/wordsketch                    # attempts and timing
+#   curl -s -X POST 'http://<control-plane-ip>/wordsketch/word?w=cat' # as if heard
+#   curl -sN http://<control-plane-ip>/wordsketch/events            # story tokens (SSE)
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: wordsketch-listen
+  namespace: default
+  labels: {app: wordsketch, tier: listen}
+spec:
+  replicas: 1
+  strategy: {type: Recreate}
+  selector:
+    matchLabels: {app: wordsketch, tier: listen}
+  template:
+    metadata:
+      labels: {app: wordsketch, tier: listen}
+      annotations:
+        kube32.io/wasm-base64: "@wordsketch-listen.wasm"
+        kube32.io/blobs: wordsketch-kws
+        kube32.io/event-topics: wordsketch.frame,wordsketch.text
+        kube32.io/tick-interval: "50ms"
+        kube32.io/execution-budget: "off"
+    spec:
+      nodeSelector:
+        kube32.io/board: cardputer
+      containers:
+        - name: listen
+          image: wasm://inline/wordsketch-listen
+          ports: [{name: http, containerPort: 7000}]
+          env:
+            - {name: STORY_URL, value: "http://wordsketch-teller/generate"}
+            - {name: STORY_STEPS, value: "80"}
+            - {name: STEPS, value: "16"}           # DDIM steps of the drawing: 8 or 16
+            - {name: THRESHOLD, value: "60"}       # percent a keyword needs
+            - {name: VOLUME, value: "30"}          # chime, percent of the speaker's ceiling
+          resources:
+            requests:
+              memory: 20Ki
+              hardware.kube32.io/microphone: "1"
+              hardware.kube32.io/speaker: "1"
+              hardware.kube32.io/tft-display: "1"
+              hardware.kube32.io/ipc: "1"
+            limits: {memory: 20Ki}
+          securityContext:
+            capabilities: {add: ["MICROPHONE", "SPEAKER", "DISPLAY", "CHANNEL_IPC", "SERVICE_CALL"]}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: wordsketch-draw
+  namespace: default
+  labels: {app: wordsketch, tier: draw}
+spec:
+  replicas: 1
+  strategy: {type: Recreate}
+  selector:
+    matchLabels: {app: wordsketch, tier: draw}
+  template:
+    metadata:
+      labels: {app: wordsketch, tier: draw}
+      annotations:
+        kube32.io/wasm-base64: "@wordsketch-draw.wasm"
+        kube32.io/blobs: wordsketch-doodle
+        kube32.io/execution-budget: "off"
+    spec:
+      containers:
+        - name: draw
+          image: wasm://inline/wordsketch-draw
+          env:
+            - {name: GUIDANCE, value: "20"}       # classifier-free guidance in tenths
+          resources:
+            # PSRAM places it: an entry-point pod runs on its own thread
+            requests: {memory: 64Ki, esp32.io/psram: 64Ki, hardware.kube32.io/ipc: "1"}
+            limits: {memory: 64Ki, esp32.io/psram: 64Ki}
+          securityContext:
+            capabilities: {add: ["CHANNEL_IPC"]}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: wordsketch-story
+  namespace: default
+  labels: {app: wordsketch, tier: story}
+spec:
+  replicas: 1
+  strategy: {type: Recreate}
+  selector:
+    matchLabels: {app: wordsketch, tier: story}
+  template:
+    metadata:
+      labels: {app: wordsketch, tier: story}
+      annotations:
+        kube32.io/wasm-base64: "@llm-shard.wasm"
+        kube32.io/wasm-stack: "1536"
+        kube32.io/execution-budget: "off"
+        kube32.io/tick-interval: "100ms"
+    spec:
+      containers:
+        - name: shard
+          image: wasm://inline/llm-shard
+          ports: [{name: http, containerPort: 7000}]
+          env:
+            - {name: STAGE, value: "0"}
+            - {name: MODEL_URL, value: "http://wordsketch-store/wordsketch-story"}
+            - {name: NEXT_URL, value: "http://wordsketch-teller/result"}
+            - name: NODE_NAME
+              valueFrom: {fieldRef: {fieldPath: spec.nodeName}}
+          resources:
+            # the 327 KB model, a KV cache of 118 positions (6 pages)
+            requests: {memory: 384Ki, esp32.io/psram: 384Ki}
+            limits: {memory: 384Ki, esp32.io/psram: 384Ki}
+          securityContext:
+            capabilities: {add: ["SERVICE_CALL"]}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: wordsketch-teller
+  namespace: default
+  labels: {app: wordsketch, tier: teller}
+spec:
+  replicas: 1
+  strategy: {type: Recreate}
+  selector:
+    matchLabels: {app: wordsketch, tier: teller}
+  template:
+    metadata:
+      labels: {app: wordsketch, tier: teller}
+      annotations:
+        kube32.io/wasm-base64: "@llm-coordinator.wasm"
+        kube32.io/tick-interval: "100ms"
+    spec:
+      containers:
+        - name: teller
+          image: wasm://inline/llm-coordinator
+          ports: [{name: http, containerPort: 7000}]
+          env:
+            - {name: SHARD_URL, value: "http://wordsketch-story/x"}
+            - {name: STORE_URL, value: "http://wordsketch-store"}
+            - {name: TOKENIZER, value: "wordsketch-tokenizer"}
+            - {name: TOPIC, value: "wordsketch.text"}
+            - {name: CONTEXT, value: "128"}
+            - {name: STEPS, value: "80"}
+            - {name: PROMPT, value: ""}
+          resources:
+            requests: {memory: 64Ki, esp32.io/psram: 64Ki, hardware.kube32.io/ipc: "1"}
+            limits: {memory: 64Ki, esp32.io/psram: 64Ki}
+          securityContext:
+            capabilities: {add: ["SERVICE_CALL", "CHANNEL_IPC"]}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: wordsketch-store
+  namespace: default
+  labels: {app: wordsketch, tier: store}
+spec:
+  replicas: 1
+  strategy: {type: Recreate}
+  selector:
+    matchLabels: {app: wordsketch, tier: store}
+  template:
+    metadata:
+      labels: {app: wordsketch, tier: store}
+      annotations:
+        kube32.io/wasm-base64: "@wordsketch-store.wasm"
+        kube32.io/wasm-stack: "512"
+        kube32.io/blobs: wordsketch-story,wordsketch-tokenizer
+    spec:
+      containers:
+        - name: store
+          image: wasm://inline/wordsketch-store
+          ports: [{name: http, containerPort: 7000}]
+          resources:
+            requests: {memory: 8Ki, esp32.io/psram: 8Ki}
+            limits: {memory: 8Ki, esp32.io/psram: 8Ki}
+---
+apiVersion: v1
+kind: Service
+metadata: {name: wordsketch-listen, namespace: default}
+spec:
+  selector: {app: wordsketch, tier: listen}
+  ports: [{name: http, port: 80, targetPort: http}]
+---
+apiVersion: v1
+kind: Service
+metadata: {name: wordsketch-story, namespace: default}
+spec:
+  selector: {app: wordsketch, tier: story}
+  ports: [{name: http, port: 80, targetPort: http}]
+---
+apiVersion: v1
+kind: Service
+metadata: {name: wordsketch-teller, namespace: default}
+spec:
+  selector: {app: wordsketch, tier: teller}
+  ports: [{name: http, port: 80, targetPort: http}]
+---
+apiVersion: v1
+kind: Service
+metadata: {name: wordsketch-store, namespace: default}
+spec:
+  selector: {app: wordsketch, tier: store}
+  ports: [{name: http, port: 80, targetPort: http}]
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: wordsketch
+  namespace: default
+  annotations:
+    kube32.io/event-stream: "/wordsketch/events=wordsketch.text"
+spec:
+  rules:
+    - http:
+        paths:
+          - path: /wordsketch
+            pathType: Prefix
+            backend:
+              service:
+                name: wordsketch-listen
+                port: {number: 80}
