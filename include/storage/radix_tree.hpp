@@ -6,6 +6,8 @@
 #include <functional>
 #include <cstdint>
 
+#include "mem/function_ref.hpp"
+
 namespace kube32::storage {
 
 struct RadixNode {
@@ -51,6 +53,11 @@ public:
                 uint64_t* out_deleted_version = nullptr);
     void list(const std::string& prefix, std::vector<std::string>& out_values, 
               std::vector<std::string>* out_keys = nullptr) const;
+    // Calls `fn` with each key under `prefix` and its value in key order, as
+    // list() returns them, without copying values; false from `fn` stops.
+    // False when it was stopped.
+    bool visit(const std::string& prefix,
+               mem::FunctionRef<bool(const std::string& key, const std::string& value)> fn) const;
     void iterate_all(const std::function<void(const std::string& key, 
                                               const std::string& value, 
                                               uint64_t ver, bool ephemeral)>& fn) const;
@@ -72,6 +79,8 @@ private:
     void list_prefix(const RadixNode* current, const std::string& remaining_prefix, 
                      const std::string& current_path, std::vector<std::string>& out_values, 
                      std::vector<std::string>* out_keys) const;
+    bool visit_all(const RadixNode* node, std::string& path,
+                   mem::FunctionRef<bool(const std::string&, const std::string&)> fn) const;
     void iterate_recursive(const RadixNode* current, const std::string& current_path,
                            const std::function<void(const std::string&, const std::string&, 
                                                     uint64_t, bool)>& fn) const;

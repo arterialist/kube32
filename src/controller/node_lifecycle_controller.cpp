@@ -368,15 +368,28 @@ void NodeLifecycleController::evict_pods(const std::map<std::string, uint64_t>& 
     taint.set("key", jstr(kUnreachableTaint));
     taint.set("effect", jstr("NoExecute"));
 
-    std::vector<std::string> pod_jsons;
+    // The pods that name a tainted node, found in place; each is read and
+    // parsed on its own below
+    std::vector<std::string> needles;
+    for (const auto& kv : tainted) needles.push_back("\"" + kv.first + "\"");
     std::vector<std::string> pod_keys;
-    store_.list_extended("/registry/pods/", pod_jsons, &pod_keys);
+    store_.visit("/registry/pods/", [&](const std::string& key, const std::string& json) {
+        for (const auto& n : needles) {
+            if (json.find(n) != std::string::npos) {
+                pod_keys.push_back(key);
+                break;
+            }
+        }
+        return true;
+    });
 
-    for (size_t i = 0; i < pod_jsons.size(); ++i) {
+    for (size_t i = 0; i < pod_keys.size(); ++i) {
         osal::Thread::yield();
+        std::string pod_json;
+        if (!store_.get(pod_keys[i], pod_json).ok()) continue;
         models::JsonValue doc;
         std::string err;
-        if (!models::parse_json(pod_jsons[i], doc, err) || !doc.is_object()) continue;
+        if (!models::parse_json(pod_json, doc, err) || !doc.is_object()) continue;
 
         const models::JsonValue* spec = doc.get("spec");
         const std::string node_name = spec ? spec->get_string("nodeName", "") : "";

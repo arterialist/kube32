@@ -239,25 +239,24 @@ std::string WorkloadController::create_pod(const std::string& owner_kind, const 
 
 void WorkloadController::reconcile() {
     passes_.fetch_add(1);
-    std::vector<std::string> pod_jsons, pod_keys;
-    store_.list_extended("/registry/pods/", pod_jsons, &pod_keys);
+    // Pods a DaemonSet or a Job owns, read in place: only they are parsed and copied
     std::vector<PodView> pods;
-    pods.reserve(pod_jsons.size());
-    for (size_t i = 0; i < pod_jsons.size(); ++i) {
+    store_.visit("/registry/pods/", [&pods](const std::string& key, const std::string& json) {
+        if (json.find("\"DaemonSet\"") == std::string::npos && json.find("\"Job\"") == std::string::npos) return true;
         models::JsonValue p;
         std::string err;
-        if (!models::parse_json(pod_jsons[i], p, err) || !p.is_object()) continue;
+        if (!models::parse_json(json, p, err) || !p.is_object()) return true;
         const models::JsonValue* meta = p.get("metadata");
         const models::JsonValue* refs = meta ? meta->get("ownerReferences") : nullptr;
-        if (!refs || !refs->is_array()) continue;
+        if (!refs || !refs->is_array()) return true;
         PodView v;
         for (const auto& r : refs->arr_val) {
             std::string kind = r.get_string("kind", "");
             if (kind == "DaemonSet" || kind == "Job") { v.owner_kind = kind; v.owner_uid = r.get_string("uid", ""); break; }
         }
-        if (v.owner_kind.empty()) continue;
-        v.key = pod_keys[i];
-        v.json = pod_jsons[i];
+        if (v.owner_kind.empty()) return true;
+        v.key = key;
+        v.json = json;
         v.ns = meta->get_string("namespace", "default");
         v.terminating = !meta->get_string("deletionTimestamp", "").empty();
         const models::JsonValue* spec = p.get("spec");
@@ -271,14 +270,15 @@ void WorkloadController::reconcile() {
         const models::JsonValue* plabels = meta->get("labels");
         v.revision = plabels ? plabels->get_string(kRevisionLabel, "") : "";
         pods.push_back(std::move(v));
-    }
+        return true;
+    });
 
     std::set<std::string> live;
-    std::vector<std::string> node_jsons;
-    store_.list("/registry/nodes/", node_jsons);
-
     std::vector<std::string> jsons, keys;
     store_.list_extended("/registry/daemonsets/", jsons, &keys);
+    // The nodes, for DaemonSets only
+    std::vector<std::string> node_jsons;
+    if (!jsons.empty()) store_.list("/registry/nodes/", node_jsons);
     for (size_t i = 0; i < jsons.size(); ++i) {
         osal::Thread::yield();
         models::JsonValue d;
@@ -497,21 +497,21 @@ void WorkloadController::reconcile_job(const std::string& key, const std::string
         }
     }
 
-    std::vector<std::string> fresh_jsons, fresh_keys;
     int64_t active_now = static_cast<int64_t>(active.size());
     if (!done) {
         // Pods created above are active too
-        store_.list_extended("/registry/pods/" + ns + "/", fresh_jsons, &fresh_keys);
         active_now = 0;
-        for (const auto& pj : fresh_jsons) {
+        store_.visit("/registry/pods/" + ns + "/", [&](const std::string&, const std::string& pj) {
+            if (pj.find(uid) == std::string::npos) return true;
             models::JsonValue p;
-            if (!models::parse_json(pj, p, err) || !p.is_object() || !models::has_owner(p, "Job", uid)) continue;
+            if (!models::parse_json(pj, p, err) || !p.is_object() || !models::has_owner(p, "Job", uid)) return true;
             const models::JsonValue* st = p.get("status");
             std::string phase = st ? st->get_string("phase", "") : "";
             const models::JsonValue* pm = p.get("metadata");
             bool terminating = pm && !pm->get_string("deletionTimestamp", "").empty();
             if (phase != "Succeeded" && phase != "Failed" && !terminating) ++active_now;
-        }
+            return true;
+        });
     }
     status.set("active", jnum(static_cast<double>(active_now)));
     status.set("ready", jnum(static_cast<double>(ready)));

@@ -8,6 +8,7 @@
 // and std::bad_alloc when neither has room, as heap_caps_malloc_default() does
 // on the ESP32-S3 with CONFIG_SPIRAM_USE_MALLOC.
 
+#include "api/event_recorder.hpp"
 #include "api/http_server.hpp"
 #include "api/watch_hub.hpp"
 #include "app/ingress_controller.hpp"
@@ -844,6 +845,121 @@ static void test_fragmented_heap(uint16_t port) {
     std::cout << "[PASS] test_fragmented_heap" << std::endl;
 }
 
+// =============================================================================
+// A Deployment on a fragmented heap: with the event store full (64 events)
+// and no free block over 4 KiB, a Deployment creates its pod, scales to
+// kReplicas and to 0, and is deleted, within a budget the size of a busy
+// control plane's free PSRAM. The controllers and the scheduler read the
+// store in place; a pass copies one object at a time, never every pod or
+// every event.
+// =============================================================================
+
+static void test_deployment_on_fragmented_heap(uint16_t port) {
+    std::cout << "[RUN] test_deployment_on_fragmented_heap" << std::endl;
+    constexpr int kReplicas = 8;
+    constexpr size_t kBudget = 96 * 1024;   // free bytes for the whole sequence, a quarter of them internal RAM
+    ControlPlane cp(port);
+    controller::DeploymentController deployments(*cp.store, cp.sched.get());
+    {
+        // The bound of the event store, as a busy cluster keeps it
+        api::EventRecorder events(*cp.store, 64);
+        for (int i = 0; i < 64; ++i) {
+            api::EventSpec ev;
+            ev.involved.kind = "Pod";
+            ev.involved.name = "other-" + std::to_string(i) + "-7f9c4b6d8-x2v5q";
+            ev.involved.namespace_name = "default";
+            ev.involved.uid = models::generate_uid();
+            ev.reason = "Scheduled";
+            ev.message = "Successfully assigned default/" + ev.involved.name + " to n1 (" + std::string(400, 'm') + ")";
+            ev.component = "default-scheduler";
+            events.record(ev);
+        }
+    }
+    // A template the size of an application's (labels, annotations, env)
+    std::string env;
+    for (int i = 0; i < 12; ++i) env += std::string(i ? "," : "") + "{\"name\":\"SETTING_" + std::to_string(i) + "\",\"value\":\"" + std::string(48, 'v') + "\"}";
+    const std::string dep = "{\"apiVersion\":\"apps/v1\",\"kind\":\"Deployment\",\"metadata\":{\"name\":\"storelist-test\",\"labels\":{\"app\":\"storelist-test\"}},"
+                            "\"spec\":{\"replicas\":1,\"selector\":{\"matchLabels\":{\"app\":\"storelist-test\"}},\"template\":{\"metadata\":{\"labels\":"
+                            "{\"app\":\"storelist-test\"},\"annotations\":{\"kube32.io/description\":\"" + std::string(300, 'd') + "\"}},"
+                            "\"spec\":{\"containers\":[{\"name\":\"c\",\"image\":\"wasm://embedded/echo\",\"env\":[" + env + "],"
+                            "\"ports\":[{\"containerPort\":7000,\"name\":\"http\"}],\"resources\":{\"requests\":{\"memory\":\"16Ki\"}}}]}}}}";
+    const char* path = "/apis/apps/v1/namespaces/default/deployments/storelist-test";
+    const std::string running = "{\"status\":{\"phase\":\"Running\",\"podIP\":\"10.0.0.2\",\"conditions\":[{\"type\":\"Ready\",\"status\":\"True\"}],"
+                                "\"containerStatuses\":[{\"name\":\"c\",\"ready\":true,\"restartCount\":0,\"state\":{\"running\":{}}}]}}";
+    auto pod_names = [&]() {
+        std::vector<std::string> names;
+        cp.store->visit("/registry/pods/default/", [&names](const std::string& key, const std::string& json) {
+            if (json.find("\"deletionTimestamp\"") == std::string::npos) names.push_back(key.substr(key.rfind('/') + 1));
+            return true;
+        });
+        return names;
+    };
+    bool ok = true;
+    auto expect = [&](const char* what, int got, int want) {
+        if (got == want) return;
+        std::printf("    %s: %d, wanted %d\n", what, got, want);
+        ok = false;
+    };
+    auto passes = [&]() {
+        try {
+            deployments.reconcile();
+            cp.sched->reconcile_cluster();
+        } catch (const std::bad_alloc&) {
+            expect("controller pass out of memory", 1, 0);
+        }
+    };
+    // Each pod as its kubelet reports it Running, and as it finishes a delete
+    auto report_running = [&]() {
+        for (const auto& name : pod_names()) {
+            const std::string p = "/api/v1/namespaces/default/pods/" + name + "/status";
+            expect("pod status update", call(port, "PATCH", p.c_str(), &running, "application/merge-patch+json").status, 200);
+        }
+    };
+    auto finish_deletes = [&]() {
+        std::vector<std::string> gone;
+        cp.store->visit("/registry/pods/default/", [&gone](const std::string& key, const std::string& json) {
+            if (json.find("\"deletionTimestamp\"") != std::string::npos) gone.push_back(key.substr(key.rfind('/') + 1));
+            return true;
+        });
+        for (const auto& name : gone) {
+            const std::string p = "/api/v1/namespaces/default/pods/" + name + "?gracePeriodSeconds=0";
+            expect("final pod delete", call(port, "DELETE", p.c_str()).status, 200);
+        }
+    };
+    auto scale = [&](int replicas) {
+        const std::string patch = "{\"spec\":{\"replicas\":" + std::to_string(replicas) + "}}";
+        expect("kubectl scale", call(port, "PATCH", (std::string(path) + "/scale").c_str(), &patch, "application/merge-patch+json").status, 200);
+        passes();
+        report_running();
+        passes();
+        finish_deletes();
+        passes();
+        expect("pods", static_cast<int>(pod_names().size()), replicas);
+    };
+
+    const uint64_t refused0 = board::refused.load();
+    board::Usage m = board::mark();
+    board::limit(kBudget / 4, kBudget - kBudget / 4);
+    board::fragment(4096);
+    expect("kubectl create deployment", call(port, "POST", "/apis/apps/v1/namespaces/default/deployments", &dep).status, 201);
+    passes();
+    report_running();
+    passes();
+    expect("pods", static_cast<int>(pod_names().size()), 1);
+    scale(kReplicas);
+    scale(0);
+    expect("kubectl delete deployment", call(port, "DELETE", path).status, 200);
+    passes();
+    board::fragment(board::kUnlimited);
+    board::unlimit();
+    const board::Window w = board::since(m);
+    const uint64_t refused = board::refused.load() - refused0;
+    std::printf("  1 -> %d -> 0 replicas, 64 events, no block over 4 KiB, %zu KiB budget: %s, peak %zu, %llu allocations refused\n", kReplicas,
+                kBudget / 1024, ok ? "every step succeeded" : "steps failed", w.peak_total, static_cast<unsigned long long>(refused));
+    assert(ok && refused == 0);
+    std::cout << "[PASS] test_deployment_on_fragmented_heap" << std::endl;
+}
+
 int main() {
     std::cout << "=== API server memory with inline images ===" << std::endl;
     osal::Socket::init_networking();
@@ -884,6 +1000,7 @@ int main() {
     test_out_of_memory_leaves_nothing_half_done(port++);
     test_list_under_memory_pressure(port++);
     test_fragmented_heap(port++);
+    test_deployment_on_fragmented_heap(port++);
     test_controller_loops_survive_exhaustion(port++);
     std::cout << "All API memory tests passed" << std::endl;
     return 0;

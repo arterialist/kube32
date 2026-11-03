@@ -268,13 +268,11 @@ uint64_t CheckpointController::wall_ms() const {
 }
 
 std::vector<CheckpointController::Node> CheckpointController::load_nodes() {
-    std::vector<std::string> jsons;
-    store_.list("/registry/nodes/", jsons);
     std::vector<Node> nodes;
-    for (const auto& json : jsons) {
+    store_.visit("/registry/nodes/", [&nodes](const std::string&, const std::string& json) {
         JsonValue doc;
         std::string err;
-        if (!models::parse_json(json, doc, err) || !doc.is_object()) continue;
+        if (!models::parse_json(json, doc, err) || !doc.is_object()) return true;
         Node n;
         n.name = field(doc, "metadata", "name");
         n.port = models::node_pod_port(doc);
@@ -293,7 +291,8 @@ std::vector<CheckpointController::Node> CheckpointController::load_nodes() {
             }
         }
         nodes.push_back(std::move(n));
-    }
+        return true;
+    });
     return nodes;
 }
 
@@ -308,8 +307,6 @@ void CheckpointController::reconcile(uint64_t now) {
     if (now == 0) now = osal::System::get_uptime_ms();
     passes_.fetch_add(1);
     const std::vector<Node> nodes = load_nodes();
-    Pods pods;
-    store_.list_extended(kPodPrefix, pods.jsons, &pods.keys);
 
     std::vector<Ckpt> cks;
     {
@@ -336,6 +333,25 @@ void CheckpointController::reconcile(uint64_t now) {
             c.new_pod = field(c.doc, "status", "newPodName");
             cks.push_back(std::move(c));
         }
+    }
+
+    // Every pod's key; the value only of the pods a pass reads: those a
+    // checkpoint names, and those with a checkpoint policy or a restore
+    Pods pods;
+    {
+        std::set<std::string> named;
+        for (const auto& ck : cks) {
+            named.insert(kPodPrefix + ck.ns + "/" + ck.pod);
+            if (!ck.new_pod.empty()) named.insert(kPodPrefix + ck.ns + "/" + ck.new_pod);
+        }
+        store_.visit(kPodPrefix, [&](const std::string& key, const std::string& json) {
+            const bool read = named.count(key) || json.find(models::kAnnotationRestoreFrom) != std::string::npos ||
+                              json.find(models::kAnnotationCheckpointInterval) != std::string::npos ||
+                              json.find("\"Auto\"") != std::string::npos;
+            pods.keys.push_back(key);
+            pods.jsons.push_back(read ? json : std::string());
+            return true;
+        });
     }
 
     for (auto& ck : cks) {

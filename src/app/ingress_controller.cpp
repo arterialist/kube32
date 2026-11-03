@@ -294,10 +294,16 @@ void IngressController::rebuild_locked() {
     try {
         std::vector<std::string> ingresses, services, pods, nodes, devices;
         opts_.store->list("/registry/ingresses/", ingresses);
-        opts_.store->list("/registry/services/", services);
-        opts_.store->list("/registry/pods/", pods);
-        opts_.store->list("/registry/nodes/", nodes);
-        if (!ingresses.empty()) opts_.store->list("/registry/devices/", devices);
+        // Backends exist only for Ingresses, and only Running pods are endpoints
+        if (!ingresses.empty()) {
+            opts_.store->list("/registry/services/", services);
+            opts_.store->visit("/registry/pods/", [&pods](const std::string&, const std::string& json) {
+                if (json.find("\"Running\"") != std::string::npos) pods.push_back(json);
+                return true;
+            });
+            opts_.store->list("/registry/nodes/", nodes);
+            opts_.store->list("/registry/devices/", devices);
+        }
         std::shared_ptr<const RouteTable> previous = routes();
         table = build_route_table(ingresses, services, pods, previous.get(), nodes, devices);
     } catch (const std::exception& e) {

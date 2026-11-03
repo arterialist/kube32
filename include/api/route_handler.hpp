@@ -194,11 +194,16 @@ private:
     void seed_namespaces();
     // Shared helpers
     std::string list_json(const ResourceInfo& info, const std::vector<std::string>& jsons) const;
+    // The request's field and label selectors, then its page (limit, continue)
     bool filter_list(const HttpRequest& req, std::vector<std::string>& jsons, HttpResponse& err_out) const;
+    // filter_list() over the objects under `prefix`, matched in place: only
+    // the objects the selectors keep are copied into `jsons`
+    bool select_list(const HttpRequest& req, const std::string& prefix, std::vector<std::string>& jsons, HttpResponse& err_out) const;
+    bool page_list(const HttpRequest& req, std::vector<std::string>& jsons, HttpResponse& err_out) const;
     void stamp_new_object(models::JsonValue& doc, const std::string& ns, const ResourceInfo& info) const;
     HttpResponse handle_watch(const HttpRequest& req, const RouteMatch& match, osal::Socket* client_sock);
-    HttpResponse handle_generic(const HttpRequest& req, const RouteMatch& match, const ResourceInfo& info);
-    HttpResponse handle_events(const HttpRequest& req, const RouteMatch& match);
+    HttpResponse handle_generic(const HttpRequest& req, const RouteMatch& match, const ResourceInfo& info, osal::Socket* client_sock = nullptr);
+    HttpResponse handle_events(const HttpRequest& req, const RouteMatch& match, osal::Socket* client_sock = nullptr);
     HttpResponse handle_pod_log(const HttpRequest& req, const RouteMatch& match, osal::Socket* client_sock);
     HttpResponse handle_pod_eviction(const HttpRequest& req, const RouteMatch& match);
     HttpResponse handle_device_activate(const HttpRequest& req, const RouteMatch& match);

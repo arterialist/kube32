@@ -392,6 +392,12 @@ public:
         return Status::Ok();
     }
 
+    Status visit(const std::string& prefix, Visitor fn) override {
+        std::lock_guard<std::recursive_mutex> lock(rw_mutex_);
+        tree_.visit(prefix, fn);
+        return Status::Ok();
+    }
+
     uint32_t watch(const std::string& prefix, WatchCallback cb) override {
         std::lock_guard<std::recursive_mutex> lock(rw_mutex_);
         uint32_t id = ++next_watch_id_;

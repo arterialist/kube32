@@ -53,7 +53,7 @@ private:
     static void task_entry(void* arg);
     void run_loop();
     void reconcile_one(const std::string& key, models::JsonValue& dep, const std::vector<PodView>& pods);
-    void delete_pod(const std::string& pod_key, const std::string& pod_json);
+    void delete_pod(const std::string& pod_key);
 
     storage::Store& store_;
     scheduler::Scheduler* scheduler_;

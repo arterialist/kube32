@@ -23,15 +23,21 @@ uint64_t parse_quantity(const std::string& val) {
 // memory the kubelet gives it. The runtime's own memory is its overhead.
 static constexpr uint64_t kDefaultPodMemoryBytes = 64 * 1024;
 
+static ResourceSpec pod_resource_requests(const models::JsonValue& doc);
+
 ResourceSpec extract_pod_resource_requests(const std::string& pod_json) {
-    ResourceSpec spec;
     models::JsonValue doc;
     std::string err;
     if (!models::parse_json(pod_json, doc, err) || !doc.is_object()) {
+        ResourceSpec spec;
         spec.memory_bytes = kDefaultPodMemoryBytes;
         return spec;
     }
+    return pod_resource_requests(doc);
+}
 
+static ResourceSpec pod_resource_requests(const models::JsonValue& doc) {
+    ResourceSpec spec;
     const models::JsonValue* spec_val = doc.get("spec");
     if (!spec_val || !spec_val->is_object()) {
         spec.memory_bytes = kDefaultPodMemoryBytes;
@@ -201,46 +207,42 @@ static bool container_running(const models::JsonValue* status) {
 static std::map<std::string, ResourceSpec> allocated_by_node(storage::Store& store, const std::map<std::string, uint64_t>& node_versions,
                                                              const std::string& exclude_pod_key) {
     std::map<std::string, ResourceSpec> allocated;
-    std::vector<std::string> pod_jsons;
-    std::vector<std::string> pod_keys;
-    store.list_extended("/registry/pods/", pod_jsons, &pod_keys);
-
-    for (size_t i = 0; i < pod_jsons.size(); ++i) {
-        if (!exclude_pod_key.empty() && pod_keys[i] == exclude_pod_key) {
-            continue;
-        }
+    // Each pod is read in place and parsed once
+    store.visit("/registry/pods/", [&](const std::string& key, const std::string& json) {
+        if (!exclude_pod_key.empty() && key == exclude_pod_key) return true;
 
         models::JsonValue doc;
         std::string err;
-        if (!models::parse_json(pod_jsons[i], doc, err) || !doc.is_object()) continue;
+        if (!models::parse_json(json, doc, err) || !doc.is_object()) return true;
 
         const models::JsonValue* spec = doc.get("spec");
-        if (!spec || !spec->is_object()) continue;
+        if (!spec || !spec->is_object()) return true;
 
         auto node = node_versions.find(spec->get_string("nodeName", ""));
-        if (node == node_versions.end()) continue;
+        if (node == node_versions.end()) return true;
         const uint64_t node_rv = node->second;
 
         const models::JsonValue* status = doc.get("status");
         std::string phase = status ? status->get_string("phase", "") : "";
-        if (phase == "Succeeded" || phase == "Failed") continue;
+        if (phase == "Succeeded" || phase == "Failed") return true;
         allocated[node->first].pods++;   // a pod count is not in any report: every bound pod counts
 
-        ResourceSpec req = extract_pod_resource_requests(pod_jsons[i]);
+        ResourceSpec req = pod_resource_requests(doc);
         ResourceSpec& used = allocated[node->first];
         used.memory_bytes += req.memory_bytes;
         used.psram_bytes += req.psram_bytes;
 
-        if (phase != "Running" && phase != "Pending") continue;
+        if (phase != "Running" && phase != "Pending") return true;
         const bool reflected = phase == "Running" && container_running(status) && node_rv > 0 && resource_version_of(doc) < node_rv;
-        if (reflected) continue;
+        if (reflected) return true;
         used.gpio_pins += req.gpio_pins;
         used.i2c_buses += req.i2c_buses;
         used.uart_ports += req.uart_ports;
         used.rmt_tx_channels += req.rmt_tx_channels;
         used.rmt_rx_channels += req.rmt_rx_channels;
         used.adc_channels += req.adc_channels;
-    }
+        return true;
+    });
 
     return allocated;
 }
@@ -691,22 +693,19 @@ private:
 
     void pass(uint64_t now, bool resync) {
         // 1. Nodes in the cluster registry
-        std::vector<std::string> node_jsons, node_keys;
-        store_.list_extended("/registry/nodes/", node_jsons, &node_keys);
+        static const size_t kNodePrefix = std::string("/registry/nodes/").size();
         std::set<std::string> existing_nodes;
-        for (const auto& k : node_keys) existing_nodes.insert(k.substr(std::string("/registry/nodes/").size()));
+        store_.visit("/registry/nodes/", [&existing_nodes](const std::string& key, const std::string&) {
+            existing_nodes.insert(key.substr(kNodePrefix));
+            return true;
+        });
 
-        // 2. Scan all pods in store
-        std::vector<std::string> pod_jsons;
-        std::vector<std::string> pod_keys;
-        store_.list_extended("/registry/pods/", pod_jsons, &pod_keys);
-
-        std::set<std::string> waiting;   // pods tried and still unbound
-        for (size_t i = 0; i < pod_jsons.size(); ++i) {
-            osal::Thread::yield();
+        // 2. The pods that need a node, found in place: their keys and versions
+        std::vector<std::pair<std::string, uint64_t>> unplaced;
+        store_.visit("/registry/pods/", [&](const std::string& key, const std::string& json) {
             models::JsonValue doc;
             std::string err;
-            if (!models::parse_json(pod_jsons[i], doc, err) || !doc.is_object()) continue;
+            if (!models::parse_json(json, doc, err) || !doc.is_object()) return true;
 
             const models::JsonValue* spec = doc.get("spec");
             std::string assigned_node = spec ? spec->get_string("nodeName", "") : "";
@@ -716,16 +715,22 @@ private:
             // DaemonSet pods belong to their node; the DaemonSet controller
             // removes them when the node goes away
             bool is_daemon = models::has_owner(doc, "DaemonSet") || (labels && labels->get_string("kube32.io/daemonset", "") == "true");
-            if (is_daemon && !assigned_node.empty() && assigned_node != "<none>") continue;
-            if (meta && !meta->get_string("deletionTimestamp", "").empty()) continue; // being torn down
+            if (is_daemon && !assigned_node.empty() && assigned_node != "<none>") return true;
+            if (meta && !meta->get_string("deletionTimestamp", "").empty()) return true; // being torn down
 
             // Unbound (new, or evicted by NodeLifecycleController), or bound to a
             // node deleted from /registry/nodes/: evict and re-schedule. A bound
             // pod stays Pending until its kubelet starts it; it is not re-evaluated.
             const bool unbound = assigned_node.empty() || assigned_node == "<none>";
-            if (!unbound && existing_nodes.count(assigned_node)) continue;
-            const std::string& key = pod_keys[i];
-            if (!attempt_due(key, resource_version_of(doc), now, resync)) {
+            if (!unbound && existing_nodes.count(assigned_node)) return true;
+            unplaced.emplace_back(key, resource_version_of(doc));
+            return true;
+        });
+
+        std::set<std::string> waiting;   // pods tried and still unbound
+        for (const auto& [key, pod_version] : unplaced) {
+            osal::Thread::yield();
+            if (!attempt_due(key, pod_version, now, resync)) {
                 waiting.insert(key);
                 continue;
             }
@@ -769,7 +774,7 @@ private:
             return {false, "", "Invalid pod manifest"};
         }
 
-        ResourceSpec pod_req = extract_pod_resource_requests(in_out_pod_json);
+        ResourceSpec pod_req = pod_resource_requests(pod_doc);
 
         // Fetch all nodes
         std::vector<std::string> node_jsons;
@@ -777,7 +782,6 @@ private:
 
         struct Candidate {
             std::string name;
-            std::string node_json;
             std::string ip{"127.0.0.1"};
             int64_t total_score{0};
         };
@@ -786,23 +790,28 @@ private:
         std::map<std::string, size_t> reasons;   // why nodes were filtered out, with counts
 
         // What the pods bound to each node take of its allocatable figures
-        // (allocated_by_node): one list of the pods for all nodes
-        std::vector<models::JsonValue> n_docs(node_jsons.size());
+        // (allocated_by_node): one list of the pods for all nodes. Each node
+        // is parsed on its own; its name and first address are kept.
+        std::vector<Candidate> n_info(node_jsons.size());
         std::map<std::string, uint64_t> node_versions;
         for (size_t i = 0; i < node_jsons.size(); ++i) {
-            if (!models::parse_json(node_jsons[i], n_docs[i], err) || !n_docs[i].is_object()) continue;
-            const models::JsonValue* meta = n_docs[i].get("metadata");
-            const std::string nname = meta ? meta->get_string("name", "") : "";
-            if (!nname.empty()) node_versions[nname] = resource_version_of(n_docs[i]);
+            models::JsonValue n_doc;
+            if (!models::parse_json(node_jsons[i], n_doc, err) || !n_doc.is_object()) continue;
+            const models::JsonValue* meta = n_doc.get("metadata");
+            n_info[i].name = meta ? meta->get_string("name", "") : "";
+            if (n_info[i].name.empty()) continue;
+            node_versions[n_info[i].name] = resource_version_of(n_doc);
+            const models::JsonValue* status = n_doc.get("status");
+            const models::JsonValue* addrs = status && status->is_object() ? status->get("addresses") : nullptr;
+            if (addrs && addrs->is_array() && !addrs->arr_val.empty()) {
+                n_info[i].ip = addrs->arr_val[0].get_string("address", "127.0.0.1");
+            }
         }
         std::map<std::string, ResourceSpec> used_by_node = allocated_by_node(store_, node_versions, exclude_pod_key);
 
         for (size_t i = 0; i < node_jsons.size(); ++i) {
             const std::string& n_json = node_jsons[i];
-            const models::JsonValue& n_doc = n_docs[i];
-            if (!n_doc.is_object()) { reasons["node(s) could not be read"]++; continue; }
-            const models::JsonValue* meta = n_doc.get("metadata");
-            std::string nname = meta ? meta->get_string("name", "") : "";
+            const std::string& nname = n_info[i].name;
             if (nname.empty()) { reasons["node(s) could not be read"]++; continue; }
             if (nname == exclude_node) { reasons["node(s) were the node the pod leaves"]++; continue; }
 
@@ -820,17 +829,7 @@ private:
             }
 
             if (passes) {
-                Candidate cand;
-                cand.name = nname;
-                cand.node_json = n_json;
-
-                const models::JsonValue* status = n_doc.get("status");
-                if (status && status->is_object()) {
-                    const models::JsonValue* addrs = status->get("addresses");
-                    if (addrs && addrs->is_array() && !addrs->arr_val.empty()) {
-                        cand.ip = addrs->arr_val[0].get_string("address", "127.0.0.1");
-                    }
-                }
+                Candidate cand = n_info[i];
 
                 // Calculate score
                 int64_t score_sum = 0;

@@ -203,6 +203,45 @@ void RadixTree::list(const std::string& prefix, std::vector<std::string>& out_va
     list_prefix(root_.get(), prefix, "", out_values, out_keys);
 }
 
+bool RadixTree::visit(const std::string& prefix,
+                      mem::FunctionRef<bool(const std::string&, const std::string&)> fn) const {
+    // One key buffer for the whole walk: no allocation per object
+    std::string path;
+    const RadixNode* current = root_.get();
+    size_t matched = 0;
+    while (matched < prefix.size()) {
+        const RadixNode* next = nullptr;
+        for (const auto& child : current->children) {
+            if (child->prefix.empty() || child->prefix[0] != prefix[matched]) continue;
+            size_t cpl = 0;
+            while (cpl < child->prefix.size() && matched + cpl < prefix.size() && child->prefix[cpl] == prefix[matched + cpl]) ++cpl;
+            if (matched + cpl == prefix.size()) return visit_all(child.get(), path, fn);   // the prefix ends in this child
+            if (cpl < child->prefix.size()) return true;                                   // diverged: nothing under it
+            path += child->prefix;
+            matched += cpl;
+            next = child.get();
+            break;
+        }
+        if (!next) return true;
+        current = next;
+    }
+    for (const auto& child : current->children) {
+        if (!visit_all(child.get(), path, fn)) return false;
+    }
+    return true;
+}
+
+bool RadixTree::visit_all(const RadixNode* node, std::string& path,
+                          mem::FunctionRef<bool(const std::string&, const std::string&)> fn) const {
+    const size_t len = path.size();
+    path += node->prefix;
+    bool more = !node->is_leaf || fn(path, node->value);
+    for (size_t i = 0; more && i < node->children.size(); ++i) more = visit_all(node->children[i].get(), path, fn);
+    path.resize(len);
+    osal::Thread::yield();
+    return more;
+}
+
 void RadixTree::iterate_recursive(const RadixNode* current, const std::string& current_path,
                                   const std::function<void(const std::string&, const std::string&, 
                                                            uint64_t, bool)>& fn) const {

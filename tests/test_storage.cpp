@@ -58,6 +58,35 @@ void test_radix_tree_edge_splitting_and_compaction() {
     std::cout << "[PASS] test_radix_tree_edge_splitting_and_compaction" << std::endl;
 }
 
+// visit() hands over what list() returns, in the same order, for prefixes
+// that end on a node boundary, inside a node's edge, past a leaf or nowhere;
+// false from the visitor stops it
+void test_visit_matches_list() {
+    std::cout << "[RUN] test_visit_matches_list" << std::endl;
+    StoreOptions opts;
+    opts.enable_flash_persistence = false;
+    auto store = create_radix_store(opts);
+    const char* keys[] = {"/registry/pods/default/nginx", "/registry/pods/default/nginx-2", "/registry/pods/default/redis",
+                          "/registry/pods/kube-system/coredns", "/registry/nodes/n1", "/registry/nodes/n10", "/registry/events/default/a.1"};
+    for (const char* k : keys) assert(store->put(k, std::string("{\"k\":\"") + k + "\"}", true).ok());
+    const char* prefixes[] = {"", "/", "/registry/", "/registry/pods/", "/registry/pods/def", "/registry/pods/default/nginx",
+                              "/registry/pods/default/nginx-", "/registry/pods/default/nginx-2/", "/registry/nodes/n1", "/registry/x", "/zz"};
+    for (const char* p : prefixes) {
+        std::vector<std::string> want_values, want_keys, got_values, got_keys;
+        assert(store->list_extended(p, want_values, &want_keys).ok());
+        assert(store->visit(p, [&](const std::string& key, const std::string& json) {
+            got_keys.push_back(key);
+            got_values.push_back(json);
+            return true;
+        }).ok());
+        assert(got_keys == want_keys && got_values == want_values);
+    }
+    size_t seen = 0;
+    store->visit("/registry/", [&seen](const std::string&, const std::string&) { return ++seen < 3; });
+    assert(seen == 3);
+    std::cout << "[PASS] test_visit_matches_list" << std::endl;
+}
+
 void test_littlefs_journal_atomic_and_recovery() {
     std::cout << "[RUN] test_littlefs_journal_atomic_and_recovery" << std::endl;
     std::string test_dir = "/tmp/kube32_test_storage_" + std::to_string(Thread::get_time_us());
@@ -267,6 +296,7 @@ void test_store_concurrency() {
 int main() {
     std::cout << "=== Running Kube32 Storage Architecture Tests ===" << std::endl;
     test_radix_tree_edge_splitting_and_compaction();
+    test_visit_matches_list();
     test_littlefs_journal_atomic_and_recovery();
     test_store_crud_and_occ();
     test_store_selective_persistence_and_recovery();

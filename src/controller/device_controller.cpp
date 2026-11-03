@@ -235,17 +235,15 @@ void DeviceController::stop() {
 }
 
 std::vector<DeviceController::NodeView> DeviceController::load_nodes() {
-    std::vector<std::string> jsons;
-    store_.list(kNodePrefix, jsons);
     std::vector<NodeView> nodes;
-    for (const auto& json : jsons) {
+    store_.visit(kNodePrefix, [&nodes](const std::string&, const std::string& json) {
         models::JsonValue doc;
         std::string err;
-        if (!models::parse_json(json, doc, err) || !doc.is_object()) continue;
+        if (!models::parse_json(json, doc, err) || !doc.is_object()) return true;
         const models::JsonValue* meta = doc.get("metadata");
         NodeView n;
         n.name = meta ? meta->get_string("name", "") : "";
-        if (n.name.empty()) continue;
+        if (n.name.empty()) return true;
         if (const models::JsonValue* labels = meta->get("labels"); labels && labels->is_object()) {
             for (const auto& kv : labels->obj_val) {
                 if (kv.second.is_string()) n.labels[kv.first] = kv.second.str_val;
@@ -266,7 +264,8 @@ std::vector<DeviceController::NodeView> DeviceController::load_nodes() {
             if (const uint16_t port = models::node_pod_port(doc)) n.pod_port = port;
         }
         nodes.push_back(std::move(n));
-    }
+        return true;
+    });
     std::sort(nodes.begin(), nodes.end(), [](const NodeView& a, const NodeView& b) { return a.name < b.name; });
     return nodes;
 }
@@ -283,32 +282,28 @@ void DeviceController::reconcile(uint64_t now) {
     // the pods that subscribe to device.<name> topics (Device names in `subscribed`)
     std::map<std::string, PodView> pods;
     std::set<std::string> subscribed;
-    {
-        std::vector<std::string> pod_jsons, pod_keys;
-        store_.list_extended(kPodPrefix, pod_jsons, &pod_keys);
-        for (size_t i = 0; i < pod_keys.size(); ++i) {
-            const std::string& k = pod_keys[i];
-            if (subscribes_to_devices(pod_jsons[i])) add_subscriptions(pod_jsons[i], subscribed);
-            if (k.size() < 8 || k.compare(k.size() - 7, 7, kPodSuffix) != 0) continue;
-            models::JsonValue p;
-            std::string err;
-            if (!models::parse_json(pod_jsons[i], p, err) || !p.is_object()) continue;
-            PodView v;
-            v.owner_uid = device_owner(p);
-            if (v.owner_uid.empty()) continue;
-            v.key = k;
-            v.json = std::move(pod_jsons[i]);
-            const models::JsonValue* meta = p.get("metadata");
-            v.terminating = meta && !meta->get_string("deletionTimestamp", "").empty();
-            const models::JsonValue* ann = meta ? meta->get("annotations") : nullptr;
-            v.hash = ann ? ann->get_string(kSpecAnnotation, "") : "";
-            const models::JsonValue* st = p.get("status");
-            v.phase = st ? st->get_string("phase", "Pending") : "Pending";
-            v.ready = pod_ready(p);
-            v.message = pod_message(p);
-            pods[k.substr(std::string(kPodPrefix).size())] = std::move(v);
-        }
-    }
+    store_.visit(kPodPrefix, [&](const std::string& k, const std::string& json) {
+        if (subscribes_to_devices(json)) add_subscriptions(json, subscribed);
+        if (k.size() < 8 || k.compare(k.size() - 7, 7, kPodSuffix) != 0) return true;
+        models::JsonValue p;
+        std::string err;
+        if (!models::parse_json(json, p, err) || !p.is_object()) return true;
+        PodView v;
+        v.owner_uid = device_owner(p);
+        if (v.owner_uid.empty()) return true;
+        v.key = k;
+        v.json = json;
+        const models::JsonValue* meta = p.get("metadata");
+        v.terminating = meta && !meta->get_string("deletionTimestamp", "").empty();
+        const models::JsonValue* ann = meta ? meta->get("annotations") : nullptr;
+        v.hash = ann ? ann->get_string(kSpecAnnotation, "") : "";
+        const models::JsonValue* st = p.get("status");
+        v.phase = st ? st->get_string("phase", "Pending") : "Pending";
+        v.ready = pod_ready(p);
+        v.message = pod_message(p);
+        pods[k.substr(std::string(kPodPrefix).size())] = std::move(v);
+        return true;
+    });
 
     std::set<std::string> live;
     std::set<std::string> live_names;   // "<namespace>/<name>"
@@ -335,16 +330,17 @@ void DeviceController::reconcile(uint64_t now) {
     for (const auto& kv : pods) {
         if (!live.count(kv.second.owner_uid) && !kv.second.terminating) delete_pod(kv.second.key, kv.second.json);
     }
-    std::vector<std::string> svc_jsons, svc_keys;
-    store_.list_extended(kServicePrefix, svc_jsons, &svc_keys);
-    for (size_t i = 0; i < svc_jsons.size(); ++i) {
-        if (svc_jsons[i].find("\"Device\"") == std::string::npos) continue;
+    std::vector<std::string> orphans;
+    store_.visit(kServicePrefix, [&](const std::string& key, const std::string& json) {
+        if (json.find("\"Device\"") == std::string::npos) return true;
         models::JsonValue s;
         std::string err;
-        if (!models::parse_json(svc_jsons[i], s, err) || !s.is_object()) continue;
+        if (!models::parse_json(json, s, err) || !s.is_object()) return true;
         const std::string owner = device_owner(s);
-        if (!owner.empty() && !live.count(owner)) store_.remove(svc_keys[i]);
-    }
+        if (!owner.empty() && !live.count(owner)) orphans.push_back(key);
+        return true;
+    });
+    for (const auto& key : orphans) store_.remove(key);
     for (auto it = retries_.begin(); it != retries_.end();) {
         it = live.count(it->first) ? std::next(it) : retries_.erase(it);
     }

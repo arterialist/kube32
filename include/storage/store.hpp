@@ -7,6 +7,8 @@
 #include <memory>
 #include <utility>
 
+#include "mem/function_ref.hpp"
+
 namespace kube32::storage {
 
 enum class StatusCode {
@@ -108,6 +110,10 @@ struct PersistenceStats {
     const char* last_error{"none"};   // cause of the last refused append
 };
 
+// One stored object as Store::visit() hands it over: its key and value, both
+// valid only during the call. Returning false ends the visit.
+using Visitor = mem::FunctionRef<bool(const std::string& key, const std::string& json)>;
+
 class Store {
 public:
     virtual ~Store() = default;
@@ -129,6 +135,18 @@ public:
     virtual Status list_extended(const std::string& prefix, 
                                  std::vector<std::string>& out_jsons, 
                                  std::vector<std::string>* out_keys) = 0;
+    // Calls `fn` with every key under `prefix` and its value, in key order,
+    // without copying either. `fn` runs under the store's lock: it must not
+    // write to the store, and it copies only what it keeps. A value that
+    // only the flash journal holds arrives empty, as list() returns it.
+    virtual Status visit(const std::string& prefix, Visitor fn) {
+        std::vector<std::string> jsons, keys;
+        Status s = list_extended(prefix, jsons, &keys);
+        for (size_t i = 0; s.ok() && i < jsons.size(); ++i) {
+            if (!fn(keys[i], jsons[i])) break;
+        }
+        return s;
+    }
     virtual uint32_t watch(const std::string& prefix, WatchCallback cb) = 0;
     virtual void unwatch(uint32_t watch_id) = 0;
     virtual uint64_t current_version() const = 0;

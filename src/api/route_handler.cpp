@@ -224,6 +224,7 @@ public:
     storage::Status list_extended(const std::string& prefix, std::vector<std::string>& out, std::vector<std::string>* keys) override {
         return real_.list_extended(prefix, out, keys);
     }
+    storage::Status visit(const std::string& prefix, storage::Visitor fn) override { return real_.visit(prefix, fn); }
     uint32_t watch(const std::string& prefix, storage::WatchCallback cb) override { return real_.watch(prefix, std::move(cb)); }
     void unwatch(uint32_t id) override { real_.unwatch(id); }
     uint64_t current_version() const override { return real_.current_version(); }
@@ -1115,7 +1116,7 @@ HttpResponse RouteHandler::dispatch(const HttpRequest& req, const RouteMatch& ma
         case RouteCategory::NetworkPolicyItem: {
             ResourceInfo info;
             resource_info(match.category, info);
-            return handle_generic(req, match, info);
+            return handle_generic(req, match, info, client_sock);
         }
 
         // Created by kube32-cli firmware rollout (or kubectl); the firmware
@@ -1133,7 +1134,7 @@ HttpResponse RouteHandler::dispatch(const HttpRequest& req, const RouteMatch& ma
                                                        "the SHA-256 of the staged firmware image (64 hex digits) is required");
                 }
             }
-            return handle_generic(req, match, info);
+            return handle_generic(req, match, info, client_sock);
         }
 
         // Validated and defaulted in handle_generic; the Device controller
@@ -1146,12 +1147,12 @@ HttpResponse RouteHandler::dispatch(const HttpRequest& req, const RouteMatch& ma
         case RouteCategory::CheckpointStatus: {
             ResourceInfo info;
             resource_info(match.category, info);
-            return handle_generic(req, match, info);
+            return handle_generic(req, match, info, client_sock);
         }
 
         case RouteCategory::EventsCollection:
         case RouteCategory::EventItem:
-            return handle_events(req, match);
+            return handle_events(req, match, client_sock);
 
         case RouteCategory::PodLog:
             return handle_pod_log(req, match, client_sock);
@@ -1181,7 +1182,7 @@ HttpResponse RouteHandler::dispatch(const HttpRequest& req, const RouteMatch& ma
                     return make_status(422, "Invalid", why);
                 }
             }
-            return handle_generic(req, match, info);
+            return handle_generic(req, match, info, client_sock);
         }
 
         case RouteCategory::NodesCollection:
@@ -1459,9 +1460,8 @@ HttpResponse RouteHandler::handle_nodes(const HttpRequest& req, const RouteMatch
             return resp;
         } else if (req.method == HttpMethod::Get) {
             std::vector<std::string> node_jsons;
-            store_.list("/registry/nodes/", node_jsons);
             HttpResponse sel_err;
-            if (!filter_list(req, node_jsons, sel_err)) return sel_err;
+            if (!select_list(req, "/registry/nodes/", node_jsons, sel_err)) return sel_err;
             const uint64_t rv = store_.current_version();
             if (stream_list(client_sock)) {
                 ChunkedStreamWriter writer(*client_sock);
@@ -1679,10 +1679,9 @@ HttpResponse RouteHandler::handle_pods(const HttpRequest& req, const RouteMatch&
             return resp;
         } else if (req.method == HttpMethod::Get) {
             std::vector<std::string> pod_jsons;
-            store_.list("/registry/pods/", pod_jsons);
             // fieldSelector (kubelets: spec.nodeName=<node>) and labelSelector
             HttpResponse sel_err;
-            if (!filter_list(req, pod_jsons, sel_err)) return sel_err;
+            if (!select_list(req, "/registry/pods/", pod_jsons, sel_err)) return sel_err;
             omit_inline_images(req, pod_jsons);
             const uint64_t rv = store_.current_version();
             if (stream_list(client_sock)) {
@@ -1726,9 +1725,8 @@ HttpResponse RouteHandler::handle_pods(const HttpRequest& req, const RouteMatch&
             return resp;
         } else if (req.method == HttpMethod::Get) {
             std::vector<std::string> pod_jsons;
-            store_.list("/registry/pods/" + ns + "/", pod_jsons);
             HttpResponse sel_err;
-            if (!filter_list(req, pod_jsons, sel_err)) return sel_err;
+            if (!select_list(req, "/registry/pods/" + ns + "/", pod_jsons, sel_err)) return sel_err;
             omit_inline_images(req, pod_jsons);
             const uint64_t rv = store_.current_version();
             if (stream_list(client_sock)) {
@@ -2039,9 +2037,10 @@ HttpResponse RouteHandler::handle_deployments(const HttpRequest& req, const Rout
             return resp;
         } else if (req.method == HttpMethod::Get) {
             std::vector<std::string> dep_jsons;
-            store_.list(cluster_wide ? std::string("/registry/deployments/") : "/registry/deployments/" + ns + "/", dep_jsons);
             HttpResponse sel_err;
-            if (!filter_list(req, dep_jsons, sel_err)) return sel_err;
+            if (!select_list(req, cluster_wide ? std::string("/registry/deployments/") : "/registry/deployments/" + ns + "/", dep_jsons, sel_err)) {
+                return sel_err;
+            }
             const uint64_t rv = store_.current_version();
             if (stream_list(client_sock)) {
                 ChunkedStreamWriter writer(*client_sock);
@@ -2305,9 +2304,8 @@ HttpResponse RouteHandler::handle_leases(const HttpRequest& req, const RouteMatc
         if (req.method == HttpMethod::Get || req.method == HttpMethod::Head) {
             std::vector<std::string> lease_jsons;
             std::string prefix = cluster_wide ? std::string("/registry/leases/") : "/registry/leases/" + ns + "/";
-            store_.list(prefix, lease_jsons);
             HttpResponse sel_err;
-            if (!filter_list(req, lease_jsons, sel_err)) return sel_err;
+            if (!select_list(req, prefix, lease_jsons, sel_err)) return sel_err;
 
             ResourceInfo linfo;
             resource_info(RouteCategory::LeasesNsCollection, linfo);
@@ -2442,6 +2440,24 @@ static HttpResponse list_response(const HttpRequest& req, const ResourceInfo& in
         resp.body = plain_list_json;
     }
     if (req.method == HttpMethod::Head) resp.body = "";
+    return resp;
+}
+
+// A plain list written to the socket object by object, as list_json() lays
+// it out, with no copy of the whole body
+static HttpResponse stream_plain_list(osal::Socket& sock, const ResourceInfo& info, const std::vector<std::string>& jsons, uint64_t rv) {
+    ChunkedStreamWriter writer(sock);
+    bool ok = writer.send_headers("application/json") && writer.write("{\"kind\":\"") && writer.write(info.list_kind) &&
+              writer.write("\",\"apiVersion\":\"") && writer.write(info.api_version) &&
+              writer.write("\",\"metadata\":{\"resourceVersion\":\"") && writer.write_uint(rv) && writer.write("\"},\"items\":[");
+    for (size_t i = 0; ok && i < jsons.size(); ++i) {
+        ok = (i == 0 || writer.write(",")) && writer.write(jsons[i].data(), jsons[i].size());
+        osal::Thread::yield();
+    }
+    if (ok && writer.write("]}")) writer.finish();
+    HttpResponse resp;
+    resp.status_code = 200;
+    resp.is_chunked = true;
     return resp;
 }
 
@@ -2645,7 +2661,25 @@ bool RouteHandler::filter_list(const HttpRequest& req, std::vector<std::string>&
         return false;
     }
     filter_jsons(sel, jsons);
+    return page_list(req, jsons, err_out);
+}
 
+bool RouteHandler::select_list(const HttpRequest& req, const std::string& prefix, std::vector<std::string>& jsons,
+                               HttpResponse& err_out) const {
+    ListSelector sel;
+    std::string err;
+    if (!ListSelector::from_query(req.query_string, sel, err)) {
+        err_out = make_status(400, "BadRequest", err);
+        return false;
+    }
+    store_.visit(prefix, [&](const std::string&, const std::string& json) {
+        if (sel.matches_json(json)) jsons.push_back(json);
+        return true;
+    });
+    return page_list(req, jsons, err_out);
+}
+
+bool RouteHandler::page_list(const HttpRequest& req, std::vector<std::string>& jsons, HttpResponse& err_out) const {
     // limit / continue
     uint64_t limit = 0;
     query_uint(req.query_string, "limit", limit);
@@ -2840,7 +2874,7 @@ static void default_service(models::JsonValue& svc) {
     }
 }
 
-HttpResponse RouteHandler::handle_generic(const HttpRequest& req, const RouteMatch& match, const ResourceInfo& info) {
+HttpResponse RouteHandler::handle_generic(const HttpRequest& req, const RouteMatch& match, const ResourceInfo& info, osal::Socket* client_sock) {
     const bool is_item = (match.category == RouteCategory::NamespaceItem ||
                           match.category == RouteCategory::ConfigMapItem ||
                           match.category == RouteCategory::SecretItem ||
@@ -2863,10 +2897,13 @@ HttpResponse RouteHandler::handle_generic(const HttpRequest& req, const RouteMat
     if (!is_item) {
         if (req.method == HttpMethod::Get || req.method == HttpMethod::Head) {
             std::vector<std::string> jsons;
-            store_.list(prefix, jsons);
             HttpResponse sel_err;
-            if (!filter_list(req, jsons, sel_err)) return sel_err;
-            return list_response(req, info, jsons, list_json(info, jsons), store_.current_version());
+            if (!select_list(req, prefix, jsons, sel_err)) return sel_err;
+            const bool table = req.as_table && TableSerializer::has_generic_table(info.kind);
+            if (req.method == HttpMethod::Get && !table && stream_list(client_sock)) {
+                return stream_plain_list(*client_sock, info, jsons, store_.current_version());
+            }
+            return list_response(req, info, jsons, table ? std::string() : list_json(info, jsons), store_.current_version());
         }
         if (req.method == HttpMethod::Post) {
             if (info.namespaced && ns.empty()) {
@@ -3046,7 +3083,7 @@ static std::string events_v1_to_core(const models::JsonValue& in) {
     return out.to_string();
 }
 
-HttpResponse RouteHandler::handle_events(const HttpRequest& req, const RouteMatch& match) {
+HttpResponse RouteHandler::handle_events(const HttpRequest& req, const RouteMatch& match, osal::Socket* client_sock) {
     ResourceInfo info;
     resource_info(RouteCategory::EventsCollection, info);
     const bool projection = (match.api_group == "events.k8s.io");
@@ -3058,14 +3095,17 @@ HttpResponse RouteHandler::handle_events(const HttpRequest& req, const RouteMatc
     if (match.category == RouteCategory::EventsCollection) {
         if (req.method == HttpMethod::Get || req.method == HttpMethod::Head) {
             std::vector<std::string> jsons;
-            store_.list(prefix, jsons);
             HttpResponse sel_err;
-            if (!filter_list(req, jsons, sel_err)) return sel_err;
+            if (!select_list(req, prefix, jsons, sel_err)) return sel_err;
             if (req.as_table) {
                 // Table cells read core fields; the projection only changes the plain list
-                return list_response(req, info, jsons, list_json(out_info, jsons), store_.current_version());
+                const bool table = TableSerializer::has_generic_table(info.kind);
+                return list_response(req, info, jsons, table ? std::string() : list_json(out_info, jsons), store_.current_version());
             }
             if (projection) for (auto& j : jsons) j = EventRecorder::to_events_v1(j);
+            if (req.method == HttpMethod::Get && stream_list(client_sock)) {
+                return stream_plain_list(*client_sock, out_info, jsons, store_.current_version());
+            }
             HttpResponse resp;
             resp.status_code = 200;
             resp.content_type = "application/json";

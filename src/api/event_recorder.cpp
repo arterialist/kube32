@@ -14,9 +14,9 @@ EventRecorder::EventRecorder(storage::Store& store, size_t max_events)
     : store_(store), max_(max_events == 0 ? 1 : max_events) {}
 
 size_t EventRecorder::count() const {
-    std::vector<std::string> jsons;
-    store_.list("/registry/events/", jsons);
-    return jsons.size();
+    size_t n = 0;
+    store_.visit("/registry/events/", [&n](const std::string&, const std::string&) { ++n; return true; });
+    return n;
 }
 
 static uint64_t rv_of(const std::string& json) {
@@ -27,43 +27,46 @@ static uint64_t rv_of(const std::string& json) {
     return v;
 }
 
+// The events are read in place: only the one found is copied
 bool EventRecorder::find_duplicate(const std::string& ns, const EventSpec& spec, std::string& out_key, std::string& out_json) const {
-    std::vector<std::string> jsons;
-    std::vector<std::string> keys;
-    store_.list_extended("/registry/events/" + ns + "/", jsons, &keys);
     const std::string reason_needle = "\"reason\":\"" + spec.reason + "\"";
     const std::string name_needle = "\"name\":\"" + spec.involved.name + "\"";
-    for (size_t i = 0; i < jsons.size(); ++i) {
-        const std::string& j = jsons[i];
-        if (j.find(reason_needle) == std::string::npos || j.find(name_needle) == std::string::npos) continue;
+    bool found = false;
+    store_.visit("/registry/events/" + ns + "/", [&](const std::string& key, const std::string& j) {
+        if (j.find(reason_needle) == std::string::npos || j.find(name_needle) == std::string::npos) return true;
         models::JsonValue doc;
         std::string err;
-        if (!models::parse_json(j, doc, err) || !doc.is_object()) continue;
+        if (!models::parse_json(j, doc, err) || !doc.is_object()) return true;
         const models::JsonValue* inv = doc.get("involvedObject");
-        if (!inv || inv->get_string("kind", "") != spec.involved.kind || inv->get_string("name", "") != spec.involved.name) continue;
-        if (doc.get_string("reason", "") != spec.reason || doc.get_string("message", "") != spec.message) continue;
-        if (doc.get_string("reportingComponent", "") != spec.component) continue;
-        out_key = keys[i];
+        if (!inv || inv->get_string("kind", "") != spec.involved.kind || inv->get_string("name", "") != spec.involved.name) return true;
+        if (doc.get_string("reason", "") != spec.reason || doc.get_string("message", "") != spec.message) return true;
+        if (doc.get_string("reportingComponent", "") != spec.component) return true;
+        out_key = key;
         out_json = j;
-        return true;
-    }
-    return false;
+        found = true;
+        return false;
+    });
+    return found;
 }
 
+// Drops the oldest events (lowest resourceVersion, the first in key order
+// among equals) until `max_` are left; one key is copied per event dropped
 void EventRecorder::enforce_bound() {
-    std::vector<std::string> jsons;
-    std::vector<std::string> keys;
-    store_.list_extended("/registry/events/", jsons, &keys);
-    while (keys.size() > max_) {
-        size_t oldest = 0;
+    size_t n = count();
+    std::string oldest;
+    while (n > max_) {
         uint64_t oldest_rv = ~0ULL;
-        for (size_t i = 0; i < jsons.size(); ++i) {
-            uint64_t rv = rv_of(jsons[i]);
-            if (rv < oldest_rv) { oldest_rv = rv; oldest = i; }
-        }
-        store_.remove(keys[oldest]);
-        keys.erase(keys.begin() + static_cast<long>(oldest));
-        jsons.erase(jsons.begin() + static_cast<long>(oldest));
+        oldest.clear();
+        store_.visit("/registry/events/", [&](const std::string& key, const std::string& json) {
+            const uint64_t rv = rv_of(json);
+            if (rv < oldest_rv) {
+                oldest_rv = rv;
+                oldest = key;
+            }
+            return true;
+        });
+        if (oldest.empty() || !store_.remove(oldest).ok()) break;
+        --n;
     }
 }
 
