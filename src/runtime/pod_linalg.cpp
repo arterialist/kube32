@@ -1,8 +1,8 @@
 // Native linear algebra for pods (include/runtime/pod_linalg.hpp).
 //
-// The inner loops are written for the ESP32-S3's Xtensa LX7 core: byte loads,
-// 32-bit integer multiplies with two independent accumulators, and float
-// vectors copied into blocks on the stack so that the loops load them
+// On the ESP32-S3 the integer products run on the core's vector unit (PIE,
+// below). The other loops are plain C for the Xtensa LX7 core and any host:
+// float vectors copied into blocks on the stack so that the loops load them
 // aligned. The build compiles this file with -ffp-contract=off: a multiply
 // followed by an add stays two roundings, as in a Wasm pod.
 #include "runtime/pod_linalg.hpp"
@@ -15,6 +15,14 @@
 
 #include <cstdint>
 
+#if defined(ESP_PLATFORM)
+#include "sdkconfig.h"
+#endif
+#if defined(CONFIG_IDF_TARGET_ESP32S3)
+#define K32_PIE 1
+#else
+#define K32_PIE 0
+#endif
 
 namespace kube32::runtime {
 
@@ -41,6 +49,172 @@ static inline void store_f32(uint8_t* p, float f) {
 static inline int32_t lo4(int32_t b) { return static_cast<int32_t>(static_cast<uint32_t>(b) << 28) >> 28; }
 static inline int32_t hi4(int32_t b) { return b >> 4; }
 
+#if K32_PIE
+// The ESP32-S3's vector unit (PIE). EE.VMULAS.S8.ACCX adds the 16 products of
+// two 128-bit registers of int8 values to the 40-bit accumulator ACCX, whose
+// low 32 bits (ACCX_0) are the int32 sum wrapped as the scalar loops wrap it:
+// a row fits the board's memory, so it has fewer than 2^25 columns and the
+// exact sum fits 40 bits.
+//
+// EE.VLD.128.IP loads 16 bytes from a 16-byte aligned address. An operand
+// that is not aligned streams through EE.LD.128.USAR.IP, which loads the
+// aligned block that holds the address and keeps the offset in SAR_BYTE, and
+// EE.SRC.Q, which takes the 16 bytes at that offset out of two consecutive
+// blocks. Such a stream loads the blocks that hold its bytes and no others,
+// so a row that ends at the end of a mapped blob is read safely. The vector
+// registers belong to the calling task (FreeRTOS saves them as coprocessor
+// state) and hold nothing between calls.
+
+static inline bool aligned16(const void* p) { return (reinterpret_cast<uintptr_t>(p) & 15) == 0; }
+
+// ACCX += the products of 16 * blocks bytes of w and x (blocks > 0); WA, XA:
+// w, x aligned
+template <bool WA, bool XA>
+static inline void pie_mac(const int8_t* w, const int8_t* x, uint32_t blocks) {
+    if (WA && XA) {
+        do asm volatile("ee.vld.128.ip q0, %0, 16\n\t"
+                        "ee.vld.128.ip q1, %1, 16\n\t"
+                        "ee.vmulas.s8.accx q0, q1" : "+r"(w), "+r"(x) : : "memory");
+        while (--blocks);
+    } else if (XA) {
+        asm volatile("ee.ld.128.usar.ip q0, %0, 16" : "+r"(w) : : "memory");
+        do asm volatile("ee.ld.128.usar.ip q1, %0, 16\n\t"
+                        "ee.src.q.qup q2, q0, q1\n\t"
+                        "ee.vld.128.ip q3, %1, 16\n\t"
+                        "ee.vmulas.s8.accx q2, q3" : "+r"(w), "+r"(x) : : "memory");
+        while (--blocks);
+    } else if (WA) {
+        asm volatile("ee.ld.128.usar.ip q0, %0, 16" : "+r"(x) : : "memory");
+        do asm volatile("ee.ld.128.usar.ip q1, %1, 16\n\t"
+                        "ee.src.q.qup q2, q0, q1\n\t"
+                        "ee.vld.128.ip q3, %0, 16\n\t"
+                        "ee.vmulas.s8.accx q2, q3" : "+r"(w), "+r"(x) : : "memory");
+        while (--blocks);
+    } else {
+        // each EE.SRC.Q follows the load of its own stream, which sets SAR_BYTE
+        asm volatile("ee.ld.128.usar.ip q0, %0, 16\n\t"
+                     "ee.ld.128.usar.ip q3, %1, 16" : "+r"(w), "+r"(x) : : "memory");
+        do asm volatile("ee.ld.128.usar.ip q1, %0, 16\n\t"
+                        "ee.src.q.qup q2, q0, q1\n\t"
+                        "ee.ld.128.usar.ip q4, %1, 16\n\t"
+                        "ee.src.q.qup q5, q3, q4\n\t"
+                        "ee.vmulas.s8.accx q2, q5" : "+r"(w), "+r"(x) : : "memory");
+        while (--blocks);
+    }
+}
+
+// Sum of w[c] * x[c]: 16 columns a step, the rest one at a time
+static inline int32_t dot_i8(const int8_t* w, const int8_t* x, uint32_t n) {
+    const uint32_t blocks = n / 16;
+    uint32_t s = 0;
+    if (blocks) {
+        asm volatile("ee.zero.accx");
+        if (aligned16(w)) aligned16(x) ? pie_mac<true, true>(w, x, blocks) : pie_mac<true, false>(w, x, blocks);
+        else aligned16(x) ? pie_mac<false, true>(w, x, blocks) : pie_mac<false, false>(w, x, blocks);
+        asm volatile("rur.accx_0 %0" : "=r"(s));
+    }
+    for (uint32_t c = 16 * blocks; c < n; c++) s += static_cast<uint32_t>(w[c] * x[c]);
+    return static_cast<int32_t>(s);
+}
+
+static const uint8_t kNibble = 0x0F, kNibbleSign = 0x08, kNibbleBias = 0xF8;
+
+// 16 * blocks bytes of int4 weights at w as 32 * blocks int8 values in column
+// order at buf (aligned): ((b & 15) ^ 8) - 8 is the low nibble's value, the
+// same of b >> 4 the high one's, and EE.VZIP.8 interleaves the two
+template <bool WA>
+static inline void pie_unpack_i4(const int8_t* w, int8_t* buf, uint32_t blocks) {
+    asm volatile("ee.vldbc.8 q6, %0\n\t"
+                 "ee.vldbc.8 q7, %1\n\t"
+                 "ee.vldbc.8 q3, %2" : : "r"(&kNibble), "r"(&kNibbleSign), "r"(&kNibbleBias) : "memory");
+    if (!WA) asm volatile("ee.ld.128.usar.ip q0, %0, 16" : "+r"(w) : : "memory");
+    do {
+        if (WA) asm volatile("ee.vld.128.ip q2, %0, 16" : "+r"(w) : : "memory");
+        else asm volatile("ee.ld.128.usar.ip q1, %0, 16\n\t"
+                          "ee.src.q.qup q2, q0, q1" : "+r"(w) : : "memory");
+        // SAR is set here for EE.VSR.32: the compiler sets it anew before each shift it emits
+        asm volatile("ee.andq q4, q2, q6\n\t"
+                     "ee.xorq q4, q4, q7\n\t"
+                     "ee.vadds.s8 q4, q4, q3\n\t"
+                     "ssai 4\n\t"
+                     "ee.vsr.32 q5, q2\n\t"
+                     "ee.andq q5, q5, q6\n\t"
+                     "ee.xorq q5, q5, q7\n\t"
+                     "ee.vadds.s8 q5, q5, q3\n\t"
+                     "ee.vzip.8 q4, q5\n\t"
+                     "ee.vst.128.ip q4, %0, 16\n\t"
+                     "ee.vst.128.ip q5, %0, 16" : "+r"(buf) : : "memory");
+    } while (--blocks);
+}
+
+// Columns of an int4 row unpacked at a time, into a buffer on the stack
+constexpr uint32_t kUnpackCols = 256;
+
+// Columns c0..c0 + len of the int4 row at row (c0 even) as int8 values at buf
+static inline void unpack_i4(const int8_t* row, uint32_t c0, uint32_t len, int8_t* buf) {
+    const int8_t* p = row + c0 / 2;
+    const uint32_t pairs = len / 2, blocks = pairs / 16;
+    if (blocks) aligned16(p) ? pie_unpack_i4<true>(p, buf, blocks) : pie_unpack_i4<false>(p, buf, blocks);
+    for (uint32_t j = 16 * blocks; j < pairs; j++) {
+        const int32_t b = p[j];
+        buf[2 * j] = static_cast<int8_t>(lo4(b));
+        buf[2 * j + 1] = static_cast<int8_t>(hi4(b));
+    }
+    if (len & 1) buf[len - 1] = static_cast<int8_t>(lo4(p[pairs]));
+}
+
+// The sums of an int4 row with g vectors x + i * cols, the row unpacked once
+// for all of them
+static inline void dots_i4(const int8_t* row, const int8_t* x, uint32_t cols, uint32_t g, uint32_t* acc) {
+    alignas(16) int8_t buf[kUnpackCols];
+    for (uint32_t i = 0; i < g; i++) acc[i] = 0;
+    for (uint32_t c0 = 0; c0 < cols; c0 += kUnpackCols) {
+        const uint32_t len = cols - c0 < kUnpackCols ? cols - c0 : kUnpackCols;
+        unpack_i4(row, c0, len, buf);
+        for (uint32_t i = 0; i < g; i++) acc[i] += static_cast<uint32_t>(dot_i8(buf, x + static_cast<size_t>(i) * cols + c0, len));
+    }
+}
+
+void matvec_i8(uint8_t* out, const int8_t* w, size_t row_stride, const uint8_t* w_scale, const int8_t* x, float x_scale,
+               uint32_t rows, uint32_t cols) {
+    for (uint32_t r = 0; r < rows; r++, w += row_stride) {
+        const float acc = static_cast<float>(dot_i8(w, x, cols));
+        store_f32(out + 4 * r, acc * (load_f32(w_scale + 4 * r) * x_scale));
+    }
+}
+
+void matvec_i4(uint8_t* out, const int8_t* w, size_t row_stride, const uint8_t* w_scale, const int8_t* x, float x_scale,
+               uint32_t rows, uint32_t cols) {
+    for (uint32_t r = 0; r < rows; r++, w += row_stride) {
+        uint32_t acc;
+        dots_i4(w, x, cols, 1, &acc);
+        store_f32(out + 4 * r, static_cast<float>(static_cast<int32_t>(acc)) * (load_f32(w_scale + 4 * r) * x_scale));
+    }
+}
+
+// Row after row, each applied to every vector: an int8 row from the cache
+// after the first, an int4 row unpacked once for kGroup vectors
+template <bool I4>
+static void matmul(uint8_t* out, const int8_t* w, size_t row_stride, const uint8_t* w_scale, const int8_t* x, const uint8_t* x_scale,
+                   uint32_t rows, uint32_t cols, uint32_t n) {
+    constexpr uint32_t kGroup = 8;
+    for (uint32_t r = 0; r < rows; r++, w += row_stride) {
+        const float ws = load_f32(w_scale + 4 * r);
+        for (uint32_t p = 0; p < n; p += kGroup) {
+            const uint32_t g = n - p < kGroup ? n - p : kGroup;
+            const int8_t* xp = x + static_cast<size_t>(p) * cols;
+            uint32_t acc[kGroup];
+            if (I4) dots_i4(w, xp, cols, g, acc);
+            else for (uint32_t i = 0; i < g; i++) acc[i] = static_cast<uint32_t>(dot_i8(w, xp + static_cast<size_t>(i) * cols, cols));
+            for (uint32_t i = 0; i < g; i++) {
+                const float acc_f = static_cast<float>(static_cast<int32_t>(acc[i]));
+                store_f32(out + 4 * (static_cast<size_t>(p + i) * rows + r), acc_f * (ws * load_f32(x_scale + 4 * (p + i))));
+            }
+        }
+    }
+}
+
+#else   // K32_PIE
 
 // Sum of w[c] * x[c]; unsigned so that a sum beyond int32 wraps
 static inline int32_t dot_i8(const int8_t* w, const int8_t* x, uint32_t n) {
@@ -176,6 +350,8 @@ static void matmul(uint8_t* out, const int8_t* w, size_t row_stride, const uint8
         }
     }
 }
+
+#endif  // K32_PIE
 
 void matmul_i8(uint8_t* out, const int8_t* w, size_t row_stride, const uint8_t* w_scale, const int8_t* x, const uint8_t* x_scale,
                uint32_t rows, uint32_t cols, uint32_t n) {

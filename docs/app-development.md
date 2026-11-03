@@ -87,6 +87,8 @@ The element-wise imports work on `count` vectors of `n` floats that follow each 
 
 `k32_matmul_*` gives the bits of `n` `k32_matvec_*` calls, and reads each row of `w` once for all `n` vectors. A pod that applies one matrix to several vectors, such as a language model that checks several drafted tokens in one pass, thus reads weights that stream from flash once instead of once a vector. Its scales are packed.
 
+On an ESP32-S3 the integer products run on the core's vector instructions, 16 multiply-adds an instruction into a 40-bit accumulator, from weights and vectors at any alignment. Their sums are the exact `int32` values of the scalar loops on other hosts.
+
 Row `r` of `w` starts `row_stride` bytes after row `r - 1`, and scale `r` `scale_stride` bytes after scale `r - 1`. A stride of `0` packs the rows, or the scales. Thus a pod passes one head of an interleaved cache without copying it. Each call returns `K32_OK`, or `K32_ERR_INVAL` (`-22`) for a stride that is not `0` and is below a row's bytes (or `4` for `scale_stride`). `out` must not overlap the other operands, except where the table allows it.
 
 The results are the same bits on every node. Integer sums are exact `int32` values; they wrap beyond that range. Every float step is one IEEE binary32 operation in the order the table shows, sums run from `0` in index order, and the node builds the kernels without fused multiply-adds. `k32_softmax_f32` and `k32_swiglu_f32` compute exp with `k32_expf`, an inline function in `k32_app_abi.h`. A pod that computes exp itself with it gets the node's bits.
