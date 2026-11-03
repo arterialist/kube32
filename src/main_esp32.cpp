@@ -1045,6 +1045,53 @@ void console_task(void* arg) {
                     }
                 }
                 con.write("K32_OK blobs\n", 13);
+            } else if (line.rfind("K32_CMD:BLOBREAD:", 0) == 0) {
+                // Reads a blob natively, start to end: a sum of its 32-bit words
+                // through the mapping, or file reads of <chunk> bytes (512 to
+                // 16384, default 4096) into a buffer: K32_CMD:BLOBREAD:<name>[:<chunk>]
+                std::string name = line.substr(17);
+                uint32_t chunk = 4096;
+                if (size_t colon = name.find(':'); colon != std::string::npos) {
+                    chunk = static_cast<uint32_t>(std::strtoul(name.c_str() + colon + 1, nullptr, 10));
+                    name.resize(colon);
+                }
+                chunk = std::max<uint32_t>(512, std::min<uint32_t>(chunk, 16384));
+                std::shared_ptr<kube32::storage::BlobReader> r;
+                const char* medium = "";
+                for (kube32::storage::BlobStore* store : kube32::storage::node_blob_stores()) {
+                    int32_t err = 0;
+                    r = store->open(name, err);
+                    if (r) { medium = store->medium(); break; }
+                }
+                char l[160];
+                int ll;
+                if (!r) {
+                    ll = snprintf(l, sizeof(l), "K32_ERR no blob %s\n", name.c_str());
+                } else {
+                    uint32_t sum = 0;
+                    uint64_t bytes = 0;
+                    const int64_t t0 = esp_timer_get_time();
+                    if (r->view()) {
+                        const uint32_t* w = reinterpret_cast<const uint32_t*>(r->view());
+                        const size_t words = static_cast<size_t>(r->size() / 4);
+                        for (size_t i = 0; i < words; ++i) sum += w[i];
+                        bytes = words * 4;
+                    } else if (uint8_t* buf = static_cast<uint8_t*>(heap_caps_malloc(chunk, MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA))) {
+                        for (uint64_t off = 0; off < r->size();) {
+                            const int32_t n = r->read(off, buf, chunk);
+                            if (n <= 0) break;
+                            for (int32_t i = 0; i + 4 <= n; i += 4) sum += *reinterpret_cast<const uint32_t*>(buf + i);
+                            off += static_cast<uint64_t>(n);
+                            bytes += static_cast<uint64_t>(n);
+                        }
+                        heap_caps_free(buf);
+                    }
+                    const int64_t us = esp_timer_get_time() - t0;
+                    ll = snprintf(l, sizeof(l), "K32_BLOBREAD %s %s %s chunk=%u bytes=%llu us=%lld kB_per_s=%llu sum=%08x\n", name.c_str(),
+                                  medium, r->view() ? "mapped" : "read", r->view() ? 0u : (unsigned)chunk, (unsigned long long)bytes,
+                                  (long long)us, (unsigned long long)(us > 0 ? bytes * 1000 / static_cast<uint64_t>(us) : 0), (unsigned)sum);
+                }
+                con.write(l, static_cast<size_t>(ll));
             } else if (line.rfind("K32_CMD:MIC:", 0) == 0) {
                 // Records the microphone for <ms> (100..10000) and prints its
                 // level per 250 ms: the mean (DC offset), the RMS and the peak
