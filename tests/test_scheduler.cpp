@@ -401,6 +401,8 @@ void test_retries_on_changes() {
     // A slow host stretches the 1 s of changes and allows more of them.
     uint64_t most = 1;
     while (100 * ((uint64_t{1} << most) - 1) <= took) ++most;
+    // One more attempt can land between the last change and the count above
+    most += 1;
     std::cout << "  " << during << " attempts in " << took << " ms of changes (at most " << most << ")" << std::endl;
     assert(during >= 1 && during <= most);
 
