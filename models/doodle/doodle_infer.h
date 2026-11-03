@@ -47,6 +47,11 @@ int doodle_load(struct doodle_model* m, const uint8_t* blob, uint32_t len);
  * drawing as it forms. */
 extern void (*doodle_on_step)(uint32_t step, uint32_t steps, const float* x);
 
+/* doodle_sample a step at a time: doodle_begin draws the starting noise,
+ * doodle_step(i) takes the image from step i to i + 1 (i < steps). */
+int doodle_begin(const struct doodle_model* m, uint32_t cls, uint32_t seed, uint32_t steps, float x[784]);
+int doodle_step(const struct doodle_model* m, uint32_t cls, uint32_t steps, uint32_t i, float guidance, float x[784]);
+
 int doodle_sample(const struct doodle_model* m, uint32_t cls, uint32_t seed, uint32_t steps, float guidance, float x[784]);
 
 #endif

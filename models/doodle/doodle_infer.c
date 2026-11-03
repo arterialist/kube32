@@ -123,24 +123,34 @@ static void conv(const struct doodle_conv* c, const int8_t* in, uint32_t H, cons
                  float skip_scale, float next_inv, int8_t* out, float* v) {
     const uint32_t Hin = c->flags & F_UP ? 2 * H : H;
     const uint32_t Ho = (Hin + c->stride - 1) / c->stride, cin = c->cin;
-    for (uint32_t y = 0; y < Ho; y++)
-        for (uint32_t x = 0; x < Ho; x++) {
-            patch(c, in, H, Hin, y, x);
-            k32_matvec_i8(g_y, c->w, c->ws, g_patch, c->scale, c->cout, 9 * cin, 0);
-            const uint32_t p = (y * Ho + x) * c->cout;
-            for (uint32_t o = 0; o < c->cout; o++) {
-                float t = g_y[o] + c->b[o];
-                if (c->flags & F_LAST) {
-                    /* channel 2 dy + dx of the 14x14 map is pixel (2y + dy, 2x + dx) */
-                    v[(2 * y + (o >> 1)) * 28 + 2 * x + (o & 1)] = t;
-                    continue;
+    /* The rows of W in blocks of about 8 KB, each block over every output
+     * pixel: the block stays in the data cache, where the whole matrix
+     * (up to 83 KB) would come from flash or PSRAM again for each pixel.
+     * Every output is the same product as row by row. */
+    uint32_t rb = 8192u / (9u * cin);
+    if (rb == 0) rb = 1;
+    for (uint32_t r0 = 0; r0 < c->cout; r0 += rb) {
+        const uint32_t n = c->cout - r0 < rb ? c->cout - r0 : rb;
+        for (uint32_t y = 0; y < Ho; y++)
+            for (uint32_t x = 0; x < Ho; x++) {
+                patch(c, in, H, Hin, y, x);
+                k32_matvec_i8(g_y, c->w + r0 * 9 * cin, c->ws + r0, g_patch, c->scale, n, 9 * cin, 0);
+                const uint32_t p = (y * Ho + x) * c->cout;
+                for (uint32_t k = 0; k < n; k++) {
+                    const uint32_t o = r0 + k;
+                    float t = g_y[k] + c->b[o];
+                    if (c->flags & F_LAST) {
+                        /* channel 2 dy + dx of the 14x14 map is pixel (2y + dy, 2x + dx) */
+                        v[(2 * y + (o >> 1)) * 28 + 2 * x + (o & 1)] = t;
+                        continue;
+                    }
+                    t = t + cond[o];
+                    if (skip) t = t + (float)skip[p + o] * skip_scale;
+                    t = t * (1.0f / (1.0f + k32_expf(-t)));
+                    out[p + o] = q_static(t, next_inv);
                 }
-                t = t + cond[o];
-                if (skip) t = t + (float)skip[p + o] * skip_scale;
-                t = t * (1.0f / (1.0f + k32_expf(-t)));
-                out[p + o] = q_static(t, next_inv);
             }
-        }
+    }
 }
 
 /* v of the image x at a step's condition */
@@ -172,32 +182,47 @@ static float g_vc[784], g_vu[784];
 
 void (*doodle_on_step)(uint32_t step, uint32_t steps, const float* x);
 
-int doodle_sample(const struct doodle_model* m, uint32_t cls, uint32_t seed, uint32_t steps, float guidance, float x[784]) {
-    const struct doodle_sched* s = 0;
+static const struct doodle_sched* schedule(const struct doodle_model* m, uint32_t steps) {
     for (uint32_t k = 0; k < m->n_sched; k++)
-        if (m->sched[k].steps == steps) s = &m->sched[k];
-    if (!s || cls >= m->n_cond) return -1;
+        if (m->sched[k].steps == steps) return &m->sched[k];
+    return 0;
+}
+
+int doodle_begin(const struct doodle_model* m, uint32_t cls, uint32_t seed, uint32_t steps, float x[784]) {
+    if (!schedule(m, steps) || cls >= m->n_cond) return -1;
     g_rng = seed ? seed : 0x6D2B79F5u;
     for (uint32_t i = 0; i < 784; i++) x[i] = gauss();
+    return 0;
+}
+
+int doodle_step(const struct doodle_model* m, uint32_t cls, uint32_t steps, uint32_t i, float guidance, float x[784]) {
+    const struct doodle_sched* s = schedule(m, steps);
+    if (!s || cls >= m->n_cond || i >= steps) return -1;
+    const int8_t* tq = s->tq + i * m->width;
+    for (uint32_t k = 0; k < m->width; k++)
+        g_cond[k] = (float)tq[k] * s->ts[i] + (float)m->class_q[cls * m->width + k] * m->class_s[cls];
+    forward(m, x, g_cond, g_vc);
+    if (guidance != 1.0f) {
+        for (uint32_t k = 0; k < m->width; k++)
+            g_cond[k] = (float)tq[k] * s->ts[i] + (float)m->class_q[DOODLE_NONE * m->width + k] * m->class_s[DOODLE_NONE];
+        forward(m, x, g_cond, g_vu);
+        for (uint32_t p = 0; p < 784; p++) g_vc[p] = g_vu[p] + guidance * (g_vc[p] - g_vu[p]);
+    }
+    const float a = s->alpha[i], sg = s->sigma[i], an = s->alpha[i + 1], sn = s->sigma[i + 1];
+    for (uint32_t p = 0; p < 784; p++) {
+        float x0 = a * x[p] - sg * g_vc[p];
+        x0 = x0 < -1.0f ? -1.0f : x0 > 1.0f ? 1.0f : x0;
+        const float eps = sg * x[p] + a * g_vc[p];
+        x[p] = an * x0 + sn * eps;
+    }
+    return 0;
+}
+
+int doodle_sample(const struct doodle_model* m, uint32_t cls, uint32_t seed, uint32_t steps, float guidance, float x[784]) {
+    if (doodle_begin(m, cls, seed, steps, x)) return -1;
     if (doodle_on_step) doodle_on_step(0, steps, x);
     for (uint32_t i = 0; i < steps; i++) {
-        const int8_t* tq = s->tq + i * m->width;
-        for (uint32_t k = 0; k < m->width; k++)
-            g_cond[k] = (float)tq[k] * s->ts[i] + (float)m->class_q[cls * m->width + k] * m->class_s[cls];
-        forward(m, x, g_cond, g_vc);
-        if (guidance != 1.0f) {
-            for (uint32_t k = 0; k < m->width; k++)
-                g_cond[k] = (float)tq[k] * s->ts[i] + (float)m->class_q[DOODLE_NONE * m->width + k] * m->class_s[DOODLE_NONE];
-            forward(m, x, g_cond, g_vu);
-            for (uint32_t p = 0; p < 784; p++) g_vc[p] = g_vu[p] + guidance * (g_vc[p] - g_vu[p]);
-        }
-        const float a = s->alpha[i], sg = s->sigma[i], an = s->alpha[i + 1], sn = s->sigma[i + 1];
-        for (uint32_t p = 0; p < 784; p++) {
-            float x0 = a * x[p] - sg * g_vc[p];
-            x0 = x0 < -1.0f ? -1.0f : x0 > 1.0f ? 1.0f : x0;
-            const float eps = sg * x[p] + a * g_vc[p];
-            x[p] = an * x0 + sn * eps;
-        }
+        doodle_step(m, cls, steps, i, guidance, x);
         if (doodle_on_step) doodle_on_step(i + 1, steps, x);
     }
     return 0;
