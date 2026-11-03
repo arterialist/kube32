@@ -9,6 +9,10 @@
 #include "esp_netif.h"
 #include "esp_netif_net_stack.h"
 #include "lwip/netif.h"
+#include "lwip/pbuf.h"
+#include "lwip/esp_netif_net_stack.h"
+#include "esp_wifi_default.h"
+#include "esp_netif_defaults.h"
 #include "esp_mac.h"
 #include "esp_log.h"
 #include "esp_timer.h"
@@ -32,6 +36,49 @@ namespace kube32::net {
 
 namespace {
 std::atomic<bool> s_rejoin_held{false};
+
+#if defined(KUBE32_TARGET_ESP32)
+// Without PSRAM, a received frame reaches lwIP in a buffer of its own size,
+// and the radio's receive buffer goes back to the driver at once. The driver
+// passes up the 1.7 KB buffer a frame arrives in: a 250 byte datagram
+// waiting for its socket would hold 1.7 KB, and frames waiting for slow
+// sockets would take the driver's whole buffer count, leaving none for the
+// access point's frames (a key handshake then times out and the station
+// drops off the network).
+esp_netif_recv_ret_t station_input_copy(void* h, void* buffer, size_t len, void* l2_buff) {
+    struct netif* netif = static_cast<struct netif*>(h);
+    void* esp_netif = netif->state;
+    if (!buffer || !netif_is_up(netif)) {
+        if (l2_buff) esp_netif_free_rx_buffer(esp_netif, l2_buff);
+        return ESP_NETIF_OPTIONAL_RETURN_CODE(ESP_FAIL);
+    }
+    struct pbuf* p = pbuf_alloc(PBUF_RAW, static_cast<u16_t>(len), PBUF_RAM);
+    if (p) std::memcpy(p->payload, buffer, len);
+    esp_netif_free_rx_buffer(esp_netif, l2_buff);
+    if (!p) return ESP_NETIF_OPTIONAL_RETURN_CODE(ESP_ERR_NO_MEM);
+    if (netif->input(p, netif) != ERR_OK) {
+        pbuf_free(p);
+        return ESP_NETIF_OPTIONAL_RETURN_CODE(ESP_FAIL);
+    }
+    return ESP_NETIF_OPTIONAL_RETURN_CODE(ESP_OK);
+}
+
+esp_netif_t* create_station_netif() {
+    if (heap_caps_get_total_size(MALLOC_CAP_SPIRAM) > 0) return esp_netif_create_default_wifi_sta();
+    static esp_netif_netstack_config_t stack;
+    stack.lwip = ESP_NETIF_NETSTACK_DEFAULT_WIFI_STA->lwip;
+    stack.lwip.input_fn = station_input_copy;
+    esp_netif_config_t cfg = ESP_NETIF_DEFAULT_WIFI_STA();
+    cfg.stack = &stack;
+    esp_netif_t* netif = esp_netif_new(&cfg);
+    if (!netif) return nullptr;
+    if (esp_netif_attach_wifi_station(netif) != ESP_OK || esp_wifi_set_default_wifi_sta_handlers() != ESP_OK) {
+        esp_netif_destroy(netif);
+        return nullptr;
+    }
+    return netif;
+}
+#endif
 }
 
 #if defined(KUBE32_TARGET_ESP32)
@@ -45,19 +92,19 @@ public:
         config_ = config;
         esp_netif_init();
         esp_event_loop_create_default();
-        sta_netif_ = esp_netif_create_default_wifi_sta();
+        sta_netif_ = create_station_netif();
 
         wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
         if (heap_caps_get_total_size(MALLOC_CAP_SPIRAM) == 0) {
-            // Frames wait in these buffers until the radio sends them or
-            // lwIP is done with them. Without PSRAM the station runs a 576
-            // byte MTU (see ip_event), so each holds at most ~650 bytes; the
-            // driver must never find the heap empty, or it stops sending.
-            // A socket with unread data holds up to 7 RX buffers (receive
-            // mailbox 4, one refused segment, 2 out of order): 12 leave the
-            // rest of the node able to receive. A TCP send buffer of 5760
+            // Frames to send wait in TX buffers until the radio sends them.
+            // Without PSRAM the station runs a 576 byte MTU (see ip_event),
+            // so each holds at most ~650 bytes; the driver must never find
+            // the heap empty, or it stops sending. A TCP send buffer of 5760
             // bytes is 11 segments of 536: fewer TX buffers make a burst
             // overflow, and the connection waits 250 ms to send again.
+            // Received frames are copied out of their RX buffer as they
+            // arrive (station_input_copy), so an RX buffer is held only
+            // while the driver hands its frame over.
             cfg.dynamic_tx_buf_num = 12;
             cfg.dynamic_rx_buf_num = 12;
         }

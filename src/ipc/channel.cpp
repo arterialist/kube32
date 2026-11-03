@@ -746,6 +746,12 @@ std::string ChannelManager::announced_api() const {
     return latest ? latest->api_address : std::string();
 }
 
+uint64_t ChannelManager::last_ip_hello_ms(const std::string& ip) const {
+    osal::LockGuard guard(peer_mutex_);
+    auto it = ip_hello_ms_.find(ip);
+    return it == ip_hello_ms_.end() ? 0 : it->second;
+}
+
 void ChannelManager::add_seed_peer(const std::string& ip, uint16_t port) {
     if (ip.empty()) return;
     osal::LockGuard guard(peer_mutex_);
@@ -781,6 +787,9 @@ void ChannelManager::handle_hello(const K32CHeader* hdr, const uint8_t* payload,
     info.endpoint.node_id = node_id;
     if (info.endpoint.udp_port == 0) info.endpoint.udp_port = 7400;
     osal::LockGuard guard(peer_mutex_);
+    if (source && !source->is_espnow && !source->ip_address.empty() && (ip_hello_ms_.size() < 16 || ip_hello_ms_.count(source->ip_address))) {
+        ip_hello_ms_[source->ip_address] = osal::System::get_uptime_ms();
+    }
     auto it = peers_.find(node_id);
     bool is_new = (it == peers_.end());
     PeerInfo& slot = peers_[node_id];

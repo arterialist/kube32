@@ -236,6 +236,9 @@ public:
     void set_announced_api(const std::string& address);
     // The address the most recently heard control plane announces, or ""
     std::string announced_api() const;
+    // Uptime in ms when a HELLO last arrived over IP (UDP) from `ip`, 0 if
+    // none has: proof that the access point carries this node's traffic
+    uint64_t last_ip_hello_ms(const std::string& ip) const;
     // Peers reachable over IP that cannot be found by ESP-NOW broadcast (nodes
     // on another access point of the same network): HELLO is sent to them
     // unicast until they answer and become regular peers.
@@ -309,6 +312,7 @@ private:
     uint32_t local_node_id_{0};
     std::string local_node_name_;
     std::string announced_api_;   // guarded by peer_mutex_: what this node announces
+    std::map<std::string, uint64_t> ip_hello_ms_;   // guarded by peer_mutex_: last HELLO over UDP per address
 
     // Host subscribers and dispatcher
     struct Subscription {
