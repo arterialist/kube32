@@ -8,6 +8,9 @@ namespace kube32::hal {
 
 static std::mutex s_sd_mutex;
 static SdInfo s_info;
+static uint32_t s_max_khz = 20000;
+
+void sd_set_max_khz(uint32_t khz) { s_max_khz = khz ? khz : 20000; }
 
 #if defined(KUBE32_TARGET_ESP32)
 
@@ -69,7 +72,7 @@ bool sd_mount() {
 
     sdmmc_host_t host = SDSPI_HOST_DEFAULT();
     host.slot = SD_SPI_HOST;
-    host.max_freq_khz = 20000;
+    host.max_freq_khz = static_cast<int>(s_max_khz);
 
     sdspi_device_config_t slot = SDSPI_DEVICE_CONFIG_DEFAULT();
     slot.host_id = SD_SPI_HOST;

@@ -26,6 +26,10 @@ struct SdInfo {
     std::string error;           // why the last mount failed, empty when mounted
 };
 
+// SPI clock the next mount asks for, in kHz (default 20000). The bus
+// divides 80 MHz: 40000, 26667 and 20000 are the steps near the top.
+void sd_set_max_khz(uint32_t khz);
+
 // Mounts the card. Returns false (and leaves sd_info().error set) when there
 // is no card, the SPI bus cannot be set up, or the filesystem is not FAT.
 bool sd_mount();

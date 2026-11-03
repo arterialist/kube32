@@ -73,6 +73,7 @@
 #include "bench/bench_kernels.h"
 
 #include <algorithm>
+#include <cmath>
 #include <atomic>
 #include <cstdio>
 #include <cstring>
@@ -1012,6 +1013,89 @@ void console_task(void* arg) {
                 vTaskDelay(pdMS_TO_TICKS(100));
                 REG_WRITE(RTC_CNTL_OPTION1_REG, RTC_CNTL_FORCE_DOWNLOAD_BOOT);
                 esp_restart();
+            } else if (line.rfind("K32_CMD:SDKHZ:", 0) == 0) {
+                // The card's SPI clock in kHz from the next boot on; 0 for the 20 MHz default
+                const uint32_t khz = static_cast<uint32_t>(std::strtoul(line.c_str() + 14, nullptr, 10));
+                nvs_handle_t h;
+                if (nvs_open("k32", NVS_READWRITE, &h) == ESP_OK) {
+                    if (khz) nvs_set_u32(h, "sdkhz", khz);
+                    else nvs_erase_key(h, "sdkhz");
+                    nvs_commit(h);
+                    nvs_close(h);
+                }
+                con.write("K32_OK sd clock stored, rebooting\n", 34);
+                vTaskDelay(pdMS_TO_TICKS(200));
+                esp_restart();
+            } else if (line == "K32_CMD:BLOBS") {
+                // The node's blob stores and what each holds
+                for (kube32::storage::BlobStore* store : {static_cast<kube32::storage::BlobStore*>(kube32::storage::node_flash_blobs()),
+                                                          kube32::storage::node_card_blobs()}) {
+                    if (!store) continue;
+                    std::string why;
+                    const bool up = store->available(&why);
+                    char l[200];
+                    int ll = snprintf(l, sizeof(l), "K32_BLOBS medium=%s location=\"%s\" available=%d capacity=%llu free=%llu%s%s\n", store->medium(),
+                                      store->location().c_str(), up ? 1 : 0, (unsigned long long)store->capacity_bytes(),
+                                      (unsigned long long)(up ? store->free_bytes() : 0), up ? "" : " reason=", up ? "" : why.c_str());
+                    con.write(l, static_cast<size_t>(ll));
+                    for (const auto& b : store->list()) {
+                        ll = snprintf(l, sizeof(l), "K32_BLOB %s %s size=%llu offset=%llu crc32=0x%08x\n", store->medium(), b.name.c_str(),
+                                      (unsigned long long)b.size, (unsigned long long)b.offset, (unsigned)b.crc32);
+                        con.write(l, static_cast<size_t>(ll));
+                    }
+                }
+                con.write("K32_OK blobs\n", 13);
+            } else if (line.rfind("K32_CMD:MIC:", 0) == 0) {
+                // Records the microphone for <ms> (100..10000) and prints its
+                // level per 250 ms: the mean (DC offset), the RMS and the peak
+                // around that mean
+                int ms = std::atoi(line.c_str() + 12);
+                if (ms < 100) ms = 100;
+                if (ms > 10000) ms = 10000;
+                static int16_t buf[500];
+                const uint32_t window = 4000;   // 250 ms at 16 kHz
+                const uint32_t total = static_cast<uint32_t>(ms) * 16;
+                uint32_t got_total = 0, in_window = 0, w = 0;
+                int64_t sum = 0, sumsq = 0, wsum = 0, wsumsq = 0;
+                int32_t wmin = 32767, wmax = -32768;
+                int32_t err = 0;
+                char l[160];
+                // The decimator settles in its first few milliseconds: not counted
+                kube32::hal::mic_read(buf, 500, 200);
+                while (got_total < total) {
+                    const int32_t n = kube32::hal::mic_read(buf, std::min<uint32_t>(500, total - got_total), 200);
+                    if (n <= 0) { err = n; break; }
+                    for (int32_t i = 0; i < n; ++i) {
+                        const int32_t v = buf[i];
+                        wsum += v;
+                        wsumsq += static_cast<int64_t>(v) * v;
+                        wmin = std::min(wmin, v);
+                        wmax = std::max(wmax, v);
+                        if (++in_window == window) {
+                            const double mean = static_cast<double>(wsum) / window;
+                            const double var = static_cast<double>(wsumsq) / window - mean * mean;
+                            const double peak = std::max(wmax - mean, mean - wmin);
+                            int ll = snprintf(l, sizeof(l), "K32_MIC window=%u mean=%.1f rms=%.1f peak=%.0f\n", (unsigned)w++, mean,
+                                              var > 0 ? std::sqrt(var) : 0.0, peak);
+                            con.write(l, static_cast<size_t>(ll));
+                            sum += wsum;
+                            sumsq += wsumsq;
+                            wsum = wsumsq = 0;
+                            wmin = 32767;
+                            wmax = -32768;
+                            in_window = 0;
+                        }
+                    }
+                    got_total += static_cast<uint32_t>(n);
+                }
+                kube32::hal::mic_read(buf, 0, 0);
+                const uint32_t counted = got_total - in_window;
+                const double mean = counted ? static_cast<double>(sum) / counted : 0.0;
+                const double var = counted ? static_cast<double>(sumsq) / counted - mean * mean : 0.0;
+                int ll = err ? snprintf(l, sizeof(l), "K32_ERR mic error=%d after %u samples\n", (int)err, (unsigned)got_total)
+                             : snprintf(l, sizeof(l), "K32_OK mic samples=%u mean=%.1f rms=%.1f\n", (unsigned)got_total, mean,
+                                        var > 0 ? std::sqrt(var) : 0.0);
+                con.write(l, static_cast<size_t>(ll));
             } else if (line == "K32_CMD:SD") {
                 // Card state, measured figures and what is on it under /sd/kube32
                 kube32::hal::SdInfo si = kube32::hal::sd_info();
@@ -1259,6 +1343,14 @@ void cluster_task(void* pv) {
     // FAT at /sd) when one is inserted, otherwise the internal flash
     // "storage" partition (FAT with wear levelling at /data). One of the two.
     {
+        // K32_CMD:SDKHZ:<khz> sets the card's SPI clock (20 MHz unless set)
+        nvs_handle_t h;
+        uint32_t sd_khz = 0;
+        if (nvs_open("k32", NVS_READONLY, &h) == ESP_OK) {
+            nvs_get_u32(h, "sdkhz", &sd_khz);
+            nvs_close(h);
+        }
+        kube32::hal::sd_set_max_khz(sd_khz);
         bool ok = kube32::hal::node_storage_mount(ident.has_display);
         kube32::hal::NodeStorageInfo si = kube32::hal::node_storage_info();
         if (ok) {
