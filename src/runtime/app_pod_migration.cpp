@@ -95,7 +95,7 @@ int AppPodHost::freeze(const std::string& pod_id, uint32_t timeout_ms, std::stri
         osal::LockGuard guard(event_mutex_);
         std::deque<PendingEvent> others;
         for (auto& ev : event_queue_) {
-            if (ev.pod_id == pod_id) queued.push_back(HeldEvent{std::move(ev.topic), std::move(ev.data)});
+            if (ev.pod_id() == pod_id) queued.push_back(HeldEvent{std::string(ev.topic()), std::string(ev.data())});
             else others.push_back(std::move(ev));
         }
         event_queue_.swap(others);
@@ -122,7 +122,7 @@ void AppPodHost::requeue_events(const std::string& pod_id, std::vector<HeldEvent
         // Ahead of what arrived since, in their order
         osal::LockGuard guard(event_mutex_);
         std::deque<PendingEvent> merged;
-        for (auto& e : events) merged.push_back(PendingEvent{pod_id, std::move(e.topic), std::move(e.data)});
+        for (auto& e : events) merged.emplace_back(pod_id, e.topic, e.data);
         for (auto& e : event_queue_) merged.push_back(std::move(e));
         event_queue_.swap(merged);
     }

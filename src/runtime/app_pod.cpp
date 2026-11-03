@@ -794,26 +794,31 @@ void AppPodHost::sync_topic_subscriptions_locked() {
 // Runs on the channel dispatcher thread, whose stack is too small for the
 // interpreter: the message is queued for the event thread.
 void AppPodHost::deliver_topic(std::string_view topic, const uint8_t* data, size_t len) {
-    std::vector<std::string> targets;
+    if (len > K32_MAX_EVENT_BYTES) return;
+    // Each message is built while the pods' table is locked, and queued
+    // without a lock on it
+    const std::string_view body(reinterpret_cast<const char*>(data), len);
+    std::vector<PendingEvent> ready;
     {
         osal::LockGuard guard(mutex_);
         for (const auto& kv : event_topics_) {
             auto pod = pods_.find(kv.first);
             if (pod == pods_.end() || !pod->second.has_event) continue;
             for (const auto& t : kv.second) {
-                if (t == topic) { targets.push_back(kv.first); break; }
+                if (t == topic) { ready.emplace_back(kv.first, topic, body); break; }
             }
         }
     }
-    if (targets.empty() || len > K32_MAX_EVENT_BYTES) return;
+    if (ready.empty()) return;
+    const size_t cap = osal::System::get_total_psram_bytes() > 0 ? kMaxQueuedEvents : kMaxQueuedEventsSmall;
     {
         osal::LockGuard guard(event_mutex_);
-        for (auto& id : targets) {
-            if (event_queue_.size() >= kMaxQueuedEvents) {
+        for (auto& ev : ready) {
+            if (event_queue_.size() >= cap) {
                 event_queue_.pop_front();   // a slow handler loses the oldest message, not the newest
                 if (events_dropped_++ < 4) printf("[POD] event queue full, dropping the oldest message\n");
             }
-            event_queue_.push_back(PendingEvent{std::move(id), std::string(topic), std::string(reinterpret_cast<const char*>(data), len)});
+            event_queue_.push_back(std::move(ev));
         }
     }
     start_event_thread();   // normally running already; retried here if it could not start
@@ -864,7 +869,7 @@ void AppPodHost::event_thread_main() {
             event_queue_.pop_front();
         }
         try {
-            event(ev.pod_id, ev.topic, reinterpret_cast<const uint8_t*>(ev.data.data()), ev.data.size());
+            event(std::string(ev.pod_id()), ev.topic(), reinterpret_cast<const uint8_t*>(ev.data().data()), ev.data().size());
         } catch (const std::exception& e) {
             // out of memory: this event is dropped, the next one is delivered
             printf("[POD] event delivery skipped: %s\n", e.what());

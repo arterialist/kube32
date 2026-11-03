@@ -322,10 +322,20 @@ private:
     std::map<std::string, std::vector<std::string>> event_topics_;   // pod -> topics
     std::map<std::string, uint32_t> topic_subs_;                      // topic -> channel subscription
 
+    // One allocation per message: the pod's id, the topic and the data in
+    // one buffer
     struct PendingEvent {
-        std::string pod_id;
-        std::string topic;
-        std::string data;
+        std::string buf;
+        uint16_t id_len{0}, topic_len{0};
+        PendingEvent() = default;
+        PendingEvent(std::string_view pod_id, std::string_view topic, std::string_view data)
+            : id_len(static_cast<uint16_t>(pod_id.size())), topic_len(static_cast<uint16_t>(topic.size())) {
+            buf.reserve(pod_id.size() + topic.size() + data.size());
+            buf.append(pod_id).append(topic).append(data);
+        }
+        std::string_view pod_id() const { return std::string_view(buf).substr(0, id_len); }
+        std::string_view topic() const { return std::string_view(buf).substr(id_len, topic_len); }
+        std::string_view data() const { return std::string_view(buf).substr(static_cast<size_t>(id_len) + topic_len); }
     };
     mutable osal::Mutex event_mutex_;
     osal::ConditionVariable event_cv_;
@@ -335,7 +345,10 @@ private:
     size_t event_stack_bytes_{0};          // 0: platform default
     bool event_stack_in_psram_{false};
     uint64_t events_dropped_{0};
+    // Messages waiting for a busy pod: 16, or 8 where internal RAM is all
+    // there is (a frame of messages takes ~250 bytes)
     static constexpr size_t kMaxQueuedEvents = 16;
+    static constexpr size_t kMaxQueuedEventsSmall = 8;
     void event_thread_main();
     void start_event_thread();
 
