@@ -44,6 +44,21 @@ jobs:
       - name: make test
         run: make -C apps/tessera test
 
+  models:
+    name: Models (host checks, pod modules)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install clang and lld (wasm-ld)
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends clang lld
+      # The C inference of the models against their test vectors, with the node's kernels
+      - name: make -C models check
+        run: make -C models check
+      - name: Build the llm-speculative and llm-diffusion modules
+        run: |
+          make -C apps/llm-speculative module
+          make -C apps/llm-diffusion
+
   kube32-cli:
     name: kube32-cli tests
     runs-on: ubuntu-24.04

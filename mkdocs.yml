@@ -66,6 +66,7 @@ nav:
       - MCP server for agents: mcp.md
       - Pod migration: migration.md
       - "Example: Tessera": examples/tessera.md
+      - "Example: neural networks in pods": examples/models.md
   - Architecture:
       - Overview: architecture/index.md
       - Object store: architecture/radix-store.md

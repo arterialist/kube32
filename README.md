@@ -170,6 +170,7 @@ Full documentation is published at [https://arterialist.github.io/kube32/](https
 - [Pod migration](docs/migration.md)
 - [Benchmarks](docs/benchmarks.md)
 - [Example: Tessera](docs/examples/tessera.md)
+- [Example: neural networks in pods](docs/examples/models.md)
 - [Architecture overview](docs/architecture/index.md)
 - [Kubernetes API coverage](docs/api-reference.md)
 - [CLI and tools reference](docs/cli-reference.md)
