@@ -1,0 +1,21 @@
+{
+ "real_holdout": 0.9179999828338623,
+ "doodle-s.bin steps 16 guidance 2": {
+  "mean": 0.7291666666666666,
+  "cat": 0.84375,
+  "dog": 0.375,
+  "bird": 0.71875,
+  "house": 0.625,
+  "tree": 0.9375,
+  "bed": 0.875
+ },
+ "doodle-l.bin steps 16 guidance 2": {
+  "mean": 0.9635416666666666,
+  "cat": 0.9375,
+  "dog": 0.90625,
+  "bird": 0.9375,
+  "house": 1.0,
+  "tree": 1.0,
+  "bed": 1.0
+ }
+}

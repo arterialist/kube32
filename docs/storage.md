@@ -253,7 +253,7 @@ A blob address reaches the first 256 MiB of a blob. An address outside every ope
 
 Handles close when the container stops or restarts. A checkpoint does not carry them: a pod restored on another node opens its blobs again in `k32_restored`. Each open card blob holds one of the card's 4 open files.
 
-`apps/blobbench` measures how fast a pod reads a blob on a node: sequential `k32_blob_read` at a given chunk size, `k32_matvec_i8` and `k32_matvec_i4` over a mapped blob in place, and the same products over rows read into memory first.
+`apps/blobbench` measures how fast a pod reads a blob on a node: sequential `k32_blob_read` at a given chunk size, `k32_matvec_i8` and `k32_matvec_i4` over a mapped blob in place, and the same products over rows read into memory first. [`apps/llm-speculative`](https://github.com/arterialist/kube32/tree/main/apps/llm-speculative) runs a language model whose 2 MB of weights stay in flash.
 
 ## Limitations
 

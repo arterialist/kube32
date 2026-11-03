@@ -19,7 +19,11 @@
  *          as int8, or with bits 4 two values a byte (column 2j in the low
  *          nibble, 2j+1 in the high one, each -7..7)
  *   HEAD:  float rms_final[dim], cls_s[vocab], int8 cls_q[vocab][dim]
- * Matrices are row-major, one row per output. */
+ *          (with TIED only rms_final: the classifier is tok_q and tok_s)
+ * Matrices are row-major, one row per output. A blob with BIDIR is a masked
+ * diffusion model: every position attends to every position of its window,
+ * and the last vocabulary entry is MASK, an input the classifier never
+ * picks. */
 #ifndef LLM_H
 #define LLM_H
 
@@ -31,6 +35,8 @@ K32_IMPORT("esp32_get_time_us") int64_t esp32_get_time_us(void);   /* microsecon
 #define LLM_MSG_MAGIC    0x4132334bu   /* "K32A" */
 #define LLM_BLOB_EMBED   1u            /* token embedding and rotary table */
 #define LLM_BLOB_HEAD    2u            /* final norm and classifier */
+#define LLM_BLOB_TIED    4u            /* the classifier is the embedding, stored once */
+#define LLM_BLOB_BIDIR   8u            /* masked diffusion: attention over the whole window */
 #define LLM_MSG_SAMPLE   1u            /* the last stage picks the next token */
 #define LLM_MSG_SHOW     2u            /* a stage with a screen shows text */
 #define LLM_MSG_PROMPT   4u            /* text is the prompt's */

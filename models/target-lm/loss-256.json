@@ -1,0 +1,8 @@
+{
+ "target-lm.bin@float": 0.8736482441425324,
+ "target-lm.bin@int8": 0.8748872319857279,
+ "target-lm.bin@int4": 0.9173704038063685,
+ "stories260K.bin@float": 1.3300217906634013,
+ "stories260K.bin@int8": 1.3334028780460359,
+ "stories260K.bin@int4": 1.4908035159111024
+}

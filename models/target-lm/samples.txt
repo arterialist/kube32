@@ -1,0 +1,30 @@
+### target LM, int8, prompt "Once upon a time" (150 tokens, greedy)
+Once upon a time, there was a little girl named Lily. She loved to play outside in the sunshine. One day, she saw a big, scary dog. The dog was very big and had a long tail. Lily was scared and didn't know what to do.
+Suddenly, she saw a little bird with a broken wing. The bird was sad and couldn't fly. Lily wanted to help the bird, so she gently picked it up and
+
+### stories260K, int8, prompt "Once upon a time" (150 tokens, greedy)
+Once upon a time, there was a little girl named Lily. She loved to play outside in the park. One day, she saw a big, red ball. She wanted to play with it, but it was too high.
+Lily's mom said, "Lily, let's go to the park." Lily was sad and didn't know what to do. She said, "I want to play with my ball." Her mom said, "I want to play with you, Lily. I will help you."
+Lily was sad and did
+
+### target LM, int8, prompt "Lily and Tom went to the park" (150 tokens, greedy)
+Lily and Tom went to the park with Mom. They saw a big slide and wanted to play on it. They climbed up the ladder and slid down the slide. They laughed and shouted.
+"Look, Tom, I can slide down the slide!" Lily said.
+"Wow, Lily, you are so fast!" Tom said.
+They ran to the slide and climbed up the ladder. They laughed and shouted. They were hav
+
+### stories260K, int8, prompt "Lily and Tom went to the park" (150 tokens, greedy)
+Lily and Tom went to the park. They saw a big box with a big box. They wanted to play with it. They wanted to play with the box. They wanted to play with the box.
+"Look, Mom!" Lily said. "Let's go to the park."
+"OK, Lily, let's go to the park." Tom said. He said, "Let's go to the park."
+Lily and Tom were happy. They played together. They had a great time. They had a great time. They had a
+
+### target LM, int8, prompt "The little dog was sad because" (150 tokens, greedy)
+The little dog was sad because he was all alone. He was always looking for something to do. He wanted to find something to eat.
+He saw a big tree with a hole in it. He thought it would be a good place to hide. He climbed up the tree and found a big box. He opened the box and found a small, shiny rock. He was so happy!
+He took the rock out of the
+
+### stories260K, int8, prompt "The little dog was sad because" (150 tokens, greedy)
+The little dog was sad because he loved to play with his toys. One day, he saw a big box in the ground. The box was very small and scary. He wanted to play with it.
+The boy said, "I want to play with you." The boy said, "I want to play with you." The boy said, "I want to play with you." The boy said, "I want to play with you." The boy said, "I can help you."
+The boy said, "I will help you." The b

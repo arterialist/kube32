@@ -51,6 +51,8 @@ MODEL_FILES = {
 
 BLOB_MAGIC = 0x4D32334B          # "K32M"
 FLAG_EMBED, FLAG_HEAD = 1, 2
+FLAG_TIED = 4                    # the head's classifier is the embedding (stored once)
+FLAG_BIDIR = 8                   # masked diffusion: every position attends to all, the last token is MASK
 BOS = 1
 F32 = np.float32
 
@@ -155,8 +157,10 @@ def blob(cfg, w, begin, end, flags, bits=8):
                   qs["w1"][1], qs["w2"][1], qs["w3"][1]]
         parts += [qs[k][0] if bits == 8 else pack4(qs[k][0]) for k in ("wq", "wk", "wv", "wo", "w1", "w2", "w3")]
     if flags & FLAG_HEAD:
-        q, s = q8(w["cls"])
-        parts += [w["rms_final"], s, q]
+        parts += [w["rms_final"]]
+        if not flags & FLAG_TIED:
+            q, s = q8(w["cls"])
+            parts += [s, q]
     body = b"".join(np.ascontiguousarray(p).astype(p.dtype.newbyteorder("<")).tobytes() for p in parts)
     header = struct.pack("<16I", BLOB_MAGIC, 1, dim, hidden, cfg["n_heads"], cfg["n_kv_heads"], cfg["vocab"], cfg["seq_len"],
                          begin, end, cfg["n_layers"], flags, 64 + len(body), bits, 0, 0)
@@ -199,8 +203,11 @@ def read_blob(data):
         out["layers"].append(L)
     if flags & FLAG_HEAD:
         out["rms_final"] = take("<f4", (dim,))
-        out["cls_s"] = take("<f4", (vocab,))
-        out["cls_q"] = take("i1", (vocab, dim))
+        if flags & FLAG_TIED:
+            out["cls_s"], out["cls_q"] = out["tok_s"], out["tok_q"]
+        else:
+            out["cls_s"] = take("<f4", (vocab,))
+            out["cls_q"] = take("i1", (vocab, dim))
     if o != len(data):
         raise ValueError("model slice: %d bytes left over" % (len(data) - o))
     return out

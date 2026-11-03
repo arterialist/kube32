@@ -1,5 +1,5 @@
-// The pods' linear algebra imports (k32_matvec_*, k32_vecmat_f32_i8,
-// k32_softmax_f32): the native kernels against plain reference loops and the
+// The pods' linear algebra imports (k32_matvec_*, k32_matmul_*,
+// k32_vecmat_f32_i8, k32_softmax_f32): the native kernels against plain reference loops and the
 // reference's bits, and the imports as a pod calls them: results, strides,
 // operands outside the linear memory, a trapped container, and the gas they
 // charge.
@@ -93,6 +93,39 @@ static void test_kernels_match_reference() {
     std::printf("[PASS] test_kernels_match_reference\n");
 }
 
+
+// n vectors at once give the bits of n matvec calls, at every group size
+// (kMatmulGroup) and remainder, with float operands off their alignment
+static void test_matmul_kernels() {
+    const Case cases[] = {{8, 64, 64, 64}, {8, 7, 13, 20}, {8, 1, 1, 1}, {4, 64, 172, 86}, {4, 9, 13, 9}, {4, 3, 1, 1}, {8, 3, 0, 0}};
+    for (const Case& k : cases) {
+        for (uint32_t n : {1u, 2u, 3u, 4u, 5u, 7u, 9u}) {
+            std::vector<int8_t> w, x0;
+            std::vector<float> ws;
+            float xs0;
+            fill(k, w, ws, x0, xs0);
+            std::vector<int8_t> x(static_cast<size_t>(n) * k.cols + 1);
+            for (auto& v : x) v = static_cast<int8_t>(rnd() >> 24);
+            std::vector<uint8_t> xs_bytes(4 * n + 1), ws_bytes(4 * k.rows + 1), out_bytes(4 * n * k.rows + 2, 0xa5);
+            std::vector<float> xs(n);
+            for (uint32_t p = 0; p < n; p++) xs[p] = static_cast<float>(rnd() >> 8) / 16777216.0f * 0.1f;
+            std::memcpy(xs_bytes.data() + 1, xs.data(), 4 * n);
+            std::memcpy(ws_bytes.data() + 1, ws.data(), 4 * k.rows);
+            (k.bits == 8 ? matmul_i8 : matmul_i4)(out_bytes.data() + 1, w.data(), k.stride, ws_bytes.data() + 1, x.data(), xs_bytes.data() + 1,
+                                                  k.rows, k.cols, n);
+            for (uint32_t p = 0; p < n; p++) {
+                const std::vector<int8_t> xp(x.begin() + p * k.cols, x.begin() + (p + 1) * k.cols);
+                const std::vector<float> want = reference(w, k.stride, k.bits, ws, xp, xs[p], k.rows, k.cols);
+                std::vector<uint8_t> one(4 * k.rows + 1);
+                (k.bits == 8 ? matvec_i8 : matvec_i4)(one.data() + 1, w.data(), k.stride, ws_bytes.data() + 1, xp.data(), xs[p], k.rows, k.cols);
+                assert(std::memcmp(out_bytes.data() + 1 + 4 * p * k.rows, want.data(), 4 * k.rows) == 0);
+                assert(std::memcmp(out_bytes.data() + 1 + 4 * p * k.rows, one.data() + 1, 4 * k.rows) == 0);
+            }
+            assert(out_bytes[0] == 0xa5 && out_bytes[4 * n * k.rows + 1] == 0xa5);
+        }
+    }
+    std::printf("[PASS] test_matmul_kernels\n");
+}
 
 // ---- float kernels -----------------------------------------------------------------
 // The test is built with -ffp-contract=off, as the kernels are: each line
@@ -205,17 +238,25 @@ static void section(std::vector<uint8_t>& m, uint8_t id, const std::vector<uint8
     m.insert(m.end(), body.begin(), body.end());
 }
 
-// The imports, with functions "mv8", "mv4", "mvf", "vm" and "sm" that pass
-// their arguments on, "oob" that calls k32_matvec_i8 with w past the end of
-// memory, and two pages of memory
+// The imports, with functions "mv8", "mv4", "mvf", "vm", "sm", "mm8" and
+// "mm4" that pass their arguments on, "oob" that calls k32_matvec_i8 with w
+// past the end of memory, and two pages of memory
 constexpr uint8_t kI32 = 0x7f, kF32 = 0x7d;
 static const std::vector<std::vector<uint8_t>> kParams = {{kI32, kI32, kI32, kI32, kF32, kI32, kI32, kI32},
                                                           {kI32, kI32, kI32, kI32, kF32, kI32, kI32, kI32, kI32},
                                                           {kI32, kI32, kI32, kI32, kI32, kI32, kI32, kI32},
                                                           {kI32, kI32},
-                                                          {}};
-static const char* const kImports[] = {"k32_matvec_i8", "k32_matvec_i4", "k32_matvec_f32_i8", "k32_vecmat_f32_i8", "k32_softmax_f32"};
-static const uint8_t kImportType[] = {0, 0, 1, 2, 3};
+                                                          {},
+                                                          {kI32, kI32, kI32, kI32, kI32, kI32, kI32, kI32, kI32}};
+constexpr uint8_t kNumImports = 7;
+static const char* const kImports[] = {"k32_matvec_i8",   "k32_matvec_i4", "k32_matvec_f32_i8", "k32_vecmat_f32_i8",
+                                       "k32_softmax_f32", "k32_matmul_i8", "k32_matmul_i4"};
+static const uint8_t kImportType[] = {0, 0, 1, 2, 3, 5, 5};
+// The module's functions after the imports, their types, and the import each calls (oob: k32_matvec_i8)
+constexpr uint8_t kNumFns = 8;
+static const char* const kFns[] = {"mv8", "mv4", "mvf", "vm", "sm", "oob", "mm8", "mm4"};
+static const uint8_t kFnType[] = {0, 0, 1, 2, 3, 4, 5, 5};
+static const uint8_t kFnCallee[] = {0, 1, 2, 3, 4, 0, 5, 6};
 
 static std::vector<uint8_t> linalg_module() {
     std::vector<uint8_t> m = {0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00};
@@ -228,33 +269,34 @@ static std::vector<uint8_t> linalg_module() {
         types.push_back(kI32);
     }
     section(m, 1, types);
-    std::vector<uint8_t> imports = {5};
-    for (int i = 0; i < 5; i++) {
+    std::vector<uint8_t> imports = {kNumImports};
+    for (int i = 0; i < kNumImports; i++) {
         name(imports, "env");
         name(imports, kImports[i]);
         imports.push_back(0x00);
         imports.push_back(kImportType[i]);
     }
     section(m, 2, imports);
-    section(m, 3, {0x06, 0x00, 0x00, 0x01, 0x02, 0x03, 0x04});
+    std::vector<uint8_t> funcs = {kNumFns};
+    funcs.insert(funcs.end(), kFnType, kFnType + kNumFns);
+    section(m, 3, funcs);
     section(m, 5, {0x01, 0x01, 0x02, 0x02});
-    std::vector<uint8_t> exports = {7};
-    const char* const fns[] = {"mv8", "mv4", "mvf", "vm", "sm", "oob"};
-    for (uint8_t i = 0; i < 6; i++) {
-        name(exports, fns[i]);
+    std::vector<uint8_t> exports = {kNumFns + 1};
+    for (uint8_t i = 0; i < kNumFns; i++) {
+        name(exports, kFns[i]);
         exports.push_back(0x00);
-        exports.push_back(5 + i);
+        exports.push_back(kNumImports + i);
     }
     name(exports, "memory");
     exports.push_back(0x02);
     exports.push_back(0x00);
     section(m, 7, exports);
-    std::vector<uint8_t> code = {6};
-    for (uint8_t callee = 0; callee < 6; callee++) {
+    std::vector<uint8_t> code = {kNumFns};
+    for (uint8_t f = 0; f < kNumFns; f++) {
         std::vector<uint8_t> body = {0x00};
-        if (callee < 5) {
-            for (uint8_t i = 0; i < kParams[kImportType[callee]].size(); i++) { body.push_back(0x20); body.push_back(i); }
-            body.push_back(0x10); body.push_back(callee);
+        if (std::strcmp(kFns[f], "oob") != 0) {
+            for (uint8_t i = 0; i < kParams[kFnType[f]].size(); i++) { body.push_back(0x20); body.push_back(i); }
+            body.push_back(0x10); body.push_back(kFnCallee[f]);
         } else {
             for (int32_t v : {0x100, 0x1FFF0, 0x9001, 0xA000}) { body.push_back(0x41); sleb(body, v); }
             body.insert(body.end(), {0x43, 0x00, 0x00, 0x80, 0x3f});   // f32.const 1.0
@@ -273,7 +315,7 @@ struct Pod {
     IM3Environment env{nullptr};
     IM3Runtime rt{nullptr};
     IM3Module mod{nullptr};
-    IM3Function fn[5]{};
+    IM3Function fn[7]{};   // mv8, mv4, mvf, vm, sm, mm8, mm4
     std::vector<uint8_t> wasm;
     uint8_t* mem{nullptr};
     size_t mem_size{0};
@@ -287,8 +329,8 @@ struct Pod {
         if (!r) r = m3_LoadModule(rt, mod);
         assert(!r);
         link_app_host_functions(mod, "default/linalg");
-        const char* const names[] = {"mv8", "mv4", "mvf", "vm", "sm"};
-        for (int i = 0; i < 5 && !r; i++) r = m3_FindFunction(&fn[i], rt, names[i]);
+        const char* const names[] = {"mv8", "mv4", "mvf", "vm", "sm", "mm8", "mm4"};
+        for (int i = 0; i < 7 && !r; i++) r = m3_FindFunction(&fn[i], rt, names[i]);
         if (r) std::printf("module: %s\n", r);
         assert(!r);
         mem = m3_GetMemory(mod, &mem_size, 0);
@@ -589,14 +631,94 @@ static void test_blob_operands() {
     std::printf("[PASS] test_blob_operands\n");
 }
 
+// k32_matmul_i8 and k32_matmul_i4 through a pod: n results, the gas of n
+// products, operands outside the memory, weights read from a blob in place
+static void test_matmul_import() {
+    using namespace kube32;
+    constexpr uint32_t kXs = 0xB000, n = 5;
+    for (Case k : {Case{8, 64, 172, 0}, Case{4, 172, 64, 40}}) {
+        const uint64_t budget = 1000000000ull;
+        Pod p(budget);
+        const uint32_t row_bytes = k.bits == 8 ? k.cols : (k.cols + 1) / 2;
+        const size_t stride = k.stride ? k.stride : row_bytes;
+        std::vector<int8_t> w, x0;
+        std::vector<float> ws;
+        float xs0;
+        fill(Case{k.bits, k.rows, k.cols, stride}, w, ws, x0, xs0);
+        std::vector<int8_t> x(n * k.cols);
+        for (auto& v : x) v = static_cast<int8_t>(rnd() >> 24);
+        float xs[n];
+        for (float& f : xs) f = static_cast<float>(rnd() >> 8) / 16777216.0f * 0.1f;
+        std::memcpy(p.mem + kW, w.data(), w.size());
+        std::memcpy(p.mem + kWs, ws.data(), 4 * ws.size());
+        std::memcpy(p.mem + kX, x.data(), x.size());
+        std::memcpy(p.mem + kXs, xs, sizeof xs);
+        const int f = k.bits == 8 ? 5 : 6;
+        const std::string fn = std::string("k32_matmul_i") + (k.bits == 8 ? "8" : "4");
+        int32_t rc = 1;
+        const uint64_t before = m3_GetResourceUsage(p.rt, c_m3Limit_GasUnits);
+        assert(!p.call_fn(f, &rc, kOut, kW, kWs, kX, kXs, k.rows, k.cols, static_cast<uint32_t>(k.stride), n) && rc == K32_OK);
+        const uint64_t gas = m3_GetResourceUsage(p.rt, c_m3Limit_GasUnits) - before;
+        assert(gas >= linalg_gas(n * matrix_units(k.rows, k.cols)) && gas - linalg_gas(n * matrix_units(k.rows, k.cols)) < 2000);
+        for (uint32_t i = 0; i < n; i++) {
+            const std::vector<int8_t> xp(x.begin() + i * k.cols, x.begin() + (i + 1) * k.cols);
+            const std::vector<float> want = reference(w, stride, k.bits, ws, xp, xs[i], k.rows, k.cols);
+            assert(std::memcmp(p.mem + kOut + 4 * i * k.rows, want.data(), 4 * k.rows) == 0);
+        }
+        // n = 0 writes nothing; a stride below a row's bytes is refused
+        assert(!p.call_fn(f, &rc, kOut, kW, kWs, kX, kXs, k.rows, k.cols, 0u, 0u) && rc == K32_OK);
+        assert(!p.call_fn(f, &rc, kOut, kW, kWs, kX, kXs, k.rows, k.cols, row_bytes - 1, n) && rc == K32_ERR_INVAL);
+        // Each operand past the end of the memory
+        const uint32_t end = 2 * 65536;
+        const auto trap = [&](uint32_t out, uint32_t wa, uint32_t sa, uint32_t xa, uint32_t xsa, const char* operand) {
+            M3Result r = p.call_fn(f, &rc, out, wa, sa, xa, xsa, k.rows, k.cols, static_cast<uint32_t>(k.stride), n);
+            assert(r && std::string(r) == "[trap] out of bounds memory access: " + std::string(operand) + " of " + fn);
+            assert(describe_trap(r, TrapContext{}).exit_code == 139);
+        };
+        trap(end - 4 * n * k.rows + 1, kW, kWs, kX, kXs, "out");
+        trap(kOut, end - static_cast<uint32_t>((k.rows - 1) * stride + row_bytes) + 1, kWs, kX, kXs, "w");
+        trap(kOut, kW, end - 4 * k.rows + 1, kX, kXs, "w_scale");
+        trap(kOut, kW, kWs, end - n * k.cols + 1, kXs, "x");
+        trap(kOut, kW, kWs, kX, end - 4 * n + 1, "x_scale");
+        // The weights and their scales from a blob, in place
+        storage::FlashBlobStore flash(storage::create_ram_blob_region(512 * 1024), false);
+        std::vector<uint8_t> bytes(w.size() + 4 * ws.size());
+        std::memcpy(bytes.data(), w.data(), w.size());
+        std::memcpy(bytes.data() + w.size(), ws.data(), 4 * ws.size());
+        store_blob(flash, "w", bytes);
+        storage::set_node_blob_stores(&flash, nullptr);
+        const std::string pod = "default/linalg";
+        PodBlobs::instance().set_allowed(pod, {"w"});
+        const int32_t h = PodBlobs::instance().open(pod, "w");
+        assert(h == 0);
+        std::memset(p.mem + kOut, 0, 4 * n * k.rows);
+        assert(!p.call_fn(f, &rc, kOut, blob_addr(h, 0), blob_addr(h, static_cast<uint32_t>(w.size())), kX, kXs, k.rows, k.cols,
+                          static_cast<uint32_t>(k.stride), n) &&
+               rc == K32_OK);
+        for (uint32_t i = 0; i < n; i++) {
+            const std::vector<int8_t> xp(x.begin() + i * k.cols, x.begin() + (i + 1) * k.cols);
+            const std::vector<float> want = reference(w, stride, k.bits, ws, xp, xs[i], k.rows, k.cols);
+            assert(std::memcmp(p.mem + kOut + 4 * i * k.rows, want.data(), 4 * k.rows) == 0);
+        }
+        M3Result r = p.call_fn(f, &rc, kOut, blob_addr(h, 0), blob_addr(h, static_cast<uint32_t>(w.size()) + 1), kX, kXs, k.rows, k.cols,
+                               static_cast<uint32_t>(k.stride), n);
+        assert(r && std::string(r) == "[trap] out of bounds memory access: w_scale of " + fn + " (a blob address outside every open blob)");
+        PodBlobs::instance().forget_pod(pod);
+        storage::set_node_blob_stores(nullptr, nullptr);
+    }
+    std::printf("[PASS] test_matmul_import\n");
+}
+
 int main() {
     test_kernels_match_reference();
+    test_matmul_kernels();
     test_float_kernels();
     test_imports_compute();
     test_out_of_bounds_traps();
     test_pod_trap();
     test_gas();
     test_blob_operands();
+    test_matmul_import();
     std::printf("All linear algebra tests passed\n");
     return 0;
 }

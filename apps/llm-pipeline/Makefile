@@ -32,7 +32,7 @@ all: modules model manifest
 
 modules: $(MODULES)
 
-build/%.o: %.c llm.h ../../include/runtime/k32_app_abi.h
+build/%.o: %.c llm.h tokenizer.h ../../include/runtime/k32_app_abi.h
 	@mkdir -p build
 	$(CLANG) $(CFLAGS) -c $< -o $@
 

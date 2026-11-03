@@ -1,0 +1,68 @@
+# llm-diffusion: a masked diffusion language model on the control plane. The
+# weights stay in the node's flash blob store and the node's linear algebra
+# reads them in place; the pod holds the 64-token window's activations.
+#
+#   make -C apps/llm-diffusion
+#   kubectl --context kube32 replace --raw \
+#     "/api/v1/nodes/<node>/proxy/blobs/mdlm?size=$(wc -c < apps/llm-diffusion/build/mdlm-blob.bin)" \
+#     -f apps/llm-diffusion/build/mdlm-blob.bin
+#   kubectl --context kube32 apply -f apps/llm-diffusion/build/llm-diffusion.yaml
+#   curl -s "http://<control plane>/diffusion/generate?steps=16&prompt=Lily%20went%20to%20the%20park"
+#   curl -s "http://<control plane>/diffusion/state"
+apiVersion: v1
+kind: Pod
+metadata:
+  name: llm-diffusion
+  namespace: default
+  labels:
+    app: llm-diffusion
+  annotations:
+    kube32.io/wasm-base64: "__WASM_BASE64__"
+    kube32.io/blobs: mdlm
+    kube32.io/execution-budget: "off"
+    kube32.io/wasm-stack: "1536"
+spec:
+  nodeSelector:
+    node-role.kubernetes.io/control-plane: ""
+  restartPolicy: Always
+  containers:
+    - name: llm-diffusion
+      image: wasm://inline/llm-diffusion
+      ports:
+        - containerPort: 7000
+          name: http
+      resources:
+        requests:
+          memory: 256Ki
+        limits:
+          memory: 256Ki
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: llm-diffusion
+  namespace: default
+spec:
+  selector:
+    app: llm-diffusion
+  ports:
+    - name: http
+      port: 80
+      targetPort: 7000
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: llm-diffusion
+  namespace: default
+spec:
+  rules:
+    - http:
+        paths:
+          - path: /diffusion
+            pathType: Prefix
+            backend:
+              service:
+                name: llm-diffusion
+                port:
+                  number: 80

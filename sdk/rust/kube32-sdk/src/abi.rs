@@ -56,6 +56,28 @@ extern "C" {
     // Linear algebra for quantized neural networks, computed natively
     pub fn k32_matvec_i8(out: *mut f32, w: *const i8, w_scale: *const f32, x: *const i8, x_scale: f32, rows: u32, cols: u32, row_stride: u32) -> i32;
     pub fn k32_matvec_i4(out: *mut f32, w: *const u8, w_scale: *const f32, x: *const i8, x_scale: f32, rows: u32, cols: u32, row_stride: u32) -> i32;
+    pub fn k32_matmul_i8(
+        out: *mut f32,
+        w: *const i8,
+        w_scale: *const f32,
+        x: *const i8,
+        x_scale: *const f32,
+        rows: u32,
+        cols: u32,
+        row_stride: u32,
+        n: u32,
+    ) -> i32;
+    pub fn k32_matmul_i4(
+        out: *mut f32,
+        w: *const u8,
+        w_scale: *const f32,
+        x: *const i8,
+        x_scale: *const f32,
+        rows: u32,
+        cols: u32,
+        row_stride: u32,
+        n: u32,
+    ) -> i32;
     pub fn k32_matvec_f32_i8(
         out: *mut f32,
         w: *const i8,
@@ -115,6 +137,10 @@ mod stubs {
     pub unsafe fn esp32_chip_temp_read(out_milli_c: *mut i32) -> i32 { no_host() }
     pub unsafe fn k32_matvec_i8(out: *mut f32, w: *const i8, w_scale: *const f32, x: *const i8, x_scale: f32, rows: u32, cols: u32, row_stride: u32) -> i32 { no_host() }
     pub unsafe fn k32_matvec_i4(out: *mut f32, w: *const u8, w_scale: *const f32, x: *const i8, x_scale: f32, rows: u32, cols: u32, row_stride: u32) -> i32 { no_host() }
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn k32_matmul_i8(out: *mut f32, w: *const i8, w_scale: *const f32, x: *const i8, x_scale: *const f32, rows: u32, cols: u32, row_stride: u32, n: u32) -> i32 { no_host() }
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn k32_matmul_i4(out: *mut f32, w: *const u8, w_scale: *const f32, x: *const i8, x_scale: *const f32, rows: u32, cols: u32, row_stride: u32, n: u32) -> i32 { no_host() }
     #[allow(clippy::too_many_arguments)]
     pub unsafe fn k32_matvec_f32_i8(out: *mut f32, w: *const i8, w_scale: *const f32, x: *const f32, alpha: f32, rows: u32, cols: u32, row_stride: u32, scale_stride: u32) -> i32 { no_host() }
     pub unsafe fn k32_vecmat_f32_i8(out: *mut f32, w: *const i8, w_scale: *const f32, x: *const f32, rows: u32, cols: u32, row_stride: u32, scale_stride: u32) -> i32 { no_host() }

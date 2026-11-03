@@ -1,6 +1,6 @@
 #pragma once
 
-// Native linear algebra for pods: the k32_matvec_*, k32_vecmat_f32_i8 and
+// Native linear algebra for pods: the k32_matvec_*, k32_matmul_*, k32_vecmat_f32_i8 and
 // k32_softmax_f32 imports (include/runtime/k32_app_abi.h). A pod passes
 // quantized matrices and vectors in its linear memory, and the node computes
 // the products natively.
@@ -36,6 +36,18 @@ void matvec_i8(uint8_t* out, const int8_t* w, size_t row_stride, const uint8_t* 
                uint32_t rows, uint32_t cols);
 void matvec_i4(uint8_t* out, const int8_t* w, size_t row_stride, const uint8_t* w_scale, const int8_t* x, float x_scale,
                uint32_t rows, uint32_t cols);
+
+// The same products for n vectors at once: x holds n vectors of cols int8
+// values one after another and x_scale n floats, and
+// out[p * rows + r] = (float)(sum over c of w[r][c] * x[p * cols + c]) * (w_scale[r] * x_scale[p]),
+// the bits of n matvec calls. Each row of w is read once for kMatmulGroup
+// vectors (from the weights' memory once for all n: the next group finds it
+// in the cache).
+constexpr uint32_t kMatmulGroup = 4;
+void matmul_i8(uint8_t* out, const int8_t* w, size_t row_stride, const uint8_t* w_scale, const int8_t* x, const uint8_t* x_scale,
+               uint32_t rows, uint32_t cols, uint32_t n);
+void matmul_i4(uint8_t* out, const int8_t* w, size_t row_stride, const uint8_t* w_scale, const int8_t* x, const uint8_t* x_scale,
+               uint32_t rows, uint32_t cols, uint32_t n);
 
 // out[r] = ((sum over c of x[c] * (float)w[r][c]) * w_scale[r]) * alpha, the
 // sum from 0 in column order. Scale r is scale_stride bytes after scale r - 1.
