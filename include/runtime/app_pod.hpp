@@ -13,7 +13,9 @@
 #include "runtime/pod_snapshot.hpp"
 #include "osal/mutex.hpp"
 #include "osal/condition_variable.hpp"
+#include "osal/thread.hpp"
 
+#include <atomic>
 #include <cstdint>
 #include <cstddef>
 #include <deque>
@@ -168,6 +170,20 @@ struct SnapshotSummary {
     uint64_t pod_time_ms{0};
 };
 
+// A pod worker: a thread that calls the k32_tick and k32_event of the pods
+// placed on it (AppPodHost::start_workers)
+struct PodWorkerOptions {
+    int core{-1};                  // the core it runs on, kube32.io/core names it
+    bool pinned{false};            // pinned to `core` (the boards)
+    size_t stack_bytes{0};         // 0: the platform default
+    bool stack_in_psram{false};
+    void* stack_buffer{nullptr};   // the stack (stack_bytes), owned by the caller
+    // The stack holds the interpreter: the worker's calls into pods run on
+    // it, not on the shared interpreter stack (kube32_interp_stack_add)
+    bool own_interpreter_stack{false};
+    uint32_t priority{4};
+};
+
 struct AppPodStats {
     uint64_t requests{0};
     uint64_t errors{0};
@@ -237,6 +253,33 @@ public:
     uint32_t tick_due(uint64_t now_ms, uint32_t max_wait_ms = 1000);
     int32_t event(const std::string& pod_id, std::string_view topic, const uint8_t* data, size_t len);
 
+    // Pod workers ------------------------------------------------------------
+    // Each worker ticks the pods placed on it and delivers their events, so
+    // pods on two workers (two cores of the ESP32-S3) run at the same time;
+    // calls into one pod stay serialized by its call lock wherever they come
+    // from. A pod goes to the worker of the core its kube32.io/core names,
+    // else to the worker with the least CPU of its pods' ticks and events
+    // over the last window (then the fewest pods). Pods that call each other
+    // in-process (k32_http_call to a Service on the node) share a worker. Every
+    // kBalanceWindowMs a worker whose pods used a quarter of the window more
+    // CPU than another's hands one group of placed-by-load pods over when
+    // that lowers the busier figure; a group stays put for kMoveHoldMs after
+    // a move. Without workers, tick_due ticks every pod and the event thread
+    // delivers every event.
+    static constexpr uint32_t kBalanceWindowMs = 2000;
+    static constexpr uint32_t kMoveHoldMs = 10000;
+    // Starts the workers once; returns how many run (a worker whose thread
+    // cannot start is left out).
+    size_t start_workers(const std::vector<PodWorkerOptions>& workers);
+    // Stops and joins the workers; pods stay registered (tests)
+    void stop_workers();
+    size_t worker_count() const { return worker_n_.load(); }
+    // kube32.io/core: the core whose worker runs the pod, -1 for placement
+    // by load; set before the pod registers
+    void set_core(const std::string& pod_id, int core);
+    // The core of the pod's worker; -1 for no such pod or no workers
+    int pod_core(const std::string& pod_id) const;
+
     AppPodStats stats(const std::string& pod_id) const;
     // Diagnostics: the request currently executing (empty when idle) and its age
     std::string in_flight(uint32_t& out_age_ms) const;
@@ -295,6 +338,14 @@ private:
         int64_t clock_offset_ms{0};
         std::vector<HeldEvent> held;             // events that arrived while frozen
         uint32_t held_dropped{0};
+        // Pod workers
+        int core_request{-1};                    // kube32.io/core, -1: placed by load
+        size_t worker{0};
+        uint32_t group{0};                       // pods linked by in-process calls share one
+        bool in_worker{false};                   // a worker ticks it now
+        uint64_t worker_cpu_us{0};               // CPU of its calls on worker threads
+        uint64_t balance_mark_us{0};             // worker_cpu_us at the last balance
+        uint64_t moved_ms{0};
     };
     struct MigrationInfo {
         std::string container;
@@ -323,13 +374,14 @@ private:
     std::map<std::string, uint32_t> topic_subs_;                      // topic -> channel subscription
 
     // One allocation per message: the pod's id, the topic and the data in
-    // one buffer
+    // one buffer; `worker` is the pod's worker (kept current by moves)
     struct PendingEvent {
         std::string buf;
         uint16_t id_len{0}, topic_len{0};
+        uint16_t worker{0};
         PendingEvent() = default;
-        PendingEvent(std::string_view pod_id, std::string_view topic, std::string_view data)
-            : id_len(static_cast<uint16_t>(pod_id.size())), topic_len(static_cast<uint16_t>(topic.size())) {
+        PendingEvent(std::string_view pod_id, std::string_view topic, std::string_view data, size_t w = 0)
+            : id_len(static_cast<uint16_t>(pod_id.size())), topic_len(static_cast<uint16_t>(topic.size())), worker(static_cast<uint16_t>(w)) {
             buf.reserve(pod_id.size() + topic.size() + data.size());
             buf.append(pod_id).append(topic).append(data);
         }
@@ -351,6 +403,34 @@ private:
     static constexpr size_t kMaxQueuedEventsSmall = 8;
     void event_thread_main();
     void start_event_thread();
+
+    struct Worker {
+        AppPodHost* host{nullptr};
+        size_t index{0};
+        PodWorkerOptions opts;
+        osal::Thread thread;
+        std::vector<std::string> due;   // its pass's due pods, buffers kept
+        std::string event_pod;          // the pod it delivers an event to now (event_mutex_)
+        bool kick{false};               // a pod became due on it (event_mutex_)
+        uint64_t load_us{0};            // CPU of its pods' worker calls in the last window (mutex_)
+    };
+    std::vector<std::unique_ptr<Worker>> workers_;
+    std::atomic<size_t> worker_n_{0};
+    bool workers_stop_{false};          // event_mutex_
+    std::map<std::string, int> core_requests_;
+    uint32_t group_seq_{0};
+    uint64_t balance_at_ms_{0};
+    void worker_main(Worker& w);
+    bool deliver_worker_event(Worker& w);
+    uint32_t tick_worker(Worker& w, uint64_t now_ms, uint32_t max_wait_ms);
+    void balance(uint64_t now_ms);
+    size_t place_locked(int core_request) const;
+    // Puts every pod of `group` on worker `to`, its queued events with it
+    void move_group_locked(uint32_t group, size_t to, uint64_t now_ms, const char* why);
+    // An in-process call from `caller` to `callee`: their groups join
+    void link_locked(const std::string& caller, const std::string& callee, uint64_t now_ms);
+    size_t worker_hint(const std::string& pod_id) const;
+    void wake_workers();
 
     Entry* find_locked(const std::string& pod_id);
     // Subscribes the topics wanted by registered k32_event pods, drops the rest.

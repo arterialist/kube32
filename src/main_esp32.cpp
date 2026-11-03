@@ -189,6 +189,16 @@ std::string read_nvs_str(const char* key) {
     return ok ? std::string(v) : std::string();
 }
 
+// Reads one number from the "k32" NVS namespace; `fallback` when absent.
+uint32_t read_nvs_u32(const char* key, uint32_t fallback) {
+    nvs_handle_t h;
+    if (nvs_open("k32", NVS_READONLY, &h) != ESP_OK) return fallback;
+    uint32_t v = fallback;
+    if (nvs_get_u32(h, key, &v) != ESP_OK) v = fallback;
+    nvs_close(h);
+    return v;
+}
+
 // WPA2 passphrase of the cluster access point: 8 to 63 printable characters
 bool valid_ap_password(const std::string& p) {
     if (p.size() < 8 || p.size() > 63) return false;
@@ -1016,6 +1026,7 @@ static void improv_command(Console& con, const NodeIdentity& ident, const std::s
 //   K32_CMD:APPASS:<cluster access point password>       -> stored in NVS, reboot
 //   K32_CMD:APPASS                                       -> K32_APPASS <password>
 //   K32_CMD:SYSRESERVE:<size>|auto                       -> PSRAM kept back for the system, stored in NVS, reboot
+//   K32_CMD:PODCORES:<1|2>                               -> pod workers on a board with PSRAM, stored in NVS, reboot
 //   K32_CMD:CERT                                         -> the API server's TLS certificate (PEM)
 //   K32_CMD:FIRMWARE                                     -> the running image and its slot (and what is staged)
 //   K32_CMD:BENCH:<kernel>:<n>:<runs>                    -> the benchmark kernels run natively (docs/benchmarks.md)
@@ -1320,6 +1331,22 @@ void console_task(void* arg) {
                         nvs_close(h);
                     }
                     con.write("K32_OK system reserve stored, rebooting\n", 40);
+                    vTaskDelay(pdMS_TO_TICKS(200));
+                    esp_restart();
+                }
+            } else if (line.rfind("K32_CMD:PODCORES:", 0) == 0) {
+                // Pod workers from the next boot on: 2 (one a core) or 1
+                const std::string value = line.substr(17);
+                if (value != "1" && value != "2") {
+                    con.write("K32_ERR pod cores must be 1 or 2\n", 32);
+                } else {
+                    nvs_handle_t h;
+                    if (nvs_open("k32", NVS_READWRITE, &h) == ESP_OK) {
+                        nvs_set_u32(h, "podcores", static_cast<uint32_t>(value[0] - '0'));
+                        nvs_commit(h);
+                        nvs_close(h);
+                    }
+                    con.write("K32_OK pod cores stored, rebooting\n", 35);
                     vTaskDelay(pdMS_TO_TICKS(200));
                     esp_restart();
                 }
@@ -2327,12 +2354,38 @@ void cluster_task(void* pv) {
     // as fast as it arrives. It blocks in reads nearly all the time.
     xTaskCreatePinnedToCore(console_task, "k32_console", 4096, &console_ctx, 11, nullptr, 0);
 
-    // Pod ticks run the interpreter, so they get a thread with a stack sized
-    // for it rather than this 9 KB task. A pod is ticked once per
-    // kube32.io/tick-interval (1 s by default); one that returns >0 from
-    // k32_tick has background work left (incremental seeding, for example)
-    // and is ticked again after a short yield so requests interleave.
-    {
+    // A pod is ticked once per kube32.io/tick-interval (1 s by default); one
+    // that returns >0 from k32_tick has background work left (incremental
+    // seeding, for example) and is ticked again after a short yield so
+    // requests interleave. On a board with PSRAM two pod workers tick the
+    // pods and deliver their events, one a core: core 1's on the shared
+    // interpreter stack, as the request threads, core 0's on a stack of its
+    // own, below Wi-Fi and the system's tasks there. That stack comes from
+    // the pod block, so pods' allocatable memory pays for the second core
+    // and the system's PSRAM stays as it is. K32_CMD:PODCORES:1 keeps one.
+    size_t pod_workers = 0;
+    if (ident.has_psram && kube32_interp_stack_active() && read_nvs_u32("podcores", 2) >= 2) {
+        std::vector<kube32::runtime::PodWorkerOptions> workers(2);
+        workers[0].core = 1;
+        workers[0].pinned = true;
+        workers[0].stack_bytes = 8192;
+        workers[0].stack_in_psram = true;
+        workers[0].priority = 4;
+        // The interpreter's recursion peaks near 56 KB: the shared stack's
+        // 64 KiB and room for the worker's own frames
+        workers[1].core = 0;
+        workers[1].pinned = true;
+        workers[1].stack_bytes = 68 * 1024;
+        workers[1].stack_buffer = kube32_pool_system_alloc(workers[1].stack_bytes);
+        workers[1].own_interpreter_stack = true;
+        workers[1].priority = 3;
+        if (!workers[1].stack_buffer) workers.pop_back();
+        pod_workers = kube32::runtime::AppPodHost::instance().start_workers(workers);
+        printf("[POD] %u pod worker(s)\n", (unsigned)pod_workers);
+    }
+    if (pod_workers == 0) {
+        // Pod ticks run the interpreter, so they get a thread with a stack
+        // sized for it rather than this 9 KB task
         kube32::osal::Thread::Config t_cfg;
         t_cfg.name = "k32_tick";
         t_cfg.stack_size = kube32_interp_stack_active() ? (ident.has_psram ? 8192 : 4096) : 65536;

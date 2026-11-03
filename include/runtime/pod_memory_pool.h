@@ -29,8 +29,20 @@ size_t kube32_pool_stack_size(void);
 void  kube32_interp_stack_set(void* stack, size_t bytes);
 int   kube32_interp_stack_active(void);
 void* kube32_interp_stack_get(size_t* out_bytes);
-/* Base of the shared stack when `sp` lies in it, else NULL. */
+/* Memory the node itself takes from the block's end at boot (the stack of
+ * a pod worker that runs the interpreter): allocatable memory leaves it
+ * out. NULL when the block has no room. */
+void*  kube32_pool_system_alloc(size_t bytes);
+size_t kube32_pool_system_bytes(void);
+/* Stacks of threads that call pods on their own stack (pod workers with a
+ * stack sized for the interpreter): a call made there runs where it is.
+ * Up to four, added once at boot. */
+void  kube32_interp_stack_add(void* stack, size_t bytes);
+/* Base of the interpreter stack `sp` lies in (the shared one or an added
+ * one), else NULL. */
 void* kube32_interp_stack_base_for(const void* sp);
+/* 1 when `sp` lies in the shared stack. */
+int   kube32_interp_stack_is_shared(const void* sp);
 int   kube32_pool_owns(const void* ptr);
 size_t kube32_pool_block_size(void);
 int   kube32_pool_free(void* ptr);                 /* 1 when the pointer was pooled */

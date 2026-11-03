@@ -25,6 +25,11 @@
 #include <mutex>
 #include <map>
 
+#if defined(ESP_PLATFORM)
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#endif
+
 
 namespace kube32::runtime {
 
@@ -81,9 +86,31 @@ static bool chain_contains(std::string_view chain, std::string_view pod) {
 // -----------------------------------------------------------------------------
 static AppPlatformHooks s_hooks;
 static bool s_verbose_requests = false;
+
+// The pod worker this thread is (AppPodHost::start_workers), or -1
+static thread_local int t_worker = -1;
+
+// What each thread that calls pods is calling now (diagnostics); a nested
+// call (a service call) restores its caller's entry
+struct InFlight {
+    uintptr_t thread{0};
+    std::string what;
+    uint64_t since{0};
+};
 static std::mutex s_inflight_mutex;
-static std::string s_inflight;
-static uint64_t s_inflight_since = 0;
+static std::vector<InFlight> s_inflight;
+
+static InFlight& inflight_locked() {
+    const uintptr_t id = osal::Thread::current_id();
+    for (auto& f : s_inflight) if (f.thread == id) return f;
+    if (s_inflight.size() >= 32) {
+        // Threads that ended leave idle entries behind
+        s_inflight.erase(std::remove_if(s_inflight.begin(), s_inflight.end(), [](const InFlight& f) { return f.what.empty(); }),
+                         s_inflight.end());
+    }
+    s_inflight.push_back(InFlight{id, std::string(), 0});
+    return s_inflight.back();
+}
 
 void set_app_request_logging(bool verbose) { s_verbose_requests = verbose; }
 
@@ -110,8 +137,10 @@ static void note_call_cost(ContainerLifecycleController* ctrl, const char* fn) {
     IM3Runtime rt = ctrl ? static_cast<IM3Runtime>(ctrl->m3_runtime_handle()) : nullptr;
     if (!rt || ctrl->config().gas_budget_per_call == 0) return;
     uint64_t used = m3_GetResourceUsage(rt, c_m3Limit_GasUnits);
+    static std::mutex s_peak_mutex;
     static std::map<std::string, uint64_t> s_peak;
     static int s_logged = 0;
+    std::lock_guard<std::mutex> lock(s_peak_mutex);
     uint64_t& peak = s_peak[ctrl->config().pod_id];
     if (used > peak + peak / 4 && s_logged < 24) {
         s_logged++;
@@ -805,12 +834,12 @@ void AppPodHost::deliver_topic(std::string_view topic, const uint8_t* data, size
             auto pod = pods_.find(kv.first);
             if (pod == pods_.end() || !pod->second.has_event) continue;
             for (const auto& t : kv.second) {
-                if (t == topic) { ready.emplace_back(kv.first, topic, body); break; }
+                if (t == topic) { ready.emplace_back(kv.first, topic, body, pod->second.worker); break; }
             }
         }
     }
     if (ready.empty()) return;
-    const size_t cap = osal::System::get_total_psram_bytes() > 0 ? kMaxQueuedEvents : kMaxQueuedEventsSmall;
+    const size_t cap = (osal::System::get_total_psram_bytes() > 0 ? kMaxQueuedEvents : kMaxQueuedEventsSmall) * std::max<size_t>(1, worker_n_.load());
     {
         osal::LockGuard guard(event_mutex_);
         for (auto& ev : ready) {
@@ -822,7 +851,9 @@ void AppPodHost::deliver_topic(std::string_view topic, const uint8_t* data, size
         }
     }
     start_event_thread();   // normally running already; retried here if it could not start
-    event_cv_.notify_one();
+    // The workers wait on the one condition, each for its own pods' events
+    if (worker_n_.load()) event_cv_.notify_all();
+    else event_cv_.notify_one();
 }
 
 // The event thread runs while some pod subscribes to a topic: it is started
@@ -831,7 +862,7 @@ void AppPodHost::deliver_topic(std::string_view topic, const uint8_t* data, size
 void AppPodHost::start_event_thread() {
     {
         osal::LockGuard guard(event_mutex_);
-        if (event_thread_running_ || !event_thread_wanted_) return;
+        if (event_thread_running_ || !event_thread_wanted_ || worker_n_.load()) return;   // workers deliver events
         event_thread_running_ = true;
     }
     osal::Thread::Config cfg;
@@ -857,9 +888,9 @@ void AppPodHost::event_thread_main() {
         PendingEvent ev;
         {
             osal::UniqueLock<osal::Mutex> lock(event_mutex_);
-            event_cv_.wait_for(lock, 1000, [this]() { return !event_queue_.empty() || !event_thread_wanted_; });
-            if (event_queue_.empty()) {
-                if (!event_thread_wanted_) {
+            event_cv_.wait_for(lock, 1000, [this]() { return !event_queue_.empty() || !event_thread_wanted_ || worker_n_.load(); });
+            if (event_queue_.empty() || worker_n_.load()) {
+                if (!event_thread_wanted_ || worker_n_.load()) {
                     event_thread_running_ = false;
                     return;
                 }
@@ -906,6 +937,13 @@ bool AppPodHost::register_pod(const std::string& pod_id, ContainerLifecycleContr
     osal::LockGuard guard(mutex_);
     auto interval = tick_intervals_.find(pod_id);
     if (interval != tick_intervals_.end()) e.tick_interval_ms = interval->second;
+    auto core = core_requests_.find(pod_id);
+    if (core != core_requests_.end()) e.core_request = core->second;
+    e.group = ++group_seq_;
+    e.worker = place_locked(e.core_request);
+    if (worker_n_.load() > 1 && (e.has_tick || e.has_event)) {
+        printf("[POD] %s: core %d (%s)\n", pod_id.c_str(), workers_[e.worker]->opts.core, e.core_request >= 0 ? "kube32.io/core" : "least busy");
+    }
     pods_[pod_id] = std::move(e);
     sync_topic_subscriptions_locked();
     return true;
@@ -936,6 +974,7 @@ void AppPodHost::unregister_pod(const std::string& pod_id) {
         assets_.erase(pod_id);
         event_topics_.erase(pod_id);
         tick_intervals_.erase(pod_id);
+        core_requests_.erase(pod_id);
         migration_.erase(pod_id);
         sync_topic_subscriptions_locked();
     }
@@ -989,9 +1028,14 @@ AppPodHost::Entry* AppPodHost::find_locked(const std::string& pod_id) {
 }
 
 std::string AppPodHost::in_flight(uint32_t& out_age_ms) const {
+    // The call that has run longest
     std::lock_guard<std::mutex> lk(s_inflight_mutex);
-    out_age_ms = s_inflight.empty() ? 0 : static_cast<uint32_t>(osal::System::get_uptime_ms() - s_inflight_since);
-    return s_inflight;
+    const InFlight* oldest = nullptr;
+    for (const auto& f : s_inflight) {
+        if (!f.what.empty() && (!oldest || f.since < oldest->since)) oldest = &f;
+    }
+    out_age_ms = oldest ? static_cast<uint32_t>(osal::System::get_uptime_ms() - oldest->since) : 0;
+    return oldest ? oldest->what : std::string();
 }
 
 AppPodStats AppPodHost::stats(const std::string& pod_id) const {
@@ -1022,6 +1066,7 @@ int32_t AppPodHost::init_pod(const std::string& pod_id) {
             e->next_tick_ms = 0;
         }
     }
+    if (init_rc == 0) wake_workers();   // its first tick is due now
     return init_rc;
 }
 
@@ -1077,12 +1122,15 @@ int32_t AppPodHost::call_with_block(Entry& e, const std::string& pod_id, const c
     uint64_t outer_since = 0;
     {
         std::lock_guard<std::mutex> lk(s_inflight_mutex);
-        outer_inflight.swap(s_inflight);
-        outer_since = s_inflight_since;
-        s_inflight.assign(fn);
-        s_inflight.append(" ");
-        s_inflight.append(reinterpret_cast<const char*>(data), len > 48 ? 48 : len);
-        s_inflight_since = osal::System::get_uptime_ms();
+        InFlight& f = inflight_locked();
+        outer_inflight.swap(f.what);
+        outer_since = f.since;
+        f.what.assign(pod_id);
+        f.what.append(" ");
+        f.what.append(fn);
+        f.what.append(" ");
+        f.what.append(reinterpret_cast<const char*>(data), len > 48 ? 48 : len);
+        f.since = osal::System::get_uptime_ms();
     }
     if (s_verbose_requests) {
         printf("[APP] > %s %s%.*s\n", pod_id.c_str(), fn, (int)(len > 48 ? 48 : len), (const char*)data);
@@ -1104,8 +1152,9 @@ int32_t AppPodHost::call_with_block(Entry& e, const std::string& pod_id, const c
     uint32_t call_us = static_cast<uint32_t>(osal::Thread::get_time_us() - t_call);
     {
         std::lock_guard<std::mutex> lk(s_inflight_mutex);
-        s_inflight.swap(outer_inflight);
-        s_inflight_since = outer_since;
+        InFlight& f = inflight_locked();
+        f.what.swap(outer_inflight);
+        f.since = outer_since;
     }
     if (s_verbose_requests || call_us > 2000000u) {
         printf("[APP] < %s %s rc=%d %u us\n", pod_id.c_str(), fn, (int)result, (unsigned)call_us);
@@ -1160,6 +1209,12 @@ int32_t AppPodHost::dispatch(const std::string& pod_id, const AppRequest& req, A
         if (!e || !e->has_handle) return nested ? K32_ERR_NOENT : -2;
         if (e->frozen) return send_frozen(sink);
         cm = e->call_mutex.get();
+        // The caller, last in the chain, and this pod go to one worker
+        if (nested && worker_n_.load() > 1 && !req.call_chain.empty()) {
+            const size_t comma = req.call_chain.rfind(',');
+            const std::string caller(req.call_chain.substr(comma == std::string_view::npos ? 0 : comma + 1));
+            link_locked(caller, pod_id, osal::System::get_uptime_ms());
+        }
         // A pod of this node earlier in the chain waits in a service call on
         // the node's one interpreter stack: this call could only run once
         // that one had timed out
@@ -1358,7 +1413,10 @@ int32_t AppPodHost::call_export(const std::string& pod_id, ContainerLifecycleCon
 void AppPodHost::add_cpu(const std::string& pod_id, uint64_t us) {
     if (us == 0) return;
     osal::LockGuard guard(mutex_);
-    if (Entry* e = find_locked(pod_id)) e->stats.cpu_us += us;
+    if (Entry* e = find_locked(pod_id)) {
+        e->stats.cpu_us += us;
+        if (t_worker >= 0) e->worker_cpu_us += us;   // what the balance weighs
+    }
 }
 
 void AppPodHost::set_busy(const std::string& pod_id, const char* fn) {
@@ -1366,6 +1424,322 @@ void AppPodHost::set_busy(const std::string& pod_id, const char* fn) {
     if (Entry* e = find_locked(pod_id)) {
         e->busy_fn = fn;
         if (fn) e->busy_since_ms = osal::System::get_uptime_ms();
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Pod workers
+// -----------------------------------------------------------------------------
+size_t AppPodHost::start_workers(const std::vector<PodWorkerOptions>& workers) {
+    if (worker_n_.load() || workers.empty()) return worker_n_.load();
+    {
+        osal::LockGuard guard(event_mutex_);
+        workers_stop_ = false;
+    }
+    // No worker reads the list before worker_n_ counts it
+    workers_.reserve(workers.size());
+    for (const auto& o : workers) {
+        auto w = std::make_unique<Worker>();
+        w->host = this;
+        w->index = workers_.size();
+        w->opts = o;
+        osal::Thread::Config cfg;
+        cfg.name = "k32_pods";
+#if defined(ESP_PLATFORM)
+        cfg.stack_size = o.stack_bytes ? o.stack_bytes : 8192;
+#else
+        cfg.stack_size = o.stack_bytes ? o.stack_bytes : 262144;
+#endif
+        cfg.stack_in_psram = o.stack_in_psram;
+        cfg.stack_buffer = o.stack_buffer;
+        cfg.priority = o.priority;
+        cfg.core_affinity = o.pinned ? o.core : -1;
+        w->opts.stack_bytes = cfg.stack_size;
+        Worker* raw = w.get();
+        workers_.push_back(std::move(w));
+        if (!raw->thread.start([](void* p) { auto* wk = static_cast<Worker*>(p); wk->host->worker_main(*wk); }, raw, cfg)) {
+            printf("[POD] cannot start the pod worker for core %d (%u byte stack)\n", o.core, (unsigned)cfg.stack_size);
+            workers_.pop_back();
+        }
+    }
+    {
+        osal::LockGuard guard(mutex_);
+        worker_n_.store(workers_.size());
+        // Pods registered before the workers are placed now, their queued
+        // events with them
+        for (auto& kv : pods_) kv.second.worker = place_locked(kv.second.core_request);
+        osal::LockGuard events(event_mutex_);
+        for (auto& ev : event_queue_) {
+            auto it = pods_.find(std::string(ev.pod_id()));
+            if (it != pods_.end()) ev.worker = static_cast<uint16_t>(it->second.worker);
+        }
+    }
+    wake_workers();
+    return worker_n_.load();
+}
+
+void AppPodHost::stop_workers() {
+    {
+        osal::LockGuard guard(event_mutex_);
+        workers_stop_ = true;
+    }
+    event_cv_.notify_all();
+    for (auto& w : workers_) w->thread.join();
+    osal::LockGuard guard(mutex_);
+    worker_n_.store(0);
+    workers_.clear();
+    for (auto& kv : pods_) kv.second.worker = 0;
+}
+
+void AppPodHost::set_core(const std::string& pod_id, int core) {
+    osal::LockGuard guard(mutex_);
+    if (core < 0) core_requests_.erase(pod_id);
+    else core_requests_[pod_id] = core;
+}
+
+int AppPodHost::pod_core(const std::string& pod_id) const {
+    osal::LockGuard guard(mutex_);
+    auto it = pods_.find(pod_id);
+    if (it == pods_.end() || it->second.worker >= worker_n_.load()) return -1;
+    return workers_[it->second.worker]->opts.core;
+}
+
+size_t AppPodHost::worker_hint(const std::string& pod_id) const {
+    osal::LockGuard guard(mutex_);
+    auto it = pods_.find(pod_id);
+    return it == pods_.end() ? 0 : it->second.worker;
+}
+
+void AppPodHost::wake_workers() {
+    if (!worker_n_.load()) return;
+    {
+        osal::LockGuard guard(event_mutex_);
+        for (size_t i = 0; i < worker_n_.load(); ++i) workers_[i]->kick = true;
+    }
+    event_cv_.notify_all();
+}
+
+// The worker of the core asked for; else the one whose pods used the least
+// CPU in the last window, then the one with the fewest pods
+size_t AppPodHost::place_locked(int core_request) const {
+    const size_t n = worker_n_.load();
+    if (n < 2) return 0;
+    if (core_request >= 0) {
+        for (size_t i = 0; i < n; ++i) {
+            if (workers_[i]->opts.core == core_request) return i;
+        }
+    }
+    std::vector<size_t> pods(n, 0);
+    for (const auto& kv : pods_) {
+        if (kv.second.worker < n) pods[kv.second.worker]++;
+    }
+    size_t best = 0;
+    for (size_t i = 1; i < n; ++i) {
+        const uint64_t a = workers_[i]->load_us, b = workers_[best]->load_us;
+        if (a < b || (a == b && pods[i] < pods[best])) best = i;
+    }
+    return best;
+}
+
+void AppPodHost::move_group_locked(uint32_t group, size_t to, uint64_t now_ms, const char* why) {
+    std::vector<std::string> moved;
+    for (auto& kv : pods_) {
+        Entry& e = kv.second;
+        if (e.group != group || e.worker == to) continue;
+        e.worker = to;
+        e.moved_ms = now_ms;
+        moved.push_back(kv.first);
+        printf("[POD] %s: core %d (%s)\n", kv.first.c_str(), workers_[to]->opts.core, why);
+    }
+    if (moved.empty()) return;
+    {
+        osal::LockGuard guard(event_mutex_);
+        for (auto& ev : event_queue_) {
+            for (const auto& id : moved) {
+                if (ev.pod_id() == id) {
+                    ev.worker = static_cast<uint16_t>(to);
+                    break;
+                }
+            }
+        }
+        workers_[to]->kick = true;
+    }
+    event_cv_.notify_all();
+}
+
+void AppPodHost::link_locked(const std::string& caller, const std::string& callee, uint64_t now_ms) {
+    Entry* a = find_locked(caller);
+    Entry* b = find_locked(callee);
+    // Pods placed by kube32.io/core stay where they are
+    if (!a || !b || a->group == b->group || a->core_request >= 0 || b->core_request >= 0) return;
+    const uint32_t from = b->group, into = a->group;
+    for (auto& kv : pods_) {
+        if (kv.second.group == from) kv.second.group = into;
+    }
+    move_group_locked(into, a->worker, now_ms, "calls in-process");
+}
+
+void AppPodHost::balance(uint64_t now_ms) {
+    const size_t n = worker_n_.load();
+    if (n < 2) return;
+    osal::LockGuard guard(mutex_);
+    if (balance_at_ms_ != 0 && now_ms - balance_at_ms_ < kBalanceWindowMs) return;
+    const uint64_t window_us = balance_at_ms_ ? (now_ms - balance_at_ms_) * 1000 : 0;
+    balance_at_ms_ = now_ms;
+    struct Group {
+        uint32_t id;
+        size_t worker;
+        uint64_t load;
+        bool movable;
+    };
+    std::vector<Group> groups;
+    std::vector<uint64_t> load(n, 0);
+    for (auto& kv : pods_) {
+        Entry& e = kv.second;
+        const uint64_t d = e.worker_cpu_us - e.balance_mark_us;
+        e.balance_mark_us = e.worker_cpu_us;
+        if (e.worker >= n) continue;
+        load[e.worker] += d;
+        auto g = std::find_if(groups.begin(), groups.end(), [&](const Group& x) { return x.id == e.group; });
+        if (g == groups.end()) {
+            groups.push_back(Group{e.group, e.worker, 0, true});
+            g = groups.end() - 1;
+        }
+        g->load += d;
+        g->movable = g->movable && e.core_request < 0 && (e.moved_ms == 0 || now_ms - e.moved_ms >= kMoveHoldMs);
+    }
+    for (size_t i = 0; i < n; ++i) workers_[i]->load_us = load[i];
+    if (window_us == 0) return;
+    size_t busy = 0, idle = 0;
+    for (size_t i = 1; i < n; ++i) {
+        if (load[i] > load[busy]) busy = i;
+        if (load[i] < load[idle]) idle = i;
+    }
+    if (load[busy] - load[idle] < window_us / 4) return;
+    const Group* pick = nullptr;
+    uint64_t best = load[busy];
+    for (const auto& g : groups) {
+        if (g.worker != busy || !g.movable || g.load == 0) continue;
+        const uint64_t after = std::max(load[busy] - g.load, load[idle] + g.load);
+        if (after + window_us / 10 < best) {
+            best = after;
+            pick = &g;
+        }
+    }
+    if (!pick) return;
+    char why[64];
+    snprintf(why, sizeof(why), "balance: cores busy %u%% and %u%%", (unsigned)(load[busy] * 100 / window_us),
+             (unsigned)(load[idle] * 100 / window_us));
+    move_group_locked(pick->id, idle, now_ms, why);
+}
+
+uint32_t AppPodHost::tick_worker(Worker& w, uint64_t now_ms, uint32_t max_wait_ms) {
+    std::vector<std::string>& due = w.due;
+    size_t n = 0;
+    {
+        osal::LockGuard guard(mutex_);
+        for (const auto& kv : pods_) {
+            const Entry& e = kv.second;
+            if (e.worker != w.index || !e.has_tick || !e.ticking || e.frozen || e.in_worker || e.next_tick_ms > now_ms) continue;
+            if (n < due.size()) due[n].assign(kv.first);
+            else due.push_back(kv.first);
+            ++n;
+        }
+    }
+    for (size_t i = 0; i < n; ++i) {
+        const std::string& id = due[i];
+        {
+            // Moved to another worker since, or ticked there now
+            osal::LockGuard guard(mutex_);
+            Entry* e = find_locked(id);
+            if (!e || e->worker != w.index || e->in_worker) continue;
+            e->in_worker = true;
+        }
+        int32_t rc = 0;
+        try {
+            rc = tick(id, static_cast<uint32_t>(now_ms));
+        } catch (...) {
+            osal::LockGuard guard(mutex_);
+            if (Entry* e = find_locked(id)) e->in_worker = false;
+            throw;
+        }
+        osal::LockGuard guard(mutex_);
+        if (Entry* e = find_locked(id)) {
+            e->in_worker = false;
+            e->next_tick_ms = now_ms + (rc > 0 ? 10 : e->tick_interval_ms);
+        }
+    }
+    uint64_t wait = max_wait_ms;
+    osal::LockGuard guard(mutex_);
+    for (const auto& kv : pods_) {
+        const Entry& e = kv.second;
+        if (e.worker != w.index || !e.has_tick || !e.ticking || e.frozen) continue;
+        wait = std::min<uint64_t>(wait, e.next_tick_ms > now_ms ? e.next_tick_ms - now_ms : 0);
+    }
+    return static_cast<uint32_t>(wait);
+}
+
+// The oldest queued event of the worker's pods, unless another worker still
+// delivers one to that pod (it moved): a pod gets its events in order
+bool AppPodHost::deliver_worker_event(Worker& w) {
+    PendingEvent ev;
+    {
+        osal::LockGuard guard(event_mutex_);
+        auto it = event_queue_.begin();
+        for (; it != event_queue_.end(); ++it) {
+            if (it->worker != w.index) continue;
+            bool elsewhere = false;
+            for (size_t i = 0; i < worker_n_.load() && !elsewhere; ++i) {
+                elsewhere = i != w.index && workers_[i]->event_pod == it->pod_id();
+            }
+            if (!elsewhere) break;
+        }
+        if (it == event_queue_.end()) return false;
+        ev = std::move(*it);
+        event_queue_.erase(it);
+        w.event_pod.assign(ev.pod_id());
+    }
+    try {
+        event(std::string(ev.pod_id()), ev.topic(), reinterpret_cast<const uint8_t*>(ev.data().data()), ev.data().size());
+    } catch (const std::exception& e) {
+        printf("[POD] event delivery skipped: %s\n", e.what());   // out of memory: the next one is delivered
+    }
+    osal::LockGuard guard(event_mutex_);
+    w.event_pod.clear();
+    return true;
+}
+
+void AppPodHost::worker_main(Worker& w) {
+    t_worker = static_cast<int>(w.index);
+#if defined(ESP_PLATFORM)
+    // Calls into pods run here, on this stack
+    if (w.opts.own_interpreter_stack) {
+        kube32_interp_stack_add(w.opts.stack_buffer ? w.opts.stack_buffer : pxTaskGetStackStart(nullptr), w.opts.stack_bytes);
+    }
+#endif
+    for (;;) {
+        uint32_t wait = 1000;
+        try {
+            // A few events, then the ticks that are due
+            for (int i = 0; i < 8 && deliver_worker_event(w); ++i) {
+            }
+            wait = tick_worker(w, osal::System::get_uptime_ms(), 1000);
+            balance(osal::System::get_uptime_ms());
+        } catch (const std::exception& e) {
+            printf("[POD] core %d: pass skipped: %s\n", w.opts.core, e.what());   // out of memory: the next pass is a second away
+        }
+        osal::System::feed_watchdog();
+        osal::UniqueLock<osal::Mutex> lock(event_mutex_);
+        auto ready = [&] {
+            if (workers_stop_ || w.kick) return true;
+            for (const auto& ev : event_queue_) {
+                if (ev.worker == w.index) return true;
+            }
+            return false;
+        };
+        event_cv_.wait_for(lock, std::max<uint32_t>(wait, 10), ready);
+        w.kick = false;
+        if (workers_stop_) return;
     }
 }
 

@@ -747,7 +747,7 @@ int32_t ServiceClient::await_driver(const runtime::ServiceCallRequest& req, cons
     // A call on this node's shared interpreter stack holds it while it
     // waits; a driver that starts here needs it to load and initialize
     bool here = false;
-    if (kube32_interp_stack_base_for(__builtin_frame_address(0))) {
+    if (kube32_interp_stack_is_shared(__builtin_frame_address(0))) {
         for (const auto& d : target.devices) here |= !opts_.node_name.empty() && d.node == opts_.node_name;
     }
     while (!here && !call_stopped(req)) {

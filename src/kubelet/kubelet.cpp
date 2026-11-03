@@ -1378,6 +1378,12 @@ bool Kubelet::deploy_and_start_pod(const models::KubePod& pod_in, const std::str
             }
         }
     }
+    // kube32.io/core: the core whose pod worker ticks the pod and delivers
+    // its events, "0" or "1"; "auto" or none places it by load
+    if (auto it = pod.annotations.find("kube32.io/core"); it != pod.annotations.end() && it->second != "auto") {
+        if (it->second == "0" || it->second == "1") spec.core = it->second[0] - '0';
+        else std::cout << "[KUBELET] " << pod_key << ": ignoring kube32.io/core \"" << it->second << "\" (want 0, 1 or auto)" << std::endl;
+    }
     // Modules read into pod memory move into the runtime (no second copy);
     // embedded images are used in place
     bool deployed = inline_bytes.empty()

@@ -8,7 +8,7 @@ The build disables exception handling, typed function references, stack switchin
 
 | Kind | Exports | Execution |
 | --- | --- | --- |
-| Request pod | `k32_alloc`, `k32_handle`, and optionally `k32_init`, `k32_tick`, `k32_event` | Runs on the node's shared interpreter stack (64 KiB in PSRAM, or 28 KiB of internal RAM on boards without PSRAM). Calls are serialized across the node. `k32_init` runs once at creation, and a non-zero return fails the pod. |
+| Request pod | `k32_alloc`, `k32_handle`, and optionally `k32_init`, `k32_tick`, `k32_event` | Runs on the node's shared interpreter stack (64 KiB in PSRAM, or 28 KiB of internal RAM on boards without PSRAM), or on its [pod worker's](#pod-workers) own stack. Calls into one pod are serialized. `k32_init` runs once at creation, and a non-zero return fails the pod. |
 | Entry-point pod | `_start`, `app_main`, or `main` | Runs on a dedicated pod thread until the function returns. Requires a board with PSRAM. |
 
 ## Images
@@ -53,10 +53,23 @@ A pod that passes admission but runs out of memory while the kubelet reads its m
 | Thread | Stack, with PSRAM / without PSRAM | Role |
 | --- | --- | --- |
 | `pod_<ns>/<name>` | 64 KiB PSRAM / not supported | Dedicated thread per entry-point pod (PSRAM boards only). |
-| `k32_tick` | 8 KiB PSRAM / 4 KiB internal | Calls `k32_tick(uptime_ms)` at 1 Hz, or every 10 ms while a pod returns > 0. |
-| `k32_events` | 8 KiB PSRAM / 4 KiB internal | Runs while any pod subscribes via `kube32.io/event-topics` and dispatches messages to `k32_event`. |
+| `k32_pods` (core 1) | 8 KiB PSRAM / none | Pod worker of core 1 on boards with PSRAM: calls the `k32_tick` and `k32_event` of the pods placed on it. |
+| `k32_pods` (core 0) | 68 KiB of the pod block / none | Pod worker of core 0 on boards with PSRAM. Its stack holds the interpreter, so its calls run there and not on the shared stack. The stack comes from the pod block at boot, and allocatable memory leaves it out. Priority 3, below Wi-Fi, lwIP and the node's services on that core. |
+| `k32_tick` | 8 KiB PSRAM with `K32_CMD:PODCORES:1` / 4 KiB internal | One worker only: calls `k32_tick(uptime_ms)` at 1 Hz, or every 10 ms while a pod returns > 0. |
+| `k32_events` | 8 KiB PSRAM with `K32_CMD:PODCORES:1` / 4 KiB internal | One worker only: runs while any pod subscribes via `kube32.io/event-topics` and dispatches messages to `k32_event`. |
 
-All host-initiated pod calls (`k32_init`, `k32_alloc`, `k32_handle`, `k32_tick`, `k32_event`) switch onto the shared interpreter stack (64 KiB in PSRAM, or 28 KiB of internal RAM without PSRAM) and run serialized across the node. `k32_init` runs from `k32_kubelet` (24 KiB PSRAM stack or 12 KiB internal stack), and `k32_handle` runs from the ingress worker or pod server thread. Run `K32_CMD:TASKS` to inspect native stack sizes and high-water marks.
+Host-initiated pod calls (`k32_init`, `k32_alloc`, `k32_handle`, `k32_tick`, `k32_event`) switch onto the shared interpreter stack (64 KiB in PSRAM, or 28 KiB of internal RAM without PSRAM), where they run one at a time. The exception is the pod worker of core 0, whose own 68 KiB stack holds the interpreter. `k32_init` runs from `k32_kubelet` (24 KiB PSRAM stack or 12 KiB internal stack), and `k32_handle` runs from the ingress worker or pod server thread. Run `K32_CMD:TASKS` to inspect native stack sizes and high-water marks.
+
+### Pod workers
+
+A board with PSRAM runs two pod workers, one per core. Each worker ticks the pods placed on it and delivers their events, so two busy pods on different workers run at the same time. Requests (`k32_handle`) still come from the ingress and pod server threads. Calls into one pod are serialized by its call lock, wherever they come from.
+
+- **Placement.** The annotation `kube32.io/core: "0"` or `"1"` puts a pod on that core's worker. Without it (or with `"auto"`), a pod goes to the worker whose pods used the least CPU in their ticks and events over the last 2 s, and then to the worker with fewer pods.
+- **Pods that call each other.** A pod that calls another pod of the node in-process (`k32_http_call` to a Service) brings the callee onto its own worker, and the two stay together from then on. This keeps the ticks of a pipeline's stages on one worker. On two workers, two stages that call each other from their ticks would each wait for the other's call lock until the call timed out.
+- **Balance.** Every 2 s, the busier worker gives one group of auto-placed pods to the other worker when its pods used a quarter of the window more CPU and the move lowers the busier figure. A group that moved stays where it is for 10 s. The node logs every placement and move: `[POD] <namespace>/<name>: core <n> (<reason>)`.
+- **Order.** Events reach each pod in the order they arrived, also across a move.
+
+Boards without PSRAM keep one `k32_tick` thread and one `k32_events` thread on core 1, which leaves internal RAM for Wi-Fi. `K32_CMD:PODCORES:1` gives a board with PSRAM these two threads from its next boot on, and `K32_CMD:PODCORES:2` restores the two workers. `kube32-sim` runs two workers, or one with `--psram 0` or `--pod-cores 1`.
 
 ## CPU usage
 

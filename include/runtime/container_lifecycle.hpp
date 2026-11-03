@@ -88,9 +88,10 @@ struct TrapContext {
 
 TrapReport describe_trap(const char* trap, const TrapContext& ctx);
 
-// Runs `fn` on the shared interpreter stack when one is set (boards without
-// PSRAM, kube32_interp_stack_set) and the caller is not on it already;
-// otherwise on the caller's stack. `fn` is invoked in place: nothing is taken
+// Runs `fn` on the shared interpreter stack when one is set
+// (kube32_interp_stack_set) and the caller is on no interpreter stack (the
+// shared one, or a pod worker's own, kube32_interp_stack_add); otherwise on
+// the caller's stack. `fn` is invoked in place: nothing is taken
 // from the heap.
 void run_on_interpreter_stack(mem::FunctionRef<void()> fn);
 

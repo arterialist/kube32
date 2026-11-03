@@ -59,6 +59,7 @@ struct DeploySpec {
     std::vector<std::string> event_topics;          // channel topics delivered to k32_event
     std::vector<std::string> blobs;                 // blobs k32_blob_open may open (kube32.io/blobs)
     uint32_t tick_interval_ms{1000};                // k32_tick period (kube32.io/tick-interval)
+    int core{-1};                                   // the core whose pod worker runs it (kube32.io/core), -1: by load
     // Bundle files the pod may send with k32_resp_asset: an embedded bundle
     // (images/web/<name>/) or a directory on node storage
     std::string asset_bundle;

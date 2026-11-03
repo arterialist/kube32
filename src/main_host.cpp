@@ -298,6 +298,7 @@ struct SimOptions {
     bool system_reserved_set{false};
     bool heap_budget_set{false};           // --heap-budget given: with --psram it models the board's PSRAM besides the block
     bool board_without_psram{false};       // --psram 0 given
+    int pod_cores{-1};                     // --pod-cores: pod workers, -1: 2 (1 with --psram 0, as the boards)
     // Stand-in for PSRAM: a block of host memory reserved like the control
     // plane board's PSRAM pod pool. -1: the role's default (1284Ki, the
     // board's reservation, except for workers, which model the Cardputer).
@@ -339,6 +340,8 @@ static void print_sim_usage(std::ostream& out) {
            "                              kept current when the network changes. A control plane with this set\n"
            "                              announces its address to workers over the IPC channel\n"
            "  --psram <size>              PSRAM to model, e.g. 8Mi; 0 models a board without PSRAM\n"
+           "  --pod-cores <n>             pod workers ticking pods and delivering their events in parallel,\n"
+           "                              1 or 2 (default 2; 1 with --psram 0, as a board without PSRAM)\n"
            "  --heap-budget <size>        heap left for pods and system with --psram 0 (default 51Ki); with\n"
            "                              --psram, the PSRAM besides the pool block (default: not modelled)\n"
            "  --system-reserved <size>    memory kept back for the system in the modelled heap budget\n"
@@ -420,6 +423,13 @@ static SimOptions parse_sim_args(int argc, char* argv[]) {
         else if (arg == "--sim-i2c" && i + 1 < argc) opts.sim_i2c = argv[++i];
         else if (arg == "--sim-mic" && i + 1 < argc) opts.sim_mic = argv[++i];
         else if (arg == "--blob-region" && i + 1 < argc) opts.blob_region_bytes = static_cast<size_t>(kube32::models::parse_quantity(argv[++i]));
+        else if (arg == "--pod-cores" && i + 1 < argc) {
+            opts.pod_cores = std::atoi(argv[++i]);
+            if (opts.pod_cores < 1 || opts.pod_cores > 2) {
+                std::cerr << "kube32-sim: --pod-cores takes 1 or 2\n";
+                std::exit(2);
+            }
+        }
         else if (arg == "--psram" && i + 1 < argc) {
             opts.psram_bytes = static_cast<int64_t>(kube32::models::parse_quantity(argv[++i]));
             opts.board_without_psram = (opts.psram_bytes == 0);
@@ -576,6 +586,18 @@ int main(int argc, char* argv[]) {
         std::cout << "[SIM] board without PSRAM: " << (kube32_pool_block_size() / 1024) << " KiB pod pool, " << (interp / 1024)
                   << " KiB interpreter stack, " << (opts.heap_budget / 1024) << " KiB heap (--heap-budget)" << std::endl;
     }
+
+    // Pod workers as on a board with PSRAM: two threads, "cores" 1 and 0,
+    // each ticking its pods and delivering their events. One core models a
+    // board without PSRAM: the tick loop below and the event thread.
+    const int pod_cores = opts.pod_cores > 0 ? opts.pod_cores : (opts.board_without_psram ? 1 : 2);
+    if (pod_cores > 1) {
+        std::vector<kube32::runtime::PodWorkerOptions> workers(2);
+        workers[0].core = 1;
+        workers[1].core = 0;
+        kube32::runtime::AppPodHost::instance().start_workers(workers);
+    }
+    const bool pod_workers = kube32::runtime::AppPodHost::instance().worker_count() > 0;
 
     // Simulated I2C parts on the node's bus: found by discovery, read by drivers
     if (!opts.sim_i2c.empty()) {
@@ -774,8 +796,8 @@ int main(int argc, char* argv[]) {
         // As on the boards: a pod is ticked once per kube32.io/tick-interval;
         // one whose k32_tick returns >0 has work left and is ticked again
         // after 10 ms.
-        auto tick = [] {
-            const uint32_t wait = kube32::runtime::AppPodHost::instance().tick_due(kube32::osal::System::get_uptime_ms(), 250);
+        auto tick = [pod_workers] {
+            const uint32_t wait = pod_workers ? 250 : kube32::runtime::AppPodHost::instance().tick_due(kube32::osal::System::get_uptime_ms(), 250);
             kube32::osal::Thread::sleep_ms(std::max<uint32_t>(wait, 10));
         };
         bool rebooting = false;
@@ -1134,7 +1156,7 @@ int main(int argc, char* argv[]) {
     // 1 Hz); ingress and store housekeeping once a second.
     uint64_t last_tick = 0;
     while (g_sim_running.load()) {
-        const uint32_t wait = kube32::runtime::AppPodHost::instance().tick_due(kube32::osal::System::get_uptime_ms(), 250);
+        const uint32_t wait = pod_workers ? 250 : kube32::runtime::AppPodHost::instance().tick_due(kube32::osal::System::get_uptime_ms(), 250);
         kube32::osal::Thread::sleep_ms(std::max<uint32_t>(wait, 10));
         uint64_t now = kube32::osal::System::get_uptime_ms();
         const bool second = now - last_tick >= 1000;

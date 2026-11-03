@@ -118,16 +118,17 @@ int AppPodHost::freeze(const std::string& pod_id, uint32_t timeout_ms, std::stri
 
 void AppPodHost::requeue_events(const std::string& pod_id, std::vector<HeldEvent>&& events) {
     if (events.empty()) return;
+    const size_t worker = worker_hint(pod_id);
     {
         // Ahead of what arrived since, in their order
         osal::LockGuard guard(event_mutex_);
         std::deque<PendingEvent> merged;
-        for (auto& e : events) merged.emplace_back(pod_id, e.topic, e.data);
+        for (auto& e : events) merged.emplace_back(pod_id, e.topic, e.data, worker);
         for (auto& e : event_queue_) merged.push_back(std::move(e));
         event_queue_.swap(merged);
     }
     start_event_thread();
-    event_cv_.notify_one();
+    event_cv_.notify_all();
 }
 
 bool AppPodHost::thaw(const std::string& pod_id) {

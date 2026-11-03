@@ -171,6 +171,16 @@ int kube32_rt_shrink(void* ptr, size_t bytes) {
     return sub_shrink_locked(ptr, bytes) ? 1 : 0;
 }
 
+static std::atomic<size_t> s_system_bytes{0};
+
+void* kube32_pool_system_alloc(size_t bytes) {
+    void* p = kube32_pool_sub_alloc(bytes);
+    if (p) s_system_bytes.fetch_add(bytes);
+    return p;
+}
+
+size_t kube32_pool_system_bytes(void) { return s_system_bytes.load(); }
+
 size_t kube32_pool_whole_capacity(void) {
     std::lock_guard<std::mutex> lock(s_sub_mutex);
     return s_sub_active ? static_cast<size_t>(s_sub_base - static_cast<uint8_t*>(s_block)) : s_block_size;
@@ -501,13 +511,14 @@ size_t kube32_pool_pod_room(size_t memory_bytes, size_t* out_capacity) {
 
 void kube32_pool_node_room(size_t* out_memory, size_t* out_psram) {
     size_t memory = 0, psram = 0;
+    const size_t block = s_block_size - s_system_bytes.load();   // what pods can have of it
 #if defined(ESP_PLATFORM)
     if (board_psram()) {
         // The block and the PSRAM above the reserve; pods get nothing else
-        memory = s_block_size + besides_block();
+        memory = block + besides_block();
         psram = memory;
     } else if (s_block) {
-        memory = s_block_size;   // admission counts the block alone
+        memory = block;   // admission counts the block alone
     } else {
         memory = besides_block();
     }
@@ -517,11 +528,11 @@ void kube32_pool_node_room(size_t* out_memory, size_t* out_psram) {
     // without PSRAM the block and the budget, as kube32_pool_pod_room counts
     // them. Without a budget, the host's memory besides the block.
     if (s_heap_budget) {
-        memory = (s_heap_budget > system_reserve() ? s_heap_budget - system_reserve() : 0) + s_block_size;
+        memory = (s_heap_budget > system_reserve() ? s_heap_budget - system_reserve() : 0) + block;
         if (s_external) psram = memory;
     } else {
-        memory = besides_block() + s_block_size;
-        if (s_external) psram = s_block_size;
+        memory = besides_block() + block;
+        if (s_external) psram = block;
     }
 #endif
     if (out_memory) *out_memory = memory;
@@ -531,8 +542,9 @@ void kube32_pool_node_room(size_t* out_memory, size_t* out_psram) {
 size_t kube32_pool_linear_max(void) {
     size_t memory = 0;
     kube32_pool_node_room(&memory, nullptr);
-    const size_t besides = memory > s_block_size ? memory - s_block_size : 0;
-    return s_block_size > besides ? s_block_size : besides;
+    const size_t block = s_block_size - s_system_bytes.load();
+    const size_t besides = memory > block ? memory - block : 0;
+    return block > besides ? block : besides;
 }
 
 static bool in_psram(const void* p) {
@@ -730,9 +742,34 @@ void* kube32_interp_stack_get(size_t* out_bytes) {
     return s_interp_stack;
 }
 
-void* kube32_interp_stack_base_for(const void* sp) {
+static constexpr int kOwnStacks = 4;
+static std::atomic<int> s_own_count{0};
+static uint8_t* s_own_stack[kOwnStacks];
+static size_t s_own_size[kOwnStacks];
+
+void kube32_interp_stack_add(void* stack, size_t bytes) {
+    static std::mutex add_mutex;
+    std::lock_guard<std::mutex> lock(add_mutex);
+    const int n = s_own_count.load();
+    if (!stack || n >= kOwnStacks) return;
+    s_own_stack[n] = static_cast<uint8_t*>(stack);
+    s_own_size[n] = bytes;
+    s_own_count.store(n + 1, std::memory_order_release);
+}
+
+int kube32_interp_stack_is_shared(const void* sp) {
     const uint8_t* p = static_cast<const uint8_t*>(sp);
-    return (s_interp_stack && p >= s_interp_stack && p < s_interp_stack + s_interp_size) ? s_interp_stack : nullptr;
+    return (s_interp_stack && p >= s_interp_stack && p < s_interp_stack + s_interp_size) ? 1 : 0;
+}
+
+void* kube32_interp_stack_base_for(const void* sp) {
+    if (kube32_interp_stack_is_shared(sp)) return s_interp_stack;
+    const uint8_t* p = static_cast<const uint8_t*>(sp);
+    const int n = s_own_count.load(std::memory_order_acquire);
+    for (int i = 0; i < n; ++i) {
+        if (p >= s_own_stack[i] && p < s_own_stack[i] + s_own_size[i]) return s_own_stack[i];
+    }
+    return nullptr;
 }
 
 int kube32_pool_owns(const void* ptr) {

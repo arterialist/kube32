@@ -145,7 +145,7 @@ bool compile_scratch_lent() {
 class CompileScratchLoan {
 public:
     CompileScratchLoan() {
-        if (!compile_scratch_lent() || kube32_interp_stack_base_for(__builtin_frame_address(0))) return;
+        if (!compile_scratch_lent() || kube32_interp_stack_is_shared(__builtin_frame_address(0))) return;
         lock_ = std::unique_lock<std::mutex>(s_interp_mutex);
         memory_ = kube32_interp_stack_get(nullptr);
     }
