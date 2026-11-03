@@ -64,6 +64,7 @@ Profile commands write to the `k32` NVS namespace, return `K32_OK ..., rebooting
 | `K32_CMD:TOKEN:<token>` | Set the API server and kubelet bearer token, 16 to 128 printable characters without spaces. `off` disables authentication. |
 | `K32_CMD:REBOOT` | Reboot without changing settings. |
 | `K32_CMD:BOOTLOADER` | Reboot into ROM download mode for flashing with `KUBE32_FLASH_BEFORE=no-reset`. |
+| `K32_CMD:SDKHZ:<khz>` | Set the microSD card's SPI clock from the next boot on and reboot. `0` returns to the 20 MHz default. See [storage](storage.md#microsd-hardware-and-mount). |
 
 ### Diagnostics
 
@@ -83,6 +84,9 @@ Profile commands write to the `k32` NVS namespace, return `K32_OK ..., rebooting
 | `K32_CMD:TCP` | One `K32_TCP` line per lwIP TCP connection with its state, local port, peer, and bytes unsent, unacknowledged, unread by the application, or out of order. |
 | `K32_CMD:ACCESSLOG:on` / `off` | Log HTTP requests on the API server and ingress. |
 | `K32_CMD:SD` | microSD mount state, capacity, and files under `/sd/kube32`. See [storage](storage.md). |
+| `K32_CMD:BLOBS` | `K32_BLOBS medium=... location=... available=... capacity=... free=...` per blob store and `K32_BLOB` lines for its blobs. See [Blobs](storage.md#blobs). |
+| `K32_CMD:BLOBREAD:<name>[:<chunk>]` | `K32_BLOBREAD <name> <medium> mapped\|read chunk=... bytes=... us=... kB_per_s=... sum=...`: reads a blob natively from start to end, through its mapping or in file reads of `<chunk>` bytes (512 to 16384, default 4096), and prints the throughput and a sum of its 32-bit words. |
+| `K32_CMD:MIC:<ms>` | Records the microphone for 100 to 10000 ms and prints `K32_MIC window=... mean=... rms=... peak=...` for every 250 ms. See [Peripherals](peripherals.md#speaker-and-microphone). |
 | `K32_CMD:KEY:<text>` | Queue keystrokes `\n`, `\b`, `\t`, and characters. |
 | `K32_CMD:KEYPOP` | Pop one key from the queue. |
 | `K32_CMD:TONE:<count>` | Play 1 to 200 short tones. |

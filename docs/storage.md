@@ -38,11 +38,13 @@ One app slot holds the running firmware, and the other receives the image writte
 | --- | --- |
 | Bus | SPI3_HOST |
 | Pins | MOSI GPIO 14, MISO GPIO 39, SCK GPIO 40, CS GPIO 12 |
-| Clock | 20 MHz |
+| Clock | 20 MHz; `K32_CMD:SDKHZ:<khz>` sets another from the next boot on |
 | Filesystem | FAT (FAT32), ESP-IDF `esp_driver_sdspi` + `fatfs`, 512-byte sectors, long file names |
 | Mount point | `/sd` |
 | Open files | 4 node-wide (`max_files`) |
 | Formatting | Never. You must format the card as FAT32 before insertion. |
+
+A card that does not switch to high speed in SPI mode runs at its default-speed limit of 25 MHz, which the bus divides down to 20 MHz. `K32_CMD:SDKHZ:40000` runs the bus at 40 MHz past that limit. Transfers carry CRCs, so a card that cannot follow fails reads and writes instead of returning wrong data; check a card with `K32_CMD:BLOBREAD` before relying on it. `K32_CMD:SDKHZ:0` returns to 20 MHz.
 
 Send `K32_CMD:SD` over the serial console to inspect the card state and list up to 64 entries under `/sd/kube32`:
 
