@@ -101,12 +101,29 @@ bool FirmwareApi::handle(HttpConnection& conn) {
     if (req.path != kStatusPath && req.path != kImagePath) return next_ && next_->handle(conn);
     if (!routes_.authenticated(req)) return fail(conn, 401, "Unauthorized", "Unauthorized");
     if (req.path == kStatusPath) {
-        if (req.method != HttpMethod::Get) return fail(conn, 405, "MethodNotAllowed", "only GET is allowed on " + req.path);
+        if (req.method == HttpMethod::Delete) return discard(conn);
+        if (req.method != HttpMethod::Get) return fail(conn, 405, "MethodNotAllowed", "GET and DELETE are allowed on " + req.path);
         return reply(conn, 200, status_json());
     }
     if (req.method == HttpMethod::Put) return upload(conn);
     if (req.method == HttpMethod::Get) return download(conn);
     return fail(conn, 405, "MethodNotAllowed", "GET and PUT are allowed on " + req.path);
+}
+
+// The staged image is forgotten: no rollout can start from it, and the
+// passive slot is free for other data (the flash blob store) until the next
+// upload. The slot's bytes stay as they are.
+bool FirmwareApi::discard(HttpConnection& conn) {
+    std::string active;
+    if (rollout_active(active)) return fail(conn, 409, "Conflict", "FirmwareRollout " + active + " is in progress: delete it first");
+    {
+        osal::LockGuard<osal::Mutex> lock(mu_);
+        if (busy_) return fail(conn, 409, "Conflict", "an upload is being written");
+        st_ = StagedFirmware{};
+    }
+    store_notes(StagedFirmware{});
+    std::printf("[FIRMWARE] staged image discarded\n");
+    return reply(conn, 200, status_json());
 }
 
 bool FirmwareApi::rollout_active(std::string& name) {

@@ -62,6 +62,7 @@ public:
 private:
     bool upload(HttpConnection& conn);
     bool download(HttpConnection& conn);
+    bool discard(HttpConnection& conn);
     bool reply(HttpConnection& conn, int code, const std::string& body);
     bool fail(HttpConnection& conn, int code, const char* reason, const std::string& message);
     // A FirmwareRollout that has not completed or failed

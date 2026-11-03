@@ -478,7 +478,14 @@ int main() {
         // What is staged survives a restart of the staging API (notes)
         api::FirmwareApi again(*cpn.slots, *cp.store, cp.server->route_handler());
         assert(again.staged().phase == "Staged" && again.staged().sha256 == sha2 && again.staged().version == "v2");
-        std::cout << "[staging] ranges, resume, checks and read-back ok" << std::endl;
+        // Discarded: no rollout starts from it, and a restart does not bring it back
+        r = http("DELETE", "/apis/kube32.io/v1/firmware");
+        assert(r.status == 200 && json(r.body).get("status")->get_string("phase", "") == "Empty");
+        api::FirmwareApi after(*cpn.slots, *cp.store, cp.server->route_handler());
+        assert(after.staged().phase == "Empty");
+        assert(upload(v2));
+        assert(cp.staged_phase() == "Staged");
+        std::cout << "[staging] ranges, resume, checks, read-back and discard ok" << std::endl;
     }
 
     // --- Rollout of v2 over the control plane and two workers --------------
@@ -496,8 +503,9 @@ int main() {
 
     const std::string sha2 = sha_of(v2);
     create_rollout(sha2);
-    // A new image cannot be staged while the rollout runs
+    // A new image cannot be staged, nor the staged one discarded, while the rollout runs
     assert(put_range(v1, sha_of(v1), 0, 1000).status == 409);
+    assert(http("DELETE", "/apis/kube32.io/v1/firmware").status == 409);
     g_max_alloc = 0;
     g_track = true;
     const bool complete = run_until(cp, nodes, reboots, 60000, [&] { return rollout_status(*cp.store, "phase") == "Complete"; });

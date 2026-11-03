@@ -263,6 +263,19 @@ def cmd_firmware_abort(args):
     return EXIT_OK
 
 
+def cmd_firmware_discard(args):
+    try:
+        st = staged_status(args)
+        if st.get("phase", "Empty") == "Empty":
+            print("no image is staged")
+            return EXIT_OK
+        api_call(args, "delete", FIRMWARE_PATH)
+    except ApiError as e:
+        return err_exit(str(e), EXIT_KUBECTL)
+    print("staged image %s discarded: %s is free for blobs until the next push" % (short(st.get("sha256")), st.get("slot") or "the update slot"))
+    return EXIT_OK
+
+
 def cmd_firmware_info(args):
     try:
         with open(args.file, "rb") as f:

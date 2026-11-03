@@ -40,6 +40,8 @@ Any later USB flash with `scripts/flash.sh` also erases `otadata`. The board the
 
 You cannot stage an image while a rollout is in progress.
 
+`kube32 firmware discard` forgets the staged image without rolling it out. The passive slot then holds no image that a rollout needs, and the control plane can keep [blobs](storage.md#blobs) there until the next `push`. Staging an image over blobs erases them, and is refused while a pod has one open.
+
 ## Rolling out
 
 `kube32 firmware rollout` creates a `FirmwareRollout` named `firmware` for the staged image and watches it until completion or failure (`--no-wait` returns immediately). The rollout controller on the control plane iterates through the nodes. It updates workers first in alphabetical order and updates the control plane last. On the first node that has not confirmed the target image, the controller sets the `kube32.io/firmware` annotation to the image SHA-256:
@@ -116,6 +118,7 @@ Each [release](releases.md) publishes the application image as `kube32-firmware-
 | `GET /apis/kube32.io/v1/firmware` | Returns the staged `FirmwareImage` with `status.phase` (`Empty`, `Receiving`, `Staged`, `Failed`), `sha256`, `size`, `received`, `version`, `slot`, `slotSize`, and `message` |
 | `PUT /apis/kube32.io/v1/firmware/image?offset=<n>&size=<bytes>&sha256=<hex>` | Writes the request body at `offset`. Offset `0` starts an upload. Subsequent ranges must start at `received` (`409 Conflict` returns the expected offset). The server streams the body to flash, so ranges can be any size. Returns `422` if the SHA-256 or image check fails |
 | `GET /apis/kube32.io/v1/firmware/image?sha256=<hex>&offset=<n>&length=<n>` | Reads bytes from the staged image, up to 256 KiB per request. Returns `409` if a different image is staged |
+| `DELETE /apis/kube32.io/v1/firmware` | Discards the staged image (phase `Empty`). Returns `409` while a rollout is in progress or an upload is being written |
 | `/apis/kube32.io/v1/firmwarerollouts[/<name>]` | Manages `FirmwareRollout` resources (cluster-scoped, short name `fwr`): get, list, watch, create, update, patch, delete. Accepts `spec.sha256` (required) and `spec.nodeTimeoutSeconds`. The controller updates `status.phase` (`Progressing`, `Complete`, `Failed`), `version`, `node`, `updatedNodes`, `totalNodes`, and `message`. `Complete` and `Failed` are terminal states. Only one rollout runs at a time |
 
 All firmware endpoints require standard API authentication.

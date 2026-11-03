@@ -43,7 +43,7 @@ from . import common, version
 from .build import cmd_build, cmd_check
 from .cluster import cmd_checkpoint, cmd_checkpoints, cmd_devices
 from .common import EXIT_CODES_HELP, EXIT_INPUT, EXIT_OK, EXIT_USAGE, err_exit
-from .firmware import cmd_firmware_abort, cmd_firmware_info, cmd_firmware_push, cmd_firmware_rollout, cmd_firmware_status
+from .firmware import cmd_firmware_abort, cmd_firmware_discard, cmd_firmware_info, cmd_firmware_push, cmd_firmware_rollout, cmd_firmware_status
 from .kube import kubectl_base, kubectl_flags, kubectl_missing
 from .pods import cmd_deploy, cmd_embed, cmd_push, cmd_sd_push
 
@@ -221,6 +221,9 @@ def build_parser(prog="kube32"):
     fa = fws.add_parser("abort", help="delete the rollout: nodes that have not switched yet keep their firmware")
     kubectl_flags(fa)
     fa.set_defaults(func=cmd_firmware_abort)
+    fd = fws.add_parser("discard", help="forget the staged image, freeing the update slot for blobs (refused during a rollout)")
+    kubectl_flags(fd)
+    fd.set_defaults(func=cmd_firmware_discard)
     fi = fws.add_parser("info", help="the version and SHA-256 of a firmware file")
     fi.add_argument("file")
     fi.set_defaults(func=cmd_firmware_info)
