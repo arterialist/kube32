@@ -103,6 +103,59 @@ backend:
 - `kube32.cluster` sends a `cluster` SSE event with cluster telemetry JSON every 2 s while a client is connected.
 - `kube32.presence` sends a `presence` SSE event with `{"viewers":N}` whenever the stream's viewer count changes.
 
+## Channel topics between nodes
+
+A pod publishes a message on a topic with `k32_event_emit` (up to 200 bytes, `K32_MAX_EVENT_BYTES`) or `k32_publish` (up to 16 KiB, `K32_MAX_MESSAGE_BYTES`). Both need `hardware.kube32.io/ipc` and the `CHANNEL_IPC` capability. The message reaches every pod on any node whose `kube32.io/event-topics` annotation lists the topic, in its `k32_event` export, and every Ingress event stream of the topic. A pod receives a message only when its `k32_alloc` returns a buffer for the topic and the whole message, so a pod with a 256-byte buffer keeps receiving small events and skips larger ones.
+
+### Delivery
+
+A message of up to 224 bytes travels as one frame. A larger message travels in frames of up to 1470 bytes: ESP-NOW v2 frames, or UDP datagrams that fit a 1500-byte MTU. The receiving node puts the fragments in place as they arrive, in any order, and delivers the message whole. When a fragment is missing 500 ms after the last one arrived, it drops the message and counts it. The sender transmits a frame again once when the peer's radio does not acknowledge it or the send fails.
+
+Each node announces the topics it subscribes to on the topic `k32.subs` with every HELLO (every 3 s) and when its subscriptions change: its pods' `kube32.io/event-topics`, the topics of its Ingress event streams, and the channels its pods open by name. A publish goes only to the nodes that subscribe to its topic. A node that announces no subscriptions, or whose last announcement is older than 20 s, gets every topic.
+
+A node heard over ESP-NOW in the last 10 s receives messages over ESP-NOW, which is one hop and acknowledged by its radio. Any other node receives messages over UDP port 7400 through the access point. HELLOs go over UDP to every node with a known address, and over ESP-NOW broadcast.
+
+### Memory
+
+| Item | Board without PSRAM | Board with PSRAM |
+| --- | --- | --- |
+| Received messages held at once (reassembly and queued for subscribers) | 19.5 KiB: one 16 KiB message | 256 KiB |
+| Reassemblies in progress | 2 | 8 |
+| ESP-NOW frames waiting for the dispatcher | 16 | 32 |
+| Messages waiting for subscribers | 8 | 32 |
+| Message buffers | Pod pool block's small heap first, then the heap while 24 KiB of it stay free | PSRAM, then internal RAM |
+
+A pod's queued event holds the received message itself, so every subscriber on the node shares one buffer. Without PSRAM a received frame of a large message is copied out of the radio's callback only while 24 KiB of the heap stay free, and a small frame while 6 KiB stay free: the Wi-Fi driver stops sending once an allocation of its own fails.
+
+### Errors and counters
+
+`k32_event_emit` and `k32_publish` return `len` once the message has gone to every destination. A negative value names the first failure; the message still reaches every other destination:
+
+| Value | Cause |
+| --- | --- |
+| `K32_ERR_HOSTUNREACH` (`-113`) | A node's radio did not acknowledge a frame, also when the frame was sent a second time |
+| `K32_ERR_TIMEOUT` (`-110`) | A node's radio did not report the send |
+| `K32_ERR_IO` (`-5`) | The frame could not be sent (the driver's or lwIP's queue was full) |
+| `K32_ERR_AGAIN` (`-11`) | A subscriber on this node had a full queue |
+| `K32_ERR_NOMEM` (`-12`) | No memory on this node could hold the message |
+| `K32_ERR_INVAL` (`-22`) | The message is over the limit, or the topic is empty or over 64 bytes |
+
+The console command `K32_CMD:IPC` prints the node's counters as a `K32_IPC` line and one `K32_IPC_PEER` line per peer: how long ago it was heard over ESP-NOW and over UDP, and how many topics it subscribes to. The cluster telemetry (`kube32.io/cluster-telemetry`) reports the same counters under `link`.
+
+| Counter | Meaning |
+| --- | --- |
+| `published`, `publish_errors` | Messages published on this node, and those a destination missed |
+| `fanout_skipped` | Sends left out because the peer does not subscribe to the topic |
+| `tx_frames`, `send_errors`, `retried` | Frames sent, frames that failed twice, frames sent a second time |
+| `rx_messages`, `reassembled` | Messages queued for this node's subscribers, and those put together from fragments |
+| `incomplete` | Messages dropped because a fragment never came, or because both reassembly slots of a board without PSRAM were taken |
+| `nomem` | Messages and frames dropped because no memory or budget held them |
+| `rxq_full` | ESP-NOW frames dropped because the dispatcher's queue was full |
+| `malformed`, `crc` | Fragments that do not fit their message, frames with a wrong CRC |
+| `dispatch_dropped` | Messages dropped because the subscribers' queue was full |
+
+`K32_CMD:IPCGAP:<us>`, `K32_CMD:IPCRXQ:<frames>` and `K32_CMD:IPCROUTE:<auto|udp|espnow>` set, until the next reboot, a pause between two frames of one message, the length of the ESP-NOW receive queue and how messages reach peers.
+
 ## Calls from pods with k32_http_call
 
 Pods call Services in the cluster and HTTP and HTTPS hosts outside it synchronously with `k32_http_call`, declared in `include/runtime/k32_app_abi.h`:

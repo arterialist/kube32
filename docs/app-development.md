@@ -38,7 +38,7 @@ All imports belong to the `env` module (`src/runtime/app_pod.cpp`, `src/runtime/
 | --- | --- | --- | --- | --- |
 | HTTP response | `k32_resp_begin`, `k32_resp_header`, `k32_resp_write`, `k32_resp_end`, `k32_resp_asset` | `v(iii)`, `v(iiii)`, `i(ii)`, `v()`, `i(iii)` | nothing | [Networking](networking.md) |
 | HTTP calls | `k32_http_call`, `k32_http_status` | `i(iiiiiiiiiiii)`, `i()` | `securityContext.capabilities.add: ["SERVICE_CALL"]` | [Networking](networking.md) |
-| Events and channels | `k32_event_emit`, `kube32_channel_open/send/recv/close` | `i(iiii)`, `i(ii)`, `i(iii)`, `i(iiii)`, `i(i)` | `hardware.kube32.io/ipc` (`CHANNEL_IPC`) | [Networking](networking.md) |
+| Events and channels | `k32_event_emit`, `k32_publish`, `kube32_channel_open/send/recv/close` | `i(iiii)`, `i(iiii)`, `i(ii)`, `i(iii)`, `i(iiii)`, `i(i)` | `hardware.kube32.io/ipc` (`CHANNEL_IPC`) | [Networking](networking.md) |
 | Node services | `k32_log`, `k32_time_ms`, `k32_unix_time_ms`, `k32_random`, `k32_env_get`, `k32_mem_stats`, `esp32_delay_ms`, `esp32_get_time_us` | `v(ii)`, `I()`, `I()`, `i()`, `i(iiii)`, `i(ii)`, `v(i)`, `I()` | nothing | `include/runtime/k32_app_abi.h` |
 | Linear algebra | `k32_matvec_i8`, `k32_matvec_i4`, `k32_matmul_i8`, `k32_matmul_i4`, `k32_matvec_f32_i8`, `k32_vecmat_f32_i8`, `k32_softmax_f32`, `k32_rmsnorm_f32`, `k32_quantize_i8`, `k32_rope_f32`, `k32_swiglu_f32`, `k32_add_f32`, `k32_argmax_f32`, `k32_fft_q15`, `k32_add_f32_i8`, `k32_quantize_i8_static`, `k32_conv3x3_i8`, `k32_attention_f32_i8`, `k32_attention_full_f32_i8` | `i(iiiifiii)`, `i(iiiifiii)`, `i(iiiiiiiii)`, `i(iiiiiiiii)`, `i(iiiifiiii)`, `i(iiiiiiii)`, `i(ii)`, `i(iiiiif)`, `i(iiiii)`, `i(iiiii)`, `i(iii)`, `i(iii)`, `i(ii)`, `i(iiiii)`, `i(iifi)`, `i(iifi)`, `i(iiiiifiiiiiiiii)`, `i(iiiiiifiiiiiii)` | nothing | [Linear algebra](#linear-algebra) |
 | Storage | `k32_fs_open/read/write/close/size/list/remove` | `i(iii)`, `i(iii)`, `i(iii)`, `i(i)`, `i(i)`, `i(iiii)`, `i(ii)` | `hardware.kube32.io/sd` (`SD`) and a volume claim | [Storage](storage.md), [storage](storage.md) |
@@ -125,6 +125,7 @@ The node checks every operand against the pod's linear memory, or a blob address
 | --- | --- | --- |
 | Request block | 16 KiB (`K32_MAX_REQUEST_BYTES`) | HTTP `413` |
 | Event payload | 200 bytes (`K32_MAX_EVENT_BYTES`), topic 1..64 bytes | `k32_event_emit` returns `K32_ERR_INVAL` (`-22`) |
+| Published message | 16 KiB (`K32_MAX_MESSAGE_BYTES`) with `k32_publish` | `k32_publish` returns `K32_ERR_INVAL` (`-22`) |
 | Response header | name 1..64 bytes, value up to 256 bytes (`K32_MAX_HEADER_BYTES`), up to 8 pending headers | Header is dropped |
 | Content type in `k32_resp_begin` | under 128 bytes | Defaults to `application/json` |
 | Log line | 512 bytes | Line is dropped |

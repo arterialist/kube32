@@ -1,12 +1,13 @@
 # Events between nodes
 
-Pods exchange messages across `src/ipc/channel.cpp` over ESP-NOW and UDP port 7400. Each frame uses the transport that discovered the peer. The simulator uses UDP on port 7400 plus the node ID.
+Pods exchange messages across `src/ipc/channel.cpp` over ESP-NOW and UDP port 7400. A peer heard over ESP-NOW in the last 10 s is sent to over ESP-NOW, any other over UDP. The simulator uses UDP on port 7400 plus the node ID. [Channel topics between nodes](../networking.md#channel-topics-between-nodes) covers delivery, fan-out, memory and errors.
 
 ## Host API
 
 | Call | Effect | Requirement |
 | --- | --- | --- |
-| `k32_event_emit(topic, payload)` | Publishes to local subscribers and known peers | `hardware.kube32.io/ipc` |
+| `k32_event_emit(topic, payload)` | Publishes up to 200 bytes to local subscribers and the peers that subscribe to the topic | `hardware.kube32.io/ipc` |
+| `k32_publish(topic, payload)` | The same for up to 16 KiB | `hardware.kube32.io/ipc` |
 | `kube32_channel_open(name, flags)` | Opens a receive queue for `name` | `hardware.kube32.io/ipc` |
 | `kube32_channel_recv(handle, buf, cap, timeout_ms)` | Reads one frame from the queue | Open handle |
 | `kube32_channel_send(handle, data, len)` | Delivers to the local queue only | Open handle |
@@ -19,12 +20,13 @@ Set the pod annotation `kube32.io/event-topics: a,b` to deliver channel topics f
 | Item | Limit |
 | --- | --- |
 | `k32_event_emit` payload | 200 bytes; topic 1 to 64 bytes |
+| `k32_publish` payload | 16 KiB |
 | `k32_events` queue | 16 messages; stack 8 KiB PSRAM or 4 KiB internal RAM, 256 KiB on the simulator |
-| Published message | 1024 bytes, split into 224-byte payload frames |
-| Reassembly | 32 fragments, 500 ms timeout, 8 messages in flight |
+| Published message | 16 KiB: one frame up to 224 bytes, else frames of 1444 payload bytes |
+| Reassembly | 12 fragments of 1444 bytes (32 of 224 bytes from older senders), 500 ms timeout, 2 messages in flight without PSRAM and 8 with it |
 | Receive queue per channel | 8 slots of 512 bytes on hardware; 16 slots of 1024 bytes on the simulator |
-| Maximum frame size | 250 bytes |
-| Delivery | Best effort, no acknowledgement or retransmission |
+| Maximum frame size | 1470 bytes; 250 bytes for a message of up to 224 bytes |
+| Delivery | A message arrives whole or not at all; a frame the peer's radio does not acknowledge is sent once more; drops are counted (`K32_CMD:IPC`) |
 
 ## Peer discovery
 
@@ -36,6 +38,8 @@ Nodes send a HELLO frame carrying the node ID and name on topic `k32.hello` ever
 
 A control plane's HELLO also carries its API server address: the payload is the node ID, the name, a NUL byte and `api=<address>`. A worker that hears no answer from the API server for 30 s and hears another address dials that one (a board stores it and restarts; `kube32-sim` switches in place, see [Following the network](../cli-reference.md#following-the-network)). A `kube32-sim` worker that dials a host other than its own also sends its HELLO to the UDP broadcast address on port 7400, so that a control plane that does not know its address adds it as a peer and sends it the API address.
 
+A node announces its subscriptions on topic `k32.subs` with each HELLO and when they change: its node ID, then the FNV-1a hash of every topic it subscribes to (`u32` each). Publishers send a topic only to the nodes that subscribe to it, and every topic to a node whose last announcement is older than 20 s or that announces none.
+
 Workers seed the control plane address at boot. Every 10 s, the control plane reads node objects and seeds the `InternalIP` of each registered node on UDP port 7400. UDP seeding routes traffic when boards sit on different access points or Wi-Fi channels and cannot receive ESP-NOW broadcast frames. On the simulator, pass `--peer name:id:port` to add static UDP peers. Peers never expire. ESP-NOW runs unencrypted at 24 Mbps.
 
 ## Frame format
@@ -46,14 +50,14 @@ Defined as a packed little-endian struct in `include/ipc/channel.hpp`:
 | --- | --- | --- |
 | 0 | 4 | Magic `K32C` (`0x4332334B` as little-endian `u32`) |
 | 4 | 1 | Version `1` |
-| 5 | 1 | Flags: `0x01` fragment, `0x02` first, `0x04` last, `0x08` ack unused, `0x10` HELLO |
+| 5 | 1 | Flags: `0x01` fragment, `0x02` first, `0x04` last, `0x08` ack unused, `0x10` HELLO, `0x20` large: fragment `i` starts at `i * 1444` (else `i * 224`) |
 | 6 | 2 | Sequence number |
 | 8 | 4 | FNV-1a hash of channel or topic name |
 | 12 | 4 | FNV-1a hash of sending pod |
 | 16 | 4 | FNV-1a hash of target pod, ignored on receive |
 | 20 | 1 | Fragment index |
 | 21 | 1 | Fragment count |
-| 22 | 2 | Payload length, 0 to 224 |
+| 22 | 2 | Payload length, 0 to 224, or 0 to 1444 with the large flag |
 | 24 | n | Payload |
 | 24 + n | 2 | CRC-16/CCITT-FALSE, polynomial `0x1021`, initial `0xFFFF`, over header and payload |
 
