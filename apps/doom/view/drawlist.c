@@ -19,8 +19,9 @@
 
 static uint32_t ld32(const uint8_t* p) { return p[0] | (p[1] << 8) | (p[2] << 16) | ((uint32_t)p[3] << 24); }
 static uint32_t ld16(const uint8_t* p) { return p[0] | (p[1] << 8); }
-static void st32(uint8_t* p, uint32_t v) { p[0] = v; p[1] = v >> 8; p[2] = v >> 16; p[3] = v >> 24; }
-static void st16(uint8_t* p, uint32_t v) { p[0] = v; p[1] = v >> 8; }
+/* the records are 4-byte aligned; wasm stores little-endian */
+static void st32(uint8_t* p, uint32_t v) { __builtin_memcpy(p, &v, 4); }
+static void st16(uint8_t* p, uint32_t v) { uint16_t h = (uint16_t)v; __builtin_memcpy(p, &h, 2); }
 static int32_t iabs(int32_t v) { return v < 0 ? -v : v; }
 
 int32_t dl_fixed_mul(int32_t a, int32_t b) { return (int32_t)(((int64_t)a * b) >> FRACBITS); }
@@ -157,9 +158,11 @@ int32_t dl_draw(dl_ctx* c, const uint8_t* list, uint32_t len, uint8_t* band, uin
             const uint8_t* col = e + 18;
             const int sky = tex == 255;
             const uint32_t table = coltable(c, sky ? c->skytexture : tex);
+            const int32_t band_last = y0 + (int32_t)rows - 1;
             for (uint32_t k = 0; k < n; k++, col += 3) {
                 int32_t iscale, mid;
                 uint8_t row;
+                if ((int32_t)col[0] > band_last || (int32_t)col[1] < y0) continue;   /* the column misses this band */
                 const uint32_t scale = scale0 + k * scalestep;
                 if (sky) { iscale = c->sky_iscale; mid = c->sky_texturemid; row = 0; }
                 else {
@@ -188,6 +191,7 @@ int32_t dl_draw(dl_ctx* c, const uint8_t* list, uint32_t len, uint8_t* band, uin
             const uint8_t* s = e + 9;
             for (uint32_t k = 0; k < nspans; k++, s += 13) {
                 const uint32_t y = s[0], x1 = ld16(s + 1), x2 = ld16(s + 3);
+                if ((int32_t)y < y0 || (int32_t)y >= y0 + (int32_t)rows) continue;   /* not this band's row */
                 const int32_t xfrac = (int32_t)ld32(s + 5), yfrac = (int32_t)ld32(s + 9);
                 const int32_t distance = dl_fixed_mul(planeheight, yslope(c, (int32_t)y));
                 const int32_t xstep = dl_fixed_mul(distance, c->basexscale), ystep = dl_fixed_mul(distance, c->baseyscale);
@@ -219,6 +223,7 @@ int32_t dl_draw(dl_ctx* c, const uint8_t* list, uint32_t len, uint8_t* band, uin
             const uint8_t* clip = e + 25;
             uint32_t frac = (uint32_t)startfrac;
             for (uint32_t x = x1; x <= x2; x++, frac += (uint32_t)xiscale, clip += 2) {
+                if ((int32_t)clip[0] - 2 + 1 > y0 + (int32_t)rows - 1 || (int32_t)clip[1] - 2 - 1 < y0) continue;   /* clipped out of this band */
                 const uint32_t column = (uint32_t)((int32_t)frac >> FRACBITS);
                 rc = keep(rc, add_col(c, src, iscale, texturemid, scale, x, column, clip[0], clip[1], (uint8_t)light, 1, translation));
             }

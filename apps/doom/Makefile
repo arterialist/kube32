@@ -48,8 +48,12 @@ CFLAGS = --target=wasm32 -Oz -nostdlib -ffreestanding -fno-exceptions -mcpu=mvp 
          -isystem port/include -DCMAP256 -DDOOMGENERIC_RESX=$(W) -DDOOMGENERIC_RESY=$(H) -DSCREENWIDTH=$(W) -DSCREENHEIGHT=$(H) \
          -DDG_ZONE_BYTES=$(ZONE_KB)*1024 -DDG_ZONE_STATS -DDG_NO_WIPE -DDG_NO_MUSIC -DDG_LUMP_PAD=128 $(EXTRA_CFLAGS)
 ENGINE_CFLAGS = $(CFLAGS) -w
+# INITIAL_MEMORY: the linear memory the module starts with; the sim-only pod declares all it
+# uses (its statics and the zone), so it never grows on the board, where a grow needs room
+# beside the pod's other allocations in the pool block
+INITIAL_MEMORY ?=
 LDFLAGS = -flavor wasm --no-entry --allow-undefined --stack-first -z stack-size=$(STACK) --max-memory=$(MAX_MEMORY) \
-          --gc-sections --export=__heap_base --export=__data_end
+          --gc-sections --export=__heap_base --export=__data_end $(if $(INITIAL_MEMORY),--initial-memory=$(INITIAL_MEMORY))
 
 all: $(OUT)
 
@@ -60,7 +64,7 @@ stats:
 # The sim-only pod: no rasterizers and no screen buffers; a frame is a draw list (port/drawlist_emit.c)
 LIST_BYTES ?= $(if $(filter 240,$(W)),12288,16384)
 sim:
-	$(MAKE) W=$(W) OUT=build/doom-sim$(SUF).wasm BUILD=build/sim$(SUF) EXTRA_CFLAGS="-DDG_DRAWLIST_STATS -DDG_SIM_ONLY -DLIST_BYTES=$(LIST_BYTES)" \
+	$(MAKE) W=$(W) OUT=build/doom-sim$(SUF).wasm BUILD=build/sim$(SUF) EXTRA_CFLAGS="-DDG_DRAWLIST_STATS -DDG_SIM_ONLY -DLIST_BYTES=$(LIST_BYTES)" INITIAL_MEMORY=655360 STACK=32768 \
 	    EXCLUDE="$(SIM_EXCLUDE)" PORT="$(PORT) port/drawlist_emit.c port/sim_stubs.c"
 
 # The view pod: the decoder and the kernels' records, no engine

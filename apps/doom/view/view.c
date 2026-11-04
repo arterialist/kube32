@@ -36,11 +36,12 @@ static uint16_t pal[256];
 static dl_ctx ctx;
 static char keys_topic[48];
 static int32_t blob = -1;
-static uint32_t frames, bytes, draw_errors, key_errors, keys_sent;
+static uint32_t frames, bytes, draw_errors, key_errors, keys_sent, draw_ms, blit_ms;   /* ms spent in the last 100 frames */
 static int ready;
 
 /* keys: pressed this tick, released with the next */
 static uint8_t release[16];
+static uint32_t last_draw_ms, last_blit_ms;
 static unsigned nrelease;
 
 static void logf(const char* s) { k32_log(s, slen(s)); }
@@ -92,13 +93,17 @@ K32_EXPORT("k32_event") int32_t k32_event(uint32_t topic, uint32_t topic_len, ui
     const uint32_t vh = msg[8];
     for (uint32_t y0 = 0; y0 < vh; y0 += BAND_ROWS) {
         const uint32_t rows = vh - y0 < BAND_ROWS ? vh - y0 : BAND_ROWS;
+        const int64_t t0 = k32_time_ms();
         int32_t rc = dl_draw(&ctx, msg, len, band, VIEW_W, (int32_t)y0, rows);
+        const int64_t t1 = k32_time_ms();
         if (rc) { draw_errors++; break; }
         k32_display_blit_pal(0, (int32_t)y0, VIEW_W, (int32_t)rows, band, pal);
+        draw_ms += (uint32_t)(t1 - t0);
+        blit_ms += (uint32_t)(k32_time_ms() - t1);
     }
     frames++;
     if (frames % 100 == 0) {   /* a line every 100 frames: kubectl logs shows the flow */
-        char line[96];
+        char line[128];
         unsigned n = 0;
         const char* s = "doom-view: frames ";
         while (*s) line[n++] = *s++;
@@ -109,7 +114,12 @@ K32_EXPORT("k32_event") int32_t k32_event(uint32_t topic, uint32_t topic_len, ui
         n += put_num(line + n, draw_errors);
         s = " keys_sent "; while (*s) line[n++] = *s++;
         n += put_num(line + n, keys_sent);
+        s = " ms/frame draw "; while (*s) line[n++] = *s++;
+        n += put_num(line + n, draw_ms / 100);
+        s = " blit "; while (*s) line[n++] = *s++;
+        n += put_num(line + n, blit_ms / 100);
         k32_log(line, n);
+        draw_ms = blit_ms = 0;
     }
     return 0;
 }
@@ -176,6 +186,8 @@ K32_EXPORT("k32_handle") int32_t k32_handle(uint32_t ptr, uint32_t len) {
     put_kv("keys_sent", keys_sent);
     put_kv("key_errors", key_errors);
     put_kv("unsupported", ctx.unsupported);
+    put_kv("draw_ms_100", draw_ms);
+    put_kv("blit_ms_100", blit_ms);
     put("}");
     k32_resp_begin(200, "application/json", 16);
     k32_resp_write(out, out_len);
