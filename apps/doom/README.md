@@ -92,15 +92,15 @@ curl -s http://<control-plane-ip>/doom-view/stats       # frames drawn on the Ca
 kubectl --context kube32 apply -f apps/wordsketch/build/wordsketch.yaml   # back to wordsketch
 ```
 
-| Blob | Node | Bytes | What |
-| --- | --- | --- | --- |
-| `doom-sim` | control plane | 280 KB | the sim pod's module (`make W=240 sim`) |
-| `doom-wad` | control plane | 274 KB | the sim pack (`wad.py simpack`) |
-| `doom-web` | control plane | 1.66 MB | player 2's page, engine and IWAD (`wad.py web`) |
-| `doom-view` | Cardputer | 7 KB | the view pod's module |
-| `doom-pack` | Cardputer | 1.44 MB | the render pack (`wad.py pack`) |
+| Blob | Node | Bytes | 64 KiB extents | What |
+| --- | --- | --- | --- | --- |
+| `doom-sim` | control plane | 279,897 | 5 | the sim pod's module (`make W=240 sim`) |
+| `doom-wad` | control plane | 94,034 | 2 | the sim pack (`wad.py simpack`: the map, the texture and sprite headers, the palette) |
+| `doom-web` | control plane | 648,562 | 10 | player 2's page, engine and IWAD, gzipped (`wad.py web`; served with `Content-Encoding: gzip`) |
+| `doom-view` | Cardputer | 7,351 | 1 | the view pod's module |
+| `doom-pack` | Cardputer | 1,437,292 | 22 | the render pack (`wad.py pack`) |
 
-The flash store keeps a replaced blob's old bytes until its pod lets go and places blobs on 64 KiB boundaries, so the largest free gap can be well under the free bytes: put `doom-web` up first into a store cleared of what DOOM does not need, and delete it before replacing it. The draw lists travel as channel messages of up to 12 KiB; the Cardputer takes them on the UDP route (`K32_CMD:IPCROUTE:udp` on both boards), which held 10 minutes at 8 fps where ESP-NOW stalled its Wi-Fi within minutes. `wordsketch-listen` must be at 0 while DOOM runs: the Cardputer's pool block holds one of them.
+The flash store places blobs on 64 KiB boundaries and keeps a replaced blob's old bytes until its pod lets go, so the largest free gap can be well under the free bytes: DOOM's three devkit blobs take 17 extents, which fit beside the wordsketch and llm-diffusion blobs (19 free); upload `doom-web` first, and delete it before replacing it. The draw lists travel as channel messages of up to 12 KiB; the Cardputer takes them on the UDP route (`K32_CMD:IPCROUTE:udp` on both boards), which held 10 minutes at 8 fps where ESP-NOW stalled its Wi-Fi within minutes. `wordsketch-listen` must be at 0 while DOOM runs: the Cardputer's pool block holds one of them.
 
 ## Two players
 
