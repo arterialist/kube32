@@ -640,6 +640,10 @@ int main(int argc, char* argv[]) {
     char interp_mops[16];
     snprintf(interp_mops, sizeof(interp_mops), "%.2f", kube32::runtime::measure_interp_mops());
     std::cout << "[SIM] interpreter: " << interp_mops << " million wasm3 operations/s" << std::endl;
+    // and whether it computes 64-bit integer values right (kube32.io/interp-check)
+    const std::string interp_i64 = kube32::runtime::check_interp_i64();
+    const std::string interp_check = interp_i64.empty() ? "ok" : "failed: " + interp_i64;
+    std::cout << "[SIM] interpreter check: " << interp_check << std::endl;
 
     if (opts.role == "worker") {
         // WORKER ROLE
@@ -707,6 +711,7 @@ int main(int argc, char* argv[]) {
         };
         kubelet_cfg.node_label_prefix = "i2c.kube32.io/";
         kubelet_cfg.node_annotations["kube32.io/interp-mops"] = interp_mops;
+        kubelet_cfg.node_annotations["kube32.io/interp-check"] = interp_check;
         kubelet_cfg.kubelet_port = opts.pod_port;
         // As a board without PSRAM starts its pods: one per sync pass
         if (opts.board_without_psram) kubelet_cfg.max_starts_per_sync = 1;
@@ -1108,6 +1113,7 @@ int main(int argc, char* argv[]) {
         };
         kubelet_cfg.node_label_prefix = "i2c.kube32.io/";
         kubelet_cfg.node_annotations["kube32.io/interp-mops"] = interp_mops;
+        kubelet_cfg.node_annotations["kube32.io/interp-check"] = interp_check;
         kubelet_cfg.kubelet_port = pod_server ? opts.pod_port : 0;
         kubelet_cfg.firmware_slots = cp_slots;
         kubelet_cfg.firmware.local_staging = true;

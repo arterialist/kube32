@@ -46,6 +46,28 @@ d_m3BeginExternC
 #define slot(TYPE)                 * (TYPE *) (_sp + immediate (i32))
 #define slot_ptr(TYPE)             (TYPE *) (_sp + immediate (i32))
 
+// One value of a type known at compile time, read from an address of any
+// alignment: a memory operand, an immediate in a code page. It is read as the
+// member of a struct packed to one byte, so it keeps its own type, and the
+// compiler open-codes the read as M3_COPY_VALUE's builtin would be. A
+// __builtin_memcpy into a local is not used here: under -mno-strict-align GCC
+// folds an eight-byte copy into a load whose value has a type aligned to one
+// byte, and GCC for Xtensa places an i64 argument of that type one register
+// below the pair an operation reads _r0 from, so the operation after an
+// i64.load would see the value's high word as its low word.
+#if defined(__GNUC__) || defined(__clang__)
+#  define d_m3UnalignedType(TYPE)   typedef struct __attribute__((packed, may_alias)) { TYPE value; } m3unaligned_##TYPE;
+#  define M3_READ_VALUE(TYPE, SRC)  (((const m3unaligned_##TYPE *) (const void *) (SRC))->value)
+#else
+#  define d_m3UnalignedType(TYPE)   static inline TYPE m3_Read_##TYPE (const void * i_src) { TYPE v; memcpy(&v, i_src, sizeof(v)); return v; }
+#  define M3_READ_VALUE(TYPE, SRC)  m3_Read_##TYPE (SRC)
+#endif
+d_m3UnalignedType(i8)   d_m3UnalignedType(u8)
+d_m3UnalignedType(i16)  d_m3UnalignedType(u16)
+d_m3UnalignedType(i32)  d_m3UnalignedType(u32)
+d_m3UnalignedType(i64)  d_m3UnalignedType(u64)
+d_m3UnalignedType(f32)  d_m3UnalignedType(f64)
+
 // Reads one address, index or length operand from a slot, at the width the
 // memory or table it belongs to is addressed by. Either way exactly one slot
 // immediate is consumed; only how much of the slot is read differs.
@@ -3709,8 +3731,7 @@ d_m3Op(Const32)
 d_m3Op(Const64)
 {
     // where a pointer is 32 bits the two lines are only 4-byte aligned
-    u64 value;
-    M3_COPY_VALUE(&value, _pc, sizeof(value));
+    u64 value = M3_READ_VALUE(u64, _pc);
     _pc += (M3_SIZEOF_PTR == 4) ? 2 : 1;
     slot(u64) = value;
     nextOp();
@@ -3790,8 +3811,7 @@ d_m3Op(CheckAddr64)
     u64  operand = slot(u64);
     u32* address = slot_ptr(u32);
 
-    u64  offset;
-    M3_COPY_VALUE(&offset, _pc, sizeof(offset));
+    u64  offset = M3_READ_VALUE(u64, _pc);
     _pc += (M3_SIZEOF_PTR == 4) ? 2 : 1;
 
     if (M3_LIKELY(operand < d_m3AddressLimit)) {
@@ -3820,7 +3840,7 @@ d_m3Op(CheckAddr64)
 #  define m3MemCheck(x) M3_LIKELY(x)
 #endif
 
-// M3_COPY_VALUE here is to support non-aligned access on some platforms.
+// M3_READ_VALUE and M3_COPY_VALUE here support non-aligned access on some platforms.
 
 #define d_m3Load(REG,DEST_TYPE,SRC_TYPE)                \
 d_m3Op(DEST_TYPE##_Load_##SRC_TYPE##_r)                 \
@@ -3836,8 +3856,7 @@ d_m3Op(DEST_TYPE##_Load_##SRC_TYPE##_r)                 \
     )) {                                                \
         {                                               \
             u8* src8 = m3MemData(_mem) + operand;       \
-            SRC_TYPE value;                             \
-            M3_COPY_VALUE(&value, src8, sizeof(value));        \
+            SRC_TYPE value = M3_READ_VALUE(SRC_TYPE, src8);   \
             M3_BSWAP_##SRC_TYPE(value);                 \
             REG = (DEST_TYPE)value;                     \
             d_m3TraceLoad(DEST_TYPE, operand, REG);     \
@@ -3858,8 +3877,7 @@ d_m3Op(DEST_TYPE##_Load_##SRC_TYPE##_s)                 \
     )) {                                                \
         {                                               \
             u8* src8 = m3MemData(_mem) + operand;       \
-            SRC_TYPE value;                             \
-            M3_COPY_VALUE(&value, src8, sizeof(value));        \
+            SRC_TYPE value = M3_READ_VALUE(SRC_TYPE, src8);   \
             M3_BSWAP_##SRC_TYPE(value);                 \
             REG = (DEST_TYPE)value;                     \
             d_m3TraceLoad(DEST_TYPE, operand, REG);     \
@@ -3911,8 +3929,7 @@ d_m3Load_i(i64, i64);
           operand + sizeof (SRC_TYPE) <= _mem->length     \
       )) {                                                \
           u8* src8 = m3MemData(_mem) + operand;           \
-          SRC_TYPE value;                                 \
-          M3_COPY_VALUE(&value, src8, sizeof(value));            \
+          SRC_TYPE value = M3_READ_VALUE(SRC_TYPE, src8);       \
           M3_BSWAP_##SRC_TYPE(value);                     \
           DEST_TYPE result = (DEST_TYPE)value;            \
           * dest = result;  REG = result;                 \
@@ -3933,8 +3950,7 @@ d_m3Load_i(i64, i64);
           operand + sizeof (SRC_TYPE) <= _mem->length     \
       )) {                                                \
           u8* src8 = m3MemData(_mem) + operand;           \
-          SRC_TYPE value;                                 \
-          M3_COPY_VALUE(&value, src8, sizeof(value));            \
+          SRC_TYPE value = M3_READ_VALUE(SRC_TYPE, src8);       \
           M3_BSWAP_##SRC_TYPE(value);                     \
           DEST_TYPE result = (DEST_TYPE)value;            \
           * dest = result;  REG = result;                 \

@@ -6,7 +6,10 @@
 
 using namespace kube32::runtime;
 
+#include "osal/system.hpp"
 #include "osal/thread.hpp"
+#include "runtime/app_pod.hpp"
+#include "runtime/interp_kernel.hpp"
 #include "wasm3.h"
 
 // Wasm module exporting "app_main" returning 42
@@ -254,6 +257,42 @@ void test_container_lifecycle_thread() {
     std::cout << "[PASS] test_container_lifecycle_thread" << std::endl;
 }
 
+// The interpreter's 64-bit check (Node annotation kube32.io/interp-check)
+// passes, and its module passes with the pods' own k32_time_ms: an i64
+// global, i64.load in each form, locals and arguments over a call, and the
+// host call's result kept in a local, the global and memory. The pod's clock
+// runs years ahead, so the result's high word is set too.
+void test_interp_i64_check() {
+    const std::string failed = check_interp_i64();
+    if (!failed.empty()) std::cout << "interpreter check failed: " << failed << std::endl;
+    assert(failed.empty());
+
+    IM3Environment env = m3_NewEnvironment();
+    IM3Runtime rt = m3_NewRuntime(env, 1024, nullptr);
+    IM3Module mod = nullptr;
+    IM3Function check = nullptr, lo = nullptr, hi = nullptr;
+    assert(!m3_ParseModule(env, &mod, kInterpCheck, sizeof(kInterpCheck)));
+    assert(!m3_LoadModule(rt, mod));
+    link_app_host_functions(mod, "default/interp-check");
+    const int64_t offset = int64_t{0x1234} << 32;
+    set_pod_clock_offset(rt, offset);
+    assert(!m3_FindFunction(&check, rt, "check") && !m3_FindFunction(&lo, rt, "value_lo") && !m3_FindFunction(&hi, rt, "value_hi"));
+    const uint64_t before = kube32::osal::System::get_uptime_ms() + offset;
+    int32_t step = -1;
+    assert(!m3_CallV(check, 13) && !m3_GetResultsV(check, &step));   // at an unaligned address
+    const uint64_t after = kube32::osal::System::get_uptime_ms() + offset;
+    if (step > 0) std::cout << "check failed: " << kInterpCheckSteps[step - 1] << std::endl;
+    assert(step == 0);
+    uint32_t vlo = 0, vhi = 0;
+    assert(!m3_CallV(lo) && !m3_GetResultsV(lo, &vlo) && !m3_CallV(hi) && !m3_GetResultsV(hi, &vhi));
+    const uint64_t t = (static_cast<uint64_t>(vhi) << 32) | vlo;
+    assert(vhi == 0x1234 && t >= before && t <= after);
+    unlink_app_host_functions(rt);
+    m3_FreeRuntime(rt);
+    m3_FreeEnvironment(env);
+    std::cout << "[PASS] test_interp_i64_check" << std::endl;
+}
+
 int main() {
     std::cout << "========================================" << std::endl;
     std::cout << " Running Wasm3 Sandboxed Runtime Tests  " << std::endl;
@@ -266,6 +305,7 @@ int main() {
     test_memory_exhaustion_is_oomkilled();
     test_trap_report_mapping();
     test_container_lifecycle_thread();
+    test_interp_i64_check();
 
     std::cout << "All Wasm Runtime tests passed successfully!" << std::endl;
     return 0;

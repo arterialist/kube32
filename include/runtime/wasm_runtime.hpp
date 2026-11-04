@@ -200,4 +200,11 @@ const char* module_entry_point(const uint8_t* wasm, size_t len);
 // board.
 double measure_interp_mops();
 
+// Whether the interpreter computes 64-bit integer values right on this node
+// (kInterpCheck): an i64 global, i64.load in each form, locals and arguments
+// over a call, and a host call's result. Returns "" when it does, else the
+// first step that read a wrong value. Runs where measure_interp_mops runs, in
+// about a millisecond on a board.
+std::string check_interp_i64();
+
 } // namespace kube32::runtime

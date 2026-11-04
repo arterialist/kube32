@@ -1951,6 +1951,11 @@ void cluster_task(void* pv) {
         kubelet_cfg.node_annotations["kube32.io/interp-mops"] = mops;
         printf("[KUBELET] interpreter: %s million wasm3 operations/s (measured in %u ms)\n", mops,
                (unsigned)(kube32::osal::System::get_uptime_ms() - t0));
+        // and whether it computes 64-bit integer values right on this build
+        const std::string i64 = kube32::runtime::check_interp_i64();
+        kubelet_cfg.node_annotations["kube32.io/interp-check"] = i64.empty() ? "ok" : "failed: " + i64;
+        if (i64.empty()) printf("[KUBELET] interpreter check: ok\n");
+        else printf("[KUBELET] interpreter check FAILED: %s; pods on this node get wrong 64-bit integer values\n", i64.c_str());
     }
     // Firmware rollouts: the kubelet downloads the image into the update slot
     // in ranges, or on the control plane boots the slot it was staged in;

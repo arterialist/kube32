@@ -741,6 +741,54 @@ double measure_interp_mops() {
     return mops;
 }
 
+namespace {
+
+// What k32_time_ms returns to the interpreter check: a value whose halves and
+// bytes all differ
+constexpr uint64_t kInterpCheckTime = 0x0123456789abcdefull;
+// The bytes of the check's page that are backed, as for a pod below one page
+constexpr uint32_t kInterpCheckMemory = 256;
+
+const void* interp_check_time(IM3Runtime, IM3ImportContext, uint64_t* sp, void*) {
+    *reinterpret_cast<int64_t*>(sp) = static_cast<int64_t>(kInterpCheckTime);
+    return m3Err_none;
+}
+
+} // namespace
+
+std::string check_interp_i64() {
+    std::string failed = "the check did not run";
+    IM3Environment env = m3_NewEnvironment();
+    if (!env) return failed;
+    IM3Runtime rt = m3_NewRuntime(env, 1024, nullptr);
+    IM3Module mod = nullptr;
+    IM3Function check = nullptr, lo = nullptr, hi = nullptr;
+    if (rt) rt->memoryLimit = kInterpCheckMemory;
+    if (rt && !m3_ParseModule(env, &mod, kInterpCheck, sizeof(kInterpCheck))) {
+        if (m3_LoadModule(rt, mod)) {
+            m3_FreeModule(mod);
+        } else if (!m3_LinkRawFunction(mod, "env", "k32_time_ms", "I()", &interp_check_time) &&
+                   !m3_FindFunction(&check, rt, "check") && !m3_FindFunction(&lo, rt, "value_lo") &&
+                   !m3_FindFunction(&hi, rt, "value_hi")) {
+            // Run where pods run: on the shared interpreter stack when there is one
+            run_on_interpreter_stack([&]() {
+                int32_t step = -1;
+                uint32_t vlo = 0, vhi = 0;
+                if (m3_CallV(check, 16) || m3_GetResultsV(check, &step)) return;
+                if (step > 0 && step <= static_cast<int32_t>(sizeof(kInterpCheckSteps) / sizeof(kInterpCheckSteps[0]))) {
+                    failed = kInterpCheckSteps[step - 1];
+                    return;
+                }
+                if (step != 0 || m3_CallV(lo) || m3_GetResultsV(lo, &vlo) || m3_CallV(hi) || m3_GetResultsV(hi, &vhi)) return;
+                failed = ((static_cast<uint64_t>(vhi) << 32) | vlo) == kInterpCheckTime ? "" : kInterpCheckSteps[5];
+            });
+        }
+    }
+    if (rt) m3_FreeRuntime(rt);
+    m3_FreeEnvironment(env);
+    return failed;
+}
+
 bool deploy_error_is_restore(const std::string& error) {
     return error.rfind(kRestoreErrorPrefix, 0) == 0;
 }

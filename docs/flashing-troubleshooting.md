@@ -35,6 +35,12 @@ bash scripts/flash.sh <serial port> 921600
 
 To enter ROM download mode from the serial console when USB auto-reset fails, send `K32_CMD:BOOTLOADER`, then flash with `KUBE32_FLASH_BEFORE=no-reset`.
 
+Each node checks at boot that its interpreter computes 64-bit integer values right: a global, loads from memory, locals and arguments over a call, and a host call's result. The boot log prints `[KUBELET] interpreter check: ok`, and the Node annotation `kube32.io/interp-check` holds `ok` or `failed: <step>`. Check it after flashing a build made with another toolchain or other compiler flags:
+
+```
+kubectl get node <node> -o jsonpath='{.metadata.annotations.kube32\.io/interp-check}'
+```
+
 Flash a board running the single-app partition table once with a current build to move it to the A/B layout; see [Firmware updates](firmware-updates.md#moving-a-board-to-this-layout). After that, update boards through the cluster with `kube32 firmware push` and `kube32 firmware rollout`.
 
 ### Quad I/O flash

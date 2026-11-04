@@ -110,6 +110,7 @@ See [Pod migration](migration.md) for the phases and the retention of Checkpoint
 | Annotation | Set by | Value |
 | --- | --- | --- |
 | `kube32.io/interp-mops` | Kubelet, once at boot | The interpreter's speed: millions of wasm3 operations per second on a fixed integer kernel, timed on the stack and memory the node gives pods, e.g. `"6.88"` on a Cardputer |
+| `kube32.io/interp-check` | Kubelet, once at boot | `ok` when the interpreter computes 64-bit integer values right on a fixed module: a global, `i64.load` in each form, locals and arguments over a call, and a host call's result. Otherwise `failed: <step>`, and pods on the node get wrong 64-bit values |
 
 ## kubectl and k9s
 

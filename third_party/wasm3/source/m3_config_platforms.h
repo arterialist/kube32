@@ -141,10 +141,11 @@
 
 #define M3_INIT(field) memset(&field, 0, sizeof(field))
 
-// A copy of one value of a size known at compile time, for an address of any
-// alignment: a memory operand, an immediate in a code page. The compiler
-// open-codes the builtin into loads and stores, where memcpy itself stays a
-// call under -fno-builtin-memcpy (ESP-IDF builds with it).
+// A copy of one value of a size known at compile time to an address of any
+// alignment: what a store writes to memory. The compiler open-codes the
+// builtin into stores, where memcpy itself stays a call under
+// -fno-builtin-memcpy (ESP-IDF builds with it). Reads go through
+// M3_READ_VALUE (m3_exec.h).
 #if defined(__GNUC__) || defined(__clang__)
 #  define M3_COPY_VALUE(DST, SRC, SIZE) __builtin_memcpy((DST), (SRC), (SIZE))
 #else
