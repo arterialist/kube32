@@ -303,7 +303,11 @@ static int64_t alone_ms;
 static int32_t alone_tic;
 int net_tick_alone(int64_t now) {
     if (role != NET_AUTHORITY || phase) return 0;
-    if (!alone_ms) { alone_ms = now; alone_tic = gametic; }
+    if (!alone_ms) {
+        alone_ms = now;
+        alone_tic = gametic;
+        for (int i = 1; i < MAXPLAYERS; i++) playeringame[i] = false;   /* nobody has left: nobody was in */
+    }
     int32_t due = alone_tic + (int32_t)((now - alone_ms) * TICRATE / 1000);
     if (due - gametic > 4) { alone_tic = gametic; alone_ms = now; due = gametic + 4; }   /* the node was busy: drop the time */
     int ran = 0;

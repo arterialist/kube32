@@ -59,7 +59,7 @@ No frame reaches the 16 KiB cap. The sim build leaves out the engine's screen-si
 
 ### The view pod
 
-`make view` builds `build/doom-view.wasm` (`view/view.c`, 6,910 B): the Cardputer side. Every tick it sends the keyboard's keys with `GET <DOOM_SIM_URL>/drawlist?keys=...`, decodes the draw list (`view/drawlist.c`) into records for the [`k32_raster_columns` and `k32_raster_spans`](../../docs/app-development.md#raster-kernels) kernels, which read the textures in place from the render pack blob (`DOOM_PACK_BLOB`, a flash blob), and puts each band of 27 rows on the screen with `k32_display_blit_pal`. It needs `hardware.kube32.io/tft-display`, `keyboard` and the `SERVICE_CALL` capability. The textures never enter its memory: 16 KiB of draw list, a 6.5 KiB band, the pack's 3 KiB of tables and 4 KiB of stack, a 40 KiB memory limit. `kube32-podsize build/doom-view.wasm --memory 40` puts it at 70 KiB of the Cardputer's 80 KiB pool block with the module held in RAM, 63 KiB as a blob image.
+`make view` builds `build/doom-view.wasm` (`view/view.c`, 7.4 KB): the Cardputer side. The sim pod publishes each frame's draw list whole on the channel topic `doom.draw` (`k32_publish`, at `DOOM_FPS` frames a second, capped at 12 KiB at 240 wide); the view pod receives it in `k32_event`, decodes it (`view/drawlist.c`) into records for the [`k32_raster_columns` and `k32_raster_spans`](../../docs/app-development.md#raster-kernels) kernels, which read the textures in place from the render pack blob (`DOOM_PACK_BLOB`, a flash blob), and puts each band of 27 rows on the screen with `k32_display_blit_pal`. Every tick it sends the keys its keyboard produced as an event on `doom.keys` (`"d173,u173,..."`, DOOM key codes; the Cardputer reports presses only, so a key is held for one tick). It needs `hardware.kube32.io/tft-display`, `keyboard` and `ipc`, the `DISPLAY`, `KEYBOARD` and `CHANNEL_IPC` capabilities, and `kube32.io/event-topics: doom.draw`. The textures never enter its memory: 12 KiB of draw list (after the topic), a 6.5 KiB band, the pack's 3 KiB of tables and 4 KiB of stack, a 32 KiB memory limit; `kube32-podsize build/doom-view.wasm --memory 32` puts it at 62 KiB of the Cardputer's 80 KiB pool block with the module held in RAM, 55 KiB as a blob image, which leaves the block room for the node's held messages. A frame that does not arrive whole is dropped by the node; the next one draws normally. Both pods log their flow every 100 frames (`kubectl logs`).
 
 `make W=240` and `make W=240 sim` build the engines at 240 x 135, the Cardputer's screen (`DOOM_SCREENBLOCKS=11` draws the whole screen; the status bar is not drawn below 320 wide). The 240-wide sim costs 267 K ops a frame (p95 531 K) and its draw list is 3.9 KB (p95 8.1 KB, max 10.8 KB), on the same course.
 
@@ -77,6 +77,30 @@ At 320 x 168 and at 240 x 135, 350 frames of the turning course match the engine
 `--state` also compares the two engines' game states every tic (`port/state_digest.c`: CRC-32 digests of the players, map objects, sectors, `P_Random`'s index and the other thinkers; `M_Random`'s index is the screen side's and kept apart) and the renderers' frames (drawsegs with their clip arrays, vissprites, visplanes, openings), and names the first part that differs; `--sim-args` and `--sim-wad` give the sim its own zone and IWAD; `--locate x,y,tic` names the entry behind a pixel. `make verify` runs the three comparisons the host suite guards: 2,000 tics on both courses at 320 wide and on the turning course at 240 wide, the full engine with a 640 KiB zone and the sim on the sim pack with 224 or 256 KiB; `make verify TICS=10000` is the long run. The game states and every pixel agree over 10,000 tics on both courses, and the result does not depend on the sim's zone (224, 256, 480 and 640 KiB tried). The one divergence found this way was a wall column the engine clips away (`dc_yh < dc_yl`, which `R_DrawColumn` draws nothing of) that the emitter recorded with its bottom row wrapped to 255; the game states had never differed.
 
 Pixel rasterization is 981 K ops a frame (73%), 17.4 ops a pixel over 56.5 K pixels (37.4 K wall, 15.9 K floor and ceiling, 3.2 K sprite). The draw list is 497 wall columns, 174 spans and 6 sprites a frame (p95: 937, 427, 18), 7.2 KB packed (p95 14.8 KB, max 16.1 KB). A frame touches 185 distinct texture columns (21.5 KB; p95 361, 39.9 KB), 3 to 4 flats (16 KB; p95 7, 28 KB) and 4 sprite patches (6.8 KB; p95 11, 13.5 KB). Without texture lookups a 416 KiB zone plays E1M1.
+
+## On the boards
+
+The two pods run from blob images ([Blob image](../../docs/app-development.md#blob-image-wasmblobname)) with their data as blobs on the nodes, and `examples/doom.yaml` carries the wordsketch pods at 0 replicas (`examples/wordsketch.yaml` the DOOM pods at 0), so one `kubectl apply` switches the boards either way:
+
+```sh
+make -C apps/doom pods                                  # the modules and the packs as blobs (build/blobs/)
+make -C apps/doom manifest                              # build/doom.yaml (build/doom-only.yaml without wordsketch)
+make -C apps/doom upload SERVER=http://<control-plane-ip>:6443
+kubectl --context kube32 apply -f apps/doom/build/doom.yaml
+curl -s http://<control-plane-ip>/doom/stats            # frames published, keys received
+curl -s http://<control-plane-ip>/doom-view/stats       # frames drawn on the Cardputer
+kubectl --context kube32 apply -f apps/wordsketch/build/wordsketch.yaml   # back to wordsketch
+```
+
+| Blob | Node | Bytes | What |
+| --- | --- | --- | --- |
+| `doom-sim` | control plane | 280 KB | the sim pod's module (`make W=240 sim`) |
+| `doom-wad` | control plane | 274 KB | the sim pack (`wad.py simpack`) |
+| `doom-web` | control plane | 1.66 MB | player 2's page, engine and IWAD (`wad.py web`) |
+| `doom-view` | Cardputer | 7 KB | the view pod's module |
+| `doom-pack` | Cardputer | 1.44 MB | the render pack (`wad.py pack`) |
+
+The flash store keeps a replaced blob's old bytes until its pod lets go and places blobs on 64 KiB boundaries, so the largest free gap can be well under the free bytes: put `doom-web` up first into a store cleared of what DOOM does not need, and delete it before replacing it. The draw lists travel as channel messages of up to 12 KiB; the Cardputer takes them on the UDP route (`K32_CMD:IPCROUTE:udp` on both boards), which held 10 minutes at 8 fps where ESP-NOW stalled its Wi-Fi within minutes. `wordsketch-listen` must be at 0 while DOOM runs: the Cardputer's pool block holds one of them.
 
 ## Two players
 

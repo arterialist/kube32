@@ -347,6 +347,15 @@ int main(int argc, char** argv) {
         std::printf("session %d: player 2 joins at tic %d (input delay %ld tics)\n", cs.session, cs.joined_at, json_int(pod.body, "delay", delay));
         return true;
     };
+    // Before anyone joins, player 1 plays alone for a while (net_tick_alone): its tics advance by the clock
+    {
+        uint32_t before = 0, after = 0;
+        before = (uint32_t)pod.call("doom_state_digest", {4});
+        for (g_now_ms = 0; g_now_ms < 2000; g_now_ms += 10) pod.call("k32_tick", {g_now_ms});
+        after = (uint32_t)pod.call("doom_state_digest", {4});
+        if (before == after) { std::printf("alone: the authority ran no tics in 2 s before a join\n"); return 1; }
+        std::printf("alone: player 1 played 2 s before player 2 joined\n");
+    }
     if (!start_client()) return 1;
 
     std::map<int32_t, uint32_t> pod_digest;      // the authority's state after each tic it ran
@@ -356,7 +365,7 @@ int main(int argc, char** argv) {
     int64_t silent_until = -1;
     const int32_t rejoin_at = tics * 2 / 3, silent_at = tics * 2 / 3 + 600;
     int64_t outage_set = 0;
-    for (g_now_ms = 0; total_tics < tics + 1200 && g_now_ms < 3600LL * 1000; g_now_ms++) {
+    for (; total_tics < tics + 1200 && g_now_ms < 3600LL * 1000; g_now_ms++) {
         // the network: posts reach the authority, events and answers the client
         for (Msg& m : net.due()) {
             if (m.to == 0) {
