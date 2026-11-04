@@ -1014,8 +1014,9 @@ static void improv_command(Console& con, const NodeIdentity& ident, const std::s
 }
 
 // K32_CMD:IPC: the channel transport's counters and settings, then one line
-// a peer: how it is reached and how many topics it subscribes to
-void console_ipc(Console& con) {
+// a peer: how it is reached and how many topics it subscribes to. Runs on a
+// stack of its own (console_run_deep): printf of 64-bit values is deep
+static void console_ipc(Console& con) {
     auto& m = kube32::ipc::ChannelManager::instance();
     auto& s = m.stats();
     char l[480];
@@ -1031,7 +1032,7 @@ void console_ipc(Console& con) {
                       (unsigned long long)s.subs_rx.load(), (unsigned)m.rx_held_bytes(), (unsigned)m.rx_budget_bytes(), (unsigned)m.fragment_gap_us(),
                       (unsigned)m.rx_queue_frames(), (unsigned)m.route());
     con.write(l, static_cast<size_t>(ll));
-    const uint64_t now = osal::System::get_uptime_ms();
+    const uint64_t now = kube32::osal::System::get_uptime_ms();
     for (const auto& p : m.peers()) {
         ll = snprintf(l, sizeof(l), "K32_IPC_PEER %s espnow_age_ms=%lld udp_age_ms=%lld subs=%u subs_age_ms=%lld\n", p.node_name.c_str(),
                       p.espnow_seen_ms ? (long long)(now - p.espnow_seen_ms) : -1LL, p.udp_seen_ms ? (long long)(now - p.udp_seen_ms) : -1LL,
@@ -1458,18 +1459,18 @@ void console_task(void* arg) {
                 }
                 con.write(l, static_cast<size_t>(ll));
             } else if (line == "K32_CMD:IPC") {
-                console_ipc(con);
+                console_run_deep(con, [&] { console_ipc(con); });
             } else if (line.rfind("K32_CMD:IPCGAP:", 0) == 0) {
                 kube32::ipc::ChannelManager::instance().set_fragment_gap_us(static_cast<uint32_t>(std::strtoul(line.c_str() + 15, nullptr, 10)));
-                console_ipc(con);
+                console_run_deep(con, [&] { console_ipc(con); });
             } else if (line.rfind("K32_CMD:IPCRXQ:", 0) == 0) {
                 kube32::ipc::ChannelManager::instance().set_rx_queue_frames(std::strtoul(line.c_str() + 15, nullptr, 10));
-                console_ipc(con);
+                console_run_deep(con, [&] { console_ipc(con); });
             } else if (line.rfind("K32_CMD:IPCROUTE:", 0) == 0) {
                 const std::string r = line.substr(17);
                 using Route = kube32::ipc::ChannelManager::Route;
                 kube32::ipc::ChannelManager::instance().set_route(r == "udp" ? Route::Udp : r == "espnow" ? Route::EspNow : Route::Auto);
-                console_ipc(con);
+                console_run_deep(con, [&] { console_ipc(con); });
             } else if (line == "K32_CMD:HEAP") {
                 // Internal heap blocks by size, used and free: what holds the
                 // memory on a board without PSRAM
