@@ -1,0 +1,64 @@
+# xfer-bench: xfer-server on the control plane, xfer-client on the Cardputer.
+# make fills in the modules; the client logs its results and then idles.
+apiVersion: v1
+kind: Service
+metadata:
+  name: xfer-server
+spec:
+  selector:
+    app: xfer-server
+  ports:
+  - port: 80
+    targetPort: 7000
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: xfer-server
+  labels:
+    app: xfer-server
+  annotations:
+    kube32.io/wasm-base64: "@SERVER_WASM@"
+spec:
+  nodeSelector:
+    node-role.kubernetes.io/control-plane: ""
+  containers:
+  - name: server
+    image: wasm://inline/xfer-server
+    ports:
+    - containerPort: 7000
+      name: http
+    resources:
+      requests:
+        memory: 16Ki
+      limits:
+        memory: 16Ki
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: xfer-client
+  labels:
+    app: xfer-client
+  annotations:
+    kube32.io/wasm-base64: "@CLIENT_WASM@"
+    kube32.io/execution-budget: "off"
+spec:
+  restartPolicy: Never
+  nodeSelector:
+    kube32.io/board: cardputer
+  containers:
+  - name: client
+    image: wasm://inline/xfer-client
+    env:
+    - name: URL
+      value: http://xfer-server/bytes
+    resources:
+      requests:
+        memory: 24Ki
+      limits:
+        memory: 24Ki
+    securityContext:
+      capabilities:
+        add:
+        - SERVICE_CALL
