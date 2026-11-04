@@ -169,6 +169,10 @@ R_RenderMaskedSegRange
 			
 	    sprtopscreen = centeryfrac - FixedMul(dc_texturemid, spryscale);
 	    dc_iscale = 0xffffffffu / (unsigned)spryscale;
+#ifdef DG_DRAWLIST_STATS
+	    { extern int DG_StatsMaskedSeg(int, int);
+	      if (DG_StatsMaskedSeg(texnum, maskedtexturecol[dc_x])) { maskedtexturecol[dc_x] = SHRT_MAX; spryscale += rw_scalestep; continue; } }
+#endif
 	    
 	    // draw the texture
 	    col = (column_t *)( 

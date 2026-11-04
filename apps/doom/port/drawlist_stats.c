@@ -126,13 +126,17 @@ int DG_StatsFlat(int lumpnum) {
 }
 
 /* r_things.c R_DrawVisSprite */
-void DG_StatsSprite(int lump) {
+int DG_StatsSprite(vissprite_t* vis) {
+    int lump = vis->patch + firstspritelump;
     st.sprites++;
     if (set_add(sprset, SPRN, (uint32_t)lump)) {
         st.sprite_lumps++;
         st.sprite_lump_bytes += (uint32_t)W_LumpLength((unsigned)lump);
     }
+    return 0;
 }
+/* r_segs.c: a two-sided middle texture column; counted as a wall column by the stub */
+int DG_StatsMaskedSeg(int tex, int col) { (void)tex; (void)col; return 0; }
 void DG_StatsMaskedBegin(void) { in_masked = 1; }
 void DG_StatsMaskedEnd(void) { in_masked = 0; }
 

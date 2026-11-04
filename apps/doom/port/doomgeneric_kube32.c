@@ -81,15 +81,33 @@ K32_EXPORT("doom_run_tic") void doom_run_tic(void) {
 }
 
 /* One frame of the current game state */
+#ifdef DG_SIM_ONLY
+void doom_render_view(void);
+K32_EXPORT("doom_render") void doom_render(void) { doom_render_view(); }
+#else
 K32_EXPORT("doom_render") void doom_render(void) { D_Display(); }
+#endif
 
 /* The 3D view alone (no status bar, HUD or menu): what a split renderer ships */
 void R_RenderPlayerView(player_t* player);
 void R_ExecuteSetViewSize(void);
 extern boolean setsizeneeded;
+#ifdef DG_SIM_ONLY
+void DG_DrawListBegin(void);
+void DG_DrawListEnd(void);
+uint32_t doom_drawlist_ptr(void);
+uint32_t doom_drawlist_len(void);
+#endif
 K32_EXPORT("doom_render_view") void doom_render_view(void) {
     if (setsizeneeded) R_ExecuteSetViewSize();
+#ifdef DG_SIM_ONLY
+    DG_DrawListBegin();
+    if (gamestate == GS_LEVEL) R_RenderPlayerView(&players[displayplayer]);
+    DG_DrawListEnd();
+    frames_drawn++;
+#else
     R_RenderPlayerView(&players[displayplayer]);
+#endif
 }
 
 /* For a host that drives the pod without HTTP: a key event */
@@ -213,6 +231,7 @@ K32_EXPORT("k32_handle") int32_t k32_handle(uint32_t ptr, uint32_t len) {
     out_len = 0;
     put("{");
 
+#ifndef DG_SIM_ONLY
     if (!strcmp(seg, "frame")) {
         static uint8_t pal[768];
         for (int i = 0; i < 256; i++) {
@@ -230,6 +249,32 @@ K32_EXPORT("k32_handle") int32_t k32_handle(uint32_t ptr, uint32_t len) {
         k32_resp_end();
         return 200;
     }
+#endif
+#ifdef DG_SIM_ONLY
+    if (!strcmp(seg, "drawlist")) {
+        /* keys ride along: keys=d<code>,u<code>,... */
+        for (const char* p = query; p && *p; ) {
+            if (!strncmp(p, "keys=", 5)) {
+                for (p += 5; *p && *p != '&'; ) {
+                    if ((*p == 'd' || *p == 'u') && p[1] >= '0' && p[1] <= '9') key_push(*p == 'd', (unsigned)strtol(p + 1, 0, 10));
+                    while (*p && *p != ',' && *p != '&') p++;
+                    if (*p == ',') p++;
+                }
+                break;
+            }
+            p = strchr(p, '&');
+            if (p) p++;
+        }
+        char n[16];
+        snprintf(n, sizeof n, "%u", (unsigned)frames_drawn);
+        k32_resp_header("X-Doom-Frame", 12, n, (uint32_t)strlen(n));
+        k32_resp_header("Cache-Control", 13, "no-store", 8);
+        k32_resp_begin(200, "application/octet-stream", 24);
+        k32_resp_write((const void*)(uintptr_t)doom_drawlist_ptr(), doom_drawlist_len());
+        k32_resp_end();
+        return 200;
+    }
+#endif
     if (!strcmp(seg, "key") && !strcmp(method, "POST")) {
         int count = 0;
         for (char* p = body; *p; ) {

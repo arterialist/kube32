@@ -232,7 +232,9 @@ int main(int argc, char** argv) {
         std::printf("exports: %s\n", r);
         return 1;
     }
-    IM3Function render_view = nullptr, stats_set = nullptr, stats_read = nullptr;
+    IM3Function render_view = nullptr, stats_set = nullptr, stats_read = nullptr, dl_len = nullptr, dl_count = nullptr, dl_trunc = nullptr;
+    if (m3_FindFunction(&dl_len, g_rt, "doom_drawlist_len")) dl_len = nullptr;
+    if (dl_len && (m3_FindFunction(&dl_count, g_rt, "doom_drawlist_count") || m3_FindFunction(&dl_trunc, g_rt, "doom_drawlist_truncated"))) dl_len = nullptr;
     if (view_only && (r = m3_FindFunction(&render_view, g_rt, "doom_render_view"))) { std::printf("doom_render_view: %s\n", r); return 1; }
     if (stats_mode >= 0 && ((r = m3_FindFunction(&stats_set, g_rt, "doom_stats_mode")) || (r = m3_FindFunction(&stats_read, g_rt, "doom_stats_read")))) {
         std::printf("stats exports (build with make stats): %s\n", r);
@@ -273,6 +275,8 @@ int main(int argc, char** argv) {
                                              "sprites", "spans", "span_px", "getcolumn_calls", "tex_cols", "tex_col_bytes", "flats",
                                              "flat_bytes", "sprite_lumps", "sprite_lump_bytes", "textures"};
     std::vector<std::vector<uint32_t>> frame_stats;
+    std::vector<uint32_t> dl_bytes, dl_counts;
+    uint32_t dl_truncated = 0;
     std::vector<Cost> tic_costs, frame_costs;
     for (int t = 0; t < tics; t++) {
         for (auto& e : course) if (e[0] == t) press(e[1], e[2]);
@@ -280,6 +284,12 @@ int main(int argc, char** argv) {
         tic_costs.push_back(call(tic, 0, nullptr, "doom_run_tic"));
         if (render_every && t % render_every == 0) {
             frame_costs.push_back(call(view_only ? render_view : render, 0, nullptr, "doom_render"));
+            if (dl_len) {
+                uint32_t v = 0;
+                call(dl_len, 0, nullptr, "doom_drawlist_len"); m3_GetResultsV(dl_len, &v); dl_bytes.push_back(v);
+                call(dl_count, 0, nullptr, "doom_drawlist_count"); m3_GetResultsV(dl_count, &v); dl_counts.push_back(v);
+                call(dl_trunc, 0, nullptr, "doom_drawlist_truncated"); m3_GetResultsV(dl_trunc, &v); dl_truncated += v;
+            }
             if (stats_read) {
                 std::string n = std::to_string(NSTATS * 4);
                 const char* a[] = {n.c_str()};
@@ -307,6 +317,20 @@ int main(int argc, char** argv) {
         std::printf("after the first second:\n");
         summary("tic", t2);
         summary("frame", f2);
+    }
+    if (!dl_bytes.empty()) {
+        auto show = [&](const char* name, std::vector<uint32_t> x) {
+            size_t from = x.size() > 35 ? 35 : 0;
+            x.erase(x.begin(), x.begin() + from);
+            std::sort(x.begin(), x.end());
+            uint64_t sum = 0;
+            for (auto e : x) sum += e;
+            std::printf("  %-18s mean %8llu  p50 %8llu  p95 %8llu  max %8llu\n", name, (unsigned long long)(sum / x.size()),
+                        (unsigned long long)x[x.size() / 2], (unsigned long long)x[x.size() * 95 / 100], (unsigned long long)x.back());
+        };
+        std::printf("draw list a frame (the pod's own list, after the first second; %u frames truncated at 16 KiB):\n", dl_truncated);
+        show("bytes", dl_bytes);
+        show("entries", dl_counts);
     }
     if (!frame_stats.empty()) {
         std::printf("draw list a frame (mode %d, %zu frames, after the first second):\n", stats_mode, frame_stats.size());

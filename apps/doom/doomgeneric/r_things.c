@@ -397,10 +397,10 @@ R_DrawVisSprite
     patch_t*		patch;
 	
 	
-    patch = W_CacheLumpNum (vis->patch+firstspritelump, PU_CACHE);
 #ifdef DG_DRAWLIST_STATS
-    { extern void DG_StatsSprite(int); extern void DG_StatsMaskedBegin(void); DG_StatsSprite(vis->patch+firstspritelump); DG_StatsMaskedBegin(); }
+    { extern int DG_StatsSprite(vissprite_t*); extern void DG_StatsMaskedBegin(void); if (DG_StatsSprite(vis)) return; DG_StatsMaskedBegin(); }
 #endif
+    patch = W_CacheLumpNum (vis->patch+firstspritelump, PU_CACHE);
 
     dc_colormap = vis->colormap;
     

@@ -244,6 +244,139 @@ def cut(src, dst, mapname, intermission=True):
         len(tex_out), len(textures), len(used_patches), len(pnames), len(keep_flat), len(flat_names), " ".join(sorted(sprites))))
 
 
+def parse_textures(lumps):
+    """(name, width, height, [(originx, originy, patchname)]) per texture, in numbering order."""
+    d = dict(lumps)
+    pnames_lump = d["PNAMES"]
+    pnames = [pnames_lump[4 + 8 * k:12 + 8 * k].rstrip(b"\0").decode("latin-1").upper() for k in range(struct.unpack_from("<i", pnames_lump)[0])]
+    out = []
+    for tl in ("TEXTURE1", "TEXTURE2"):
+        if tl not in d:
+            continue
+        t = d[tl]
+        n = struct.unpack_from("<i", t)[0]
+        for off in struct.unpack_from("<%di" % n, t, 4):
+            name = t[off:off + 8].rstrip(b"\0").decode("latin-1").upper()
+            w, h = struct.unpack_from("<hh", t, off + 12)
+            pc = struct.unpack_from("<h", t, off + 20)[0]
+            patches = [struct.unpack_from("<hhh", t, off + 22 + 10 * k)[:2] + (pnames[struct.unpack_from("<h", t, off + 22 + 10 * k + 4)[0]],)
+                       for k in range(pc)]
+            out.append((name, w, h, patches))
+    return out
+
+
+def compose(w, h, patches, d):
+    """The texture as DOOM's R_GenerateComposite draws it: column-major, w columns of h bytes."""
+    pix = bytearray(w * h)
+    for ox, oy, pname in patches:
+        pt = d[pname]
+        pw, ph = struct.unpack_from("<hh", pt, 0)
+        cofs = struct.unpack_from("<%di" % pw, pt, 8)
+        for x in range(pw):
+            tx = ox + x
+            if tx < 0 or tx >= w:
+                continue
+            o = cofs[x]
+            while pt[o] != 0xff:
+                top, ln = pt[o], pt[o + 1]
+                for y in range(ln):
+                    ty = oy + top + y
+                    if 0 <= ty < h:
+                        pix[tx * h + ty] = pt[o + 3 + y]
+                o += ln + 4
+    return bytes(pix)
+
+
+def pack(src, dst):
+    """The render pack: what a rasterizer needs and the sim does not (wad.py pack <iwad> <blob>).
+
+    Little-endian. Header: "K32DOOMPK", u8 version 1, u16 ntextures, u16 nflats, u16 nsprites,
+    u16 first_flat_lump, u16 first_sprite_lump, u32 palette_offset (768 B), u32 colormap_offset
+    (34 x 256 B), then the texture table (u16 width, u16 height, u8 kind: 0 composite column-major,
+    1 a single patch kept as a patch for its posts, u8 pad, u32 offset, u32 size), the flat table
+    (u32 offset: 4096 B each, by flat number), the sprite table (u32 offset, u32 size, by lump
+    number from first_sprite_lump), then the data, each item 4-byte aligned."""
+    kind, lumps = read_wad(src)
+    d = dict(lumps)
+    names = [n for n, _ in lumps]
+    textures = parse_textures(lumps)
+    f0, f1 = names.index("F_START"), names.index("F_END")
+    s0, s1 = names.index("S_START"), names.index("S_END")
+    flats = [data for _, data in lumps[f0 + 1:f1]]
+    sprites = [data for _, data in lumps[s0 + 1:s1]]
+    blob = bytearray()
+    def add(b):
+        while len(blob) % 4:
+            blob.append(0)
+        off = len(blob)
+        blob.extend(b)
+        return off
+    tex_table = []
+    composite_bytes = patch_bytes = 0
+    for name, w, h, patches in textures:
+        if len(patches) == 1 and patches[0][0] == 0 and patches[0][1] == 0 and struct.unpack_from("<hh", d[patches[0][2]], 0) == (w, h):
+            b, k = d[patches[0][2]], 1
+            patch_bytes += len(b)
+        else:
+            b, k = compose(w, h, patches, d), 0
+            composite_bytes += len(b)
+        tex_table.append((w, h, k, add(b), len(b)))
+    flat_table = [add(b) for b in flats]
+    sprite_table = [(add(b), len(b)) for b in sprites]
+    pal_off = add(d["PLAYPAL"][:768])
+    cmap_off = add(d["COLORMAP"][:34 * 256])
+    head_len = 9 + 1 + 2 * 5 + 4 * 2 + 16 * len(tex_table) + 4 * len(flat_table) + 8 * len(sprite_table)
+    head_len = (head_len + 3) & ~3
+    base = head_len
+    head = bytearray(b"K32DOOMPK" + bytes([1]))
+    head += struct.pack("<HHHHHII", len(tex_table), len(flat_table), len(sprite_table), f0 + 1, s0 + 1, base + pal_off, base + cmap_off)
+    for w, h, k, off, size in tex_table:
+        head += struct.pack("<HHBBII", w, h, k, 0, base + off, size)
+    for off in flat_table:
+        head += struct.pack("<I", base + off)
+    for off, size in sprite_table:
+        head += struct.pack("<II", base + off, size)
+    while len(head) < head_len:
+        head.append(0)
+    open(dst, "wb").write(bytes(head) + bytes(blob))
+    total = len(head) + len(blob)
+    print("%s: %d bytes" % (dst, total))
+    print("  textures %9d bytes (%d: %d B composed, %d B kept as patches)" % (sum(t[4] for t in tex_table), len(tex_table), composite_bytes, patch_bytes))
+    print("  flats    %9d bytes (%d)" % (sum(len(b) for b in flats), len(flats)))
+    print("  sprites  %9d bytes (%d)" % (sum(len(b) for b in sprites), len(sprites)))
+    print("  tables   %9d bytes, palette and colormaps %d" % (len(head), 768 + 34 * 256))
+
+
+def simpack(src, dst):
+    """The sim pack: the IWAD with the graphics the sim never reads cut to what it does read
+    (wad.py simpack <iwad> <wad>): patches and sprites keep their 8-byte header (width, height,
+    offsets), flats keep their name only. Lump numbers do not change."""
+    kind, lumps = read_wad(src)
+    names = [n for n, _ in lumps]
+    d = dict(lumps)
+    pnames_lump = d["PNAMES"]
+    pnames = {pnames_lump[4 + 8 * k:12 + 8 * k].rstrip(b"\0").decode("latin-1").upper() for k in range(struct.unpack_from("<i", pnames_lump)[0])}
+    f0, f1 = names.index("F_START"), names.index("F_END")
+    s0, s1 = names.index("S_START"), names.index("S_END")
+    in_patches = False
+    out = []
+    cut_bytes = 0
+    for k, (name, data) in enumerate(lumps):
+        if name in ("P_START", "PP_START"):
+            in_patches = True
+        elif name in ("P_END", "PP_END"):
+            in_patches = False
+        keep = data
+        if f0 < k < f1:
+            keep = b""
+        elif s0 < k < s1 or ((in_patches or name in pnames) and data):
+            keep = data[:8]
+        cut_bytes += len(data) - len(keep)
+        out.append((name, keep))
+    total = write_wad(dst, b"IWAD", out)
+    print("%s: %d lumps, %d bytes (%d cut from %d)" % (dst, len(out), total, cut_bytes, os.path.getsize(src)))
+
+
 def fetch(directory):
     os.makedirs(directory, exist_ok=True)
     zpath = os.path.join(directory, os.path.basename(FREEDOOM_URL))
@@ -270,9 +403,17 @@ def main():
     c.add_argument("dst")
     c.add_argument("--map", default="E1M1")
     c.add_argument("--no-intermission", action="store_true", help="also drop the intermission screens (the map's exit then stops the game)")
+    for name in ("pack", "simpack"):
+        q = sub.add_parser(name)
+        q.add_argument("src")
+        q.add_argument("dst")
     a = ap.parse_args()
     if a.cmd == "fetch":
         fetch(a.dir)
+    elif a.cmd == "pack":
+        pack(a.src, a.dst)
+    elif a.cmd == "simpack":
+        simpack(a.src, a.dst)
     else:
         cut(a.src, a.dst, a.map.upper(), not a.no_intermission)
 

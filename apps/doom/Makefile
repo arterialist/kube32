@@ -32,6 +32,10 @@ all: $(OUT)
 stats:
 	$(MAKE) OUT=build/doom-stats.wasm BUILD=build/stats EXTRA_CFLAGS=-DDG_DRAWLIST_STATS PORT="$(PORT) port/drawlist_stats.c"
 
+# The sim-only pod: no rasterizers and no screen buffers; a frame is a draw list (port/drawlist_emit.c)
+sim:
+	$(MAKE) OUT=build/doom-sim.wasm BUILD=build/sim EXTRA_CFLAGS="-DDG_DRAWLIST_STATS -DDG_SIM_ONLY" PORT="$(PORT) port/drawlist_emit.c"
+
 $(BUILD)/engine/%.o: doomgeneric/%.c
 	@mkdir -p $(BUILD)/engine
 	$(CLANG) $(ENGINE_CFLAGS) -c $< -o $@
@@ -66,4 +70,4 @@ bench: build/doombench build/doombench-fast
 clean:
 	rm -rf build
 
-.PHONY: all stats bench clean
+.PHONY: all stats sim bench clean
