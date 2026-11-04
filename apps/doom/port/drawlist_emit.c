@@ -51,7 +51,9 @@
 #include "../doomgeneric/m_fixed.h"
 
 #define K32_EXPORT(name) __attribute__((export_name(name)))
-#define LIST_BYTES 16384
+#ifndef LIST_BYTES
+#define LIST_BYTES 16384   /* -DLIST_BYTES caps the list (a board without PSRAM holds two 16 KiB messages at most) */
+#endif
 #define STRIPS 3
 
 extern void (*colfunc)(void);

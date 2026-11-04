@@ -6,6 +6,11 @@
 #   make view                the Cardputer view pod (build/doom-view.wasm)
 #   make check               build/drawlist_check: the split renderer against the engine
 #   make verify [TICS=n]     runs it: game states and pixels, both widths, the sim on the sim pack
+#   make pods                the two pods' modules and the packs as blobs (build/blobs/)
+#   make manifest            build/doom.yaml (with the wordsketch pods at 0 replicas, from
+#                            apps/wordsketch/build) and build/doom-only.yaml (DOOM alone)
+#   make upload SERVER=<url> the blobs to the nodes: doom-sim and doom-wad to the control
+#                            plane, doom-view and doom-pack to the Cardputer
 #   make ZONE_KB=512         the zone (DOOM's heap) size; -kb <n> in DOOM_ARGS overrides it
 #
 # The module starts with its static data and grows its linear memory with
@@ -52,8 +57,9 @@ stats:
 	$(MAKE) W=$(W) OUT=build/doom-stats$(SUF).wasm BUILD=build/stats$(SUF) EXTRA_CFLAGS=-DDG_DRAWLIST_STATS PORT="$(PORT) port/drawlist_stats.c"
 
 # The sim-only pod: no rasterizers and no screen buffers; a frame is a draw list (port/drawlist_emit.c)
+LIST_BYTES ?= $(if $(filter 240,$(W)),12288,16384)
 sim:
-	$(MAKE) W=$(W) OUT=build/doom-sim$(SUF).wasm BUILD=build/sim$(SUF) EXTRA_CFLAGS="-DDG_DRAWLIST_STATS -DDG_SIM_ONLY" \
+	$(MAKE) W=$(W) OUT=build/doom-sim$(SUF).wasm BUILD=build/sim$(SUF) EXTRA_CFLAGS="-DDG_DRAWLIST_STATS -DDG_SIM_ONLY -DLIST_BYTES=$(LIST_BYTES)" \
 	    EXCLUDE="$(SIM_EXCLUDE)" PORT="$(PORT) port/drawlist_emit.c port/sim_stubs.c"
 
 # The view pod: the decoder and the kernels' records, no engine
@@ -66,6 +72,45 @@ build/doom-view.wasm: view/view.c view/drawlist.c view/drawlist.h ../../include/
 	@ls -la $@
 
 view: build/doom-view.wasm
+
+# ---- the boards: blobs, manifests, upload ----
+KUBECTL ?= kubectl --context kube32
+SERVER ?=
+LLM ?= uv run --script ../llm-pipeline/tools/llm.py
+IWAD ?= build/wad/doom1-e1m1-min.wad
+BLOBS = build/blobs/doom-sim build/blobs/doom-wad build/blobs/doom-view build/blobs/doom-pack
+
+pods: $(BLOBS)
+build/blobs/doom-sim: FORCE
+	@mkdir -p build/blobs
+	$(MAKE) W=240 sim
+	cp build/doom-sim-240.wasm $@
+build/blobs/doom-view: build/doom-view.wasm
+	@mkdir -p build/blobs
+	cp $< $@
+build/blobs/doom-wad: $(IWAD) wad.py
+	@mkdir -p build/blobs
+	$(PYTHON) wad.py simpack $< $@
+build/blobs/doom-pack: $(IWAD) wad.py
+	@mkdir -p build/blobs
+	$(PYTHON) wad.py pack $< $@
+
+manifest:
+	@mkdir -p build
+	$(PYTHON) -c "import sys; d=open('../../examples/doom.yaml').read().split('\n---\n'); n=[x for x in d if 'app: doom' in x or 'name: doom' in x]; open('build/doom-only.yaml','w').write('\n---\n'.join(n)+'\n')"
+	@ls ../wordsketch/build/wordsketch-listen.wasm >/dev/null 2>&1 && $(LLM) manifest --template ../../examples/doom.yaml --modules ../wordsketch/build --out build/doom.yaml \
+	    || echo "build/doom.yaml needs the wordsketch modules (make -C ../wordsketch modules); build/doom-only.yaml has the DOOM pods alone"
+
+upload: $(BLOBS)
+	@cardputer=$$($(KUBECTL) $(if $(SERVER),--server $(SERVER)) get nodes -l kube32.io/board=cardputer -o name | head -1 | cut -d/ -f2); \
+	control=$$($(KUBECTL) $(if $(SERVER),--server $(SERVER)) get nodes -l node-role.kubernetes.io/control-plane -o name | head -1 | cut -d/ -f2); \
+	for b in doom-sim:$$control doom-wad:$$control doom-view:$$cardputer doom-pack:$$cardputer; do \
+	  name=$${b%%:*}; node=$${b#*:}; size=$$(wc -c < build/blobs/$$name | tr -d ' '); \
+	  echo "$$name ($$size B) -> $$node"; \
+	  $(KUBECTL) $(if $(SERVER),--server $(SERVER)) replace --raw "/api/v1/nodes/$$node/proxy/blobs/$$name?size=$$size" -f build/blobs/$$name || exit 1; \
+	done
+
+FORCE:
 
 # The host check against the engine (bench/drawlist_check.cpp), with the kernels of
 # src/runtime/pod_raster.cpp built alone; needs the repository's wasm3 (cmake --build build --target wasm3)
@@ -128,4 +173,4 @@ bench: build/doombench build/doombench-fast
 clean:
 	rm -rf build
 
-.PHONY: all stats sim view check verify bench clean
+.PHONY: all stats sim view check verify pods manifest upload bench clean FORCE

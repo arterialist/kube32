@@ -29,6 +29,9 @@
 #include "../doomgeneric/doomstat.h"
 
 K32_IMPORT("esp32_get_time_us") int64_t esp32_get_time_us(void);
+#ifndef K32_MAX_MESSAGE_BYTES
+K32_IMPORT("k32_publish") int32_t k32_publish(const char* topic, uint32_t topic_len, const void* data, uint32_t len);
+#endif
 
 void D_Display(void);
 void TryRunTics(void);
@@ -119,6 +122,9 @@ K32_EXPORT("doom_render_view") void doom_render_view(void) {
 /* For a host that drives the pod without HTTP: a key event */
 K32_EXPORT("doom_key") void doom_key(int32_t pressed, int32_t code) { key_push(pressed, (unsigned)code); }
 
+#ifdef DG_SIM_ONLY
+static void sim_env(void);
+#endif
 static char* argv_store[24];
 static char args_buf[256];
 
@@ -144,6 +150,9 @@ K32_EXPORT("k32_init") int32_t k32_init(void) {
     }
     argv_store[argc] = 0;
     singletics = true;          /* every TryRunTics runs exactly one tic */
+#ifdef DG_SIM_ONLY
+    sim_env();
+#endif
     {   /* DOOM_SCREENBLOCKS: 10 leaves room for the status bar, 11 is the whole screen */
         char sb[8];
         int32_t m = k32_env_get("DOOM_SCREENBLOCKS", 17, sb, sizeof sb - 1);
@@ -155,18 +164,68 @@ K32_EXPORT("k32_init") int32_t k32_init(void) {
     return 0;
 }
 
+#ifdef DG_SIM_ONLY
+/* The sim publishes a frame's draw list whole on a channel topic (DOOM_DRAW_TOPIC,
+ * default doom.draw) at DOOM_FPS frames a second (default 8), and takes keys
+ * published on DOOM_KEYS_TOPIC (default doom.keys): "d<code>,u<code>,..." */
+static char draw_topic[48] = "doom.draw", keys_topic[48] = "doom.keys";
+static uint32_t frame_ms = 125, publish_errors, frames_published, keys_received;
+static int64_t last_frame_ms;
+uint32_t doom_drawlist_ptr(void);
+uint32_t doom_drawlist_len(void);
+static void sim_env(void) {
+    char v[16];
+    int32_t n = k32_env_get("DOOM_DRAW_TOPIC", 15, draw_topic, sizeof draw_topic - 1);
+    if (n > 0 && n < (int32_t)sizeof draw_topic) draw_topic[n] = 0; else strcpy(draw_topic, "doom.draw");
+    n = k32_env_get("DOOM_KEYS_TOPIC", 15, keys_topic, sizeof keys_topic - 1);
+    if (n > 0 && n < (int32_t)sizeof keys_topic) keys_topic[n] = 0; else strcpy(keys_topic, "doom.keys");
+    n = k32_env_get("DOOM_FPS", 8, v, sizeof v - 1);
+    if (n > 0 && n < (int32_t)sizeof v) { v[n] = 0; long fps = atoi(v); if (fps >= 1 && fps <= 35) frame_ms = (uint32_t)(1000 / fps); }
+}
+static void parse_keys(const char* p, const char* end) {
+    while (p < end) {
+        if ((*p == 'd' || *p == 'u') && p + 1 < end && p[1] >= '0' && p[1] <= '9') { key_push(*p == 'd', (unsigned)strtol(p + 1, 0, 10)); keys_received++; }
+        while (p < end && *p != ',') p++;
+        if (p < end) p++;
+    }
+}
+/* keys arrive as events on the keys topic */
+K32_EXPORT("k32_event") int32_t k32_event(uint32_t topic, uint32_t topic_len, uint32_t ptr, uint32_t len) {
+    (void)topic; (void)topic_len;
+    const char* p = (const char*)(uintptr_t)ptr;
+    parse_keys(p, p + len);
+    return 0;
+}
+#endif
+
 K32_EXPORT("k32_tick") int32_t k32_tick(uint32_t uptime_ms) {
     (void)uptime_ms;
     if (!started) return 0;
-    uint32_t due = (uint32_t)((k32_time_ms() - start_ms) * TICRATE / 1000);
-    if (due <= tics_run) return 1;
-    uint32_t n = due - tics_run;
-    if (n > 4) {                 /* behind: drop the time rather than catch up */
-        tics_run = due - 4;
-        n = 4;
+    const int64_t now = k32_time_ms();
+    uint32_t due = (uint32_t)((now - start_ms) * TICRATE / 1000);
+    if (due > tics_run) {
+        uint32_t n = due - tics_run;
+        if (n > 4) {                 /* behind: drop the time rather than catch up */
+            tics_run = due - 4;
+            n = 4;
+        }
+        while (n--) doom_run_tic();
     }
-    while (n--) doom_run_tic();
+#ifdef DG_SIM_ONLY
+    if (now - last_frame_ms < (int64_t)frame_ms) return 1;
+    last_frame_ms = now;
     doom_render();
+    int32_t rc = k32_publish(draw_topic, (uint32_t)strlen(draw_topic), (const void*)(uintptr_t)doom_drawlist_ptr(), doom_drawlist_len());
+    if (rc < 0) publish_errors++; else frames_published++;
+    if ((frames_published + publish_errors) % 100 == 0) {
+        char line[96];
+        snprintf(line, sizeof line, "doom-sim: frames %u publish_errors %u keys %u list %u B", (unsigned)frames_published, (unsigned)publish_errors,
+                 (unsigned)keys_received, (unsigned)doom_drawlist_len());
+        k32_log(line, (uint32_t)strlen(line));
+    }
+#else
+    if (due > tics_run) doom_render();
+#endif
     return 1;
 }
 
@@ -314,6 +373,11 @@ K32_EXPORT("k32_handle") int32_t k32_handle(uint32_t ptr, uint32_t len) {
         put_kv("memory_bytes", (int64_t)__builtin_wasm_memory_size(0) * 65536);
         put_kv("blob_reads", k32_libc_blob_reads);
         put_kv("blob_bytes", k32_libc_blob_bytes);
+#ifdef DG_SIM_ONLY
+        put_kv("frames_published", frames_published);
+        put_kv("publish_errors", publish_errors);
+        put_kv("keys_received", keys_received);
+#endif
         return reply_json();
     }
     if (!strcmp(seg, "bench")) {

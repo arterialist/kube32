@@ -1,25 +1,27 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
-/* doom-view: the Cardputer side of the split DOOM. Every tick it sends the
- * keys the keyboard produced to the sim pod, fetches the frame's draw list
- * (GET <DOOM_SIM_URL>/drawlist?keys=...), draws it band by band with the
- * k32_raster_* kernels from the render pack blob (the textures never enter
- * this pod's memory: the kernels read them in place), and puts each band on
- * the screen with k32_display_blit_pal.
+/* doom-view: the Cardputer side of the split DOOM. The sim pod publishes a
+ * frame's draw list whole on a channel topic (doom.draw); this pod receives
+ * it in k32_event, draws it band by band with the k32_raster_* kernels from
+ * the render pack blob (the textures never enter this pod's memory: the
+ * kernels read them in place), and puts each band on the screen with
+ * k32_display_blit_pal. Every tick it sends the keys the keyboard produced
+ * as an event on doom.keys ("d<code>,u<code>,...").
  *
- *   env DOOM_SIM_URL    the sim pod's draw list, default http://doom-sim/drawlist
- *   env DOOM_PACK_BLOB  the render pack blob (wad.py pack), default doom-pack
- *   GET /stats          frames, bytes and errors as JSON
+ *   annotation kube32.io/event-topics: doom.draw
+ *   env DOOM_KEYS_TOPIC  where the keys go, default doom.keys
+ *   env DOOM_PACK_BLOB   the render pack blob (wad.py pack), default doom-pack
+ *   GET /stats           frames, bytes and errors as JSON
  *
  * The Cardputer keyboard reports presses, not releases: a key is held for
- * the frame it arrives in and released with the next request. w a s d move
- * and turn, space uses, f or ctrl fires, enter and escape pass through. */
+ * the frame it arrives in and released with the next tick. w a s d move
+ * and turn, space uses, f fires, enter and escape pass through. */
 #include <stdint.h>
 #include "runtime/k32_app_abi.h"
 #include "drawlist.h"
 
 #define VIEW_W 240
 #define BAND_ROWS 27            /* 5 bands of a 135-row view */
-#define LIST_BYTES 16384
+#define LIST_BYTES 12288        /* the sim's cap at 240 wide (Makefile: LIST_BYTES) */
 #define HEAD_BYTES 4096
 
 /* the tiny libc clang expects for a freestanding module */
@@ -27,20 +29,17 @@ void* memcpy(void* d, const void* s, unsigned long n) { uint8_t* a = d; const ui
 void* memset(void* d, int c, unsigned long n) { uint8_t* a = d; while (n--) *a++ = (uint8_t)c; return d; }
 static unsigned slen(const char* s) { unsigned n = 0; while (s[n]) n++; return n; }
 
-static uint8_t list[LIST_BYTES];
+static uint8_t list[LIST_BYTES + 64];   /* the topic comes first, then the message */
 static uint8_t band[VIEW_W * BAND_ROWS];
 static uint8_t head[HEAD_BYTES];
 static uint16_t pal[256];
 static dl_ctx ctx;
-static char url[128];
-static char req_url[192];
+static char keys_topic[48];
 static int32_t blob = -1;
-static uint32_t frames, bytes, fetch_errors, draw_errors, last_status;
+static uint32_t frames, bytes, draw_errors, key_errors, keys_sent;
 static int ready;
 
-/* keys: pressed this frame, released with the next request */
-static uint8_t pressed[16];
-static unsigned npressed;
+/* keys: pressed this tick, released with the next */
 static uint8_t release[16];
 static unsigned nrelease;
 
@@ -63,7 +62,7 @@ static uint32_t env(const char* key, char* out, uint32_t cap, const char* def) {
 
 K32_EXPORT("k32_init") int32_t k32_init(void) {
     char name[48];
-    env("DOOM_SIM_URL", url, sizeof url, "http://doom-sim/drawlist");
+    env("DOOM_KEYS_TOPIC", keys_topic, sizeof keys_topic, "doom.keys");
     env("DOOM_PACK_BLOB", name, sizeof name, "doom-pack");
     blob = k32_blob_open(name, slen(name));
     if (blob < 0) { logf("doom-view: the render pack blob is not open"); return -1; }
@@ -76,6 +75,42 @@ K32_EXPORT("k32_init") int32_t k32_init(void) {
     if (k32_blob_read(blob, ctx.palette, rgb, 768) != 768) return -1;
     for (int i = 0; i < 256; i++) pal[i] = (uint16_t)(((rgb[3 * i] >> 3) << 11) | ((rgb[3 * i + 1] >> 2) << 5) | (rgb[3 * i + 2] >> 3));
     ready = 1;
+    return 0;
+}
+
+/* a draw list arrives whole; the buffer also serves the requests */
+K32_EXPORT("k32_alloc") uint32_t k32_alloc(uint32_t size) {
+    return size <= sizeof list ? (uint32_t)(uintptr_t)list : 0;
+}
+
+static unsigned put_num(char* p, unsigned v);
+K32_EXPORT("k32_event") int32_t k32_event(uint32_t topic, uint32_t topic_len, uint32_t ptr, uint32_t len) {
+    (void)topic; (void)topic_len;
+    const uint8_t* msg = (const uint8_t*)(uintptr_t)ptr;
+    if (!ready || len < DL_HEADER_BYTES || msg[0] != 'D') return 0;
+    bytes += len;
+    const uint32_t vh = msg[8];
+    for (uint32_t y0 = 0; y0 < vh; y0 += BAND_ROWS) {
+        const uint32_t rows = vh - y0 < BAND_ROWS ? vh - y0 : BAND_ROWS;
+        int32_t rc = dl_draw(&ctx, msg, len, band, VIEW_W, (int32_t)y0, rows);
+        if (rc) { draw_errors++; break; }
+        k32_display_blit_pal(0, (int32_t)y0, VIEW_W, (int32_t)rows, band, pal);
+    }
+    frames++;
+    if (frames % 100 == 0) {   /* a line every 100 frames: kubectl logs shows the flow */
+        char line[96];
+        unsigned n = 0;
+        const char* s = "doom-view: frames ";
+        while (*s) line[n++] = *s++;
+        n += put_num(line + n, frames);
+        s = " bytes "; while (*s) line[n++] = *s++;
+        n += put_num(line + n, bytes);
+        s = " draw_errors "; while (*s) line[n++] = *s++;
+        n += put_num(line + n, draw_errors);
+        s = " keys_sent "; while (*s) line[n++] = *s++;
+        n += put_num(line + n, keys_sent);
+        k32_log(line, n);
+    }
     return 0;
 }
 
@@ -103,35 +138,22 @@ static unsigned put_num(char* p, unsigned v) {
 K32_EXPORT("k32_tick") int32_t k32_tick(uint32_t uptime_ms) {
     (void)uptime_ms;
     if (!ready) return 0;
-    /* the keys: releases of the last frame's presses, then this frame's presses */
-    npressed = 0;
+    /* releases of the last tick's presses, then this tick's presses */
+    uint8_t pressed[16];
+    unsigned npressed = 0;
     for (int32_t k; (k = k32_key_read()) >= 0 && npressed < sizeof pressed;) {
         uint8_t c = doom_key(k);
         if (c) pressed[npressed++] = c;
     }
-    unsigned n = slen(url);
-    memcpy(req_url, url, n);
     if (nrelease || npressed) {
-        memcpy(req_url + n, "?keys=", 6); n += 6;
-        for (unsigned i = 0; i < nrelease; i++) { req_url[n++] = 'u'; n += put_num(req_url + n, release[i]); req_url[n++] = ','; }
-        for (unsigned i = 0; i < npressed; i++) { req_url[n++] = 'd'; n += put_num(req_url + n, pressed[i]); req_url[n++] = ','; }
-        n--;
+        char msg[160];
+        unsigned n = 0;
+        for (unsigned i = 0; i < nrelease; i++) { msg[n++] = 'u'; n += put_num(msg + n, release[i]); msg[n++] = ','; }
+        for (unsigned i = 0; i < npressed; i++) { msg[n++] = 'd'; n += put_num(msg + n, pressed[i]); msg[n++] = ','; }
+        if (k32_event_emit(keys_topic, slen(keys_topic), msg, n - 1) < 0) key_errors++; else keys_sent += nrelease + npressed;
     }
     memcpy(release, pressed, npressed);
     nrelease = npressed;
-    uint32_t got = 0;
-    int32_t st = k32_http_call("GET", 3, req_url, n, "", 0, (const uint8_t*)"", 0, list, sizeof list, &got, 2000);
-    last_status = (uint32_t)st;
-    if (st != 200 || got < DL_HEADER_BYTES) { fetch_errors++; return 1; }
-    bytes += got;
-    const uint32_t vh = list[8];
-    for (uint32_t y0 = 0; y0 < vh; y0 += BAND_ROWS) {
-        const uint32_t rows = vh - y0 < BAND_ROWS ? vh - y0 : BAND_ROWS;
-        int32_t rc = dl_draw(&ctx, list, got, band, VIEW_W, (int32_t)y0, rows);
-        if (rc) { draw_errors++; break; }
-        k32_display_blit_pal(0, (int32_t)y0, VIEW_W, (int32_t)rows, band, pal);
-    }
-    frames++;
     return 1;
 }
 
@@ -144,19 +166,15 @@ static void put_kv(const char* k, uint32_t v) {
     out_len += put_num(out + out_len, v);
 }
 
-K32_EXPORT("k32_alloc") uint32_t k32_alloc(uint32_t size) {
-    static uint8_t req[1024];
-    return size <= sizeof req ? (uint32_t)(uintptr_t)req : 0;
-}
 K32_EXPORT("k32_handle") int32_t k32_handle(uint32_t ptr, uint32_t len) {
     (void)ptr; (void)len;
     out_len = 0;
     put("{");
     put_kv("frames", frames);
     put_kv("bytes", bytes);
-    put_kv("fetch_errors", fetch_errors);
     put_kv("draw_errors", draw_errors);
-    put_kv("last_status", last_status);
+    put_kv("keys_sent", keys_sent);
+    put_kv("key_errors", key_errors);
     put_kv("unsupported", ctx.unsupported);
     put("}");
     k32_resp_begin(200, "application/json", 16);
