@@ -38,7 +38,7 @@ CONFIG_LWIP_TCP_OOSEQ_TIMEOUT=3
 CONFIG_LWIP_TCP_RECVMBOX_SIZE=4
 # A large channel message arrives as a burst of UDP datagrams while a pod may be busy for
 # 100 ms: the socket and the TCP/IP mailboxes must hold a few messages of them
-CONFIG_LWIP_UDP_RECVMBOX_SIZE=32
+CONFIG_LWIP_UDP_RECVMBOX_SIZE=8
 CONFIG_LWIP_TCPIP_RECVMBOX_SIZE=64
 CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ_240=y
 CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ=240
