@@ -248,6 +248,10 @@ struct PeerInfo {
     // 0 for a node that announces none (it is sent every topic)
     std::vector<uint32_t> subs;
     uint64_t subs_ms{0};
+    // The bytes a second the node takes (0: no limit), from its
+    // announcement; a publisher paces messages to it accordingly
+    uint32_t rx_rate{0};
+    uint64_t next_send_us{0};
 };
 
 // A node heard over ESP-NOW this recently is sent to over ESP-NOW
@@ -255,14 +259,19 @@ constexpr uint64_t K32C_ESPNOW_FRESH_MS = 10000;
 // A node's subscription announcement holds this long; after that it is
 // sent every topic again (it may run a firmware that does not announce)
 constexpr uint64_t K32C_SUBS_FRESH_MS = 20000;
+// The bytes a second a node without PSRAM asks publishers for, and the
+// longest a publish waits for a peer's pace
+constexpr uint32_t K32C_RX_RATE_NO_PSRAM = 48 * 1024;
+constexpr uint32_t K32C_MAX_PACE_WAIT_MS = 500;
 
 constexpr const char* K32C_HELLO_TOPIC = "k32.hello";
 // A node name: that node's kubelet lists its pods at once (the control
 // plane bound a pod to it or is deleting one)
 constexpr const char* K32C_KUBELET_SYNC_TOPIC = "k32.kubelet.sync";
-// A node's subscriptions: its node id and the hash of every topic it
-// subscribes to (u32 each, little-endian), sent with each HELLO and when
-// they change. Publishers send a topic only to the nodes that subscribe.
+// A node's subscriptions: its node id, the bytes a second it takes (0: no
+// limit) and the hash of every topic it subscribes to (u32 each,
+// little-endian), sent with each HELLO and when they change. Publishers send
+// a topic only to the nodes that subscribe, no faster than they take.
 constexpr const char* K32C_SUBS_TOPIC = "k32.subs";
 
 class ChannelManager {
@@ -312,6 +321,10 @@ public:
     // the most the node holds (beyond it a message is dropped and counted)
     size_t rx_held_bytes() const;
     void set_rx_budget_bytes(size_t bytes) { rx_budget_bytes_.store(bytes); }
+    // The bytes a second this node announces it takes (0: no limit; 48 KiB
+    // without PSRAM)
+    void set_rx_rate_bytes(uint32_t bytes) { rx_rate_bytes_.store(bytes); subs_changed_.store(true); }
+    uint32_t rx_rate_bytes() const { return rx_rate_bytes_.load(); }
     size_t rx_budget_bytes() const { return rx_budget_bytes_.load(); }
 
     // ---- Peers -------------------------------------------------------------
@@ -385,6 +398,8 @@ public:
         std::atomic<uint64_t> rx_queue_full{0};
         std::atomic<uint64_t> rx_malformed{0};
         std::atomic<uint64_t> subs_rx{0};
+        // Time publishers waited for a peer's announced rate
+        std::atomic<uint64_t> paced_us{0};
     };
     ChannelStats& stats() { return stats_; }
 
@@ -467,6 +482,8 @@ private:
     std::atomic<uint8_t> route_{0};
     std::atomic<size_t> rx_budget_bytes_{K32C_MAX_MESSAGE_BYTES * 8};
     bool has_psram_{false};
+    std::atomic<uint32_t> rx_rate_bytes_{0};
+    void pace_to(uint32_t node_id, size_t len, uint32_t rate);
 
     // Queues a message for this node's subscribers; false when it was
     // dropped (queue full)

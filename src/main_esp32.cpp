@@ -1023,13 +1023,14 @@ static void console_ipc(Console& con) {
     int ll = snprintf(l, sizeof(l),
                       "K32_IPC tx_frames=%llu send_errors=%llu retried=%llu published=%llu publish_errors=%llu fanout_skipped=%llu "
                       "rx_frames=%llu crc=%llu rx_messages=%llu reassembled=%llu incomplete=%llu nomem=%llu rxq_full=%llu malformed=%llu "
-                      "dispatch_dropped=%llu subs_rx=%llu held=%u budget=%u gap_us=%u rxq=%u route=%u\n",
+                      "dispatch_dropped=%llu subs_rx=%llu paced_ms=%llu held=%u budget=%u rx_rate=%u gap_us=%u rxq=%u route=%u\n",
                       (unsigned long long)s.frames_sent.load(), (unsigned long long)s.send_errors.load(), (unsigned long long)s.frames_retried.load(),
                       (unsigned long long)s.msgs_published.load(), (unsigned long long)s.publish_errors.load(), (unsigned long long)s.fanout_skipped.load(),
                       (unsigned long long)s.frames_received.load(), (unsigned long long)s.crc_errors.load(), (unsigned long long)s.rx_messages.load(),
                       (unsigned long long)s.reassembled_msgs.load(), (unsigned long long)s.rx_incomplete.load(), (unsigned long long)s.rx_nomem.load(),
                       (unsigned long long)s.rx_queue_full.load(), (unsigned long long)s.rx_malformed.load(), (unsigned long long)s.dispatch_dropped.load(),
-                      (unsigned long long)s.subs_rx.load(), (unsigned)m.rx_held_bytes(), (unsigned)m.rx_budget_bytes(), (unsigned)m.fragment_gap_us(),
+                      (unsigned long long)s.subs_rx.load(), (unsigned long long)(s.paced_us.load() / 1000), (unsigned)m.rx_held_bytes(),
+                      (unsigned)m.rx_budget_bytes(), (unsigned)m.rx_rate_bytes(), (unsigned)m.fragment_gap_us(),
                       (unsigned)m.rx_queue_frames(), (unsigned)m.route());
     con.write(l, static_cast<size_t>(ll));
     const uint64_t now = kube32::osal::System::get_uptime_ms();

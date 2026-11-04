@@ -111,12 +111,13 @@ std::vector<std::vector<uint8_t>> split(const std::string& topic, uint32_t sende
     return out;
 }
 
-void subs_announcement(uint32_t node_id, const std::vector<std::string>& topics) {
-    std::vector<uint8_t> p(4 + 4 * topics.size());
+void subs_announcement(uint32_t node_id, const std::vector<std::string>& topics, uint32_t rate = 0) {
+    std::vector<uint8_t> p(8 + 4 * topics.size());
     std::memcpy(p.data(), &node_id, 4);
+    std::memcpy(p.data() + 4, &rate, 4);
     for (size_t i = 0; i < topics.size(); ++i) {
         const uint32_t h = fnv1a_32(topics[i]);
-        std::memcpy(p.data() + 4 + 4 * i, &h, 4);
+        std::memcpy(p.data() + 8 + 4 * i, &h, 4);
     }
     feed(make_frame(fnv1a_32(K32C_SUBS_TOPIC), 0, 1, 0, 1, p.data(), p.size(), 0));
 }
@@ -307,7 +308,7 @@ void test_subscription_fanout() {
             const auto* h = hdr_of(f);
             uint32_t node = 0;
             std::memcpy(&node, f.data() + K32C_HEADER_LEN, 4);
-            for (size_t off = 4; off + 4 <= h->payload_len; off += 4) {
+            for (size_t off = 8; off + 4 <= h->payload_len; off += 4) {
                 uint32_t v = 0;
                 std::memcpy(&v, f.data() + K32C_HEADER_LEN + off, 4);
                 if (node == 1 && v == mine) return true;
@@ -323,6 +324,34 @@ void test_subscription_fanout() {
     assert(!std::binary_search(after.begin(), after.end(), mine));
     m.shutdown();
     std::cout << "[PASS] test_subscription_fanout" << std::endl;
+}
+
+// A peer that announces the bytes a second it takes gets messages no faster
+void test_announced_rate() {
+    start_node();
+    auto& m = ChannelManager::instance();
+    PeerSocket a(kBasePort + 31);
+    m.add_peer(peer(31, "slow", a.port));
+    subs_announcement(31, {"doom.draw"}, 40000);   // 40 KB a second
+    const auto msg = pattern(4000, 50);
+    const uint64_t t0 = osal::System::get_uptime_ms();
+    for (int i = 0; i < 6; ++i) assert(m.publish("pub", "doom.draw", msg.data(), msg.size()) == static_cast<int32_t>(msg.size()));
+    const uint64_t took = osal::System::get_uptime_ms() - t0;
+    assert(took >= 450);   // 6 x 4000 bytes at 40 KB/s: the last one starts after 500 ms
+    assert(frames_of(a.drain(100), "doom.draw").size() == 6 * 3);
+    assert(m.stats().paced_us.load() > 0);
+    // This node announces its own rate
+    m.set_rx_rate_bytes(12345);
+    bool seen = false;
+    for (const auto& f : frames_of(a.drain(300), K32C_SUBS_TOPIC)) {
+        uint32_t node = 0, rate = 0;
+        std::memcpy(&node, f.data() + K32C_HEADER_LEN, 4);
+        std::memcpy(&rate, f.data() + K32C_HEADER_LEN + 4, 4);
+        if (node == 1 && rate == 12345) seen = true;
+    }
+    assert(seen);
+    m.shutdown();
+    std::cout << "[PASS] test_announced_rate" << std::endl;
 }
 
 // publish reports a message a local subscriber's full queue dropped, and one
@@ -361,6 +390,7 @@ int main() {
     test_out_of_order_and_duplicates();
     test_loss();
     test_subscription_fanout();
+    test_announced_rate();
     test_publish_errors();
     std::cout << "All large channel message tests passed" << std::endl;
     return 0;

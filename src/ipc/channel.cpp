@@ -702,6 +702,23 @@ NodeEndpoint ChannelManager::route_to(const PeerInfo& p, uint64_t now_ms) const 
     return p.endpoint;   // a peer added by hand (simulation)
 }
 
+void ChannelManager::pace_to(uint32_t node_id, size_t len, uint32_t rate) {
+    uint64_t wait_us = 0;
+    {
+        osal::LockGuard guard(peer_mutex_);
+        auto it = peers_.find(node_id);
+        if (it == peers_.end()) return;
+        const uint64_t now = osal::Thread::get_time_us();
+        uint64_t& next = it->second.next_send_us;
+        if (next > now) wait_us = std::min<uint64_t>(next - now, K32C_MAX_PACE_WAIT_MS * 1000ull);
+        next = std::max(next, now) + static_cast<uint64_t>(len) * 1000000ull / rate;
+    }
+    if (wait_us > 0) {
+        stats_.paced_us.fetch_add(wait_us, std::memory_order_relaxed);
+        osal::Thread::sleep_ms(static_cast<uint32_t>((wait_us + 999) / 1000));
+    }
+}
+
 bool ChannelManager::peer_wants(uint32_t node_id, uint32_t topic_hash) const {
     osal::LockGuard guard(peer_mutex_);
     auto it = peers_.find(node_id);
@@ -721,7 +738,11 @@ int32_t ChannelManager::publish(const std::string& pod_id, const std::string& to
     if (!deliver_local(channel_hash, sender_hash, data, len, &nomem)) err = nomem ? IPC_ERR_NOMEM : IPC_ERR_AGAIN;
 
     // Peers that subscribe to the topic
-    std::vector<NodeEndpoint> targets;
+    struct Target {
+        NodeEndpoint ep;
+        uint32_t rate;
+    };
+    std::vector<Target> targets;
     {
         const uint64_t now = osal::System::get_uptime_ms();
         osal::LockGuard guard(peer_mutex_);
@@ -731,11 +752,14 @@ int32_t ChannelManager::publish(const std::string& pod_id, const std::string& to
                 stats_.fanout_skipped.fetch_add(1, std::memory_order_relaxed);
                 continue;
             }
-            targets.push_back(route_to(kv.second, now));
+            targets.push_back(Target{route_to(kv.second, now), now - kv.second.subs_ms <= K32C_SUBS_FRESH_MS ? kv.second.rx_rate : 0});
         }
     }
-    for (const auto& ep : targets) {
-        const int32_t rc = send_frames_to(ep, channel_hash, sender_hash, 0, data, len, 0);
+    for (const auto& t : targets) {
+        // A peer that announces the bytes a second it takes is sent no
+        // faster: the publisher waits (at most K32C_MAX_PACE_WAIT_MS)
+        if (t.rate > 0) pace_to(t.ep.node_id, len, t.rate);
+        const int32_t rc = send_frames_to(t.ep, channel_hash, sender_hash, 0, data, len, 0);
         if (rc != IPC_OK && err == IPC_OK) err = rc;
     }
     if (err != IPC_OK) {
@@ -990,6 +1014,11 @@ bool ChannelManager::start_background(uint32_t hello_interval_ms, size_t dispatc
     // Without PSRAM: two messages of the largest size held at once (one
     // being put together while the pod reads the other)
     rx_budget_bytes_.store(psram ? 256 * 1024 : 2 * (K32C_MAX_MESSAGE_BYTES + K32C_LARGE_CHUNK));
+    // Without PSRAM the node asks publishers for at most 48 KiB a second: its
+    // Wi-Fi stops sending under a heavier stream of large messages
+#if defined(KUBE32_TARGET_ESP32)
+    rx_rate_bytes_.store(psram ? 0 : K32C_RX_RATE_NO_PSRAM);
+#endif
     has_psram_ = psram;
     background_running_.store(true);
     dispatch_thread_ = std::make_unique<osal::Thread>();
@@ -1040,10 +1069,12 @@ bool ChannelManager::find_peer_by_name(const std::string& node_name, PeerInfo& o
 void ChannelManager::send_subs() {
     if (!transport_ || !initialized_) return;
     const std::vector<uint32_t> hashes = local_topic_hashes();
-    const size_t n = std::min(hashes.size(), (K32C_MAX_MESSAGE_BYTES - 4) / 4);
-    std::vector<uint8_t> payload(4 + 4 * n);
+    const size_t n = std::min(hashes.size(), (K32C_MAX_MESSAGE_BYTES - 8) / 4);
+    std::vector<uint8_t> payload(8 + 4 * n);
+    const uint32_t rate = rx_rate_bytes_.load();
     std::memcpy(payload.data(), &local_node_id_, 4);
-    for (size_t i = 0; i < n; ++i) std::memcpy(payload.data() + 4 + 4 * i, &hashes[i], 4);
+    std::memcpy(payload.data() + 4, &rate, 4);
+    for (size_t i = 0; i < n; ++i) std::memcpy(payload.data() + 8 + 4 * i, &hashes[i], 4);
     const uint32_t hash = subs_topic_hash();
     const uint32_t sender = fnv1a_32(local_node_name_);
 #if defined(KUBE32_TARGET_ESP32)
@@ -1066,12 +1097,13 @@ void ChannelManager::send_subs() {
 }
 
 void ChannelManager::handle_subs(const uint8_t* payload, size_t len) {
-    if (len < 4) return;
-    uint32_t node_id = 0;
+    if (len < 8) return;
+    uint32_t node_id = 0, rate = 0;
     std::memcpy(&node_id, payload, 4);
+    std::memcpy(&rate, payload + 4, 4);
     if (node_id == local_node_id_) return;
-    std::vector<uint32_t> hashes((len - 4) / 4);
-    for (size_t i = 0; i < hashes.size(); ++i) std::memcpy(&hashes[i], payload + 4 + 4 * i, 4);
+    std::vector<uint32_t> hashes((len - 8) / 4);
+    for (size_t i = 0; i < hashes.size(); ++i) std::memcpy(&hashes[i], payload + 8 + 4 * i, 4);
     std::sort(hashes.begin(), hashes.end());
     stats_.subs_rx.fetch_add(1, std::memory_order_relaxed);
     osal::LockGuard guard(peer_mutex_);
@@ -1079,6 +1111,7 @@ void ChannelManager::handle_subs(const uint8_t* payload, size_t len) {
     if (it == peers_.end()) return;   // its HELLO comes first
     it->second.subs.swap(hashes);
     it->second.subs_ms = osal::System::get_uptime_ms();
+    it->second.rx_rate = rate;
 }
 
 void ChannelManager::send_hello() {
