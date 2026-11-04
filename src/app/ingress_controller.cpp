@@ -1007,14 +1007,21 @@ std::string IngressController::build_cluster_json() {
     out += ",\"send_errors\":" + std::to_string(cs.send_errors.load());
     out += ",\"reassembled\":" + std::to_string(cs.reassembled_msgs.load());
     out += ",\"hello_rx\":" + std::to_string(cs.hello_rx.load());
+    out += ",\"published\":" + std::to_string(cs.msgs_published.load());
+    out += ",\"publish_errors\":" + std::to_string(cs.publish_errors.load());
+    out += ",\"fanout_skipped\":" + std::to_string(cs.fanout_skipped.load());
+    out += ",\"rx_messages\":" + std::to_string(cs.rx_messages.load());
+    out += ",\"rx_incomplete\":" + std::to_string(cs.rx_incomplete.load());
+    out += ",\"rx_nomem\":" + std::to_string(cs.rx_nomem.load());
+    out += ",\"rx_queue_full\":" + std::to_string(cs.rx_queue_full.load());
     out += ",\"peers\":[";
     bool pf = true;
     for (const auto& p : ipc::ChannelManager::instance().peers()) {
         if (!pf) out += ",";
         pf = false;
         char mac[24];
-        snprintf(mac, sizeof(mac), "%02x:%02x:%02x:%02x:%02x:%02x", p.endpoint.mac_address[0], p.endpoint.mac_address[1], p.endpoint.mac_address[2],
-                 p.endpoint.mac_address[3], p.endpoint.mac_address[4], p.endpoint.mac_address[5]);
+        snprintf(mac, sizeof(mac), "%02x:%02x:%02x:%02x:%02x:%02x", p.mac_address[0], p.mac_address[1], p.mac_address[2],
+                 p.mac_address[3], p.mac_address[4], p.mac_address[5]);
         out += "{\"node\":\"" + p.node_name + "\",\"id\":" + std::to_string(p.node_id) + ",\"mac\":\"" + mac + "\",\"last_seen_ms\":" + std::to_string(p.last_seen_ms) + ",\"hellos\":" + std::to_string(p.hello_count) + "}";
     }
     out += "]},\"now\":" + std::to_string(osal::System::get_uptime_ms()) + "}";

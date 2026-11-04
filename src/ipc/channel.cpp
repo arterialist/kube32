@@ -1,18 +1,22 @@
 #include "ipc/channel.hpp"
 #include "osal/system.hpp"
 #include "osal/thread.hpp"
+#include "runtime/pod_memory_pool.h"
 
 #include <cstring>
 #include <algorithm>
 #include <cstdio>
 #include <iostream>
 #include <new>
+#include <cstdlib>
+#include <deque>
 
 #if defined(KUBE32_TARGET_ESP32)
 #include "esp_now.h"
 #include "esp_wifi.h"
 #include "esp_mac.h"
 #include "esp_log.h"
+#include "esp_heap_caps.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 #include "freertos/task.h"
@@ -33,19 +37,90 @@ uint32_t fnv1a_32(const char* data, size_t len) {
     return hash;
 }
 
+namespace {
+// CRC-16/CCITT a byte at a time (a 1444-byte fragment is checked on every
+// frame received)
+struct Crc16Table {
+    uint16_t t[256];
+    constexpr Crc16Table() : t() {
+        for (int i = 0; i < 256; ++i) {
+            uint16_t c = static_cast<uint16_t>(i << 8);
+            for (int j = 0; j < 8; ++j) c = (c & 0x8000) ? static_cast<uint16_t>((c << 1) ^ 0x1021) : static_cast<uint16_t>(c << 1);
+            t[i] = c;
+        }
+    }
+};
+constexpr Crc16Table kCrc16;
+} // namespace
+
 uint16_t crc16_ccitt(const uint8_t* data, size_t len, uint16_t init) {
     uint16_t crc = init;
     for (size_t i = 0; i < len; ++i) {
-        crc ^= static_cast<uint16_t>(data[i]) << 8;
-        for (int j = 0; j < 8; ++j) {
-            if (crc & 0x8000) {
-                crc = (crc << 1) ^ 0x1021;
-            } else {
-                crc = crc << 1;
-            }
-        }
+        crc = static_cast<uint16_t>((crc << 8) ^ kCrc16.t[((crc >> 8) ^ data[i]) & 0xFF]);
     }
     return crc;
+}
+
+// =============================================================================
+// Message buffers
+// =============================================================================
+namespace {
+std::atomic<size_t> g_message_bytes{0};
+
+#if defined(KUBE32_TARGET_ESP32)
+// Without PSRAM a message takes the heap only while this much stays free for
+// Wi-Fi, lwIP and the kubelet; then the pod pool block's small heap
+constexpr size_t kHeapReserveNoPsram = 14 * 1024;
+#endif
+
+uint8_t* message_alloc(size_t n) {
+    if (n == 0) n = 1;
+#if defined(KUBE32_TARGET_ESP32)
+    if (osal::System::get_total_psram_bytes() > 0) {
+        void* p = heap_caps_malloc(n, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        if (!p) p = heap_caps_malloc(n, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+        return static_cast<uint8_t*>(p);
+    }
+    if (heap_caps_get_free_size(MALLOC_CAP_INTERNAL) >= n + kHeapReserveNoPsram &&
+        heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL) >= n) {
+        if (void* p = heap_caps_malloc(n, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT)) return static_cast<uint8_t*>(p);
+    }
+    return static_cast<uint8_t*>(kube32_pool_sub_alloc(n));
+#else
+    return static_cast<uint8_t*>(std::malloc(n));
+#endif
+}
+
+void message_free(uint8_t* p) {
+    if (!p) return;
+#if defined(KUBE32_TARGET_ESP32)
+    if (kube32_pool_sub_free(p)) return;
+#endif
+    std::free(p);
+}
+} // namespace
+
+ChannelMessage::~ChannelMessage() {
+    if (data) {
+        message_free(data);
+        g_message_bytes.fetch_sub(cap);
+    }
+}
+
+MessagePtr make_message(size_t capacity) {
+    uint8_t* p = message_alloc(capacity);
+    if (!p) return nullptr;
+    MessagePtr m;
+    try {
+        m = std::make_shared<ChannelMessage>();
+    } catch (const std::bad_alloc&) {
+        message_free(p);
+        return nullptr;
+    }
+    m->data = p;
+    m->cap = capacity;
+    g_message_bytes.fetch_add(capacity);
+    return m;
 }
 
 // =============================================================================
@@ -210,12 +285,16 @@ private:
     }
 
     void rx_worker() {
-        uint8_t buffer[512];
+        // Large-message frames are up to 1470 bytes: off the thread's stack
+        std::unique_ptr<uint8_t[]> buf(new (std::nothrow) uint8_t[K32C_MAX_FRAME_LEN]);
+        if (!buf) return;
+        uint8_t* buffer = buf.get();
+        const size_t buffer_len = K32C_MAX_FRAME_LEN;
         std::string sender_ip;
         uint16_t sender_port = 0;
 
         while (running_.load()) {
-            ssize_t n = sock_.recvfrom(buffer, sizeof(buffer), &sender_ip, &sender_port);
+            ssize_t n = sock_.recvfrom(buffer, buffer_len, &sender_ip, &sender_port);
             if (n >= static_cast<ssize_t>(K32C_HEADER_LEN + K32C_CRC_LEN)) {
                 NodeEndpoint src;
                 src.is_espnow = false;
@@ -311,7 +390,7 @@ private:
 
     static void recv_callback(const esp_now_recv_info_t* info, const uint8_t* data, int len) {
         // Runs on the Wi-Fi task: copy out and let the dispatcher thread parse it
-        if (data && len >= static_cast<int>(K32C_HEADER_LEN + K32C_CRC_LEN) && len <= 250) {
+        if (data && len >= static_cast<int>(K32C_HEADER_LEN + K32C_CRC_LEN) && len <= static_cast<int>(K32C_MAX_FRAME_LEN)) {
             ChannelManager::instance().enqueue_raw_frame((info && info->src_addr) ? info->src_addr : nullptr, data, static_cast<size_t>(len));
         }
     }
@@ -399,6 +478,16 @@ void ChannelManager::shutdown() {
         osal::LockGuard r_guard(reassembly_mutex_);
         reassembly_table_.clear();
     }
+    {
+        osal::LockGuard d_guard(disp_mutex_);
+        for (size_t i = 0; i < rx_count_; ++i) {
+            RawFrame& f = rx_frames_[(rx_head_ + i) % rx_cap_];
+            std::free(f.data);
+            f = RawFrame{};
+        }
+        rx_head_ = rx_count_ = 0;
+        msg_queue_.clear();
+    }
     initialized_ = false;
 }
 
@@ -485,44 +574,69 @@ int32_t ChannelManager::send(const std::string& pod_id, int32_t handle, const ui
 
     // Remote delivery: Frame packetization & transport dispatch
     if (!transport_) return IPC_ERR_IO;
+    if (len > K32C_MAX_MESSAGE_BYTES) return IPC_ERR_INVAL;
     uint32_t target_hash = fnv1a_32(route.target_pod);
-    send_frames_to(route.remote_endpoint, channel_hash, sender_hash, target_hash, data, len, 0);
-    return static_cast<int32_t>(len);
+    const int32_t rc = send_frames_to(route.remote_endpoint, channel_hash, sender_hash, target_hash, data, len, 0);
+    return rc == IPC_OK ? static_cast<int32_t>(len) : rc;
 }
 
 int32_t ChannelManager::send_frames_to(const NodeEndpoint& ep, uint32_t channel_hash, uint32_t sender_hash, uint32_t target_hash,
                                        const uint8_t* data, size_t len, uint8_t extra_flags) {
     if (!transport_) return IPC_ERR_IO;
-    uint16_t seq = seq_generator_.fetch_add(1);
-    size_t frag_count = (len + K32C_MAX_PAYLOAD_CHUNK - 1) / K32C_MAX_PAYLOAD_CHUNK;
+    if (len > K32C_MAX_MESSAGE_BYTES) return IPC_ERR_INVAL;
+    // A message of up to 224 bytes is one frame every node reads; a larger
+    // one goes out in frames of up to 1444 bytes of it
+    const bool large = len > K32C_MAX_PAYLOAD_CHUNK;
+    const size_t chunk = large ? K32C_LARGE_CHUNK : K32C_MAX_PAYLOAD_CHUNK;
+    size_t frag_count = (len + chunk - 1) / chunk;
     if (frag_count == 0) frag_count = 1;
-    if (frag_count > 32) frag_count = 32; // receiver caps reassembly at 32 fragments
+
+    osal::LockGuard guard(send_mutex_);
+    if (!tx_frame_) tx_frame_.reset(new (std::nothrow) uint8_t[K32C_MAX_FRAME_LEN]);
+    if (!tx_frame_) return IPC_ERR_NOMEM;
+    uint8_t* const frame = tx_frame_.get();
+    const uint16_t seq = seq_generator_.fetch_add(1);
+    const uint32_t gap_us = fragment_gap_us_.load();
 
     for (size_t i = 0; i < frag_count; ++i) {
-        size_t offset = i * K32C_MAX_PAYLOAD_CHUNK;
-        size_t chunk_len = std::min(K32C_MAX_PAYLOAD_CHUNK, len - offset);
+        const size_t offset = i * chunk;
+        const size_t chunk_len = std::min(chunk, len - offset);
 
-        K32CPacket pkt = {};
-        pkt.header.magic = K32C_MAGIC;
-        pkt.header.version = K32C_VERSION;
-        pkt.header.flags = extra_flags;
-        pkt.header.seq_num = seq;
-        pkt.header.channel_hash = channel_hash;
-        pkt.header.sender_hash = sender_hash;
-        pkt.header.target_hash = target_hash;
-        pkt.header.frag_index = static_cast<uint8_t>(i);
-        pkt.header.frag_count = static_cast<uint8_t>(frag_count);
-        pkt.header.payload_len = static_cast<uint16_t>(chunk_len);
-        if (frag_count > 1) pkt.header.flags |= K32C_FLAG_FRAGMENT;
-        if (i == 0) pkt.header.flags |= K32C_FLAG_FIRST_FRAG;
-        if (i == frag_count - 1) pkt.header.flags |= K32C_FLAG_LAST_FRAG;
-        if (chunk_len > 0) std::memcpy(pkt.payload, data + offset, chunk_len);
+        K32CHeader hdr = {};
+        hdr.magic = K32C_MAGIC;
+        hdr.version = K32C_VERSION;
+        hdr.flags = extra_flags;
+        if (large) hdr.flags |= K32C_FLAG_LARGE;
+        if (frag_count > 1) hdr.flags |= K32C_FLAG_FRAGMENT;
+        if (i == 0) hdr.flags |= K32C_FLAG_FIRST_FRAG;
+        if (i == frag_count - 1) hdr.flags |= K32C_FLAG_LAST_FRAG;
+        hdr.seq_num = seq;
+        hdr.channel_hash = channel_hash;
+        hdr.sender_hash = sender_hash;
+        hdr.target_hash = target_hash;
+        hdr.frag_index = static_cast<uint8_t>(i);
+        hdr.frag_count = static_cast<uint8_t>(frag_count);
+        hdr.payload_len = static_cast<uint16_t>(chunk_len);
+        std::memcpy(frame, &hdr, K32C_HEADER_LEN);
+        if (chunk_len > 0) std::memcpy(frame + K32C_HEADER_LEN, data + offset, chunk_len);
+        const size_t frame_bytes = K32C_HEADER_LEN + chunk_len;
+        const uint16_t crc = crc16_ccitt(frame, frame_bytes);
+        std::memcpy(frame + frame_bytes, &crc, 2);
 
-        size_t frame_bytes = K32C_HEADER_LEN + chunk_len;
-        uint16_t crc = crc16_ccitt(reinterpret_cast<const uint8_t*>(&pkt), frame_bytes);
-        std::memcpy(pkt.payload + chunk_len, &crc, 2);
-
-        int32_t res = transport_->send_frame(ep, reinterpret_cast<const uint8_t*>(&pkt), frame_bytes + 2);
+        if (i > 0 && gap_us > 0) {
+            if (gap_us >= 1000) osal::Thread::sleep_ms((gap_us + 500) / 1000);
+            else {
+                const uint64_t until = osal::Thread::get_time_us() + gap_us;
+                while (osal::Thread::get_time_us() < until) {
+                }
+            }
+        }
+        int32_t res = transport_->send_frame(ep, frame, frame_bytes + 2);
+        if (res != IPC_OK) {
+            // One more try: a lost frame loses the whole message
+            stats_.frames_retried.fetch_add(1, std::memory_order_relaxed);
+            res = transport_->send_frame(ep, frame, frame_bytes + 2);
+        }
         if (res == IPC_OK) stats_.frames_sent.fetch_add(1, std::memory_order_relaxed);
         else { stats_.send_errors.fetch_add(1, std::memory_order_relaxed); return res; }
     }
@@ -532,30 +646,91 @@ int32_t ChannelManager::send_frames_to(const NodeEndpoint& ep, uint32_t channel_
 // =============================================================================
 // Topic publish/subscribe and peers
 // =============================================================================
+namespace {
+uint32_t subs_topic_hash() {
+    static const uint32_t h = fnv1a_32(K32C_SUBS_TOPIC, std::strlen(K32C_SUBS_TOPIC));
+    return h;
+}
+bool wants_locked(const PeerInfo& p, uint32_t topic_hash, uint64_t now_ms) {
+    if (p.subs_ms == 0 || now_ms - p.subs_ms > K32C_SUBS_FRESH_MS) return true;   // announces none: every topic
+    return std::binary_search(p.subs.begin(), p.subs.end(), topic_hash);
+}
+} // namespace
+
+NodeEndpoint ChannelManager::route_to(const PeerInfo& p, uint64_t now_ms) const {
+    const Route r = route();
+    const bool has_mac = p.espnow_seen_ms != 0;
+    const bool has_ip = !p.ip_address.empty();
+    bool espnow;
+    if (r == Route::Udp) espnow = !has_ip;
+    else if (r == Route::EspNow) espnow = has_mac;
+    else espnow = (has_mac && now_ms - p.espnow_seen_ms < K32C_ESPNOW_FRESH_MS) || !has_ip;
+    NodeEndpoint ep;
+    ep.node_id = p.node_id;
+    if (espnow && has_mac) {
+        ep.is_espnow = true;
+        std::memcpy(ep.mac_address, p.mac_address, 6);
+        return ep;
+    }
+    if (has_ip) {
+        ep.ip_address = p.ip_address;
+        ep.udp_port = p.udp_port ? p.udp_port : 7400;
+        return ep;
+    }
+    return p.endpoint;   // a peer added by hand (simulation)
+}
+
+bool ChannelManager::peer_wants(uint32_t node_id, uint32_t topic_hash) const {
+    osal::LockGuard guard(peer_mutex_);
+    auto it = peers_.find(node_id);
+    return it == peers_.end() || wants_locked(it->second, topic_hash, osal::System::get_uptime_ms());
+}
+
 int32_t ChannelManager::publish(const std::string& pod_id, const std::string& topic, const uint8_t* data, size_t len) {
     if (!data && len > 0) return IPC_ERR_FAULT;
-    if (len > K32C_RING_SLOT_SIZE) return IPC_ERR_INVAL;
-    uint32_t channel_hash = fnv1a_32(topic);
-    uint32_t sender_hash = fnv1a_32(pod_id);
+    if (len > K32C_MAX_MESSAGE_BYTES) return IPC_ERR_INVAL;
+    const uint32_t channel_hash = fnv1a_32(topic);
+    const uint32_t sender_hash = fnv1a_32(pod_id);
+    stats_.msgs_published.fetch_add(1, std::memory_order_relaxed);
+    int32_t err = IPC_OK;
 
-    // Local pods and host subscribers
-    deliver_local(channel_hash, sender_hash, data, len);
+    // Local pods and subscribers
+    bool nomem = false;
+    if (!deliver_local(channel_hash, sender_hash, data, len, &nomem)) err = nomem ? IPC_ERR_NOMEM : IPC_ERR_AGAIN;
 
-    // Remote peers
-    std::vector<PeerInfo> targets = peers();
-    for (const auto& p : targets) {
-        if (p.node_id == local_node_id_) continue;
-        send_frames_to(p.endpoint, channel_hash, sender_hash, 0, data, len, 0);
+    // Peers that subscribe to the topic
+    std::vector<NodeEndpoint> targets;
+    {
+        const uint64_t now = osal::System::get_uptime_ms();
+        osal::LockGuard guard(peer_mutex_);
+        for (const auto& kv : peers_) {
+            if (kv.first == local_node_id_) continue;
+            if (!wants_locked(kv.second, channel_hash, now)) {
+                stats_.fanout_skipped.fetch_add(1, std::memory_order_relaxed);
+                continue;
+            }
+            targets.push_back(route_to(kv.second, now));
+        }
+    }
+    for (const auto& ep : targets) {
+        const int32_t rc = send_frames_to(ep, channel_hash, sender_hash, 0, data, len, 0);
+        if (rc != IPC_OK && err == IPC_OK) err = rc;
+    }
+    if (err != IPC_OK) {
+        stats_.publish_errors.fetch_add(1, std::memory_order_relaxed);
+        return err;
     }
     return static_cast<int32_t>(len);
 }
 
-void ChannelManager::deliver_local(uint32_t channel_hash, uint32_t sender_hash, const uint8_t* data, size_t len) {
+size_t ChannelManager::rx_held_bytes() const { return g_message_bytes.load(); }
+
+bool ChannelManager::deliver_local(uint32_t channel_hash, uint32_t sender_hash, const uint8_t* data, size_t len, bool* nomem) {
+    bool ok = true;
     ChannelRoute route;
     if (VirtualChannelRoutingTable::instance().lookup_route_by_hash(channel_hash, route) && route.is_local && route.local_ring) {
-        if (route.local_ring->push(sender_hash, data, len)) {
-            stats_.frames_delivered.fetch_add(1, std::memory_order_relaxed);
-        }
+        if (route.local_ring->push(sender_hash, data, len)) stats_.frames_delivered.fetch_add(1, std::memory_order_relaxed);
+        else ok = false;
     }
     bool has_sub = false;
     {
@@ -564,80 +739,209 @@ void ChannelManager::deliver_local(uint32_t channel_hash, uint32_t sender_hash, 
             if (sub.topic_hash == channel_hash) { has_sub = true; break; }
         }
     }
-    if (has_sub && dispatch_ring_) {
-        // Prefix the payload with the channel hash so the dispatcher can route it
-        uint8_t tmp[264];
-        if (len + 4 <= sizeof(tmp) && len + 4 <= dispatch_ring_->slot_size()) {
-            std::memcpy(tmp, &channel_hash, 4);
-            if (len > 0) std::memcpy(tmp + 4, data, len);
-            if (!dispatch_ring_->push(sender_hash, tmp, len + 4)) stats_.dispatch_dropped.fetch_add(1, std::memory_order_relaxed);
+    if (!has_sub || !background_running_.load()) return ok;
+    MessagePtr msg;
+    if (g_message_bytes.load() + len <= rx_budget_bytes_.load()) msg = make_message(len);
+    if (!msg) {
+        stats_.rx_nomem.fetch_add(1, std::memory_order_relaxed);
+        if (nomem) *nomem = true;
+        return false;
+    }
+    if (len > 0) std::memcpy(msg->data, data, len);
+    msg->len = len;
+    msg->channel_hash = channel_hash;
+    msg->sender_hash = sender_hash;
+    return deliver_local(msg) && ok;
+}
+
+bool ChannelManager::deliver_local(const MessagePtr& msg) {
+    {
+        osal::LockGuard guard(disp_mutex_);
+        if (msg_queue_.size() >= msg_cap_) {
+            stats_.dispatch_dropped.fetch_add(1, std::memory_order_relaxed);
+            return false;
+        }
+        msg_queue_.push_back(msg);
+        disp_ready_ = true;
+    }
+    stats_.rx_messages.fetch_add(1, std::memory_order_relaxed);
+    disp_cv_.notify_one();
+    return true;
+}
+
+uint32_t ChannelManager::subscribe(const std::string& topic, TopicCallback cb) {
+    uint32_t id;
+    {
+        osal::LockGuard guard(sub_mutex_);
+        Subscription s;
+        s.id = id = next_sub_id_++;
+        s.topic_hash = fnv1a_32(topic);
+        s.topic = topic;
+        s.cb = std::move(cb);
+        subs_.push_back(std::move(s));
+    }
+    subs_changed_.store(true);
+    disp_cv_.notify_one();
+    return id;
+}
+
+uint32_t ChannelManager::subscribe_messages(const std::string& topic, MessageCallback cb) {
+    uint32_t id;
+    {
+        osal::LockGuard guard(sub_mutex_);
+        Subscription s;
+        s.id = id = next_sub_id_++;
+        s.topic_hash = fnv1a_32(topic);
+        s.topic = topic;
+        s.msg_cb = std::move(cb);
+        subs_.push_back(std::move(s));
+    }
+    subs_changed_.store(true);
+    disp_cv_.notify_one();
+    return id;
+}
+
+void ChannelManager::unsubscribe(uint32_t id) {
+    {
+        osal::LockGuard guard(sub_mutex_);
+        for (auto it = subs_.begin(); it != subs_.end(); ++it) {
+            if (it->id == id) { subs_.erase(it); break; }
+        }
+    }
+    subs_changed_.store(true);
+    disp_cv_.notify_one();
+}
+
+std::vector<uint32_t> ChannelManager::local_topic_hashes() const {
+    std::vector<uint32_t> out = VirtualChannelRoutingTable::instance().local_hashes();
+    {
+        osal::LockGuard guard(sub_mutex_);
+        for (const auto& s : subs_) out.push_back(s.topic_hash);
+    }
+    std::sort(out.begin(), out.end());
+    out.erase(std::unique(out.begin(), out.end()), out.end());
+    return out;
+}
+
+void ChannelManager::set_rx_queue_frames(size_t n) {
+    if (n == 0) n = 1;
+    if (n > 256) n = 256;
+    osal::LockGuard guard(disp_mutex_);
+    std::vector<RawFrame> next(n);
+    size_t kept = 0;
+    for (size_t i = 0; i < rx_count_; ++i) {
+        RawFrame& f = rx_frames_[(rx_head_ + i) % rx_cap_];
+        if (kept < n) next[kept++] = f;
+        else std::free(f.data);
+    }
+    rx_frames_.swap(next);
+    rx_cap_ = n;
+    rx_head_ = 0;
+    rx_count_ = kept;
+}
+
+size_t ChannelManager::rx_queue_frames() const {
+    return rx_cap_;
+}
+
+// Runs on the Wi-Fi task (ESP-NOW receive callback): a copy of the frame
+// waits for the dispatcher
+void ChannelManager::enqueue_raw_frame(const uint8_t* src_mac, const uint8_t* frame, size_t len) {
+    if (!frame || len > K32C_MAX_FRAME_LEN) return;
+    auto* p = static_cast<uint8_t*>(std::malloc(len + 6));
+    if (!p) {
+        stats_.rx_nomem.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
+    if (src_mac) std::memcpy(p, src_mac, 6); else std::memset(p, 0, 6);
+    std::memcpy(p + 6, frame, len);
+    {
+        osal::LockGuard guard(disp_mutex_);
+        if (rx_count_ >= rx_cap_ || rx_frames_.size() != rx_cap_) {
+            std::free(p);
+            stats_.rx_queue_full.fetch_add(1, std::memory_order_relaxed);
+            return;
+        }
+        rx_frames_[(rx_head_ + rx_count_) % rx_cap_] = RawFrame{p, static_cast<uint16_t>(len + 6)};
+        rx_count_++;
+        disp_ready_ = true;
+    }
+    disp_cv_.notify_one();
+}
+
+void ChannelManager::dispatch_message(const MessagePtr& msg) {
+    std::vector<Subscription> matched;
+    {
+        osal::LockGuard guard(sub_mutex_);
+        for (const auto& sub : subs_) if (sub.topic_hash == msg->channel_hash) matched.push_back(sub);
+    }
+    for (const auto& sub : matched) {
+        if (sub.msg_cb) sub.msg_cb(sub.topic, msg);
+        else if (sub.cb) sub.cb(sub.topic, msg->sender_hash, msg->data, msg->len);
+    }
+}
+
+void ChannelManager::prune_reassembly(uint64_t now_ms) {
+    osal::LockGuard guard(reassembly_mutex_);
+    for (auto it = reassembly_table_.begin(); it != reassembly_table_.end();) {
+        if (now_ms >= it->last_activity_ms && now_ms - it->last_activity_ms > K32C_REASSEMBLY_TIMEOUT) {
+            if (it->msg) stats_.rx_incomplete.fetch_add(1, std::memory_order_relaxed);
+            it = reassembly_table_.erase(it);
+        } else {
+            ++it;
         }
     }
 }
 
-uint32_t ChannelManager::subscribe(const std::string& topic, TopicCallback cb) {
-    osal::LockGuard guard(sub_mutex_);
-    Subscription s;
-    s.id = next_sub_id_++;
-    s.topic_hash = fnv1a_32(topic);
-    s.topic = topic;
-    s.cb = std::move(cb);
-    subs_.push_back(std::move(s));
-    return subs_.back().id;
-}
-
-void ChannelManager::unsubscribe(uint32_t id) {
-    osal::LockGuard guard(sub_mutex_);
-    for (auto it = subs_.begin(); it != subs_.end(); ++it) {
-        if (it->id == id) { subs_.erase(it); return; }
-    }
-}
-
-void ChannelManager::enqueue_raw_frame(const uint8_t* src_mac, const uint8_t* frame, size_t len) {
-    if (!rx_ring_ || len + 6 > rx_ring_->slot_size()) return;
-    uint8_t tmp[6 + 250];
-    if (src_mac) std::memcpy(tmp, src_mac, 6); else std::memset(tmp, 0, 6);
-    std::memcpy(tmp + 6, frame, len);
-    rx_ring_->push(0xFFFFFFFFu, tmp, len + 6);
-}
-
 void ChannelManager::dispatch_loop() {
-    uint8_t buf[264];
     while (background_running_.load()) {
         // Out of memory a frame or a hello is dropped; the dispatcher (and
         // with it every channel subscription on this node) keeps running
         try {
-            uint32_t sender = 0;
             uint64_t now = osal::System::get_uptime_ms();
             if (hello_interval_ms_ > 0 && now - last_hello_ms_ >= hello_interval_ms_) {
                 last_hello_ms_ = now;
                 send_hello();
+                send_subs();
+                subs_changed_.store(false);
+                prune_reassembly(now);
+            } else if (subs_changed_.exchange(false)) {
+                send_subs();
             }
-            // Raw frames from the ESP-NOW callback
-            if (rx_ring_) {
-                int32_t rn;
-                while ((rn = rx_ring_->pop(buf, sizeof(buf), 0, &sender)) > 6) {
+            // Frames from the ESP-NOW callback, then the messages they and
+            // the UDP receiver completed
+            for (;;) {
+                RawFrame f;
+                {
+                    osal::LockGuard guard(disp_mutex_);
+                    if (rx_count_ == 0) break;
+                    f = rx_frames_[rx_head_];
+                    rx_frames_[rx_head_] = RawFrame{};
+                    rx_head_ = (rx_head_ + 1) % rx_cap_;
+                    rx_count_--;
+                }
+                std::unique_ptr<uint8_t, void (*)(void*)> hold(f.data, std::free);
+                if (f.len > 6) {
                     NodeEndpoint src;
                     src.is_espnow = true;
-                    std::memcpy(src.mac_address, buf, 6);
-                    on_frame_received(buf + 6, static_cast<size_t>(rn - 6), &src);
+                    std::memcpy(src.mac_address, f.data, 6);
+                    on_frame_received(f.data + 6, f.len - 6u, &src);
                 }
             }
-            int32_t n = dispatch_ring_ ? dispatch_ring_->pop(buf, sizeof(buf), 20, &sender) : IPC_ERR_TIMEDOUT;
-            if (n < 4) {
-                osal::System::feed_watchdog();
-                continue;
-            }
-            uint32_t hash = 0;
-            std::memcpy(&hash, buf, 4);
-            std::vector<Subscription> matched;
+            MessagePtr msg;
             {
-                osal::LockGuard guard(sub_mutex_);
-                for (const auto& sub : subs_) if (sub.topic_hash == hash) matched.push_back(sub);
+                osal::UniqueLock<osal::Mutex> lock(disp_mutex_);
+                if (!msg_queue_.empty()) {
+                    msg = std::move(msg_queue_.front());
+                    msg_queue_.pop_front();
+                } else if (rx_count_ == 0 && !subs_changed_.load()) {
+                    disp_ready_ = false;
+                    const uint64_t since = osal::System::get_uptime_ms() - last_hello_ms_;
+                    const uint32_t wait = hello_interval_ms_ == 0 ? 100 : static_cast<uint32_t>(since >= hello_interval_ms_ ? 1 : std::min<uint64_t>(100, hello_interval_ms_ - since));
+                    disp_cv_.wait_for(lock, wait, [this] { return disp_ready_ || subs_changed_.load() || !background_running_.load(); });
+                }
             }
-            for (const auto& sub : matched) {
-                if (sub.cb) sub.cb(sub.topic, sender, buf + 4, static_cast<size_t>(n - 4));
-            }
+            if (msg) dispatch_message(msg);
             osal::System::feed_watchdog();
         } catch (const std::bad_alloc&) {
             osal::System::feed_watchdog();
@@ -648,13 +952,20 @@ void ChannelManager::dispatch_loop() {
 bool ChannelManager::start_background(uint32_t hello_interval_ms, size_t dispatcher_stack_bytes, bool stack_in_psram) {
     if (background_running_.load()) return true;
     hello_interval_ms_ = hello_interval_ms;
-    // Events are capped at K32_MAX_EVENT_BYTES (200) + 4 bytes of topic hash.
-    // With PSRAM the queue holds the bursts of two pod workers publishing at
-    // once (a picture's rows and a story's tokens)
-    if (!dispatch_ring_) dispatch_ring_ = std::make_shared<RingBuffer>(osal::System::get_total_psram_bytes() > 0 ? 32 : 8, 256);
-#if defined(KUBE32_TARGET_ESP32)
-    if (!rx_ring_) rx_ring_ = std::make_shared<RingBuffer>(8, 264);
-#endif
+    // Without PSRAM: 16 received frames, 8 messages for subscribers, two
+    // reassemblies and 32 KiB of messages at once; with PSRAM 32, 32, 8 and
+    // 256 KiB (two pod workers publishing at once, large messages arriving)
+    const bool psram = osal::System::get_total_psram_bytes() > 0;
+    {
+        osal::LockGuard guard(disp_mutex_);
+        msg_cap_ = psram ? 32 : 8;
+    }
+    if (rx_frames_.empty()) set_rx_queue_frames(psram ? 32 : 16);
+    {
+        osal::LockGuard guard(reassembly_mutex_);
+        max_reassembly_ = psram ? 8 : 2;
+    }
+    rx_budget_bytes_.store(psram ? 256 * 1024 : 32 * 1024);
     background_running_.store(true);
     dispatch_thread_ = std::make_unique<osal::Thread>();
     osal::Thread::Config cfg;
@@ -675,9 +986,13 @@ void ChannelManager::set_local_identity(uint32_t node_id, const std::string& nod
 void ChannelManager::add_peer(const PeerInfo& peer) {
     osal::LockGuard guard(peer_mutex_);
     PeerInfo& slot = peers_[peer.node_id];
-    uint32_t count = slot.hello_count;
+    const PeerInfo before = slot;
     slot = peer;
-    slot.hello_count = count;
+    slot.hello_count = before.hello_count;
+    if (slot.subs_ms == 0) {
+        slot.subs = before.subs;
+        slot.subs_ms = before.subs_ms;
+    }
     if (slot.last_seen_ms == 0) slot.last_seen_ms = osal::System::get_uptime_ms();
 }
 
@@ -694,6 +1009,51 @@ bool ChannelManager::find_peer_by_name(const std::string& node_name, PeerInfo& o
         if (kv.second.node_name == node_name) { out = kv.second; return true; }
     }
     return false;
+}
+
+// The node's subscriptions go to every node a HELLO goes to
+void ChannelManager::send_subs() {
+    if (!transport_ || !initialized_) return;
+    const std::vector<uint32_t> hashes = local_topic_hashes();
+    const size_t n = std::min(hashes.size(), (K32C_MAX_MESSAGE_BYTES - 4) / 4);
+    std::vector<uint8_t> payload(4 + 4 * n);
+    std::memcpy(payload.data(), &local_node_id_, 4);
+    for (size_t i = 0; i < n; ++i) std::memcpy(payload.data() + 4 + 4 * i, &hashes[i], 4);
+    const uint32_t hash = subs_topic_hash();
+    const uint32_t sender = fnv1a_32(local_node_name_);
+#if defined(KUBE32_TARGET_ESP32)
+    NodeEndpoint bcast;
+    bcast.is_espnow = true;
+    std::memset(bcast.mac_address, 0xff, 6);
+    send_frames_to(bcast, hash, sender, 0, payload.data(), payload.size(), 0);
+#endif
+    std::vector<NodeEndpoint> targets;
+    {
+        const uint64_t now = osal::System::get_uptime_ms();
+        osal::LockGuard guard(peer_mutex_);
+        for (const auto& kv : peers_) {
+            if (kv.first == local_node_id_) continue;
+            targets.push_back(route_to(kv.second, now));
+        }
+        for (const auto& ep : seed_peers_) targets.push_back(ep);
+    }
+    for (const auto& ep : targets) send_frames_to(ep, hash, sender, 0, payload.data(), payload.size(), 0);
+}
+
+void ChannelManager::handle_subs(const uint8_t* payload, size_t len) {
+    if (len < 4) return;
+    uint32_t node_id = 0;
+    std::memcpy(&node_id, payload, 4);
+    if (node_id == local_node_id_) return;
+    std::vector<uint32_t> hashes((len - 4) / 4);
+    for (size_t i = 0; i < hashes.size(); ++i) std::memcpy(&hashes[i], payload + 4 + 4 * i, 4);
+    std::sort(hashes.begin(), hashes.end());
+    stats_.subs_rx.fetch_add(1, std::memory_order_relaxed);
+    osal::LockGuard guard(peer_mutex_);
+    auto it = peers_.find(node_id);
+    if (it == peers_.end()) return;   // its HELLO comes first
+    it->second.subs.swap(hashes);
+    it->second.subs_ms = osal::System::get_uptime_ms();
 }
 
 void ChannelManager::send_hello() {
@@ -719,18 +1079,26 @@ void ChannelManager::send_hello() {
     std::memset(bcast.mac_address, 0xff, 6);
     send_frames_to(bcast, hash, sender, 0, payload, 4 + name_len, K32C_FLAG_PING);
 #endif
-    for (const auto& p : peers()) {
-        if (p.node_id == local_node_id_) continue;
-        send_frames_to(p.endpoint, hash, sender, 0, payload, 4 + name_len, K32C_FLAG_PING);
-    }
-    std::vector<NodeEndpoint> seeds;
+    // A HELLO goes over UDP to every node whose address is known: a worker
+    // takes the control plane's HELLOs over IP as proof that its link works
+    std::vector<NodeEndpoint> targets;
     {
         osal::LockGuard guard(peer_mutex_);
-        seeds = seed_peers_;
+        for (const auto& kv : peers_) {
+            if (kv.first == local_node_id_) continue;
+            if (!kv.second.ip_address.empty()) {
+                NodeEndpoint ep;
+                ep.node_id = kv.first;
+                ep.ip_address = kv.second.ip_address;
+                ep.udp_port = kv.second.udp_port ? kv.second.udp_port : 7400;
+                targets.push_back(ep);
+            } else {
+                targets.push_back(kv.second.endpoint);
+            }
+        }
+        for (const auto& ep : seed_peers_) targets.push_back(ep);
     }
-    for (const auto& ep : seeds) {
-        send_frames_to(ep, hash, sender, 0, payload, 4 + name_len, K32C_FLAG_PING);
-    }
+    for (const auto& ep : targets) send_frames_to(ep, hash, sender, 0, payload, 4 + name_len, K32C_FLAG_PING);
 }
 
 void ChannelManager::set_announced_api(const std::string& address) {
@@ -775,32 +1143,41 @@ void ChannelManager::handle_hello(const K32CHeader* hdr, const uint8_t* payload,
     std::memcpy(&node_id, payload, 4);
     if (node_id == local_node_id_) return;
     stats_.hello_rx.fetch_add(1, std::memory_order_relaxed);
-    PeerInfo info;
-    info.node_id = node_id;
     const char* text = reinterpret_cast<const char*>(payload + 4);
     const size_t text_len = len - 4;
     const void* nul = std::memchr(text, 0, text_len);
     const size_t name_len = nul ? static_cast<size_t>(static_cast<const char*>(nul) - text) : text_len;
-    info.node_name.assign(text, name_len);
+    std::string api_address;
     if (nul && text_len - name_len > 5 && std::memcmp(text + name_len + 1, "api=", 4) == 0) {
-        info.api_address.assign(text + name_len + 5, text_len - name_len - 5);
+        api_address.assign(text + name_len + 5, text_len - name_len - 5);
     }
-    if (source) info.endpoint = *source;
-    info.endpoint.node_id = node_id;
-    if (info.endpoint.udp_port == 0) info.endpoint.udp_port = 7400;
+    const uint64_t now = osal::System::get_uptime_ms();
     osal::LockGuard guard(peer_mutex_);
     if (source && !source->is_espnow && !source->ip_address.empty() && (ip_hello_ms_.size() < 16 || ip_hello_ms_.count(source->ip_address))) {
-        ip_hello_ms_[source->ip_address] = osal::System::get_uptime_ms();
+        ip_hello_ms_[source->ip_address] = now;
     }
-    auto it = peers_.find(node_id);
-    bool is_new = (it == peers_.end());
+    const bool is_new = peers_.find(node_id) == peers_.end();
     PeerInfo& slot = peers_[node_id];
-    uint32_t count = is_new ? 0 : slot.hello_count;
-    slot = info;
-    slot.hello_count = count + 1;
-    slot.last_seen_ms = osal::System::get_uptime_ms();
+    slot.node_id = node_id;
+    slot.node_name.assign(text, name_len);
+    slot.api_address = api_address;
+    if (source) {
+        slot.endpoint = *source;
+        if (source->is_espnow) {
+            slot.espnow_seen_ms = now;
+            std::memcpy(slot.mac_address, source->mac_address, 6);
+        } else if (!source->ip_address.empty()) {
+            slot.udp_seen_ms = now;
+            slot.ip_address = source->ip_address;
+            slot.udp_port = source->udp_port ? source->udp_port : 7400;
+        }
+    }
+    slot.endpoint.node_id = node_id;
+    if (slot.endpoint.udp_port == 0) slot.endpoint.udp_port = 7400;
+    slot.hello_count++;
+    slot.last_seen_ms = now;
     if (is_new) {
-        std::cout << "[IPC] Discovered peer node " << info.node_name << " (id " << node_id << ")" << std::endl << std::flush;
+        std::cout << "[IPC] Discovered peer node " << slot.node_name << " (id " << node_id << ")" << std::endl << std::flush;
     }
 }
 
@@ -850,7 +1227,8 @@ void ChannelManager::on_frame_received(const uint8_t* frame, size_t len, const N
         stats_.bad_magic_errors.fetch_add(1, std::memory_order_relaxed);
         return;
     }
-    if (hdr->payload_len > K32C_MAX_PAYLOAD_CHUNK || (K32C_HEADER_LEN + hdr->payload_len + K32C_CRC_LEN) > len) return;
+    const size_t max_payload = (hdr->flags & K32C_FLAG_LARGE) ? K32C_LARGE_CHUNK : K32C_MAX_PAYLOAD_CHUNK;
+    if (hdr->payload_len > max_payload || (K32C_HEADER_LEN + hdr->payload_len + K32C_CRC_LEN) > len) return;
 
     // CRC Verification
     uint16_t expected_crc = crc16_ccitt(frame, K32C_HEADER_LEN + hdr->payload_len);
@@ -867,85 +1245,115 @@ void ChannelManager::on_frame_received(const uint8_t* frame, size_t len, const N
         return;
     }
 
-    // Single-frame message fast path
+    // A message in one frame
     if (hdr->frag_count <= 1) {
+        if (hdr->channel_hash == subs_topic_hash()) {
+            handle_subs(frame + K32C_HEADER_LEN, hdr->payload_len);
+            return;
+        }
         deliver_local(hdr->channel_hash, hdr->sender_hash, frame + K32C_HEADER_LEN, hdr->payload_len);
         return;
     }
+    on_fragment(hdr, frame + K32C_HEADER_LEN);
+}
 
-    // Multi-fragment reassembly bounds check (Fix Item 4)
-    if (hdr->frag_count == 0 || hdr->frag_count > 32 ||
-        hdr->frag_index >= hdr->frag_count || hdr->frag_index >= 32) {
+// A fragment lands in place in its message's buffer; the message is
+// delivered when its last missing fragment arrives, in whatever order they
+// come, and dropped (counted) when one never does
+void ChannelManager::on_fragment(const K32CHeader* hdr, const uint8_t* payload) {
+    const size_t chunk = (hdr->flags & K32C_FLAG_LARGE) ? K32C_LARGE_CHUNK : K32C_MAX_PAYLOAD_CHUNK;
+    const size_t count = hdr->frag_count;
+    if (count > 32 || hdr->frag_index >= count || count * chunk >= K32C_MAX_MESSAGE_BYTES + chunk ||
+        (hdr->frag_index + 1u < count && hdr->payload_len != chunk)) {
+        stats_.rx_malformed.fetch_add(1, std::memory_order_relaxed);
         return;
     }
-
-    size_t offset = static_cast<size_t>(hdr->frag_index) * K32C_MAX_PAYLOAD_CHUNK;
-    if (offset + hdr->payload_len > K32C_RING_SLOT_SIZE) {
-        return;
-    }
-
-    uint64_t reassembly_key = (static_cast<uint64_t>(hdr->channel_hash) << 32) | hdr->seq_num;
-    uint64_t now_ms = osal::System::get_uptime_ms();
-
-    osal::LockGuard guard(reassembly_mutex_);
-
-    // Prune stale entries (Fix Item 5: 500ms timeout reaper)
-    for (auto it = reassembly_table_.begin(); it != reassembly_table_.end(); ) {
-        if (now_ms >= it->second.last_activity_ms &&
-            (now_ms - it->second.last_activity_ms) > K32C_REASSEMBLY_TIMEOUT) {
-            it = reassembly_table_.erase(it);
-        } else {
-            ++it;
+    // Only a message this node takes is held
+    bool wanted = false;
+    {
+        osal::LockGuard guard(sub_mutex_);
+        for (const auto& s : subs_) {
+            if (s.topic_hash == hdr->channel_hash) { wanted = true; break; }
         }
     }
+    if (!wanted) {
+        ChannelRoute route;
+        wanted = VirtualChannelRoutingTable::instance().lookup_route_by_hash(hdr->channel_hash, route) && route.is_local && route.local_ring;
+    }
+    if (!wanted) return;
 
-    // Capacity cap (Fix Item 5: max 8 entries)
-    constexpr size_t MAX_REASSEMBLY_ENTRIES = 8;
-    if (reassembly_table_.find(reassembly_key) == reassembly_table_.end()) {
-        if (reassembly_table_.size() >= MAX_REASSEMBLY_ENTRIES) {
-            auto oldest_it = reassembly_table_.begin();
-            for (auto it = reassembly_table_.begin(); it != reassembly_table_.end(); ++it) {
-                if (it->second.last_activity_ms < oldest_it->second.last_activity_ms) {
-                    oldest_it = it;
+    const uint64_t now_ms = osal::System::get_uptime_ms();
+    MessagePtr done;
+    {
+        osal::LockGuard guard(reassembly_mutex_);
+        for (auto it = reassembly_table_.begin(); it != reassembly_table_.end();) {
+            if (now_ms >= it->last_activity_ms && now_ms - it->last_activity_ms > K32C_REASSEMBLY_TIMEOUT) {
+                if (it->msg) stats_.rx_incomplete.fetch_add(1, std::memory_order_relaxed);
+                it = reassembly_table_.erase(it);
+            } else {
+                ++it;
+            }
+        }
+        ReassemblyEntry* entry = nullptr;
+        for (auto& e : reassembly_table_) {
+            if (e.channel_hash == hdr->channel_hash && e.sender_hash == hdr->sender_hash && e.seq_num == hdr->seq_num) { entry = &e; break; }
+        }
+        if (!entry) {
+            if (reassembly_table_.size() >= max_reassembly_) {
+                // The slots are taken: the least recently active message is dropped
+                auto oldest = reassembly_table_.begin();
+                for (auto it = reassembly_table_.begin(); it != reassembly_table_.end(); ++it) {
+                    if (it->last_activity_ms < oldest->last_activity_ms) oldest = it;
                 }
+                if (oldest->msg) stats_.rx_incomplete.fetch_add(1, std::memory_order_relaxed);
+                reassembly_table_.erase(oldest);
             }
-            if (oldest_it != reassembly_table_.end()) {
-                reassembly_table_.erase(oldest_it);
-            }
+            ReassemblyEntry e;
+            e.channel_hash = hdr->channel_hash;
+            e.sender_hash = hdr->sender_hash;
+            e.seq_num = hdr->seq_num;
+            e.total_frags = static_cast<uint8_t>(count);
+            e.chunk = static_cast<uint32_t>(chunk);
+            const size_t cap = count * chunk;
+            if (g_message_bytes.load() + cap <= rx_budget_bytes_.load()) e.msg = make_message(cap);
+            // Without memory the message is dropped once; its other fragments
+            // are swallowed by the empty entry
+            if (!e.msg) stats_.rx_nomem.fetch_add(1, std::memory_order_relaxed);
+            reassembly_table_.push_back(std::move(e));
+            entry = &reassembly_table_.back();
+        }
+        entry->last_activity_ms = now_ms;
+        if (!entry->msg) return;
+        if (entry->total_frags != count || entry->chunk != chunk) {
+            stats_.rx_malformed.fetch_add(1, std::memory_order_relaxed);
+            return;
+        }
+        const uint32_t bit = 1u << hdr->frag_index;
+        if (entry->received_mask & bit) return;   // a duplicate
+        entry->received_mask |= bit;
+        entry->received_frags++;
+        std::memcpy(entry->msg->data + static_cast<size_t>(hdr->frag_index) * chunk, payload, hdr->payload_len);
+        if (hdr->frag_index + 1u == count) entry->last_len = hdr->payload_len;
+        if (entry->received_frags < entry->total_frags) return;
+        done = std::move(entry->msg);
+        done->len = (count - 1) * chunk + entry->last_len;
+        done->channel_hash = entry->channel_hash;
+        done->sender_hash = entry->sender_hash;
+        reassembly_table_.erase(reassembly_table_.begin() + (entry - reassembly_table_.data()));
+    }
+    stats_.reassembled_msgs.fetch_add(1, std::memory_order_relaxed);
+    ChannelRoute route;
+    if (VirtualChannelRoutingTable::instance().lookup_route_by_hash(done->channel_hash, route) && route.is_local && route.local_ring) {
+        if (route.local_ring->push(done->sender_hash, done->data, done->len)) stats_.frames_delivered.fetch_add(1, std::memory_order_relaxed);
+    }
+    bool has_sub = false;
+    {
+        osal::LockGuard guard(sub_mutex_);
+        for (const auto& s : subs_) {
+            if (s.topic_hash == done->channel_hash) { has_sub = true; break; }
         }
     }
-
-    auto& entry = reassembly_table_[reassembly_key];
-    if (entry.total_frags == 0) {
-        entry.channel_hash = hdr->channel_hash;
-        entry.sender_hash = hdr->sender_hash;
-        entry.seq_num = hdr->seq_num;
-        entry.total_frags = hdr->frag_count;
-        entry.received_frags = 0;
-        entry.received_mask = 0;
-        entry.total_bytes = 0;
-    }
-
-    entry.last_activity_ms = now_ms;
-    if ((entry.received_mask & (1U << hdr->frag_index)) == 0) {
-        entry.received_mask |= (1U << hdr->frag_index);
-        entry.received_frags++;
-        if (offset + hdr->payload_len <= sizeof(entry.buffer)) {
-            std::memcpy(entry.buffer + offset, frame + K32C_HEADER_LEN, hdr->payload_len);
-            entry.total_bytes += hdr->payload_len;
-        }
-    }
-
-    if (entry.received_frags == entry.total_frags) {
-        uint8_t done[K32C_RING_SLOT_SIZE];
-        size_t total = entry.total_bytes;
-        std::memcpy(done, entry.buffer, total);
-        uint32_t ch = entry.channel_hash;
-        uint32_t snd = entry.sender_hash;
-        reassembly_table_.erase(reassembly_key);
-        stats_.reassembled_msgs.fetch_add(1, std::memory_order_relaxed);
-        deliver_local(ch, snd, done, total);
-    }
+    if (has_sub && background_running_.load()) deliver_local(done);
 }
 
 // =============================================================================
@@ -1014,6 +1422,13 @@ bool VirtualChannelRoutingTable::lookup_route(const std::string& channel_uri, Ch
         }
     }
     return false;
+}
+
+std::vector<uint32_t> VirtualChannelRoutingTable::local_hashes() const {
+    osal::LockGuard guard(mutex_);
+    std::vector<uint32_t> out;
+    for (const auto& kv : routes_by_hash_) if (kv.second.is_local) out.push_back(kv.first);
+    return out;
 }
 
 void VirtualChannelRoutingTable::clear() {

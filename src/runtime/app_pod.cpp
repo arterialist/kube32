@@ -324,7 +324,9 @@ static const void* raw_resp_end(IM3Runtime rt, IM3ImportContext, uint64_t*, void
     return m3Err_none;
 }
 
-static const void* raw_event_emit(IM3Runtime rt, IM3ImportContext ictx, uint64_t* sp, void* mem) {
+// k32_event_emit (up to K32_MAX_EVENT_BYTES) and k32_publish (up to
+// K32_MAX_MESSAGE_BYTES)
+static const void* publish_import(IM3Runtime rt, IM3ImportContext ictx, uint64_t* sp, void* mem, size_t max_len) {
     uint32_t toff = static_cast<uint32_t>(sp[1]);
     uint32_t tlen = static_cast<uint32_t>(sp[2]);
     uint32_t doff = static_cast<uint32_t>(sp[3]);
@@ -334,7 +336,7 @@ static const void* raw_event_emit(IM3Runtime rt, IM3ImportContext ictx, uint64_t
         *reinterpret_cast<int32_t*>(sp) = hal::HAL_ERR_PERM;
         return m3Err_none;
     }
-    if (tlen == 0 || tlen > 64 || dlen > K32_MAX_EVENT_BYTES || !guest_range_ok(mem, toff, tlen) || !guest_range_ok(mem, doff, dlen)) {
+    if (tlen == 0 || tlen > 64 || dlen > max_len || !guest_range_ok(mem, toff, tlen) || !guest_range_ok(mem, doff, dlen)) {
         *reinterpret_cast<int32_t*>(sp) = K32_ERR_INVAL;
         return m3Err_none;
     }
@@ -345,6 +347,14 @@ static const void* raw_event_emit(IM3Runtime rt, IM3ImportContext ictx, uint64_t
     }
     *reinterpret_cast<int32_t*>(sp) = res;
     return m3Err_none;
+}
+
+static const void* raw_event_emit(IM3Runtime rt, IM3ImportContext ictx, uint64_t* sp, void* mem) {
+    return publish_import(rt, ictx, sp, mem, K32_MAX_EVENT_BYTES);
+}
+
+static const void* raw_publish(IM3Runtime rt, IM3ImportContext ictx, uint64_t* sp, void* mem) {
+    return publish_import(rt, ictx, sp, mem, K32_MAX_MESSAGE_BYTES);
 }
 
 static const void* raw_time_ms(IM3Runtime rt, IM3ImportContext, uint64_t* sp, void*) {
@@ -790,6 +800,7 @@ void link_app_host_functions(IM3Module module, const std::string& pod_id) {
     m3_LinkRawFunction(module, "env", "k32_resp_write",   "i(ii)",      &raw_resp_write);
     m3_LinkRawFunction(module, "env", "k32_resp_end",     "v()",        &raw_resp_end);
     m3_LinkRawFunction(module, "env", "k32_event_emit",   "i(iiii)",    &raw_event_emit);
+    m3_LinkRawFunction(module, "env", "k32_publish",      "i(iiii)",    &raw_publish);
     m3_LinkRawFunction(module, "env", "k32_time_ms",      "I()",        &raw_time_ms);
     m3_LinkRawFunction(module, "env", "k32_unix_time_ms", "I()",        &raw_unix_time_ms);
     m3_LinkRawFunction(module, "env", "k32_log",          "v(ii)",      &raw_log);
@@ -873,8 +884,8 @@ void AppPodHost::sync_topic_subscriptions_locked() {
     for (const auto& t : wanted) {
         if (topic_subs_.count(t)) continue;
         // Runs on the channel dispatcher thread
-        topic_subs_[t] = ipc::ChannelManager::instance().subscribe(t, [this](std::string_view topic, uint32_t, const uint8_t* data, size_t len) {
-            deliver_topic(topic, data, len);
+        topic_subs_[t] = ipc::ChannelManager::instance().subscribe_messages(t, [this](std::string_view topic, const ipc::MessagePtr& msg) {
+            deliver_topic(topic, msg, msg->data, msg->len);
         });
     }
     {
@@ -887,8 +898,8 @@ void AppPodHost::sync_topic_subscriptions_locked() {
 
 // Runs on the channel dispatcher thread, whose stack is too small for the
 // interpreter: the message is queued for the event thread.
-void AppPodHost::deliver_topic(std::string_view topic, const uint8_t* data, size_t len) {
-    if (len > K32_MAX_EVENT_BYTES) return;
+void AppPodHost::deliver_topic(std::string_view topic, std::shared_ptr<const void> owner, const uint8_t* data, size_t len) {
+    if (len > K32_MAX_MESSAGE_BYTES) return;
     // Each message is built while the pods' table is locked, and queued
     // without a lock on it
     const std::string_view body(reinterpret_cast<const char*>(data), len);
@@ -899,7 +910,11 @@ void AppPodHost::deliver_topic(std::string_view topic, const uint8_t* data, size
             auto pod = pods_.find(kv.first);
             if (pod == pods_.end() || !pod->second.has_event) continue;
             for (const auto& t : kv.second) {
-                if (t == topic) { ready.emplace_back(kv.first, topic, body, pod->second.worker); break; }
+                if (t == topic) {
+                    if (owner) ready.emplace_back(kv.first, topic, owner, body, pod->second.worker);
+                    else ready.emplace_back(kv.first, topic, body, pod->second.worker);
+                    break;
+                }
             }
         }
     }
@@ -1430,7 +1445,7 @@ uint32_t AppPodHost::tick_due(uint64_t now_ms, uint32_t max_wait_ms) {
 int32_t AppPodHost::event(const std::string& pod_id, std::string_view topic, const uint8_t* data, size_t len) {
     Entry* e = nullptr;
     osal::Mutex* cm = nullptr;
-    if (topic.empty() || len > K32_MAX_EVENT_BYTES) return K32_ERR_INVAL;
+    if (topic.empty() || len > K32_MAX_MESSAGE_BYTES) return K32_ERR_INVAL;
     // A frozen pod holds the event; it is delivered after a thaw or a restore
     auto hold = [&](Entry& f) {
         if (f.held.size() >= kMaxHeldEvents) {

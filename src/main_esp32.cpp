@@ -1013,6 +1013,34 @@ static void improv_command(Console& con, const NodeIdentity& ident, const std::s
     }
 }
 
+// K32_CMD:IPC: the channel transport's counters and settings, then one line
+// a peer: how it is reached and how many topics it subscribes to
+void console_ipc(Console& con) {
+    auto& m = kube32::ipc::ChannelManager::instance();
+    auto& s = m.stats();
+    char l[480];
+    int ll = snprintf(l, sizeof(l),
+                      "K32_IPC tx_frames=%llu send_errors=%llu retried=%llu published=%llu publish_errors=%llu fanout_skipped=%llu "
+                      "rx_frames=%llu crc=%llu rx_messages=%llu reassembled=%llu incomplete=%llu nomem=%llu rxq_full=%llu malformed=%llu "
+                      "dispatch_dropped=%llu subs_rx=%llu held=%u budget=%u gap_us=%u rxq=%u route=%u\n",
+                      (unsigned long long)s.frames_sent.load(), (unsigned long long)s.send_errors.load(), (unsigned long long)s.frames_retried.load(),
+                      (unsigned long long)s.msgs_published.load(), (unsigned long long)s.publish_errors.load(), (unsigned long long)s.fanout_skipped.load(),
+                      (unsigned long long)s.frames_received.load(), (unsigned long long)s.crc_errors.load(), (unsigned long long)s.rx_messages.load(),
+                      (unsigned long long)s.reassembled_msgs.load(), (unsigned long long)s.rx_incomplete.load(), (unsigned long long)s.rx_nomem.load(),
+                      (unsigned long long)s.rx_queue_full.load(), (unsigned long long)s.rx_malformed.load(), (unsigned long long)s.dispatch_dropped.load(),
+                      (unsigned long long)s.subs_rx.load(), (unsigned)m.rx_held_bytes(), (unsigned)m.rx_budget_bytes(), (unsigned)m.fragment_gap_us(),
+                      (unsigned)m.rx_queue_frames(), (unsigned)m.route());
+    con.write(l, static_cast<size_t>(ll));
+    const uint64_t now = osal::System::get_uptime_ms();
+    for (const auto& p : m.peers()) {
+        ll = snprintf(l, sizeof(l), "K32_IPC_PEER %s espnow_age_ms=%lld udp_age_ms=%lld subs=%u subs_age_ms=%lld\n", p.node_name.c_str(),
+                      p.espnow_seen_ms ? (long long)(now - p.espnow_seen_ms) : -1LL, p.udp_seen_ms ? (long long)(now - p.udp_seen_ms) : -1LL,
+                      (unsigned)p.subs.size(), p.subs_ms ? (long long)(now - p.subs_ms) : -1LL);
+        con.write(l, static_cast<size_t>(ll));
+    }
+    con.write("K32_OK ipc\n", 11);
+}
+
 // Console protocol (line oriented, binary-safe payloads):
 //   K32_RESET, K32_OPEN, K32_CLOSE: concurrent streamed HTTP (include/app/console_relay.hpp)
 //   K32_HTTP <port> <len> [crc32hex]\n<len bytes of HTTP request> -> K32_RESP <len>\n<bytes>
@@ -1032,6 +1060,10 @@ static void improv_command(Console& con, const NodeIdentity& ident, const std::s
 //   K32_CMD:BENCH:<kernel>:<n>:<runs>                    -> the benchmark kernels run natively (docs/benchmarks.md)
 //   K32_CMD:BENCH:hostcall:<calls>                       -> <calls> native esp_timer_get_time calls
 //   K32_CMD:THROW                                        -> the housekeeping loop raises std::bad_alloc once
+//   K32_CMD:IPC                                          -> channel counters, settings and peers (K32_IPC lines)
+//   K32_CMD:IPCGAP:<us>                                  -> pause between two frames of one message (until reboot)
+//   K32_CMD:IPCRXQ:<frames>                              -> ESP-NOW frames waiting for the dispatcher (until reboot)
+//   K32_CMD:IPCROUTE:<auto|udp|espnow>                   -> how messages reach peers (until reboot)
 //   K32_CMD:REBOOT
 void console_task(void* arg) {
     auto* ctx = static_cast<std::pair<Console*, NodeIdentity*>*>(arg);
@@ -1425,6 +1457,19 @@ void console_task(void* arg) {
                                   (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL), (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
                 }
                 con.write(l, static_cast<size_t>(ll));
+            } else if (line == "K32_CMD:IPC") {
+                console_ipc(con);
+            } else if (line.rfind("K32_CMD:IPCGAP:", 0) == 0) {
+                kube32::ipc::ChannelManager::instance().set_fragment_gap_us(static_cast<uint32_t>(std::strtoul(line.c_str() + 15, nullptr, 10)));
+                console_ipc(con);
+            } else if (line.rfind("K32_CMD:IPCRXQ:", 0) == 0) {
+                kube32::ipc::ChannelManager::instance().set_rx_queue_frames(std::strtoul(line.c_str() + 15, nullptr, 10));
+                console_ipc(con);
+            } else if (line.rfind("K32_CMD:IPCROUTE:", 0) == 0) {
+                const std::string r = line.substr(17);
+                using Route = kube32::ipc::ChannelManager::Route;
+                kube32::ipc::ChannelManager::instance().set_route(r == "udp" ? Route::Udp : r == "espnow" ? Route::EspNow : Route::Auto);
+                console_ipc(con);
             } else if (line == "K32_CMD:HEAP") {
                 // Internal heap blocks by size, used and free: what holds the
                 // memory on a board without PSRAM

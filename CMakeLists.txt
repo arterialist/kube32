@@ -501,6 +501,13 @@ else()
     target_link_libraries(test_channel_ipc_stress PRIVATE kube32_core)
     add_test(NAME test_channel_ipc_stress COMMAND test_channel_ipc_stress)
 
+    # 21b. Large channel messages: fragmentation, reassembly, loss, fan-out
+    add_executable(test_channel_ipc_large
+        tests/test_channel_ipc_large.cpp
+    )
+    target_link_libraries(test_channel_ipc_large PRIVATE kube32_core)
+    add_test(NAME test_channel_ipc_large COMMAND test_channel_ipc_large)
+
     # 22. microSD card: HAL over KUBE32_SD_ROOT, pod storage ABI, images pulled from the card
     add_executable(test_sd_card
         tests/test_sd_card.cpp

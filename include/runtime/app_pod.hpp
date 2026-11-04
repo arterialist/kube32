@@ -376,9 +376,13 @@ private:
     std::map<std::string, uint32_t> topic_subs_;                      // topic -> channel subscription
 
     // One allocation per message: the pod's id, the topic and the data in
-    // one buffer; `worker` is the pod's worker (kept current by moves)
+    // one buffer; a channel message is not copied: the event holds it (every
+    // pod subscribed to the topic shares it). `worker` is the pod's worker
+    // (kept current by moves)
     struct PendingEvent {
         std::string buf;
+        std::shared_ptr<const void> msg;
+        std::string_view msg_data;
         uint16_t id_len{0}, topic_len{0};
         uint16_t worker{0};
         PendingEvent() = default;
@@ -387,9 +391,15 @@ private:
             buf.reserve(pod_id.size() + topic.size() + data.size());
             buf.append(pod_id).append(topic).append(data);
         }
+        PendingEvent(std::string_view pod_id, std::string_view topic, std::shared_ptr<const void> owner, std::string_view data, size_t w = 0)
+            : msg(std::move(owner)), msg_data(data), id_len(static_cast<uint16_t>(pod_id.size())), topic_len(static_cast<uint16_t>(topic.size())),
+              worker(static_cast<uint16_t>(w)) {
+            buf.reserve(pod_id.size() + topic.size());
+            buf.append(pod_id).append(topic);
+        }
         std::string_view pod_id() const { return std::string_view(buf).substr(0, id_len); }
         std::string_view topic() const { return std::string_view(buf).substr(id_len, topic_len); }
-        std::string_view data() const { return std::string_view(buf).substr(static_cast<size_t>(id_len) + topic_len); }
+        std::string_view data() const { return msg ? msg_data : std::string_view(buf).substr(static_cast<size_t>(id_len) + topic_len); }
     };
     mutable osal::Mutex event_mutex_;
     osal::ConditionVariable event_cv_;
@@ -437,8 +447,9 @@ private:
     Entry* find_locked(const std::string& pod_id);
     // Subscribes the topics wanted by registered k32_event pods, drops the rest.
     void sync_topic_subscriptions_locked();
-    // Hands one channel message to every pod subscribed to its topic.
-    void deliver_topic(std::string_view topic, const uint8_t* data, size_t len);
+    // Hands one channel message to every pod subscribed to its topic: each
+    // queued event holds the message (`owner`), data lies in it
+    void deliver_topic(std::string_view topic, std::shared_ptr<const void> owner, const uint8_t* data, size_t len);
     int32_t call_with_block(Entry& e, const std::string& pod_id, const char* fn, std::string_view topic, const uint8_t* data, size_t len,
                             AppResponseSink* sink, const AppRequest* req = nullptr);
     // handle() and call_nested(): `wait_ms` 0 waits for a busy pod indefinitely

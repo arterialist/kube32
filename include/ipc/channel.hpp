@@ -7,6 +7,7 @@
 #include <vector>
 #include <atomic>
 #include <map>
+#include <deque>
 #include <functional>
 #include <string_view>
 
@@ -22,10 +23,17 @@ namespace kube32::ipc {
 // =============================================================================
 constexpr uint32_t K32C_MAGIC               = 0x4332334B; // "K32C" in wire byte order ('K', '3', '2', 'C') on little-endian
 constexpr uint8_t  K32C_VERSION             = 0x01;
-constexpr size_t   K32C_MAX_PACKET_LEN      = 250;        // ESP-NOW MTU
+constexpr size_t   K32C_MAX_PACKET_LEN      = 250;        // ESP-NOW v1 MTU: a small message is one such frame
 constexpr size_t   K32C_HEADER_LEN          = 24;
 constexpr size_t   K32C_CRC_LEN             = 2;
 constexpr size_t   K32C_MAX_PAYLOAD_CHUNK   = K32C_MAX_PACKET_LEN - K32C_HEADER_LEN - K32C_CRC_LEN; // 224 bytes
+// A large message goes out in frames of up to 1470 bytes (an ESP-NOW v2
+// frame, and a UDP datagram that fits a 1500-byte Ethernet MTU)
+constexpr size_t   K32C_MAX_FRAME_LEN       = 1470;
+constexpr size_t   K32C_LARGE_CHUNK         = K32C_MAX_FRAME_LEN - K32C_HEADER_LEN - K32C_CRC_LEN; // 1444 bytes
+// The largest channel message (topic publish or channel send)
+constexpr size_t   K32C_MAX_MESSAGE_BYTES   = 16384;
+constexpr size_t   K32C_MAX_FRAGMENTS       = (K32C_MAX_MESSAGE_BYTES + K32C_LARGE_CHUNK - 1) / K32C_LARGE_CHUNK; // 12
 constexpr size_t   K32C_RING_SLOT_SIZE      = 1024;
 constexpr size_t   K32C_RING_SLOT_COUNT     = 16;         // Must be power of 2
 constexpr uint32_t K32C_REASSEMBLY_TIMEOUT  = 500;        // ms
@@ -36,6 +44,9 @@ constexpr uint8_t K32C_FLAG_FIRST_FRAG      = 0x02;
 constexpr uint8_t K32C_FLAG_LAST_FRAG       = 0x04;
 constexpr uint8_t K32C_FLAG_ACK_REQ         = 0x08;
 constexpr uint8_t K32C_FLAG_PING            = 0x10;
+// Fragments of K32C_LARGE_CHUNK bytes (fragment i starts at i * 1444);
+// without it a fragment holds K32C_MAX_PAYLOAD_CHUNK bytes
+constexpr uint8_t K32C_FLAG_LARGE           = 0x20;
 
 // POSIX-aligned Error Codes
 constexpr int32_t IPC_OK                    = 0;
@@ -64,7 +75,7 @@ struct K32CHeader {
     uint32_t target_hash;    // Hash of target pod name
     uint8_t  frag_index;     // Current fragment index (0-based)
     uint8_t  frag_count;     // Total fragment count
-    uint16_t payload_len;    // Length of payload following header (0..224)
+    uint16_t payload_len;    // Length of payload following header (0..224, 0..1444 with K32C_FLAG_LARGE)
 };
 
 struct K32CPacket {
@@ -80,6 +91,29 @@ static_assert(sizeof(K32CHeader) == 24, "K32CHeader must be exactly 24 bytes");
 uint32_t fnv1a_32(const char* data, size_t len);
 inline uint32_t fnv1a_32(const std::string& str) { return fnv1a_32(str.data(), str.size()); }
 uint16_t crc16_ccitt(const uint8_t* data, size_t len, uint16_t init = 0xFFFF);
+
+// =============================================================================
+// A received or published message in one buffer
+// =============================================================================
+// The buffer comes from PSRAM where the node has it, else from the heap,
+// else from the pod pool block's small heap (a node without PSRAM keeps a
+// reserve of its heap for Wi-Fi and lwIP). Subscribers share it: a pod's
+// queued event holds the message, not a copy.
+struct ChannelMessage {
+    uint32_t channel_hash{0};
+    uint32_t sender_hash{0};
+    size_t len{0};
+    size_t cap{0};
+    uint8_t* data{nullptr};
+    ChannelMessage() = default;
+    ChannelMessage(const ChannelMessage&) = delete;
+    ChannelMessage& operator=(const ChannelMessage&) = delete;
+    ~ChannelMessage();
+};
+using MessagePtr = std::shared_ptr<ChannelMessage>;
+// A message with room for `capacity` bytes (len 0), or nullptr when no
+// memory can hold it
+MessagePtr make_message(size_t capacity);
 
 // =============================================================================
 // Lock-Free SPSC Slotted Ring Buffer
@@ -167,6 +201,8 @@ public:
 
     bool lookup_route(const std::string& channel_uri, ChannelRoute& out_route) const;
     bool lookup_route_by_hash(uint32_t channel_hash, ChannelRoute& out_route) const;
+    // Hashes of the channels pods on this node opened by name
+    std::vector<uint32_t> local_hashes() const;
     void clear();
 
 private:
@@ -199,12 +235,35 @@ struct PeerInfo {
     // The API server address a control plane announces in its HELLO
     // ("" from a worker)
     std::string api_address;
+    // Where the node was last heard over ESP-NOW and over UDP (0: never).
+    // A node heard over ESP-NOW in the last K32C_ESPNOW_FRESH_MS is sent
+    // to over ESP-NOW (one hop, acknowledged by the radio), else over UDP.
+    uint64_t espnow_seen_ms{0};
+    uint64_t udp_seen_ms{0};
+    uint8_t mac_address[6]{0};
+    std::string ip_address;
+    uint16_t udp_port{0};
+    // The topics the node's subscriptions cover (sorted hashes), from its
+    // announcements on K32C_SUBS_TOPIC; subs_ms is when the last one came,
+    // 0 for a node that announces none (it is sent every topic)
+    std::vector<uint32_t> subs;
+    uint64_t subs_ms{0};
 };
+
+// A node heard over ESP-NOW this recently is sent to over ESP-NOW
+constexpr uint64_t K32C_ESPNOW_FRESH_MS = 10000;
+// A node's subscription announcement holds this long; after that it is
+// sent every topic again (it may run a firmware that does not announce)
+constexpr uint64_t K32C_SUBS_FRESH_MS = 20000;
 
 constexpr const char* K32C_HELLO_TOPIC = "k32.hello";
 // A node name: that node's kubelet lists its pods at once (the control
 // plane bound a pod to it or is deleting one)
 constexpr const char* K32C_KUBELET_SYNC_TOPIC = "k32.kubelet.sync";
+// A node's subscriptions: its node id and the hash of every topic it
+// subscribes to (u32 each, little-endian), sent with each HELLO and when
+// they change. Publishers send a topic only to the nodes that subscribe.
+constexpr const char* K32C_SUBS_TOPIC = "k32.subs";
 
 class ChannelManager {
 public:
@@ -216,11 +275,44 @@ public:
 
     // ---- Topic publish/subscribe (host-side consumers) --------------------
     using TopicCallback = std::function<void(std::string_view topic, uint32_t sender_hash, const uint8_t* data, size_t len)>;
-    // Delivers to the local ring for the topic (if a pod opened it), to every
-    // host subscriber, and to every known peer node. Returns bytes or error.
+    // The same, with the message itself: the subscriber may keep it
+    using MessageCallback = std::function<void(std::string_view topic, const MessagePtr& msg)>;
+    // Delivers a message of up to K32C_MAX_MESSAGE_BYTES to the local ring
+    // for the topic (if a pod opened it), to this node's subscribers, and to
+    // every peer node that subscribes to the topic (every peer that does not
+    // announce its subscriptions). Returns len, or an error when a peer's
+    // radio did not acknowledge it or its sending failed (IPC_ERR_HOSTUNREACH,
+    // IPC_ERR_TIMEDOUT, IPC_ERR_IO), when a local subscriber's queue was full
+    // (IPC_ERR_AGAIN) or no memory could hold it (IPC_ERR_NOMEM). The
+    // message still reaches every other destination.
     int32_t publish(const std::string& pod_id, const std::string& topic, const uint8_t* data, size_t len);
     uint32_t subscribe(const std::string& topic, TopicCallback cb);
+    uint32_t subscribe_messages(const std::string& topic, MessageCallback cb);
     void unsubscribe(uint32_t id);
+    // This node's subscriptions as sorted topic hashes (subscribers, and
+    // channels pods opened by name)
+    std::vector<uint32_t> local_topic_hashes() const;
+    // Whether a publish on `topic_hash` goes to the peer `node_id`
+    bool peer_wants(uint32_t node_id, uint32_t topic_hash) const;
+
+    // ---- Transport tuning ------------------------------------------------------
+    // Pause between two frames of one message to one peer (0: none)
+    void set_fragment_gap_us(uint32_t us) { fragment_gap_us_.store(us); }
+    uint32_t fragment_gap_us() const { return fragment_gap_us_.load(); }
+    // Frames received over ESP-NOW waiting for the dispatcher (default 16, or
+    // 32 with PSRAM)
+    void set_rx_queue_frames(size_t n);
+    size_t rx_queue_frames() const;
+    // 0: ESP-NOW to a node heard over ESP-NOW recently, else UDP; 1: UDP
+    // whenever the node's address is known; 2: ESP-NOW whenever its MAC is
+    enum class Route : uint8_t { Auto = 0, Udp = 1, EspNow = 2 };
+    void set_route(Route r) { route_.store(static_cast<uint8_t>(r)); }
+    Route route() const { return static_cast<Route>(route_.load()); }
+    // Bytes of messages held in reassembly and waiting for subscribers, and
+    // the most the node holds (beyond it a message is dropped and counted)
+    size_t rx_held_bytes() const;
+    void set_rx_budget_bytes(size_t bytes) { rx_budget_bytes_.store(bytes); }
+    size_t rx_budget_bytes() const { return rx_budget_bytes_.load(); }
 
     // ---- Peers -------------------------------------------------------------
     void set_local_identity(uint32_t node_id, const std::string& node_name);
@@ -277,6 +369,22 @@ public:
         // Messages for this node's subscriptions that found the dispatcher's
         // queue full
         std::atomic<uint64_t> dispatch_dropped{0};
+        // Messages published, and those a peer's send failed for
+        std::atomic<uint64_t> msgs_published{0};
+        std::atomic<uint64_t> publish_errors{0};
+        std::atomic<uint64_t> frames_retried{0};
+        // Sends a peer was left out of: it does not subscribe to the topic
+        std::atomic<uint64_t> fanout_skipped{0};
+        // Received messages delivered whole to this node's subscribers
+        std::atomic<uint64_t> rx_messages{0};
+        // Received messages dropped: a fragment never came (or the
+        // reassembly slots were all taken), no memory or budget held it, the
+        // ESP-NOW receive queue was full, or the frames did not fit together
+        std::atomic<uint64_t> rx_incomplete{0};
+        std::atomic<uint64_t> rx_nomem{0};
+        std::atomic<uint64_t> rx_queue_full{0};
+        std::atomic<uint64_t> rx_malformed{0};
+        std::atomic<uint64_t> subs_rx{0};
     };
     ChannelStats& stats() { return stats_; }
 
@@ -293,7 +401,8 @@ private:
     ChannelStats stats_;
     bool initialized_{false};
 
-    // Multi-fragment reassembly state
+    // A message being reassembled: its fragments land in place in a buffer
+    // sized for frag_count fragments
     struct ReassemblyEntry {
         uint32_t channel_hash{0};
         uint32_t sender_hash{0};
@@ -301,12 +410,15 @@ private:
         uint8_t  total_frags{0};
         uint8_t  received_frags{0};
         uint32_t received_mask{0};
-        uint32_t total_bytes{0};
+        uint32_t chunk{0};
+        uint32_t last_len{0};          // the last fragment's bytes (when it came)
         uint64_t last_activity_ms{0};
-        uint8_t  buffer[K32C_RING_SLOT_SIZE];
+        MessagePtr msg;
     };
     osal::Mutex reassembly_mutex_;
-    std::map<uint64_t, ReassemblyEntry> reassembly_table_;
+    std::vector<ReassemblyEntry> reassembly_table_;
+    // Reassemblies at once: 2 without PSRAM, 8 with it
+    size_t max_reassembly_{8};
 
     // Peers and identity
     mutable osal::Mutex peer_mutex_;
@@ -317,27 +429,57 @@ private:
     std::string announced_api_;   // guarded by peer_mutex_: what this node announces
     std::map<std::string, uint64_t> ip_hello_ms_;   // guarded by peer_mutex_: last HELLO over UDP per address
 
-    // Host subscribers and dispatcher
+    // Subscribers and dispatcher
     struct Subscription {
         uint32_t id;
         uint32_t topic_hash;
         std::string topic;
         TopicCallback cb;
+        MessageCallback msg_cb;
     };
     mutable osal::Mutex sub_mutex_;
     std::vector<Subscription> subs_;
     uint32_t next_sub_id_{1};
-    std::shared_ptr<RingBuffer> dispatch_ring_;
-    std::shared_ptr<RingBuffer> rx_ring_;      // raw ESP-NOW frames awaiting parsing
+    std::atomic<bool> subs_changed_{false};   // announce the subscriptions now
+
+    // Frames received over ESP-NOW (copied out of the radio's callback) and
+    // messages for this node's subscribers, both waiting for the dispatcher
+    struct RawFrame {
+        uint8_t* data{nullptr};   // malloc'd: 6 bytes of source MAC, then the frame
+        uint16_t len{0};
+    };
+    osal::Mutex disp_mutex_;
+    osal::ConditionVariable disp_cv_;
+    std::vector<RawFrame> rx_frames_;          // a ring of rx_cap_ entries
+    size_t rx_head_{0}, rx_count_{0}, rx_cap_{16};
+    std::deque<MessagePtr> msg_queue_;         // at most msg_cap_
+    size_t msg_cap_{8};
+    bool disp_ready_{false};
     std::unique_ptr<osal::Thread> dispatch_thread_;
     std::atomic<bool> background_running_{false};
     uint32_t hello_interval_ms_{3000};
     uint64_t last_hello_ms_{0};
 
-    void deliver_local(uint32_t channel_hash, uint32_t sender_hash, const uint8_t* data, size_t len);
+    // Sending: one frame buffer, one sender at a time
+    osal::Mutex send_mutex_;
+    std::unique_ptr<uint8_t[]> tx_frame_;
+    std::atomic<uint32_t> fragment_gap_us_{0};
+    std::atomic<uint8_t> route_{0};
+    std::atomic<size_t> rx_budget_bytes_{K32C_MAX_MESSAGE_BYTES * 8};
+
+    // Queues a message for this node's subscribers; false when it was
+    // dropped (queue full)
+    bool deliver_local(const MessagePtr& msg);
+    bool deliver_local(uint32_t channel_hash, uint32_t sender_hash, const uint8_t* data, size_t len, bool* nomem = nullptr);
     int32_t send_frames_to(const NodeEndpoint& ep, uint32_t channel_hash, uint32_t sender_hash, uint32_t target_hash, const uint8_t* data, size_t len, uint8_t extra_flags);
+    NodeEndpoint route_to(const PeerInfo& p, uint64_t now_ms) const;
     void dispatch_loop();
+    void dispatch_message(const MessagePtr& msg);
+    void prune_reassembly(uint64_t now_ms);
     void handle_hello(const K32CHeader* hdr, const uint8_t* payload, size_t len, const NodeEndpoint* source);
+    void handle_subs(const uint8_t* payload, size_t len);
+    void send_subs();
+    void on_fragment(const K32CHeader* hdr, const uint8_t* payload);
 };
 
 // =============================================================================

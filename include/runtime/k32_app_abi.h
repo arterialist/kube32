@@ -161,7 +161,8 @@ extern "C" {
 
 /* Limits enforced by the host */
 #define K32_MAX_REQUEST_BYTES   (16 * 1024)
-#define K32_MAX_EVENT_BYTES     (200)        /* fits one ESP-NOW frame after the K32C header */
+#define K32_MAX_EVENT_BYTES     (200)        /* k32_event_emit: fits one ESP-NOW frame after the K32C header */
+#define K32_MAX_MESSAGE_BYTES   (16 * 1024)  /* k32_publish, and what k32_event can receive */
 #define K32_MAX_HEADER_BYTES    (256)
 
 /* ---- Infrared: RMT pulse trains, gated by the capability firewall -------
@@ -242,10 +243,23 @@ K32_IMPORT("k32_resp_header") void    k32_resp_header(const char* name, uint32_t
 K32_IMPORT("k32_resp_write")  int32_t k32_resp_write(const void* data, uint32_t len);
 K32_IMPORT("k32_resp_end")    void    k32_resp_end(void);
 
-/* Publish an event on a cluster virtual channel (ESP-NOW on hardware).
- * topic is the channel name, e.g. "myapp.events". Requires the
- * CHANNEL_IPC capability. Returns bytes sent or a negative error. */
+/* Publish an event of up to K32_MAX_EVENT_BYTES on a channel topic, e.g.
+ * "myapp.events". It reaches the pods on this node and on every node that
+ * subscribes to the topic. Requires the CHANNEL_IPC capability. Returns len,
+ * or a negative error; the message still reaches every other destination:
+ *   K32_ERR_INVAL       len over the limit, or a topic of 0 or over 64 bytes
+ *   K32_ERR_HOSTUNREACH a node's radio did not acknowledge a frame (sent twice)
+ *   K32_ERR_TIMEOUT     a node's radio did not answer
+ *   K32_ERR_IO          the frame could not be sent
+ *   K32_ERR_AGAIN       a subscriber on this node had a full queue
+ *   K32_ERR_NOMEM       no memory on this node could hold it
+ *   K32_ERR_PERM        the pod lacks CHANNEL_IPC */
 K32_IMPORT("k32_event_emit")  int32_t k32_event_emit(const char* topic, uint32_t topic_len, const void* data, uint32_t len);
+/* The same for a message of up to K32_MAX_MESSAGE_BYTES (16 KiB). The node
+ * sends it in frames of up to 1470 bytes and the receiving node delivers it
+ * whole to k32_event, or not at all. A subscriber receives it when its
+ * k32_alloc returns a buffer for the topic and the whole message. */
+K32_IMPORT("k32_publish")     int32_t k32_publish(const char* topic, uint32_t topic_len, const void* data, uint32_t len);
 
 K32_IMPORT("k32_time_ms")     int64_t k32_time_ms(void);      /* milliseconds since node boot */
 K32_IMPORT("k32_unix_time_ms") int64_t k32_unix_time_ms(void); /* wall clock, Unix milliseconds; 0 while the node's clock is not set */
