@@ -15,7 +15,7 @@
 // past the timeout (player 2 leaves the game), then it joins once more.
 //
 //   net_check <doom-sim.wasm> <doom.wasm> <sim iwad> <iwad> [--tics N] [--delay D] [--jitter MS] [--base MS]
-//             [--loss PERCENT] [--outage-ms MS] [--batch N] [--screenblocks N] [--pod-tick-ms MS] [--no-render] [--args "..."] [--client-args "..."] [--iwad-name doom1.wad]
+//             [--loss PERCENT] [--outage-ms MS] [--batch N] [--screenblocks N] [--pod-tick-ms MS] [--draw-rate B/s] [--fps N] [--pod-env K=V] [--no-render] [--args "..."] [--client-args "..."] [--iwad-name doom1.wad]
 //
 // Exits 0 when every compared tic agrees, 4 at the first that does not.
 #include "wasm3.h"
@@ -35,12 +35,19 @@
 #include <vector>
 
 static int64_t g_now_ms;
+// k32_publish as the runtime paces it toward a view that takes g_draw_rate bytes a second
+// (--draw-rate): it waits for the last message to leave (at most 500 ms) before it sends,
+// and the pod, its POSTs and its tick wait with it until g_pod_busy_until
+static int64_t g_draw_rate, g_pod_busy_until;
+static double g_next_send_ms, g_publish_wait_ms;
+static uint64_t g_published;
 
 struct Engine;
 static std::map<IM3Runtime, Engine*> g_engines;
 
 struct Engine {
     const char* name = "";
+    bool paced = false;                        // its k32_publish is paced (the pod)
     IM3Environment env{};
     IM3Runtime rt{};
     IM3Module mod{};
@@ -100,7 +107,8 @@ m3ApiRawFunction(h_log) {
     if (std::getenv("NET_LOG") || (len > 9 && !std::strncmp(msg, "doom-net:", 9))) std::printf("  [%s] %.*s\n", eng(runtime)->name, (int)len, msg);
     m3ApiSuccess();
 }
-m3ApiRawFunction(h_time_ms) { m3ApiReturnType(int64_t); m3ApiReturn(g_now_ms); }
+// the pod's clock runs on through a paced k32_publish, so the pod sees how long it waited
+m3ApiRawFunction(h_time_ms) { m3ApiReturnType(int64_t); m3ApiReturn(eng(runtime)->paced ? std::max(g_now_ms, g_pod_busy_until) : g_now_ms); }
 m3ApiRawFunction(h_time_us) { m3ApiReturnType(int64_t); m3ApiReturn(g_now_ms * 1000); }
 m3ApiRawFunction(h_env_get) {
     m3ApiReturnType(int32_t);
@@ -155,6 +163,25 @@ m3ApiRawFunction(h_resp_write) {
     m3ApiReturn((int32_t)len);
 }
 m3ApiRawFunction(h_resp_end) { m3ApiSuccess(); }
+m3ApiRawFunction(h_publish) {
+    m3ApiReturnType(int32_t);
+    m3ApiGetArgMem(const char*, topic);
+    m3ApiGetArg(uint32_t, tlen);
+    m3ApiGetArgMem(const char*, data);
+    m3ApiGetArg(uint32_t, len);
+    (void)topic; (void)tlen;
+    m3ApiCheckMem(data, len);
+    if (len > 16 * 1024) m3ApiReturn(K32_ERR_INVAL);
+    g_published++;
+    if (g_draw_rate > 0) {
+        const double now = (double)std::max(g_now_ms, g_pod_busy_until);
+        const double wait = g_next_send_ms > now ? std::min(g_next_send_ms - now, 500.0) : 0.0;
+        g_next_send_ms = std::max(g_next_send_ms, now) + len * 1000.0 / (double)g_draw_rate;
+        g_publish_wait_ms += wait;
+        g_pod_busy_until = (int64_t)(now + wait + 0.5);
+    }
+    m3ApiReturn((int32_t)len);
+}
 m3ApiRawFunction(h_event_emit) {
     m3ApiReturnType(int32_t);
     m3ApiGetArgMem(const char*, topic);
@@ -183,7 +210,7 @@ static bool load(Engine& e, const char* path) {
         {"k32_blob_read", "i(iiii)", h_blob_read}, {"k32_blob_close", "i(i)", h_blob_close}, {"k32_resp_begin", "v(iii)", h_resp_begin},
         {"k32_resp_header", "v(iiii)", h_resp_header}, {"k32_resp_write", "i(ii)", h_resp_write}, {"k32_resp_end", "v()", h_resp_end},
         {"k32_event_emit", "i(iiii)", h_event_emit},
-        {"k32_publish", "i(iiii)", h_event_emit},   /* the draw list to the view pod: not followed here */
+        {"k32_publish", "i(iiii)", h_publish},      /* the draw list to the view pod: paced, not followed */
     };
     for (auto& im : imports) {
         r = m3_LinkRawFunction(e.mod, "env", im.name, im.sig, im.fn);
@@ -275,7 +302,7 @@ struct Course {
 int main(int argc, char** argv) {
     if (argc < 5) {
         std::fprintf(stderr, "usage: net_check <doom-sim.wasm> <doom.wasm> <sim iwad> <iwad> [--tics N] [--delay D] [--jitter MS] [--base MS] "
-                             "[--loss PERCENT] [--outage-ms MS] [--batch N] [--screenblocks N] [--pod-tick-ms MS] [--no-render] [--args \"...\"] [--client-args \"...\"] [--iwad-name NAME]\n");
+                             "[--loss PERCENT] [--outage-ms MS] [--batch N] [--screenblocks N] [--pod-tick-ms MS] [--draw-rate B/s] [--fps N] [--pod-env K=V] [--no-render] [--args \"...\"] [--client-args \"...\"] [--iwad-name NAME]\n");
         return 2;
     }
     std::ifstream sw(argv[3], std::ios::binary), cw(argv[4], std::ios::binary);
@@ -284,6 +311,8 @@ int main(int argc, char** argv) {
     int tics = 6000, delay = 4, outage_ms = 1500;
     std::string batch = "2", screenblocks = "10";   // --screenblocks 11 for a sim built 240 wide
     int pod_tick_ms = 10;                           // --pod-tick-ms: how often the node ticks the pod
+    std::string fps = "8";                          // --fps: DOOM_FPS, the frames the sim publishes a second
+    std::vector<std::pair<std::string, std::string>> pod_env;   // --pod-env KEY=VALUE
     bool render = true;
     const bool trace = std::getenv("NET_TRACE") != nullptr;
     std::string args = "-warp 1 1 -skill 3", iwad_name = "doom1.wad", client_args;   // --client-args: a client that plays another game
@@ -298,6 +327,13 @@ int main(int argc, char** argv) {
         else if (a == "--batch") batch = argv[++i];
         else if (a == "--screenblocks") screenblocks = argv[++i];
         else if (a == "--pod-tick-ms") pod_tick_ms = std::max(1, std::atoi(argv[++i]));
+        else if (a == "--draw-rate") g_draw_rate = std::atoll(argv[++i]);
+        else if (a == "--fps") fps = argv[++i];
+        else if (a == "--pod-env") {
+            const std::string kv = argv[++i];
+            const size_t eq = kv.find('=');
+            if (eq != std::string::npos) pod_env.emplace_back(kv.substr(0, eq), kv.substr(eq + 1));
+        }
         else if (a == "--outage-ms") outage_ms = std::atoi(argv[++i]);
         else if (a == "--no-render") render = false;
         else if (a == "--args") args = argv[++i];
@@ -308,9 +344,11 @@ int main(int argc, char** argv) {
     // the authority: the sim-only engine as the pod
     Engine pod;
     pod.name = "pod";
+    pod.paced = true;
     pod.wad = &sim_wad;
     pod.envs = {{"DOOM_IWAD", iwad_name}, {"DOOM_WAD_BLOB", "doom-wad"}, {"DOOM_ARGS", args + " -kb 256"}, {"DOOM_PLAYERS", "2"},
-                {"DOOM_NET_DELAY", std::to_string(delay)}, {"DOOM_NET_TIMEOUT_MS", "5000"}, {"DOOM_NET_DIGEST", "1"}, {"DOOM_NET_BATCH", batch}, {"DOOM_SCREENBLOCKS", screenblocks}};
+                {"DOOM_NET_DELAY", std::to_string(delay)}, {"DOOM_NET_TIMEOUT_MS", "5000"}, {"DOOM_NET_DIGEST", "1"}, {"DOOM_NET_BATCH", batch}, {"DOOM_SCREENBLOCKS", screenblocks}, {"DOOM_FPS", fps}};
+    for (auto& kv : pod_env) pod.envs[kv.first] = kv.second;
     if (!load(pod, argv[1])) return 1;
     if (pod.call("k32_init")) { std::printf("pod: k32_init failed\n"); return 1; }
 
@@ -422,10 +460,16 @@ int main(int argc, char** argv) {
         }
         return 0;
     };
+    bool tick_due = false;
     for (; total_tics < tics + 1200 && g_now_ms < 3600LL * 1000; g_now_ms++) {
         // the network: posts reach the authority, events and answers the client
         for (Msg& m : net.due()) {
             if (m.to == 0) {
+                if (g_now_ms < g_pod_busy_until) {   // the pod is inside k32_publish: the POST waits
+                    m.at = g_pod_busy_until;
+                    net.q.push_back(std::move(m));
+                    continue;
+                }
                 pod.request("POST", "/doom/tics", m.body);
                 pod_after();
                 net.send(1, 2, m.gen, pod.body, m.id);
@@ -444,7 +488,9 @@ int main(int argc, char** argv) {
             }
         }
         // the node ticks the pod every pod_tick_ms (10 ms, as a node does)
-        if (g_now_ms % pod_tick_ms == 0) {
+        if (g_now_ms % pod_tick_ms == 0) tick_due = true;
+        if (tick_due && g_now_ms >= g_pod_busy_until) {
+            tick_due = false;
             p1.feed(pod_tic, [&](int d, int k) { pod.call("doom_key", {d, k}); });
             pod.call("k32_tick", {g_now_ms});
             pod_after();
@@ -511,6 +557,9 @@ int main(int argc, char** argv) {
     std::printf("authority: %s\n", ps.c_str());
     std::printf("client:    %s\n", cst.c_str());
     const long tics_run = json_int(ps, "tics", 0), stalled = json_int(ps, "stalled_tics", 0);
+    if (g_draw_rate)
+        std::printf("draw lists: %llu published, paced at %lld B/s: the pod waited %.0f ms in k32_publish\n", (unsigned long long)g_published,
+                    (long long)g_draw_rate, g_publish_wait_ms);
     std::printf("network: %llu messages, %llu lost (%d%% and a %d ms outage), %llu overtaken; latency %d to %d ms one way\n",
                 (unsigned long long)net.sent, (unsigned long long)net.lost, net.loss_pct, outage_ms, (unsigned long long)net.reordered, net.base_ms,
                 net.base_ms + net.jitter_ms);

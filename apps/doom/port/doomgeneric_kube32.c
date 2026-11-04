@@ -204,6 +204,14 @@ K32_EXPORT("k32_init") int32_t k32_init(void) {
 static char draw_topic[48] = "doom.draw", keys_topic[48] = "doom.keys";
 static uint32_t frame_ms = 125, publish_errors, frames_published, keys_received;
 static int64_t last_frame_ms;
+/* k32_publish sends no faster than the bytes a second the view's node announces, and waits
+ * for the last message to leave before it sends the next: the pod, and every POST behind
+ * it, would wait with it. A frame is drawn and published once the last list has left at
+ * DOOM_DRAW_RATE bytes a second (default 49152, the Cardputer's; 0 publishes at once). */
+static uint32_t draw_rate = 49152;
+static int64_t drained_ms;
+static uint32_t frame_waits, publish_ms_max;
+static uint64_t publish_ms_sum;
 uint32_t doom_drawlist_ptr(void);
 uint32_t doom_drawlist_len(void);
 static void sim_env(void) {
@@ -214,6 +222,8 @@ static void sim_env(void) {
     if (n > 0 && n < (int32_t)sizeof keys_topic) keys_topic[n] = 0; else strcpy(keys_topic, "doom.keys");
     n = k32_env_get("DOOM_FPS", 8, v, sizeof v - 1);
     if (n > 0 && n < (int32_t)sizeof v) { v[n] = 0; long fps = atoi(v); if (fps >= 1 && fps <= 35) frame_ms = (uint32_t)(1000 / fps); }
+    n = k32_env_get("DOOM_DRAW_RATE", 14, v, sizeof v - 1);
+    if (n > 0 && n < (int32_t)sizeof v) { v[n] = 0; draw_rate = (uint32_t)atoi(v); }
 }
 static void parse_keys(const char* p, const char* end) {
     while (p < end) {
@@ -231,10 +241,24 @@ K32_EXPORT("k32_event") int32_t k32_event(uint32_t topic, uint32_t topic_len, ui
 }
 #endif
 
+/* How long each k32_tick takes (GET /stats) */
+static uint32_t tick_ms_max;
+static uint64_t tick_ms_sum, ticks_timed;
+static int32_t tick(int64_t now);
+
 K32_EXPORT("k32_tick") int32_t k32_tick(uint32_t uptime_ms) {
     (void)uptime_ms;
     if (!started) return 0;
-    const int64_t now = k32_time_ms();
+    const int64_t t0 = k32_time_ms();
+    const int32_t rc = tick(t0);
+    const uint32_t ms = (uint32_t)(k32_time_ms() - t0);
+    tick_ms_sum += ms;
+    ticks_timed++;
+    if (ms > tick_ms_max) tick_ms_max = ms;
+    return rc;
+}
+
+static int32_t tick(int64_t now) {
     static int drawn_tic = -1;
     if (net_role() == NET_AUTHORITY) {
         /* two players: the tics whose ticcmds are in (a POST may have run some);
@@ -254,15 +278,31 @@ K32_EXPORT("k32_tick") int32_t k32_tick(uint32_t uptime_ms) {
     if (gametic == drawn_tic) return 1;   /* a frame when the game moved (not in the lobby) */
 #ifdef DG_SIM_ONLY
     if (now - last_frame_ms < (int64_t)frame_ms) return 1;
+    if (draw_rate && now < drained_ms) { frame_waits++; return 1; }   /* the last list is still leaving */
     last_frame_ms = now;
     drawn_tic = gametic;
     doom_render();
+    const int64_t p0 = k32_time_ms();
     int32_t rc = k32_publish(draw_topic, (uint32_t)strlen(draw_topic), (const void*)(uintptr_t)doom_drawlist_ptr(), doom_drawlist_len());
+    const int64_t p1 = k32_time_ms();
+    publish_ms_sum += (uint64_t)(p1 - p0);
+    if ((uint32_t)(p1 - p0) > publish_ms_max) publish_ms_max = (uint32_t)(p1 - p0);
+    if (draw_rate) {
+        /* a publish that still waited means the view takes less than the rate assumed: assume a
+         * quarter less; after 20 that did not wait, a tenth more, up to DOOM_DRAW_RATE */
+        static uint32_t rate, clean;
+        if (!rate) rate = draw_rate;
+        if (p1 - p0 > 10) { rate -= rate / 4; if (rate < 4096) rate = 4096; clean = 0; }
+        else if (++clean >= 20 && rate < draw_rate) { rate += rate / 10; if (rate > draw_rate) rate = draw_rate; clean = 0; }
+        drained_ms = p1 + (int64_t)doom_drawlist_len() * 1000 / rate;
+    }
     if (rc < 0) publish_errors++; else frames_published++;
     if ((frames_published + publish_errors) % 100 == 0) {
-        char line[96];
-        snprintf(line, sizeof line, "doom-sim: frames %u publish_errors %u keys %u list %u B", (unsigned)frames_published, (unsigned)publish_errors,
-                 (unsigned)keys_received, (unsigned)doom_drawlist_len());
+        char line[160];
+        const uint32_t sent = frames_published + publish_errors;
+        snprintf(line, sizeof line, "doom-sim: frames %u publish_errors %u keys %u list %u B; publish %u ms mean, %u max; tick %u ms mean, %u max",
+                 (unsigned)frames_published, (unsigned)publish_errors, (unsigned)keys_received, (unsigned)doom_drawlist_len(),
+                 (unsigned)(publish_ms_sum / sent), (unsigned)publish_ms_max, (unsigned)(ticks_timed ? tick_ms_sum / ticks_timed : 0), (unsigned)tick_ms_max);
         k32_log(line, (uint32_t)strlen(line));
     }
 #else
@@ -432,10 +472,15 @@ static int32_t handle_request(char* req, uint32_t len) {
         put_kv("memory_bytes", (int64_t)__builtin_wasm_memory_size(0) * 65536);
         put_kv("blob_reads", k32_libc_blob_reads);
         put_kv("blob_bytes", k32_libc_blob_bytes);
+        put_kv("tick_ms_mean", ticks_timed ? (int64_t)(tick_ms_sum / ticks_timed) : 0);
+        put_kv("tick_ms_max", tick_ms_max);
 #ifdef DG_SIM_ONLY
         put_kv("frames_published", frames_published);
         put_kv("publish_errors", publish_errors);
         put_kv("keys_received", keys_received);
+        put_kv("publish_ms_mean", frames_published + publish_errors ? (int64_t)(publish_ms_sum / (frames_published + publish_errors)) : 0);
+        put_kv("publish_ms_max", publish_ms_max);
+        put_kv("frame_waits", frame_waits);
 #endif
         return reply_json();
     }
