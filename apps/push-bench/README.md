@@ -4,10 +4,10 @@ push-bench measures how many frames of a few KB a pod on one node can push to a 
 
 | Pod | Node | What it runs | Memory |
 | --- | --- | --- | ---: |
-| `push-pub` | control plane | publishes frames of each size in `SIZES` at each rate in `RATES` on `doom.draw`, `SECONDS` a run | 16 KiB |
-| `push-sub` | Cardputer (`kube32.io/board: cardputer`) | reassembles the frames from `k32_event` and logs one line a run | 16 KiB |
+| `push-pub` | control plane | publishes frames of each size in `SIZES` at each rate in `RATES` on `doom.draw`, `SECONDS` a run | 32 KiB |
+| `push-sub` | Cardputer (`kube32.io/board: cardputer`) | reassembles the frames from `k32_event` and logs one line a run | 24 KiB |
 
-An event carries at most 200 bytes (`K32_MAX_EVENT_BYTES`), so a frame goes out as `count` chunks of a 16-byte header and up to 184 frame bytes (`push.h`). The header holds the run, the frame number, the chunk's index and count, the frame's size and rate, and the publisher's wall clock when the frame went out. The subscriber checks every chunk's bytes and reassembles up to `WINDOW` frames at a time. A chunk of a newer frame when every slot is taken evicts the oldest frame as partial.
+With `CHUNK=0` (the manifest's setting) each frame goes out whole in one `k32_publish` message of up to 16 KiB and arrives as one event. With `CHUNK` from 17 to 200 the frame goes out with `k32_event_emit` (at most 200 bytes, `K32_MAX_EVENT_BYTES`) as `count` chunks of a 16-byte header and up to 184 frame bytes (`push.h`). The header holds the run, the frame number, the chunk's index and count, the frame's size and rate, and the publisher's wall clock when the frame went out. The subscriber checks every chunk's bytes and reassembles up to `WINDOW` frames at a time. A chunk of a newer frame when every slot is taken evicts the oldest frame as partial.
 
 ```
 push sent run=1 size=4600 fps=6 chunk=200 count=25 frames=318 chunks=7950 skipped=42 emit_err=0 (first rc=0) frame_send_ms mean=168 max=1453
@@ -25,11 +25,26 @@ kubectl --context kube32 logs -f push-sub
 make -C apps/push-bench delete
 ```
 
-Publisher: `TOPIC` (default `doom.draw`), `SIZES` (default `4600,12600`), `RATES` (default `6,8,10`), `CHUNK` (default 200), `PER_TICK` (chunks a 10 ms tick, 0 for the whole frame in one tick), `SECONDS` (60), `PAUSE` (5), `DELAY` (10). Subscriber: `WINDOW` (1 to 4), `CHECK` (0 skips the byte check).
+Publisher: `TOPIC` (default `doom.draw`), `SIZES` (default `4600,12600`), `RATES` (default `6,8,10`), `CHUNK` (default 200; 0 for whole frames), `PER_TICK` (chunks a 10 ms tick, 0 for the whole frame in one tick), `SECONDS` (60), `PAUSE` (5), `DELAY` (10). Subscriber: `WINDOW` (1 to 4), `CHECK` (0 skips the byte check).
 
 ## Results
 
-Devkit publisher, Cardputer subscriber, 60 s a run, wordsketch-listen stopped. "Delivered" is the share of chunks the publisher sent that arrived.
+Devkit publisher, Cardputer subscriber, wordsketch-listen stopped.
+
+### Whole frames (`k32_publish`, `CHUNK=0`)
+
+Firmware with large channel messages; messages go over ESP-NOW (the default route). Whole frames a second, then the publisher-to-subscriber latency (p50 / p95 ms, both nodes' wall clocks).
+
+| Size | 6 fps | 8 fps | 10 fps | Latency p50 / p95 ms |
+| ---: | ---: | ---: | ---: | --- |
+| 4,600 | 5.91 | 7.95 | 9.51 | 36 to 40 / 93 to 133 |
+| 12,600 | 5.02 | 6.55 | 7.26 | 86 to 89 / 122 to 136 |
+
+Runs of 45 s. Every frame that arrived had the right bytes. 1 to 5% of the 4.6 KB frames and 16 to 27% of the 12.6 KB frames were lost. The Cardputer's Wi-Fi stops sending under a sustained stream of large messages (in this pass during the 4.6 KB run at 10 fps): the node turns NotReady while ESP-NOW frames keep arriving, and only a reboot brings it back.
+
+### Frames in 200-byte events (`k32_event_emit`)
+
+Runs of 60 s. "Delivered" is the share of chunks the publisher sent that arrived.
 
 | Size | Rate | Chunk | Per tick | Window | Frames sent | Whole frames/s | Partial | Delivered | Reassembly p50 / p95 / max ms |
 | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |
