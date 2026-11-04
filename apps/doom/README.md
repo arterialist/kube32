@@ -100,7 +100,7 @@ kubectl --context kube32 apply -f apps/wordsketch/build/wordsketch.yaml   # back
 | `doom-view` | Cardputer | 7,351 | 1 | the view pod's module |
 | `doom-pack` | Cardputer | 1,437,292 | 22 | the render pack (`wad.py pack`) |
 
-The flash store places blobs on 64 KiB boundaries and keeps a replaced blob's old bytes until its pod lets go, so the largest free gap can be well under the free bytes: DOOM's three devkit blobs take 17 extents, which fit beside the wordsketch and llm-diffusion blobs (19 free); upload `doom-web` first, and delete it before replacing it. The draw lists travel as channel messages of up to 12 KiB; the Cardputer takes them on the UDP route (`K32_CMD:IPCROUTE:udp` on both boards), which held 10 minutes at 8 fps where ESP-NOW stalled its Wi-Fi within minutes. `wordsketch-listen` must be at 0 while DOOM runs: the Cardputer's pool block holds one of them.
+The flash store places blobs on 64 KiB boundaries and keeps a replaced blob's old bytes until its pod lets go, so the largest free gap can be well under the free bytes: DOOM's three devkit blobs take 17 extents, which fit beside the wordsketch and llm-diffusion blobs, the llm-diffusion module among them (18 of 19 free extents taken); upload `doom-web` first, and delete it before replacing it. The draw lists travel as channel messages of up to 12 KiB; the Cardputer takes them on the UDP route (`K32_CMD:IPCROUTE:udp` on both boards), which held 10 minutes at 8 fps where ESP-NOW stalled its Wi-Fi within minutes. `wordsketch-listen` must be at 0 while DOOM runs: the Cardputer's pool block holds one of them.
 
 ## Two players
 
