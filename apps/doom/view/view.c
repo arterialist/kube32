@@ -37,7 +37,7 @@ static dl_ctx ctx;
 static char keys_topic[48];
 static int32_t blob = -1;
 static uint32_t frames, bytes, draw_errors, key_errors, keys_sent, draw_ms, blit_ms;   /* ms spent in the last 100 frames */
-static int ready;
+static int ready, draw = 1;   /* DOOM_VIEW_DRAW=0: receive and count only (a transport measurement) */
 
 /* keys: pressed this tick, released with the next */
 static uint8_t release[16];
@@ -64,6 +64,7 @@ static uint32_t env(const char* key, char* out, uint32_t cap, const char* def) {
 K32_EXPORT("k32_init") int32_t k32_init(void) {
     char name[48];
     env("DOOM_KEYS_TOPIC", keys_topic, sizeof keys_topic, "doom.keys");
+    { char v[4]; env("DOOM_VIEW_DRAW", v, sizeof v, "1"); draw = v[0] != '0'; }
     env("DOOM_PACK_BLOB", name, sizeof name, "doom-pack");
     blob = k32_blob_open(name, slen(name));
     if (blob < 0) { logf("doom-view: the render pack blob is not open"); return -1; }
@@ -91,7 +92,7 @@ K32_EXPORT("k32_event") int32_t k32_event(uint32_t topic, uint32_t topic_len, ui
     if (!ready || len < DL_HEADER_BYTES || msg[0] != 'D') return 0;
     bytes += len;
     const uint32_t vh = msg[8];
-    for (uint32_t y0 = 0; y0 < vh; y0 += BAND_ROWS) {
+    for (uint32_t y0 = 0; draw && y0 < vh; y0 += BAND_ROWS) {
         const uint32_t rows = vh - y0 < BAND_ROWS ? vh - y0 : BAND_ROWS;
         const int64_t t0 = k32_time_ms();
         int32_t rc = dl_draw(&ctx, msg, len, band, VIEW_W, (int32_t)y0, rows);
