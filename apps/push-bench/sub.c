@@ -21,7 +21,10 @@
  * longest time between two whole frames. A frame sent whole (k32_publish)
  * arrives as one event. Runs in 24 KiB of linear memory.
  *
- * Environment: WINDOW, CHECK (0: the bytes are not checked). */
+ * Each tick (kube32.io/tick-interval) it also publishes a 16-byte input
+ * message on INPUT_TOPIC when set: inputs_sent= and input_err= per run.
+ *
+ * Environment: WINDOW, CHECK (0: the bytes are not checked), INPUT_TOPIC. */
 #include "../../include/runtime/k32_app_abi.h"
 #include "push.h"
 
@@ -46,6 +49,12 @@ static uint32_t run, size, fps, count, seen, first, last, t_last_chunk, t_last_w
 static uint32_t ok, dup, stale, bad, whole, partial, gap_max, n_reasm;
 static uint16_t reasm[MAX_SAMPLES];
 static int16_t e2e[MAX_SAMPLES];
+
+/* An input message of 16 bytes a tick on INPUT_TOPIC (default doom.input),
+ * as a game's key presses go back to its engine */
+static uint32_t in_seq, in_sent, in_err;
+static char in_topic[32];
+static uint32_t in_topic_len;
 
 K32_EXPORT("k32_alloc") uint32_t k32_alloc(uint32_t n) {
     return n <= sizeof block ? (uint32_t)(uintptr_t)block : 0;
@@ -75,6 +84,8 @@ K32_EXPORT("k32_init") int32_t k32_init(void) {
     if (n > 0 && v[0] >= '1' && v[0] <= '0' + MAX_WINDOW) window = (uint32_t)(v[0] - '0');
     n = k32_env_get("CHECK", 5, v, sizeof v);
     if (n > 0 && v[0] == '0') check = 0;
+    n = k32_env_get("INPUT_TOPIC", 11, in_topic, sizeof in_topic);
+    if (n > 0) in_topic_len = (uint32_t)n;
     put("push sub window="); putn((int32_t)window); put(" check="); putn((int32_t)check);
     flush();
     return 0;
@@ -125,6 +136,8 @@ static NOINLINE void end_run(void) {
         put_pcts("e2e_ms", e2e[n / 2], e2e[n * 95 / 100], e2e[n - 1]);
     }
     put(" gap_ms max="); putn((int32_t)gap_max);
+    put(" inputs_sent="); putn((int32_t)in_sent); put(" input_err="); putn((int32_t)in_err);
+    in_sent = in_err = 0;
     flush();
     seen = 0;
 }
@@ -215,6 +228,13 @@ K32_EXPORT("k32_event") int32_t k32_event(uint32_t tp, uint32_t tl, uint32_t ptr
 
 K32_EXPORT("k32_tick") int32_t k32_tick(uint32_t uptime_ms) {
     (void)uptime_ms;
+    if (in_topic_len) {
+        uint8_t m[16] = {'I'};
+        push_wr32(m + 4, in_seq++);
+        push_wr32(m + 8, (uint32_t)k32_unix_time_ms());
+        if (k32_event_emit(in_topic, in_topic_len, m, sizeof m) == (int32_t)sizeof m) in_sent++;
+        else in_err++;
+    }
     if (seen && now_ms() - t_last_chunk > 3000u) end_run();
     return 0;
 }

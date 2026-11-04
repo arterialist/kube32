@@ -10,6 +10,7 @@ metadata:
   annotations:
     kube32.io/wasm-base64: "@SUB_WASM@"
     kube32.io/event-topics: doom.draw
+    kube32.io/tick-interval: 100ms
 spec:
   restartPolicy: Never
   nodeSelector:
@@ -20,6 +21,8 @@ spec:
     env:
     - name: WINDOW
       value: "1"
+    - name: INPUT_TOPIC
+      value: doom.input
     resources:
       requests:
         memory: 24Ki
@@ -40,6 +43,7 @@ metadata:
   annotations:
     kube32.io/wasm-base64: "@PUB_WASM@"
     kube32.io/execution-budget: "off"
+    kube32.io/event-topics: doom.input
 spec:
   restartPolicy: Never
   nodeSelector:
