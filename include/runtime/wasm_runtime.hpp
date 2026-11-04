@@ -58,6 +58,10 @@ struct DeploySpec {
     uint64_t gas_budget_per_call{4000000000ULL};   // 0: no metering (see ContainerConfig)
     std::vector<std::string> event_topics;          // channel topics delivered to k32_event
     std::vector<std::string> blobs;                 // blobs k32_blob_open may open (kube32.io/blobs)
+    // The module's bytes are read in place from a mapped source (a flash
+    // blob) that this keeps open for the module's lifetime; the runtime then
+    // holds no copy of them
+    std::shared_ptr<const void> module_source;
     uint32_t tick_interval_ms{1000};                // k32_tick period (kube32.io/tick-interval)
     int core{-1};                                   // the core whose pod worker runs it (kube32.io/core), -1: by load
     // Bundle files the pod may send with k32_resp_asset: an embedded bundle

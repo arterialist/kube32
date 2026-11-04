@@ -187,12 +187,19 @@ private:
     uint64_t held_bytes_locked() const;   // mutex_ held by caller
     void cleanup_runtime();
 
+public:
+    // The bytes the next deploy(ptr, len) gets are read in place from a
+    // mapped source that `source` keeps open (a flash blob): no copy is made
+    void set_module_source(std::shared_ptr<const void> source) { module_source_ = std::move(source); }
+
+private:
     ContainerConfig config_;
     mutable osal::Mutex mutex_;          // status and runtime pointers
     osal::Mutex call_mutex_;             // one call into the module at a time (call_function, deploy)
     ContainerStatus status_;
     
     ModuleBytes wasm_bytecode_;               // the module's bytes when the image is not memory mapped
+    std::shared_ptr<const void> module_source_;   // keeps a mapped source (a flash blob) open while the module uses it
     const uint8_t* wasm_view_{nullptr};       // bytes the module was parsed from
     size_t wasm_view_len_{0};
     std::atomic<bool> stop_requested_{false};

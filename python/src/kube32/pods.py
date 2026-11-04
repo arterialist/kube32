@@ -135,7 +135,7 @@ def cmd_deploy(args):
     except ValueError as e:
         return err_exit(str(e), EXIT_USAGE)
     if args.image is not None and not args.image.startswith("wasm://"):
-        return err_exit("--image must be a wasm:// reference such as wasm://sd/%s or wasm://embedded/%s:v1" % (name, name), EXIT_USAGE)
+        return err_exit("--image must be a wasm:// reference such as wasm://sd/%s, wasm://blob/%s or wasm://embedded/%s:v1" % (name, name, name), EXIT_USAGE)
 
     # kubelet.cpp: the sandbox is max(limits.memory, esp32.io/psram); under one
     # page it backs the first page partly

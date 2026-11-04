@@ -15,11 +15,12 @@ The build disables exception handling, typed function references, stack switchin
 
 The kubelet resolves `spec.containers[0].image` in order:
 
-1. `wasm://sd/<name>[:<tag>]` reads `<card>/kube32/images/<name>[-<tag>].wasm` from the [storage](../storage.md).
-2. `wasm://embedded/<name>` or any other reference matches `images/*.wasm` in the embedded firmware registry by the last path component before `:` and parses modules in place from flash.
-3. An inline image: the module the API server took out of the `kube32.io/wasm-base64` annotation (written by `kube32 deploy`) and keeps under the pod's `kube32.io/wasm-sha256`. The kubelet reads it from `GET /apis/kube32.io/v1/images/<sha256>` into one allocation of the module's size and checks it against the digest. See [Writing app pods](../app-development.md#inline-image-kube32-cli-deploy).
+1. `wasm://blob/<name>` opens the module in the node's flash [blob store](../storage.md#blobs) and parses it in place from the mapped region; the container keeps the blob open for the module's lifetime (`DeploySpec::module_source`), so a replaced or removed blob keeps its old bytes until the pod stops.
+2. `wasm://sd/<name>[:<tag>]` reads `<card>/kube32/images/<name>[-<tag>].wasm` from the [storage](../storage.md).
+3. `wasm://embedded/<name>` or any other reference matches `images/*.wasm` in the embedded firmware registry by the last path component before `:` and parses modules in place from flash.
+4. An inline image: the module the API server took out of the `kube32.io/wasm-base64` annotation (written by `kube32 deploy`) and keeps under the pod's `kube32.io/wasm-sha256`. The kubelet reads it from `GET /apis/kube32.io/v1/images/<sha256>` into one allocation of the module's size and checks it against the digest. See [Writing app pods](../app-development.md#inline-image-kube32-cli-deploy).
 
-wasm3 reads a module's bytes in place for as long as the module is loaded. An embedded image is mapped from flash and takes no RAM. The bytes of any other image are pod memory: the kubelet reads them into one allocation, placed as the pod's other allocations are (the pool block first, see [Memory](#memory)), and the container keeps them for restarts and charges them to the pod. Thus a module needs no contiguous piece of the general heap.
+wasm3 reads a module's bytes in place for as long as the module is loaded. An embedded image or a blob image is mapped from flash and takes no RAM. The bytes of any other image are pod memory: the kubelet reads them into one allocation, placed as the pod's other allocations are (the pool block first, see [Memory](#memory)), and the container keeps them for restarts and charges them to the pod. Thus a module needs no contiguous piece of the general heap.
 
 Unresolved images, and card images over the board's size limit, fail the pod with `ErrImagePull`. A module that finds no room in pod memory makes the pod wait for memory, as a load does ([Memory admission](#memory-admission)).
 

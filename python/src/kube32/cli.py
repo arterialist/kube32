@@ -168,7 +168,7 @@ def build_parser(prog="kube32"):
     d.add_argument("--hardware", help="comma list of ipc, display, keyboard, speaker, microphone, sd, service-call, chip-temp, or 'none' (default: inferred from the module's imports)")
     d.add_argument("--sd-claim", help="volume claim for the sd hardware (default: the pod name)")
     d.add_argument("--env", action="append", metavar="K=V", help="container environment variable (repeatable)")
-    d.add_argument("--image", help="use this wasm:// reference (wasm://sd/<name>, wasm://embedded/<name>:v1) instead of carrying the module inline")
+    d.add_argument("--image", help="use this wasm:// reference (wasm://sd/<name>, wasm://blob/<name>, wasm://embedded/<name>:v1) instead of carrying the module inline")
     d.add_argument("--port", type=int, default=7000, help="containerPort for request pods (default 7000)")
     d.add_argument("--replace", action="store_true", help="delete an existing pod of that name first")
     d.add_argument("--timeout", type=int, default=60, help="seconds to wait for the old pod to go away with --replace (default 60)")

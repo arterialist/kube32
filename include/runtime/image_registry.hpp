@@ -117,4 +117,9 @@ bool parse_sd_image_ref(const std::string& image_ref, std::string& out_name, std
 // "kube32/images/<name>[-<tag>].wasm", relative to the card's mount point.
 std::string sd_image_relative_path(const std::string& name, const std::string& tag);
 
+// wasm://blob/<name>: true when `image_ref` names a module in the node's
+// blob store (storage::valid_blob_name), which the kubelet parses and
+// compiles in place from the mapped flash region.
+bool parse_blob_image_ref(const std::string& image_ref, std::string& out_name);
+
 } // namespace kube32::runtime

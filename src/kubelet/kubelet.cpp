@@ -6,6 +6,7 @@
 #include "hal/sd_card.hpp"
 #include "hal/node_storage.hpp"
 #include "runtime/image_registry.hpp"
+#include "storage/blob_store.hpp"
 #include "runtime/wasm_runtime.hpp"
 #include "runtime/pod_log.hpp"
 #include "runtime/app_pod.hpp"
@@ -1022,9 +1023,21 @@ bool Kubelet::deploy_and_start_pod(const models::KubePod& pod_in, const std::str
     {
         const uint8_t* module = nullptr;
         size_t module_len = 0;
-        bool module_held = true;   // read into pod memory, unless embedded (mapped from flash)
-        std::string sd_name, sd_tag;
-        if (runtime::parse_sd_image_ref(pod.image, sd_name, sd_tag)) {
+        bool module_held = true;   // read into pod memory, unless embedded or a blob (mapped from flash)
+        std::string sd_name, sd_tag, blob_name;
+        std::shared_ptr<storage::BlobReader> blob_module;
+        if (runtime::parse_blob_image_ref(pod.image, blob_name)) {
+            int32_t err = 0;
+            for (storage::BlobStore* store : storage::node_blob_stores()) {
+                if ((blob_module = store->open(blob_name, err)) && blob_module->view()) break;
+                blob_module.reset();
+            }
+            if (blob_module) {
+                module = blob_module->view();
+                module_len = static_cast<size_t>(blob_module->size());
+                module_held = false;
+            }
+        } else if (runtime::parse_sd_image_ref(pod.image, sd_name, sd_tag)) {
             struct stat st;
             const std::string root = hal::sd_root_path();
             if (!root.empty() && ::stat((root + "/" + runtime::sd_image_relative_path(sd_name, sd_tag)).c_str(), &st) == 0 && st.st_size > 0) {
@@ -1189,7 +1202,29 @@ bool Kubelet::deploy_and_start_pod(const models::KubePod& pod_in, const std::str
     std::string sd_name, sd_tag;
     std::string asset_bundle, asset_directory;   // k32_resp_asset: the image's bundle
     std::string image_error;                      // why an inline image could not be read
-    if (runtime::parse_sd_image_ref(pod.image, sd_name, sd_tag)) {
+    std::string blob_name;
+    std::shared_ptr<storage::BlobReader> blob_module;   // a blob image: parsed in place, kept open by the runtime
+    if (runtime::parse_blob_image_ref(pod.image, blob_name)) {
+        image_key = blob_name;
+        image_source = "flash blob";
+        int32_t err = 0;
+        bool found = false;
+        for (storage::BlobStore* store : storage::node_blob_stores()) {
+            auto reader = store->open(blob_name, err);
+            if (!reader) continue;
+            found = true;
+            if (reader->view()) { blob_module = std::move(reader); break; }
+        }
+        if (blob_module) {
+            image_bytes = blob_module->view();
+            image_len = static_cast<size_t>(blob_module->size());
+            std::cout << "[KUBELET] " << pod_key << ": blob image " << blob_name << ", " << image_len << " bytes, read in place" << std::endl;
+        } else if (found) {
+            image_error = "blob " + blob_name + " is not mapped: a module runs in place from the flash blob store only";
+        } else {
+            image_error = "blob " + blob_name + " is not in the node's blob store (a firmware update erases the flash blobs: upload it again)";
+        }
+    } else if (runtime::parse_sd_image_ref(pod.image, sd_name, sd_tag)) {
         image_key = sd_name + (sd_tag.empty() ? std::string() : ":" + sd_tag);
         image_source = "sd card";
         record_pod_event(rec, "Pulling", "Pulling image \"" + pod.image + "\" from the sd card", false);
@@ -1385,7 +1420,8 @@ bool Kubelet::deploy_and_start_pod(const models::KubePod& pod_in, const std::str
         else std::cout << "[KUBELET] " << pod_key << ": ignoring kube32.io/core \"" << it->second << "\" (want 0, 1 or auto)" << std::endl;
     }
     // Modules read into pod memory move into the runtime (no second copy);
-    // embedded images are used in place
+    // embedded images and blob images are used in place
+    spec.module_source = blob_module;
     bool deployed = inline_bytes.empty()
         ? runtime_.deploy_workload_ex(pod_key, image_bytes, image_len, spec, deploy_err)
         : runtime_.deploy_workload_owned(pod_key, std::move(inline_bytes), spec, deploy_err);

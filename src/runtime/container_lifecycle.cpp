@@ -351,7 +351,7 @@ bool ContainerLifecycleController::deploy(const uint8_t* wasm_bytes, size_t len)
     // bytes are the pod's: taken over (deploy(ModuleBytes&&)), or copied into
     // pod memory here. Restarts reuse them.
     const bool own_copy = !wasm_bytecode_.empty() && wasm_bytes == wasm_bytecode_.data();
-    if (!own_copy && module_is_mapped(wasm_bytes, len)) {
+    if (!own_copy && (module_source_ || module_is_mapped(wasm_bytes, len))) {
         wasm_bytecode_.clear();
         wasm_view_ = wasm_bytes;
         wasm_view_len_ = len;

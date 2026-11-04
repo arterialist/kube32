@@ -488,9 +488,10 @@ Exit codes of `kube32`: `0` ok, `1` input or toolchain error, `2` usage error, `
 
 The kubelet resolves `spec.containers[0].image` in this order:
 
-1. `wasm://sd/<name>[:<tag>]` reads `<card>/kube32/images/<name>[-<tag>].wasm` (up to 256 KiB without PSRAM, 2 MiB with PSRAM).
-2. Any other image reference is looked up in the firmware's embedded registry by its key (the last path component before `:`).
-3. Otherwise, a pod with `kube32.io/wasm-sha256` gets the module the API server keeps under that digest (an inline image, below), from `GET /apis/kube32.io/v1/images/<sha256>`. The kubelet checks the bytes against the digest.
+1. `wasm://blob/<name>` parses the module in place from the node's flash [blob store](storage.md#blobs): the module's bytes take no pod memory.
+2. `wasm://sd/<name>[:<tag>]` reads `<card>/kube32/images/<name>[-<tag>].wasm` (up to 256 KiB without PSRAM, 2 MiB with PSRAM).
+3. Any other image reference is looked up in the firmware's embedded registry by its key (the last path component before `:`).
+4. Otherwise, a pod with `kube32.io/wasm-sha256` gets the module the API server keeps under that digest (an inline image, below), from `GET /apis/kube32.io/v1/images/<sha256>`. The kubelet checks the bytes against the digest.
 
 ### Inline image (`kube32 deploy`)
 
@@ -535,6 +536,10 @@ $ kube32 deploy sdk/rust/examples/notes/build/notes.wasm --image wasm://sd/notes
 
 See [Storage and volumes](storage.md) for volume and image layout.
 
+### Blob image (`wasm://blob/<name>`)
+
+A module too large to hold in pod memory next to its own linear memory goes into the node's flash blob store and runs from there: upload it as a blob (`kubectl replace --raw "/api/v1/nodes/<node>/proxy/blobs/<name>?size=<bytes>" -f module.wasm`, see [Blobs](storage.md#blobs)) and name it as the image, `wasm://blob/<name>`. The kubelet opens the blob, parses and compiles the module in place from the mapped flash region and keeps the blob open for the pod's lifetime, so its bytes count neither in the pod's memory nor in the API server's Pod Overhead (`kube32 deploy --image wasm://blob/<name> module.wasm` still writes `kube32.io/wasm-size`, from which the overhead estimates the compiled code). A blob replaced or removed while the pod runs keeps its old bytes for that pod; the next start reads the new blob, or fails with `ErrImagePull` when it is gone. A blob image lives in the flash store only (a card blob is not mapped), and a firmware update erases the flash blobs: upload the module again before the pod restarts. While such a pod runs it holds the passive app slot, so staging a firmware image is refused until it stops.
+
 ### Embedded image (`kube32 embed`)
 
 Copy a checked module into `images/<name>.wasm` for the next firmware or simulator build:
@@ -555,7 +560,7 @@ Rebuild the firmware with `pio run -e esp32s3`, or reconfigure and build the hos
 
 | Field | Meaning |
 | --- | --- |
-| `spec.containers[0].image` | `wasm://sd/<name>[:<tag>]`, `wasm://embedded/<name>`, or `wasm://inline/<name>-<digest>` |
+| `spec.containers[0].image` | `wasm://blob/<name>`, `wasm://sd/<name>[:<tag>]`, `wasm://embedded/<name>`, or `wasm://inline/<name>-<digest>` |
 | `spec.nodeName`, `spec.nodeSelector` | Pins or selects nodes (such as `node-role.kubernetes.io/control-plane` or `kube32.io/board: cardputer`) |
 | `spec.restartPolicy` | `Always` (default), `OnFailure`, or `Never` |
 | `spec.containers[0].env`, `envFrom` | Literal values, `valueFrom` (`configMapKeyRef`, `secretKeyRef`, `fieldRef`), `envFrom` with `prefix`, `$(VAR)` expansion, and `<SVC>_SERVICE_HOST` / `_PORT` links (unless `enableServiceLinks: false`). Missing refs hold the pod in `CreateContainerConfigError`. |

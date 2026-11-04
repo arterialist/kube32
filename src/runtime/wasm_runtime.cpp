@@ -110,6 +110,7 @@ bool WasmRuntime::deploy_impl(const std::string& pod_id, const uint8_t* wasm_byt
     const size_t psram_before = heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
 #endif
     auto controller = std::make_unique<ContainerLifecycleController>(config);
+    if (spec.module_source) controller->set_module_source(spec.module_source);
     bool deployed = owned ? controller->deploy(std::move(*owned)) : controller->deploy(wasm_bytes, len);
     if (!deployed) {
         out_error = controller->get_status().exit_message;
@@ -647,8 +648,15 @@ size_t set_pod_overhead(models::JsonValue& pod) {
         bool held = false;
         const std::string image = c.get_string("image", "");
         std::string sd_name, sd_tag;
+        std::string blob_name;
         if (parse_sd_image_ref(image, sd_name, sd_tag)) {
             continue;   // on a node's card, which this node cannot see: the kubelet's admission counts it
+        } else if (parse_blob_image_ref(image, blob_name)) {
+            // in a node's flash blob store, read in place: its bytes are not held; the
+            // code is estimated from kube32.io/wasm-size when the pod carries it
+            const std::string size = annotation("kube32.io/wasm-size");
+            if (size.empty()) continue;
+            module_len = static_cast<size_t>(models::parse_quantity(size));
         } else if (const EmbeddedImage* img = ImageRegistry::instance().resolve(image, nullptr)) {
             module = img->data;
             module_len = img->len;

@@ -1,4 +1,5 @@
 #include "runtime/image_registry.hpp"
+#include "storage/blob_store.hpp"
 #include "runtime/pod_memory_pool.h"
 
 #include <algorithm>
@@ -161,6 +162,17 @@ static bool valid_image_token(const std::string& s, size_t max_len) {
         bool ok = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '.' || c == '_' || c == '-';
         if (!ok) return false;
     }
+    return true;
+}
+
+bool parse_blob_image_ref(const std::string& image_ref, std::string& out_name) {
+    out_name.clear();
+    std::string s = image_ref;
+    if (s.rfind("wasm://", 0) == 0) s = s.substr(7);
+    if (s.rfind("blob/", 0) != 0) return false;
+    s = s.substr(5);
+    if (!storage::valid_blob_name(s)) return false;
+    out_name = s;
     return true;
 }
 

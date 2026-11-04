@@ -40,7 +40,7 @@ Any later USB flash with `scripts/flash.sh` also erases `otadata`. The board the
 
 You cannot stage an image while a rollout is in progress.
 
-`kube32 firmware discard` forgets the staged image without rolling it out. The passive slot then holds no image that a rollout needs, and the control plane can keep [blobs](storage.md#blobs) there until the next `push`. Staging an image over blobs erases them, and is refused while a pod has one open.
+`kube32 firmware discard` forgets the staged image without rolling it out. The passive slot then holds no image that a rollout needs, and the control plane can keep [blobs](storage.md#blobs) there until the next `push`. Staging an image over blobs erases them, and is refused while a pod has one open (a pod whose image is a blob, `wasm://blob/<name>`, holds it for as long as it runs).
 
 ## Rolling out
 

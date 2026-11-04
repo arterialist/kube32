@@ -191,6 +191,8 @@ A blob is a named, read-only byte string that a node keeps for its pods, such as
 
 On `kube32-sim` the flash region is a file, `<data-dir>/blobs.img` (`--blob-region <size>`, 3328 KiB by default, `0` for none), and the card is the `KUBE32_SD_ROOT` directory. Both are mapped there.
 
+A blob in the flash store can also be a pod's module: `spec.containers[0].image: wasm://blob/<name>` makes the kubelet parse and compile it in place from the mapping, so the module's bytes take no pod memory and no Pod Overhead ([Blob image](app-development.md#blob-image-wasmblobname)). The pod keeps the blob open while it runs, which holds the passive app slot against a firmware staging, and a firmware update erases it with the other flash blobs.
+
 ### The flash region
 
 The 8 MB partition table has no free space: its two 3.25 MB app slots, the 1 MB journal and the 384 KB `storage` partition fill the flash after the first 128 KB. The slot that does not run the firmware is idle between firmware updates, so it holds the blobs: 3,342,336 bytes (3264 KiB) after the directory. A custom partition table can add a `data` partition labelled `blobs` instead, which kube32 then uses and never shares with the firmware.

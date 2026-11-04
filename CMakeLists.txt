@@ -268,6 +268,9 @@ else()
             src/main_host.cpp
         )
         target_link_libraries(kube32-sim PRIVATE kube32_core)
+        # What a module takes of a node, by the API server's estimate (tools/podsize.cpp)
+        add_executable(kube32-podsize tools/podsize.cpp)
+        target_link_libraries(kube32-podsize PRIVATE kube32_core)
     endif()
 
     # ==========================================================================
@@ -376,6 +379,11 @@ else()
     add_executable(test_pod_raster tests/test_pod_raster.cpp)
     target_link_libraries(test_pod_raster PRIVATE kube32_core)
     add_test(NAME test_pod_raster COMMAND test_pod_raster)
+
+    # 10c'. Blob images (wasm://blob/<name>): modules parsed in place from the flash blob store
+    add_executable(test_blob_images tests/test_blob_images.cpp)
+    target_link_libraries(test_blob_images PRIVATE kube32_core)
+    add_test(NAME test_blob_images COMMAND test_blob_images)
 
     # 10c. Blobs: the flash and card stores, a pod's handles, /blobs over HTTP
     add_executable(test_blob_store tests/test_blob_store.cpp)
