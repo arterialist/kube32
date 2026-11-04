@@ -68,9 +68,11 @@ namespace {
 std::atomic<size_t> g_message_bytes{0};
 
 #if defined(KUBE32_TARGET_ESP32)
-// Without PSRAM a message takes the heap only while this much stays free for
-// Wi-Fi, lwIP and the kubelet; then the pod pool block's small heap
-constexpr size_t kHeapReserveNoPsram = 14 * 1024;
+// Without PSRAM a message comes from the pod pool block's small heap, and
+// from the heap only while this much of it stays free: the Wi-Fi driver stops
+// sending for good once an allocation of its own fails, and lwIP, the kubelet
+// and the received frames waiting for the dispatcher need it too
+constexpr size_t kHeapReserveNoPsram = 24 * 1024;
 #endif
 
 uint8_t* message_alloc(size_t n) {
@@ -81,11 +83,12 @@ uint8_t* message_alloc(size_t n) {
         if (!p) p = heap_caps_malloc(n, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
         return static_cast<uint8_t*>(p);
     }
+    if (void* p = kube32_pool_sub_alloc(n)) return static_cast<uint8_t*>(p);
     if (heap_caps_get_free_size(MALLOC_CAP_INTERNAL) >= n + kHeapReserveNoPsram &&
         heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL) >= n) {
-        if (void* p = heap_caps_malloc(n, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT)) return static_cast<uint8_t*>(p);
+        return static_cast<uint8_t*>(heap_caps_malloc(n, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
     }
-    return static_cast<uint8_t*>(kube32_pool_sub_alloc(n));
+    return nullptr;
 #else
     return static_cast<uint8_t*>(std::malloc(n));
 #endif
@@ -848,6 +851,14 @@ size_t ChannelManager::rx_queue_frames() const {
 // waits for the dispatcher
 void ChannelManager::enqueue_raw_frame(const uint8_t* src_mac, const uint8_t* frame, size_t len) {
     if (!frame || len > K32C_MAX_FRAME_LEN) return;
+#if defined(KUBE32_TARGET_ESP32)
+    // Without PSRAM a frame of a large message waits in the heap only above
+    // its reserve; a small frame (a HELLO, an event) above 6 KiB
+    if (!has_psram_ && heap_caps_get_free_size(MALLOC_CAP_INTERNAL) < len + (len > K32C_MAX_PACKET_LEN ? kHeapReserveNoPsram : 6 * 1024)) {
+        stats_.rx_nomem.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
+#endif
     auto* p = static_cast<uint8_t*>(std::malloc(len + 6));
     if (!p) {
         stats_.rx_nomem.fetch_add(1, std::memory_order_relaxed);
@@ -953,7 +964,7 @@ bool ChannelManager::start_background(uint32_t hello_interval_ms, size_t dispatc
     if (background_running_.load()) return true;
     hello_interval_ms_ = hello_interval_ms;
     // Without PSRAM: 16 received frames, 8 messages for subscribers, two
-    // reassemblies and 32 KiB of messages at once; with PSRAM 32, 32, 8 and
+    // reassemblies and 19.5 KiB of messages at once; with PSRAM 32, 32, 8 and
     // 256 KiB (two pod workers publishing at once, large messages arriving)
     const bool psram = osal::System::get_total_psram_bytes() > 0;
     {
@@ -965,7 +976,9 @@ bool ChannelManager::start_background(uint32_t hello_interval_ms, size_t dispatc
         osal::LockGuard guard(reassembly_mutex_);
         max_reassembly_ = psram ? 8 : 2;
     }
-    rx_budget_bytes_.store(psram ? 256 * 1024 : 32 * 1024);
+    // Without PSRAM: one message of the largest size held at once
+    rx_budget_bytes_.store(psram ? 256 * 1024 : K32C_MAX_MESSAGE_BYTES + K32C_LARGE_CHUNK + 2048);
+    has_psram_ = psram;
     background_running_.store(true);
     dispatch_thread_ = std::make_unique<osal::Thread>();
     osal::Thread::Config cfg;

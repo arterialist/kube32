@@ -466,6 +466,7 @@ private:
     std::atomic<uint32_t> fragment_gap_us_{0};
     std::atomic<uint8_t> route_{0};
     std::atomic<size_t> rx_budget_bytes_{K32C_MAX_MESSAGE_BYTES * 8};
+    bool has_psram_{false};
 
     // Queues a message for this node's subscribers; false when it was
     // dropped (queue full)

@@ -66,7 +66,7 @@ static NOINLINE uint32_t parse_list(const char* key, uint32_t key_len, uint32_t*
         if (pos >= (uint32_t)n) break;
         uint32_t v = 0;
         while (pos < (uint32_t)n && s[pos] >= '0' && s[pos] <= '9') v = v * 10u + (uint32_t)(s[pos++] - '0');
-        if (v) out[k++] = v;
+        out[k++] = v;
     }
     return k;
 }
@@ -104,7 +104,7 @@ K32_EXPORT("k32_init") int32_t k32_init(void) {
 static NOINLINE void begin_run(uint32_t now) {
     uint32_t r = run;   /* runs are numbered from 1; run r covers size (r-1)/n_rates, rate (r-1)%n_rates */
     size = sizes[(r - 1) / n_rates];
-    fps = rates[(r - 1) % n_rates];
+    fps = rates[(r - 1) % n_rates] ? rates[(r - 1) % n_rates] : 1;
     if (size > sizeof ev - PUSH_HDR) size = sizeof ev - PUSH_HDR;
     if (chunk == 0) {   /* the whole frame in one k32_publish */
         per = 0;
