@@ -33,7 +33,7 @@ SIM_EXCLUDE = doomgeneric/m_menu.c doomgeneric/am_map.c doomgeneric/wi_stuff.c d
 EXCLUDE ?=
 ENGINE = $(filter-out doomgeneric/i_sdlmusic.c doomgeneric/i_sdlsound.c doomgeneric/i_allegromusic.c \
            doomgeneric/i_allegrosound.c doomgeneric/doomgeneric_%.c $(EXCLUDE), $(wildcard doomgeneric/*.c))
-PORT = port/libc.c port/doomgeneric_kube32.c
+PORT = port/libc.c port/doomgeneric_kube32.c port/state_digest.c
 BUILD ?= build
 OBJS = $(ENGINE:doomgeneric/%.c=$(BUILD)/engine/%.o) $(PORT:port/%.c=$(BUILD)/port/%.o)
 

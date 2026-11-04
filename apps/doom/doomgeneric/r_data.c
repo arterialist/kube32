@@ -245,7 +245,10 @@ void R_GenerateComposite (int texnum)
     block = Z_Malloc (texturecompositesize[texnum] + DG_LUMP_PAD,
 		      PU_STATIC, 
 		      &texturecomposite[texnum]);	
-    memset (block + texturecompositesize[texnum], 0, DG_LUMP_PAD);
+    /* the texels no patch covers stay zero, as in a render pack (vanilla
+     * leaves them whatever the zone block held, which changes when the
+     * composite is purged and regenerated) */
+    memset (block, 0, texturecompositesize[texnum] + DG_LUMP_PAD);
 #else
     block = Z_Malloc (texturecompositesize[texnum],
 		      PU_STATIC, 

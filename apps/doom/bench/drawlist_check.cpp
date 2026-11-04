@@ -8,6 +8,14 @@
 //
 //   drawlist_check <doom.wasm> <doom-sim.wasm> <iwad> <pack> [--tics N] [--args "..."]
 //                  [--iwad-name doom1.wad] [--screenblocks 10|11] [--spin] [--dump frame.ppm]
+//                  [--state] [--no-pixels] [--sim-args "..."] [--locate x,y,tic]
+//
+// --state also compares the two engines' game states (players, map objects,
+// sectors, P_Random) every tic and the renderers' frames (drawsegs,
+// vissprites, visplanes, openings) every frame, and names the first part
+// that differs; --no-pixels skips the frames (the game states alone, fast).
+// --sim-args gives the sim engine its own DOOM_ARGS (a smaller zone), --sim-wad its
+// own IWAD (the sim pack, wad.py simpack).
 //
 // Prints the frames compared, the pixels that differ, and the decode time
 // (records plus kernels) a frame on this host.
@@ -32,6 +40,10 @@ extern "C" {
 
 static std::vector<uint8_t> g_wad, g_pack;
 static std::string g_env_iwad = "doom1.wad", g_env_args = "-warp 1 1 -skill 3 -kb 480", g_env_blocks = "10";
+static std::string g_sim_args;   // --sim-args: the sim engine's DOOM_ARGS when they differ (its zone)
+static std::vector<uint8_t> g_sim_wad;   // --sim-wad: the sim engine's IWAD when it differs (the sim pack)
+static IM3Runtime g_sim_rt;
+static const std::vector<uint8_t>& wad_of(IM3Runtime rt) { return rt == g_sim_rt && !g_sim_wad.empty() ? g_sim_wad : g_wad; }
 static int64_t g_clock_ms;
 
 static uint64_t now_us() {
@@ -104,7 +116,7 @@ m3ApiRawFunction(h_env_get) {
     m3ApiReturn((int32_t)v->size());
 }
 m3ApiRawFunction(h_blob_open) { m3ApiReturnType(int32_t); m3ApiGetArgMem(const char*, n); m3ApiGetArg(uint32_t, l); (void)n; (void)l; m3ApiReturn(0); }
-m3ApiRawFunction(h_blob_size) { m3ApiReturnType(int32_t); m3ApiGetArg(int32_t, h); (void)h; m3ApiReturn((int32_t)g_wad.size()); }
+m3ApiRawFunction(h_blob_size) { m3ApiReturnType(int32_t); m3ApiGetArg(int32_t, h); (void)h; m3ApiReturn((int32_t)wad_of(runtime).size()); }
 m3ApiRawFunction(h_blob_read) {
     m3ApiReturnType(int32_t);
     m3ApiGetArg(int32_t, h);
@@ -113,9 +125,10 @@ m3ApiRawFunction(h_blob_read) {
     m3ApiGetArg(uint32_t, len);
     (void)h;
     m3ApiCheckMem(dst, len);
-    if (off >= g_wad.size()) m3ApiReturn(0);
-    uint32_t n = std::min<uint32_t>(len, (uint32_t)g_wad.size() - off);
-    std::memcpy(dst, g_wad.data() + off, n);
+    const std::vector<uint8_t>& wad = wad_of(runtime);
+    if (off >= wad.size()) m3ApiReturn(0);
+    uint32_t n = std::min<uint32_t>(len, (uint32_t)wad.size() - off);
+    std::memcpy(dst, wad.data() + off, n);
     m3ApiReturn((int32_t)n);
 }
 m3ApiRawFunction(h_blob_close) { m3ApiReturnType(int32_t); m3ApiGetArg(int32_t, h); (void)h; m3ApiReturn(0); }
@@ -128,7 +141,7 @@ struct Engine {
     IM3Environment env{};
     IM3Runtime rt{};
     IM3Module mod{};
-    IM3Function init{}, tic{}, render{}, key{}, screen{}, dl_ptr{}, dl_len{};
+    IM3Function init{}, tic{}, render{}, key{}, screen{}, dl_ptr{}, dl_len{}, digest{}, mobj{}, rdigest{};
     std::vector<uint8_t> wasm;
     bool load(const char* path, bool sim) {
         std::ifstream f(path, std::ios::binary);
@@ -153,6 +166,8 @@ struct Engine {
             std::printf("%s exports: %s\n", path, r);
             return false;
         }
+        if (!m3_FindFunction(&digest, rt, "doom_state_digest")) m3_FindFunction(&mobj, rt, "doom_mobj_field"); else digest = nullptr;
+        if (m3_FindFunction(&rdigest, rt, "doom_render_digest")) rdigest = nullptr;
         if (sim) r = m3_FindFunction(&dl_ptr, rt, "doom_drawlist_ptr"), r = r ? r : m3_FindFunction(&dl_len, rt, "doom_drawlist_len");
         else r = m3_FindFunction(&screen, rt, "doom_screen_ptr");
         if (r) { std::printf("%s: %s (built for this check?)\n", path, r); return false; }
@@ -164,6 +179,13 @@ struct Engine {
         return true;
     }
     uint32_t result(IM3Function fn) { uint32_t v = 0; m3_GetResultsV(fn, &v); return v; }
+    uint32_t call1(IM3Function fn, int32_t a) { std::string s = std::to_string(a); const char* v[] = {s.c_str()}; call(fn, 1, v); return result(fn); }
+    int32_t call2(IM3Function fn, int32_t a, int32_t b) {
+        std::string s = std::to_string(a), t = std::to_string(b);
+        const char* v[] = {s.c_str(), t.c_str()};
+        call(fn, 2, v);
+        return (int32_t)result(fn);
+    }
     const uint8_t* mem() { return m3_GetMemory(mod, nullptr, 0); }
     void press(int down, int code) {
         std::string d = std::to_string(down), c = std::to_string(code);
@@ -186,6 +208,7 @@ int main(int argc, char** argv) {
     bool spin = false;
     const char* dump = nullptr;
     int locate_x = -1, locate_y = -1, locate_tic = -1;   // --locate x,y,tic: which entry last writes that pixel
+    bool state = false, no_pixels = false;   // --state: both engines' game-state digests every tic; --no-pixels: no frames
     for (int i = 5; i < argc; i++) {
         std::string a = argv[i];
         if (a == "--tics") tics = std::atoi(argv[++i]);
@@ -195,10 +218,19 @@ int main(int argc, char** argv) {
         else if (a == "--spin") spin = true;
         else if (a == "--dump") dump = argv[++i];
         else if (a == "--locate") std::sscanf(argv[++i], "%d,%d,%d", &locate_x, &locate_y, &locate_tic);
+        else if (a == "--state") state = true;
+        else if (a == "--sim-args") g_sim_args = argv[++i];
+        else if (a == "--sim-wad") { std::ifstream sw(argv[++i], std::ios::binary); g_sim_wad.assign(std::istreambuf_iterator<char>(sw), std::istreambuf_iterator<char>()); }
+        else if (a == "--no-pixels") no_pixels = true;
     }
     Engine full, sim;
     if (!full.load(argv[1], false) || !sim.load(argv[2], true)) return 1;
-    if (!full.call(full.init) || !sim.call(sim.init)) return 1;
+    g_sim_rt = sim.rt;
+    if (!full.call(full.init)) return 1;
+    const std::string full_args = g_env_args;
+    if (!g_sim_args.empty()) g_env_args = g_sim_args;
+    if (!sim.call(sim.init)) return 1;
+    g_env_args = full_args;
     dl_ctx ctx;
     const uint32_t hl = dl_head_len(g_pack.data());
     if (dl_init(&ctx, 0, g_pack.data(), hl)) { std::printf("not a version 2 render pack\n"); return 1; }
@@ -222,7 +254,32 @@ int main(int argc, char** argv) {
         for (auto& e : course) if (e[0] == t) { full.press(e[1], e[2]); sim.press(e[1], e[2]); }
         g_clock_ms = (int64_t)(t + 1) * 1000 / 35;
         if (!full.call(full.tic) || !sim.call(sim.tic)) return 1;
+        if (state && full.digest && sim.digest) {
+            const uint32_t a = full.call1(full.digest, 0), b = sim.call1(sim.digest, 0);
+            if (a != b) {
+                static const char* groups[] = {"", "players", "mobjs", "sectors", "P_Random/time", "other thinkers", "M_Random"};
+                std::printf("tic %d: the game states differ:", t);
+                for (int g = 1; g <= 6; g++) if (full.call1(full.digest, g) != sim.call1(sim.digest, g)) std::printf(" %s", groups[g]);
+                std::printf("\n");
+                for (int i = 0; i < 4096; i++) {
+                    if (full.call2(full.mobj, i, -1) != 1 && sim.call2(sim.mobj, i, -1) != 1) break;
+                    for (int f = 0; f < 21; f++) {
+                        const int32_t fa = full.call2(full.mobj, i, f), fb = sim.call2(sim.mobj, i, f);
+                        if (fa != fb) std::printf("  mobj %d field %d: full %d sim %d (type %d, state %d)\n", i, f, fa, fb, full.call2(full.mobj, i, 4), full.call2(full.mobj, i, 6));
+                    }
+                }
+                return 4;
+            }
+        }
+        if (no_pixels) { frames++; continue; }
         if (!full.call(full.render) || !sim.call(sim.render)) return 1;
+        if (state && full.rdigest && sim.rdigest && full.call1(full.rdigest, 0) != sim.call1(sim.rdigest, 0)) {
+            static const char* parts[] = {"drawsegs", "vissprites", "visplanes", "openings"};
+            std::printf("tic %d: the renderers' frames differ:", t);
+            for (int g = 10; g <= 13; g++) if (full.call1(full.rdigest, g) != sim.call1(sim.rdigest, g)) std::printf(" %s", parts[g - 10]);
+            std::printf("\n");
+            return 4;
+        }
         full.call(full.screen);
         const uint32_t screen = full.result(full.screen);
         sim.call(sim.dl_ptr);
@@ -331,7 +388,25 @@ int main(int argc, char** argv) {
                                                (int32_t)(e[13] | (e[14] << 8) | (e[15] << 16) | ((uint32_t)e[16] << 24)),
                                                (int32_t)(e[17] | (e[18] << 8) | (e[19] << 16) | ((uint32_t)e[20] << 24)),
                                                (int32_t)(e[21] | (e[22] << 8) | (e[23] << 16) | ((uint32_t)e[24] << 24)));
-                    if (e[0] == 1) std::printf("  strip x0 %u n %u tex %u light %u\n", e[1] | (e[2] << 8), e[3], e[4], e[5]);
+                    if (e[0] == 1) {
+                        const uint32_t x0 = e[1] | (e[2] << 8), n = e[3], tex = e[4], light = e[5];
+                        auto i32 = [&](int o) { return (int32_t)(e[o] | (e[o + 1] << 8) | (e[o + 2] << 16) | ((uint32_t)e[o + 3] << 24)); };
+                        std::printf("  strip x0 %u n %u tex %u light %u texturemid %d scale0 %d scalestep %d\n", x0, n, tex, light, i32(6), i32(10), i32(14));
+                        if ((uint32_t)locate_x >= x0 && (uint32_t)locate_x < x0 + n) {
+                            const uint32_t k = locate_x - x0;
+                            const uint8_t* c = e + 18 + 3 * k;
+                            const uint32_t scale = (uint32_t)i32(10) + k * (uint32_t)i32(14), iscale = 0xffffffffu / scale;
+                            const uint32_t idx = ((uint32_t)i32(6) + (uint32_t)(locate_y - ctx.viewheight / 2) * iscale) >> 16;
+                            const uint32_t table = ctx.tex_table[8 * tex + 4] | (ctx.tex_table[8 * tex + 5] << 8) | (ctx.tex_table[8 * tex + 6] << 16) | ((uint32_t)ctx.tex_table[8 * tex + 7] << 24);
+                            const uint32_t coff = g_pack[table + 4 * c[2]] | (g_pack[table + 4 * c[2] + 1] << 8) | (g_pack[table + 4 * c[2] + 2] << 16) | ((uint32_t)g_pack[table + 4 * c[2] + 3] << 24);
+                            const uint16_t tw = ctx.tex_table[8 * tex] | (ctx.tex_table[8 * tex + 1] << 8), th = ctx.tex_table[8 * tex + 2] | (ctx.tex_table[8 * tex + 3] << 8);
+                            std::printf("  column %u: yl %u yh %u texture column %u (texture %ux%u, column table at %u, texels at %u), scale %u iscale %u, texel index %u (&127 %u), texel %u\n",
+                                        locate_x, c[0], c[1], c[2], tw, th, table, coff, scale, iscale, idx, idx & 127, g_pack[coff + (idx & 127)]);
+                            std::printf("  texels around:");
+                            for (int d = -3; d <= 3; d++) std::printf(" [%d]=%u", (int)(idx & 127) + d, g_pack[coff + ((idx + d) & 127)]);
+                            std::printf("\n");
+                        }
+                    }
                     if (e[0] == 4) std::printf("  masked x %u tex %u col %u light %u\n", e[1] | (e[2] << 8), e[3], e[4], e[5]);
                     last = v;
                 }
@@ -358,6 +433,7 @@ int main(int argc, char** argv) {
             std::fclose(f);
         }
     }
+    if (no_pixels) { std::printf("%llu tics: the game states agree\n", (unsigned long long)frames); return 0; }
     std::printf("%llu frames of %u x %u, %s: %llu frames differ, %llu of %llu pixels (worst frame %llu); decode %llu us a frame on this host; "
                 "%u entries unsupported\n",
                 (unsigned long long)frames, vw, vh, g_env_blocks == "11" ? "whole screen" : "status bar below", (unsigned long long)bad_frames,

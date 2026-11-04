@@ -121,6 +121,7 @@ static void plane_close(void) {
 }
 
 static void emit_col(void) {
+    if (dc_yh < dc_yl) return;   /* a wall part clipped away: the engine's R_DrawColumn draws nothing of it */
 #ifdef DL_DEBUG_COLS
     { static int dbg; if (dbg < 6) { dbg++; printf("emit x %d col %d tex %d rw_scale %d step %d iscale %d mid %d\n", dc_x, cur_col, cur_tex, rw_scale, rw_scalestep, dc_iscale, dc_texturemid); } }
 #endif

@@ -279,9 +279,16 @@ def texture_columns(w, h, patches, d):
         for x in range(max(ox, 0), min(ox + pw, w)):
             count[x] += 1
             single[x] = (pname, cofs[x - ox] + 3)
+    # R_GenerateLookup stops at the first column no patch covers: the columns from there on keep
+    # the one patch's column of the first pass (also where several patches cover them), and the
+    # uncovered column reads the composite block's start
     comp_ofs = [None] * w
+    gap = [False] * w
     size = 0
     for x in range(w):
+        if count[x] == 0:
+            gap[x] = True
+            break
         if count[x] > 1:
             comp_ofs[x] = size
             size += h
@@ -308,12 +315,16 @@ def texture_columns(w, h, patches, d):
                 o += ln + 4
     cols = []
     for x in range(w):
-        if count[x] > 1:
+        if gap[x]:
+            cols.append(("composite", 0))
+        elif comp_ofs[x] is not None:
             cols.append(("composite", comp_ofs[x]))
-        elif count[x] == 1:
+        elif single[x] is not None:
             cols.append(("patch",) + single[x])
         else:
             cols.append(("none",))
+    if any(gap) and not block:
+        block = bytearray(128)   # the gap column reads the block's start: zeros, as the engine's zeroed block
     return cols, bytes(block)
 
 
