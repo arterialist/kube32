@@ -323,3 +323,42 @@ spec:
             limits: {memory: 32Ki}
           securityContext:
             capabilities: {add: ["DISPLAY", "KEYBOARD", "CHANNEL_IPC"]}
+# ---- llm-diffusion (examples/llm-diffusion.yaml) beside wordsketch on the control plane ----
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: llm-diffusion
+  namespace: default
+  labels:
+    app: llm-diffusion
+spec:
+  replicas: 1
+  strategy: {type: Recreate}
+  selector:
+    matchLabels:
+      app: llm-diffusion
+  template:
+    metadata:
+      labels:
+        app: llm-diffusion
+      annotations:
+        kube32.io/wasm-base64: "@llm-diffusion.wasm"
+        kube32.io/blobs: mdlm
+        kube32.io/execution-budget: "off"
+        kube32.io/wasm-stack: "1536"
+    spec:
+      nodeSelector:
+        node-role.kubernetes.io/control-plane: ""
+      restartPolicy: Always
+      containers:
+        - name: llm-diffusion
+          image: wasm://inline/llm-diffusion
+          ports:
+            - containerPort: 7000
+              name: http
+          resources:
+            requests:
+              memory: 256Ki
+            limits:
+              memory: 256Ki

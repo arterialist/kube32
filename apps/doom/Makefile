@@ -106,10 +106,14 @@ build/blobs/doom-web: $(IWAD) wad.py web/index.html web/doom-net.js FORCE
 	$(PYTHON) wad.py web $(IWAD) build/doom.wasm $@
 
 manifest:
-	@mkdir -p build
+	@mkdir -p build build/modules
 	$(PYTHON) -c "import sys; d=open('../../examples/doom.yaml').read().split('\n---\n'); n=[x for x in d if 'app: doom' in x or 'name: doom' in x]; open('build/doom-only.yaml','w').write('\n---\n'.join(n)+'\n')"
-	@ls ../wordsketch/build/wordsketch-listen.wasm >/dev/null 2>&1 && $(LLM) manifest --template ../../examples/doom.yaml --modules ../wordsketch/build --out build/doom.yaml \
-	    || echo "build/doom.yaml needs the wordsketch modules (make -C ../wordsketch modules); build/doom-only.yaml has the DOOM pods alone"
+	@cp -n ../wordsketch/build/*.wasm build/modules/ 2>/dev/null || true
+	@cp -n ../llm-diffusion/build/llm-diffusion.wasm build/modules/ 2>/dev/null || true
+	@ls build/modules/wordsketch-listen.wasm build/modules/llm-diffusion.wasm >/dev/null 2>&1 \
+	    && $(LLM) manifest --template ../../examples/doom.yaml --modules build/modules --out build/doom.yaml \
+	    && $(LLM) manifest --template ../../examples/wordsketch.yaml --modules build/modules --out build/wordsketch.yaml \
+	    || echo "build/doom.yaml and build/wordsketch.yaml need the wordsketch and llm-diffusion modules in build/modules/ (make -C ../wordsketch modules, make -C ../llm-diffusion build/llm-diffusion.wasm; or fetch a cluster's from /apis/kube32.io/v1/images/<sha256>); build/doom-only.yaml has the DOOM pods alone"
 
 upload: $(BLOBS)
 	@cardputer=$$($(KUBECTL) $(if $(SERVER),--server $(SERVER)) get nodes -l kube32.io/board=cardputer -o name | head -1 | cut -d/ -f2); \

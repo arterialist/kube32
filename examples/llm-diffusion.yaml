@@ -9,33 +9,43 @@
 #   kubectl --context kube32 apply -f apps/llm-diffusion/build/llm-diffusion.yaml
 #   curl -s "http://<control plane>/diffusion/generate?steps=16&prompt=Lily%20went%20to%20the%20park"
 #   curl -s "http://<control plane>/diffusion/state"
-apiVersion: v1
-kind: Pod
+apiVersion: apps/v1
+kind: Deployment
 metadata:
   name: llm-diffusion
   namespace: default
   labels:
     app: llm-diffusion
-  annotations:
-    kube32.io/wasm-base64: "__WASM_BASE64__"
-    kube32.io/blobs: mdlm
-    kube32.io/execution-budget: "off"
-    kube32.io/wasm-stack: "1536"
 spec:
-  nodeSelector:
-    node-role.kubernetes.io/control-plane: ""
-  restartPolicy: Always
-  containers:
-    - name: llm-diffusion
-      image: wasm://inline/llm-diffusion
-      ports:
-        - containerPort: 7000
-          name: http
-      resources:
-        requests:
-          memory: 256Ki
-        limits:
-          memory: 256Ki
+  replicas: 1
+  strategy: {type: Recreate}
+  selector:
+    matchLabels:
+      app: llm-diffusion
+  template:
+    metadata:
+      labels:
+        app: llm-diffusion
+      annotations:
+        kube32.io/wasm-base64: "__WASM_BASE64__"
+        kube32.io/blobs: mdlm
+        kube32.io/execution-budget: "off"
+        kube32.io/wasm-stack: "1536"
+    spec:
+      nodeSelector:
+        node-role.kubernetes.io/control-plane: ""
+      restartPolicy: Always
+      containers:
+        - name: llm-diffusion
+          image: wasm://inline/llm-diffusion
+          ports:
+            - containerPort: 7000
+              name: http
+          resources:
+            requests:
+              memory: 256Ki
+            limits:
+              memory: 256Ki
 ---
 apiVersion: v1
 kind: Service
