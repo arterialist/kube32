@@ -11,6 +11,10 @@
  *   push sent run=1 size=4600 fps=6 chunk=200 count=25 frames=360 chunks=9000
  *        skipped=0 emit_err=0 (first rc=0) frame_send_ms mean=.. max=..
  *
+ * With PEAK and PEAK_EVERY, every PEAK_EVERY-th whole frame is PEAK bytes.
+ * Messages on the topics of the pod's kube32.io/event-topics (the
+ * subscriber's input messages) are counted: inputs= in each line.
+ *
  * Environment: TOPIC (default doom.draw), SIZES (default 4600,12600), RATES
  * (default 6,8,10), CHUNK (default 200, the event limit; 17 to 200; 0 sends
  * each frame whole with k32_publish, at most 12,800 bytes),
@@ -29,7 +33,8 @@ static char line[256];
 static uint32_t line_len;
 
 static uint32_t sizes[MAX_LIST], n_sizes, rates[MAX_LIST], n_rates;
-static uint32_t chunk = 200, per_tick, seconds = 60, pause_s = 5, delay_s = 10;
+static uint32_t chunk = 200, per_tick, seconds = 60, pause_s = 5, delay_s = 10, peak, peak_every, base_size, inputs;
+static unsigned char in_block[96];
 
 /* run state; times are 32-bit milliseconds */
 static uint32_t phase, run, t_begin, t_run, t_pause, t_frame, frame, idx, count, per, size, fps, sending;
@@ -90,6 +95,9 @@ K32_EXPORT("k32_init") int32_t k32_init(void) {
     chunk = env_u("CHUNK", 5, 200);
     if (chunk != 0 && (chunk < PUSH_HDR + 1 || chunk > K32_MAX_EVENT_BYTES)) chunk = K32_MAX_EVENT_BYTES;
     per_tick = env_u("PER_TICK", 8, 0);
+    peak = env_u("PEAK", 4, 0);
+    if (peak > sizeof ev - PUSH_HDR) peak = sizeof ev - PUSH_HDR;
+    peak_every = env_u("PEAK_EVERY", 10, 0);
     seconds = env_u("SECONDS", 7, 60);
     pause_s = env_u("PAUSE", 5, 5);
     delay_s = env_u("DELAY", 5, 10);
@@ -103,7 +111,7 @@ K32_EXPORT("k32_init") int32_t k32_init(void) {
 
 static NOINLINE void begin_run(uint32_t now) {
     uint32_t r = run;   /* runs are numbered from 1; run r covers size (r-1)/n_rates, rate (r-1)%n_rates */
-    size = sizes[(r - 1) / n_rates];
+    size = base_size = sizes[(r - 1) / n_rates];
     fps = rates[(r - 1) % n_rates] ? rates[(r - 1) % n_rates] : 1;
     if (size > sizeof ev - PUSH_HDR) size = sizeof ev - PUSH_HDR;
     if (chunk == 0) {   /* the whole frame in one k32_publish */
@@ -131,6 +139,8 @@ static NOINLINE void end_run(void) {
     put(" (first rc="); putn((int32_t)first_rc); put(")");
     put(" frame_send_ms mean="); putn(frames ? (int32_t)(send_ms_sum / frames) : 0);
     put(" max="); putn((int32_t)send_ms_max);
+    put(" inputs="); putn((int32_t)inputs);
+    inputs = 0;
     flush();
 }
 
@@ -182,10 +192,23 @@ static NOINLINE void step(uint32_t now) {
     if ((int32_t)(now - due(frame)) < 0) return;
     while ((int32_t)(now - due(frame + 1)) >= 0) { frame++; skipped++; }
     t_frame = now;
+    /* whole frames: every PEAK_EVERY-th frame is PEAK bytes */
+    if (per == 0) size = peak && peak_every && frame % peak_every == 0 ? peak : base_size;
     t_sent_unix = (uint32_t)k32_unix_time_ms();
     idx = 0;
     sending = 1;
     step(now);
+}
+
+/* Messages on the input topic (event-topics): counted per run */
+K32_EXPORT("k32_alloc") uint32_t k32_alloc(uint32_t n) {
+    return n <= sizeof in_block ? (uint32_t)(uintptr_t)in_block : 0;
+}
+
+K32_EXPORT("k32_event") int32_t k32_event(uint32_t tp, uint32_t tl, uint32_t ptr, uint32_t len) {
+    (void)tp; (void)tl; (void)ptr;
+    if (len > 0) inputs++;
+    return 0;
 }
 
 K32_EXPORT("k32_tick") int32_t k32_tick(uint32_t uptime_ms) {

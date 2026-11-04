@@ -109,11 +109,11 @@ A pod publishes a message on a topic with `k32_event_emit` (up to 200 bytes, `K3
 
 ### Delivery
 
-A message of up to 224 bytes travels as one frame. A larger message travels in frames of up to 1470 bytes: ESP-NOW v2 frames, or UDP datagrams that fit a 1500-byte MTU. The receiving node puts the fragments in place as they arrive, in any order, and delivers the message whole. When a fragment is missing 500 ms after the last one arrived, it drops the message and counts it. The sender transmits a frame again once when the peer's radio does not acknowledge it or the send fails.
+A message of up to 224 bytes travels as one frame. A larger message travels in frames of up to 1470 bytes (UDP datagrams that fit a 1500-byte MTU, or ESP-NOW v2 frames), or of up to 546 bytes to a node that announces that limit (a board without PSRAM). The receiving node puts the fragments in place as they arrive, in any order, and delivers the message whole. When a fragment is missing 500 ms after the last one arrived, it drops the message and counts it. When sending a frame fails, the sender tries twice more, 2 ms apart.
 
 Each node announces the topics it subscribes to, and the bytes a second it takes, on the topic `k32.subs` with every HELLO (every 3 s) and when its subscriptions change: its pods' `kube32.io/event-topics`, the topics of its Ingress event streams, and the channels its pods open by name. A publish goes only to the nodes that subscribe to its topic. A node that announces no subscriptions, or whose last announcement is older than 20 s, gets every topic. A publish to a node that announces a rate waits until that node's pace allows the message, at most 500 ms, so a fast publisher slows down instead of overrunning a small receiver.
 
-A node heard over ESP-NOW in the last 10 s receives messages over ESP-NOW, which is one hop and acknowledged by its radio. Any other node receives messages over UDP port 7400 through the access point. HELLOs go over UDP to every node with a known address, and over ESP-NOW broadcast.
+Messages go over UDP port 7400 through the access point to every node whose address is known, and over ESP-NOW to a node heard only over ESP-NOW. A sustained stream of messages over ESP-NOW stops a board without PSRAM from receiving data frames (its Wi-Fi driver keeps every dynamic RX buffer allocated), so ESP-NOW carries only HELLOs, subscription announcements and nodes without an address. HELLOs go over UDP to every node with a known address, and over ESP-NOW broadcast.
 
 ### Memory
 
@@ -134,7 +134,7 @@ A pod's queued event holds the received message itself, so every subscriber on t
 
 | Value | Cause |
 | --- | --- |
-| `K32_ERR_HOSTUNREACH` (`-113`) | A node's radio did not acknowledge a frame, also when the frame was sent a second time |
+| `K32_ERR_HOSTUNREACH` (`-113`) | A node's radio did not acknowledge an ESP-NOW frame, three times |
 | `K32_ERR_TIMEOUT` (`-110`) | A node's radio did not report the send |
 | `K32_ERR_IO` (`-5`) | The frame could not be sent (the driver's or lwIP's queue was full) |
 | `K32_ERR_AGAIN` (`-11`) | A subscriber on this node had a full queue |
@@ -147,7 +147,7 @@ The console command `K32_CMD:IPC` prints the node's counters as a `K32_IPC` line
 | --- | --- |
 | `published`, `publish_errors` | Messages published on this node, and those a destination missed |
 | `fanout_skipped` | Sends left out because the peer does not subscribe to the topic |
-| `tx_frames`, `send_errors`, `retried` | Frames sent, frames that failed twice, frames sent a second time |
+| `tx_frames`, `send_errors`, `retried` | Frames sent, frames that failed three times, tries after a failure |
 | `rx_messages`, `reassembled` | Messages queued for this node's subscribers, and those put together from fragments |
 | `incomplete` | Messages dropped because a fragment never came, or because both reassembly slots of a board without PSRAM were taken |
 | `nomem` | Messages and frames dropped because no memory or budget held them |
@@ -156,7 +156,7 @@ The console command `K32_CMD:IPC` prints the node's counters as a `K32_IPC` line
 | `malformed`, `crc` | Fragments that do not fit their message, frames with a wrong CRC |
 | `dispatch_dropped` | Messages dropped because the subscribers' queue was full |
 
-`K32_CMD:IPCGAP:<us>`, `K32_CMD:IPCRXQ:<frames>` and `K32_CMD:IPCROUTE:<auto|udp|espnow>` set, until the next reboot, a pause between two frames of one message, the length of the ESP-NOW receive queue and how messages reach peers.
+`K32_CMD:IPCGAP:<us>`, `K32_CMD:IPCRXQ:<frames>` and `K32_CMD:IPCROUTE:<udp|auto|espnow>` set, until the next reboot, a pause between two frames of one message, the length of the ESP-NOW receive queue and how messages reach peers.
 
 ## Calls from pods with k32_http_call
 
