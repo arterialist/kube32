@@ -432,6 +432,9 @@ static int32_t serve_web(const char* lump, const char* type) {
             if (strncmp((const char*)e + 8, lump, 8)) continue;
             uint32_t pos = e[0] | e[1] << 8 | e[2] << 16 | (uint32_t)e[3] << 24;
             uint32_t left = e[4] | e[5] << 8 | e[6] << 16 | (uint32_t)e[7] << 24;
+            uint8_t magic[2];
+            if (left >= 2 && k32_blob_read(h, pos, magic, 2) == 2 && magic[0] == 0x1f && magic[1] == 0x8b)
+                k32_resp_header("Content-Encoding", 16, "gzip", 4);   /* a gzipped lump (wad.py web) */
             k32_resp_header("Cache-Control", 13, "no-cache", 8);
             k32_resp_begin(200, type, (uint32_t)strlen(type));
             while (left) {

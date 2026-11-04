@@ -423,7 +423,10 @@ def pack(src, dst):
 def simpack(src, dst):
     """The sim pack: the IWAD with the graphics the sim never reads cut to what it does read
     (wad.py simpack <iwad> <wad>): patches and sprites keep their 8-byte header (width, height,
-    offsets), flats keep their name only. Lump numbers do not change."""
+    offsets), flats and the screen's graphics (title, menu, fonts, status bar) keep their name
+    only. Lump numbers do not change."""
+    MAP = set(MAP_LUMPS)
+    KEEP = {"PLAYPAL", "COLORMAP", "TEXTURE1", "TEXTURE2", "PNAMES", "GENMIDI", "DMXGUS"}
     kind, lumps = read_wad(src)
     names = [n for n, _ in lumps]
     d = dict(lumps)
@@ -440,27 +443,35 @@ def simpack(src, dst):
         elif name in ("P_END", "PP_END"):
             in_patches = False
         keep = data
+        in_map = any(0 <= k - names.index(m) < 1 + len(MAP_LUMPS) for m in ("E1M1", "MAP01") if m in names) if False else False
         if f0 < k < f1:
             keep = b""
         elif s0 < k < s1 or ((in_patches or name in pnames) and data):
             keep = data[:8]
+        elif name not in KEEP and name not in MAP and not (name.startswith("E") and len(name) == 4 and name[2] == "M") \
+                and not name.startswith("MAP") and not name.endswith("_START") and not name.endswith("_END"):
+            keep = b""   # title, menu, font, status bar and intermission graphics: the sim draws nothing
         cut_bytes += len(data) - len(keep)
         out.append((name, keep))
     total = write_wad(dst, b"IWAD", out)
     print("%s: %d lumps, %d bytes (%d cut from %d)" % (dst, len(out), total, cut_bytes, os.path.getsize(src)))
 
 
-def web(iwad, engine, dst):
+def web(iwad, engine, dst, plain=False):
     """The browser client the pod serves for a two-player game (wad.py web <iwad> <doom.wasm> <out>):
     a PWAD whose lumps are the page (INDEX), its host (DOOMJS), the full engine (DOOMWASM) and the
-    IWAD the browser plays (IWAD). Upload it as the blob DOOM_WEB_BLOB names."""
+    IWAD the browser plays (IWAD), each gzipped (the pod serves a lump that starts with gzip's
+    magic with Content-Encoding: gzip; --raw keeps them plain). Upload it as the blob
+    DOOM_WEB_BLOB names."""
+    import gzip
     web_dir = os.path.join(HERE, "web")
-    lumps = [("INDEX", open(os.path.join(web_dir, "index.html"), "rb").read()),
-             ("DOOMJS", open(os.path.join(web_dir, "doom-net.js"), "rb").read()),
-             ("DOOMWASM", open(engine, "rb").read()),
-             ("IWAD", open(iwad, "rb").read())]
+    raw = [("INDEX", open(os.path.join(web_dir, "index.html"), "rb").read()),
+           ("DOOMJS", open(os.path.join(web_dir, "doom-net.js"), "rb").read()),
+           ("DOOMWASM", open(engine, "rb").read()),
+           ("IWAD", open(iwad, "rb").read())]
+    lumps = raw if plain else [(n, gzip.compress(d, compresslevel=9, mtime=0)) for n, d in raw]
     total = write_wad(dst, b"PWAD", lumps)
-    print("%s: %d bytes (%s)" % (dst, total, ", ".join("%s %d" % (n, len(d)) for n, d in lumps)))
+    print("%s: %d bytes (%s)" % (dst, total, ", ".join("%s %d%s" % (n, len(d), "" if plain else " of %d" % len(r)) for (n, d), (_, r) in zip(lumps, raw))))
 
 
 def fetch(directory):
@@ -497,6 +508,7 @@ def main():
     w.add_argument("iwad")
     w.add_argument("engine")
     w.add_argument("dst")
+    w.add_argument("--raw", action="store_true", help="store the lumps plain, not gzipped")
     a = ap.parse_args()
     if a.cmd == "fetch":
         fetch(a.dir)
@@ -505,7 +517,7 @@ def main():
     elif a.cmd == "simpack":
         simpack(a.src, a.dst)
     elif a.cmd == "web":
-        web(a.iwad, a.engine, a.dst)
+        web(a.iwad, a.engine, a.dst, a.raw)
     else:
         cut(a.src, a.dst, a.map.upper(), not a.no_intermission)
 
