@@ -177,6 +177,10 @@ class TestUnits(unittest.TestCase):
                 linked[n] = sig
             for n, sig in re.findall(r'K32_MAT(?:RIX|MUL)\("([a-z0-9_]+)", "([^"]+)"', text):
                 linked[n] = sig
+            # The attention imports share one signature, given where their table is linked
+            att = re.search(r'kAttentionImports\) m3_LinkRawFunctionEx\(module, "env", im\.name, "([^"]+)"', text)
+            for n in re.findall(r'K32_ATTENTION\("([a-z0-9_]+)"', text):
+                linked[n] = att.group(1)
         self.assertEqual(linked, wasm.KNOWN_IMPORTS)
 
 
