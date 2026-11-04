@@ -181,16 +181,32 @@ struct Memory {
     uint64_t size;
     bool blob_fault;   // the last miss was a blob address
     bool not_mapped;
+    // A blob's mapping, looked up once a call (a frame's columns read thousands of windows
+    // of the same blob; the lookup takes the blob table's lock and the pod's name)
+    uint32_t blob_handle{8};
+    const uint8_t* blob_base{nullptr};
+    uint64_t blob_size{0};
 };
 static const uint8_t* resolve(void* ctx, uint32_t addr, uint32_t len) {
     Memory& m = *static_cast<Memory*>(ctx);
     const bool blob = (addr & K32_BLOB_ADDR_FLAG) != 0 && addr >= m.size;
     m.blob_fault = blob;
     if (!blob) return inside(m.size, addr, len) ? m.base + addr : nullptr;
-    int32_t rc = K32_OK;
-    const uint8_t* p = PodBlobs::instance().view(app_pod_id(m.rt), (addr >> K32_BLOB_HANDLE_SHIFT) & 7, addr & K32_BLOB_OFFSET_MASK, len, rc);
-    if (!p && rc == K32_ERR_NOTSUP) m.not_mapped = true;
-    return p;
+    const uint32_t handle = (addr >> K32_BLOB_HANDLE_SHIFT) & 7, off = addr & K32_BLOB_OFFSET_MASK;
+    if (handle != m.blob_handle) {
+        int32_t rc = K32_OK;
+        const std::string& pod = app_pod_id(m.rt);
+        const int32_t size = PodBlobs::instance().size(pod, static_cast<int32_t>(handle));
+        const uint8_t* base = size > 0 ? PodBlobs::instance().view(pod, handle, 0, static_cast<uint64_t>(size), rc) : nullptr;
+        if (!base) {
+            if (rc == K32_ERR_NOTSUP) m.not_mapped = true;
+            return nullptr;
+        }
+        m.blob_handle = handle;
+        m.blob_base = base;
+        m.blob_size = static_cast<uint64_t>(size);
+    }
+    return off <= m.blob_size && len <= m.blob_size - off ? m.blob_base + off : nullptr;
 }
 
 static M3Result charge(IM3Runtime rt, uint64_t units) {
