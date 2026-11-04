@@ -17,12 +17,15 @@ The model is `models/mdlm` ([model card](../../models/mdlm/README.md)): 4 layers
 ```sh
 make -C apps/llm-diffusion
 kubectl --context kube32 replace --raw \
+  "/api/v1/nodes/<node>/proxy/blobs/llm-diffusion?size=$(wc -c < apps/llm-diffusion/build/llm-diffusion.wasm)" \
+  -f apps/llm-diffusion/build/llm-diffusion.wasm
+kubectl --context kube32 replace --raw \
   "/api/v1/nodes/<node>/proxy/blobs/mdlm?size=$(wc -c < apps/llm-diffusion/build/mdlm-blob.bin)" \
   -f apps/llm-diffusion/build/mdlm-blob.bin
 kubectl --context kube32 apply -f apps/llm-diffusion/build/llm-diffusion.yaml
 ```
 
-`make` builds the module, `build/mdlm-blob.bin` (the model without its rotary table), `build/llm-diffusion.yaml` (`examples/llm-diffusion.yaml` with the module inline) and the [viewer](#viewer-on-the-cardputer)'s `build/llm-diffusion-viewer.yaml`. `tools/pack.py` writes the rotary table and the tokenizer into the module's data. The pod needs a node with PSRAM and about 13 free flash blocks. Upload the blob to the node's API server address when the request body exceeds the serial gateway's 64 KB.
+`make` builds the module, `build/mdlm-blob.bin` (the model without its rotary table), `build/llm-diffusion.yaml` (a copy of `examples/llm-diffusion.yaml`: the Deployment names the module blob, `wasm://blob/llm-diffusion`, so the object stays under the serial gateway's body limit) and the [viewer](#viewer-on-the-cardputer)'s `build/llm-diffusion-viewer.yaml`. `tools/pack.py` writes the rotary table and the tokenizer into the module's data. The pod needs a node with PSRAM and about 14 free flash blocks (13 for the weights, 1 for the module). Upload the blob to the node's API server address when the request body exceeds the serial gateway's 64 KB.
 
 ## API
 

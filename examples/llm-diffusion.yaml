@@ -1,8 +1,13 @@
 # llm-diffusion: a masked diffusion language model on the control plane. The
-# weights stay in the node's flash blob store and the node's linear algebra
-# reads them in place; the pod holds the 64-token window's activations.
+# module and the weights stay in the node's flash blob store (the Deployment
+# is a 2 KB object, within the serial gateway's body limit) and the node's
+# linear algebra reads the weights in place; the pod holds the 64-token
+# window's activations.
 #
 #   make -C apps/llm-diffusion
+#   kubectl --context kube32 replace --raw \
+#     "/api/v1/nodes/<node>/proxy/blobs/llm-diffusion?size=$(wc -c < apps/llm-diffusion/build/llm-diffusion.wasm)" \
+#     -f apps/llm-diffusion/build/llm-diffusion.wasm
 #   kubectl --context kube32 replace --raw \
 #     "/api/v1/nodes/<node>/proxy/blobs/mdlm?size=$(wc -c < apps/llm-diffusion/build/mdlm-blob.bin)" \
 #     -f apps/llm-diffusion/build/mdlm-blob.bin
@@ -27,8 +32,7 @@ spec:
       labels:
         app: llm-diffusion
       annotations:
-        kube32.io/wasm-base64: "__WASM_BASE64__"
-        kube32.io/blobs: mdlm
+        kube32.io/blobs: llm-diffusion,mdlm
         kube32.io/execution-budget: "off"
         kube32.io/wasm-stack: "1536"
     spec:
@@ -37,7 +41,7 @@ spec:
       restartPolicy: Always
       containers:
         - name: llm-diffusion
-          image: wasm://inline/llm-diffusion
+          image: wasm://blob/llm-diffusion
           ports:
             - containerPort: 7000
               name: http

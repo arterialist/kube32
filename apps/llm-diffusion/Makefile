@@ -35,7 +35,7 @@ build/tables.h: build/mdlm-blob.bin
 	@test -f $@
 
 build/llm-diffusion.yaml: ../../examples/llm-diffusion.yaml build/llm-diffusion.wasm
-	sed "s|__WASM_BASE64__|$$(base64 < build/llm-diffusion.wasm | tr -d '\n')|" $< > $@
+	cp $< $@
 
 # the viewer: one 64 KiB page, of which the pod limit keeps 20 KiB
 VIEWER_LD = $(if $(findstring rust-lld,$(WASM_LD)),-flavor wasm) --no-entry --allow-undefined -z stack-size=2048 --initial-memory=65536 --max-memory=65536

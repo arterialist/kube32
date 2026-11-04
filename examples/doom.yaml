@@ -336,8 +336,7 @@ spec:
       labels:
         app: llm-diffusion
       annotations:
-        kube32.io/wasm-base64: "@llm-diffusion.wasm"
-        kube32.io/blobs: mdlm
+        kube32.io/blobs: llm-diffusion,mdlm
         kube32.io/execution-budget: "off"
         kube32.io/wasm-stack: "1536"
     spec:
@@ -346,7 +345,7 @@ spec:
       restartPolicy: Always
       containers:
         - name: llm-diffusion
-          image: wasm://inline/llm-diffusion
+          image: wasm://blob/llm-diffusion
           ports:
             - containerPort: 7000
               name: http
