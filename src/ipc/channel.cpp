@@ -1037,11 +1037,11 @@ bool ChannelManager::start_background(uint32_t hello_interval_ms, size_t dispatc
     // Wi-Fi stops sending under a heavier stream of large messages
 #if defined(KUBE32_TARGET_ESP32)
     rx_rate_bytes_.store(psram ? 0 : K32C_RX_RATE_NO_PSRAM);
-    // and frames of at most 546 bytes: the radio holds each received frame
-    // in a buffer of its size from the heap until the frame is handed on,
-    // and twelve 1.5 KB frames at once leave the heap too little for the
-    // driver (which then stops receiving and sending for good)
-    rx_max_frame_.store(psram ? 0 : static_cast<uint32_t>(K32C_MID_FRAME_LEN));
+    // Frames stay 1470 bytes (3 datagrams for a 4 KB frame): a burst of
+    // 546-byte frames, 8 or more a message, overruns lwIP's UDP receive
+    // mailbox while the node's pod is busy, and the heap the smaller frames
+    // were to spare is held by the linalg scratch no longer taken here
+    rx_max_frame_.store(0);
 #endif
     has_psram_ = psram;
     background_running_.store(true);
