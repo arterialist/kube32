@@ -49,7 +49,8 @@ spec:
             - {name: DOOM_WAD_BLOB, value: "doom-wad"}         # the sim pack (wad.py simpack)
             - {name: DOOM_ARGS, value: "-warp 1 1 -skill 3 -kb 224"}
             - {name: DOOM_SCREENBLOCKS, value: "11"}           # the whole 240 x 135 screen
-            - {name: DOOM_FPS, value: "8"}
+            - {name: DOOM_FPS, value: "4"}
+            - {name: DOOM_NET_DELAY, value: "5"}               # input delay in tics (README: by round trip)
             - {name: DOOM_PLAYERS, value: "2"}                 # a browser may join as player 2
             - {name: DOOM_WEB_BLOB, value: "doom-web"}         # the page for it (wad.py web)
             - {name: DOOM_NET_TOPIC, value: "doom.tics"}
