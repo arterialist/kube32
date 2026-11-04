@@ -1487,12 +1487,12 @@ void console_task(void* arg) {
                     static_cast<Console*>(ctx)->write(l, static_cast<size_t>(ll));
                 }, &con);
                 con.write("K32_OK pool\n", 12);
-#if CONFIG_HEAP_USE_HOOKS
             } else if (line == "K32_CMD:WIFISTATS") {
-                // The Wi-Fi driver's buffer and RX/TX counters, in its own log format
+                // The Wi-Fi driver's buffer and RX/TX counters, in its own log
+                // format: a buffer type whose alloc column stays at its max
+                // has stopped the driver
                 console_run_deep(con, [&] { esp_wifi_statis_dump(WIFI_STATIS_BUFFER | WIFI_STATIS_RXTX); });
                 con.write("K32_OK wifistats\n", 17);
-#endif
             } else if (line == "K32_CMD:TCP") {
                 // lwIP's TCP connections and the bytes each one holds
                 console_tcp_pcbs(con);

@@ -111,13 +111,14 @@ std::vector<std::vector<uint8_t>> split(const std::string& topic, uint32_t sende
     return out;
 }
 
-void subs_announcement(uint32_t node_id, const std::vector<std::string>& topics, uint32_t rate = 0) {
-    std::vector<uint8_t> p(8 + 4 * topics.size());
+void subs_announcement(uint32_t node_id, const std::vector<std::string>& topics, uint32_t rate = 0, uint32_t max_frame = 0) {
+    std::vector<uint8_t> p(12 + 4 * topics.size());
     std::memcpy(p.data(), &node_id, 4);
     std::memcpy(p.data() + 4, &rate, 4);
+    std::memcpy(p.data() + 8, &max_frame, 4);
     for (size_t i = 0; i < topics.size(); ++i) {
         const uint32_t h = fnv1a_32(topics[i]);
-        std::memcpy(p.data() + 8 + 4 * i, &h, 4);
+        std::memcpy(p.data() + 12 + 4 * i, &h, 4);
     }
     feed(make_frame(fnv1a_32(K32C_SUBS_TOPIC), 0, 1, 0, 1, p.data(), p.size(), 0));
 }
@@ -308,7 +309,7 @@ void test_subscription_fanout() {
             const auto* h = hdr_of(f);
             uint32_t node = 0;
             std::memcpy(&node, f.data() + K32C_HEADER_LEN, 4);
-            for (size_t off = 8; off + 4 <= h->payload_len; off += 4) {
+            for (size_t off = 12; off + 4 <= h->payload_len; off += 4) {
                 uint32_t v = 0;
                 std::memcpy(&v, f.data() + K32C_HEADER_LEN + off, 4);
                 if (node == 1 && v == mine) return true;
@@ -354,6 +355,47 @@ void test_announced_rate() {
     std::cout << "[PASS] test_announced_rate" << std::endl;
 }
 
+// A peer that takes frames of at most 546 bytes gets 520-byte fragments,
+// and they reassemble in any order
+void test_announced_frame_size() {
+    start_node();
+    auto& m = ChannelManager::instance();
+    PeerSocket a(kBasePort + 41);
+    m.add_peer(peer(41, "small", a.port));
+    subs_announcement(41, {"doom.draw"}, 0, K32C_MID_FRAME_LEN);
+    const auto msg = pattern(12600, 60);
+    assert(m.publish("pub", "doom.draw", msg.data(), msg.size()) == static_cast<int32_t>(msg.size()));
+    auto frames = frames_of(a.drain(150), "doom.draw");
+    assert(frames.size() == (msg.size() + K32C_MID_CHUNK - 1) / K32C_MID_CHUNK);   // 25
+    for (const auto& f : frames) {
+        assert(f.size() <= K32C_MID_FRAME_LEN);
+        assert((hdr_of(f)->flags & K32C_FLAG_MID) && !(hdr_of(f)->flags & K32C_FLAG_LARGE));
+    }
+    Received r;
+    subscribe_into("doom.draw", r);
+    std::reverse(frames.begin(), frames.end());
+    for (const auto& f : frames) feed(f);
+    assert(wait_for([&] { return r.count() == 1; }, 1000));
+    assert(r.msgs[0] == msg);
+    // The largest message fits 32 fragments of 520 bytes
+    std::vector<uint8_t> big = pattern(K32C_MAX_MESSAGE_BYTES, 61);
+    for (const auto& f : split("doom.draw", 0xD4, 70, big, K32C_MID_CHUNK, K32C_FLAG_MID)) feed(f);
+    assert(wait_for([&] { return r.count() == 2; }, 1000));
+    assert(r.msgs[1] == big);
+    // This node announces its own largest frame
+    m.set_rx_max_frame(777);
+    bool seen = false;
+    for (const auto& f : frames_of(a.drain(300), K32C_SUBS_TOPIC)) {
+        uint32_t node = 0, mf = 0;
+        std::memcpy(&node, f.data() + K32C_HEADER_LEN, 4);
+        std::memcpy(&mf, f.data() + K32C_HEADER_LEN + 8, 4);
+        if (node == 1 && mf == 777) seen = true;
+    }
+    assert(seen);
+    m.shutdown();
+    std::cout << "[PASS] test_announced_frame_size" << std::endl;
+}
+
 // publish reports a message a local subscriber's full queue dropped, and one
 // no memory could hold
 void test_publish_errors() {
@@ -391,6 +433,7 @@ int main() {
     test_loss();
     test_subscription_fanout();
     test_announced_rate();
+    test_announced_frame_size();
     test_publish_errors();
     std::cout << "All large channel message tests passed" << std::endl;
     return 0;
