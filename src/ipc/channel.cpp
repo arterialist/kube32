@@ -668,9 +668,11 @@ int32_t ChannelManager::send_frames_to(const NodeEndpoint& ep, uint32_t channel_
             }
         }
         int32_t res = transport_->send_frame(ep, frame, frame_bytes + 2);
-        if (res != IPC_OK) {
-            // One more try: a lost frame loses the whole message
+        // Two more tries, 2 ms apart (the radio's or lwIP's queue was full,
+        // or the peer did not acknowledge): a lost frame loses the message
+        for (int retry = 0; retry < 2 && res != IPC_OK; ++retry) {
             stats_.frames_retried.fetch_add(1, std::memory_order_relaxed);
+            osal::Thread::sleep_ms(2);
             res = transport_->send_frame(ep, frame, frame_bytes + 2);
         }
         if (res == IPC_OK) stats_.frames_sent.fetch_add(1, std::memory_order_relaxed);

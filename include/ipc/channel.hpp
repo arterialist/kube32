@@ -241,8 +241,8 @@ struct PeerInfo {
     // ("" from a worker)
     std::string api_address;
     // Where the node was last heard over ESP-NOW and over UDP (0: never).
-    // A node heard over ESP-NOW in the last K32C_ESPNOW_FRESH_MS is sent
-    // to over ESP-NOW (one hop, acknowledged by the radio), else over UDP.
+    // Messages go over UDP to a node whose address is known, else over
+    // ESP-NOW (see ChannelManager::Route).
     uint64_t espnow_seen_ms{0};
     uint64_t udp_seen_ms{0};
     uint8_t mac_address[6]{0};
@@ -320,8 +320,11 @@ public:
     // 32 with PSRAM)
     void set_rx_queue_frames(size_t n);
     size_t rx_queue_frames() const;
-    // 0: ESP-NOW to a node heard over ESP-NOW recently, else UDP; 1: UDP
-    // whenever the node's address is known; 2: ESP-NOW whenever its MAC is
+    // 1 (the default): UDP whenever the node's address is known, else
+    // ESP-NOW; 0: ESP-NOW to a node heard over ESP-NOW in the last
+    // K32C_ESPNOW_FRESH_MS, else UDP; 2: ESP-NOW whenever its MAC is known.
+    // A stream of messages over ESP-NOW stops a board without PSRAM from
+    // receiving data frames: its Wi-Fi driver keeps every dynamic RX buffer
     enum class Route : uint8_t { Auto = 0, Udp = 1, EspNow = 2 };
     void set_route(Route r) { route_.store(static_cast<uint8_t>(r)); }
     Route route() const { return static_cast<Route>(route_.load()); }
@@ -490,7 +493,7 @@ private:
     // Sending: one sender at a time
     osal::Mutex send_mutex_;
     std::atomic<uint32_t> fragment_gap_us_{0};
-    std::atomic<uint8_t> route_{0};
+    std::atomic<uint8_t> route_{1};
     std::atomic<size_t> rx_budget_bytes_{K32C_MAX_MESSAGE_BYTES * 8};
     bool has_psram_{false};
     std::atomic<uint32_t> rx_rate_bytes_{0};

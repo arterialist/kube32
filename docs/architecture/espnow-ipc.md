@@ -1,6 +1,6 @@
 # Events between nodes
 
-Pods exchange messages across `src/ipc/channel.cpp` over ESP-NOW and UDP port 7400. A peer heard over ESP-NOW in the last 10 s is sent to over ESP-NOW, any other over UDP. The simulator uses UDP on port 7400 plus the node ID. [Channel topics between nodes](../networking.md#channel-topics-between-nodes) covers delivery, fan-out, memory and errors.
+Pods exchange messages across `src/ipc/channel.cpp` over ESP-NOW and UDP port 7400. Messages go over UDP to a peer whose address is known and over ESP-NOW to a peer heard only over ESP-NOW. The simulator uses UDP on port 7400 plus the node ID. [Channel topics between nodes](../networking.md#channel-topics-between-nodes) covers delivery, fan-out, memory and errors.
 
 ## Host API
 
@@ -26,7 +26,7 @@ Set the pod annotation `kube32.io/event-topics: a,b` to deliver channel topics f
 | Reassembly | 12 fragments of 1444 bytes (32 of 224 bytes from older senders), 500 ms timeout, 2 messages in flight without PSRAM and 8 with it |
 | Receive queue per channel | 8 slots of 512 bytes on hardware; 16 slots of 1024 bytes on the simulator |
 | Maximum frame size | 1470 bytes; 250 bytes for a message of up to 224 bytes |
-| Delivery | A message arrives whole or not at all; a frame the peer's radio does not acknowledge is sent once more; drops are counted (`K32_CMD:IPC`) |
+| Delivery | A message arrives whole or not at all; a frame whose send fails is tried twice more, 2 ms apart; drops are counted (`K32_CMD:IPC`) |
 
 ## Peer discovery
 
