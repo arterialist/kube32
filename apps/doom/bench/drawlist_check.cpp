@@ -49,8 +49,19 @@ extern "C" int32_t dl_host_columns(uint8_t* dst, uint32_t stride, int32_t y0, ui
     const uint8_t* cmap = resolve(nullptr, colormap, 34 * 256);
     if (!cmap) return K32_ERR_FAULT;
     const uint64_t t0 = now_us();
+    static const char* trace = std::getenv("DL_TRACE");   // "x,y": the records at column x and the pixel at y after the call
+    int tx = -1, ty = -1;
+    if (trace) std::sscanf(trace, "%d,%d", &tx, &ty);
     int32_t rc = kube32::runtime::raster_columns(dst, stride, y0, rows, static_cast<const uint8_t*>(records), n, cmap, translation, centery,
                                                  &resolve, nullptr, &bad);
+    if (trace)
+        for (uint32_t i = 0; i < n; i++) {
+            const uint8_t* r = static_cast<const uint8_t*>(records) + 24 * i;
+            const uint32_t x = r[16] | (r[17] << 8);
+            if ((int)x != tx || ty < y0 || ty >= y0 + (int)rows) continue;
+            std::printf("  record kind %u index %u x %u a %u b %u light %u src %u: band row %d now %u (rc %d)\n", r[23], r[18] | (r[19] << 8), x, r[20], r[21],
+                        r[22], r[0] | (r[1] << 8) | (r[2] << 16) | ((uint32_t)r[3] << 24), ty, dst[(ty - y0) * stride + x], rc);
+        }
     g_kernel_us += now_us() - t0;
     g_column_records += n;
     g_kernel_calls++;
@@ -174,6 +185,7 @@ int main(int argc, char** argv) {
     int tics = 350;
     bool spin = false;
     const char* dump = nullptr;
+    int locate_x = -1, locate_y = -1, locate_tic = -1;   // --locate x,y,tic: which entry last writes that pixel
     for (int i = 5; i < argc; i++) {
         std::string a = argv[i];
         if (a == "--tics") tics = std::atoi(argv[++i]);
@@ -182,6 +194,7 @@ int main(int argc, char** argv) {
         else if (a == "--screenblocks") g_env_blocks = argv[++i];
         else if (a == "--spin") spin = true;
         else if (a == "--dump") dump = argv[++i];
+        else if (a == "--locate") std::sscanf(argv[++i], "%d,%d,%d", &locate_x, &locate_y, &locate_tic);
     }
     Engine full, sim;
     if (!full.load(argv[1], false) || !sim.load(argv[2], true)) return 1;
@@ -190,10 +203,10 @@ int main(int argc, char** argv) {
     const uint32_t hl = dl_head_len(g_pack.data());
     if (dl_init(&ctx, 0, g_pack.data(), hl)) { std::printf("not a version 2 render pack\n"); return 1; }
 
-    // the bench's course
+    // the bench's course, without its cheat: cheats are the status bar's, which the sim
+    // leaves out (as a netgame does), and a player that dies in one engine only diverges
     const int UP = 0xad, LEFT = 0xac, RIGHT = 0xae, FIRE = 0xa3, USE = 0xa2;
     std::vector<std::vector<int>> course;
-    for (int c : {'i', 'd', 'd', 'q', 'd'}) { course.push_back({3, 1, c}); course.push_back({3, 0, c}); }
     const int pattern[][3] = {{UP, 0, 70}, {RIGHT, UP, 20}, {UP, FIRE, 40}, {LEFT, 0, 30}, {UP, USE, 50}, {RIGHT, FIRE, 35}, {UP, 0, 60}, {LEFT, UP, 25}};
     if (spin) course.push_back({10, 1, RIGHT});
     for (int t = 10; t < tics;) {
@@ -249,6 +262,82 @@ int main(int argc, char** argv) {
         }
         decode_us += now_us() - t0;
         const uint8_t* want = full.mem() + screen;
+        if (t == locate_tic) {
+            // draw the list entry by entry (its header's byte count cut after each) and watch the pixel
+            std::vector<uint8_t> copy(list, list + ll), f2((size_t)vw * vh, 0);
+            uint32_t at = 28, k = 0;
+            uint8_t last = 0;
+            while (at < ll) {
+                const uint8_t* e = list + at;
+                uint32_t size;
+                if (e[0] == 1) size = 18 + 3 * e[3];
+                else if (e[0] == 2) size = 9 + 13 * (e[7] | (e[8] << 8));
+                else if (e[0] == 3) { const uint32_t x1 = e[3] | (e[4] << 8), x2 = e[5] | (e[6] << 8); size = 25 + 2 * (x2 >= x1 ? x2 - x1 + 1 : 0); }
+                else size = 20;
+                at += size;
+                copy[4] = at & 255; copy[5] = at >> 8;
+                std::fill(f2.begin(), f2.end(), 0);
+                for (uint32_t y0 = 0; y0 < vh; y0 += 27) {
+                    const uint32_t rows = std::min<uint32_t>(27, vh - y0);
+                    dl_draw(&ctx, copy.data(), ll, band.data(), vw, (int32_t)y0, rows);
+                    std::memcpy(f2.data() + (size_t)y0 * vw, band.data(), (size_t)rows * vw);
+                }
+                const uint8_t v = f2[(size_t)locate_y * vw + locate_x];
+                if (e[0] == 3 || e[0] == 4) {
+                    const uint32_t ex1 = e[0] == 3 ? (e[3] | (e[4] << 8)) : (e[1] | (e[2] << 8)), ex2 = e[0] == 3 ? (e[5] | (e[6] << 8)) : ex1;
+                    if ((uint32_t)locate_x >= ex1 && (uint32_t)locate_x <= ex2) {
+                        std::printf("entry %u (type %u) covers x %d: columns %u..%u", k, e[0], locate_x, ex1, ex2);
+                        if (e[0] == 3) std::printf(", clips at x: ceiling %d floor %d", (int)e[25 + 2 * (locate_x - ex1)] - 2, (int)e[26 + 2 * (locate_x - ex1)] - 2);
+                        std::printf("; pixel now %u\n", v);
+                        if (e[0] == 3) {   // the column's posts as the kernel walks them
+                            auto i32 = [&](const uint8_t* q) { return (int32_t)(q[0] | (q[1] << 8) | (q[2] << 16) | ((uint32_t)q[3] << 24)); };
+                            const uint32_t lump = e[1] | (e[2] << 8), idx = lump - ctx.first_sprite;
+                            const uint32_t off = (uint32_t)(ctx.sprite_table[8 * idx] | (ctx.sprite_table[8 * idx + 1] << 8) | (ctx.sprite_table[8 * idx + 2] << 16) | ((uint32_t)ctx.sprite_table[8 * idx + 3] << 24));
+                            const uint32_t size = (uint32_t)(ctx.sprite_table[8 * idx + 4] | (ctx.sprite_table[8 * idx + 5] << 8) | (ctx.sprite_table[8 * idx + 6] << 16) | ((uint32_t)ctx.sprite_table[8 * idx + 7] << 24));
+                            const int32_t scale = i32(e + 9), xiscale = i32(e + 13), startfrac = i32(e + 17), texturemid = i32(e + 21);
+                            const uint32_t col = (uint32_t)((int32_t)((uint32_t)startfrac + (uint32_t)xiscale * (uint32_t)(locate_x - ex1)) >> 16);
+                            const uint8_t* patch = g_pack.data() + off;
+                            const uint32_t w = patch[0] | (patch[1] << 8), colofs = (uint32_t)i32(patch + 8 + 4 * col);
+                            const int32_t sprtop = (ctx.viewheight / 2 << 16) - (int32_t)(((int64_t)texturemid * scale) >> 16);
+                            std::printf("  lump %u at pack %u (%u bytes) width %u column %u at +%u, sprtopscreen %d, iscale %d\n", lump, off, size, w, col, colofs, sprtop, xiscale);
+                            {   // the kernel alone on this one column, into a band around the pixel
+                                uint8_t rec[24] = {0};
+                                auto st32 = [](uint8_t* q, uint32_t v) { q[0] = v; q[1] = v >> 8; q[2] = v >> 16; q[3] = v >> 24; };
+                                st32(rec, off); st32(rec + 4, (uint32_t)(xiscale < 0 ? -xiscale : xiscale)); st32(rec + 8, (uint32_t)texturemid); st32(rec + 12, (uint32_t)scale);
+                                rec[16] = locate_x & 255; rec[17] = locate_x >> 8; rec[18] = col & 255; rec[19] = col >> 8;
+                                rec[20] = e[25 + 2 * (locate_x - ex1)]; rec[21] = e[26 + 2 * (locate_x - ex1)]; rec[22] = e[7]; rec[23] = 1;
+                                std::vector<uint8_t> b1((size_t)vw * 8, 255);
+                                uint32_t badr = 0;
+                                const int32_t rc1 = kube32::runtime::raster_columns(b1.data(), vw, locate_y - 2, 8, rec, 1, g_pack.data() + ctx.colormap, nullptr,
+                                                                                    ctx.viewheight / 2, &resolve, nullptr, &badr);
+                                std::printf("  kernel alone: rc %d, rows %d..%d at x: ", rc1, locate_y - 2, locate_y + 5);
+                                for (int r = 0; r < 8; r++) std::printf("%u ", b1[(size_t)r * vw + locate_x]);
+                                std::printf("(texturemid %d scale %d light %u)\n", texturemid, scale, e[7]);
+                            }
+                            for (const uint8_t* post = patch + colofs; *post != 0xff; post += post[1] + 4) {
+                                const int32_t top = sprtop + scale * post[0], bottom = top + scale * post[1];
+                                std::printf("    post topdelta %u length %u: rows %d..%d (post at pack %u, %s lump end)\n", post[0], post[1], (top + 65535) >> 16, (bottom - 1) >> 16,
+                                            (uint32_t)(post - g_pack.data()), (uint32_t)(post - g_pack.data()) + 4 + post[1] + 128 > off + size ? "window past" : "inside");
+                            }
+                        }
+                    }
+                }
+                if (v != last) {
+                    std::printf("entry %u (type %u at %u, %u bytes) writes pixel (%d,%d) = %u; the engine has %u\n", k, e[0], at - size, size,
+                                locate_x, locate_y, v, want[(size_t)locate_y * vw + locate_x]);
+                    if (e[0] == 3) std::printf("  sprite lump %u x %u..%u light %u trans %u scale %d xiscale %d startfrac %d texturemid %d\n",
+                                               e[1] | (e[2] << 8), e[3] | (e[4] << 8), e[5] | (e[6] << 8), e[7], e[8],
+                                               (int32_t)(e[9] | (e[10] << 8) | (e[11] << 16) | ((uint32_t)e[12] << 24)),
+                                               (int32_t)(e[13] | (e[14] << 8) | (e[15] << 16) | ((uint32_t)e[16] << 24)),
+                                               (int32_t)(e[17] | (e[18] << 8) | (e[19] << 16) | ((uint32_t)e[20] << 24)),
+                                               (int32_t)(e[21] | (e[22] << 8) | (e[23] << 16) | ((uint32_t)e[24] << 24)));
+                    if (e[0] == 1) std::printf("  strip x0 %u n %u tex %u light %u\n", e[1] | (e[2] << 8), e[3], e[4], e[5]);
+                    if (e[0] == 4) std::printf("  masked x %u tex %u col %u light %u\n", e[1] | (e[2] << 8), e[3], e[4], e[5]);
+                    last = v;
+                }
+                k++;
+            }
+        }
         uint64_t bad = 0;
         for (size_t i = 0; i < frame.size(); i++) bad += frame[i] != want[i];
         frames++;

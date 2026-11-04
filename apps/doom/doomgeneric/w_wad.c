@@ -413,8 +413,18 @@ void *W_CacheLumpNum(int lumpnum, int tag)
     {
         // Not yet loaded, so load it now
 
+#ifdef DG_LUMP_PAD
+        /* The renderer reads up to 128 texels past a column's start whatever
+         * the post or lump holds there (vanilla's masked texel index); with a
+         * zeroed pad after every lump it reads zeros, the same bytes a
+         * render pack (wad.py pack) keeps past its lumps. */
+        lump->cache = Z_Malloc(W_LumpLength(lumpnum) + DG_LUMP_PAD, tag, &lump->cache);
+	W_ReadLump (lumpnum, lump->cache);
+        memset((byte*)lump->cache + W_LumpLength(lumpnum), 0, DG_LUMP_PAD);
+#else
         lump->cache = Z_Malloc(W_LumpLength(lumpnum), tag, &lump->cache);
 	W_ReadLump (lumpnum, lump->cache);
+#endif
         result = lump->cache;
     }
 	

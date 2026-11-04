@@ -239,9 +239,18 @@ void R_GenerateComposite (int texnum)
 	
     texture = textures[texnum];
 
+#ifdef DG_LUMP_PAD
+    /* zeroed bytes past the composite, as past a lump (w_wad.c): what a
+     * column reads beyond the last composed column */
+    block = Z_Malloc (texturecompositesize[texnum] + DG_LUMP_PAD,
+		      PU_STATIC, 
+		      &texturecomposite[texnum]);	
+    memset (block + texturecompositesize[texnum], 0, DG_LUMP_PAD);
+#else
     block = Z_Malloc (texturecompositesize[texnum],
 		      PU_STATIC, 
 		      &texturecomposite[texnum]);	
+#endif
 
     collump = texturecolumnlump[texnum];
     colofs = texturecolumnofs[texnum];

@@ -22,18 +22,27 @@ SUF = $(if $(filter 320,$(W)),,-$(W))
 OUT ?= build/doom$(SUF).wasm
 BUILD ?= build/full$(SUF)
 
+# The sim-only build leaves out what never runs without a screen: the menu, automap,
+# intermission, finale, wipe, HUD, status bar, savegames, the rasterizers and the screen
+# (port/sim_stubs.c answers the calls the rest of the engine still makes)
+SIM_EXCLUDE = doomgeneric/m_menu.c doomgeneric/am_map.c doomgeneric/wi_stuff.c doomgeneric/f_finale.c doomgeneric/f_wipe.c \
+              doomgeneric/hu_stuff.c doomgeneric/hu_lib.c doomgeneric/st_stuff.c doomgeneric/st_lib.c doomgeneric/p_saveg.c \
+              doomgeneric/r_draw.c doomgeneric/v_video.c doomgeneric/i_scale.c doomgeneric/i_endoom.c doomgeneric/statdump.c \
+              doomgeneric/w_checksum.c doomgeneric/sha1.c doomgeneric/i_joystick.c doomgeneric/i_cdmus.c doomgeneric/i_sound.c \
+              doomgeneric/i_video.c doomgeneric/m_config.c
+EXCLUDE ?=
 ENGINE = $(filter-out doomgeneric/i_sdlmusic.c doomgeneric/i_sdlsound.c doomgeneric/i_allegromusic.c \
-           doomgeneric/i_allegrosound.c doomgeneric/doomgeneric_%.c, $(wildcard doomgeneric/*.c))
+           doomgeneric/i_allegrosound.c doomgeneric/doomgeneric_%.c $(EXCLUDE), $(wildcard doomgeneric/*.c))
 PORT = port/libc.c port/doomgeneric_kube32.c
 BUILD ?= build
 OBJS = $(ENGINE:doomgeneric/%.c=$(BUILD)/engine/%.o) $(PORT:port/%.c=$(BUILD)/port/%.o)
 
 CFLAGS = --target=wasm32 -Oz -nostdlib -ffreestanding -fno-exceptions -mcpu=mvp -msign-ext -mbulk-memory \
          -isystem port/include -DCMAP256 -DDOOMGENERIC_RESX=$(W) -DDOOMGENERIC_RESY=$(H) -DSCREENWIDTH=$(W) -DSCREENHEIGHT=$(H) \
-         -DDG_ZONE_BYTES=$(ZONE_KB)*1024 -DDG_ZONE_STATS -DDG_NO_WIPE -DDG_NO_MUSIC $(EXTRA_CFLAGS)
+         -DDG_ZONE_BYTES=$(ZONE_KB)*1024 -DDG_ZONE_STATS -DDG_NO_WIPE -DDG_NO_MUSIC -DDG_LUMP_PAD=128 $(EXTRA_CFLAGS)
 ENGINE_CFLAGS = $(CFLAGS) -w
 LDFLAGS = -flavor wasm --no-entry --allow-undefined --stack-first -z stack-size=$(STACK) --max-memory=$(MAX_MEMORY) \
-          --gc-sections
+          --gc-sections --export=__heap_base --export=__data_end
 
 all: $(OUT)
 
@@ -43,7 +52,8 @@ stats:
 
 # The sim-only pod: no rasterizers and no screen buffers; a frame is a draw list (port/drawlist_emit.c)
 sim:
-	$(MAKE) W=$(W) OUT=build/doom-sim$(SUF).wasm BUILD=build/sim$(SUF) EXTRA_CFLAGS="-DDG_DRAWLIST_STATS -DDG_SIM_ONLY" PORT="$(PORT) port/drawlist_emit.c"
+	$(MAKE) W=$(W) OUT=build/doom-sim$(SUF).wasm BUILD=build/sim$(SUF) EXTRA_CFLAGS="-DDG_DRAWLIST_STATS -DDG_SIM_ONLY" \
+	    EXCLUDE="$(SIM_EXCLUDE)" PORT="$(PORT) port/drawlist_emit.c port/sim_stubs.c"
 
 # The view pod: the decoder and the kernels' records, no engine
 VIEW_CFLAGS = --target=wasm32 -Oz -nostdlib -ffreestanding -mcpu=mvp -msign-ext -mbulk-memory -Wall -I../../include -Iview

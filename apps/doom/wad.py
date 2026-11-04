@@ -328,7 +328,9 @@ def pack(src, dst):
     offset a column: the post data of the one patch that covers it, or its column of the
     texture's composite block (the engine's own layout, so the kernels read the bytes the engine
     reads). The patches follow once each, every item 4-byte aligned, and 256 zero bytes end the
-    pack so a column's 128-texel window stays inside it."""
+    pack so a column's 128-texel window stays inside it; 128 zero bytes follow every patch,
+    composite and sprite lump, the bytes a column reads past its post (the port's engine zeroes
+    the same bytes past a cached lump, DG_LUMP_PAD)."""
     kind, lumps = read_wad(src)
     d = dict(lumps)
     names = [n for n, _ in lumps]
@@ -344,17 +346,20 @@ def pack(src, dst):
         off = len(blob)
         blob.extend(b)
         return off
+    # 128 zero bytes follow every patch, composite and sprite: the texels a column reads past
+    # its post or lump (the engine's own renderer reads them too, zeroed by the port: DG_LUMP_PAD)
+    pad = bytes(128)
     patch_off = {}
     for _, _, _, patches in textures:
         for _, _, pname in patches:
             if pname not in patch_off:
-                patch_off[pname] = add(d[pname])
+                patch_off[pname] = add(d[pname] + pad)
     tex_table = []
     composite_bytes = 0
     patch_cols = comp_cols = 0
     for name, w, h, patches in textures:
         cols, block = texture_columns(w, h, patches, d)
-        comp_off = add(block) if block else 0
+        comp_off = add(block + pad) if block else 0
         composite_bytes += len(block)
         table = bytearray()
         for c in cols:
@@ -368,7 +373,7 @@ def pack(src, dst):
                 table += struct.pack("<I", 0)
         tex_table.append((w, h, add(table)))
     flat_table = [add(b) for b in flats]
-    sprite_table = [(add(b), len(b)) for b in sprites]
+    sprite_table = [(add(b + pad), len(b)) for b in sprites]
     pal_off = add(d["PLAYPAL"][:768])
     cmap_off = add(d["COLORMAP"][:34 * 256])
     add(bytes(256))
