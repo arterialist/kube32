@@ -1,0 +1,70 @@
+# push-bench: push-sub on the Cardputer, push-pub on the control plane.
+# make fills in the modules. The publisher waits DELAY seconds, then runs
+# every size at every rate; the subscriber logs one line a run.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: push-sub
+  labels:
+    app: push-sub
+  annotations:
+    kube32.io/wasm-base64: "@SUB_WASM@"
+    kube32.io/event-topics: doom.draw
+spec:
+  restartPolicy: Never
+  nodeSelector:
+    kube32.io/board: cardputer
+  containers:
+  - name: sub
+    image: wasm://inline/push-sub
+    env:
+    - name: WINDOW
+      value: "1"
+    resources:
+      requests:
+        memory: 16Ki
+        hardware.kube32.io/ipc: "1"
+      limits:
+        memory: 16Ki
+    securityContext:
+      capabilities:
+        add:
+        - CHANNEL_IPC
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: push-pub
+  labels:
+    app: push-pub
+  annotations:
+    kube32.io/wasm-base64: "@PUB_WASM@"
+    kube32.io/execution-budget: "off"
+spec:
+  restartPolicy: Never
+  nodeSelector:
+    node-role.kubernetes.io/control-plane: ""
+  containers:
+  - name: pub
+    image: wasm://inline/push-pub
+    env:
+    - name: TOPIC
+      value: doom.draw
+    - name: SIZES
+      value: "4600,12600"
+    - name: RATES
+      value: "6,8,10"
+    - name: CHUNK
+      value: "200"
+    - name: SECONDS
+      value: "60"
+    resources:
+      requests:
+        memory: 16Ki
+        hardware.kube32.io/ipc: "1"
+      limits:
+        memory: 16Ki
+    securityContext:
+      capabilities:
+        add:
+        - CHANNEL_IPC
