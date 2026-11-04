@@ -80,6 +80,10 @@ boolean singletics = false;
 
 static int localplayer;
 
+// The players of a lockstep netgame (-lockstep), 0 otherwise.
+
+int lockstep_players = 0;
+
 // Used for original sync code.
 
 static int      skiptics = 0;
@@ -437,12 +441,50 @@ void D_StartNetGame(net_gamesettings_t *settings,
     //    printf("Syncing netgames like Vanilla Doom.\n");
     //}
 #else
+    int i;
+
     settings->consoleplayer = 0;
 	settings->num_players = 1;
 	settings->player_classes[0] = player_class;
 	settings->new_sync = 0;
 	settings->extratics = 1;
 	settings->ticdup = 1;
+
+    //!
+    // @arg <n>
+    // @category net
+    //
+    // Play a netgame of n players whose ticcmds the platform layer
+    // carries: it builds this side's ticcmd with D_BuildLocalTiccmd and
+    // runs each tic with every player's ticcmd with D_RunNetTic.
+    // -consoleplayer <p> picks this side's player, 0 based.
+    //
+
+    i = M_CheckParmWithArgs("-lockstep", 1);
+
+    if (i > 0)
+    {
+        lockstep_players = atoi(myargv[i+1]);
+        if (lockstep_players < 1)
+            lockstep_players = 1;
+        if (lockstep_players > 4)       // MAXPLAYERS
+            lockstep_players = 4;
+        settings->num_players = lockstep_players;
+
+        i = M_CheckParmWithArgs("-consoleplayer", 1);
+        if (i > 0)
+            settings->consoleplayer = atoi(myargv[i+1]);
+        if (settings->consoleplayer < 0
+         || settings->consoleplayer >= lockstep_players)
+            settings->consoleplayer = 0;
+    }
+
+    localplayer = settings->consoleplayer;
+
+    for (i = 0; i < NET_MAXPLAYERS; ++i)
+    {
+        local_playeringame[i] = i < settings->num_players;
+    }
 
 	ticdup = settings->ticdup;
 	new_sync = settings->new_sync;
@@ -723,6 +765,14 @@ void TryRunTics (void)
 
     if (singletics)
     {
+        // In a lockstep netgame the platform layer runs the tics
+        // (D_RunNetTic), once every player's ticcmd is known.
+
+        if (lockstep_players)
+        {
+            return;
+        }
+
         BuildNewTic();
     }
     else
@@ -818,6 +868,49 @@ void TryRunTics (void)
 
 	NetUpdate ();	// check for new console commands
     }
+}
+
+//
+// Lockstep netgame (-lockstep): the platform layer carries the ticcmds.
+//
+
+// Builds the local player's ticcmd for a tic from the input so far: the
+// events, the menu, then BuildTiccmd. The tic is the one the ticcmd will
+// run in, which may lie ahead of gametic (the input delay).
+
+void D_BuildLocalTiccmd(ticcmd_t *cmd, int tic)
+{
+    I_StartTic();
+    loop_interface->ProcessEvents();
+    loop_interface->RunMenu();
+
+    memset(cmd, 0, sizeof(ticcmd_t));
+    loop_interface->BuildTiccmd(cmd, tic);
+
+    if (maketic <= tic)
+    {
+        maketic = tic + 1;
+    }
+}
+
+// Runs the next tic (gametic) with every player's ticcmd. A player whose
+// ingame[] entry is false has left the game, as in any netgame.
+
+void D_RunNetTic(ticcmd_t *cmds, boolean *ingame)
+{
+    ticcmd_set_t *set = &ticdata[gametic % BACKUPTICS];
+    int i;
+
+    for (i = 0; i < NET_MAXPLAYERS; ++i)
+    {
+        set->cmds[i] = cmds[i];
+        set->ingame[i] = ingame[i];
+    }
+
+    memcpy(local_playeringame, set->ingame, sizeof(local_playeringame));
+
+    loop_interface->RunTic(set->cmds, set->ingame);
+    gametic++;
 }
 
 void D_RegisterLoopCallbacks(loop_interface_t *i)

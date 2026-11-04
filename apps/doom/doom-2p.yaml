@@ -1,0 +1,81 @@
+# Two-player DOOM: the sim pod on the control plane plays player 1 and orders
+# both players' ticcmds; a browser joins as player 2 at http://<cluster>/doom/.
+# The control plane's flash holds three blobs (apps/doom/README.md#two-players):
+#   doom-sim       build/doom-sim-240.wasm, the pod's module
+#   doom-sim-wad   the sim pack (wad.py simpack)
+#   doom-web       the browser client and its IWAD (wad.py web)
+apiVersion: v1
+kind: Pod
+metadata:
+  name: doom
+  namespace: default
+  labels:
+    app: doom
+  annotations:
+    kube32.io/blobs: doom-sim-wad,doom-web
+spec:
+  nodeSelector:
+    node-role.kubernetes.io/control-plane: ""
+  restartPolicy: Always
+  containers:
+    - name: doom
+      image: wasm://blob/doom-sim
+      ports:
+        - containerPort: 7000
+          name: http
+      env:
+        - name: DOOM_PLAYERS
+          value: "2"
+        - name: DOOM_IWAD
+          value: doom1.wad
+        - name: DOOM_WAD_BLOB
+          value: doom-sim-wad
+        - name: DOOM_WEB_BLOB
+          value: doom-web
+        - name: DOOM_ARGS
+          value: "-warp 1 1 -skill 3 -kb 256"
+        - name: DOOM_SCREENBLOCKS
+          value: "11"
+        - name: DOOM_NET_TOPIC
+          value: doom.tics
+      resources:
+        requests:
+          memory: 768Ki
+          hardware.kube32.io/ipc: "1"
+        limits:
+          memory: 768Ki
+      securityContext:
+        capabilities:
+          add: ["CHANNEL_IPC"]
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: doom
+  namespace: default
+spec:
+  selector:
+    app: doom
+  ports:
+    - name: http
+      port: 80
+      targetPort: 7000
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: doom
+  namespace: default
+  annotations:
+    kube32.io/event-stream: "/doom/events=doom.tics"
+spec:
+  rules:
+    - http:
+        paths:
+          - path: /doom
+            pathType: Prefix
+            backend:
+              service:
+                name: doom
+                port:
+                  number: 80

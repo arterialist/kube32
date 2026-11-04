@@ -4,6 +4,7 @@
 
   wad.py fetch [--dir DIR]                 download Freedoom (phase 1) and check it
   wad.py cut IN.wad OUT.wad [--map E1M1]   one map and the lumps the engine needs for it
+  wad.py web IWAD ENGINE.wasm OUT.wad      the browser client of a two-player game, as one blob
 
 `cut` keeps the map, the textures, flats and patches its sides and sectors
 use (with the skies, the episode's switches and whole animations), the
@@ -449,6 +450,19 @@ def simpack(src, dst):
     print("%s: %d lumps, %d bytes (%d cut from %d)" % (dst, len(out), total, cut_bytes, os.path.getsize(src)))
 
 
+def web(iwad, engine, dst):
+    """The browser client the pod serves for a two-player game (wad.py web <iwad> <doom.wasm> <out>):
+    a PWAD whose lumps are the page (INDEX), its host (DOOMJS), the full engine (DOOMWASM) and the
+    IWAD the browser plays (IWAD). Upload it as the blob DOOM_WEB_BLOB names."""
+    web_dir = os.path.join(HERE, "web")
+    lumps = [("INDEX", open(os.path.join(web_dir, "index.html"), "rb").read()),
+             ("DOOMJS", open(os.path.join(web_dir, "doom-net.js"), "rb").read()),
+             ("DOOMWASM", open(engine, "rb").read()),
+             ("IWAD", open(iwad, "rb").read())]
+    total = write_wad(dst, b"PWAD", lumps)
+    print("%s: %d bytes (%s)" % (dst, total, ", ".join("%s %d" % (n, len(d)) for n, d in lumps)))
+
+
 def fetch(directory):
     os.makedirs(directory, exist_ok=True)
     zpath = os.path.join(directory, os.path.basename(FREEDOOM_URL))
@@ -479,6 +493,10 @@ def main():
         q = sub.add_parser(name)
         q.add_argument("src")
         q.add_argument("dst")
+    w = sub.add_parser("web")
+    w.add_argument("iwad")
+    w.add_argument("engine")
+    w.add_argument("dst")
     a = ap.parse_args()
     if a.cmd == "fetch":
         fetch(a.dir)
@@ -486,6 +504,8 @@ def main():
         pack(a.src, a.dst)
     elif a.cmd == "simpack":
         simpack(a.src, a.dst)
+    elif a.cmd == "web":
+        web(a.iwad, a.engine, a.dst)
     else:
         cut(a.src, a.dst, a.map.upper(), not a.no_intermission)
 

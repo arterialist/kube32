@@ -3,7 +3,11 @@
 #   doom-sim    control plane (PSRAM): the game and its BSP pass, run in place
 #               from the flash blob doom-sim with the IWAD cut to one map in the
 #               blob doom-wad; publishes a frame's draw list on doom.draw at
-#               DOOM_FPS, takes keys from doom.keys
+#               DOOM_FPS, takes keys from doom.keys. With DOOM_PLAYERS=2 it
+#               orders two players' ticcmds (port/net.c): a browser joins as
+#               player 2 at http://<control-plane-ip>/doom/ (the page, its
+#               engine and IWAD from the blob doom-web), ticcmds go out on
+#               doom.tics as an Ingress event stream and come back by POST
 #   doom-view   Cardputer: draws the draw lists with the raster kernels from
 #               the render pack blob doom-pack, keys from its keyboard
 #
@@ -29,7 +33,7 @@ spec:
     metadata:
       labels: {app: doom, tier: sim}
       annotations:
-        kube32.io/blobs: doom-wad
+        kube32.io/blobs: doom-wad,doom-web
         kube32.io/event-topics: doom.keys
         kube32.io/tick-interval: "50ms"
         kube32.io/execution-budget: "off"
@@ -46,6 +50,9 @@ spec:
             - {name: DOOM_ARGS, value: "-warp 1 1 -skill 3 -kb 256"}
             - {name: DOOM_SCREENBLOCKS, value: "11"}           # the whole 240 x 135 screen
             - {name: DOOM_FPS, value: "8"}
+            - {name: DOOM_PLAYERS, value: "2"}                 # a browser may join as player 2
+            - {name: DOOM_WEB_BLOB, value: "doom-web"}         # the page for it (wad.py web)
+            - {name: DOOM_NET_TOPIC, value: "doom.tics"}
           resources:
             requests: {memory: 768Ki, esp32.io/psram: 768Ki, hardware.kube32.io/ipc: "1"}
             limits: {memory: 768Ki, esp32.io/psram: 768Ki}
@@ -110,6 +117,8 @@ kind: Ingress
 metadata:
   name: doom
   namespace: default
+  annotations:
+    kube32.io/event-stream: "/doom/events=doom.tics"
 spec:
   rules:
     - http:

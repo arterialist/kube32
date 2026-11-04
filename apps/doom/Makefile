@@ -6,11 +6,12 @@
 #   make view                the Cardputer view pod (build/doom-view.wasm)
 #   make check               build/drawlist_check: the split renderer against the engine
 #   make verify [TICS=n]     runs it: game states and pixels, both widths, the sim on the sim pack
+#   make verify-net          two players in lockstep through a simulated network (port/net.c)
 #   make pods                the two pods' modules and the packs as blobs (build/blobs/)
 #   make manifest            build/doom.yaml (with the wordsketch pods at 0 replicas, from
 #                            apps/wordsketch/build) and build/doom-only.yaml (DOOM alone)
-#   make upload SERVER=<url> the blobs to the nodes: doom-sim and doom-wad to the control
-#                            plane, doom-view and doom-pack to the Cardputer
+#   make upload SERVER=<url> the blobs to the nodes: doom-sim, doom-wad and doom-web to the
+#                            control plane, doom-view and doom-pack to the Cardputer
 #   make ZONE_KB=512         the zone (DOOM's heap) size; -kb <n> in DOOM_ARGS overrides it
 #
 # The module starts with its static data and grows its linear memory with
@@ -39,7 +40,7 @@ SIM_EXCLUDE = doomgeneric/m_menu.c doomgeneric/am_map.c doomgeneric/wi_stuff.c d
 EXCLUDE ?=
 ENGINE = $(filter-out doomgeneric/i_sdlmusic.c doomgeneric/i_sdlsound.c doomgeneric/i_allegromusic.c \
            doomgeneric/i_allegrosound.c doomgeneric/doomgeneric_%.c $(EXCLUDE), $(wildcard doomgeneric/*.c))
-PORT = port/libc.c port/doomgeneric_kube32.c port/state_digest.c
+PORT = port/libc.c port/doomgeneric_kube32.c port/state_digest.c port/net.c
 BUILD ?= build
 OBJS = $(ENGINE:doomgeneric/%.c=$(BUILD)/engine/%.o) $(PORT:port/%.c=$(BUILD)/port/%.o)
 
@@ -78,7 +79,7 @@ KUBECTL ?= kubectl --context kube32
 SERVER ?=
 LLM ?= uv run --script ../llm-pipeline/tools/llm.py
 IWAD ?= build/wad/doom1-e1m1-min.wad
-BLOBS = build/blobs/doom-sim build/blobs/doom-wad build/blobs/doom-view build/blobs/doom-pack
+BLOBS = build/blobs/doom-sim build/blobs/doom-wad build/blobs/doom-view build/blobs/doom-pack build/blobs/doom-web
 
 pods: $(BLOBS)
 build/blobs/doom-sim: FORCE
@@ -94,6 +95,11 @@ build/blobs/doom-wad: $(IWAD) wad.py
 build/blobs/doom-pack: $(IWAD) wad.py
 	@mkdir -p build/blobs
 	$(PYTHON) wad.py pack $< $@
+# the page for player 2: its engine is the full 320-wide build
+build/blobs/doom-web: $(IWAD) wad.py web/index.html web/doom-net.js FORCE
+	@mkdir -p build/blobs
+	$(MAKE) W=320
+	$(PYTHON) wad.py web $(IWAD) build/doom.wasm $@
 
 manifest:
 	@mkdir -p build
@@ -104,7 +110,7 @@ manifest:
 upload: $(BLOBS)
 	@cardputer=$$($(KUBECTL) $(if $(SERVER),--server $(SERVER)) get nodes -l kube32.io/board=cardputer -o name | head -1 | cut -d/ -f2); \
 	control=$$($(KUBECTL) $(if $(SERVER),--server $(SERVER)) get nodes -l node-role.kubernetes.io/control-plane -o name | head -1 | cut -d/ -f2); \
-	for b in doom-sim:$$control doom-wad:$$control doom-view:$$cardputer doom-pack:$$cardputer; do \
+	for b in doom-sim:$$control doom-wad:$$control doom-web:$$control doom-view:$$cardputer doom-pack:$$cardputer; do \
 	  name=$${b%%:*}; node=$${b#*:}; size=$$(wc -c < build/blobs/$$name | tr -d ' '); \
 	  echo "$$name ($$size B) -> $$node"; \
 	  $(KUBECTL) $(if $(SERVER),--server $(SERVER)) replace --raw "/api/v1/nodes/$$node/proxy/blobs/$$name?size=$$size" -f build/blobs/$$name || exit 1; \
@@ -135,6 +141,18 @@ verify: build/drawlist_check build/doom.wasm build/doom-sim.wasm build/doom-240.
 	./build/drawlist_check build/doom-240.wasm build/doom-sim-240.wasm $(WAD) build/wad/doom1-e1m1.pack --tics $(TICS) --spin --state --screenblocks 11 \
 	    --args "-warp 1 1 -skill 3 -kb 640" --sim-args "-warp 1 1 -skill 3 -kb 224" --sim-wad build/wad/doom1-e1m1-sim.wad
 
+# Two-player lockstep (port/net.c) through a simulated network: the sim pod as the
+# authority, the full engine as the browser's client, jitter, loss, an outage, a
+# reload and a timeout; both game states compared at every tic, with the sim at 320
+# and at 240 wide (the Cardputer's) against the browser's 320 (make verify-net NET_TICS=n)
+build/net_check: bench/net_check.cpp $(REPO)/build/libwasm3.a
+	$(BENCH_CXX) $(WASM3_DEFS) -o $@ $< $(REPO)/src/runtime/pod_memory_pool.cpp $(REPO)/src/osal/system_posix.cpp $(REPO)/build/libwasm3.a
+
+NET_TICS ?= 6000
+verify-net: build/net_check build/doom.wasm build/doom-sim.wasm build/doom-sim-240.wasm build/wad/doom1-e1m1-sim.wad
+	./build/net_check build/doom-sim.wasm build/doom.wasm build/wad/doom1-e1m1-sim.wad $(WAD) --tics $(NET_TICS)
+	./build/net_check build/doom-sim-240.wasm build/doom.wasm build/wad/doom1-e1m1-sim.wad $(WAD) --tics $(NET_TICS) --screenblocks 11
+
 build/wad/doom1-e1m1.pack: $(WAD) wad.py
 	$(PYTHON) wad.py pack $< $@
 build/wad/doom1-e1m1-sim.wad: $(WAD) wad.py
@@ -144,7 +162,7 @@ $(BUILD)/engine/%.o: doomgeneric/%.c
 	@mkdir -p $(BUILD)/engine
 	$(CLANG) $(ENGINE_CFLAGS) -c $< -o $@
 
-$(BUILD)/port/%.o: port/%.c port/include/k32libc.h ../../include/runtime/k32_app_abi.h
+$(BUILD)/port/%.o: port/%.c port/include/k32libc.h port/net.h ../../include/runtime/k32_app_abi.h
 	@mkdir -p $(BUILD)/port
 	$(CLANG) $(CFLAGS) -Wall -Wno-unused-function -c $< -o $@
 
@@ -173,4 +191,4 @@ bench: build/doombench build/doombench-fast
 clean:
 	rm -rf build
 
-.PHONY: all stats sim view check verify pods manifest upload bench clean FORCE
+.PHONY: all stats sim view check verify verify-net pods manifest upload bench clean FORCE

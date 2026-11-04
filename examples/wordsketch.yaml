@@ -259,7 +259,7 @@ spec:
     metadata:
       labels: {app: doom, tier: sim}
       annotations:
-        kube32.io/blobs: doom-wad
+        kube32.io/blobs: doom-wad,doom-web
         kube32.io/event-topics: doom.keys
         kube32.io/tick-interval: "50ms"
         kube32.io/execution-budget: "off"
@@ -276,6 +276,9 @@ spec:
             - {name: DOOM_ARGS, value: "-warp 1 1 -skill 3 -kb 256"}
             - {name: DOOM_SCREENBLOCKS, value: "11"}           # the whole 240 x 135 screen
             - {name: DOOM_FPS, value: "8"}
+            - {name: DOOM_PLAYERS, value: "2"}                 # a browser may join as player 2
+            - {name: DOOM_WEB_BLOB, value: "doom-web"}         # the page for it (wad.py web)
+            - {name: DOOM_NET_TOPIC, value: "doom.tics"}
           resources:
             requests: {memory: 768Ki, esp32.io/psram: 768Ki, hardware.kube32.io/ipc: "1"}
             limits: {memory: 768Ki, esp32.io/psram: 768Ki}

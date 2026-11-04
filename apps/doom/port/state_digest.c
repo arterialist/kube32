@@ -22,12 +22,16 @@
 #define K32_EXPORT(name) __attribute__((export_name(name)))
 extern int prndindex, rndindex;
 
+static uint32_t crc_table[256];
 static uint32_t crc_bytes(uint32_t crc, const void* p, size_t n) {
     const uint8_t* b = p;
-    for (size_t i = 0; i < n; i++) {
-        crc ^= b[i];
-        for (int k = 0; k < 8; k++) crc = (crc >> 1) ^ (0xEDB88320u & (0u - (crc & 1u)));
-    }
+    if (!crc_table[1])
+        for (uint32_t i = 0; i < 256; i++) {
+            uint32_t c = i;
+            for (int k = 0; k < 8; k++) c = (c >> 1) ^ (0xEDB88320u & (0u - (c & 1u)));
+            crc_table[i] = c;
+        }
+    for (size_t i = 0; i < n; i++) crc = (crc >> 8) ^ crc_table[(crc ^ b[i]) & 0xff];
     return crc;
 }
 static uint32_t crc_i32(uint32_t crc, int32_t v) { return crc_bytes(crc, &v, 4); }
