@@ -86,6 +86,7 @@ set(KUBE32_APP_SRCS
     runtime/wasm_runtime.cpp
     runtime/app_pod.cpp
     runtime/pod_linalg.cpp
+    runtime/pod_raster.cpp
     runtime/pod_blobs.cpp
     runtime/pod_log.cpp
     runtime/image_registry.cpp
