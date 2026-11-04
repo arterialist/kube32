@@ -157,4 +157,13 @@ constexpr uint64_t kFftUnits = 8;
 // Links the imports into a pod's module
 void link_linalg_host_functions(IM3Module module);
 
+// Whether a kernel takes scratch of `bytes` from internal RAM: only on a
+// board with PSRAM (where the interpreter's stack is in PSRAM) and while
+// kLinalgScratchReserve bytes of internal RAM stay free. A board without
+// PSRAM works from its stack, which is internal RAM: a transient 8 KB block
+// at every product took the heap the Wi-Fi driver allocates its receive
+// buffers from, and a driver that fails one keeps its buffers for good
+constexpr size_t kLinalgScratchReserve = 32 * 1024;
+bool linalg_scratch_allowed(bool has_psram, size_t internal_free, size_t bytes);
+
 }  // namespace kube32::runtime

@@ -1228,7 +1228,18 @@ static void test_attention_full() {
     std::printf("[PASS] test_attention_full\n");
 }
 
+// Scratch in internal RAM only with PSRAM, and only above the reserve
+static void test_scratch_policy() {
+    using kube32::runtime::linalg_scratch_allowed;
+    using kube32::runtime::kLinalgScratchReserve;
+    assert(!linalg_scratch_allowed(false, 1u << 20, 8192));               // no PSRAM: the stack, whatever is free
+    assert(linalg_scratch_allowed(true, kLinalgScratchReserve + 8192, 8192));
+    assert(!linalg_scratch_allowed(true, kLinalgScratchReserve + 8191, 8192));
+    std::printf("[PASS] test_scratch_policy\n");
+}
+
 int main() {
+    test_scratch_policy();
     test_attention();
     test_attention_full();
     test_conv();

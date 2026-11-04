@@ -28,12 +28,20 @@
 
 namespace kube32::runtime {
 
+bool linalg_scratch_allowed(bool has_psram, size_t internal_free, size_t bytes) {
+    return has_psram && internal_free >= bytes + kLinalgScratchReserve;
+}
+
 // Scratch for a call's operands in internal RAM (the stack of the interpreter
 // lies in PSRAM on a board with PSRAM, behind the cache): 16-byte aligned,
 // null when none is free, and a kernel then works from the stack or the
-// operands in place
+// operands in place. A board without PSRAM gets none: its interpreter stack
+// is internal RAM already, and taking 8 KB of its heap at every product
+// starves the Wi-Fi driver (linalg_scratch_allowed)
 static void* scratch_alloc(size_t bytes) {
 #if defined(ESP_PLATFORM)
+    static const bool has_psram = heap_caps_get_total_size(MALLOC_CAP_SPIRAM) > 0;
+    if (!linalg_scratch_allowed(has_psram, heap_caps_get_free_size(MALLOC_CAP_INTERNAL), bytes)) return nullptr;
     return heap_caps_aligned_alloc(16, bytes, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
 #else
     void* p = nullptr;
