@@ -211,6 +211,7 @@ static int64_t last_frame_ms;
 static uint32_t draw_rate = 49152;
 static int64_t drained_ms;
 static uint32_t frame_waits, publish_ms_max;
+static uint32_t rate_assumed;          /* the rate the sim assumes now (GET /stats: draw_rate_assumed) */
 static uint64_t publish_ms_sum;
 uint32_t doom_drawlist_ptr(void);
 uint32_t doom_drawlist_len(void);
@@ -288,21 +289,28 @@ static int32_t tick(int64_t now) {
     publish_ms_sum += (uint64_t)(p1 - p0);
     if ((uint32_t)(p1 - p0) > publish_ms_max) publish_ms_max = (uint32_t)(p1 - p0);
     if (draw_rate) {
-        /* a publish that still waited means the view takes less than the rate assumed: assume a
-         * quarter less; after 20 that did not wait, a tenth more, up to DOOM_DRAW_RATE */
-        static uint32_t rate, clean;
-        if (!rate) rate = draw_rate;
-        if (p1 - p0 > 10) { rate -= rate / 4; if (rate < 4096) rate = 4096; clean = 0; }
-        else if (++clean >= 20 && rate < draw_rate) { rate += rate / 10; if (rate > draw_rate) rate = draw_rate; clean = 0; }
-        drained_ms = p1 + (int64_t)doom_drawlist_len() * 1000 / rate;
+        /* A publish that waited means the view takes less than the rate assumed. A publish costs
+         * up to about 15 ms on a board and a pacing wait tens to hundreds, so one over 60 ms
+         * waited: assume a quarter less, down to half of DOOM_DRAW_RATE; each one that did not,
+         * an eighth more, up to DOOM_DRAW_RATE */
+        if (!rate_assumed) rate_assumed = draw_rate;
+        if (p1 - p0 > 60) {
+            rate_assumed -= rate_assumed / 4;
+            if (rate_assumed < draw_rate / 2) rate_assumed = draw_rate / 2;
+        } else if (rate_assumed < draw_rate) {
+            rate_assumed += rate_assumed / 8 + 1;
+            if (rate_assumed > draw_rate) rate_assumed = draw_rate;
+        }
+        drained_ms = p1 + (int64_t)doom_drawlist_len() * 1000 / rate_assumed;
     }
     if (rc < 0) publish_errors++; else frames_published++;
     if ((frames_published + publish_errors) % 100 == 0) {
-        char line[160];
+        char line[192];
         const uint32_t sent = frames_published + publish_errors;
-        snprintf(line, sizeof line, "doom-sim: frames %u publish_errors %u keys %u list %u B; publish %u ms mean, %u max; tick %u ms mean, %u max",
+        snprintf(line, sizeof line, "doom-sim: frames %u publish_errors %u keys %u list %u B; publish %u ms mean, %u max; tick %u ms mean, %u max; rate %u B/s",
                  (unsigned)frames_published, (unsigned)publish_errors, (unsigned)keys_received, (unsigned)doom_drawlist_len(),
-                 (unsigned)(publish_ms_sum / sent), (unsigned)publish_ms_max, (unsigned)(ticks_timed ? tick_ms_sum / ticks_timed : 0), (unsigned)tick_ms_max);
+                 (unsigned)(publish_ms_sum / sent), (unsigned)publish_ms_max, (unsigned)(ticks_timed ? tick_ms_sum / ticks_timed : 0), (unsigned)tick_ms_max,
+                 (unsigned)(rate_assumed ? rate_assumed : draw_rate));
         k32_log(line, (uint32_t)strlen(line));
     }
 #else
@@ -481,6 +489,7 @@ static int32_t handle_request(char* req, uint32_t len) {
         put_kv("publish_ms_mean", frames_published + publish_errors ? (int64_t)(publish_ms_sum / (frames_published + publish_errors)) : 0);
         put_kv("publish_ms_max", publish_ms_max);
         put_kv("frame_waits", frame_waits);
+        put_kv("draw_rate_assumed", rate_assumed ? rate_assumed : draw_rate);
 #endif
         return reply_json();
     }
