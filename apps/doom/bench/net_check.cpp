@@ -15,7 +15,7 @@
 // past the timeout (player 2 leaves the game), then it joins once more.
 //
 //   net_check <doom-sim.wasm> <doom.wasm> <sim iwad> <iwad> [--tics N] [--delay D] [--jitter MS] [--base MS]
-//             [--loss PERCENT] [--outage-ms MS] [--batch N] [--screenblocks N] [--no-render] [--args "..."] [--client-args "..."] [--iwad-name doom1.wad]
+//             [--loss PERCENT] [--outage-ms MS] [--batch N] [--screenblocks N] [--pod-tick-ms MS] [--no-render] [--args "..."] [--client-args "..."] [--iwad-name doom1.wad]
 //
 // Exits 0 when every compared tic agrees, 4 at the first that does not.
 #include "wasm3.h"
@@ -275,7 +275,7 @@ struct Course {
 int main(int argc, char** argv) {
     if (argc < 5) {
         std::fprintf(stderr, "usage: net_check <doom-sim.wasm> <doom.wasm> <sim iwad> <iwad> [--tics N] [--delay D] [--jitter MS] [--base MS] "
-                             "[--loss PERCENT] [--outage-ms MS] [--batch N] [--screenblocks N] [--no-render] [--args \"...\"] [--client-args \"...\"] [--iwad-name NAME]\n");
+                             "[--loss PERCENT] [--outage-ms MS] [--batch N] [--screenblocks N] [--pod-tick-ms MS] [--no-render] [--args \"...\"] [--client-args \"...\"] [--iwad-name NAME]\n");
         return 2;
     }
     std::ifstream sw(argv[3], std::ios::binary), cw(argv[4], std::ios::binary);
@@ -283,6 +283,7 @@ int main(int argc, char** argv) {
     const std::vector<uint8_t> wad((std::istreambuf_iterator<char>(cw)), std::istreambuf_iterator<char>());
     int tics = 6000, delay = 4, outage_ms = 1500;
     std::string batch = "2", screenblocks = "10";   // --screenblocks 11 for a sim built 240 wide
+    int pod_tick_ms = 10;                           // --pod-tick-ms: how often the node ticks the pod
     bool render = true;
     const bool trace = std::getenv("NET_TRACE") != nullptr;
     std::string args = "-warp 1 1 -skill 3", iwad_name = "doom1.wad", client_args;   // --client-args: a client that plays another game
@@ -296,6 +297,7 @@ int main(int argc, char** argv) {
         else if (a == "--loss") net.loss_pct = std::atoi(argv[++i]);
         else if (a == "--batch") batch = argv[++i];
         else if (a == "--screenblocks") screenblocks = argv[++i];
+        else if (a == "--pod-tick-ms") pod_tick_ms = std::max(1, std::atoi(argv[++i]));
         else if (a == "--outage-ms") outage_ms = std::atoi(argv[++i]);
         else if (a == "--no-render") render = false;
         else if (a == "--args") args = argv[++i];
@@ -308,7 +310,7 @@ int main(int argc, char** argv) {
     pod.name = "pod";
     pod.wad = &sim_wad;
     pod.envs = {{"DOOM_IWAD", iwad_name}, {"DOOM_WAD_BLOB", "doom-wad"}, {"DOOM_ARGS", args + " -kb 256"}, {"DOOM_PLAYERS", "2"},
-                {"DOOM_NET_DELAY", std::to_string(delay)}, {"DOOM_NET_TIMEOUT_MS", "5000"}, {"DOOM_NET_DIGEST", "35"}, {"DOOM_NET_BATCH", batch}, {"DOOM_SCREENBLOCKS", screenblocks}};
+                {"DOOM_NET_DELAY", std::to_string(delay)}, {"DOOM_NET_TIMEOUT_MS", "5000"}, {"DOOM_NET_DIGEST", "1"}, {"DOOM_NET_BATCH", batch}, {"DOOM_SCREENBLOCKS", screenblocks}};
     if (!load(pod, argv[1])) return 1;
     if (pod.call("k32_init")) { std::printf("pod: k32_init failed\n"); return 1; }
 
@@ -320,9 +322,17 @@ int main(int argc, char** argv) {
     const int p2_pattern[][3] = {{UP, 0, 50}, {LEFT, FIRE, 25}, {UP, USE, 45}, {RIGHT, 0, 40}, {DOWN, FIRE, 30}, {UP, RIGHT, 55}, {FIRE, 0, 20}, {LEFT, UP, 35}};
     Course p1(p1_pattern, 8, 1 << 20, 5);
     std::vector<Course> p2s;
-    // the page posts new ticcmds at once and every 50 ms regardless, up to 4 POSTs in
-    // flight; it gives up on one with no answer after 300 ms
-    struct Side { int32_t session = 0, joined_at = -1; std::map<uint64_t, int64_t> in_flight; int64_t last_post = -1000; bool alive = true; };
+    // the page (web/doom-net.js) steps on every message and every 4 ms: it runs the confirmed
+    // tics, builds its ticcmds by the clock (doom_net_pace, with the POST round trip), and posts
+    // them two at a time, or one that has waited 35 ms, or every 250 ms regardless, up to 4 POSTs
+    // in flight; it gives up on one with no answer after 300 ms
+    struct Side {
+        int32_t session = 0, joined_at = -1;
+        std::map<uint64_t, int64_t> in_flight;
+        int64_t last_post = -1000, fresh_at = -1;
+        double rtt = 0;
+        bool alive = true, dirty = false;
+    };
     uint64_t post_id = 0;
     Side cs;
     auto start_client = [&]() -> bool {
@@ -357,6 +367,7 @@ int main(int argc, char** argv) {
         std::printf("alone: player 1 played 2 s before player 2 joined\n");
     }
     if (!start_client()) return 1;
+    const int64_t joined_ms = g_now_ms;
 
     std::map<int32_t, uint32_t> pod_digest;      // the authority's state after each tic it ran
     uint64_t compared = 0, frames = 0;
@@ -365,59 +376,85 @@ int main(int argc, char** argv) {
     int64_t silent_until = -1;
     const int32_t rejoin_at = tics * 2 / 3, silent_at = tics * 2 / 3 + 600;
     int64_t outage_set = 0;
+    // after the authority ran (its tick or a POST): its digest, its tic, its channel messages
+    auto pod_after = [&]() {
+        const int32_t t = (int32_t)pod.call("doom_net_tic");
+        if (t != pod_tic) {
+            for (int32_t x = pod_tic; x < t; x++) {   // every tic it ran, from the ring (DOOM_NET_DIGEST=1)
+                const uint32_t d = (uint32_t)pod.call("doom_net_digest_at", {x});
+                if (d) pod_digest[x] = d;
+            }
+            total_tics += t - pod_tic;
+            pod_tic = t;
+        }
+        for (auto& ev : pod.events) net.send(1, 0, gen, ev);
+        pod.events.clear();
+    };
+    auto client_step = [&]() -> int {   // 4: the states differ
+        int32_t ran = 0;
+        for (; ran < 8; ran++) {
+            const int32_t t = (int32_t)client.call("doom_net_tic");
+            p2s.back().feed(t, [&](int d, int k) { client.call("doom_key", {d, k}); });
+            if (client.call("doom_net_run", {1}) != 1) break;
+            auto it = pod_digest.find(t);
+            if (it != pod_digest.end()) {
+                const uint32_t mine = (uint32_t)client.call("doom_state_digest", {0});
+                compared++;
+                if (mine != it->second) {
+                    std::printf("tic %d: the game states differ (authority %08x, client %08x)\n", t, it->second, mine);
+                    static const char* groups[] = {"", "players", "mobjs", "sectors", "P_Random/time", "other thinkers"};
+                    // the authority has moved on; the groups name what differs now
+                    for (int g = 1; g <= 5; g++) std::printf("  %s: %08x %08x\n", groups[g], (uint32_t)pod.call("doom_state_digest", {g}), (uint32_t)client.call("doom_state_digest", {g}));
+                    return 4;
+                }
+            }
+        }
+        if (ran) cs.dirty = true;
+        const int32_t fresh = (int32_t)client.call("doom_net_pace", {(int64_t)cs.rtt});
+        if (fresh > 0 && cs.fresh_at < 0) cs.fresh_at = g_now_ms;
+        for (auto it = cs.in_flight.begin(); it != cs.in_flight.end();) it = g_now_ms - it->second > 300 ? cs.in_flight.erase(it) : std::next(it);
+        if ((fresh >= 2 || (fresh > 0 && g_now_ms - cs.fresh_at >= 35) || g_now_ms - cs.last_post >= 250) && cs.in_flight.size() < 4) {
+            const std::string b = client.out((int32_t)client.call("doom_net_post"));
+            net.send(0, 1, gen, b, ++post_id);
+            cs.in_flight[post_id] = g_now_ms;
+            cs.last_post = g_now_ms;
+            cs.fresh_at = -1;
+        }
+        return 0;
+    };
     for (; total_tics < tics + 1200 && g_now_ms < 3600LL * 1000; g_now_ms++) {
         // the network: posts reach the authority, events and answers the client
         for (Msg& m : net.due()) {
             if (m.to == 0) {
                 pod.request("POST", "/doom/tics", m.body);
+                pod_after();
                 net.send(1, 2, m.gen, pod.body, m.id);
             } else if (m.gen == gen && client.rt && cs.alive) {
                 const int32_t r = client.recv(m.body);
-                if (m.kind == 2) cs.in_flight.erase(m.id);
-                if (r == -2) { std::printf("t=%lld ms: the session is gone, the client joins again\n", (long long)g_now_ms); if (!start_client()) return 1; }
-            }
-        }
-        // the node ticks the pod every 10 ms
-        if (g_now_ms % 10 == 0) {
-            p1.feed(pod_tic, [&](int d, int k) { pod.call("doom_key", {d, k}); });
-            pod.call("k32_tick", {g_now_ms});
-            const int32_t t = (int32_t)pod.call("doom_net_tic");
-            if (t != pod_tic) {
-                if (t == pod_tic + 1) pod_digest[t - 1] = (uint32_t)pod.call("doom_state_digest", {0});
-                total_tics += t - pod_tic;
-                pod_tic = t;
-            }
-            for (auto& ev : pod.events) net.send(1, 0, gen, ev);
-            pod.events.clear();
-        }
-        // the browser draws a frame every 16 ms
-        if (g_now_ms % 16 == 0 && client.rt && cs.alive) {
-            int32_t ran = 0;
-            for (; ran < 8; ran++) {
-                const int32_t t = (int32_t)client.call("doom_net_tic");
-                p2s.back().feed(t, [&](int d, int k) { client.call("doom_key", {d, k}); });
-                if (client.call("doom_net_run", {1}) != 1) break;
-                auto it = pod_digest.find(t);
-                if (it != pod_digest.end()) {
-                    const uint32_t mine = (uint32_t)client.call("doom_state_digest", {0});
-                    compared++;
-                    if (mine != it->second) {
-                        std::printf("tic %d: the game states differ (authority %08x, client %08x)\n", t, it->second, mine);
-                        static const char* groups[] = {"", "players", "mobjs", "sectors", "P_Random/time", "other thinkers"};
-                        // the authority has moved on; the groups name what differs now
-                        for (int g = 1; g <= 5; g++) std::printf("  %s: %08x %08x\n", groups[g], (uint32_t)pod.call("doom_state_digest", {g}), (uint32_t)client.call("doom_state_digest", {g}));
-                        return 4;
+                if (m.kind == 2) {
+                    auto f = cs.in_flight.find(m.id);
+                    if (f != cs.in_flight.end()) {
+                        const double sample = (double)(g_now_ms - f->second);
+                        cs.rtt = cs.rtt ? cs.rtt * 0.9 + sample * 0.1 : sample;
+                        cs.in_flight.erase(f);
                     }
                 }
+                if (r == -2) { std::printf("t=%lld ms: the session is gone, the client joins again\n", (long long)g_now_ms); if (!start_client()) return 1; }
+                else if (client_step()) return 4;
             }
-            if (ran && render) { client.call("doom_render"); frames++; }
-            for (auto it = cs.in_flight.begin(); it != cs.in_flight.end();) it = g_now_ms - it->second > 300 ? cs.in_flight.erase(it) : std::next(it);
-            if ((client.call("doom_net_fresh") > 0 || g_now_ms - cs.last_post >= 50) && cs.in_flight.size() < 4) {
-                const std::string b = client.out((int32_t)client.call("doom_net_post"));
-                net.send(0, 1, gen, b, ++post_id);
-                cs.in_flight[post_id] = g_now_ms;
-                cs.last_post = g_now_ms;
-            }
+        }
+        // the node ticks the pod every pod_tick_ms (10 ms, as a node does)
+        if (g_now_ms % pod_tick_ms == 0) {
+            p1.feed(pod_tic, [&](int d, int k) { pod.call("doom_key", {d, k}); });
+            pod.call("k32_tick", {g_now_ms});
+            pod_after();
+        }
+        // the page steps every 4 ms and draws every 16 ms
+        if (g_now_ms % 4 == 0 && client.rt && cs.alive && client_step()) return 4;
+        if (g_now_ms % 16 == 0 && client.rt && cs.alive && cs.dirty && render) {
+            client.call("doom_render");
+            frames++;
+            cs.dirty = false;
         }
         if (trace) {   // NET_TRACE: both sides while the authority waits
             static int32_t last_t = -1;
@@ -439,7 +476,7 @@ int main(int argc, char** argv) {
             const long run0 = json_int(s0, "tics", 0), stalled0 = json_int(s0, "stalled_tics", 0);
             std::printf("steady state, %ld tics in %.1f s: %ld stalled (%.2f%%), %ld ms stalled, longest %ld ms; ticcmds arrive %.2f tics "
                         "ahead (min %ld); %ld posts, %ld events\n",
-                        run0, g_now_ms / 1000.0, stalled0, run0 ? 100.0 * stalled0 / run0 : 0.0, json_int(s0, "stall_ms", 0),
+                        run0, (g_now_ms - joined_ms) / 1000.0, stalled0, run0 ? 100.0 * stalled0 / run0 : 0.0, json_int(s0, "stall_ms", 0),
                         json_int(s0, "longest_stall_ms", 0), json_int(s0, "lead_mean_x100", 0) / 100.0, json_int(s0, "lead_min", 0),
                         json_int(s0, "posts", 0), json_int(s0, "events", 0));
             net.outage_from = g_now_ms;

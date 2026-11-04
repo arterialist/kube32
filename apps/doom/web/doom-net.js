@@ -7,7 +7,9 @@
 // from the confirmed ticcmds alone: the pod's stream of both players'
 // ticcmds (Server-Sent Events from the Ingress, and the answer to every
 // POST) runs the tics in order; this side's ticcmds go to the pod with
-// POST <base>/tics, `delay` tics ahead of the tic they run in.
+// POST <base>/tics, two at a time, built by the clock `delay` tics past the
+// pod's tic as the page estimates it from the newest confirmed tic and the
+// round trip.
 //
 // Query parameters: delay=<tics> (the input delay, default the pod's),
 // events=<url> (the event stream, default <base>/events), wad=<url> and
@@ -22,7 +24,8 @@ const DOOM_KEYS = {
   F7: 0xc1, F8: 0xc2, F9: 0xc3, F10: 0xc4, F11: 0xd7, F12: 0xd8, Minus: 0x2d, Equal: 0x3d,
 };
 
-const POST_EVERY_MS = 50;     // a POST at least this often, new ticcmds or not
+const POST_EVERY_MS = 250;    // a POST at least this often, new ticcmds or not
+const POST_HOLD_MS = 35;      // a lone new ticcmd waits this long for a second one to share its POST
 const POSTS_IN_FLIGHT = 4;
 const POST_TIMEOUT_MS = 1000;
 const TICS_PER_STEP = 8;
@@ -37,6 +40,7 @@ export class DoomNet {
     this.params = here.searchParams;
     this.inFlight = 0;
     this.lastPost = -1e9;
+    this.freshAt = -1;
     this.posts = 0;
     this.answers = 0;
     this.rtt = 0;
@@ -188,12 +192,18 @@ export class DoomNet {
       this.x.doom_render();
       this.dirty = true;
     }
+    // this side's ticcmds by the clock: `delay` tics past the authority's tic as estimated
+    // from the newest confirmed tic and the round trip (port/net.c, doom_net_pace)
     const now = performance.now();
-    if ((this.x.doom_net_fresh() > 0 || now - this.lastPost >= POST_EVERY_MS) && this.inFlight < POSTS_IN_FLIGHT) this.post(now);
+    const fresh = this.x.doom_net_pace(Math.round(this.rtt));
+    if (fresh > 0 && this.freshAt < 0) this.freshAt = now;
+    const due = fresh >= 2 || (fresh > 0 && now - this.freshAt >= POST_HOLD_MS) || now - this.lastPost >= POST_EVERY_MS;
+    if (due && this.inFlight < POSTS_IN_FLIGHT) this.post(now);
   }
 
   async post(now) {
     const body = this.text(this.x.doom_net_out(), this.x.doom_net_post());
+    this.freshAt = -1;
     this.inFlight++;
     this.lastPost = now;
     this.posts++;
