@@ -4,8 +4,11 @@ All notable changes to this project will be documented in this file. The format 
 
 ## [Unreleased]
 
+## [0.1.0] - 2026-11-04
+
 ### Added
 
+- Pod workers on both cores ([docs/architecture/wasm-runtime.md](docs/architecture/wasm-runtime.md#pod-workers)). A board with PSRAM ticks pods and delivers their events on two workers, one per core, so two busy pods run at the same time. `kube32.io/core` puts a pod on a core; otherwise a pod goes to the less busy worker, a pod that calls another in-process brings the callee onto its worker, and every 2 s the busier worker gives a group of pods to the other. `K32_CMD:PODCORES:1` keeps the single tick and event threads of a board without PSRAM.
 - JSON Patch (`application/json-patch+json`, RFC 6902) on every resource that accepts a patch, so `kubectl patch --type json`, Helm, Argo CD and k9s work ([docs/api-reference.md](docs/api-reference.md)). The operations are `add`, `remove`, `replace`, `move`, `copy` and `test` at JSON Pointer paths, with `~0` and `~1` escapes and `-` to append to an array. A patch applies whole or not at all, and a failing operation answers `422 Invalid`. The Deployment `scale` subresource takes JSON patches against the `Scale` object.
 
 - The `wordsketch` example ([apps/wordsketch](apps/wordsketch/README.md), `examples/wordsketch.yaml`) turns a word spoken to the Cardputer into a doodle and a short story. A pod on the Cardputer listens with a keyword spotter (cat, dog, bird, house, tree, bed; integer front end, weights read in place from a blob) in 79 KiB of its pod pool, an entry-point pod on a board with PSRAM draws the word with a class-conditional diffusion model and publishes every step's image, stories260K writes the story, and the Cardputer's screen shows both as they form. The models, their training code and their C inference, which computes the reference's bits, are in `models/`.
@@ -93,6 +96,8 @@ All notable changes to this project will be documented in this file. The format 
 
 ### Fixed
 
+- Ingress event streams keep every message while a viewer reads slowly. A viewer may fall up to 32 KiB behind, and one further behind, or one that reads nothing for 10 s, is disconnected and its EventSource reconnects. The cluster telemetry counts `sse_received`, `sse_dropped` and `link.dispatch_dropped`.
+- A `ServiceClient` with TLS joins its session threads when it is destroyed, so a process that exits right after it no longer frees OpenSSL's per-thread state twice.
 - A Wi-Fi station without PSRAM, such as the Cardputer, stays on its access point while sockets read slowly. A received frame stayed in the driver's receive buffer until a socket read it, and once frames held every buffer the station could not receive the access point's key handshake. The station copies each frame out and returns the buffer at once.
 - A worker that receives the control plane's UDP HELLOs keeps its Wi-Fi link while the API server is slow or restarting, instead of joining the access point again, restarting Wi-Fi or rebooting.
 - A control plane whose PSRAM is fragmented keeps answering API requests. Each request took a 16 KiB scratch block from the heap, so once the free PSRAM lay in smaller pieces every request answered `503 node is out of memory`, also with over 100 KiB free. Each API worker now allocates a 1 KiB scratch at start, and a request whose objects are under 4 KiB needs no larger block. A control plane also sets 64 KiB of PSRAM aside at boot for allocations over 4 KiB (lists, copies of large objects, controller working sets), which go there first and to the heap when it has no room ([docs/hardware-spec.md](docs/hardware-spec.md#node-and-pod-memory-figures)). The `[MEM]` console lines report the largest free PSRAM block and the region's figures, and the first allocation of 1 KiB or more refused between two lines prints its size, the PSRAM figures and a backtrace. The IPC dispatcher's stack on a board with PSRAM is 8 KiB, down from 32 KiB: it queues messages and runs no pod code.
