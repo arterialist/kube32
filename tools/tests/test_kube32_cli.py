@@ -506,7 +506,7 @@ class TestDeploy(TempDirCase):
             (("--name", "x", "--env", "1BAD=v"), "error: invalid environment variable name '1BAD'\n"),
             (("--name", "x", "--hardware", "lasers"), "error: unknown hardware 'lasers' (expected display, keyboard, speaker, microphone, ipc, sd, service-call, chip-temp or none)\n"),
             (("--name", "x", "--memory", "lots"), "error: invalid quantity 'lots' (expected e.g. 64Ki, 1280Ki, 2Mi, 65536)\n"),
-            (("--name", "x", "--image", "docker.io/nginx"), "error: --image must be a wasm:// reference such as wasm://sd/x or wasm://embedded/x:v1\n"),
+            (("--name", "x", "--image", "docker.io/nginx"), "error: --image must be a wasm:// reference such as wasm://sd/x, wasm://blob/x or wasm://embedded/x:v1\n"),
             (("--name", "x", "--sd-claim", "data"), "error: --sd-claim needs the sd hardware (--hardware ...,sd, or a module that imports k32_fs_*)\n"),
         ]
         for extra, msg in cases:
