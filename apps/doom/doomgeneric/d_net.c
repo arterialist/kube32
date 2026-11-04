@@ -231,6 +231,14 @@ void D_ConnectNetGame(void)
     {
         netgame = true;
     }
+
+    // A lockstep netgame: the platform layer carries the ticcmds
+    // (d_loop.c, D_RunNetTic).
+
+    if (M_CheckParmWithArgs("-lockstep", 1) > 0)
+    {
+        netgame = true;
+    }
 }
 
 //

@@ -1,0 +1,53 @@
+<!doctype html>
+<!-- SPDX-License-Identifier: GPL-2.0-or-later -->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>DOOM, player 2</title>
+<style>
+  :root { --bg: #0b0b0b; --fg: #d8d0c0; --dim: #a39b8c; --accent: #e0513f; }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; background: var(--bg); color: var(--fg); font: 13px/1.4 ui-monospace, SFMono-Regular, Menlo, monospace; }
+  body { display: grid; grid-template-rows: 1fr auto; place-items: center; padding: 12px 16px; gap: 10px; }
+  canvas { width: min(100%, calc((100vh - 90px) * 1.6)); aspect-ratio: 8 / 5; image-rendering: pixelated; background: #000; outline: none; }
+  #bar { width: min(100%, calc((100vh - 90px) * 1.6)); display: flex; gap: 12px; align-items: center; justify-content: space-between; }
+  #status { color: var(--dim); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  #status.error { color: var(--accent); }
+  button { font: inherit; color: var(--bg); background: var(--fg); border: 0; padding: 6px 14px; cursor: pointer; }
+  #help { color: var(--dim); white-space: nowrap; }
+  @media (max-width: 640px) { #help { display: none; } }
+</style>
+</head>
+<body>
+<canvas id="screen" width="320" height="200" tabindex="0"></canvas>
+<div id="bar">
+  <span id="status">Player 2 of the pod's game.</span>
+  <span id="help">arrows or WASD move · ctrl fire · space use · shift run · 1-7 weapons</span>
+  <button id="join">Join</button>
+</div>
+<script type="module">
+  const here = location.pathname;
+  const base = here.endsWith('/') ? here : /\.html?$/.test(here) ? here.replace(/[^/]*$/, '') : here + '/';
+  const { DoomNet } = await import(base + 'doom-net.js');
+  const status = document.getElementById('status');
+  const button = document.getElementById('join');
+  const canvas = document.getElementById('screen');
+  const game = new DoomNet(canvas, status);
+  window.doomNet = game;
+  button.addEventListener('click', async () => {
+    button.disabled = true;
+    canvas.focus();
+    try {
+      await game.start();
+      button.remove();
+    } catch (e) {
+      status.classList.add('error');
+      status.textContent = e.message;
+      button.disabled = false;
+    }
+  });
+  if (new URLSearchParams(location.search).has('autojoin')) button.click();
+</script>
+</body>
+</html>

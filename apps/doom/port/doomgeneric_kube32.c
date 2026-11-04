@@ -18,7 +18,11 @@
  *                     the same game state; the microseconds of each part
  *
  * A path matches by its last segment, so the pod also answers under an
- * Ingress prefix (/doom/frame). */
+ * Ingress prefix (/doom/frame).
+ *
+ * With env DOOM_PLAYERS=2 the pod plays player 1 of a two-player netgame
+ * and orders both players' ticcmds (port/net.c): it waits for player 2 to
+ * join, then runs each tic once player 2's ticcmd for it is in. */
 #include "include/k32libc.h"
 #include "../../../include/runtime/k32_app_abi.h"
 
@@ -27,6 +31,7 @@
 #include "../doomgeneric/d_loop.h"
 #include "../doomgeneric/i_video.h"
 #include "../doomgeneric/doomstat.h"
+#include "net.h"
 
 K32_IMPORT("esp32_get_time_us") int64_t esp32_get_time_us(void);
 
@@ -92,6 +97,16 @@ K32_EXPORT("doom_render") void doom_render(void) { D_Display(); }
 #ifndef DG_SIM_ONLY
 /* The frame the engine drew, palette indices, SCREENWIDTH x SCREENHEIGHT (a host check reads it) */
 K32_EXPORT("doom_screen_ptr") uint32_t doom_screen_ptr(void) { return (uint32_t)(uintptr_t)I_VideoBuffer; }
+/* The palette the frame uses, 256 RGB triplets */
+K32_EXPORT("doom_palette") uint32_t doom_palette(void) {
+    static uint8_t pal[768];
+    for (int i = 0; i < 256; i++) {
+        pal[i * 3] = colors[i].r;
+        pal[i * 3 + 1] = colors[i].g;
+        pal[i * 3 + 2] = colors[i].b;
+    }
+    return (uint32_t)(uintptr_t)pal;
+}
 #endif
 
 /* The 3D view alone (no status bar, HUD or menu): what a split renderer ships */
@@ -131,16 +146,33 @@ K32_EXPORT("k32_init") int32_t k32_init(void) {
     else iwad[n] = 0;
     argv_store[argc++] = "-iwad";
     argv_store[argc++] = iwad;
+    static char client_args[256];   /* DOOM_ARGS less the zone size: what a client's engine starts with */
     n = k32_env_get("DOOM_ARGS", 9, args_buf, sizeof args_buf - 1);
     if (n > 0 && n < (int32_t)sizeof args_buf) {
         args_buf[n] = 0;
         char* p = args_buf;
-        while (*p && argc < 23) {
+        while (*p && argc < 21) {
             while (*p == ' ') *p++ = 0;
             if (!*p) break;
             argv_store[argc++] = p;
             while (*p && *p != ' ') p++;
         }
+    }
+    for (int i = 3, skip = 0; i < argc; i++) {
+        if (skip) { skip = 0; continue; }
+        if (!strcmp(argv_store[i], "-kb")) { skip = 1; continue; }
+        if (client_args[0]) strcat(client_args, " ");
+        strcat(client_args, argv_store[i]);
+    }
+    int32_t players = 1;
+    {
+        char b[8];
+        int32_t m = k32_env_get("DOOM_PLAYERS", 12, b, sizeof b - 1);
+        if (m > 0 && m < (int32_t)sizeof b) { b[m] = 0; players = atoi(b); }
+    }
+    if (players == 2) {             /* player 1 of a lockstep netgame (port/net.c) */
+        argv_store[argc++] = "-lockstep";
+        argv_store[argc++] = "2";
     }
     argv_store[argc] = 0;
     singletics = true;          /* every TryRunTics runs exactly one tic */
@@ -150,6 +182,7 @@ K32_EXPORT("k32_init") int32_t k32_init(void) {
         if (m > 0 && m < (int32_t)sizeof sb) { sb[m] = 0; screenblocks = atoi(sb); }
     }
     doomgeneric_Create(argc, argv_store);
+    if (players == 2) net_init_authority(client_args, iwad);
     started = 1;
     start_ms = k32_time_ms();
     return 0;
@@ -158,6 +191,16 @@ K32_EXPORT("k32_init") int32_t k32_init(void) {
 K32_EXPORT("k32_tick") int32_t k32_tick(uint32_t uptime_ms) {
     (void)uptime_ms;
     if (!started) return 0;
+    if (net_role() == NET_AUTHORITY) {
+        /* the tics whose ticcmds are in (a POST may have run some); a frame when the game moved */
+        static int drawn_tic = -1;
+        net_tick(k32_time_ms());
+        if (gametic != drawn_tic) {
+            doom_render();
+            drawn_tic = gametic;
+        }
+        return 1;
+    }
     uint32_t due = (uint32_t)((k32_time_ms() - start_ms) * TICRATE / 1000);
     if (due <= tics_run) return 1;
     uint32_t n = due - tics_run;
@@ -172,10 +215,23 @@ K32_EXPORT("k32_tick") int32_t k32_tick(uint32_t uptime_ms) {
 
 /* ---- HTTP --------------------------------------------------------------- */
 
+/* A request; one that does not fit (a browser's cookies) comes from the heap until k32_handle returns */
 static unsigned char req_buf[2048];
+static unsigned char* req_big;
 
 K32_EXPORT("k32_alloc") uint32_t k32_alloc(uint32_t size) {
-    return size <= sizeof req_buf ? (uint32_t)(uintptr_t)req_buf : 0;
+    if (size < sizeof req_buf) return (uint32_t)(uintptr_t)req_buf;
+    free(req_big);
+    req_big = malloc(size + 1);
+    return (uint32_t)(uintptr_t)req_big;
+}
+
+static int32_t handle_request(char* req, uint32_t len);
+
+K32_EXPORT("k32_handle") int32_t k32_handle(uint32_t ptr, uint32_t len) {
+    int32_t status = handle_request((char*)(uintptr_t)ptr, len);
+    if (req_big) { free(req_big); req_big = 0; }
+    return status;
 }
 
 static char out[640];
@@ -222,8 +278,7 @@ static const char page[] =
     "for(let i=0;i<64000;i++){const p=a[768+i]*3;img.data.set([a[p],a[p+1],a[p+2],255],i*4)}c.putImageData(img,0,0)}catch(e){}"
     "requestAnimationFrame(loop)}loop()</script>";
 
-K32_EXPORT("k32_handle") int32_t k32_handle(uint32_t ptr, uint32_t len) {
-    char* req = (char*)(uintptr_t)ptr;
+static int32_t handle_request(char* req, uint32_t len) {
     req[len] = 0;
     char* sp = strchr(req, ' ');
     if (!sp) return K32_HANDLE_ERR_BAD_REQUEST;
@@ -241,6 +296,10 @@ K32_EXPORT("k32_handle") int32_t k32_handle(uint32_t ptr, uint32_t len) {
     seg = seg ? seg + 1 : path;
     out_len = 0;
     put("{");
+    {
+        int32_t net_status = net_route(method, seg, body);
+        if (net_status) return net_status;
+    }
 
 #ifndef DG_SIM_ONLY
     if (!strcmp(seg, "frame")) {

@@ -6,6 +6,7 @@
 #   make view                the Cardputer view pod (build/doom-view.wasm)
 #   make check               build/drawlist_check: the split renderer against the engine
 #   make verify [TICS=n]     runs it: game states and pixels, both widths, the sim on the sim pack
+#   make verify-net          two players in lockstep through a simulated network (port/net.c)
 #   make ZONE_KB=512         the zone (DOOM's heap) size; -kb <n> in DOOM_ARGS overrides it
 #
 # The module starts with its static data and grows its linear memory with
@@ -34,7 +35,7 @@ SIM_EXCLUDE = doomgeneric/m_menu.c doomgeneric/am_map.c doomgeneric/wi_stuff.c d
 EXCLUDE ?=
 ENGINE = $(filter-out doomgeneric/i_sdlmusic.c doomgeneric/i_sdlsound.c doomgeneric/i_allegromusic.c \
            doomgeneric/i_allegrosound.c doomgeneric/doomgeneric_%.c $(EXCLUDE), $(wildcard doomgeneric/*.c))
-PORT = port/libc.c port/doomgeneric_kube32.c port/state_digest.c
+PORT = port/libc.c port/doomgeneric_kube32.c port/state_digest.c port/net.c
 BUILD ?= build
 OBJS = $(ENGINE:doomgeneric/%.c=$(BUILD)/engine/%.o) $(PORT:port/%.c=$(BUILD)/port/%.o)
 
@@ -90,6 +91,18 @@ verify: build/drawlist_check build/doom.wasm build/doom-sim.wasm build/doom-240.
 	./build/drawlist_check build/doom-240.wasm build/doom-sim-240.wasm $(WAD) build/wad/doom1-e1m1.pack --tics $(TICS) --spin --state --screenblocks 11 \
 	    --args "-warp 1 1 -skill 3 -kb 640" --sim-args "-warp 1 1 -skill 3 -kb 224" --sim-wad build/wad/doom1-e1m1-sim.wad
 
+# Two-player lockstep (port/net.c) through a simulated network: the sim pod as the
+# authority, the full engine as the browser's client, jitter, loss, an outage, a
+# reload and a timeout; both game states compared at every tic, with the sim at 320
+# and at 240 wide (the Cardputer's) against the browser's 320 (make verify-net NET_TICS=n)
+build/net_check: bench/net_check.cpp $(REPO)/build/libwasm3.a
+	$(BENCH_CXX) $(WASM3_DEFS) -o $@ $< $(REPO)/src/runtime/pod_memory_pool.cpp $(REPO)/src/osal/system_posix.cpp $(REPO)/build/libwasm3.a
+
+NET_TICS ?= 6000
+verify-net: build/net_check build/doom.wasm build/doom-sim.wasm build/doom-sim-240.wasm build/wad/doom1-e1m1-sim.wad
+	./build/net_check build/doom-sim.wasm build/doom.wasm build/wad/doom1-e1m1-sim.wad $(WAD) --tics $(NET_TICS)
+	./build/net_check build/doom-sim-240.wasm build/doom.wasm build/wad/doom1-e1m1-sim.wad $(WAD) --tics $(NET_TICS) --screenblocks 11
+
 build/wad/doom1-e1m1.pack: $(WAD) wad.py
 	$(PYTHON) wad.py pack $< $@
 build/wad/doom1-e1m1-sim.wad: $(WAD) wad.py
@@ -99,7 +112,7 @@ $(BUILD)/engine/%.o: doomgeneric/%.c
 	@mkdir -p $(BUILD)/engine
 	$(CLANG) $(ENGINE_CFLAGS) -c $< -o $@
 
-$(BUILD)/port/%.o: port/%.c port/include/k32libc.h ../../include/runtime/k32_app_abi.h
+$(BUILD)/port/%.o: port/%.c port/include/k32libc.h port/net.h ../../include/runtime/k32_app_abi.h
 	@mkdir -p $(BUILD)/port
 	$(CLANG) $(CFLAGS) -Wall -Wno-unused-function -c $< -o $@
 
@@ -128,4 +141,4 @@ bench: build/doombench build/doombench-fast
 clean:
 	rm -rf build
 
-.PHONY: all stats sim view check verify bench clean
+.PHONY: all stats sim view check verify verify-net bench clean

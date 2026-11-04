@@ -12,6 +12,8 @@ DOOM ([doomgeneric](https://github.com/ozkl/doomgeneric), a portable Chocolate D
 
 A path matches by its last segment, so the pod also answers under an Ingress prefix (`/doom/frame`).
 
+With `DOOM_PLAYERS=2` the pod plays player 1 of a two-player game and a browser joins as player 2 ([Two players](#two-players)).
+
 ## Build
 
 ```sh
@@ -75,6 +77,59 @@ At 320 x 168 and at 240 x 135, 350 frames of the turning course match the engine
 `--state` also compares the two engines' game states every tic (`port/state_digest.c`: CRC-32 digests of the players, map objects, sectors, `P_Random`'s index and the other thinkers; `M_Random`'s index is the screen side's and kept apart) and the renderers' frames (drawsegs with their clip arrays, vissprites, visplanes, openings), and names the first part that differs; `--sim-args` and `--sim-wad` give the sim its own zone and IWAD; `--locate x,y,tic` names the entry behind a pixel. `make verify` runs the three comparisons the host suite guards: 2,000 tics on both courses at 320 wide and on the turning course at 240 wide, the full engine with a 640 KiB zone and the sim on the sim pack with 224 or 256 KiB; `make verify TICS=10000` is the long run. The game states and every pixel agree over 10,000 tics on both courses, and the result does not depend on the sim's zone (224, 256, 480 and 640 KiB tried). The one divergence found this way was a wall column the engine clips away (`dc_yh < dc_yl`, which `R_DrawColumn` draws nothing of) that the emitter recorded with its bottom row wrapped to 255; the game states had never differed.
 
 Pixel rasterization is 981 K ops a frame (73%), 17.4 ops a pixel over 56.5 K pixels (37.4 K wall, 15.9 K floor and ceiling, 3.2 K sprite). The draw list is 497 wall columns, 174 spans and 6 sprites a frame (p95: 937, 427, 18), 7.2 KB packed (p95 14.8 KB, max 16.1 KB). A frame touches 185 distinct texture columns (21.5 KB; p95 361, 39.9 KB), 3 to 4 flats (16 KB; p95 7, 28 KB) and 4 sprite patches (6.8 KB; p95 11, 13.5 KB). Without texture lookups a 416 KiB zone plays E1M1.
+
+## Two players
+
+Player 1 plays on the boards: the sim pod on the control plane runs the game, and the Cardputer's view pod draws it and sends the keys, as above. Player 2 plays in a browser at `http://<cluster>/doom/`: the page runs the same engine (`build/doom.wasm`) and draws its own view. It is a vanilla netgame of two players (`-lockstep 2`, `doomgeneric/d_loop.c`) whose ticcmds travel through kube32 (`port/net.c`):
+
+- The pod orders the ticcmds. It runs tic T once player 2's ticcmd for T is in, builds player 1's at that moment, and publishes both on a channel topic, two tics a message. The Ingress serves the topic to the page as Server-Sent Events.
+- The page runs the tics from that stream, in order, and nothing else. After it runs tic T it builds player 2's ticcmd for tic T + 4 (the input delay) and sends it with `POST /doom/tics`. Every POST carries all of the page's ticcmds the pod has not confirmed, and every answer carries the confirmed tics the page lacks, so a lost POST, a lost event or a dropped event stream costs time and never the game state. The page runs its tics as the messages arrive rather than on a timer, so a hidden tab, whose timers the browser slows to once a second, keeps the game at full speed.
+- A late ticcmd holds the pod's next tic, and its clock with it, until it arrives; the tic runs as the POST lands. A page that sends nothing for 5 s leaves the game ("Player 2 left the game") and player 1 plays on alone.
+- A page that joins starts a new session: the pod restarts the map, and the page's engine starts it in the same state at the same tic. Reloading the page joins again.
+- Both sides digest their game state every 35 tics (`port/state_digest.c`) and compare: the page reports its digest in each POST, the pod sends its own with the tics. `GET /doom/netstats` and the page's status line count the checks. The vanilla consistency check (`consistancy` in the ticcmd) runs as well.
+
+| Request | Answer |
+| --- | --- |
+| `GET /doom/net` | The game: players, session, tic, and the IWAD name and arguments a client's engine starts with |
+| `POST /doom/join` | Takes player 2's place: `{"t":"join","g":<session>,"s":<first tic>,"delay":4,"digest":35}` |
+| `POST /doom/tics` | `g=<session>&a=<first tic lacking>&s=<first tic>&c=<ticcmds, hex>[&d=<tic>&h=<digest>]`; answers the confirmed tics from `a` |
+| `GET /doom/netstats` | Tics run, tics that waited and for how long, how early ticcmds arrive, digest checks |
+| `GET /doom/`, `/doom/doom-net.js`, `/doom/doom.wasm`, `/doom/doom.wad` | The page, its host, the engine and the IWAD, from the `DOOM_WEB_BLOB` blob |
+
+Confirmed tics, on the topic and in each answer: `{"t":"tics","g":<session>,"s":<first tic>,"m":<players in the game, bits>,"c":"<hex>"[,"d":<tic>,"h":"<digest>"]}`. A ticcmd is 7 bytes (forwardmove, sidemove, angleturn, chatchar, buttons, consistancy), so a tic of two players is 28 hex digits and a message of two tics is about 100 bytes; a channel message holds at most 4 tics.
+
+| Setting (pod env) | Meaning |
+| --- | --- |
+| `DOOM_PLAYERS` | `2`: the two-player game |
+| `DOOM_NET_TOPIC` | The channel topic of the confirmed tics (default `doom.tics`); the Ingress's `kube32.io/event-stream` serves it |
+| `DOOM_NET_DELAY` | The input delay a page plays with, in tics (default 4; the page's `?delay=` overrides it) |
+| `DOOM_NET_BATCH` | Tics a message (default 2, at most 4) |
+| `DOOM_NET_TIMEOUT_MS` | How long a silent player 2 stays in the game (default 5000) |
+| `DOOM_NET_DIGEST` | Tics between state digests (default 35, 0 for none) |
+| `DOOM_WEB_BLOB` | The blob holding the page, the engine and the IWAD (default `doom-web`) |
+
+```sh
+make W=240 sim && make                      # the pod's engine and the page's
+python3 wad.py simpack build/wad/doom1-e1m1-min.wad build/wad/doom1-e1m1-sim.wad
+python3 wad.py web build/wad/doom1-e1m1-min.wad build/doom.wasm build/wad/doom-web.wad
+for b in doom-sim:build/doom-sim-240.wasm doom-sim-wad:build/wad/doom1-e1m1-sim.wad doom-web:build/wad/doom-web.wad; do
+  curl -X PUT --data-binary @${b#*:} http://<control-plane>:6443/api/v1/nodes/<control-plane node>/proxy/blobs/${b%%:*}
+done
+kubectl --context kube32 apply -f doom-2p.yaml   # the pod, its Service, and the Ingress with the event stream
+```
+
+The three blobs take 2.2 MB of the control plane's 3.2 MB blob region, so replacing `doom-web` takes a `DELETE` of the old one first. The page is 1.66 MB to load: the engine (366 KiB) and the IWAD (1.2 MiB). At 240 wide the pod's linear memory stays at 704 KiB; the netgame adds 8,875 B to the module (278,313 B), and `kube32-podsize` puts the overhead at 491 KiB read from flash (467 KiB for the single-player pod), so the pod takes 1,195 KiB of the devkit's 1,280 KiB.
+
+`make verify-net` plays both sides on the host's wasm3: the sim pod as the authority, driven as a node drives it (`k32_tick` every 10 ms, the requests through `k32_handle`, its channel messages captured), and the full engine as the page drives it (a frame every 16 ms), each player on a scripted course. Every message crosses a relay that delays it 5 to 45 ms, so messages overtake each other, and loses 2% of them; the network then goes dark for 1.5 s, the page reloads, and later goes silent past the timeout and joins again. The two game states are compared at every tic both ran (`bench/net_check.cpp`), with the sim at 320 and at 240 wide against the page's 320. Over 7,200 tics all 7,156 compared tics agree. The input delay sets how often a tic waits for player 2; over the 2,000 tics before the outage (57.1 s at 35 tics a second):
+
+| Input delay | Tics that wait | Time waited | Ticcmds arrive ahead (mean) |
+| --- | --- | --- | --- |
+| 3 tics (86 ms) | 12.6% | 3,355 ms in 60.0 s | 0.55 tics |
+| 4 tics (114 ms) | 1.55% | 528 ms in 57.6 s | 1.26 tics |
+| 5 tics (143 ms) | 0.3% | 150 ms in 57.3 s | 2.21 tics |
+| 6 tics (171 ms) | the first tic only | 0 ms in 57.1 s | 3.21 tics |
+
+The outage holds one tic for 1.5 s, and the game goes on from there; the silent page holds one tic for the 5 s timeout, then player 2 leaves the game. `--client-args` gives the page's engine other arguments: with `-nomonsters` the check stops at tic 0 and names the parts that differ.
 
 ## IWAD
 

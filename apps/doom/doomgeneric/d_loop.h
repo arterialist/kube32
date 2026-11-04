@@ -74,8 +74,16 @@ boolean D_InitNetGame(net_connect_data_t *connect_data);
 void D_StartNetGame(net_gamesettings_t *settings,
                     netgame_startup_callback_t callback);
 
+// Lockstep netgame (-lockstep <players>): the platform layer builds the
+// local player's ticcmd for a tic, and runs each tic once every player's
+// ticcmd for it is known. TryRunTics runs nothing on its own then.
+
+void D_BuildLocalTiccmd(ticcmd_t *cmd, int tic);
+void D_RunNetTic(ticcmd_t *cmds, boolean *ingame);
+
 extern boolean singletics;
 extern int gametic, ticdup;
+extern int lockstep_players;
 
 #endif
 
