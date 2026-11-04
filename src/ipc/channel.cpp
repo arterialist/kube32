@@ -614,9 +614,16 @@ int32_t ChannelManager::send_frames_to(const NodeEndpoint& ep, uint32_t channel_
     if (frag_count == 0) frag_count = 1;
 
     osal::LockGuard guard(send_mutex_);
-    if (!tx_frame_) tx_frame_.reset(new (std::nothrow) uint8_t[K32C_MAX_FRAME_LEN]);
-    if (!tx_frame_) return IPC_ERR_NOMEM;
-    uint8_t* const frame = tx_frame_.get();
+    // A small message's frame lies on the stack; a large message's buffer
+    // exists only while it goes out (a node without PSRAM keeps no 1.5 KB
+    // buffer for it)
+    uint8_t small_frame[K32C_MAX_PACKET_LEN];
+    std::unique_ptr<uint8_t[]> large_frame;
+    if (large) {
+        large_frame.reset(new (std::nothrow) uint8_t[K32C_MAX_FRAME_LEN]);
+        if (!large_frame) return IPC_ERR_NOMEM;
+    }
+    uint8_t* const frame = large ? large_frame.get() : small_frame;
     const uint16_t seq = seq_generator_.fetch_add(1);
     const uint32_t gap_us = fragment_gap_us_.load();
 

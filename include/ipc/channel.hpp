@@ -475,9 +475,8 @@ private:
     uint32_t hello_interval_ms_{3000};
     uint64_t last_hello_ms_{0};
 
-    // Sending: one frame buffer, one sender at a time
+    // Sending: one sender at a time
     osal::Mutex send_mutex_;
-    std::unique_ptr<uint8_t[]> tx_frame_;
     std::atomic<uint32_t> fragment_gap_us_{0};
     std::atomic<uint8_t> route_{0};
     std::atomic<size_t> rx_budget_bytes_{K32C_MAX_MESSAGE_BYTES * 8};
