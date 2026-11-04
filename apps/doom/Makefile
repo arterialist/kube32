@@ -5,6 +5,7 @@
 #   make sim [W=240]         the sim-only pod (build/doom-sim[-240].wasm): a draw list a frame
 #   make view                the Cardputer view pod (build/doom-view.wasm)
 #   make check               build/drawlist_check: the split renderer against the engine
+#   make verify [TICS=n]     runs it: game states and pixels, both widths, the sim on the sim pack
 #   make ZONE_KB=512         the zone (DOOM's heap) size; -kb <n> in DOOM_ARGS overrides it
 #
 # The module starts with its static data and grows its linear memory with
@@ -76,6 +77,24 @@ build/drawlist_check: bench/drawlist_check.cpp view/drawlist.c view/drawlist.h $
 
 check: build/drawlist_check
 
+# The split renderer against the engine, game state and pixels, at both widths and
+# with the sim on the sim pack at 224 KiB (make verify TICS=10000 for the long run)
+TICS ?= 2000
+PYTHON ?= $(if $(wildcard $(REPO)/.venv/bin/python),$(REPO)/.venv/bin/python,python3)
+WAD = build/wad/doom1-e1m1-min.wad
+verify: build/drawlist_check build/doom.wasm build/doom-sim.wasm build/doom-240.wasm build/doom-sim-240.wasm build/wad/doom1-e1m1.pack build/wad/doom1-e1m1-sim.wad
+	./build/drawlist_check build/doom.wasm build/doom-sim.wasm $(WAD) build/wad/doom1-e1m1.pack --tics $(TICS) --spin --state \
+	    --args "-warp 1 1 -skill 3 -kb 640" --sim-args "-warp 1 1 -skill 3 -kb 224" --sim-wad build/wad/doom1-e1m1-sim.wad
+	./build/drawlist_check build/doom.wasm build/doom-sim.wasm $(WAD) build/wad/doom1-e1m1.pack --tics $(TICS) --state \
+	    --args "-warp 1 1 -skill 3 -kb 640" --sim-args "-warp 1 1 -skill 3 -kb 256" --sim-wad build/wad/doom1-e1m1-sim.wad
+	./build/drawlist_check build/doom-240.wasm build/doom-sim-240.wasm $(WAD) build/wad/doom1-e1m1.pack --tics $(TICS) --spin --state --screenblocks 11 \
+	    --args "-warp 1 1 -skill 3 -kb 640" --sim-args "-warp 1 1 -skill 3 -kb 224" --sim-wad build/wad/doom1-e1m1-sim.wad
+
+build/wad/doom1-e1m1.pack: $(WAD) wad.py
+	$(PYTHON) wad.py pack $< $@
+build/wad/doom1-e1m1-sim.wad: $(WAD) wad.py
+	$(PYTHON) wad.py simpack $< $@
+
 $(BUILD)/engine/%.o: doomgeneric/%.c
 	@mkdir -p $(BUILD)/engine
 	$(CLANG) $(ENGINE_CFLAGS) -c $< -o $@
@@ -109,4 +128,4 @@ bench: build/doombench build/doombench-fast
 clean:
 	rm -rf build
 
-.PHONY: all stats sim view check bench clean
+.PHONY: all stats sim view check verify bench clean
