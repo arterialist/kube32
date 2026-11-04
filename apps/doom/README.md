@@ -106,8 +106,8 @@ The flash store keeps a replaced blob's old bytes until its pod lets go and plac
 
 Player 1 plays on the boards: the sim pod on the control plane runs the game, and the Cardputer's view pod draws it and sends the keys, as above. Player 2 plays in a browser at `http://<cluster>/doom/`: the page runs the same engine (`build/doom.wasm`) and draws its own view. It is a vanilla netgame of two players (`-lockstep 2`, `doomgeneric/d_loop.c`) whose ticcmds travel through kube32 (`port/net.c`):
 
-- The pod orders the ticcmds. It runs tic T once player 2's ticcmd for T is in, builds player 1's at that moment, and publishes both on a channel topic, two tics a message. The Ingress serves the topic to the page as Server-Sent Events.
-- The page runs the tics from that stream, in order, and nothing else. After it runs tic T it builds player 2's ticcmd for tic T + 4 (the input delay) and sends it with `POST /doom/tics`. Every POST carries all of the page's ticcmds the pod has not confirmed, and every answer carries the confirmed tics the page lacks, so a lost POST, a lost event or a dropped event stream costs time and never the game state. The page runs its tics as the messages arrive rather than on a timer, so a hidden tab, whose timers the browser slows to once a second, keeps the game at full speed.
+- The pod orders the ticcmds. It runs tic T once player 2's ticcmd for T is in, builds player 1's at that moment, and publishes both on a channel topic, two tics a message. The Ingress serves the topic to the page as Server-Sent Events. The pod runs the tics due by its clock whenever the node ticks it and whenever a POST arrives, and catches up to a second of tics when the node ticks it late, so a busy node keeps the game at 35 tics a second.
+- The page runs the tics from that stream, in order, and nothing else. It builds player 2's ticcmds by the clock, 4 tics (the input delay) past the pod's tic, which it estimates from the newest confirmed tic, the time since it arrived and half the round trip; a ticcmd then has the input delay for the trip one way. It sends them with `POST /doom/tics`, two at a time. Every POST carries all of the page's ticcmds the pod has not confirmed, and every answer carries the confirmed tics the page lacks, so a lost POST, a lost event or a dropped event stream costs time and never the game state. The page runs its tics as the messages arrive rather than on a timer, so a hidden tab, whose timers the browser slows to once a second, keeps the game at full speed.
 - A late ticcmd holds the pod's next tic, and its clock with it, until it arrives; the tic runs as the POST lands. A page that sends nothing for 5 s leaves the game ("Player 2 left the game") and player 1 plays on alone.
 - A page that joins starts a new session: the pod restarts the map, and the page's engine starts it in the same state at the same tic. Reloading the page joins again.
 - Both sides digest their game state every 35 tics (`port/state_digest.c`) and compare: the page reports its digest in each POST, the pod sends its own with the tics. `GET /doom/netstats` and the page's status line count the checks. The vanilla consistency check (`consistancy` in the ticcmd) runs as well.
@@ -117,7 +117,7 @@ Player 1 plays on the boards: the sim pod on the control plane runs the game, an
 | `GET /doom/net` | The game: players, session, tic, and the IWAD name and arguments a client's engine starts with |
 | `POST /doom/join` | Takes player 2's place: `{"t":"join","g":<session>,"s":<first tic>,"delay":4,"digest":35}` |
 | `POST /doom/tics` | `g=<session>&a=<first tic lacking>&s=<first tic>&c=<ticcmds, hex>[&d=<tic>&h=<digest>]`; answers the confirmed tics from `a` |
-| `GET /doom/netstats` | Tics run, tics that waited and for how long, how early ticcmds arrive, digest checks |
+| `GET /doom/netstats` | Tics run, tics that waited and for how long, how early ticcmds arrive, digest checks; how often the node ticks the pod (`tick_gap_mean_ms`, `tick_gap_max_ms`), the tics run as POSTs land (`post_tics`) and the tics of time dropped after a second behind (`dropped_tics`) |
 | `GET /doom/`, `/doom/doom-net.js`, `/doom/doom.wasm`, `/doom/doom.wad` | The page, its host, the engine and the IWAD, from the `DOOM_WEB_BLOB` blob |
 
 Confirmed tics, on the topic and in each answer: `{"t":"tics","g":<session>,"s":<first tic>,"m":<players in the game, bits>,"c":"<hex>"[,"d":<tic>,"h":"<digest>"]}`. A ticcmd is 7 bytes (forwardmove, sidemove, angleturn, chatchar, buttons, consistancy), so a tic of two players is 28 hex digits and a message of two tics is about 100 bytes; a channel message holds at most 4 tics.
@@ -126,7 +126,7 @@ Confirmed tics, on the topic and in each answer: `{"t":"tics","g":<session>,"s":
 | --- | --- |
 | `DOOM_PLAYERS` | `2`: the two-player game |
 | `DOOM_NET_TOPIC` | The channel topic of the confirmed tics (default `doom.tics`); the Ingress's `kube32.io/event-stream` serves it |
-| `DOOM_NET_DELAY` | The input delay a page plays with, in tics (default 4; the page's `?delay=` overrides it) |
+| `DOOM_NET_DELAY` | The input delay a page plays with, in tics (default 4; the page's `?delay=` overrides it). It covers the trip one way and its jitter: 5 for a round trip near 170 ms |
 | `DOOM_NET_BATCH` | Tics a message (default 2, at most 4) |
 | `DOOM_NET_TIMEOUT_MS` | How long a silent player 2 stays in the game (default 5000) |
 | `DOOM_NET_DIGEST` | Tics between state digests (default 35, 0 for none) |
@@ -144,14 +144,15 @@ kubectl --context kube32 apply -f doom-2p.yaml   # the pod, its Service, and the
 
 The three blobs take 2.2 MB of the control plane's 3.2 MB blob region, so replacing `doom-web` takes a `DELETE` of the old one first. The page is 1.66 MB to load: the engine (366 KiB) and the IWAD (1.2 MiB). At 240 wide the pod's linear memory stays at 704 KiB; the netgame adds 8,875 B to the module (278,313 B), and `kube32-podsize` puts the overhead at 491 KiB read from flash (467 KiB for the single-player pod), so the pod takes 1,195 KiB of the devkit's 1,280 KiB.
 
-`make verify-net` plays both sides on the host's wasm3: the sim pod as the authority, driven as a node drives it (`k32_tick` every 10 ms, the requests through `k32_handle`, its channel messages captured), and the full engine as the page drives it (a frame every 16 ms), each player on a scripted course. Every message crosses a relay that delays it 5 to 45 ms, so messages overtake each other, and loses 2% of them; the network then goes dark for 1.5 s, the page reloads, and later goes silent past the timeout and joins again. The two game states are compared at every tic both ran (`bench/net_check.cpp`), with the sim at 320 and at 240 wide against the page's 320. Over 7,200 tics all 7,156 compared tics agree. The input delay sets how often a tic waits for player 2; over the 2,000 tics before the outage (57.1 s at 35 tics a second):
+`make verify-net` plays both sides on the host's wasm3: the sim pod as the authority, driven as a node drives it (`k32_tick` every 10 ms, the requests through `k32_handle`, its channel messages captured), and the full engine as the page drives it (a step on every message and every 4 ms, a frame every 16 ms), each player on a scripted course. Every message crosses a relay that delays it 5 to 45 ms, so messages overtake each other, and loses 2% of them; the network then goes dark for 1.5 s, the page reloads, and later goes silent past the timeout and joins again. The two game states are compared at every tic both ran (`bench/net_check.cpp`), with the sim at 320 and at 240 wide against the page's 320, and once more on a slow network (60 to 110 ms one way) with a node that ticks the pod only every 350 ms (`--pod-tick-ms 350`). Each run plays 7,200 tics, and all 7,147 to 7,155 compared tics agree. The input delay sets how often a tic waits for player 2; over the 2,000 tics before the outage (57.1 s at 35 tics a second), with the page posting 18 times a second:
 
-| Input delay | Tics that wait | Time waited | Ticcmds arrive ahead (mean) |
-| --- | --- | --- | --- |
-| 3 tics (86 ms) | 12.6% | 3,355 ms in 60.0 s | 0.55 tics |
-| 4 tics (114 ms) | 1.55% | 528 ms in 57.6 s | 1.26 tics |
-| 5 tics (143 ms) | 0.3% | 150 ms in 57.3 s | 2.21 tics |
-| 6 tics (171 ms) | the first tic only | 0 ms in 57.1 s | 3.21 tics |
+| Input delay | 5 to 45 ms one way: tics that wait | Time waited | 60 to 110 ms one way, pod ticked every 350 ms: tics that wait | Time waited |
+| --- | --- | --- | --- | --- |
+| 3 tics (86 ms) | 1.3% | 479 ms in 57.5 s | | |
+| 4 tics (114 ms) | 0.4% | 119 ms in 57.2 s | 2.15% | 775 ms in 57.8 s |
+| 5 tics (143 ms) | 0.1% | 21 ms in 57.1 s | 0.35% | 89 ms in 57.3 s |
+| 6 tics (171 ms) | the first tic only | 6 ms in 57.1 s | the first tic only | 15 ms in 57.1 s |
+| 8 tics (229 ms) | | | none | 0 ms in 57.1 s |
 
 The outage holds one tic for 1.5 s, and the game goes on from there; the silent page holds one tic for the 5 s timeout, then player 2 leaves the game. `--client-args` gives the page's engine other arguments: with `-nomonsters` the check stops at tic 0 and names the parts that differ.
 

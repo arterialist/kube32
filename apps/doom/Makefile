@@ -144,7 +144,8 @@ verify: build/drawlist_check build/doom.wasm build/doom-sim.wasm build/doom-240.
 # Two-player lockstep (port/net.c) through a simulated network: the sim pod as the
 # authority, the full engine as the browser's client, jitter, loss, an outage, a
 # reload and a timeout; both game states compared at every tic, with the sim at 320
-# and at 240 wide (the Cardputer's) against the browser's 320 (make verify-net NET_TICS=n)
+# and at 240 wide (the Cardputer's) against the browser's 320, and on a slow network with a node
+# that ticks the pod every 350 ms (make verify-net NET_TICS=n)
 build/net_check: bench/net_check.cpp $(REPO)/build/libwasm3.a
 	$(BENCH_CXX) $(WASM3_DEFS) -o $@ $< $(REPO)/src/runtime/pod_memory_pool.cpp $(REPO)/src/osal/system_posix.cpp $(REPO)/build/libwasm3.a
 
@@ -152,6 +153,8 @@ NET_TICS ?= 6000
 verify-net: build/net_check build/doom.wasm build/doom-sim.wasm build/doom-sim-240.wasm build/wad/doom1-e1m1-sim.wad
 	./build/net_check build/doom-sim.wasm build/doom.wasm build/wad/doom1-e1m1-sim.wad $(WAD) --tics $(NET_TICS)
 	./build/net_check build/doom-sim-240.wasm build/doom.wasm build/wad/doom1-e1m1-sim.wad $(WAD) --tics $(NET_TICS) --screenblocks 11
+	./build/net_check build/doom-sim-240.wasm build/doom.wasm build/wad/doom1-e1m1-sim.wad $(WAD) --tics $(NET_TICS) --screenblocks 11 \
+	    --base 60 --jitter 50 --pod-tick-ms 350 --delay 5
 
 build/wad/doom1-e1m1.pack: $(WAD) wad.py
 	$(PYTHON) wad.py pack $< $@

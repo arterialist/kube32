@@ -10,9 +10,13 @@
  * with the same ticcmds in the same order, so their game states agree tic by
  * tic (port/state_digest.c digests them; the two sides compare digests).
  *
- * A client builds its ticcmd for tic T + delay when it has run tic T, so a
- * ticcmd has `delay` tics to reach the authority. A late ticcmd holds the
- * authority's next tic, and its clock with it, until it arrives; a client
+ * A client builds its ticcmds by the clock, `delay` tics past the
+ * authority's tic, which it estimates from the newest confirmed tic, the time
+ * since it arrived and half the round trip (doom_net_pace); a ticcmd then has
+ * `delay` tics for the trip one way. The authority runs the tics due by its
+ * clock from the node's tick and from every POST, and catches up when the
+ * node ticks it late. A late ticcmd holds the authority's next tic, and its
+ * clock with it, until it arrives; a client
  * that sends nothing for DOOM_NET_TIMEOUT_MS leaves the game ("Player 2
  * left the game") from the next tic on, as in any netgame. Every POST
  * carries all of the client's ticcmds the authority has not confirmed, and
@@ -65,6 +69,8 @@ extern int iquetail;
 #define AHEAD 128          /* player 2's ticcmds the authority holds ahead of the game */
 #define EVENT_TICS 4       /* a channel message holds K32_MAX_EVENT_BYTES */
 #define ANSWER_TICS 64     /* confirmed tics in one answer to POST /tics */
+#define RUN_MAX 16         /* tics the authority runs in one call */
+#define CATCH_UP 35        /* tics behind its clock the authority catches up; past that it drops the time */
 
 typedef struct {
     int32_t tic;           /* -1: empty */
@@ -181,9 +187,11 @@ static int32_t batch = 2, timeout_ms = 5000, delay = 4;
 static char topic[64] = "doom.tics", game_args[256], game_iwad[48], web_blob[48] = "doom-web";
 static int32_t stall_tic = -1, checked_tic = -1;
 static int64_t stall_since;
+static int64_t last_tick_ms;
 static struct {
     uint32_t tics, stalled_tics, stall_ms, longest_stall_ms, posts, cmds, cmds_old, events, event_errors, joins, drops;
     uint32_t digests_checked, digests_bad, lead_sum, lead_n, lead_min;
+    uint32_t ticks, tick_gap_sum_ms, tick_gap_max_ms, post_tics, dropped_tics;
     int32_t first_bad_tic;
 } st = { .lead_min = 0xffffffffu, .first_bad_tic = -1 };
 
@@ -241,11 +249,13 @@ static void publish(int32_t from, int32_t to) {
     }
 }
 
-int net_tick(int64_t now) {
+/* Runs the tics due by now whose ticcmds are in, from the node's tick and from each POST:
+ * a node that ticks the pod late still keeps the game at 35 tics a second */
+static int run_due(int64_t now) {
     if (role != NET_AUTHORITY || !phase) return 0;
     int ran = 0, stalled = 0;
     int32_t due = clock_tic + (int32_t)((now - clock_ms) * TICRATE / 1000) + 1;   /* tics due by now */
-    while (gametic < due && ran < 4) {
+    while (gametic < due && ran < RUN_MAX) {
         const int32_t t = gametic;
         ticcmd_t cmds[NET_MAXPLAYERS];
         boolean ingame[NET_MAXPLAYERS];
@@ -286,7 +296,11 @@ int net_tick(int64_t now) {
             if (ms > st.longest_stall_ms) st.longest_stall_ms = ms;
             stall_since = 0;
         }
-        if (due - gametic > 4) { clock_tic = gametic; clock_ms = now; }   /* the node was busy: drop the time */
+        if (due - gametic > CATCH_UP) {     /* the node was busy for a second: drop the time */
+            st.dropped_tics += (uint32_t)(due - gametic);
+            clock_tic = gametic;
+            clock_ms = now;
+        }
     }
     st.tics += (uint32_t)ran;
     if (gametic - emitted >= batch || (stalled && gametic > emitted)) {
@@ -295,6 +309,18 @@ int net_tick(int64_t now) {
         emitted = to;
     }
     return ran;
+}
+
+int net_tick(int64_t now) {
+    if (role != NET_AUTHORITY || !phase) return 0;
+    if (last_tick_ms) {
+        const uint32_t gap = (uint32_t)(now - last_tick_ms);
+        st.ticks++;
+        st.tick_gap_sum_ms += gap;
+        if (gap > st.tick_gap_max_ms) st.tick_gap_max_ms = gap;
+    }
+    last_tick_ms = now;
+    return run_due(now);
 }
 
 /* Before a browser joins, player 1 plays alone: the tics due by the clock, each with
@@ -309,9 +335,9 @@ int net_tick_alone(int64_t now) {
         for (int i = 1; i < MAXPLAYERS; i++) playeringame[i] = false;   /* nobody has left: nobody was in */
     }
     int32_t due = alone_tic + (int32_t)((now - alone_ms) * TICRATE / 1000);
-    if (due - gametic > 4) { alone_tic = gametic; alone_ms = now; due = gametic + 4; }   /* the node was busy: drop the time */
+    if (due - gametic > CATCH_UP) { alone_tic = gametic; alone_ms = now; due = gametic + RUN_MAX; }   /* busy for a second: drop the time */
     int ran = 0;
-    while (gametic < due && ran < 4) {
+    while (gametic < due && ran < RUN_MAX) {
         ticcmd_t cmds[NET_MAXPLAYERS];
         boolean ingame[NET_MAXPLAYERS];
         memset(cmds, 0, sizeof cmds);
@@ -336,6 +362,7 @@ static int32_t join(int64_t now) {
     emitted = gametic;
     stall_tic = checked_tic = -1;
     stall_since = 0;
+    last_tick_ms = 0;
     for (int i = 0; i < AHEAD; i++) remote[i].tic = -1;
     st.joins++;
     printf("doom-net: player 2 joins, session %d from tic %d\n", (int)session, (int)gametic);
@@ -367,7 +394,7 @@ static int handle_tics(const char* body, int64_t now, int* status) {
         st.lead_n++;
         if (lead < st.lead_min) st.lead_min = lead;
     }
-    if (stall_since) net_tick(now);     /* the tic waiting for these runs now, not at the next tick */
+    st.post_tics += (uint32_t)run_due(now);   /* the tics these complete run now, not at the next tick */
     const int32_t dtic = (int32_t)get_int(body, "d", 0, -1);
     const char* dh;
     if (dtic >= session_start && dtic > checked_tic && get_hex(body, "h", 0, &dh) == 8) {
@@ -402,11 +429,13 @@ static int stats_json(char* out, int cap) {
                     "{\"role\":\"%s\",\"session\":%d,\"playing\":%d,\"player2\":%d,\"tic\":%d,\"tics\":%u,\"stalled_tics\":%u,\"stall_ms\":%u,"
                     "\"longest_stall_ms\":%u,\"posts\":%u,\"cmds\":%u,\"cmds_old\":%u,\"lead_mean_x100\":%u,\"lead_min\":%d,\"events\":%u,"
                     "\"event_errors\":%u,\"joins\":%u,\"drops\":%u,\"delay\":%d,\"batch\":%d,\"digests_checked\":%u,\"digests_bad\":%u,"
+                    "\"ticks\":%u,\"tick_gap_mean_ms\":%u,\"tick_gap_max_ms\":%u,\"post_tics\":%u,\"dropped_tics\":%u,"
                     "\"first_bad_tic\":%d,\"digest\":\"%08x\"}",
                     role == NET_AUTHORITY ? "authority" : role == NET_CLIENT ? "client" : "single", (int)session, phase, p2_in,
                     (int)gametic, st.tics, st.stalled_tics, st.stall_ms, st.longest_stall_ms, st.posts, st.cmds, st.cmds_old,
                     st.lead_n ? st.lead_sum * 100 / st.lead_n : 0, st.lead_n ? (int)st.lead_min : -1, st.events, st.event_errors, st.joins,
-                    st.drops, (int)delay, (int)batch, st.digests_checked, st.digests_bad, (int)st.first_bad_tic, (unsigned)doom_state_digest(0));
+                    st.drops, (int)delay, (int)batch, st.digests_checked, st.digests_bad, st.ticks, st.ticks ? st.tick_gap_sum_ms / st.ticks : 0,
+                    st.tick_gap_max_ms, st.post_tics, st.dropped_tics, (int)st.first_bad_tic, (unsigned)doom_state_digest(0));
 }
 
 static int32_t reply(int32_t status, const char* type, const void* body, uint32_t len) {
@@ -485,6 +514,12 @@ int32_t net_route(const char* method, const char* seg, const char* body) {
 
 /* The next tic to run */
 K32_EXPORT("doom_net_tic") int32_t doom_net_tic(void) { return gametic; }
+/* The authority's state digest after tic t ran, while the ring holds it (every tic's with
+ * DOOM_NET_DIGEST=1); 0 when it kept none */
+K32_EXPORT("doom_net_digest_at") uint32_t doom_net_digest_at(int32_t t) {
+    const nettic_t* e = &tics[(t < 0 ? 0 : t) % HIST];
+    return t >= 0 && e->tic == t && e->has_digest ? e->digest : 0;
+}
 
 /* ---- the client (the full engine; the sim-only pod is always the authority) ---- */
 #ifndef DG_SIM_ONLY
@@ -494,6 +529,8 @@ static uint8_t own[AHEAD][CMD_BYTES];
 static int32_t own_tic[AHEAD];
 static int32_t make_tic;                /* the next ticcmd this side builds */
 static int32_t recv_hi;                 /* one past the highest confirmed tic received */
+static int64_t recv_at_ms;              /* when recv_hi last moved */
+static int32_t rtt_ms;                  /* the POST round trip (doom_net_pace) */
 static uint32_t fresh;                  /* ticcmds built since the last POST */
 static struct { int32_t tic; uint32_t digest; } theirs[16], mine[16];
 static int32_t my_digest_tic = -1;
@@ -514,8 +551,26 @@ static void compare(int32_t tic) {
     theirs[a].tic = mine[a].tic = -1;
 }
 
+/* The tic this side's next ticcmd runs in: `delay` tics past the authority's tic, which this
+ * side estimates from the newest confirmed tic, the time since it arrived and the trip it made
+ * (half a round trip). Ticcmds then leave by the clock rather than a round trip after the tics
+ * they follow, and a ticcmd needs `delay` tics for one way only. At least `delay` tics past this
+ * side's own tic; at most a round trip past the newest confirmed tic, so a slow authority holds
+ * this side back too. */
+static int32_t build_target(void) {
+    int32_t target = gametic + delay;
+    if (recv_at_ms) {
+        int32_t est = recv_hi + (int32_t)((k32_time_ms() - recv_at_ms + rtt_ms / 2) * TICRATE / 1000);
+        const int32_t cap = recv_hi + (rtt_ms * TICRATE + 999) / 1000 + 2;
+        if (est > cap) est = cap;
+        if (est + delay > target) target = est + delay;
+    }
+    return target < gametic + AHEAD / 2 ? target : gametic + AHEAD / 2;
+}
+
 static void build_ahead(void) {
-    while (make_tic < gametic + delay && make_tic - gametic < AHEAD) {
+    const int32_t target = build_target();
+    while (make_tic < target) {
         ticcmd_t c;
         D_BuildLocalTiccmd(&c, make_tic);
         cmd_pack(&c, own[make_tic % AHEAD]);
@@ -536,6 +591,7 @@ K32_EXPORT("doom_net_join") int32_t doom_net_join(int32_t g, int32_t s, int32_t 
     gametic = s;
     make_tic = s;
     recv_hi = s;
+    recv_at_ms = 0;
     for (int i = 0; i < HIST; i++) tics[i].tic = -1;
     for (int i = 0; i < AHEAD; i++) own_tic[i] = -1;
     for (int i = 0; i < 16; i++) theirs[i].tic = mine[i].tic = -1;
@@ -566,7 +622,10 @@ K32_EXPORT("doom_net_recv") int32_t doom_net_recv(int32_t len) {
         e->mask = mask;
         for (int p = 0; p < NETP; p++) hex_get(hex + 2 * CMD_BYTES * (NETP * i + p), 2 * CMD_BYTES, e->cmd[p], CMD_BYTES);
         cs.tics_in++;
-        if (t + 1 > recv_hi) recv_hi = t + 1;
+        if (t + 1 > recv_hi) {
+            recv_hi = t + 1;
+            recv_at_ms = k32_time_ms();
+        }
     }
     const int32_t d = (int32_t)get_int(in_buf, "d", 1, -1);
     const char* dh;
@@ -623,6 +682,15 @@ K32_EXPORT("doom_net_post") int32_t doom_net_post(void) {
     if (my_digest_tic >= 0) p += snprintf(p, sizeof out_buf - (size_t)(p - out_buf), "&d=%d&h=%08x", (int)my_digest_tic, (unsigned)my_digest);
     fresh = 0;
     return (int32_t)(p - out_buf);
+}
+
+/* Builds this side's ticcmds due by the clock, with the POST round trip in ms; call it often
+ * (every few ms); returns the ticcmds built since the last doom_net_post */
+K32_EXPORT("doom_net_pace") int32_t doom_net_pace(int32_t rtt) {
+    if (role != NET_CLIENT) return 0;
+    rtt_ms = rtt < 0 ? 0 : rtt > 2000 ? 2000 : rtt;
+    build_ahead();
+    return (int32_t)fresh;
 }
 
 /* Ticcmds built since the last doom_net_post */
