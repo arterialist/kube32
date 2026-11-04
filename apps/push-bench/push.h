@@ -12,7 +12,8 @@
  *                     when the frame's first chunk went out
  *  12  size           u16, the frame's bytes
  *  14  fps            u8, the run's frame rate
- *  15  per            u8, frame bytes in every chunk but the last
+ *  15  per            u8, frame bytes in every chunk but the last; 0 for a
+ *                     frame sent whole in one message (count 1)
  *
  * Chunk idx carries frame bytes [idx * per, min(size, (idx + 1) * per)).
  * Frame byte i is push_byte(frame, i), so every chunk can be checked on

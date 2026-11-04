@@ -12,16 +12,17 @@
  *        skipped=0 emit_err=0 (first rc=0) frame_send_ms mean=.. max=..
  *
  * Environment: TOPIC (default doom.draw), SIZES (default 4600,12600), RATES
- * (default 6,8,10), CHUNK (default 200, the event limit; 17 to 200),
+ * (default 6,8,10), CHUNK (default 200, the event limit; 17 to 200; 0 sends
+ * each frame whole with k32_publish, at most 12,800 bytes),
  * PER_TICK (default 0), SECONDS (default 60), PAUSE (default 5), DELAY
- * (default 10). Runs in 16 KiB of linear memory. */
+ * (default 10). Runs in 32 KiB of linear memory. */
 #include "../../include/runtime/k32_app_abi.h"
 #include "push.h"
 
 #define NOINLINE __attribute__((noinline))
 #define MAX_LIST 6
 
-static uint8_t ev[K32_MAX_EVENT_BYTES];
+static uint8_t ev[PUSH_HDR + 12800];   /* a whole frame (CHUNK=0) or one chunk */
 static char topic[64];
 static uint32_t topic_len;
 static char line[256];
@@ -87,8 +88,7 @@ K32_EXPORT("k32_init") int32_t k32_init(void) {
     n_sizes = parse_list("SIZES", 5, sizes, def_sizes, 2);
     n_rates = parse_list("RATES", 5, rates, def_rates, 3);
     chunk = env_u("CHUNK", 5, 200);
-    if (chunk < PUSH_HDR + 1 || chunk > K32_MAX_EVENT_BYTES) chunk = K32_MAX_EVENT_BYTES;
-    if (chunk - PUSH_HDR > 255) chunk = PUSH_HDR + 255;
+    if (chunk != 0 && (chunk < PUSH_HDR + 1 || chunk > K32_MAX_EVENT_BYTES)) chunk = K32_MAX_EVENT_BYTES;
     per_tick = env_u("PER_TICK", 8, 0);
     seconds = env_u("SECONDS", 7, 60);
     pause_s = env_u("PAUSE", 5, 5);
@@ -105,8 +105,14 @@ static NOINLINE void begin_run(uint32_t now) {
     uint32_t r = run;   /* runs are numbered from 1; run r covers size (r-1)/n_rates, rate (r-1)%n_rates */
     size = sizes[(r - 1) / n_rates];
     fps = rates[(r - 1) % n_rates];
-    per = chunk - PUSH_HDR;
-    count = (size + per - 1) / per;
+    if (size > sizeof ev - PUSH_HDR) size = sizeof ev - PUSH_HDR;
+    if (chunk == 0) {   /* the whole frame in one k32_publish */
+        per = 0;
+        count = 1;
+    } else {
+        per = chunk - PUSH_HDR;
+        count = (size + per - 1) / per;
+    }
     if (count > PUSH_MAX_CHUNKS) {
         per = (size + PUSH_MAX_CHUNKS - 1) / PUSH_MAX_CHUNKS;
         count = (size + per - 1) / per;
@@ -119,7 +125,7 @@ static NOINLINE void begin_run(uint32_t now) {
 
 static NOINLINE void end_run(void) {
     put("push sent run="); putn((int32_t)run); put(" size="); putn((int32_t)size); put(" fps="); putn((int32_t)fps);
-    put(" chunk="); putn((int32_t)(per + PUSH_HDR)); put(" count="); putn((int32_t)count);
+    put(" chunk="); putn((int32_t)(per ? per + PUSH_HDR : PUSH_HDR + size)); put(" count="); putn((int32_t)count);
     put(" frames="); putn((int32_t)frames); put(" chunks="); putn((int32_t)chunks);
     put(" skipped="); putn((int32_t)skipped); put(" emit_err="); putn((int32_t)emit_err);
     put(" (first rc="); putn((int32_t)first_rc); put(")");
@@ -129,7 +135,7 @@ static NOINLINE void end_run(void) {
 }
 
 static NOINLINE void emit_chunk(void) {
-    uint32_t off = idx * per, len = size - off < per ? size - off : per;
+    uint32_t off = idx * per, len = per == 0 ? size : size - off < per ? size - off : per;
     ev[0] = 'D';
     ev[1] = (uint8_t)run;
     ev[2] = (uint8_t)idx;
@@ -141,7 +147,7 @@ static NOINLINE void emit_chunk(void) {
     ev[14] = (uint8_t)fps;
     ev[15] = (uint8_t)per;
     for (uint32_t i = 0; i < len; i++) ev[PUSH_HDR + i] = push_byte(frame, off + i);
-    int32_t rc = k32_event_emit(topic, topic_len, ev, PUSH_HDR + len);
+    int32_t rc = per == 0 ? k32_publish(topic, topic_len, ev, PUSH_HDR + len) : k32_event_emit(topic, topic_len, ev, PUSH_HDR + len);
     if (rc < 0) {
         if (!emit_err) first_rc = (uint32_t)rc;
         emit_err++;

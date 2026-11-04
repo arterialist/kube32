@@ -18,7 +18,8 @@
  * chunk to its last on this node's clock; e2e_ms from the publisher's wall
  * clock when the frame went out to this node's wall clock when it was
  * whole, so it includes the offset between the two clocks. gap_ms is the
- * longest time between two whole frames. Runs in 16 KiB of linear memory.
+ * longest time between two whole frames. A frame sent whole (k32_publish)
+ * arrives as one event. Runs in 24 KiB of linear memory.
  *
  * Environment: WINDOW, CHECK (0: the bytes are not checked). */
 #include "../../include/runtime/k32_app_abi.h"
@@ -29,7 +30,7 @@
 #define MAX_SAMPLES 640
 #define WORDS ((PUSH_MAX_CHUNKS + 31) / 32)
 
-static unsigned char block[320];
+static unsigned char block[PUSH_HDR + 12800 + 80];   /* topic + a whole frame */
 static char line[400];
 static uint32_t line_len;
 

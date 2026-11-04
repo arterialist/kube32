@@ -22,10 +22,10 @@ spec:
       value: "1"
     resources:
       requests:
-        memory: 16Ki
+        memory: 24Ki
         hardware.kube32.io/ipc: "1"
       limits:
-        memory: 16Ki
+        memory: 24Ki
     securityContext:
       capabilities:
         add:
@@ -55,15 +55,15 @@ spec:
     - name: RATES
       value: "6,8,10"
     - name: CHUNK
-      value: "200"
+      value: "0"
     - name: SECONDS
       value: "60"
     resources:
       requests:
-        memory: 16Ki
+        memory: 32Ki
         hardware.kube32.io/ipc: "1"
       limits:
-        memory: 16Ki
+        memory: 32Ki
     securityContext:
       capabilities:
         add:
