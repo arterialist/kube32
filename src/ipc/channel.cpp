@@ -53,6 +53,11 @@ struct Crc16Table {
 constexpr Crc16Table kCrc16;
 } // namespace
 
+// Bytes of a message a fragment holds, by the frame's flags
+static size_t chunk_of(uint8_t flags) {
+    return (flags & K32C_FLAG_LARGE) ? K32C_LARGE_CHUNK : (flags & K32C_FLAG_MID) ? K32C_MID_CHUNK : K32C_MAX_PAYLOAD_CHUNK;
+}
+
 uint16_t crc16_ccitt(const uint8_t* data, size_t len, uint16_t init) {
     uint16_t crc = init;
     for (size_t i = 0; i < len; ++i) {
@@ -603,13 +608,15 @@ int32_t ChannelManager::send(const std::string& pod_id, int32_t handle, const ui
 }
 
 int32_t ChannelManager::send_frames_to(const NodeEndpoint& ep, uint32_t channel_hash, uint32_t sender_hash, uint32_t target_hash,
-                                       const uint8_t* data, size_t len, uint8_t extra_flags) {
+                                       const uint8_t* data, size_t len, uint8_t extra_flags, size_t max_frame) {
     if (!transport_) return IPC_ERR_IO;
     if (len > K32C_MAX_MESSAGE_BYTES) return IPC_ERR_INVAL;
     // A message of up to 224 bytes is one frame every node reads; a larger
-    // one goes out in frames of up to 1444 bytes of it
+    // one goes out in frames of 1444 bytes of it, or 520 to a node that takes
+    // frames of at most 546 bytes
     const bool large = len > K32C_MAX_PAYLOAD_CHUNK;
-    const size_t chunk = large ? K32C_LARGE_CHUNK : K32C_MAX_PAYLOAD_CHUNK;
+    const bool mid = large && max_frame < K32C_MAX_FRAME_LEN;
+    const size_t chunk = !large ? K32C_MAX_PAYLOAD_CHUNK : mid ? K32C_MID_CHUNK : K32C_LARGE_CHUNK;
     size_t frag_count = (len + chunk - 1) / chunk;
     if (frag_count == 0) frag_count = 1;
 
@@ -635,7 +642,7 @@ int32_t ChannelManager::send_frames_to(const NodeEndpoint& ep, uint32_t channel_
         hdr.magic = K32C_MAGIC;
         hdr.version = K32C_VERSION;
         hdr.flags = extra_flags;
-        if (large) hdr.flags |= K32C_FLAG_LARGE;
+        if (large) hdr.flags |= mid ? K32C_FLAG_MID : K32C_FLAG_LARGE;
         if (frag_count > 1) hdr.flags |= K32C_FLAG_FRAGMENT;
         if (i == 0) hdr.flags |= K32C_FLAG_FIRST_FRAG;
         if (i == frag_count - 1) hdr.flags |= K32C_FLAG_LAST_FRAG;
@@ -748,6 +755,7 @@ int32_t ChannelManager::publish(const std::string& pod_id, const std::string& to
     struct Target {
         NodeEndpoint ep;
         uint32_t rate;
+        uint32_t max_frame;
     };
     std::vector<Target> targets;
     {
@@ -759,14 +767,16 @@ int32_t ChannelManager::publish(const std::string& pod_id, const std::string& to
                 stats_.fanout_skipped.fetch_add(1, std::memory_order_relaxed);
                 continue;
             }
-            targets.push_back(Target{route_to(kv.second, now), now - kv.second.subs_ms <= K32C_SUBS_FRESH_MS ? kv.second.rx_rate : 0});
+            const bool fresh = now - kv.second.subs_ms <= K32C_SUBS_FRESH_MS;
+            targets.push_back(Target{route_to(kv.second, now), fresh ? kv.second.rx_rate : 0,
+                                     fresh && kv.second.rx_max_frame ? kv.second.rx_max_frame : static_cast<uint32_t>(K32C_MAX_FRAME_LEN)});
         }
     }
     for (const auto& t : targets) {
         // A peer that announces the bytes a second it takes is sent no
         // faster: the publisher waits (at most K32C_MAX_PACE_WAIT_MS)
         if (t.rate > 0) pace_to(t.ep.node_id, len, t.rate);
-        const int32_t rc = send_frames_to(t.ep, channel_hash, sender_hash, 0, data, len, 0);
+        const int32_t rc = send_frames_to(t.ep, channel_hash, sender_hash, 0, data, len, 0, t.max_frame);
         if (rc != IPC_OK && err == IPC_OK) err = rc;
     }
     if (err != IPC_OK) {
@@ -1025,6 +1035,11 @@ bool ChannelManager::start_background(uint32_t hello_interval_ms, size_t dispatc
     // Wi-Fi stops sending under a heavier stream of large messages
 #if defined(KUBE32_TARGET_ESP32)
     rx_rate_bytes_.store(psram ? 0 : K32C_RX_RATE_NO_PSRAM);
+    // and frames of at most 546 bytes: the radio holds each received frame
+    // in a buffer of its size from the heap until the frame is handed on,
+    // and twelve 1.5 KB frames at once leave the heap too little for the
+    // driver (which then stops receiving and sending for good)
+    rx_max_frame_.store(psram ? 0 : static_cast<uint32_t>(K32C_MID_FRAME_LEN));
 #endif
     has_psram_ = psram;
     background_running_.store(true);
@@ -1076,12 +1091,14 @@ bool ChannelManager::find_peer_by_name(const std::string& node_name, PeerInfo& o
 void ChannelManager::send_subs() {
     if (!transport_ || !initialized_) return;
     const std::vector<uint32_t> hashes = local_topic_hashes();
-    const size_t n = std::min(hashes.size(), (K32C_MAX_MESSAGE_BYTES - 8) / 4);
-    std::vector<uint8_t> payload(8 + 4 * n);
+    const size_t n = std::min(hashes.size(), (K32C_MAX_MESSAGE_BYTES - 12) / 4);
+    std::vector<uint8_t> payload(12 + 4 * n);
     const uint32_t rate = rx_rate_bytes_.load();
+    const uint32_t max_frame = rx_max_frame_.load();
     std::memcpy(payload.data(), &local_node_id_, 4);
     std::memcpy(payload.data() + 4, &rate, 4);
-    for (size_t i = 0; i < n; ++i) std::memcpy(payload.data() + 8 + 4 * i, &hashes[i], 4);
+    std::memcpy(payload.data() + 8, &max_frame, 4);
+    for (size_t i = 0; i < n; ++i) std::memcpy(payload.data() + 12 + 4 * i, &hashes[i], 4);
     const uint32_t hash = subs_topic_hash();
     const uint32_t sender = fnv1a_32(local_node_name_);
 #if defined(KUBE32_TARGET_ESP32)
@@ -1104,13 +1121,14 @@ void ChannelManager::send_subs() {
 }
 
 void ChannelManager::handle_subs(const uint8_t* payload, size_t len) {
-    if (len < 8) return;
-    uint32_t node_id = 0, rate = 0;
+    if (len < 12) return;
+    uint32_t node_id = 0, rate = 0, max_frame = 0;
     std::memcpy(&node_id, payload, 4);
     std::memcpy(&rate, payload + 4, 4);
+    std::memcpy(&max_frame, payload + 8, 4);
     if (node_id == local_node_id_) return;
-    std::vector<uint32_t> hashes((len - 8) / 4);
-    for (size_t i = 0; i < hashes.size(); ++i) std::memcpy(&hashes[i], payload + 8 + 4 * i, 4);
+    std::vector<uint32_t> hashes((len - 12) / 4);
+    for (size_t i = 0; i < hashes.size(); ++i) std::memcpy(&hashes[i], payload + 12 + 4 * i, 4);
     std::sort(hashes.begin(), hashes.end());
     stats_.subs_rx.fetch_add(1, std::memory_order_relaxed);
     osal::LockGuard guard(peer_mutex_);
@@ -1119,6 +1137,7 @@ void ChannelManager::handle_subs(const uint8_t* payload, size_t len) {
     it->second.subs.swap(hashes);
     it->second.subs_ms = osal::System::get_uptime_ms();
     it->second.rx_rate = rate;
+    it->second.rx_max_frame = max_frame;
 }
 
 void ChannelManager::send_hello() {
@@ -1292,7 +1311,7 @@ void ChannelManager::on_frame_received(const uint8_t* frame, size_t len, const N
         stats_.bad_magic_errors.fetch_add(1, std::memory_order_relaxed);
         return;
     }
-    const size_t max_payload = (hdr->flags & K32C_FLAG_LARGE) ? K32C_LARGE_CHUNK : K32C_MAX_PAYLOAD_CHUNK;
+    const size_t max_payload = chunk_of(hdr->flags);
     if (hdr->payload_len > max_payload || (K32C_HEADER_LEN + hdr->payload_len + K32C_CRC_LEN) > len) return;
 
     // CRC Verification
@@ -1326,7 +1345,7 @@ void ChannelManager::on_frame_received(const uint8_t* frame, size_t len, const N
 // delivered when its last missing fragment arrives, in whatever order they
 // come, and dropped (counted) when one never does
 void ChannelManager::on_fragment(const K32CHeader* hdr, const uint8_t* payload) {
-    const size_t chunk = (hdr->flags & K32C_FLAG_LARGE) ? K32C_LARGE_CHUNK : K32C_MAX_PAYLOAD_CHUNK;
+    const size_t chunk = chunk_of(hdr->flags);
     const size_t count = hdr->frag_count;
     if (count > 32 || hdr->frag_index >= count || count * chunk >= K32C_MAX_MESSAGE_BYTES + chunk ||
         (hdr->frag_index + 1u < count && hdr->payload_len != chunk)) {

@@ -47,6 +47,11 @@ constexpr uint8_t K32C_FLAG_PING            = 0x10;
 // Fragments of K32C_LARGE_CHUNK bytes (fragment i starts at i * 1444);
 // without it a fragment holds K32C_MAX_PAYLOAD_CHUNK bytes
 constexpr uint8_t K32C_FLAG_LARGE           = 0x20;
+// Fragments of K32C_MID_CHUNK bytes, for a node that takes frames of at most
+// K32C_MID_FRAME_LEN bytes (a board without PSRAM)
+constexpr uint8_t K32C_FLAG_MID             = 0x40;
+constexpr size_t  K32C_MID_CHUNK            = 520;
+constexpr size_t  K32C_MID_FRAME_LEN        = K32C_MID_CHUNK + K32C_HEADER_LEN + K32C_CRC_LEN;   // 546 bytes
 
 // POSIX-aligned Error Codes
 constexpr int32_t IPC_OK                    = 0;
@@ -251,6 +256,8 @@ struct PeerInfo {
     // The bytes a second the node takes (0: no limit), from its
     // announcement; a publisher paces messages to it accordingly
     uint32_t rx_rate{0};
+    // The largest frame the node takes (0: K32C_MAX_FRAME_LEN)
+    uint32_t rx_max_frame{0};
     uint64_t next_send_us{0};
 };
 
@@ -269,9 +276,10 @@ constexpr const char* K32C_HELLO_TOPIC = "k32.hello";
 // plane bound a pod to it or is deleting one)
 constexpr const char* K32C_KUBELET_SYNC_TOPIC = "k32.kubelet.sync";
 // A node's subscriptions: its node id, the bytes a second it takes (0: no
-// limit) and the hash of every topic it subscribes to (u32 each,
-// little-endian), sent with each HELLO and when they change. Publishers send
-// a topic only to the nodes that subscribe, no faster than they take.
+// limit), the largest frame it takes (0: K32C_MAX_FRAME_LEN) and the hash of
+// every topic it subscribes to (u32 each, little-endian), sent with each
+// HELLO and when they change. Publishers send a topic only to the nodes that
+// subscribe, no faster and in no larger frames than they take.
 constexpr const char* K32C_SUBS_TOPIC = "k32.subs";
 
 class ChannelManager {
@@ -325,6 +333,10 @@ public:
     // without PSRAM)
     void set_rx_rate_bytes(uint32_t bytes) { rx_rate_bytes_.store(bytes); subs_changed_.store(true); }
     uint32_t rx_rate_bytes() const { return rx_rate_bytes_.load(); }
+    // The largest frame this node announces it takes (0: K32C_MAX_FRAME_LEN;
+    // K32C_MID_FRAME_LEN without PSRAM)
+    void set_rx_max_frame(uint32_t bytes) { rx_max_frame_.store(bytes); subs_changed_.store(true); }
+    uint32_t rx_max_frame() const { return rx_max_frame_.load(); }
     size_t rx_budget_bytes() const { return rx_budget_bytes_.load(); }
 
     // ---- Peers -------------------------------------------------------------
@@ -482,13 +494,15 @@ private:
     std::atomic<size_t> rx_budget_bytes_{K32C_MAX_MESSAGE_BYTES * 8};
     bool has_psram_{false};
     std::atomic<uint32_t> rx_rate_bytes_{0};
+    std::atomic<uint32_t> rx_max_frame_{0};
     void pace_to(uint32_t node_id, size_t len, uint32_t rate);
 
     // Queues a message for this node's subscribers; false when it was
     // dropped (queue full)
     bool deliver_local(const MessagePtr& msg);
     bool deliver_local(uint32_t channel_hash, uint32_t sender_hash, const uint8_t* data, size_t len, bool* nomem = nullptr);
-    int32_t send_frames_to(const NodeEndpoint& ep, uint32_t channel_hash, uint32_t sender_hash, uint32_t target_hash, const uint8_t* data, size_t len, uint8_t extra_flags);
+    int32_t send_frames_to(const NodeEndpoint& ep, uint32_t channel_hash, uint32_t sender_hash, uint32_t target_hash, const uint8_t* data, size_t len, uint8_t extra_flags,
+                           size_t max_frame = K32C_MAX_FRAME_LEN);
     NodeEndpoint route_to(const PeerInfo& p, uint64_t now_ms) const;
     void dispatch_loop();
     void dispatch_message(const MessagePtr& msg);
