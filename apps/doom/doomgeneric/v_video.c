@@ -99,7 +99,11 @@ void V_CopyRect(int srcx, int srcy, byte *source,
      || desty < 0
      || desty + height > SCREENHEIGHT)
     {
+#if SCREENWIDTH < 320
+        return;   /* a narrow screen: the 320-wide status bar is not copied */
+#else
         I_Error ("Bad V_CopyRect");
+#endif
     }
 #endif 
 
@@ -162,7 +166,11 @@ void V_DrawPatch(int x, int y, patch_t *patch)
      || y < 0
      || y + SHORT(patch->height) > SCREENHEIGHT)
     {
+#if SCREENWIDTH < 320
+        return;   /* a narrow screen: the 320-wide status bar and borders are not drawn */
+#else
         I_Error("Bad V_DrawPatch x=%i y=%i patch.width=%i patch.height=%i topoffset=%i leftoffset=%i", x, y, patch->width, patch->height, patch->topoffset, patch->leftoffset);
+#endif
     }
 #endif
 

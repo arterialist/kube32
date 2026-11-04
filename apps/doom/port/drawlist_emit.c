@@ -20,9 +20,10 @@
  *     light = zlight[lightnum][distance >> 20] (capped at 127)
  * Little-endian; i32 are the engine's 16.16 fixed-point values.
  *   header 'D' 1  u16 count  u16 bytes  u16 viewwidth  u8 viewheight  u8 truncated
- *          i32 sky_iscale  i32 sky_texturemid  i32 basexscale  i32 baseyscale  (26 B)
+ *          u8 skytexture  u8 pad  i32 sky_iscale  i32 sky_texturemid  i32 basexscale
+ *          i32 baseyscale                                                  (28 B)
  *   1 strip  u16 x0  u8 n  u8 texture  u8 light  i32 texturemid  i32 scale0
- *            i32 scalestep, then n x (u8 yl, u8 yh, u8 column)          (16 B + 3/column)
+ *            i32 scalestep, then n x (u8 yl, u8 yh, u8 column)          (18 B + 3/column)
  *            light: 0..15 a scalelight row, 0x80|map a fixed colormap;
  *            texture 255 is the sky (scale0 and scalestep 0)
  *   2 plane  u8 flat  u8 light  i32 planeheight  u16 nspans,
@@ -37,6 +38,7 @@
  * among them), then masked columns and sprites back to front. */
 #include <stdint.h>
 #include <string.h>
+#include <stdio.h>
 
 #include "../doomgeneric/doomtype.h"
 #include "../doomgeneric/r_defs.h"
@@ -103,12 +105,12 @@ static uint8_t clip8(short v) { int c = v + 2; return (uint8_t)(c < 0 ? 0 : c > 
 static void strip_flush(struct strip* s) {
     if (!s->open) return;
     s->open = 0;
-    uint8_t* p = room(16 + 3 * s->n);
+    uint8_t* p = room(18 + 3 * s->n);
     if (!p) return;
     count++;
     p[0] = 1; put16(p + 1, s->x0); p[3] = s->n; p[4] = s->tex; p[5] = s->light;
     put32(p + 6, s->texturemid); put32(p + 10, s->scale0); put32(p + 14, s->scalestep);
-    memcpy(p + 16, s->cols, 3 * s->n);
+    memcpy(p + 18, s->cols, 3 * s->n);
 }
 static void strips_flush(void) {
     for (int i = 0; i < STRIPS; i++) strip_flush(&strips[i]);
@@ -119,6 +121,9 @@ static void plane_close(void) {
 }
 
 static void emit_col(void) {
+#ifdef DL_DEBUG_COLS
+    { static int dbg; if (dbg < 6) { dbg++; printf("emit x %d col %d tex %d rw_scale %d step %d iscale %d mid %d\n", dc_x, cur_col, cur_tex, rw_scale, rw_scalestep, dc_iscale, dc_texturemid); } }
+#endif
     int sky = cur_tex == skytexture;
     uint8_t tex = sky ? 255 : (uint8_t)cur_tex;
     uint8_t light;
@@ -212,7 +217,7 @@ void DG_StatsMaskedEnd(void) {}
 
 /* The frame boundary: doom_render_view calls begin before and end after R_RenderPlayerView */
 void DG_DrawListBegin(void) {
-    len = 26;
+    len = 28;
     count = 0;
     truncated = 0;
     plane_at = 0;
@@ -223,8 +228,8 @@ void DG_DrawListEnd(void) {
     plane_close();
     uint8_t* p = list;
     p[0] = 'D'; p[1] = 1; put16(p + 2, count); put16(p + 4, len); put16(p + 6, viewwidth); p[8] = (uint8_t)viewheight; p[9] = (uint8_t)truncated;
-    put32(p + 10, pspriteiscale); put32(p + 14, skytexturemid); put32(p + 18, basexscale); put32(p + 22, baseyscale);
-    /* gametic rides in the HTTP header (X-Doom-Frame counts frames); the list stays 26 B of header */
+    p[10] = (uint8_t)skytexture; p[11] = 0;
+    put32(p + 12, pspriteiscale); put32(p + 16, skytexturemid); put32(p + 20, basexscale); put32(p + 24, baseyscale);
 }
 
 K32_EXPORT("doom_drawlist_ptr") uint32_t doom_drawlist_ptr(void) { return (uint32_t)(uintptr_t)list; }

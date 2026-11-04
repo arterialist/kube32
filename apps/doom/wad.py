@@ -265,37 +265,70 @@ def parse_textures(lumps):
     return out
 
 
-def compose(w, h, patches, d):
-    """The texture as DOOM's R_GenerateComposite draws it: column-major, w columns of h bytes."""
-    pix = bytearray(w * h)
+def texture_columns(w, h, patches, d):
+    """What R_GenerateLookup and R_GenerateComposite make of a texture: per column, either
+    ("patch", name, offset of its post data) when one patch covers it, or ("composite", offset)
+    into the composite block, which holds the multi-patch columns only, in order, h bytes each,
+    drawn patch by patch as R_DrawColumnInCache draws them (uncovered texels stay 0)."""
+    count = [0] * w
+    single = [None] * w
     for ox, oy, pname in patches:
         pt = d[pname]
-        pw, ph = struct.unpack_from("<hh", pt, 0)
+        pw = struct.unpack_from("<h", pt, 0)[0]
         cofs = struct.unpack_from("<%di" % pw, pt, 8)
-        for x in range(pw):
-            tx = ox + x
-            if tx < 0 or tx >= w:
+        for x in range(max(ox, 0), min(ox + pw, w)):
+            count[x] += 1
+            single[x] = (pname, cofs[x - ox] + 3)
+    comp_ofs = [None] * w
+    size = 0
+    for x in range(w):
+        if count[x] > 1:
+            comp_ofs[x] = size
+            size += h
+    block = bytearray(size)
+    for ox, oy, pname in patches:
+        pt = d[pname]
+        pw = struct.unpack_from("<h", pt, 0)[0]
+        cofs = struct.unpack_from("<%di" % pw, pt, 8)
+        for x in range(max(ox, 0), min(ox + pw, w)):
+            if comp_ofs[x] is None:
                 continue
-            o = cofs[x]
+            o = cofs[x - ox]
             while pt[o] != 0xff:
                 top, ln = pt[o], pt[o + 1]
-                for y in range(ln):
-                    ty = oy + top + y
-                    if 0 <= ty < h:
-                        pix[tx * h + ty] = pt[o + 3 + y]
+                n, pos, src = ln, oy + top, o + 3
+                if pos < 0:
+                    n += pos
+                    src -= pos
+                    pos = 0
+                if pos + n > h:
+                    n = h - pos
+                if n > 0:
+                    block[comp_ofs[x] + pos:comp_ofs[x] + pos + n] = pt[src:src + n]
                 o += ln + 4
-    return bytes(pix)
+    cols = []
+    for x in range(w):
+        if count[x] > 1:
+            cols.append(("composite", comp_ofs[x]))
+        elif count[x] == 1:
+            cols.append(("patch",) + single[x])
+        else:
+            cols.append(("none",))
+    return cols, bytes(block)
 
 
 def pack(src, dst):
     """The render pack: what a rasterizer needs and the sim does not (wad.py pack <iwad> <blob>).
 
-    Little-endian. Header: "K32DOOMPK", u8 version 1, u16 ntextures, u16 nflats, u16 nsprites,
+    Little-endian. Header: "K32DOOMPK", u8 version 2, u16 ntextures, u16 nflats, u16 nsprites,
     u16 first_flat_lump, u16 first_sprite_lump, u32 palette_offset (768 B), u32 colormap_offset
-    (34 x 256 B), then the texture table (u16 width, u16 height, u8 kind: 0 composite column-major,
-    1 a single patch kept as a patch for its posts, u8 pad, u32 offset, u32 size), the flat table
-    (u32 offset: 4096 B each, by flat number), the sprite table (u32 offset, u32 size, by lump
-    number from first_sprite_lump), then the data, each item 4-byte aligned."""
+    (34 x 256 B), then the texture table (u16 width, u16 height, u32 column table offset), the
+    flat table (u32 offset: 4096 B each, by flat number) and the sprite table (u32 offset, u32
+    size, by lump number from first_sprite_lump). A texture's column table holds one u32 pack
+    offset a column: the post data of the one patch that covers it, or its column of the
+    texture's composite block (the engine's own layout, so the kernels read the bytes the engine
+    reads). The patches follow once each, every item 4-byte aligned, and 256 zero bytes end the
+    pack so a column's 128-texel window stays inside it."""
     kind, lumps = read_wad(src)
     d = dict(lumps)
     names = [n for n, _ in lumps]
@@ -311,37 +344,60 @@ def pack(src, dst):
         off = len(blob)
         blob.extend(b)
         return off
+    patch_off = {}
+    for _, _, _, patches in textures:
+        for _, _, pname in patches:
+            if pname not in patch_off:
+                patch_off[pname] = add(d[pname])
     tex_table = []
-    composite_bytes = patch_bytes = 0
+    composite_bytes = 0
+    patch_cols = comp_cols = 0
     for name, w, h, patches in textures:
-        if len(patches) == 1 and patches[0][0] == 0 and patches[0][1] == 0 and struct.unpack_from("<hh", d[patches[0][2]], 0) == (w, h):
-            b, k = d[patches[0][2]], 1
-            patch_bytes += len(b)
-        else:
-            b, k = compose(w, h, patches, d), 0
-            composite_bytes += len(b)
-        tex_table.append((w, h, k, add(b), len(b)))
+        cols, block = texture_columns(w, h, patches, d)
+        comp_off = add(block) if block else 0
+        composite_bytes += len(block)
+        table = bytearray()
+        for c in cols:
+            if c[0] == "patch":
+                table += struct.pack("<I", patch_off[c[1]] + c[2])
+                patch_cols += 1
+            elif c[0] == "composite":
+                table += struct.pack("<I", comp_off + c[1])
+                comp_cols += 1
+            else:
+                table += struct.pack("<I", 0)
+        tex_table.append((w, h, add(table)))
     flat_table = [add(b) for b in flats]
     sprite_table = [(add(b), len(b)) for b in sprites]
     pal_off = add(d["PLAYPAL"][:768])
     cmap_off = add(d["COLORMAP"][:34 * 256])
-    head_len = 9 + 1 + 2 * 5 + 4 * 2 + 16 * len(tex_table) + 4 * len(flat_table) + 8 * len(sprite_table)
+    add(bytes(256))
+    head_len = 9 + 1 + 2 * 5 + 4 * 2 + 8 * len(tex_table) + 4 * len(flat_table) + 8 * len(sprite_table)
     head_len = (head_len + 3) & ~3
     base = head_len
-    head = bytearray(b"K32DOOMPK" + bytes([1]))
+    head = bytearray(b"K32DOOMPK" + bytes([2]))
     head += struct.pack("<HHHHHII", len(tex_table), len(flat_table), len(sprite_table), f0 + 1, s0 + 1, base + pal_off, base + cmap_off)
-    for w, h, k, off, size in tex_table:
-        head += struct.pack("<HHBBII", w, h, k, 0, base + off, size)
+    for w, h, off in tex_table:
+        head += struct.pack("<HHI", w, h, base + off)
     for off in flat_table:
         head += struct.pack("<I", base + off)
     for off, size in sprite_table:
         head += struct.pack("<II", base + off, size)
     while len(head) < head_len:
         head.append(0)
-    open(dst, "wb").write(bytes(head) + bytes(blob))
-    total = len(head) + len(blob)
-    print("%s: %d bytes" % (dst, total))
-    print("  textures %9d bytes (%d: %d B composed, %d B kept as patches)" % (sum(t[4] for t in tex_table), len(tex_table), composite_bytes, patch_bytes))
+    # the column tables hold offsets from the pack's start: shift them past the header
+    out = bytearray(bytes(head) + bytes(blob))
+    for w, h, off in tex_table:
+        for x in range(w):
+            p = base + off + 4 * x
+            v = struct.unpack_from("<I", out, p)[0]
+            if v:
+                struct.pack_into("<I", out, p, v + base)
+    open(dst, "wb").write(bytes(out))
+    print("%s: %d bytes" % (dst, len(out)))
+    print("  patches  %9d bytes (%d), composites %d bytes; %d columns from patches, %d composed" % (
+        sum(len(d[p]) for p in patch_off), len(patch_off), composite_bytes, patch_cols, comp_cols))
+    print("  textures %9d bytes of column tables (%d)" % (sum(4 * w for w, _, _ in tex_table), len(tex_table)))
     print("  flats    %9d bytes (%d)" % (sum(len(b) for b in flats), len(flats)))
     print("  sprites  %9d bytes (%d)" % (sum(len(b) for b in sprites), len(sprites)))
     print("  tables   %9d bytes, palette and colormaps %d" % (len(head), 768 + 34 * 256))

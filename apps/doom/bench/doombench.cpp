@@ -6,7 +6,7 @@
 //
 //   doombench <doom.wasm> <iwad> [--tics N] [--memory BYTES] [--args "..."]
 //             [--iwad-name freedoom1.wad] [--render-every N] [--quiet]
-//             [--view-only] [--stats-mode 0|1|2]
+//             [--view-only] [--stats-mode 0|1|2] [--screenblocks 10|11] [--spin]
 //
 // --view-only draws the 3D view alone (doom_render_view), without the status
 // bar and HUD. --stats-mode needs build/doom-stats.wasm (make stats): 1
@@ -38,7 +38,7 @@ static u64 m3_opCount;   // this build does not count
 #endif
 
 static std::vector<uint8_t> g_wad;
-static std::string g_env_iwad = "freedoom1.wad", g_env_args = "-warp 1 1 -skill 3";
+static std::string g_env_iwad = "freedoom1.wad", g_env_args = "-warp 1 1 -skill 3", g_env_blocks = "10";
 static int64_t g_clock_ms;
 static bool g_quiet;
 static std::string g_resp;
@@ -68,7 +68,7 @@ m3ApiRawFunction(h_env_get) {
     m3ApiGetArgMem(char*, out);
     m3ApiGetArg(uint32_t, cap);
     std::string k(key, key_len);
-    const std::string* v = k == "DOOM_IWAD" ? &g_env_iwad : k == "DOOM_ARGS" ? &g_env_args : nullptr;
+    const std::string* v = k == "DOOM_IWAD" ? &g_env_iwad : k == "DOOM_ARGS" ? &g_env_args : k == "DOOM_SCREENBLOCKS" ? &g_env_blocks : nullptr;
     if (!v) m3ApiReturn(-1);
     uint32_t n = std::min<uint32_t>(cap, (uint32_t)v->size());
     std::memcpy(out, v->data(), n);
@@ -203,6 +203,7 @@ int main(int argc, char** argv) {
         else if (a == "--view-only") view_only = true;
         else if (a == "--spin") spin = true;   // the player also turns right the whole time: the view sweeps the room
         else if (a == "--stats-mode") stats_mode = std::atoi(argv[++i]);
+        else if (a == "--screenblocks") g_env_blocks = argv[++i];   // 11: the whole screen, no status bar
     }
     // everything wasm3 allocates for the pod is charged to one account, as on a node
     const int account = kube32_pod_account_open();

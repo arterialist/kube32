@@ -35,7 +35,7 @@ Shareware E1M1, 700 tics, `--view-only --spin`, after the first second (wasm3 op
 
 ### The sim-only pod
 
-`make sim` builds `build/doom-sim.wasm`: the same engine with no rasterizers and no screen buffers. A frame is a draw list (`port/drawlist_emit.c` documents the format): wall strips with one header a seg part and 3 bytes a column, planes with 13 bytes a span, sprites with their per-column clip, two-sided middle texture columns. `GET /drawlist?keys=d173,u173` answers the latest list (16 KiB at most, `X-Doom-Frame` counts frames) and takes key events in the query. A rasterizer draws the frame from the list and the render pack alone.
+`make sim` builds `build/doom-sim.wasm`: the same engine with no rasterizers and no screen buffers. A frame is a draw list (`port/drawlist_emit.c` documents the format): wall strips with an 18-byte header a seg part and 3 bytes a column, planes with 13 bytes a span, sprites with their per-column clip, two-sided middle texture columns. `GET /drawlist?keys=d173,u173` answers the latest list (16 KiB at most, `X-Doom-Frame` counts frames) and takes key events in the query. A rasterizer draws the frame from the list and the render pack alone.
 
 ```sh
 python3 wad.py pack build/wad/doom1-e1m1-min.wad build/wad/doom1-e1m1.pack       # what a rasterizer reads
@@ -54,6 +54,23 @@ Shareware E1M1, 700 tics, `--spin`, after the first second, on the sim pack:
 | Tic, wasm3 ops | 15.4 K | 43 K | 92 K |
 
 No frame reaches the 16 KiB cap. A 320 KiB zone plays E1M1 (288 KiB does not): 832 KiB of linear memory, of which 533 KB is the module's data, zero-initialised statics and stack. The sim pack is 273,714 B (1,004,720 B cut from the 1,278,434 B map cut); the render pack is 1,323,116 B: textures 734,680 (71; 614,080 composed, 120,600 kept as patches), flats 98,304 (24), sprites 477,032 (296), tables 3,628, palette and colormaps 9,472. The sim reads 158 KB from its blob over the 700 tics, with no zone purges at 416 KiB.
+
+### The view pod
+
+`make view` builds `build/doom-view.wasm` (`view/view.c`, 6,910 B): the Cardputer side. Every tick it sends the keyboard's keys with `GET <DOOM_SIM_URL>/drawlist?keys=...`, decodes the draw list (`view/drawlist.c`) into records for the [`k32_raster_columns` and `k32_raster_spans`](../../docs/app-development.md#raster-kernels) kernels, which read the textures in place from the render pack blob (`DOOM_PACK_BLOB`, a flash blob), and puts each band of 27 rows on the screen with `k32_display_blit_pal`. It needs `hardware.kube32.io/tft-display`, `keyboard` and the `SERVICE_CALL` capability. The textures never enter its memory: 16 KiB of draw list, a 6.5 KiB band, the pack's 3 KiB of tables and 4 KiB of stack.
+
+`make W=240` and `make W=240 sim` build the engines at 240 x 135, the Cardputer's screen (`DOOM_SCREENBLOCKS=11` draws the whole screen; the status bar is not drawn below 320 wide). The 240-wide sim costs 267 K ops a frame (p95 531 K) and its draw list is 3.9 KB (p95 8.1 KB, max 10.8 KB), on the same course.
+
+### The check against the engine
+
+`make check` builds `build/drawlist_check` (`bench/drawlist_check.cpp`): the full engine and the sim run in lockstep on the host's wasm3, same IWAD, keys and clock; every frame the sim's draw list is drawn with the native kernels (`src/runtime/pod_raster.cpp`) through the view pod's decoder and the render pack, and compared pixel by pixel with the frame the full engine drew.
+
+```sh
+./build/drawlist_check build/doom.wasm build/doom-sim.wasm build/wad/doom1-e1m1-min.wad build/wad/doom1-e1m1.pack --tics 350 --spin
+./build/drawlist_check build/doom-240.wasm build/doom-sim-240.wasm build/wad/doom1-e1m1-min.wad build/wad/doom1-e1m1.pack --tics 350 --spin --screenblocks 11
+```
+
+At 320 x 168, 350 frames: 2 of 18,816,000 pixels differ (one frame); at 240 x 135, 1 of 11,340,000 (one frame). The remaining pixels are texel reads past the end of a lump, where the engine reads whatever follows the lump in its zone and the pack holds the next item. On the host the kernels take 130 us a frame at 320 wide and 65 us at 240 (4,339 and 2,426 column records, 1,302 and 749 span records, in 5 bands), the decoder 32 and 18 us.
 
 Pixel rasterization is 981 K ops a frame (73%), 17.4 ops a pixel over 56.5 K pixels (37.4 K wall, 15.9 K floor and ceiling, 3.2 K sprite). The draw list is 497 wall columns, 174 spans and 6 sprites a frame (p95: 937, 427, 18), 7.2 KB packed (p95 14.8 KB, max 16.1 KB). A frame touches 185 distinct texture columns (21.5 KB; p95 361, 39.9 KB), 3 to 4 flats (16 KB; p95 7, 28 KB) and 4 sprite patches (6.8 KB; p95 11, 13.5 KB). Without texture lookups a 416 KiB zone plays E1M1.
 

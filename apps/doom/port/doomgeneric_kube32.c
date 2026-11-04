@@ -36,6 +36,7 @@ void I_StartFrame(void);
 void Z_UsageBytes(unsigned int* fixed, unsigned int* cache);
 int Z_FreeMemory(void);
 extern unsigned int z_purges, z_purged_bytes;
+extern int screenblocks;
 extern uint32_t k32_libc_heap_peak, k32_libc_blob_reads, k32_libc_blob_bytes;
 
 /* ---- doomgeneric callbacks --------------------------------------------- */
@@ -88,6 +89,11 @@ K32_EXPORT("doom_render") void doom_render(void) { doom_render_view(); }
 K32_EXPORT("doom_render") void doom_render(void) { D_Display(); }
 #endif
 
+#ifndef DG_SIM_ONLY
+/* The frame the engine drew, palette indices, SCREENWIDTH x SCREENHEIGHT (a host check reads it) */
+K32_EXPORT("doom_screen_ptr") uint32_t doom_screen_ptr(void) { return (uint32_t)(uintptr_t)I_VideoBuffer; }
+#endif
+
 /* The 3D view alone (no status bar, HUD or menu): what a split renderer ships */
 void R_RenderPlayerView(player_t* player);
 void R_ExecuteSetViewSize(void);
@@ -138,6 +144,11 @@ K32_EXPORT("k32_init") int32_t k32_init(void) {
     }
     argv_store[argc] = 0;
     singletics = true;          /* every TryRunTics runs exactly one tic */
+    {   /* DOOM_SCREENBLOCKS: 10 leaves room for the status bar, 11 is the whole screen */
+        char sb[8];
+        int32_t m = k32_env_get("DOOM_SCREENBLOCKS", 17, sb, sizeof sb - 1);
+        if (m > 0 && m < (int32_t)sizeof sb) { sb[m] = 0; screenblocks = atoi(sb); }
+    }
     doomgeneric_Create(argc, argv_store);
     started = 1;
     start_ms = k32_time_ms();
