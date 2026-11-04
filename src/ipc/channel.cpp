@@ -101,6 +101,25 @@ void message_free(uint8_t* p) {
 #endif
     std::free(p);
 }
+
+// A frame from the ESP-NOW callback, until the dispatcher parses it. Without
+// PSRAM a frame of a large message waits in the pod pool block, else in the
+// heap above its reserve; a small frame (a HELLO, an event) in the heap while
+// 6 KiB of it stay free
+uint8_t* raw_frame_alloc(size_t n, bool psram) {
+#if defined(KUBE32_TARGET_ESP32)
+    if (!psram) {
+        const bool large = n > K32C_MAX_PACKET_LEN + 6;
+        if (large) {
+            if (void* p = kube32_pool_sub_alloc(n)) return static_cast<uint8_t*>(p);
+        }
+        if (heap_caps_get_free_size(MALLOC_CAP_INTERNAL) < n + (large ? kHeapReserveNoPsram : 6 * 1024)) return nullptr;
+    }
+#else
+    (void)psram;
+#endif
+    return static_cast<uint8_t*>(std::malloc(n));
+}
 } // namespace
 
 ChannelMessage::~ChannelMessage() {
@@ -485,7 +504,7 @@ void ChannelManager::shutdown() {
         osal::LockGuard d_guard(disp_mutex_);
         for (size_t i = 0; i < rx_count_; ++i) {
             RawFrame& f = rx_frames_[(rx_head_ + i) % rx_cap_];
-            std::free(f.data);
+            message_free(f.data);
             f = RawFrame{};
         }
         rx_head_ = rx_count_ = 0;
@@ -835,7 +854,7 @@ void ChannelManager::set_rx_queue_frames(size_t n) {
     for (size_t i = 0; i < rx_count_; ++i) {
         RawFrame& f = rx_frames_[(rx_head_ + i) % rx_cap_];
         if (kept < n) next[kept++] = f;
-        else std::free(f.data);
+        else message_free(f.data);
     }
     rx_frames_.swap(next);
     rx_cap_ = n;
@@ -851,15 +870,7 @@ size_t ChannelManager::rx_queue_frames() const {
 // waits for the dispatcher
 void ChannelManager::enqueue_raw_frame(const uint8_t* src_mac, const uint8_t* frame, size_t len) {
     if (!frame || len > K32C_MAX_FRAME_LEN) return;
-#if defined(KUBE32_TARGET_ESP32)
-    // Without PSRAM a frame of a large message waits in the heap only above
-    // its reserve; a small frame (a HELLO, an event) above 6 KiB
-    if (!has_psram_ && heap_caps_get_free_size(MALLOC_CAP_INTERNAL) < len + (len > K32C_MAX_PACKET_LEN ? kHeapReserveNoPsram : 6 * 1024)) {
-        stats_.rx_nomem.fetch_add(1, std::memory_order_relaxed);
-        return;
-    }
-#endif
-    auto* p = static_cast<uint8_t*>(std::malloc(len + 6));
+    uint8_t* p = raw_frame_alloc(len + 6, has_psram_);
     if (!p) {
         stats_.rx_nomem.fetch_add(1, std::memory_order_relaxed);
         return;
@@ -869,7 +880,7 @@ void ChannelManager::enqueue_raw_frame(const uint8_t* src_mac, const uint8_t* fr
     {
         osal::LockGuard guard(disp_mutex_);
         if (rx_count_ >= rx_cap_ || rx_frames_.size() != rx_cap_) {
-            std::free(p);
+            message_free(p);
             stats_.rx_queue_full.fetch_add(1, std::memory_order_relaxed);
             return;
         }
@@ -931,7 +942,7 @@ void ChannelManager::dispatch_loop() {
                     rx_head_ = (rx_head_ + 1) % rx_cap_;
                     rx_count_--;
                 }
-                std::unique_ptr<uint8_t, void (*)(void*)> hold(f.data, std::free);
+                std::unique_ptr<uint8_t, void (*)(uint8_t*)> hold(f.data, message_free);
                 if (f.len > 6) {
                     NodeEndpoint src;
                     src.is_espnow = true;
@@ -964,7 +975,7 @@ bool ChannelManager::start_background(uint32_t hello_interval_ms, size_t dispatc
     if (background_running_.load()) return true;
     hello_interval_ms_ = hello_interval_ms;
     // Without PSRAM: 16 received frames, 8 messages for subscribers, two
-    // reassemblies and 19.5 KiB of messages at once; with PSRAM 32, 32, 8 and
+    // reassemblies and 34.8 KiB of messages at once; with PSRAM 32, 32, 8 and
     // 256 KiB (two pod workers publishing at once, large messages arriving)
     const bool psram = osal::System::get_total_psram_bytes() > 0;
     {
@@ -976,8 +987,9 @@ bool ChannelManager::start_background(uint32_t hello_interval_ms, size_t dispatc
         osal::LockGuard guard(reassembly_mutex_);
         max_reassembly_ = psram ? 8 : 2;
     }
-    // Without PSRAM: one message of the largest size held at once
-    rx_budget_bytes_.store(psram ? 256 * 1024 : K32C_MAX_MESSAGE_BYTES + K32C_LARGE_CHUNK + 2048);
+    // Without PSRAM: two messages of the largest size held at once (one
+    // being put together while the pod reads the other)
+    rx_budget_bytes_.store(psram ? 256 * 1024 : 2 * (K32C_MAX_MESSAGE_BYTES + K32C_LARGE_CHUNK));
     has_psram_ = psram;
     background_running_.store(true);
     dispatch_thread_ = std::make_unique<osal::Thread>();
