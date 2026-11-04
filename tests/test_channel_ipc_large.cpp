@@ -20,7 +20,7 @@ using namespace kube32::ipc;
 
 namespace {
 
-constexpr uint16_t kBasePort = 7470;   // this node listens on kBasePort + 1 (node id 1)
+constexpr uint16_t kBasePort = 7600;   // this node listens on kBasePort + 1 (node id 1); peers on kBasePort + 11 to + 41
 
 struct Received {
     std::mutex m;
