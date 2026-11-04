@@ -111,7 +111,7 @@ A pod publishes a message on a topic with `k32_event_emit` (up to 200 bytes, `K3
 
 A message of up to 224 bytes travels as one frame. A larger message travels in frames of up to 1470 bytes: ESP-NOW v2 frames, or UDP datagrams that fit a 1500-byte MTU. The receiving node puts the fragments in place as they arrive, in any order, and delivers the message whole. When a fragment is missing 500 ms after the last one arrived, it drops the message and counts it. The sender transmits a frame again once when the peer's radio does not acknowledge it or the send fails.
 
-Each node announces the topics it subscribes to on the topic `k32.subs` with every HELLO (every 3 s) and when its subscriptions change: its pods' `kube32.io/event-topics`, the topics of its Ingress event streams, and the channels its pods open by name. A publish goes only to the nodes that subscribe to its topic. A node that announces no subscriptions, or whose last announcement is older than 20 s, gets every topic.
+Each node announces the topics it subscribes to, and the bytes a second it takes, on the topic `k32.subs` with every HELLO (every 3 s) and when its subscriptions change: its pods' `kube32.io/event-topics`, the topics of its Ingress event streams, and the channels its pods open by name. A publish goes only to the nodes that subscribe to its topic. A node that announces no subscriptions, or whose last announcement is older than 20 s, gets every topic. A publish to a node that announces a rate waits until that node's pace allows the message, at most 500 ms, so a fast publisher slows down instead of overrunning a small receiver.
 
 A node heard over ESP-NOW in the last 10 s receives messages over ESP-NOW, which is one hop and acknowledged by its radio. Any other node receives messages over UDP port 7400 through the access point. HELLOs go over UDP to every node with a known address, and over ESP-NOW broadcast.
 
@@ -119,13 +119,14 @@ A node heard over ESP-NOW in the last 10 s receives messages over ESP-NOW, which
 
 | Item | Board without PSRAM | Board with PSRAM |
 | --- | --- | --- |
-| Received messages held at once (reassembly and queued for subscribers) | 19.5 KiB: one 16 KiB message | 256 KiB |
+| Received messages held at once (reassembly and queued for subscribers) | 34.8 KiB: two 16 KiB messages | 256 KiB |
+| Receive rate the node announces | 48 KiB a second | no limit |
 | Reassemblies in progress | 2 | 8 |
 | ESP-NOW frames waiting for the dispatcher | 16 | 32 |
 | Messages waiting for subscribers | 8 | 32 |
-| Message buffers | Pod pool block's small heap first, then the heap while 24 KiB of it stay free | PSRAM, then internal RAM |
+| Message buffers, and ESP-NOW frames of large messages | Pod pool block's small heap first, then the heap while 24 KiB of it stay free | PSRAM, then internal RAM |
 
-A pod's queued event holds the received message itself, so every subscriber on the node shares one buffer. Without PSRAM a received frame of a large message is copied out of the radio's callback only while 24 KiB of the heap stay free, and a small frame while 6 KiB stay free: the Wi-Fi driver stops sending once an allocation of its own fails.
+A pod's queued event holds the received message itself, so every subscriber on the node shares one buffer. Without PSRAM a received frame of a large message waits in the pod pool block, or in the heap while 24 KiB of it stay free, and a small frame waits in the heap while 6 KiB stay free: the Wi-Fi driver stops sending once an allocation of its own fails.
 
 ### Errors and counters
 
@@ -150,6 +151,7 @@ The console command `K32_CMD:IPC` prints the node's counters as a `K32_IPC` line
 | `rx_messages`, `reassembled` | Messages queued for this node's subscribers, and those put together from fragments |
 | `incomplete` | Messages dropped because a fragment never came, or because both reassembly slots of a board without PSRAM were taken |
 | `nomem` | Messages and frames dropped because no memory or budget held them |
+| `paced_ms` | Time publishers on this node waited for peers' announced rates |
 | `rxq_full` | ESP-NOW frames dropped because the dispatcher's queue was full |
 | `malformed`, `crc` | Fragments that do not fit their message, frames with a wrong CRC |
 | `dispatch_dropped` | Messages dropped because the subscribers' queue was full |
