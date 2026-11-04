@@ -484,6 +484,47 @@ K32_IMPORT("k32_conv3x3_i8") int32_t k32_conv3x3_i8(float* out, const int8_t* w,
  * pays for n / 2 x log2 n butterflies, 8 units each. */
 K32_IMPORT("k32_fft_q15")    int32_t k32_fft_q15(int32_t* re, int32_t* im, uint32_t n, const int16_t* tw_re, const int16_t* tw_im);
 
+/* ---- Software-rasterizer kernels ---------------------------------------
+ * The inner loops of a paletted 2.5D renderer (textured vertical columns
+ * and horizontal spans through a light table, as DOOM-class engines draw
+ * walls, floors and sprites) over a band of an 8-bit frame: dst holds rows
+ * y0 .. y0 + rows - 1, dst_stride bytes each, and a frame is drawn band by
+ * band from the same records. Texels and tables come from the pod's memory
+ * or from a mapped blob (K32_BLOB_ADDR), the frame's palette conversion is
+ * k32_display_blit_pal. Both return K32_OK, K32_ERR_INVAL for a record the
+ * kernel refuses (a column at or past dst_stride, a light row at or past
+ * 34, an unknown kind, x2 < x1), K32_ERR_NOTSUP for a blob that is not
+ * mapped, and trap on an operand outside the pod's memory or every open
+ * blob. A metered pod pays 64 units a record.
+ *
+ * k32_raster_columns: n records of 24 bytes:
+ *   u32 src, i32 iscale, i32 texturemid, i32 scale, u16 x, u16 index,
+ *   u8 a, u8 b, u8 light, u8 kind
+ * kind 0 is a solid column: src is a table of u32 offsets (in src's own
+ * memory) and the texels are the 128 bytes at table[index]; rows a .. b of
+ * frame column x take texel ((texturemid + (y - centery) * iscale) >> 16)
+ * & 127, mapped through row light of colormap (34 x 256 bytes). kind 1
+ * walks the posts of column index of the patch at src (DOOM's patch
+ * format: columnofs, then posts of topdelta, length, a pad, the texels, a
+ * pad, 0xff last), kind 2 the posts of the column at table[index] - 3; a
+ * post is drawn as a solid column of texturemid - (topdelta << 16) from
+ * the sprite's top at (centery << 16) - texturemid * scale, clipped to
+ * rows a - 1 .. b - 1 exclusive (a and b carry the clips + 2). With a
+ * translation (256 bytes, 0 for none) a texel goes through it first and
+ * the index is not masked.
+ *
+ * k32_raster_spans: n records of 28 bytes:
+ *   u32 src, i32 xfrac, i32 yfrac, i32 xstep, i32 ystep, u16 x1, u16 x2,
+ *   u8 y, u8 light, u16 pad
+ * Row y, columns x1 .. x2, take texels of the 64 x 64 tile at src (4096
+ * bytes) at a position that starts at (xfrac, yfrac) and steps by (xstep,
+ * ystep) in 6.10 fixed point (the top ten fraction bits of the 16.16
+ * values), through row light of colormap. */
+K32_IMPORT("k32_raster_columns") int32_t k32_raster_columns(uint8_t* dst, uint32_t dst_stride, int32_t y0, uint32_t rows, const void* records,
+                                                            uint32_t n, const uint8_t* colormap, const uint8_t* translation, int32_t centery);
+K32_IMPORT("k32_raster_spans") int32_t k32_raster_spans(uint8_t* dst, uint32_t dst_stride, int32_t y0, uint32_t rows, const void* records,
+                                                        uint32_t n, const uint8_t* colormap);
+
 /* ---- Hardware imports, gated by the capability firewall ---------------
  * The pod manifest must request the matching resource:
  *   hardware.kube32.io/tft-display: "1"  -> k32_display_*
@@ -515,6 +556,10 @@ K32_IMPORT("k32_fft_q15")    int32_t k32_fft_q15(int32_t* re, int32_t* im, uint3
 K32_IMPORT("k32_display_text") int32_t k32_display_text(int32_t x, int32_t y, const char* text, uint32_t len, uint32_t fg565, uint32_t bg565);
 K32_IMPORT("k32_display_rect") int32_t k32_display_rect(int32_t x, int32_t y, int32_t w, int32_t h, uint32_t color565);
 K32_IMPORT("k32_display_bar")  int32_t k32_display_bar(int32_t x, int32_t y, int32_t w, int32_t h, uint32_t pct, uint32_t fg565, uint32_t bg565);
+/* w x h pixels, row after row, to (x, y); the part outside the screen is dropped. w and h are 1..1024 (K32_ERR_INVAL) */
+K32_IMPORT("k32_display_blit") int32_t k32_display_blit(int32_t x, int32_t y, int32_t w, int32_t h, const uint16_t* rgb565);
+/* the same from 8-bit palette indices through 256 RGB565 entries */
+K32_IMPORT("k32_display_blit_pal") int32_t k32_display_blit_pal(int32_t x, int32_t y, int32_t w, int32_t h, const uint8_t* idx, const uint16_t* pal565);
 K32_IMPORT("k32_key_read")     int32_t k32_key_read(void);    /* next key code (ASCII), K32_ERR_AGAIN when empty */
 K32_IMPORT("k32_tone")         int32_t k32_tone(uint32_t freq_hz, uint32_t duration_ms, uint32_t volume_pct);
 K32_IMPORT("k32_audio_play")   int32_t k32_audio_play(const int16_t* samples, uint32_t count, uint32_t sample_rate, uint32_t volume_pct);

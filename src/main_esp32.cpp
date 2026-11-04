@@ -1545,6 +1545,10 @@ void install_hardware_hooks(bool has_display) {
             kube32::hal::display_draw_bar(x, y, w, h, pct, static_cast<uint16_t>(fg), static_cast<uint16_t>(bg));
             return 0;
         };
+        hooks.display_blit = [](int32_t x, int32_t y, int32_t w, int32_t h, const uint16_t* pixels) -> int32_t {
+            kube32::hal::display_blit(x, y, w, h, pixels);
+            return 0;
+        };
         hooks.key_read = []() -> int32_t {
             int k = kube32::hal::keyboard_pop();
             return (k < 0) ? -11 : k;

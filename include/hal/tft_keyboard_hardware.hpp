@@ -44,6 +44,8 @@ constexpr uint16_t COLOR_BG_DARK = 0x10A2; // #141218
 bool init_display_and_backlight();
 void set_backlight(bool enabled);
 void display_fill_rect(int x, int y, int w, int h, uint16_t color);
+// w x h RGB565 pixels, row after row, to (x, y); the part outside the screen is dropped
+void display_blit(int x, int y, int w, int h, const uint16_t* pixels);
 void display_clear(uint16_t color = COLOR_BG_DARK);
 // 6x8 cell font; strings longer than the panel are clipped
 void display_draw_string(int x, int y, const char* str, uint16_t color = COLOR_WHITE, uint16_t bg = COLOR_BG_DARK);

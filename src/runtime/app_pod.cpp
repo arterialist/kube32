@@ -5,6 +5,7 @@
 #include "runtime/pod_log.hpp"
 #include "runtime/pod_fs.hpp"
 #include "runtime/pod_linalg.hpp"
+#include "runtime/pod_raster.hpp"
 #include "runtime/pod_blobs.hpp"
 #include "runtime/k32_app_abi.h"
 #include "hal/capability_firewall.hpp"
@@ -554,6 +555,67 @@ static const void* raw_display_bar(IM3Runtime rt, IM3ImportContext ictx, uint64_
     return m3Err_none;
 }
 
+// k32_display_blit(x, y, w, h, pixels): w x h RGB565 pixels from the pod's memory
+constexpr int32_t kBlitMaxSide = 1024;
+static const void* raw_display_blit(IM3Runtime rt, IM3ImportContext ictx, uint64_t* sp, void* mem) {
+    const int32_t x = static_cast<int32_t>(sp[1]), y = static_cast<int32_t>(sp[2]), w = static_cast<int32_t>(sp[3]), h = static_cast<int32_t>(sp[4]);
+    const uint32_t off = static_cast<uint32_t>(sp[5]);
+    const std::string& pod_id = pod_for(rt, ictx);
+    if (!hal::CapabilityFirewall::instance().check_permission(pod_id, hal::PeripheralType::Display, 0, hal::AccessMode::Write)) {
+        *reinterpret_cast<int32_t*>(sp) = hal::HAL_ERR_PERM;
+        return m3Err_none;
+    }
+    if (w <= 0 || h <= 0 || w > kBlitMaxSide || h > kBlitMaxSide) {
+        *reinterpret_cast<int32_t*>(sp) = K32_ERR_INVAL;
+        return m3Err_none;
+    }
+    if (!guest_range_ok(mem, off, static_cast<uint32_t>(w) * static_cast<uint32_t>(h) * 2u)) {
+        *reinterpret_cast<int32_t*>(sp) = hal::HAL_ERR_FAULT;
+        return m3Err_none;
+    }
+    const uint16_t* px = reinterpret_cast<const uint16_t*>(static_cast<const uint8_t*>(mem) + off);
+    *reinterpret_cast<int32_t*>(sp) = s_hooks.display_blit ? s_hooks.display_blit(x, y, w, h, px) : hal::HAL_ERR_NODEV;
+    return m3Err_none;
+}
+
+// k32_display_blit_pal(x, y, w, h, idx, pal): w x h palette indices through 256 RGB565 entries,
+// converted kBlitPalRows rows at a time
+constexpr int32_t kBlitPalRows = 8;
+static const void* raw_display_blit_pal(IM3Runtime rt, IM3ImportContext ictx, uint64_t* sp, void* mem) {
+    const int32_t x = static_cast<int32_t>(sp[1]), y = static_cast<int32_t>(sp[2]), w = static_cast<int32_t>(sp[3]), h = static_cast<int32_t>(sp[4]);
+    const uint32_t idx = static_cast<uint32_t>(sp[5]), pal = static_cast<uint32_t>(sp[6]);
+    const std::string& pod_id = pod_for(rt, ictx);
+    if (!hal::CapabilityFirewall::instance().check_permission(pod_id, hal::PeripheralType::Display, 0, hal::AccessMode::Write)) {
+        *reinterpret_cast<int32_t*>(sp) = hal::HAL_ERR_PERM;
+        return m3Err_none;
+    }
+    if (w <= 0 || h <= 0 || w > kBlitMaxSide || h > kBlitMaxSide) {
+        *reinterpret_cast<int32_t*>(sp) = K32_ERR_INVAL;
+        return m3Err_none;
+    }
+    if (!guest_range_ok(mem, idx, static_cast<uint32_t>(w) * static_cast<uint32_t>(h)) || !guest_range_ok(mem, pal, 512)) {
+        *reinterpret_cast<int32_t*>(sp) = hal::HAL_ERR_FAULT;
+        return m3Err_none;
+    }
+    if (!s_hooks.display_blit) {
+        *reinterpret_cast<int32_t*>(sp) = hal::HAL_ERR_NODEV;
+        return m3Err_none;
+    }
+    const uint8_t* src = static_cast<const uint8_t*>(mem) + idx;
+    uint16_t palette[256];
+    std::memcpy(palette, static_cast<const uint8_t*>(mem) + pal, sizeof palette);
+    uint16_t band[kBlitMaxSide * kBlitPalRows];
+    int32_t rc = 0;
+    for (int32_t row = 0; row < h && rc == 0; row += kBlitPalRows) {
+        const int32_t rows = h - row < kBlitPalRows ? h - row : kBlitPalRows;
+        const uint8_t* s = src + static_cast<size_t>(row) * w;
+        for (int32_t i = 0; i < rows * w; i++) band[i] = palette[s[i]];
+        rc = s_hooks.display_blit(x, y + row, w, rows, band);
+    }
+    *reinterpret_cast<int32_t*>(sp) = rc;
+    return m3Err_none;
+}
+
 static const void* raw_key_read(IM3Runtime rt, IM3ImportContext ictx, uint64_t* sp, void*) {
     const std::string& pod_id = pod_for(rt, ictx);
     if (!hal::CapabilityFirewall::instance().check_permission(pod_id, hal::PeripheralType::Keyboard, 0, hal::AccessMode::Read)) {
@@ -740,6 +802,8 @@ void link_app_host_functions(IM3Module module, const std::string& pod_id) {
     m3_LinkRawFunction(module, "env", "k32_display_text", "i(iiiiii)",  &raw_display_text);
     m3_LinkRawFunction(module, "env", "k32_display_rect", "i(iiiii)",   &raw_display_rect);
     m3_LinkRawFunction(module, "env", "k32_display_bar",  "i(iiiiiii)", &raw_display_bar);
+    m3_LinkRawFunction(module, "env", "k32_display_blit", "i(iiiii)",   &raw_display_blit);
+    m3_LinkRawFunction(module, "env", "k32_display_blit_pal", "i(iiiiii)", &raw_display_blit_pal);
     m3_LinkRawFunction(module, "env", "k32_key_read",     "i()",        &raw_key_read);
     m3_LinkRawFunction(module, "env", "k32_tone",         "i(iii)",     &raw_tone);
     m3_LinkRawFunction(module, "env", "k32_audio_play",   "i(iiii)",    &raw_audio_play);
@@ -753,6 +817,7 @@ void link_app_host_functions(IM3Module module, const std::string& pod_id) {
     m3_LinkRawFunction(module, "env", "k32_fs_remove",    "i(ii)",      &raw_fs_remove);
     link_linalg_host_functions(module);
     link_blob_host_functions(module);
+    link_raster_host_functions(module);
 }
 
 // -----------------------------------------------------------------------------

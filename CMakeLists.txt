@@ -169,6 +169,7 @@ else()
         src/runtime/wasm_runtime.cpp
         src/runtime/app_pod.cpp
         src/runtime/pod_linalg.cpp
+        src/runtime/pod_raster.cpp
         src/runtime/pod_blobs.cpp
         src/runtime/pod_log.cpp
         src/runtime/image_registry.cpp
@@ -370,6 +371,11 @@ else()
     target_link_libraries(test_pod_linalg PRIVATE kube32_core)
     target_compile_options(test_pod_linalg PRIVATE -ffp-contract=off)   # its reference loops round as the kernels do
     add_test(NAME test_pod_linalg COMMAND test_pod_linalg)
+
+    # 10b'. Native software-rasterizer imports (k32_raster_*) and the display blits
+    add_executable(test_pod_raster tests/test_pod_raster.cpp)
+    target_link_libraries(test_pod_raster PRIVATE kube32_core)
+    add_test(NAME test_pod_raster COMMAND test_pod_raster)
 
     # 10c. Blobs: the flash and card stores, a pod's handles, /blobs over HTTP
     add_executable(test_blob_store tests/test_blob_store.cpp)

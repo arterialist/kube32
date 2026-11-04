@@ -20,7 +20,7 @@ The firewall reads `resources.requests`, or `resources.limits` when `requests` i
 | `esp32.io/uart: "<count>"` | None | `<count>` free UART ports |
 | `esp32.io/rmt-tx: "1"` | None | One RMT (infrared) transmit channel and its pin: `esp32_rmt_send` |
 | `esp32.io/rmt-rx: "1"` | None | One RMT (infrared) receive channel and its pin: `esp32_rmt_receive` |
-| `hardware.kube32.io/tft-display: "1"` | `DISPLAY`, `TFT_DISPLAY` | `k32_display_text`, `k32_display_rect`, `k32_display_bar` |
+| `hardware.kube32.io/tft-display: "1"` | `DISPLAY`, `TFT_DISPLAY` | `k32_display_text`, `k32_display_rect`, `k32_display_bar`, `k32_display_blit`, `k32_display_blit_pal` |
 | `hardware.kube32.io/keyboard: "1"` | `KEYBOARD` | `k32_key_read` |
 | `hardware.kube32.io/speaker: "1"` | `SPEAKER`, `AUDIO` | `k32_tone`, `k32_audio_play` |
 | `hardware.kube32.io/microphone: "1"` | `MICROPHONE`, `MIC` | `k32_mic_read` |
@@ -86,6 +86,8 @@ Nodes running the `cardputer` board profile, selected with `K32_CMD:BOARD:cardpu
 | --- | --- | --- | --- |
 | `k32_display_text` | `i(iiiiii)` | `int32_t k32_display_text(int32_t x, int32_t y, const char* text, uint32_t len, uint32_t fg565, uint32_t bg565)` | Draws up to 64 bytes of ASCII `text` at `x, y` in a 6x8 cell font using RGB565 colors. |
 | `k32_display_rect` | `i(iiiii)` | `int32_t k32_display_rect(int32_t x, int32_t y, int32_t w, int32_t h, uint32_t color565)` | Fills rectangle `x, y, w, h` with RGB565 `color565`. |
+| `k32_display_blit` | `i(iiiii)` | `int32_t k32_display_blit(int32_t x, int32_t y, int32_t w, int32_t h, const uint16_t* rgb565)` | Copies `w x h` RGB565 pixels, row after row, to `x, y`; the part outside the screen is dropped. `w` and `h` are 1 to 1024. |
+| `k32_display_blit_pal` | `i(iiiiii)` | `int32_t k32_display_blit_pal(int32_t x, int32_t y, int32_t w, int32_t h, const uint8_t* idx, const uint16_t* pal565)` | The same from 8-bit palette indices through 256 RGB565 entries: a paletted frame (such as one the [raster kernels](app-development.md#raster-kernels) draw) reaches the screen without the pod converting it. |
 | `k32_display_bar` | `i(iiiiiii)` | `int32_t k32_display_bar(int32_t x, int32_t y, int32_t w, int32_t h, uint32_t pct, uint32_t fg565, uint32_t bg565)` | Draws a horizontal bar at `x, y, w, h` filled to `pct` from `0` to `100`. |
 | `k32_key_read` | `i()` | `int32_t k32_key_read(void)` | Pops the next ASCII key code from the 16-entry scanner queue, or `K32_ERR_AGAIN` (`-11`) when empty. |
 | `k32_tone` | `i(iii)` | `int32_t k32_tone(uint32_t freq_hz, uint32_t duration_ms, uint32_t volume_pct)` | Plays a square-wave tone at `freq_hz` for `duration_ms`, capped at `2000`, at `volume_pct` (`0` to `100`) of the speaker's ceiling. |

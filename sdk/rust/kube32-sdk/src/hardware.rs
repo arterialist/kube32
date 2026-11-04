@@ -39,6 +39,24 @@ pub fn display_rect(x: i32, y: i32, w: i32, h: i32, color565: u32) -> Result<(),
     Error::from_rc(rc).map(|_| ())
 }
 
+/// `w x h` RGB565 pixels, row after row, to `(x, y)`; `pixels` holds `w * h` entries.
+pub fn display_blit(x: i32, y: i32, w: i32, h: i32, pixels: &[u16]) -> Result<(), Error> {
+    if pixels.len() < (w.max(0) as usize) * (h.max(0) as usize) {
+        return Err(Error::Invalid);
+    }
+    let rc = unsafe { abi::k32_display_blit(x, y, w, h, pixels.as_ptr()) };
+    Error::from_rc(rc).map(|_| ())
+}
+
+/// The same from 8-bit palette indices through 256 RGB565 entries.
+pub fn display_blit_pal(x: i32, y: i32, w: i32, h: i32, idx: &[u8], pal565: &[u16; 256]) -> Result<(), Error> {
+    if idx.len() < (w.max(0) as usize) * (h.max(0) as usize) {
+        return Err(Error::Invalid);
+    }
+    let rc = unsafe { abi::k32_display_blit_pal(x, y, w, h, idx.as_ptr(), pal565.as_ptr()) };
+    Error::from_rc(rc).map(|_| ())
+}
+
 /// A horizontal progress bar filled to `pct` percent.
 pub fn display_bar(x: i32, y: i32, w: i32, h: i32, pct: u32, fg565: u32, bg565: u32) -> Result<(), Error> {
     let rc = unsafe { abi::k32_display_bar(x, y, w, h, pct, fg565, bg565) };

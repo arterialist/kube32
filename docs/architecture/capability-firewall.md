@@ -14,7 +14,7 @@ The firewall reads `resources.requests`, or `resources.limits` if `requests` is 
 | --- | --- | --- |
 | `hardware.kube32.io/ipc: "1"` | `CHANNEL_IPC`, `IPC` | `k32_event_emit`, `kube32_channel_open` |
 | None | `SERVICE_CALL` | `k32_http_call` |
-| `hardware.kube32.io/tft-display: "1"` | `DISPLAY`, `TFT_DISPLAY` | `k32_display_text`, `k32_display_rect`, `k32_display_bar` |
+| `hardware.kube32.io/tft-display: "1"` | `DISPLAY`, `TFT_DISPLAY` | `k32_display_text`, `k32_display_rect`, `k32_display_bar`, `k32_display_blit`, `k32_display_blit_pal` |
 | `hardware.kube32.io/keyboard: "1"` | `KEYBOARD` | `k32_key_read` |
 | `hardware.kube32.io/speaker: "1"` | `SPEAKER`, `AUDIO` | `k32_tone` |
 | `hardware.kube32.io/sd: "1"` plus volume claim | `SD`, `SD_CARD` | `k32_fs_*` in the pod directory, see [storage](../storage.md) |

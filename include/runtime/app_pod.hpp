@@ -128,6 +128,8 @@ struct AppPlatformHooks {
     std::function<int32_t(int32_t x, int32_t y, const char* text, size_t len, uint32_t fg, uint32_t bg)> display_text;
     std::function<int32_t(int32_t x, int32_t y, int32_t w, int32_t h, uint32_t color)> display_rect;
     std::function<int32_t(int32_t x, int32_t y, int32_t w, int32_t h, uint32_t pct, uint32_t fg, uint32_t bg)> display_bar;
+    // k32_display_blit: w x h RGB565 pixels, row after row (the pod's memory, any alignment)
+    std::function<int32_t(int32_t x, int32_t y, int32_t w, int32_t h, const uint16_t* pixels)> display_blit;
     std::function<int32_t()> key_read;
     std::function<int32_t(uint32_t freq, uint32_t ms, uint32_t vol)> tone;
     // k32_audio_play: count samples (the pod's memory, any alignment) at rate

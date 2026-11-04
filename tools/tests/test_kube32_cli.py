@@ -170,7 +170,8 @@ class TestUnits(unittest.TestCase):
         # The signatures are the ones the host links with m3_LinkRawFunction,
         # and the linear algebra imports from their tables (K32_MATRIX, K32_MATMUL).
         linked = {}
-        for src in ("src/runtime/app_pod.cpp", "src/runtime/host_functions.cpp", "src/runtime/pod_linalg.cpp", "src/runtime/pod_blobs.cpp"):
+        for src in ("src/runtime/app_pod.cpp", "src/runtime/host_functions.cpp", "src/runtime/pod_linalg.cpp", "src/runtime/pod_blobs.cpp",
+                    "src/runtime/pod_raster.cpp"):
             with open(os.path.join(REPO, src)) as f:
                 text = f.read()
             for n, sig in re.findall(r'm3_LinkRawFunction\(module, "env", "([a-z0-9_]+)",\s*"([^"]+)"', text):

@@ -208,6 +208,7 @@ void install_default_platform_hooks() {
     }
     if (!hooks.display_rect) hooks.display_rect = [](int32_t, int32_t, int32_t, int32_t, uint32_t) -> int32_t { return 0; };
     if (!hooks.display_bar) hooks.display_bar = [](int32_t, int32_t, int32_t, int32_t, uint32_t, uint32_t, uint32_t) -> int32_t { return 0; };
+    if (!hooks.display_blit) hooks.display_blit = [](int32_t, int32_t, int32_t, int32_t, const uint16_t*) -> int32_t { return 0; };
     if (!hooks.key_read) hooks.key_read = []() -> int32_t { return -11; };
     if (!hooks.tone) hooks.tone = [](uint32_t f, uint32_t ms, uint32_t) -> int32_t {
         std::cout << "[TONE] " << f << " Hz for " << ms << " ms" << std::endl;

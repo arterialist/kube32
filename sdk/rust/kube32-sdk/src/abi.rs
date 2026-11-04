@@ -5,7 +5,8 @@
 //! (`k32_matvec_*`, `k32_matmul_*`, `k32_vecmat_f32_i8`, `k32_softmax_f32`, the element-wise
 //! `k32_rmsnorm_f32`, `k32_quantize_i8`, `k32_rope_f32`, `k32_swiglu_f32`, `k32_add_f32`,
 //! `k32_argmax_f32`, `k32_attention_f32_i8` and `k32_attention_full_f32_i8`, the convolution `k32_conv3x3_i8`,
-//! `k32_add_f32_i8` and `k32_quantize_i8_static`, raw here only) and `src/runtime/host_functions.cpp`
+//! `k32_add_f32_i8` and `k32_quantize_i8_static`, raw here only), `src/runtime/pod_raster.cpp`
+//! (`k32_raster_columns`, `k32_raster_spans`, raw here only) and `src/runtime/host_functions.cpp`
 //! (`esp32_delay_ms`, `esp32_rmt_*`, `kube32_channel_*`): pointers and
 //! lengths are `i32`/`u32` in wasm, `k32_time_ms` returns `i64`. The GPIO,
 //! ADC, I2C and UART imports of host_functions.cpp are not wrapped by this
@@ -37,6 +38,10 @@ extern "C" {
     pub fn k32_display_text(x: i32, y: i32, text: *const u8, len: u32, fg565: u32, bg565: u32) -> i32;
     pub fn k32_display_rect(x: i32, y: i32, w: i32, h: i32, color565: u32) -> i32;
     pub fn k32_display_bar(x: i32, y: i32, w: i32, h: i32, pct: u32, fg565: u32, bg565: u32) -> i32;
+    pub fn k32_display_blit(x: i32, y: i32, w: i32, h: i32, rgb565: *const u16) -> i32;
+    pub fn k32_display_blit_pal(x: i32, y: i32, w: i32, h: i32, idx: *const u8, pal565: *const u16) -> i32;
+    pub fn k32_raster_columns(dst: *mut u8, dst_stride: u32, y0: i32, rows: u32, records: *const u8, n: u32, colormap: *const u8, translation: *const u8, centery: i32) -> i32;
+    pub fn k32_raster_spans(dst: *mut u8, dst_stride: u32, y0: i32, rows: u32, records: *const u8, n: u32, colormap: *const u8) -> i32;
     pub fn k32_key_read() -> i32;
     pub fn k32_tone(freq_hz: u32, duration_ms: u32, volume_pct: u32) -> i32;
 
@@ -137,6 +142,10 @@ mod stubs {
     pub unsafe fn k32_display_text(x: i32, y: i32, text: *const u8, len: u32, fg565: u32, bg565: u32) -> i32 { no_host() }
     pub unsafe fn k32_display_rect(x: i32, y: i32, w: i32, h: i32, color565: u32) -> i32 { no_host() }
     pub unsafe fn k32_display_bar(x: i32, y: i32, w: i32, h: i32, pct: u32, fg565: u32, bg565: u32) -> i32 { no_host() }
+    pub unsafe fn k32_display_blit(x: i32, y: i32, w: i32, h: i32, rgb565: *const u16) -> i32 { no_host() }
+    pub unsafe fn k32_display_blit_pal(x: i32, y: i32, w: i32, h: i32, idx: *const u8, pal565: *const u16) -> i32 { no_host() }
+    pub unsafe fn k32_raster_columns(dst: *mut u8, dst_stride: u32, y0: i32, rows: u32, records: *const u8, n: u32, colormap: *const u8, translation: *const u8, centery: i32) -> i32 { no_host() }
+    pub unsafe fn k32_raster_spans(dst: *mut u8, dst_stride: u32, y0: i32, rows: u32, records: *const u8, n: u32, colormap: *const u8) -> i32 { no_host() }
     pub unsafe fn k32_key_read() -> i32 { no_host() }
     pub unsafe fn k32_tone(freq_hz: u32, duration_ms: u32, volume_pct: u32) -> i32 { no_host() }
     pub unsafe fn k32_fs_open(path: *const u8, path_len: u32, flags: u32) -> i32 { no_host() }

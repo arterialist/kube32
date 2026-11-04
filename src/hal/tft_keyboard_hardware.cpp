@@ -195,6 +195,29 @@ void display_clear(uint16_t color) {
     display_fill_rect(0, 0, LCD_WIDTH, LCD_HEIGHT, color);
 }
 
+void display_blit(int x, int y, int w, int h, const uint16_t* pixels) {
+    if (!s_display_ok || !pixels || w <= 0 || h <= 0) return;
+    // clip, keeping the source rows and columns that stay on the screen
+    const int src_stride = w;
+    int cx = x, cy = y, cw = w, ch = h;
+    if (!clip(cx, cy, cw, ch)) return;
+    const int skip_x = cx - x, skip_y = cy - y;
+    LcdLock lock;
+    for (int row = 0; row < ch; row += LINEBUF_ROWS) {
+        const int rows = (ch - row < LINEBUF_ROWS) ? (ch - row) : LINEBUF_ROWS;
+        for (int r = 0; r < rows; ++r) {
+            const uint16_t* src = pixels + static_cast<size_t>(skip_y + row + r) * src_stride + skip_x;
+            uint16_t* dst = s_linebuf + static_cast<size_t>(r) * cw;
+            for (int i = 0; i < cw; ++i) {
+                uint16_t v;
+                memcpy(&v, src + i, sizeof v);   // the pod's pixels may be unaligned
+                dst[i] = swap16(v);
+            }
+        }
+        flush_rows(cx, cy + row, cw, rows);
+    }
+}
+
 void display_draw_string_n(int x, int y, const char* str, size_t len, uint16_t color, uint16_t bg) {
     if (!s_display_ok || !str || len == 0) return;
     if (y >= LCD_HEIGHT || y + 8 <= 0 || x >= LCD_WIDTH) return;
