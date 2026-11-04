@@ -200,8 +200,11 @@ const char* module_entry_point(const uint8_t* wasm, size_t len);
 
 // The interpreter's speed on this node: millions of wasm3 operations per
 // second on a small fixed integer kernel (kInterpKernelOps operations per
-// run), measured on the stack and memory pods use. Takes about 20 ms on a
-// board.
+// run), measured on the stack and memory pods use: the fastest of 10 runs of
+// about 10 ms, a random 25 to 75 ms apart, each timed by the CPU time the
+// thread ran where the platform counts it (wall time otherwise), so a host's
+// other processes, another node starting on the same host and a slow first
+// run do not halve it. Takes about 550 ms.
 double measure_interp_mops();
 
 // Whether the interpreter computes 64-bit integer values right on this node

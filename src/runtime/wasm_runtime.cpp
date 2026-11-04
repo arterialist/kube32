@@ -22,6 +22,7 @@
 #include <cstring>
 #include <iostream>
 #include <map>
+#include <random>
 #include <vector>
 
 namespace kube32::runtime {
@@ -712,6 +713,12 @@ uint32_t module_stack_need_bytes(const M3Module* module) {
     return (most + 1) * static_cast<uint32_t>(sizeof(m3slot_t));
 }
 
+// measure_interp_mops: the runs of the kernel it times, the work of one run
+// and the mean pause between two runs
+static constexpr uint32_t kInterpRuns = 10;
+static constexpr uint64_t kInterpRunUs = 10000;
+static constexpr uint32_t kInterpGapMs = 50;
+
 double measure_interp_mops() {
     IM3Environment env = m3_NewEnvironment();
     if (!env) return 0;
@@ -723,23 +730,38 @@ double measure_interp_mops() {
         if (m3_LoadModule(rt, mod)) {
             m3_FreeModule(mod);
         } else if (!m3_FindFunction(&fn, rt, "run")) {
-            // Timed where pods run: on the shared interpreter stack when there is one
+            // Timed where pods run: on the shared interpreter stack when there
+            // is one. The time is the CPU time the thread ran where the
+            // platform counts it, so other processes of the host do not count.
             auto timed = [&](uint32_t n) {
                 uint64_t us = 0;
                 run_on_interpreter_stack([&]() {
+                    uint64_t c0 = 0, c1 = 0;
+                    const bool cpu = osal::Thread::current_cpu_time_us(c0);
                     const uint64_t t0 = osal::Thread::get_time_us();
                     m3_CallV(fn, n);
                     us = osal::Thread::get_time_us() - t0;
+                    if (cpu && osal::Thread::current_cpu_time_us(c1) && c1 > c0) us = c1 - c0;
                 });
                 return us;
             };
             timed(100);   // compiles the kernel
             uint32_t n = 1000;
             uint64_t us = timed(n);
-            // About 20 ms of work, whatever the node's speed
-            if (us < 20000) {
-                n = static_cast<uint32_t>(std::min<uint64_t>(20000ull * n / (us ? us : 1), 100000000ull));
-                us = timed(n);
+            // About kInterpRunUs of work, whatever the node's speed
+            if (us < kInterpRunUs) n = static_cast<uint32_t>(std::min<uint64_t>(kInterpRunUs * n / (us ? us : 1), 100000000ull));
+            // The fastest of several runs: a run that shares the core with
+            // other work, or starts before the clock speed rises, takes up to
+            // several times as long. The pauses between runs last a random
+            // 0.5 to 1.5 kInterpGapMs, so a burst of other work passes and
+            // two nodes that start together on one host do not run theirs
+            // at the same moments.
+            std::minstd_rand gap(static_cast<uint32_t>(osal::Thread::get_time_us()));
+            us = 0;
+            for (uint32_t i = 0; i < kInterpRuns; ++i) {
+                if (i) osal::Thread::sleep_ms(kInterpGapMs / 2 + static_cast<uint32_t>(gap() % kInterpGapMs));
+                const uint64_t t = timed(n);
+                if (t > 0 && (us == 0 || t < us)) us = t;
             }
             if (us > 0) mops = static_cast<double>(n) * kInterpKernelOpsPerIteration / static_cast<double>(us);
         }
