@@ -628,7 +628,7 @@ static void console_bench(Console& con, const std::string& args) {
 // K32_CMD:HEAPWATCH:dump. The table exists only while armed; disarmed, a
 // hook is one load and a branch.
 namespace heapwatch {
-constexpr size_t kSlots = 384;
+constexpr size_t kSlots = 640;
 constexpr size_t kTasks = 24;
 constexpr uintptr_t kTomb = 1;
 struct Slot { uintptr_t ptr; uint16_t size; uint8_t task; };
@@ -641,6 +641,7 @@ struct Watch {
     int64_t peak_us;
 };
 Watch* volatile s_watch = nullptr;
+Watch s_storage;   // in .bss: arming needs no block of this size from a fragmented heap
 portMUX_TYPE s_mux = portMUX_INITIALIZER_UNLOCKED;
 
 static IRAM_ATTR inline int bucket_of(size_t n) { return n <= 128 ? 0 : n <= 512 ? 1 : n <= 1700 ? 2 : 3; }
@@ -705,13 +706,20 @@ extern "C" IRAM_ATTR void esp_heap_trace_free_hook(void* ptr) {
     portEXIT_CRITICAL_SAFE(&s_mux);
 }
 
+// A heap-hooks build arms the watch at boot, after Wi-Fi: K32_CMD:HEAPWATCH:live
+// then shows what the cluster services and the first pods keep
+static void heapwatch_arm_at_boot() {
+    using namespace heapwatch;
+    std::memset(&s_storage, 0, sizeof(s_storage));
+    s_watch = &s_storage;
+}
+
 static void console_heapwatch(Console& con, const std::string& arg) {
     using namespace heapwatch;
     char l[160];
     int ll;
     if (arg == "on") {
         if (!s_watch) {
-            static Watch s_storage;   // in .bss: arming needs no block of this size from a fragmented heap
             std::memset(&s_storage, 0, sizeof(s_storage));
             s_watch = &s_storage;
         }
@@ -745,17 +753,16 @@ static void console_heapwatch(Console& con, const std::string& arg) {
         con.write(l, static_cast<size_t>(ll));
     }
     if (arg == "live") {
-        // Every recorded allocation still held, by address, with its task:
-        // what was allocated since the watch began and outlives its user
-        static Slot live[kSlots];
-        size_t n = 0;
-        portENTER_CRITICAL(&s_mux);
-        for (size_t i = 0; i < kSlots; ++i) if (w->slots[i].ptr > kTomb) live[n++] = w->slots[i];
-        portEXIT_CRITICAL(&s_mux);
-        std::sort(live, live + n, [](const Slot& x, const Slot& y) { return x.ptr < y.ptr; });
-        for (size_t i = 0; i < n; ++i) {
-            ll = snprintf(l, sizeof(l), "K32_HEAPWATCH_LIVE 0x%08x %5u %s\n", (unsigned)live[i].ptr, (unsigned)live[i].size,
-                          live[i].task < copy.ntasks ? copy.tasks[live[i].task].name : "?");
+        // Every recorded allocation still held, with its task: what was
+        // allocated since the watch began and outlives its user (in the
+        // table's order; sort by address on the host)
+        for (size_t i = 0; i < kSlots; ++i) {
+            portENTER_CRITICAL(&s_mux);
+            const Slot sl = w->slots[i];
+            portEXIT_CRITICAL(&s_mux);
+            if (sl.ptr <= kTomb) continue;
+            ll = snprintf(l, sizeof(l), "K32_HEAPWATCH_LIVE 0x%08x %5u %s\n", (unsigned)sl.ptr, (unsigned)sl.size,
+                          sl.task < copy.ntasks ? copy.tasks[sl.task].name : "?");
             con.write(l, static_cast<size_t>(ll));
         }
     }
@@ -1906,6 +1913,9 @@ void cluster_task(void* pv) {
     std::string ip = net_mgr->get_ip_address();
     printf("[NET] %s ip=%s%s\n", net_mgr->current_mode() == kube32::net::NetworkMode::Station ? "station" : "softap", ip.c_str(), uplink ? " (+uplink)" : "");
     log_memory("after wifi");
+#if CONFIG_HEAP_USE_HOOKS
+    heapwatch_arm_at_boot();
+#endif
     if (uplink) {
         // Wall clock for creationTimestamp, event times and log timestamps.
         // Until the first sync the API omits those fields rather than
