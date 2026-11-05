@@ -149,6 +149,11 @@ static int started;
 static uint32_t tics_run;
 static int64_t start_ms;
 
+/* Where the pod's time goes, in microseconds since k32_init (GET /stats: cpu_*) */
+uint64_t cpu_tics_us, cpu_digest_us;
+static uint64_t cpu_render_us, cpu_handle_us, handles;
+int64_t doom_us(void) { return esp32_get_time_us(); }
+
 /* One game tic: input, then the game state advances by 1/35 s */
 K32_EXPORT("doom_run_tic") void doom_run_tic(void) {
     I_StartFrame();
@@ -326,8 +331,8 @@ K32_EXPORT("k32_tick") int32_t k32_tick(uint32_t uptime_ms) {
     return rc;
 }
 
+static void frame(int64_t now);
 static int32_t tick(int64_t now) {
-    static int drawn_tic = -1;
     if (net_role() == NET_AUTHORITY) {
         /* two players: the tics whose ticcmds are in (a POST may have run some);
          * before a browser joins, player 1's tics alone */
@@ -340,16 +345,34 @@ static int32_t tick(int64_t now) {
                 tics_run = due - 4;
                 n = 4;
             }
+            const int64_t t0 = doom_us();
             while (n--) doom_run_tic();
+            cpu_tics_us += (uint64_t)(doom_us() - t0);
         }
     }
-    if (gametic == drawn_tic) return 1;   /* a frame when the game moved (not in the lobby) */
+    frame(now);
+    return 1;
+}
+
+/* A frame of the game state, when one is due: from the node's tick, and in a two-player game
+ * also from each request, since a node busy with player 2's POSTs ticks the pod seldom. With
+ * two players frames take a third of the time at most: the tics, and the POSTs that bring
+ * player 2's ticcmds, come first. */
+static void frame(int64_t now) {
+    static int drawn_tic = -1;
+    if (gametic == drawn_tic) return;   /* a frame when the game moved (not in the lobby) */
 #ifdef DG_SIM_ONLY
-    if (now - last_frame_ms < (int64_t)frame_ms) return 1;
-    if (draw_rate && now < drained_ms) { frame_waits++; return 1; }   /* the last list is still leaving */
+    static int64_t next_ms;              /* two players: the next frame no sooner */
+    if (now - last_frame_ms < (int64_t)frame_ms) return;
+    if (net_active() && now < next_ms) return;
+    if (draw_rate && now < drained_ms) { frame_waits++; return; }   /* the last list is still leaving */
     last_frame_ms = now;
     drawn_tic = gametic;
+    const int64_t r0 = doom_us();
     doom_render();
+    const int64_t r1 = doom_us();
+    cpu_render_us += (uint64_t)(r1 - r0);
+    next_ms = k32_time_ms() + 2 * ((r1 - r0) / 1000);
     const int64_t p0 = k32_time_ms();
     int32_t rc = k32_publish(draw_topic, (uint32_t)strlen(draw_topic), (const void*)(uintptr_t)doom_drawlist_ptr(), doom_drawlist_len());
     const int64_t p1 = k32_time_ms();
@@ -384,7 +407,6 @@ static int32_t tick(int64_t now) {
     drawn_tic = gametic;
     doom_render();
 #endif
-    return 1;
 }
 
 /* ---- HTTP --------------------------------------------------------------- */
@@ -400,11 +422,17 @@ K32_EXPORT("k32_alloc") uint32_t k32_alloc(uint32_t size) {
     return (uint32_t)(uintptr_t)req_big;
 }
 
-static int32_t handle_request(char* req, uint32_t len);
+/* not inlined: an interpreter without tail calls keeps a native frame for every operation of
+ * k32_handle until it returns, and a frame drawn after the request would sit on all of them */
+__attribute__((noinline)) static int32_t handle_request(char* req, uint32_t len);
 
 K32_EXPORT("k32_handle") int32_t k32_handle(uint32_t ptr, uint32_t len) {
+    const int64_t t0 = doom_us();
     int32_t status = handle_request((char*)(uintptr_t)ptr, len);
+    cpu_handle_us += (uint64_t)(doom_us() - t0);
+    handles++;
     if (req_big) { free(req_big); req_big = 0; }
+    if (started && net_active()) frame(k32_time_ms());
     return status;
 }
 
@@ -549,6 +577,15 @@ static int32_t handle_request(char* req, uint32_t len) {
         put_kv("blob_bytes", k32_libc_blob_bytes);
         put_kv("tick_ms_mean", ticks_timed ? (int64_t)(tick_ms_sum / ticks_timed) : 0);
         put_kv("tick_ms_max", tick_ms_max);
+        /* the ms since k32_init, and those spent in game tics (wherever they ran), state digests,
+         * frames (the BSP pass and the draw list) and requests (a tic run as a POST lands counts
+         * in both) */
+        put_kv("uptime_ms", k32_time_ms() - start_ms);
+        put_kv("cpu_tics_ms", (int64_t)(cpu_tics_us / 1000));
+        put_kv("cpu_digest_ms", (int64_t)(cpu_digest_us / 1000));
+        put_kv("cpu_render_ms", (int64_t)(cpu_render_us / 1000));
+        put_kv("cpu_handle_ms", (int64_t)(cpu_handle_us / 1000));
+        put_kv("handles", (int64_t)handles);
 #ifdef DG_SIM_ONLY
         put_kv("frames_published", frames_published);
         put_kv("publish_errors", publish_errors);

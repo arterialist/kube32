@@ -171,7 +171,7 @@ verify-net: build/net_check build/net_check-frames build/doom.wasm build/doom-si
 
 # The pod's deepest call, in the interpreter's operation frames: a board's interpreter runs a call on a
 # 64 KiB native stack. With the sound traversal recursing, this course's deepest call took 1,435 frames,
-# and the devkit's pod ran out of that stack in k32_handle; it now takes about 1,070
+# and the devkit's pod ran out of that stack in k32_handle; it now takes about 1,080
 FRAMES_MAX ?= 1200
 
 build/wad/doom1-e1m1.pack: $(WAD) wad.py

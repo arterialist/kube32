@@ -83,7 +83,7 @@ typedef struct {
 static int role;           /* NET_SINGLE, NET_AUTHORITY, NET_CLIENT */
 static int32_t session;
 static int32_t session_start;
-static int32_t digest_every = 35;
+static int32_t digest_every = 175;
 static nettic_t tics[HIST];
 static char out_buf[4096];
 
@@ -223,7 +223,7 @@ void net_init_authority(const char* args, const char* iwad) {
     if (batch > EVENT_TICS) batch = EVENT_TICS;
     timeout_ms = env_int("DOOM_NET_TIMEOUT_MS", 5000);
     delay = env_int("DOOM_NET_DELAY", 4);
-    digest_every = env_int("DOOM_NET_DIGEST", 35);
+    digest_every = env_int("DOOM_NET_DIGEST", 175);
     for (int i = 0; i < HIST; i++) tics[i].tic = -1;
     for (int i = 0; i < AHEAD; i++) remote[i].tic = -1;
 }
@@ -273,14 +273,20 @@ static int run_due(int64_t now) {
                 ingame[1] = true;
             }
         }
+        const int64_t t0 = doom_us();
         D_BuildLocalTiccmd(&cmds[0], t);
         nettic_t* e = &tics[t % HIST];
         e->tic = t;
         e->mask = (uint8_t)(1 | (ingame[1] ? 2 : 0));
         for (int i = 0; i < NETP; i++) cmd_pack(&cmds[i], e->cmd[i]);
         D_RunNetTic(cmds, ingame);
+        const int64_t t1 = doom_us();
+        cpu_tics_us += (uint64_t)(t1 - t0);
         e->has_digest = digest_every > 0 && (t + 1) % digest_every == 0;
-        if (e->has_digest) e->digest = doom_state_digest(0);
+        if (e->has_digest) {
+            e->digest = doom_state_digest(0);
+            cpu_digest_us += (uint64_t)(doom_us() - t1);
+        }
         ran++;
     }
     if (stalled) {
@@ -343,8 +349,10 @@ int net_tick_alone(int64_t now) {
         memset(cmds, 0, sizeof cmds);
         memset(ingame, 0, sizeof ingame);
         ingame[0] = true;
+        const int64_t t0 = doom_us();
         D_BuildLocalTiccmd(&cmds[0], gametic);
         D_RunNetTic(cmds, ingame);
+        cpu_tics_us += (uint64_t)(doom_us() - t0);
         ran++;
     }
     return ran;

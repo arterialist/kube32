@@ -18,5 +18,8 @@ void net_init_authority(const char* args, const char* iwad);
 int net_tick(int64_t now_ms);
 /* The netgame's requests: an HTTP status once answered, 0 for the others */
 int32_t net_route(const char* method, const char* seg, const char* body);
+/* Microseconds since k32_init spent in game tics and in state digests (GET /stats: cpu_*) */
+extern uint64_t cpu_tics_us, cpu_digest_us;
+int64_t doom_us(void);
 
 #endif
