@@ -12,12 +12,229 @@
 #               the render pack blob doom-pack, keys from its keyboard
 #
 # The modules and the data are blobs on the nodes; the wordsketch pods are here
-# at 0 replicas, so this one apply switches the boards from wordsketch to DOOM
-# and apps/wordsketch/build/wordsketch.yaml switches them back:
+# at 0 replicas, first, so this one apply scales them down before DOOM's pods
+# start and switches the boards from wordsketch to DOOM;
+# apps/wordsketch/build/wordsketch.yaml switches them back:
 #   make -C apps/doom pods manifest   # modules, packs, build/doom.yaml (needs apps/wordsketch/build)
 #   make -C apps/doom upload SERVER=http://<control-plane-ip>:6443 DEVKIT=<devkit node> CARDPUTER=<cardputer node>
 #   kubectl --context kube32 apply -f apps/doom/build/doom.yaml
 #   curl -s http://<control-plane-ip>/doom/stats
+# ---- wordsketch (examples/wordsketch.yaml) and llm-diffusion (examples/llm-diffusion.yaml)
+# at 0 replicas, first: their memory is free before DOOM's pods start ----
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: wordsketch-listen
+  namespace: default
+  labels: {app: wordsketch, tier: listen}
+spec:
+  replicas: 0
+  strategy: {type: Recreate}
+  selector:
+    matchLabels: {app: wordsketch, tier: listen}
+  template:
+    metadata:
+      labels: {app: wordsketch, tier: listen}
+      annotations:
+        kube32.io/blobs: wordsketch-kws
+        kube32.io/event-topics: wordsketch.frame,wordsketch.text
+        kube32.io/tick-interval: "50ms"
+        kube32.io/execution-budget: "off"
+    spec:
+      nodeSelector:
+        kube32.io/board: cardputer
+      containers:
+        - name: listen
+          image: wasm://blob/wordsketch-listen
+          ports: [{name: http, containerPort: 7000}]
+          env:
+            - {name: STORY_URL, value: "http://wordsketch-teller/generate"}
+            - {name: STORY_STEPS, value: "80"}
+            - {name: STEPS, value: "8"}            # DDIM steps of the drawing: 8 or 16
+            - {name: THRESHOLD, value: "60"}       # percent a keyword needs
+            - {name: VOLUME, value: "30"}          # chime, percent of the speaker's ceiling
+          resources:
+            requests:
+              memory: 20Ki
+              hardware.kube32.io/microphone: "1"
+              hardware.kube32.io/speaker: "1"
+              hardware.kube32.io/tft-display: "1"
+              hardware.kube32.io/ipc: "1"
+            limits: {memory: 20Ki}
+          securityContext:
+            capabilities: {add: ["MICROPHONE", "SPEAKER", "DISPLAY", "CHANNEL_IPC", "SERVICE_CALL"]}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: wordsketch-draw
+  namespace: default
+  labels: {app: wordsketch, tier: draw}
+spec:
+  replicas: 0
+  strategy: {type: Recreate}
+  selector:
+    matchLabels: {app: wordsketch, tier: draw}
+  template:
+    metadata:
+      labels: {app: wordsketch, tier: draw}
+      annotations:
+        kube32.io/wasm-base64: "@wordsketch-draw.wasm"
+        kube32.io/blobs: wordsketch-doodle
+        kube32.io/event-topics: wordsketch.word
+        kube32.io/tick-interval: "100ms"
+        kube32.io/execution-budget: "off"
+    spec:
+      containers:
+        - name: draw
+          image: wasm://inline/wordsketch-draw
+          env:
+            - {name: GUIDANCE, value: "20"}       # classifier-free guidance in tenths
+          resources:
+            # PSRAM places it: a node with room for the drawing's maps
+            requests: {memory: 192Ki, esp32.io/psram: 192Ki, hardware.kube32.io/ipc: "1"}
+            limits: {memory: 192Ki, esp32.io/psram: 192Ki}
+          securityContext:
+            capabilities: {add: ["CHANNEL_IPC"]}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: wordsketch-story
+  namespace: default
+  labels: {app: wordsketch, tier: story}
+spec:
+  replicas: 0
+  strategy: {type: Recreate}
+  selector:
+    matchLabels: {app: wordsketch, tier: story}
+  template:
+    metadata:
+      labels: {app: wordsketch, tier: story}
+      annotations:
+        kube32.io/blobs: wordsketch-story
+        kube32.io/wasm-stack: "1536"
+        kube32.io/execution-budget: "off"
+        kube32.io/tick-interval: "100ms"
+    spec:
+      containers:
+        - name: shard
+          image: wasm://blob/llm-shard
+          ports: [{name: http, containerPort: 7000}]
+          env:
+            - {name: STAGE, value: "0"}
+            - {name: MODEL_BLOB, value: "wordsketch-story"}   # read in place
+            - {name: NEXT_URL, value: "http://wordsketch-teller/result"}
+            - name: NODE_NAME
+              valueFrom: {fieldRef: {fieldPath: spec.nodeName}}
+          resources:
+            # norms and token scales, a KV cache of 110 positions; the
+            # 327 KB model stays in its blob
+            requests: {memory: 64Ki, esp32.io/psram: 64Ki}
+            limits: {memory: 64Ki, esp32.io/psram: 64Ki}
+          securityContext:
+            capabilities: {add: ["SERVICE_CALL"]}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: wordsketch-teller
+  namespace: default
+  labels: {app: wordsketch, tier: teller}
+spec:
+  replicas: 0
+  strategy: {type: Recreate}
+  selector:
+    matchLabels: {app: wordsketch, tier: teller}
+  template:
+    metadata:
+      labels: {app: wordsketch, tier: teller}
+      annotations:
+        kube32.io/tick-interval: "100ms"
+    spec:
+      containers:
+        - name: teller
+          image: wasm://blob/llm-coordinator
+          ports: [{name: http, containerPort: 7000}]
+          env:
+            - {name: SHARD_URL, value: "http://wordsketch-story/x"}
+            - {name: STORE_URL, value: "http://wordsketch-store"}
+            - {name: TOKENIZER, value: "wordsketch-tokenizer"}
+            - {name: TOPIC, value: "wordsketch.text"}
+            - {name: CONTEXT, value: "128"}
+            - {name: STEPS, value: "80"}
+            - {name: PROMPT, value: ""}
+          resources:
+            requests: {memory: 64Ki, esp32.io/psram: 64Ki, hardware.kube32.io/ipc: "1"}
+            limits: {memory: 64Ki, esp32.io/psram: 64Ki}
+          securityContext:
+            capabilities: {add: ["SERVICE_CALL", "CHANNEL_IPC"]}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: wordsketch-store
+  namespace: default
+  labels: {app: wordsketch, tier: store}
+spec:
+  replicas: 0
+  strategy: {type: Recreate}
+  selector:
+    matchLabels: {app: wordsketch, tier: store}
+  template:
+    metadata:
+      labels: {app: wordsketch, tier: store}
+      annotations:
+        kube32.io/wasm-base64: "@wordsketch-store.wasm"
+        kube32.io/wasm-stack: "512"
+        kube32.io/blobs: wordsketch-tokenizer
+    spec:
+      containers:
+        - name: store
+          image: wasm://inline/wordsketch-store
+          ports: [{name: http, containerPort: 7000}]
+          resources:
+            requests: {memory: 8Ki, esp32.io/psram: 8Ki}
+            limits: {memory: 8Ki, esp32.io/psram: 8Ki}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: llm-diffusion
+  namespace: default
+  labels:
+    app: llm-diffusion
+spec:
+  replicas: 0
+  strategy: {type: Recreate}
+  selector:
+    matchLabels:
+      app: llm-diffusion
+  template:
+    metadata:
+      labels:
+        app: llm-diffusion
+      annotations:
+        kube32.io/blobs: llm-diffusion,mdlm
+        kube32.io/execution-budget: "off"
+        kube32.io/wasm-stack: "1536"
+    spec:
+      nodeSelector:
+        node-role.kubernetes.io/control-plane: ""
+      restartPolicy: Always
+      containers:
+        - name: llm-diffusion
+          image: wasm://blob/llm-diffusion
+          ports:
+            - containerPort: 7000
+              name: http
+          resources:
+            requests:
+              memory: 256Ki
+            limits:
+              memory: 256Ki
+---
+# ---- DOOM ----
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -136,221 +353,3 @@ spec:
               service:
                 name: doom-view
                 port: {number: 80}
-# ---- the wordsketch pods, scaled to 0 while DOOM has the boards ----
----
-apiVersion: apps/v1
-kind: Deployment
-metadata:
-  name: wordsketch-listen
-  namespace: default
-  labels: {app: wordsketch, tier: listen}
-spec:
-  replicas: 0
-  strategy: {type: Recreate}
-  selector:
-    matchLabels: {app: wordsketch, tier: listen}
-  template:
-    metadata:
-      labels: {app: wordsketch, tier: listen}
-      annotations:
-        kube32.io/wasm-base64: "@wordsketch-listen.wasm"
-        kube32.io/blobs: wordsketch-kws
-        kube32.io/event-topics: wordsketch.frame,wordsketch.text
-        kube32.io/tick-interval: "50ms"
-        kube32.io/execution-budget: "off"
-    spec:
-      nodeSelector:
-        kube32.io/board: cardputer
-      containers:
-        - name: listen
-          image: wasm://inline/wordsketch-listen
-          ports: [{name: http, containerPort: 7000}]
-          env:
-            - {name: STORY_URL, value: "http://wordsketch-teller/generate"}
-            - {name: STORY_STEPS, value: "80"}
-            - {name: STEPS, value: "8"}            # DDIM steps of the drawing: 8 or 16
-            - {name: THRESHOLD, value: "60"}       # percent a keyword needs
-            - {name: VOLUME, value: "30"}          # chime, percent of the speaker's ceiling
-          resources:
-            requests:
-              memory: 20Ki
-              hardware.kube32.io/microphone: "1"
-              hardware.kube32.io/speaker: "1"
-              hardware.kube32.io/tft-display: "1"
-              hardware.kube32.io/ipc: "1"
-            limits: {memory: 20Ki}
-          securityContext:
-            capabilities: {add: ["MICROPHONE", "SPEAKER", "DISPLAY", "CHANNEL_IPC", "SERVICE_CALL"]}
----
-apiVersion: apps/v1
-kind: Deployment
-metadata:
-  name: wordsketch-draw
-  namespace: default
-  labels: {app: wordsketch, tier: draw}
-spec:
-  replicas: 0
-  strategy: {type: Recreate}
-  selector:
-    matchLabels: {app: wordsketch, tier: draw}
-  template:
-    metadata:
-      labels: {app: wordsketch, tier: draw}
-      annotations:
-        kube32.io/wasm-base64: "@wordsketch-draw.wasm"
-        kube32.io/blobs: wordsketch-doodle
-        kube32.io/event-topics: wordsketch.word
-        kube32.io/tick-interval: "100ms"
-        kube32.io/execution-budget: "off"
-    spec:
-      containers:
-        - name: draw
-          image: wasm://inline/wordsketch-draw
-          env:
-            - {name: GUIDANCE, value: "20"}       # classifier-free guidance in tenths
-          resources:
-            # PSRAM places it: a node with room for the drawing's maps
-            requests: {memory: 192Ki, esp32.io/psram: 192Ki, hardware.kube32.io/ipc: "1"}
-            limits: {memory: 192Ki, esp32.io/psram: 192Ki}
-          securityContext:
-            capabilities: {add: ["CHANNEL_IPC"]}
----
-apiVersion: apps/v1
-kind: Deployment
-metadata:
-  name: wordsketch-story
-  namespace: default
-  labels: {app: wordsketch, tier: story}
-spec:
-  replicas: 0
-  strategy: {type: Recreate}
-  selector:
-    matchLabels: {app: wordsketch, tier: story}
-  template:
-    metadata:
-      labels: {app: wordsketch, tier: story}
-      annotations:
-        kube32.io/wasm-base64: "@llm-shard.wasm"
-        kube32.io/blobs: wordsketch-story
-        kube32.io/wasm-stack: "1536"
-        kube32.io/execution-budget: "off"
-        kube32.io/tick-interval: "100ms"
-    spec:
-      containers:
-        - name: shard
-          image: wasm://inline/llm-shard
-          ports: [{name: http, containerPort: 7000}]
-          env:
-            - {name: STAGE, value: "0"}
-            - {name: MODEL_BLOB, value: "wordsketch-story"}   # read in place
-            - {name: NEXT_URL, value: "http://wordsketch-teller/result"}
-            - name: NODE_NAME
-              valueFrom: {fieldRef: {fieldPath: spec.nodeName}}
-          resources:
-            # norms and token scales, a KV cache of 110 positions; the
-            # 327 KB model stays in its blob
-            requests: {memory: 64Ki, esp32.io/psram: 64Ki}
-            limits: {memory: 64Ki, esp32.io/psram: 64Ki}
-          securityContext:
-            capabilities: {add: ["SERVICE_CALL"]}
----
-apiVersion: apps/v1
-kind: Deployment
-metadata:
-  name: wordsketch-teller
-  namespace: default
-  labels: {app: wordsketch, tier: teller}
-spec:
-  replicas: 0
-  strategy: {type: Recreate}
-  selector:
-    matchLabels: {app: wordsketch, tier: teller}
-  template:
-    metadata:
-      labels: {app: wordsketch, tier: teller}
-      annotations:
-        kube32.io/wasm-base64: "@llm-coordinator.wasm"
-        kube32.io/tick-interval: "100ms"
-    spec:
-      containers:
-        - name: teller
-          image: wasm://inline/llm-coordinator
-          ports: [{name: http, containerPort: 7000}]
-          env:
-            - {name: SHARD_URL, value: "http://wordsketch-story/x"}
-            - {name: STORE_URL, value: "http://wordsketch-store"}
-            - {name: TOKENIZER, value: "wordsketch-tokenizer"}
-            - {name: TOPIC, value: "wordsketch.text"}
-            - {name: CONTEXT, value: "128"}
-            - {name: STEPS, value: "80"}
-            - {name: PROMPT, value: ""}
-          resources:
-            requests: {memory: 64Ki, esp32.io/psram: 64Ki, hardware.kube32.io/ipc: "1"}
-            limits: {memory: 64Ki, esp32.io/psram: 64Ki}
-          securityContext:
-            capabilities: {add: ["SERVICE_CALL", "CHANNEL_IPC"]}
----
-apiVersion: apps/v1
-kind: Deployment
-metadata:
-  name: wordsketch-store
-  namespace: default
-  labels: {app: wordsketch, tier: store}
-spec:
-  replicas: 0
-  strategy: {type: Recreate}
-  selector:
-    matchLabels: {app: wordsketch, tier: store}
-  template:
-    metadata:
-      labels: {app: wordsketch, tier: store}
-      annotations:
-        kube32.io/wasm-base64: "@wordsketch-store.wasm"
-        kube32.io/wasm-stack: "512"
-        kube32.io/blobs: wordsketch-tokenizer
-    spec:
-      containers:
-        - name: store
-          image: wasm://inline/wordsketch-store
-          ports: [{name: http, containerPort: 7000}]
-          resources:
-            requests: {memory: 8Ki, esp32.io/psram: 8Ki}
-            limits: {memory: 8Ki, esp32.io/psram: 8Ki}
-# ---- llm-diffusion (examples/llm-diffusion.yaml), scaled to 0 while DOOM has the boards ----
----
-apiVersion: apps/v1
-kind: Deployment
-metadata:
-  name: llm-diffusion
-  namespace: default
-  labels:
-    app: llm-diffusion
-spec:
-  replicas: 0
-  strategy: {type: Recreate}
-  selector:
-    matchLabels:
-      app: llm-diffusion
-  template:
-    metadata:
-      labels:
-        app: llm-diffusion
-      annotations:
-        kube32.io/blobs: llm-diffusion,mdlm
-        kube32.io/execution-budget: "off"
-        kube32.io/wasm-stack: "1536"
-    spec:
-      nodeSelector:
-        node-role.kubernetes.io/control-plane: ""
-      restartPolicy: Always
-      containers:
-        - name: llm-diffusion
-          image: wasm://blob/llm-diffusion
-          ports:
-            - containerPort: 7000
-              name: http
-          resources:
-            requests:
-              memory: 256Ki
-            limits:
-              memory: 256Ki

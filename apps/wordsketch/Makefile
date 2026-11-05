@@ -88,14 +88,18 @@ manifest: $(MODULES)
 	$(LLM) manifest --template ../../examples/wordsketch.yaml --modules build --out build/wordsketch.yaml
 
 # The blobs go to the node that runs their pods: the Cardputer (by its
-# board label) and the control plane
-upload: $(BLOBS)
+# board label) and the control plane. wordsketch-listen, llm-shard and
+# llm-coordinator are module blobs (wasm://blob/ images in the manifest)
+upload: $(BLOBS) build/wordsketch-listen.wasm build/llm-shard.wasm build/llm-coordinator.wasm
 	@cardputer=$$($(KUBECTL) get nodes -l kube32.io/board=cardputer -o name | head -1 | cut -d/ -f2); \
 	control=$$($(KUBECTL) get nodes -l node-role.kubernetes.io/control-plane -o name | head -1 | cut -d/ -f2); \
-	for b in wordsketch-kws:$$cardputer wordsketch-doodle:$$control wordsketch-story:$$control wordsketch-tokenizer:$$control; do \
-	  name=$${b%%:*}; node=$${b#*:}; size=$$(wc -c < build/blobs/$$name | tr -d ' '); \
+	for b in wordsketch-kws:$$cardputer:build/blobs/wordsketch-kws wordsketch-doodle:$$control:build/blobs/wordsketch-doodle \
+	         wordsketch-story:$$control:build/blobs/wordsketch-story wordsketch-tokenizer:$$control:build/blobs/wordsketch-tokenizer \
+	         wordsketch-listen:$$cardputer:build/wordsketch-listen.wasm llm-shard:$$control:build/llm-shard.wasm \
+	         llm-coordinator:$$control:build/llm-coordinator.wasm; do \
+	  name=$${b%%:*}; rest=$${b#*:}; node=$${rest%%:*}; file=$${rest#*:}; size=$$(wc -c < $$file | tr -d ' '); \
 	  echo "$$name ($$size B) -> $$node"; \
-	  $(KUBECTL) $(if $(SERVER),--server $(SERVER)) replace --raw "/api/v1/nodes/$$node/proxy/blobs/$$name?size=$$size" -f build/blobs/$$name || exit 1; \
+	  $(KUBECTL) $(if $(SERVER),--server $(SERVER)) replace --raw "/api/v1/nodes/$$node/proxy/blobs/$$name?size=$$size" -f $$file || exit 1; \
 	done
 
 clean:
