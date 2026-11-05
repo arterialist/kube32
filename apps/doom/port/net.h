@@ -11,6 +11,7 @@
 
 int net_role(void);
 int net_active(void);
+int net_player2(void);             /* player 2 is in the game */
 int net_tick_alone(int64_t now);   /* player 1 alone, before a join */
 /* The pod orders the ticcmds: args and iwad are what a client's engine starts with */
 void net_init_authority(const char* args, const char* iwad);

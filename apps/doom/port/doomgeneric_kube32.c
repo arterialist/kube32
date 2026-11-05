@@ -354,17 +354,17 @@ static int32_t tick(int64_t now) {
     return 1;
 }
 
-/* A frame of the game state, when one is due: from the node's tick, and in a two-player game
- * also from each request, since a node busy with player 2's POSTs ticks the pod seldom. With
- * two players frames take a third of the time at most: the tics, and the POSTs that bring
- * player 2's ticcmds, come first. */
+/* A frame of the game state, when one is due: from the node's tick, and while player 2 is in
+ * the game also from each request, since a node busy with its POSTs ticks the pod seldom. Then
+ * frames take a third of the time at most: the tics, and the POSTs that bring player 2's
+ * ticcmds, come first. */
 static void frame(int64_t now) {
     static int drawn_tic = -1;
     if (gametic == drawn_tic) return;   /* a frame when the game moved (not in the lobby) */
 #ifdef DG_SIM_ONLY
     static int64_t next_ms;              /* two players: the next frame no sooner */
     if (now - last_frame_ms < (int64_t)frame_ms) return;
-    if (net_active() && now < next_ms) return;
+    if (net_player2() && now < next_ms) return;
     if (draw_rate && now < drained_ms) { frame_waits++; return; }   /* the last list is still leaving */
     last_frame_ms = now;
     drawn_tic = gametic;
@@ -432,7 +432,7 @@ K32_EXPORT("k32_handle") int32_t k32_handle(uint32_t ptr, uint32_t len) {
     cpu_handle_us += (uint64_t)(doom_us() - t0);
     handles++;
     if (req_big) { free(req_big); req_big = 0; }
-    if (started && net_active()) frame(k32_time_ms());
+    if (started && net_player2()) frame(k32_time_ms());
     return status;
 }
 

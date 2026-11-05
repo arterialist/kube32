@@ -207,6 +207,8 @@ int net_role(void) { return role; }
 /* An authority with a session: its tics wait for player 2's ticcmds (net_tick); before the
  * first join player 1 plays alone, as a single player does */
 int net_active(void) { return role == NET_AUTHORITY && phase != 0; }
+/* Player 2 is in the game: its POSTs keep the node busy */
+int net_player2(void) { return role == NET_AUTHORITY && phase != 0 && p2_in; }
 
 void net_init_authority(const char* args, const char* iwad) {
     role = NET_AUTHORITY;
