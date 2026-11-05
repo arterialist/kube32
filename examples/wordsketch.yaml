@@ -22,9 +22,10 @@
 #
 # DOOM's Deployments come first at 0 replicas: one apply frees DOOM's memory
 # before the wordsketch pods start, and the module blobs keep each Deployment
-# small in every request. llm-diffusion stays at 0 here: beside wordsketch it
-# leaves the control plane too little PSRAM to switch (examples/llm-diffusion.yaml
-# runs it on its own).
+# small in every request. llm-diffusion runs on its own
+# (examples/llm-diffusion.yaml) and stays at 0 here: it must be at 0 before
+# switching to DOOM, since beside wordsketch it leaves the control plane too
+# little PSRAM for a switch.
 # ---- the DOOM pods (examples/doom.yaml) and llm-diffusion (examples/llm-diffusion.yaml)
 # at 0 replicas, first: their memory is free before wordsketch's pods start ----
 apiVersion: apps/v1

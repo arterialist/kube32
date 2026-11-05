@@ -14,6 +14,10 @@
 #   kubectl --context kube32 apply -f apps/llm-diffusion/build/llm-diffusion.yaml
 #   curl -s "http://<control plane>/diffusion/generate?steps=16&prompt=Lily%20went%20to%20the%20park"
 #   curl -s "http://<control plane>/diffusion/state"
+#
+# It runs on its own, not beside wordsketch or DOOM: examples/wordsketch.yaml
+# and examples/doom.yaml both set it to 0, and it must be at 0 before
+# switching to DOOM (the control plane's PSRAM does not hold it and a switch).
 apiVersion: apps/v1
 kind: Deployment
 metadata:
