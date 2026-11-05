@@ -17,6 +17,11 @@
 // --sim-args gives the sim engine its own DOOM_ARGS (a smaller zone), --sim-wad its
 // own IWAD (the sim pack, wad.py simpack).
 //
+// Every frame, the status bar's numbers the sim appends to its draw list are
+// compared with the engine's player. A tap of the fire key, pressed and
+// released before the same tic (as a keyboard that reports presses alone
+// sends it), must fire a shot: the ammo the record shows drops.
+//
 // Prints the frames compared, the pixels that differ, and the decode time
 // (records plus kernels) a frame on this host.
 #include "wasm3.h"
@@ -141,7 +146,7 @@ struct Engine {
     IM3Environment env{};
     IM3Runtime rt{};
     IM3Module mod{};
-    IM3Function init{}, tic{}, render{}, key{}, screen{}, dl_ptr{}, dl_len{}, digest{}, mobj{}, rdigest{};
+    IM3Function init{}, tic{}, render{}, key{}, screen{}, dl_ptr{}, dl_len{}, digest{}, mobj{}, rdigest{}, hud{};
     std::vector<uint8_t> wasm;
     bool load(const char* path, bool sim) {
         std::ifstream f(path, std::ios::binary);
@@ -170,6 +175,7 @@ struct Engine {
         if (m3_FindFunction(&rdigest, rt, "doom_render_digest")) rdigest = nullptr;
         if (sim) r = m3_FindFunction(&dl_ptr, rt, "doom_drawlist_ptr"), r = r ? r : m3_FindFunction(&dl_len, rt, "doom_drawlist_len");
         else r = m3_FindFunction(&screen, rt, "doom_screen_ptr");
+        if (!r) r = m3_FindFunction(&hud, rt, "doom_hud_ptr");
         if (r) { std::printf("%s: %s (built for this check?)\n", path, r); return false; }
         return true;
     }
@@ -241,6 +247,11 @@ int main(int argc, char** argv) {
     std::vector<std::vector<int>> course;
     const int pattern[][3] = {{UP, 0, 70}, {RIGHT, UP, 20}, {UP, FIRE, 40}, {LEFT, 0, 30}, {UP, USE, 50}, {RIGHT, FIRE, 35}, {UP, 0, 60}, {LEFT, UP, 25}};
     if (spin) course.push_back({10, 1, RIGHT});
+    // a tap of the fire key once the pistol is up: pressed and released before the same tic
+    const int tap_tic = 30, tap_seen_by = 45;
+    course.push_back({tap_tic, 1, FIRE});
+    course.push_back({tap_tic, 0, FIRE});
+    int tap_ammo = -1;
     for (int t = 10; t < tics;) {
         for (auto& p : pattern) {
             for (int k = 0; k < 2; k++) if (p[k]) { course.push_back({t, 1, p[k]}); course.push_back({t + p[2], 0, p[k]}); }
@@ -271,6 +282,14 @@ int main(int argc, char** argv) {
                 return 4;
             }
         }
+        if (t == tap_tic - 1 || t == tap_seen_by) {   // the ammo the engine's record shows, before the tap and after
+            full.call(full.hud);
+            const uint8_t* h = full.mem() + full.result(full.hud);
+            const int ammo = (int16_t)(h[6] | h[7] << 8);
+            if (t == tap_tic - 1) tap_ammo = ammo;
+            else if (ammo >= tap_ammo) { std::printf("tic %d: a tap of the fire key at tic %d fired nothing (ammo %d, then %d)\n", t, tap_tic, tap_ammo, ammo); return 5; }
+            else std::printf("tic %d: a tap of the fire key at tic %d fired (ammo %d, then %d)\n", t, tap_tic, tap_ammo, ammo);
+        }
         if (no_pixels) { frames++; continue; }
         if (!full.call(full.render) || !sim.call(sim.render)) return 1;
         if (state && full.rdigest && sim.rdigest && full.call1(full.rdigest, 0) != sim.call1(sim.rdigest, 0)) {
@@ -290,6 +309,15 @@ int main(int argc, char** argv) {
         vw = list[6] | (list[7] << 8);
         vh = list[8];
         if (list[9]) std::printf("tic %d: the draw list was truncated\n", t);
+        {   // the status bar's numbers after the entries, against the engine's player
+            const uint32_t entries = list[4] | (list[5] << 8);
+            full.call(full.hud);
+            const uint8_t* want_hud = full.mem() + full.result(full.hud);
+            if (ll != entries + 12 || std::memcmp(list + entries, want_hud, 12)) {
+                std::printf("tic %d: the status bar's record differs from the engine's player\n", t);
+                return 4;
+            }
+        }
         if (std::getenv("DL_DEBUG") && t == 0) {
             uint32_t at = 28;
             for (int k = 0; k < 6 && at < ll; k++) {
@@ -324,7 +352,7 @@ int main(int argc, char** argv) {
             std::vector<uint8_t> copy(list, list + ll), f2((size_t)vw * vh, 0);
             uint32_t at = 28, k = 0;
             uint8_t last = 0;
-            while (at < ll) {
+            while (at < (uint32_t)(list[4] | (list[5] << 8))) {
                 const uint8_t* e = list + at;
                 uint32_t size;
                 if (e[0] == 1) size = 18 + 3 * e[3];

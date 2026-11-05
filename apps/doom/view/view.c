@@ -12,9 +12,12 @@
  *   env DOOM_PACK_BLOB   the render pack blob (wad.py pack), default doom-pack
  *   GET /stats           frames, bytes and errors as JSON
  *
- * The Cardputer keyboard reports presses, not releases: a key is held for
- * the frame it arrives in and released with the next tick. w a s d move
- * and turn, space uses, f fires, enter and escape pass through. */
+ * The Cardputer keyboard reports presses, not releases: a key is released
+ * with the next tick (the sim keeps it down for a few tics at least). w a
+ * s d move and turn, space uses, f fires, enter and escape pass through.
+ *
+ * Along the bottom it draws the status bar's numbers the sim appends to
+ * each draw list: the ammo of the weapon up, health, armor, and the keys. */
 #include <stdint.h>
 #include "runtime/k32_app_abi.h"
 #include "drawlist.h"
@@ -46,6 +49,56 @@ static unsigned nrelease;
 
 static void logf(const char* s) { k32_log(s, slen(s)); }
 
+/* The status bar's numbers, which the sim appends to each draw list past its entries
+ * (port/drawlist_emit.c): ammo, health and armor in a strip along the bottom, and the keys */
+#define HUD_Y 123               /* the strip: rows 123 .. 134 */
+#define HUD_ROWS 12
+static const uint16_t font[] = {   /* 3 x 5, a row of 3 bits each, top row first */
+    075557, 026227, 071747, 071717, 055711, 074717, 074757, 071111, 075757, 075717,   /* 0 .. 9 */
+    051245,                                                                                /* % */
+};
+enum { C_BACK, C_AMMO, C_HEALTH, C_ARMOR1, C_ARMOR2, C_DIM, C_BLUE, C_YELLOW, C_RED, C_COLORS };
+static uint8_t hud_color[C_COLORS];
+static const uint8_t hud_rgb[C_COLORS][3] = {
+    {0, 0, 0}, {255, 215, 0}, {220, 40, 40}, {60, 200, 60}, {80, 120, 255}, {150, 150, 150}, {40, 80, 255}, {255, 230, 0}, {230, 0, 0},
+};
+static uint8_t hud[12];
+static int hud_valid;
+
+static void hud_fill(int32_t y0, uint32_t rows, int x, int y, int w, int h, uint8_t color) {
+    for (int yy = y; yy < y + h; yy++) {
+        if (yy < y0 || yy >= y0 + (int32_t)rows) continue;
+        for (int xx = x; xx < x + w && xx < VIEW_W; xx++) if (xx >= 0) band[(yy - y0) * VIEW_W + xx] = color;
+    }
+}
+/* a glyph at twice its size: 6 x 10 pixels */
+static void hud_glyph(int32_t y0, uint32_t rows, int x, int g, uint8_t color) {
+    for (int r = 0; r < 5; r++)
+        for (int c = 0; c < 3; c++)
+            if (font[g] >> (3 * (4 - r) + (2 - c)) & 1) hud_fill(y0, rows, x + 2 * c, HUD_Y + 1 + 2 * r, 2, 2, color);
+}
+/* a number right-aligned to x_end, with a box behind it; percent adds a % */
+static void hud_number(int32_t y0, uint32_t rows, int x_end, int v, int percent, uint8_t color) {
+    int digits[4], n = 0;
+    if (v < 0) v = 0;
+    do { digits[n++] = v % 10; v /= 10; } while (v && n < 4);
+    const int chars = n + percent, x0 = x_end - 8 * chars;
+    hud_fill(y0, rows, x0 - 2, HUD_Y, 8 * chars + 2, HUD_ROWS, hud_color[C_BACK]);
+    for (int i = 0; i < n; i++) hud_glyph(y0, rows, x0 + 8 * i, digits[n - 1 - i], color);
+    if (percent) hud_glyph(y0, rows, x0 + 8 * n, 10, color);
+}
+static void hud_draw(int32_t y0, uint32_t rows) {
+    if (!hud_valid || y0 + (int32_t)rows <= HUD_Y) return;
+    const int health = (int16_t)(hud[2] | hud[3] << 8), armor = (int16_t)(hud[4] | hud[5] << 8), ammo = (int16_t)(hud[6] | hud[7] << 8);
+    if (ammo >= 0) hud_number(y0, rows, 34, ammo, 0, hud_color[C_AMMO]);
+    hud_number(y0, rows, 90, health, 1, hud_color[C_HEALTH]);
+    hud_number(y0, rows, 146, armor, 1, hud_color[!armor ? C_DIM : hud[9] >= 2 ? C_ARMOR2 : C_ARMOR1]);
+    const uint8_t keys = hud[10];
+    if (keys & 077) hud_fill(y0, rows, 202, HUD_Y, 36, HUD_ROWS, hud_color[C_BACK]);
+    for (int k = 0; k < 3; k++)   /* blue, yellow, red: a card or a skull key */
+        if (keys >> k & 011) hud_fill(y0, rows, 205 + 11 * k, HUD_Y + 2, 8, 8, hud_color[C_BLUE + k]);
+}
+
 int32_t dl_host_columns(uint8_t* dst, uint32_t stride, int32_t y0, uint32_t rows, const void* records, uint32_t n, uint32_t colormap,
                         const uint8_t* translation, int32_t centery) {
     return k32_raster_columns(dst, stride, y0, rows, records, n, (const uint8_t*)(uintptr_t)colormap, translation, centery);
@@ -76,6 +129,14 @@ K32_EXPORT("k32_init") int32_t k32_init(void) {
     uint8_t rgb[768];
     if (k32_blob_read(blob, ctx.palette, rgb, 768) != 768) return -1;
     for (int i = 0; i < 256; i++) pal[i] = (uint16_t)(((rgb[3 * i] >> 3) << 11) | ((rgb[3 * i + 1] >> 2) << 5) | (rgb[3 * i + 2] >> 3));
+    for (int c = 0; c < C_COLORS; c++) {   /* the status bar's colours: the palette's nearest */
+        uint32_t best = 0xffffffffu;
+        for (int i = 0; i < 256; i++) {
+            const int dr = rgb[3 * i] - hud_rgb[c][0], dg = rgb[3 * i + 1] - hud_rgb[c][1], db = rgb[3 * i + 2] - hud_rgb[c][2];
+            const uint32_t d = (uint32_t)(dr * dr + dg * dg + db * db);
+            if (d < best) { best = d; hud_color[c] = (uint8_t)i; }
+        }
+    }
     ready = 1;
     return 0;
 }
@@ -91,13 +152,16 @@ K32_EXPORT("k32_event") int32_t k32_event(uint32_t topic, uint32_t topic_len, ui
     const uint8_t* msg = (const uint8_t*)(uintptr_t)ptr;
     if (!ready || len < DL_HEADER_BYTES || msg[0] != 'D') return 0;
     bytes += len;
-    const uint32_t vh = msg[8];
+    const uint32_t vh = msg[8], entries = (uint32_t)(msg[4] | msg[5] << 8);
+    hud_valid = entries + sizeof hud <= len && msg[entries] == 'H' && msg[entries + 1] >= sizeof hud;
+    if (hud_valid) memcpy(hud, msg + entries, sizeof hud);
     for (uint32_t y0 = 0; draw && y0 < vh; y0 += BAND_ROWS) {
         const uint32_t rows = vh - y0 < BAND_ROWS ? vh - y0 : BAND_ROWS;
         const int64_t t0 = k32_time_ms();
         int32_t rc = dl_draw(&ctx, msg, len, band, VIEW_W, (int32_t)y0, rows);
         const int64_t t1 = k32_time_ms();
         if (rc) { draw_errors++; break; }
+        hud_draw((int32_t)y0, rows);
         k32_display_blit_pal(0, (int32_t)y0, VIEW_W, (int32_t)rows, band, pal);
         draw_ms += (uint32_t)(t1 - t0);
         blit_ms += (uint32_t)(k32_time_ms() - t1);

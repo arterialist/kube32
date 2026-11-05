@@ -35,7 +35,12 @@
  *   4 masked u16 x  u8 texture  u8 column  u8 light  i32 iscale  i32 scale
  *            i32 texturemid  u8 cliptop+2  u8 clipbot+2                 (20 B)
  * Entries come in the engine's order: walls, then planes (sky strips
- * among them), then masked columns and sprites back to front. */
+ * among them), then masked columns and sprites back to front.
+ *
+ * After the entries (past the header's byte count, so a reader of the
+ * entries alone skips it) comes what the status bar would show, 12 bytes
+ * (doom_hud_record in port/doomgeneric_kube32.c): 'H', its length, health,
+ * armor, the ammo of the weapon up, the weapon, the armor type, the keys. */
 #include <stdint.h>
 #include <string.h>
 #include <stdio.h>
@@ -55,6 +60,8 @@
 #define LIST_BYTES 16384   /* -DLIST_BYTES caps the list (a board without PSRAM holds two 16 KiB messages at most) */
 #endif
 #define STRIPS 3
+#define HUD_BYTES 12       /* the status bar's numbers, after the entries */
+void doom_hud_record(uint8_t* p);
 
 extern void (*colfunc)(void);
 extern void (*basecolfunc)(void);
@@ -94,7 +101,7 @@ static uint32_t plane_at;
 static uint16_t plane_spans;
 
 static uint8_t* room(uint32_t n) {
-    if (len + n > LIST_BYTES) { truncated = 1; return 0; }
+    if (len + n > LIST_BYTES - HUD_BYTES) { truncated = 1; return 0; }
     uint8_t* p = list + len;
     len += n;
     return p;
@@ -233,9 +240,11 @@ void DG_DrawListEnd(void) {
     p[0] = 'D'; p[1] = 1; put16(p + 2, count); put16(p + 4, len); put16(p + 6, viewwidth); p[8] = (uint8_t)viewheight; p[9] = (uint8_t)truncated;
     p[10] = (uint8_t)skytexture; p[11] = 0;
     put32(p + 12, pspriteiscale); put32(p + 16, skytexturemid); put32(p + 20, basexscale); put32(p + 24, baseyscale);
+    doom_hud_record(list + len);
 }
 
 K32_EXPORT("doom_drawlist_ptr") uint32_t doom_drawlist_ptr(void) { return (uint32_t)(uintptr_t)list; }
-K32_EXPORT("doom_drawlist_len") uint32_t doom_drawlist_len(void) { return len; }
+/* the entries and the status bar's record after them */
+K32_EXPORT("doom_drawlist_len") uint32_t doom_drawlist_len(void) { return len + HUD_BYTES; }
 K32_EXPORT("doom_drawlist_count") uint32_t doom_drawlist_count(void) { return count; }
 K32_EXPORT("doom_drawlist_truncated") uint32_t doom_drawlist_truncated(void) { return (uint32_t)truncated; }

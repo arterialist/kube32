@@ -67,13 +67,80 @@ void DG_DrawFrame(void) { frames_drawn++; }
 void DG_SleepMs(uint32_t ms) { (void)ms; }
 uint32_t DG_GetTicksMs(void) { return (uint32_t)(k32_time_ms() + clock_offset_ms); }
 void DG_SetWindowTitle(const char* title) { (void)title; }
+
+/* A key stays down for at least KEY_HOLD_TICS tics. A keyboard that reports presses only (the
+ * Cardputer's) is released by its view a tick later, so a press and its release often arrive
+ * between two tics, and no tic would see the key down. A release waits until its key has been
+ * down that long; a press of a key that is down (the keyboard's repeat) keeps it down that much
+ * longer. The engine reads the keys once a tic (I_StartTic), which counts the tics here. */
+#define KEY_HOLD_TICS 4
+static uint8_t key_hold[256];      /* tics the key stays down at least */
+static uint8_t key_down[256], key_release[256];
+static int key_polling;
 int DG_GetKey(int* pressed, unsigned char* key) {
-    if (keyq_head == keyq_tail) return 0;
-    uint16_t e = keyq[keyq_head];
-    keyq_head = (keyq_head + 1) % KEYQ;
-    *pressed = (e >> 8) & 1;
-    *key = (unsigned char)e;
-    return 1;
+    if (!key_polling) {   /* a tic reads its keys: the releases that have waited long enough */
+        key_polling = 1;
+        for (int k = 1; k < 256; k++) if (key_hold[k]) key_hold[k]--;
+    }
+    for (int k = 1; k < 256; k++) {
+        if (key_release[k] && !key_hold[k]) {
+            key_release[k] = key_down[k] = 0;
+            *pressed = 0;
+            *key = (unsigned char)k;
+            return 1;
+        }
+    }
+    while (keyq_head != keyq_tail) {
+        uint16_t e = keyq[keyq_head];
+        keyq_head = (keyq_head + 1) % KEYQ;
+        const unsigned k = e & 0xff;
+        if (e >> 8) {
+            const int repeat = key_down[k];
+            key_down[k] = 1;
+            key_hold[k] = KEY_HOLD_TICS;
+            key_release[k] = 0;
+            if (repeat) continue;
+        } else if (key_hold[k]) {
+            key_release[k] = 1;
+            continue;
+        } else {
+            key_down[k] = key_release[k] = 0;
+        }
+        *pressed = (e >> 8) & 1;
+        *key = (unsigned char)k;
+        return 1;
+    }
+    key_polling = 0;
+    return 0;
+}
+
+/* What the status bar shows, for a screen without one (the sim appends it to each draw list):
+ *   'H'  u8 bytes (12)  i16 health  i16 armor  i16 ammo of the weapon up (-1: it takes none)
+ *   u8 weapon  u8 armortype  u8 keys (bits: blue, yellow, red card, blue, yellow, red skull)
+ *   u8 flags (bit 0: dead) */
+#include "../doomgeneric/d_items.h"
+#define DOOM_HUD_BYTES 12   /* port/drawlist_emit.c appends it */
+void doom_hud_record(uint8_t* p) {
+    const player_t* pl = &players[displayplayer];
+    const ammotype_t at = weaponinfo[pl->readyweapon].ammo;
+    const int ammo = at == am_noammo ? -1 : pl->ammo[at];
+    uint8_t keys = 0;
+    for (int i = 0; i < NUMCARDS && i < 8; i++) if (pl->cards[i]) keys |= (uint8_t)(1 << i);
+    p[0] = 'H';
+    p[1] = DOOM_HUD_BYTES;
+    p[2] = (uint8_t)pl->health; p[3] = (uint8_t)(pl->health >> 8);
+    p[4] = (uint8_t)pl->armorpoints; p[5] = (uint8_t)(pl->armorpoints >> 8);
+    p[6] = (uint8_t)ammo; p[7] = (uint8_t)(ammo >> 8);
+    p[8] = (uint8_t)pl->readyweapon;
+    p[9] = (uint8_t)pl->armortype;
+    p[10] = keys;
+    p[11] = pl->playerstate == PST_DEAD;
+}
+/* The record of the player shown (a host check compares the sim's with the engine's) */
+K32_EXPORT("doom_hud_ptr") uint32_t doom_hud_ptr(void) {
+    static uint8_t hud[DOOM_HUD_BYTES];
+    doom_hud_record(hud);
+    return (uint32_t)(uintptr_t)hud;
 }
 
 /* ---- the game loop ------------------------------------------------------ */
