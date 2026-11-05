@@ -23,6 +23,7 @@
 
 #include "m_random.h"
 #include "i_system.h"
+#include "z_zone.h"
 
 #include "doomdef.h"
 #include "p_local.h"
@@ -95,49 +96,94 @@ void A_Fall (mobj_t *actor);
 
 mobj_t*		soundtarget;
 
+// kube32: the traversal keeps its own stack (a sector, its soundblocks and
+// the next line to check) instead of recursing, a sector deep for every
+// sector the sound passes through: an interpreter whose native stack holds
+// every call in flight runs out of it on a large open map. It visits the
+// sectors and checks the lines in the order the recursion did.
+typedef struct
+{
+    sector_t*	sec;
+    int		soundblocks;
+    int		line;
+} soundstep_t;
+
+static soundstep_t*	soundsteps;	// numsectors of them, PU_LEVEL
+
+// wake up all monsters in this sector; false when it is already flooded
+static boolean P_SoundEnter (sector_t* sec, int soundblocks)
+{
+    if (sec->validcount == validcount
+	&& sec->soundtraversed <= soundblocks+1)
+    {
+	return false;		// already flooded
+    }
+
+    sec->validcount = validcount;
+    sec->soundtraversed = soundblocks+1;
+    sec->soundtarget = soundtarget;
+    return true;
+}
+
 void
 P_RecursiveSound
 ( sector_t*	sec,
   int		soundblocks )
 {
-    int		i;
     line_t*	check;
     sector_t*	other;
-	
-    // wake up all monsters in this sector
-    if (sec->validcount == validcount
-	&& sec->soundtraversed <= soundblocks+1)
+    soundstep_t*	step;
+    int		depth;
+
+    if (!P_SoundEnter (sec, soundblocks))
+	return;
+
+    // a sector is on the path at most once: soundblocks only grows along it
+    if (!soundsteps)
+	soundsteps = Z_Malloc (numsectors * sizeof(*soundsteps), PU_LEVEL, &soundsteps);
+
+    soundsteps[0].sec = sec;
+    soundsteps[0].soundblocks = soundblocks;
+    soundsteps[0].line = 0;
+    depth = 1;
+
+    while (depth)
     {
-	return;		// already flooded
-    }
-    
-    sec->validcount = validcount;
-    sec->soundtraversed = soundblocks+1;
-    sec->soundtarget = soundtarget;
-	
-    for (i=0 ;i<sec->linecount ; i++)
-    {
-	check = sec->lines[i];
+	step = &soundsteps[depth-1];
+	if (step->line >= step->sec->linecount)
+	{
+	    depth--;
+	    continue;
+	}
+	check = step->sec->lines[step->line++];
 	if (! (check->flags & ML_TWOSIDED) )
 	    continue;
-	
+
 	P_LineOpening (check);
 
 	if (openrange <= 0)
 	    continue;	// closed door
-	
-	if ( sides[ check->sidenum[0] ].sector == sec)
+
+	if ( sides[ check->sidenum[0] ].sector == step->sec)
 	    other = sides[ check->sidenum[1] ] .sector;
 	else
 	    other = sides[ check->sidenum[0] ].sector;
-	
+
 	if (check->flags & ML_SOUNDBLOCK)
 	{
-	    if (!soundblocks)
-		P_RecursiveSound (other, 1);
+	    if (step->soundblocks)
+		continue;
+	    soundblocks = 1;
 	}
 	else
-	    P_RecursiveSound (other, soundblocks);
+	    soundblocks = step->soundblocks;
+
+	if (!P_SoundEnter (other, soundblocks) || depth >= numsectors)
+	    continue;
+	soundsteps[depth].sec = other;
+	soundsteps[depth].soundblocks = soundblocks;
+	soundsteps[depth].line = 0;
+	depth++;
     }
 }
 

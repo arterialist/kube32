@@ -35,6 +35,12 @@
 #include <vector>
 
 static int64_t g_now_ms;
+#if d_m3CountOpFrames
+extern "C" u32 m3_opFrames, m3_opFramesPeak;
+// The deepest call of each export, in operation frames: the native stack a board's interpreter
+// takes grows with them (make verify-net builds build/net_check-frames and bounds the pod's)
+static std::map<std::string, uint32_t> g_frames_peak;
+#endif
 // k32_publish as the runtime paces it toward a view that takes g_draw_rate bytes a second
 // (--draw-rate): it waits for the last message to leave (at most 500 ms) before it sends,
 // and the pod, its POSTs and its tick wait with it until g_pod_busy_until
@@ -71,7 +77,14 @@ struct Engine {
         for (auto a : args) s.push_back(std::to_string(a));
         std::vector<const char*> argv;
         for (auto& x : s) argv.push_back(x.c_str());
+#if d_m3CountOpFrames
+        m3_opFramesPeak = m3_opFrames;
+#endif
         M3Result r = m3_CallArgv(f, (uint32_t)argv.size(), argv.data());
+#if d_m3CountOpFrames
+        uint32_t& peak = g_frames_peak[std::string(name) + " " + n];
+        if (m3_opFramesPeak > peak) peak = m3_opFramesPeak;
+#endif
         if (r) {
             M3ErrorInfo info;
             m3_GetErrorInfo(rt, &info);
@@ -85,8 +98,8 @@ struct Engine {
         return (int32_t)v;
     }
     // a request through k32_handle; the answer in status and body
-    void request(const std::string& method, const std::string& path, const std::string& req_body) {
-        const std::string req = method + " " + path + "\nContent-Type: text/plain\n\n" + req_body;
+    void request(const std::string& method, const std::string& path, const std::string& req_body, const std::string& headers = "") {
+        const std::string req = method + " " + path + "\nContent-Type: text/plain\n" + headers + "\n" + req_body;
         const uint32_t p = (uint32_t)call("k32_alloc", {(int64_t)req.size() + 1});
         if (!p) { std::printf("%s: k32_alloc refused %zu bytes\n", name, req.size()); std::exit(1); }
         std::memcpy(mem() + p, req.data(), req.size());
@@ -317,6 +330,7 @@ int main(int argc, char** argv) {
     std::string fps = "8";                          // --fps: DOOM_FPS, the frames the sim publishes a second
     std::vector<std::pair<std::string, std::string>> pod_env;   // --pod-env KEY=VALUE
     bool render = true;
+    uint32_t frames_max = 0;                        // --frames-max: the pod's deepest call, in operation frames (net_check-frames)
     const bool trace = std::getenv("NET_TRACE") != nullptr;
     std::string args = "-warp 1 1 -skill 3", iwad_name = "doom1.wad", client_args;   // --client-args: a client that plays another game
     Net net;
@@ -343,6 +357,7 @@ int main(int argc, char** argv) {
         else if (a == "--args") args = argv[++i];
         else if (a == "--iwad-name") iwad_name = argv[++i];
         else if (a == "--client-args") client_args = std::string(" ") + argv[++i];
+        else if (a == "--frames-max") frames_max = (uint32_t)std::atol(argv[++i]);
     }
 
     // the authority: the sim-only engine as the pod
@@ -555,6 +570,22 @@ int main(int argc, char** argv) {
         }
     }
     (void)outage_set;
+    // The largest POST a page sends: after a stall, every ticcmd it holds ahead (64 at most), fire
+    // held in each, behind a browser's headers (past the pod's 2 KiB request buffer), landing when the
+    // pod's clock has a second of tics due: it runs 16 of them inside k32_handle, player 2 firing
+    if (client.rt && cs.alive) {
+        client.call("doom_key", {1, FIRE});
+        g_now_ms = std::max(g_now_ms, g_pod_busy_until) + 1000;
+        client.call("doom_net_pace", {2000});
+        const std::string b = client.out((int32_t)client.call("doom_net_post"));
+        const std::string headers = "User-Agent: " + std::string(400, 'u') + "\nCookie: " + std::string(1200, 'c') + "\n";
+        const int32_t before = pod_tic;
+        pod.request("POST", "/doom/tics", b, headers);
+        pod_after();
+        std::printf("the largest POST: %zu bytes, %zu ticcmds: answered %d, %zu bytes; ran tics %d to %d\n", b.size() + headers.size(),
+                    (std::min(b.find('&', b.find("&c=") + 3), b.size()) - b.find("&c=") - 3) / 14, pod.status, pod.body.size(), before, pod_tic - 1);
+        if (pod.status != 200 || pod_tic <= before) return 6;
+    }
     pod.request("GET", "/doom/netstats", "");
     const std::string ps = pod.body;
     const std::string cst = client.out((int32_t)client.call("doom_net_stats"));
@@ -574,6 +605,19 @@ int main(int argc, char** argv) {
                 json_int(ps, "stall_ms", 0), json_int(ps, "longest_stall_ms", 0), delay, json_int(ps, "lead_mean_x100", 0) / 100.0,
                 json_int(ps, "lead_min", 0), json_int(ps, "digests_checked", 0), json_int(ps, "digests_bad", 0), json_int(cst, "digests_checked", 0),
                 json_int(cst, "digests_bad", 0), json_int(ps, "events", 0));
+#if d_m3CountOpFrames
+    uint32_t pod_frames = 0;
+    for (auto& kv : g_frames_peak) {
+        std::printf("operation frames, deepest call: %-24s %u\n", kv.first.c_str(), kv.second);
+        if (!kv.first.compare(0, 4, "pod ")) pod_frames = std::max(pod_frames, kv.second);
+    }
+    if (frames_max && pod_frames > frames_max) {
+        std::printf("the pod's deepest call takes %u operation frames, over %u\n", pod_frames, frames_max);
+        return 7;
+    }
+#else
+    (void)frames_max;
+#endif
     if (json_int(ps, "digests_bad", 0) || json_int(cst, "digests_bad", 0)) return 4;
     return compared ? 0 : 3;
 }

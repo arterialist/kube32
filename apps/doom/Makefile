@@ -156,13 +156,23 @@ verify: build/drawlist_check build/doom.wasm build/doom-sim.wasm build/doom-240.
 # that ticks the pod every 350 ms and a view that takes 30,000 B/s of draw lists (make verify-net NET_TICS=n)
 build/net_check: bench/net_check.cpp $(REPO)/build/libwasm3.a
 	$(BENCH_CXX) $(WASM3_DEFS) -o $@ $< $(REPO)/src/runtime/pod_memory_pool.cpp $(REPO)/src/osal/system_posix.cpp $(REPO)/build/libwasm3.a
+# the same with the interpreter as the boards build it, counting its operation frames
+build/net_check-frames: bench/net_check.cpp $(REPO)/build/libwasm3_opframes.a
+	$(BENCH_CXX) $(OPFRAMES_DEFS) -o $@ $< $(REPO)/src/runtime/pod_memory_pool.cpp $(REPO)/src/osal/system_posix.cpp $(REPO)/build/libwasm3_opframes.a
 
 NET_TICS ?= 6000
-verify-net: build/net_check build/doom.wasm build/doom-sim.wasm build/doom-sim-240.wasm build/wad/doom1-e1m1-sim.wad
+verify-net: build/net_check build/net_check-frames build/doom.wasm build/doom-sim.wasm build/doom-sim-240.wasm build/wad/doom1-e1m1-sim.wad
 	./build/net_check build/doom-sim.wasm build/doom.wasm build/wad/doom1-e1m1-sim.wad $(WAD) --tics $(NET_TICS)
 	./build/net_check build/doom-sim-240.wasm build/doom.wasm build/wad/doom1-e1m1-sim.wad $(WAD) --tics $(NET_TICS) --screenblocks 11
 	./build/net_check build/doom-sim-240.wasm build/doom.wasm build/wad/doom1-e1m1-sim.wad $(WAD) --tics $(NET_TICS) --screenblocks 11 \
 	    --base 60 --jitter 50 --pod-tick-ms 350 --delay 5 --fps 8 --draw-rate 30000 --publish-ms 9
+	./build/net_check-frames build/doom-sim-240.wasm build/doom.wasm build/wad/doom1-e1m1-sim.wad $(WAD) --tics 3000 --screenblocks 11 \
+	    --frames-max $(FRAMES_MAX)
+
+# The pod's deepest call, in the interpreter's operation frames: a board's interpreter runs a call on a
+# 64 KiB native stack. With the sound traversal recursing, this course's deepest call took 1,435 frames,
+# and the devkit's pod ran out of that stack in k32_handle; it now takes about 1,070
+FRAMES_MAX ?= 1200
 
 build/wad/doom1-e1m1.pack: $(WAD) wad.py
 	$(PYTHON) wad.py pack $< $@
