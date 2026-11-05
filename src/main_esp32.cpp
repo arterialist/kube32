@@ -711,9 +711,9 @@ static void console_heapwatch(Console& con, const std::string& arg) {
     int ll;
     if (arg == "on") {
         if (!s_watch) {
-            auto* w = static_cast<Watch*>(heap_caps_calloc(1, sizeof(Watch), MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
-            if (!w) { con.write("K32_ERR heapwatch: no memory\n", 29); return; }
-            s_watch = w;
+            static Watch s_storage;   // in .bss: arming needs no block of this size from a fragmented heap
+            std::memset(&s_storage, 0, sizeof(s_storage));
+            s_watch = &s_storage;
         }
         heap_caps_monitor_local_minimum_free_size_start();   // min in the dump: since now
         ll = snprintf(l, sizeof(l), "K32_OK heapwatch on (%u bytes)\n", (unsigned)sizeof(Watch));
@@ -744,11 +744,25 @@ static void console_heapwatch(Console& con, const std::string& arg) {
                       (int)p.bytes, (int)p.count, p.bucket[0], p.bucket[1], p.bucket[2], p.bucket[3], (int)c.bytes, (int)c.count);
         con.write(l, static_cast<size_t>(ll));
     }
+    if (arg == "live") {
+        // Every recorded allocation still held, by address, with its task:
+        // what was allocated since the watch began and outlives its user
+        static Slot live[kSlots];
+        size_t n = 0;
+        portENTER_CRITICAL(&s_mux);
+        for (size_t i = 0; i < kSlots; ++i) if (w->slots[i].ptr > kTomb) live[n++] = w->slots[i];
+        portEXIT_CRITICAL(&s_mux);
+        std::sort(live, live + n, [](const Slot& x, const Slot& y) { return x.ptr < y.ptr; });
+        for (size_t i = 0; i < n; ++i) {
+            ll = snprintf(l, sizeof(l), "K32_HEAPWATCH_LIVE 0x%08x %5u %s\n", (unsigned)live[i].ptr, (unsigned)live[i].size,
+                          live[i].task < copy.ntasks ? copy.tasks[live[i].task].name : "?");
+            con.write(l, static_cast<size_t>(ll));
+        }
+    }
     if (arg == "off") {
         portENTER_CRITICAL(&s_mux);   // a hook on the other core finishes first
         s_watch = nullptr;
         portEXIT_CRITICAL(&s_mux);
-        heap_caps_free(w);
         heap_caps_monitor_local_minimum_free_size_stop();
     }
     con.write("K32_OK heapwatch\n", 17);
