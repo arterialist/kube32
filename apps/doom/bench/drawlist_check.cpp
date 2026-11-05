@@ -7,7 +7,7 @@
 // pack, and compares the pixels with the frame the full engine drew.
 //
 //   drawlist_check <doom.wasm> <doom-sim.wasm> <iwad> <pack> [--tics N] [--args "..."]
-//                  [--iwad-name doom1.wad] [--screenblocks 10|11] [--spin] [--dump frame.ppm]
+//                  [--iwad-name doom1.wad] [--screenblocks 10|11] [--detail 0|1] [--spin] [--dump frame.ppm]
 //                  [--state] [--no-pixels] [--sim-args "..."] [--locate x,y,tic]
 //
 // --state also compares the two engines' game states (players, map objects,
@@ -44,7 +44,7 @@ extern "C" {
 #include <vector>
 
 static std::vector<uint8_t> g_wad, g_pack;
-static std::string g_env_iwad = "doom1.wad", g_env_args = "-warp 1 1 -skill 3 -kb 480", g_env_blocks = "10";
+static std::string g_env_iwad = "doom1.wad", g_env_args = "-warp 1 1 -skill 3 -kb 480", g_env_blocks = "10", g_env_detail = "0";
 static std::string g_sim_args;   // --sim-args: the sim engine's DOOM_ARGS when they differ (its zone)
 static std::vector<uint8_t> g_sim_wad;   // --sim-wad: the sim engine's IWAD when it differs (the sim pack)
 static IM3Runtime g_sim_rt;
@@ -114,7 +114,7 @@ m3ApiRawFunction(h_env_get) {
     m3ApiGetArgMem(char*, out);
     m3ApiGetArg(uint32_t, cap);
     std::string k(key, key_len);
-    const std::string* v = k == "DOOM_IWAD" ? &g_env_iwad : k == "DOOM_ARGS" ? &g_env_args : k == "DOOM_SCREENBLOCKS" ? &g_env_blocks : nullptr;
+    const std::string* v = k == "DOOM_IWAD" ? &g_env_iwad : k == "DOOM_ARGS" ? &g_env_args : k == "DOOM_SCREENBLOCKS" ? &g_env_blocks : k == "DOOM_DETAIL" ? &g_env_detail : nullptr;
     if (!v) m3ApiReturn(-1);
     uint32_t n = std::min<uint32_t>(cap, (uint32_t)v->size());
     std::memcpy(out, v->data(), n);
@@ -203,7 +203,7 @@ struct Engine {
 int main(int argc, char** argv) {
     if (argc < 5) {
         std::fprintf(stderr, "usage: drawlist_check <doom.wasm> <doom-sim.wasm> <iwad> <pack> [--tics N] [--args \"...\"] [--iwad-name NAME] "
-                             "[--screenblocks N] [--spin] [--dump frame.ppm]\n");
+                             "[--screenblocks N] [--detail 0|1] [--spin] [--dump frame.ppm]\n");
         return 2;
     }
     std::ifstream w(argv[3], std::ios::binary);
@@ -221,6 +221,7 @@ int main(int argc, char** argv) {
         else if (a == "--args") g_env_args = argv[++i];
         else if (a == "--iwad-name") g_env_iwad = argv[++i];
         else if (a == "--screenblocks") g_env_blocks = argv[++i];
+        else if (a == "--detail") g_env_detail = argv[++i];
         else if (a == "--spin") spin = true;
         else if (a == "--dump") dump = argv[++i];
         else if (a == "--locate") std::sscanf(argv[++i], "%d,%d,%d", &locate_x, &locate_y, &locate_tic);
@@ -335,7 +336,10 @@ int main(int argc, char** argv) {
                 else { std::printf("masked\n"); at += 20; }
             }
         }
-        // the full engine's screen is SCREENWIDTH wide: the view's width here, rows 0 .. vh - 1
+        // the full engine's screen is SCREENWIDTH wide: the view's width here, rows 0 .. vh - 1; at low
+        // detail (--detail 1) the list's columns are half as many, each two pixels wide on the screen
+        const uint32_t ds = list[11] & 1;
+        vw <<= ds;
         frame.assign((size_t)vw * vh, 0);
         band.assign((size_t)vw * 27, 0);
         const uint64_t t0 = now_us();
@@ -343,6 +347,9 @@ int main(int argc, char** argv) {
             const uint32_t rows = std::min<uint32_t>(27, vh - y0);
             int32_t rc = dl_draw(&ctx, list, ll, band.data(), vw, (int32_t)y0, rows);
             if (rc) { std::printf("tic %d: decode rc %d (entry type %u at %u of %u)\n", t, rc, dl_error_type, dl_error_at, ll); return 1; }
+            if (ds)   // each column two pixels wide, as the view widens it
+                for (uint32_t r = 0; r < rows; r++)
+                    for (uint32_t x = vw / 2; x-- > 0;) band[r * vw + 2 * x] = band[r * vw + 2 * x + 1] = band[r * vw + x];
             std::memcpy(frame.data() + (size_t)y0 * vw, band.data(), (size_t)rows * vw);
         }
         decode_us += now_us() - t0;

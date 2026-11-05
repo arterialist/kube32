@@ -5,7 +5,7 @@
 #   make sim [W=240]         the sim-only pod (build/doom-sim[-240].wasm): a draw list a frame
 #   make view                the Cardputer view pod (build/doom-view.wasm)
 #   make check               build/drawlist_check: the split renderer against the engine
-#   make verify [TICS=n]     runs it: game states and pixels, both widths, the sim on the sim pack
+#   make verify [TICS=n]     runs it: game states and pixels, both widths and both details, the sim on the sim pack
 #   make verify-net          two players in lockstep through a simulated network (port/net.c)
 #   make pods                the two pods' modules and the packs as blobs (build/blobs/)
 #   make manifest            build/doom.yaml (with the wordsketch pods at 0 replicas, from
@@ -148,6 +148,8 @@ verify: build/drawlist_check build/doom.wasm build/doom-sim.wasm build/doom-240.
 	    --args "-warp 1 1 -skill 3 -kb 640" --sim-args "-warp 1 1 -skill 3 -kb 256" --sim-wad build/wad/doom1-e1m1-sim.wad
 	./build/drawlist_check build/doom-240.wasm build/doom-sim-240.wasm $(WAD) build/wad/doom1-e1m1.pack --tics $(TICS) --spin --state --screenblocks 11 \
 	    --args "-warp 1 1 -skill 3 -kb 640" --sim-args "-warp 1 1 -skill 3 -kb 224" --sim-wad build/wad/doom1-e1m1-sim.wad
+	./build/drawlist_check build/doom-240.wasm build/doom-sim-240.wasm $(WAD) build/wad/doom1-e1m1.pack --tics $(TICS) --spin --state --screenblocks 11 \
+	    --detail 1 --args "-warp 1 1 -skill 3 -kb 640" --sim-args "-warp 1 1 -skill 3 -kb 224" --sim-wad build/wad/doom1-e1m1-sim.wad
 
 # Two-player lockstep (port/net.c) through a simulated network: the sim pod as the
 # authority, the full engine as the browser's client, jitter, loss, an outage, a

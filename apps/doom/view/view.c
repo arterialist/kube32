@@ -161,6 +161,9 @@ K32_EXPORT("k32_event") int32_t k32_event(uint32_t topic, uint32_t topic_len, ui
         int32_t rc = dl_draw(&ctx, msg, len, band, VIEW_W, (int32_t)y0, rows);
         const int64_t t1 = k32_time_ms();
         if (rc) { draw_errors++; break; }
+        if (ctx.detailshift)   /* low detail: each column two pixels wide */
+            for (uint32_t r = 0; r < rows; r++)
+                for (uint32_t x = VIEW_W / 2; x-- > 0;) band[r * VIEW_W + 2 * x] = band[r * VIEW_W + 2 * x + 1] = band[r * VIEW_W + x];
         hud_draw((int32_t)y0, rows);
         k32_display_blit_pal(0, (int32_t)y0, VIEW_W, (int32_t)rows, band, pal);
         draw_ms += (uint32_t)(t1 - t0);

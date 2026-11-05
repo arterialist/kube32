@@ -29,6 +29,7 @@ typedef struct {
     /* the frame being decoded */
     uint16_t viewwidth;
     uint8_t viewheight, skytexture;
+    uint8_t detailshift;          /* 1: low detail, every column two pixels wide on the screen */
     int32_t sky_iscale, sky_texturemid, basexscale, baseyscale;
     /* records under construction */
     uint8_t cols[DL_COLUMN_RECORDS * 24];

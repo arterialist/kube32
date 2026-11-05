@@ -48,7 +48,7 @@ static uint8_t scalelight(const dl_ctx* c, uint32_t lightnum, uint32_t index) {
 }
 static uint8_t zlight(const dl_ctx* c, uint32_t lightnum, uint32_t index) {
     const int32_t startmap = ((LIGHTLEVELS - 1 - (int32_t)lightnum) * 2) * NUMCOLORMAPS / LIGHTLEVELS;
-    int32_t scale = dl_fixed_div((int32_t)c->viewwidth / 2 * FRACUNIT, (int32_t)(index + 1) << LIGHTZSHIFT);
+    int32_t scale = dl_fixed_div((int32_t)(c->viewwidth << c->detailshift) / 2 * FRACUNIT, (int32_t)(index + 1) << LIGHTZSHIFT);
     scale >>= LIGHTSCALESHIFT;
     int32_t level = startmap - scale / DISTMAP;
     if (level < 0) level = 0;
@@ -58,7 +58,7 @@ static uint8_t zlight(const dl_ctx* c, uint32_t lightnum, uint32_t index) {
 static int32_t yslope(const dl_ctx* c, int32_t y) {
     int32_t dy = ((y - (int32_t)c->viewheight / 2) << FRACBITS) + FRACUNIT / 2;
     dy = iabs(dy);
-    return dl_fixed_div((int32_t)c->viewwidth / 2 * FRACUNIT, dy);
+    return dl_fixed_div((int32_t)(c->viewwidth << c->detailshift) / 2 * FRACUNIT, dy);
 }
 
 uint32_t dl_head_len(const uint8_t* h) {
@@ -134,6 +134,7 @@ int32_t dl_draw(dl_ctx* c, const uint8_t* list, uint32_t len, uint8_t* band, uin
     c->viewwidth = (uint16_t)ld16(list + 6);
     c->viewheight = list[8];
     c->skytexture = list[10];
+    c->detailshift = list[11] & 1;
     c->sky_iscale = (int32_t)ld32(list + 12);
     c->sky_texturemid = (int32_t)ld32(list + 16);
     c->basexscale = (int32_t)ld32(list + 20);
@@ -219,7 +220,7 @@ int32_t dl_draw(dl_ctx* c, const uint8_t* list, uint32_t len, uint8_t* band, uin
             const uint32_t idx = lump - c->first_sprite;
             const uint32_t src = pack_addr(c, idx < c->nsprites ? ld32(c->sprite_table + 8 * idx) : 0);
             const uint8_t* translation = trans ? c->translation + (trans - 1) * 256 : 0;
-            const int32_t iscale = iabs(xiscale);
+            const int32_t iscale = iabs(xiscale) >> c->detailshift;
             const uint8_t* clip = e + 25;
             uint32_t frac = (uint32_t)startfrac;
             for (uint32_t x = x1; x <= x2; x++, frac += (uint32_t)xiscale, clip += 2) {

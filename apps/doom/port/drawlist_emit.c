@@ -20,8 +20,9 @@
  *     light = zlight[lightnum][distance >> 20] (capped at 127)
  * Little-endian; i32 are the engine's 16.16 fixed-point values.
  *   header 'D' 1  u16 count  u16 bytes  u16 viewwidth  u8 viewheight  u8 truncated
- *          u8 skytexture  u8 pad  i32 sky_iscale  i32 sky_texturemid  i32 basexscale
+ *          u8 skytexture  u8 detailshift  i32 sky_iscale  i32 sky_texturemid  i32 basexscale
  *          i32 baseyscale                                                  (28 B)
+ *          detailshift 1 (low detail): column x is screen columns 2x and 2x + 1
  *   1 strip  u16 x0  u8 n  u8 texture  u8 light  i32 texturemid  i32 scale0
  *            i32 scalestep, then n x (u8 yl, u8 yh, u8 column)          (18 B + 3/column)
  *            light: 0..15 a scalelight row, 0x80|map a fixed colormap;
@@ -238,8 +239,8 @@ void DG_DrawListEnd(void) {
     plane_close();
     uint8_t* p = list;
     p[0] = 'D'; p[1] = 1; put16(p + 2, count); put16(p + 4, len); put16(p + 6, viewwidth); p[8] = (uint8_t)viewheight; p[9] = (uint8_t)truncated;
-    p[10] = (uint8_t)skytexture; p[11] = 0;
-    put32(p + 12, pspriteiscale); put32(p + 16, skytexturemid); put32(p + 20, basexscale); put32(p + 24, baseyscale);
+    p[10] = (uint8_t)skytexture; p[11] = (uint8_t)detailshift;
+    put32(p + 12, pspriteiscale >> detailshift); put32(p + 16, skytexturemid); put32(p + 20, basexscale); put32(p + 24, baseyscale);
     doom_hud_record(list + len);
 }
 
