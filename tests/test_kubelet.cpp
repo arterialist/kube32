@@ -722,7 +722,20 @@ void test_http_chunked_response_decoding() {
     std::cout << "[PASS] test_http_chunked_response_decoding" << std::endl;
 }
 
+// A worker restarts only when its kubelet has had no answer for 90 s and its
+// heap has no 12 KiB block left
+static void test_stalled_on_heap() {
+    using kube32::kubelet::stalled_on_heap;
+    assert(!stalled_on_heap(100000, 0, 20000, 4096));        // 80 s since the kubelet started
+    assert(stalled_on_heap(120000, 0, 20000, 4096));         // 100 s, no answer, 4 KB block
+    assert(!stalled_on_heap(120000, 0, 20000, 31744));       // the heap is whole: the control plane is away
+    assert(!stalled_on_heap(200000, 150000, 20000, 4096));   // answered 50 s ago
+    assert(stalled_on_heap(260000, 150000, 20000, 7680));    // answered 110 s ago, 7.5 KB block
+    std::cout << "[PASS] test_stalled_on_heap" << std::endl;
+}
+
 int main() {
+    test_stalled_on_heap();
     // Pods in these tests reference images that must exist in the local registry
     static const uint8_t k_min_wasm[] = {0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00};
     for (const char* key : {"sensor", "gpio", "trap", "trap2", "app", "test"}) {

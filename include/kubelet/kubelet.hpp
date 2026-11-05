@@ -304,4 +304,18 @@ private:
     uint64_t last_policy_refresh_ms_{0};
 };
 
+// A worker without PSRAM whose kubelet has had no answer from the API server
+// for kStallRestartMs while the largest free block of its internal heap is
+// under kStallLargestBlock restarts: its Wi-Fi driver, short of a buffer once,
+// keeps every receive buffer and the node stays NotReady even while the
+// control plane's HELLOs still arrive. A restart brings the heap back whole and
+// the kubelet starts its pods again. A control plane that is away leaves the
+// heap as it is and causes no restart. `since_ms` is when the kubelet started.
+constexpr uint64_t kStallRestartMs = 90000;
+constexpr size_t kStallLargestBlock = 12 * 1024;
+inline bool stalled_on_heap(uint64_t now_ms, uint64_t last_ok_ms, uint64_t since_ms, size_t largest_block) {
+    const uint64_t ref = last_ok_ms > since_ms ? last_ok_ms : since_ms;
+    return now_ms > ref && now_ms - ref > kStallRestartMs && largest_block < kStallLargestBlock;
+}
+
 } // namespace kube32::kubelet

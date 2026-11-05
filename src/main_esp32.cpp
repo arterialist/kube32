@@ -2514,6 +2514,22 @@ void cluster_task(void* pv) {
             } catch (const std::exception& e) {
                 printf("[IPC] peer seeding skipped: %s\n", e.what());
             }
+            if (!ident.is_control_plane && kubelet && !ident.has_psram && iter % 10 == 0) {
+                // A worker without PSRAM whose kubelet gets no answer while
+                // its heap has no large block left restarts, HELLOs or not
+                // (kubelet::stalled_on_heap)
+                static const uint64_t kubelet_since = kube32::osal::System::get_uptime_ms();
+                const uint64_t now = kube32::osal::System::get_uptime_ms();
+                const size_t largest = heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL);
+                const uint64_t last_ok = kubelet->last_sync_ok_ms();
+                if (kube32::kubelet::stalled_on_heap(now, last_ok, kubelet_since, largest)) {
+                    log_memory("before reboot");
+                    printf("[NET] no answer from the API server for %u s and the largest free block is %u B: restarting\n",
+                           (unsigned)((now - std::max(last_ok, kubelet_since)) / 1000), (unsigned)largest);
+                    fflush(stdout);
+                    esp_restart();
+                }
+            }
             if (!ident.is_control_plane && kubelet && iter % 10 == 0) {
                 // A station can stay associated with an access point that no
                 // longer knows it: a control plane that restarts its AP within
