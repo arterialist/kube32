@@ -141,7 +141,7 @@ bool init_display_and_backlight() {
 
     esp_lcd_panel_dev_config_t panel_config = {};
     panel_config.reset_gpio_num = PIN_LCD_RST;
-    panel_config.rgb_ele_order = LCD_RGB_ELEMENT_ORDER_BGR;
+    panel_config.rgb_ele_order = LCD_RGB_ELEMENT_ORDER_RGB;
     panel_config.bits_per_pixel = 16;
     ret = esp_lcd_new_panel_st7789(s_io_handle, &panel_config, &s_panel_handle);
     if (ret != ESP_OK) {
