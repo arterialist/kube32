@@ -67,6 +67,8 @@ nav:
       - Pod migration: migration.md
       - "Example: Tessera": examples/tessera.md
       - "Example: neural networks in pods": examples/models.md
+      - "Example: DOOM across two boards": examples/doom.md
+      - "Example: wordsketch": examples/wordsketch.md
   - Architecture:
       - Overview: architecture/index.md
       - Object store: architecture/radix-store.md

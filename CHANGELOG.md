@@ -4,10 +4,15 @@ All notable changes to this project will be documented in this file. The format 
 
 ## [Unreleased]
 
+### Fixed
+
+- wordsketch's modules link with `--stack-first`. Without it a newer linker put `wordsketch-listen`'s stack above the pod's 20 KiB limit, and the pod trapped in `k32_init`.
+
 ### Added
 
 - Blob images ([docs/app-development.md](docs/app-development.md#blob-image-wasmblobname)): `image: wasm://blob/<name>` runs a module in place from the node's flash blob store. The kubelet parses and compiles it from the mapping and keeps the blob open while the pod runs, so the module's bytes take no pod memory and no Pod Overhead; a blob replaced or removed meanwhile keeps its old bytes for that pod. `kube32-podsize` reports what a module takes of a node by the API server's estimate, held in RAM and read from flash.
 - Software-rasterizer kernels ([docs/app-development.md](docs/app-development.md#raster-kernels)): `k32_raster_columns` and `k32_raster_spans` draw textured columns, the posts of patch columns and spans of a paletted 2.5D renderer into a band of an 8-bit frame through a light table, with the texels in the pod's memory or read in place from a mapped blob. `k32_display_blit` and `k32_display_blit_pal` ([docs/peripherals.md](docs/peripherals.md)) put RGB565 pixels, or palette indices through 256 entries, on a node's screen.
+- Example pages for [DOOM](docs/examples/doom.md) and [wordsketch](docs/examples/wordsketch.md), with one `kubectl apply` to switch the boards between them.
 - The `doom` example ([apps/doom](apps/doom/README.md)): DOOM (doomgeneric) as kube32 pods. The sim-only pod runs the game and emits a draw list a frame, 704 KiB of linear memory at 240 wide; the view pod draws it on the Cardputer with the raster kernels from a render pack blob; a host check draws the sim's lists and matches the engine's own frames pixel for pixel.
 
 ## [0.1.0] - 2026-11-04

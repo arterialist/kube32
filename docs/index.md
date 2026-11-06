@@ -27,6 +27,8 @@ flowchart LR
 | Let Claude Code and other agents read Devices and deploy pods over MCP | [MCP server for agents](mcp.md) |
 | Four-pod issue tracker running across a devkit and Cardputer | [Tessera example](examples/tessera.md) |
 | Language models, a diffusion model, a denoiser and a keyword spotter running in pods | [Neural networks in pods](examples/models.md) |
+| A spoken word becomes a drawing and a story, three models in five pods | [wordsketch](examples/wordsketch.md) |
+| Two-player DOOM across a devkit, a Cardputer and a browser | [DOOM](examples/doom.md) |
 | Control plane, kubelet, and runtime internals | [Architecture overview](architecture/index.md) |
 | Supported Kubernetes API resources, subresources, and semantics | [Kubernetes API reference](api-reference.md) |
 | `kube32`, `kube32-sim`, and serial console commands | [CLI and serial reference](cli-reference.md) |

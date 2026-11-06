@@ -151,6 +151,23 @@ kubectl apply -f examples/tessera.yaml
 
 Open `http://<control-plane-ip>/` or `http://127.0.0.1:8080/` on the simulator, and sign in as `mara` with password `demo`.
 
+## Example: DOOM and a multi-model app, one apply apart
+
+The devkit runs DOOM's game and BSP pass, the Cardputer draws the frames and takes the keyboard, and a browser joins as player 2 through the Ingress. wordsketch shares the same two boards: speak a word to the Cardputer and three neural networks in five pods hear it, draw it and write a story about it.
+
+Both live as blobs on the boards, so switching is a plain rollout. The manifests stop the running app first, and the swap finishes in 12 to 15 s:
+
+```sh
+kubectl apply -f apps/wordsketch/build/wordsketch.yaml
+kubectl apply -f apps/doom/build/doom.yaml
+```
+
+![k9s while kubectl switches the boards from DOOM to wordsketch and back](docs/assets/examples/swap-k9s.gif)
+
+![Player 2 in the browser with player 1 in view](docs/assets/examples/doom-two-players.jpg)
+
+Build steps and measurements: [DOOM](docs/examples/doom.md) and [wordsketch](docs/examples/wordsketch.md).
+
 ## Documentation
 
 Full documentation is published at [https://arterialist.github.io/kube32/](https://arterialist.github.io/kube32/).
@@ -171,6 +188,8 @@ Full documentation is published at [https://arterialist.github.io/kube32/](https
 - [Benchmarks](docs/benchmarks.md)
 - [Example: Tessera](docs/examples/tessera.md)
 - [Example: neural networks in pods](docs/examples/models.md)
+- [Example: DOOM across two boards](docs/examples/doom.md)
+- [Example: wordsketch](docs/examples/wordsketch.md)
 - [Architecture overview](docs/architecture/index.md)
 - [Kubernetes API coverage](docs/api-reference.md)
 - [CLI and tools reference](docs/cli-reference.md)
