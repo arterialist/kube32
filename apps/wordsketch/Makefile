@@ -21,9 +21,9 @@ LDFLAGS = $(if $(findstring rust-lld,$(WASM_LD)),-flavor wasm) --no-entry --allo
 INSPECT = $(PYTHON) ../tessera/common/wasm_inspect.py
 
 # shadow stack, linear memory (the pod limit caps a single page)
-LISTEN_LD = -z stack-size=1024 --initial-memory=65536 --max-memory=65536
-DRAW_LD = -z stack-size=1024 --initial-memory=196608 --max-memory=196608
-STORE_LD = -z stack-size=1024 --initial-memory=65536 --max-memory=65536
+LISTEN_LD = --stack-first -z stack-size=1024 --initial-memory=65536 --max-memory=65536
+DRAW_LD = --stack-first -z stack-size=1024 --initial-memory=196608 --max-memory=196608
+STORE_LD = --stack-first -z stack-size=1024 --initial-memory=65536 --max-memory=65536
 
 MODULES = build/wordsketch-listen.wasm build/wordsketch-draw.wasm build/wordsketch-store.wasm \
           build/llm-shard.wasm build/llm-coordinator.wasm
