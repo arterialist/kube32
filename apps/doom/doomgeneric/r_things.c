@@ -34,6 +34,9 @@
 #include "r_local.h"
 
 #include "doomstat.h"
+#ifdef DG_SIM_ONLY
+#include "../port/hunt.h"
+#endif
 
 
 
@@ -599,6 +602,9 @@ void R_ProjectSprite (mobj_t* thing)
 
 	vis->colormap = spritelights[index];
     }	
+#ifdef DG_SIM_ONLY
+    if (hunt_on) hunt_project(thing, vis);
+#endif
 }
 
 

@@ -38,6 +38,9 @@
 #include "s_sound.h"
 
 #include "p_inter.h"
+#ifdef DG_SIM_ONLY
+#include "../port/hunt.h"
+#endif
 
 
 #define BONUSADD	6
@@ -670,6 +673,9 @@ P_KillMobj
     mobjtype_t	item;
     mobj_t*	mo;
 	
+#ifdef DG_SIM_ONLY
+    if (hunt_on) hunt_killed(target);
+#endif
     target->flags &= ~(MF_SHOOTABLE|MF_FLOAT|MF_SKULLFLY);
 
     if (target->type != MT_SKULL)
@@ -735,6 +741,10 @@ P_KillMobj
         return;
     }
 
+#ifdef DG_SIM_ONLY
+    if (hunt_on) return;
+#endif
+
     // Drop stuff.
     // This determines the kind of object spawned
     // during the death frame of a thing.
@@ -788,6 +798,9 @@ P_DamageMobj
     fixed_t	thrust;
     int		temp;
 	
+#ifdef DG_SIM_ONLY
+    if (hunt_on && hunt_shielded(target, source)) return;
+#endif
     if ( !(target->flags & MF_SHOOTABLE) )
 	return;	// shouldn't happen...
 		

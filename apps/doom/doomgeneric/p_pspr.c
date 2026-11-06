@@ -34,6 +34,9 @@
 #include "sounds.h"
 
 #include "p_pspr.h"
+#ifdef DG_SIM_ONLY
+#include "../port/hunt.h"
+#endif
 
 #define LOWERSPEED		FRACUNIT*6
 #define RAISESPEED		FRACUNIT*6
@@ -639,6 +642,9 @@ P_GunShot
     angle_t	angle;
     int		damage;
 	
+#ifdef DG_SIM_ONLY
+    if (hunt_on && hunt_shot(mo)) return;
+#endif
     damage = 5*(P_Random ()%3+1);
     angle = mo->angle;
 

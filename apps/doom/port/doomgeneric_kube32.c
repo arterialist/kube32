@@ -32,6 +32,9 @@
 #include "../doomgeneric/i_video.h"
 #include "../doomgeneric/doomstat.h"
 #include "net.h"
+#ifdef DG_SIM_ONLY
+#include "hunt.h"
+#endif
 
 K32_IMPORT("esp32_get_time_us") int64_t esp32_get_time_us(void);
 #ifndef K32_MAX_MESSAGE_BYTES
@@ -248,6 +251,15 @@ K32_EXPORT("k32_init") int32_t k32_init(void) {
         int32_t m = k32_env_get("DOOM_PLAYERS", 12, b, sizeof b - 1);
         if (m > 0 && m < (int32_t)sizeof b) { b[m] = 0; players = atoi(b); }
     }
+#ifdef DG_SIM_ONLY
+    hunt_init();                /* port/hunt.c */
+    if (hunt_on) {
+        /* player 1 of a netgame nobody joins: a single player's start in k32_init takes the
+         * interpreter past the native stack of a call (make verify-hunt) */
+        players = 2;
+        argv_store[argc++] = "-nomonsters";
+    }
+#endif
     if (players == 2) {             /* player 1 of a lockstep netgame (port/net.c) */
         argv_store[argc++] = "-lockstep";
         argv_store[argc++] = "2";
@@ -308,10 +320,10 @@ static void parse_keys(const char* p, const char* end) {
         if (p < end) p++;
     }
 }
-/* keys arrive as events on the keys topic */
+/* keys arrive as events on the keys topic; the hunt has topics of its own */
 K32_EXPORT("k32_event") int32_t k32_event(uint32_t topic, uint32_t topic_len, uint32_t ptr, uint32_t len) {
-    (void)topic; (void)topic_len;
     const char* p = (const char*)(uintptr_t)ptr;
+    if (hunt_event((const char*)(uintptr_t)topic, topic_len, p, len)) return 0;
     parse_keys(p, p + len);
     return 0;
 }
@@ -353,6 +365,9 @@ static int32_t tick(int64_t now) {
             cpu_tics_us += (uint64_t)(doom_us() - t0);
         }
     }
+#ifdef DG_SIM_ONLY
+    hunt_tick(now);
+#endif
     frame(now);
     return 1;
 }
@@ -371,6 +386,7 @@ static void frame(int64_t now) {
     if (draw_rate && now < drained_ms) { frame_waits++; return; }   /* the last list is still leaving */
     last_frame_ms = now;
     drawn_tic = gametic;
+    hunt_frame(now);
     const int64_t r0 = doom_us();
     doom_render();
     const int64_t r1 = doom_us();
@@ -404,7 +420,7 @@ static void frame(int64_t now) {
                  (unsigned)frames_published, (unsigned)publish_errors, (unsigned)keys_received, (unsigned)doom_drawlist_len(),
                  (unsigned)(publish_ms_sum / sent), (unsigned)publish_ms_max, (unsigned)(ticks_timed ? tick_ms_sum / ticks_timed : 0), (unsigned)tick_ms_max,
                  (unsigned)(rate_assumed ? rate_assumed : draw_rate));
-        k32_log(line, (uint32_t)strlen(line));
+        if (!hunt_on) k32_log(line, (uint32_t)strlen(line));
     }
 #else
     drawn_tic = gametic;
@@ -501,6 +517,12 @@ static int32_t handle_request(char* req, uint32_t len) {
     seg = seg ? seg + 1 : path;
     out_len = 0;
     put("{");
+#ifdef DG_SIM_ONLY
+    {
+        int32_t hunt_status = hunt_route(method, seg);
+        if (hunt_status) return hunt_status;
+    }
+#endif
     {
         int32_t net_status = net_route(method, seg, body);
         if (net_status) return net_status;

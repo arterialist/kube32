@@ -7,11 +7,14 @@
 #   make check               build/drawlist_check: the split renderer against the engine
 #   make verify [TICS=n]     runs it: game states and pixels, both widths and both details, the sim on the sim pack
 #   make verify-net          two players in lockstep through a simulated network (port/net.c)
+#   make verify-hunt         the hunt (port/hunt.c) against a stand-in for the cluster
 #   make pods                the two pods' modules and the packs as blobs (build/blobs/)
 #   make manifest            build/doom.yaml (with the wordsketch pods at 0 replicas, from
-#                            apps/wordsketch/build) and build/doom-only.yaml (DOOM alone)
-#   make upload SERVER=<url> the blobs to the nodes: doom-sim, doom-wad and doom-web to the
-#                            control plane, doom-view and doom-pack to the Cardputer
+#                            apps/wordsketch/build), build/doom-only.yaml (DOOM alone) and
+#                            build/doom-hunt.yaml (the hunt, examples/doom-hunt.yaml)
+#   make upload SERVER=<url> the blobs to the nodes: doom-sim, doom-wad, doom-web and doom-reaper
+#                            to the control plane, doom-view and doom-pack to the Cardputer,
+#                            doom-target to both
 #   make ZONE_KB=512         the zone (DOOM's heap) size; -kb <n> in DOOM_ARGS overrides it
 #
 # The module starts with its static data and grows its linear memory with
@@ -65,7 +68,7 @@ stats:
 LIST_BYTES ?= $(if $(filter 240,$(W)),12288,16384)
 sim:
 	$(MAKE) W=$(W) OUT=build/doom-sim$(SUF).wasm BUILD=build/sim$(SUF) EXTRA_CFLAGS="-DDG_DRAWLIST_STATS -DDG_SIM_ONLY -DLIST_BYTES=$(LIST_BYTES)" INITIAL_MEMORY=655360 STACK=32768 \
-	    EXCLUDE="$(SIM_EXCLUDE)" PORT="$(PORT) port/drawlist_emit.c port/sim_stubs.c"
+	    EXCLUDE="$(SIM_EXCLUDE)" PORT="$(PORT) port/drawlist_emit.c port/sim_stubs.c port/hunt.c"
 
 # The view pod: the decoder and the kernels' records, no engine
 VIEW_CFLAGS = --target=wasm32 -Oz -nostdlib -ffreestanding -mcpu=mvp -msign-ext -mbulk-memory -Wall -I../../include -Iview
@@ -78,12 +81,26 @@ build/doom-view.wasm: view/view.c view/drawlist.c view/drawlist.h ../../include/
 
 view: build/doom-view.wasm
 
+# The hunt's small pods (hunt/): a target that announces itself, and the pod that deletes targets
+HUNT_LDFLAGS = -flavor wasm --no-entry --allow-undefined --stack-first --initial-memory=65536 --max-memory=65536 --gc-sections
+build/doom-target.wasm: hunt/target.c ../../include/runtime/k32_app_abi.h
+	@mkdir -p build/hunt
+	$(CLANG) $(VIEW_CFLAGS) -c hunt/target.c -o build/hunt/target.o
+	$(RUST_LLD) $(HUNT_LDFLAGS) -z stack-size=256 -o $@ build/hunt/target.o
+	@ls -la $@
+build/doom-reaper.wasm: hunt/reaper.c ../../include/runtime/k32_app_abi.h
+	@mkdir -p build/hunt
+	$(CLANG) $(VIEW_CFLAGS) -c hunt/reaper.c -o build/hunt/reaper.o
+	$(RUST_LLD) $(HUNT_LDFLAGS) -z stack-size=1024 -o $@ build/hunt/reaper.o
+	@ls -la $@
+
 # ---- the boards: blobs, manifests, upload ----
 KUBECTL ?= kubectl --context kube32
 SERVER ?=
 LLM ?= uv run --script ../llm-pipeline/tools/llm.py
 IWAD ?= build/wad/doom1-e1m1-min.wad
-BLOBS = build/blobs/doom-sim build/blobs/doom-wad build/blobs/doom-view build/blobs/doom-pack build/blobs/doom-web
+BLOBS = build/blobs/doom-sim build/blobs/doom-wad build/blobs/doom-view build/blobs/doom-pack build/blobs/doom-web \
+        build/blobs/doom-target build/blobs/doom-reaper
 
 pods: $(BLOBS)
 build/blobs/doom-sim: FORCE
@@ -91,6 +108,12 @@ build/blobs/doom-sim: FORCE
 	$(MAKE) W=240 sim
 	cp build/doom-sim-240.wasm $@
 build/blobs/doom-view: build/doom-view.wasm
+	@mkdir -p build/blobs
+	cp $< $@
+build/blobs/doom-target: build/doom-target.wasm
+	@mkdir -p build/blobs
+	cp $< $@
+build/blobs/doom-reaper: build/doom-reaper.wasm
 	@mkdir -p build/blobs
 	cp $< $@
 build/blobs/doom-wad: $(IWAD) wad.py
@@ -113,12 +136,15 @@ manifest:
 	@ls build/modules/wordsketch-listen.wasm build/modules/llm-diffusion.wasm >/dev/null 2>&1 \
 	    && $(LLM) manifest --template ../../examples/doom.yaml --modules build/modules --out build/doom.yaml \
 	    && $(LLM) manifest --template ../../examples/wordsketch.yaml --modules build/modules --out build/wordsketch.yaml \
+	    && $(PYTHON) -c "d=open('../../examples/doom.yaml').read().split('\n---\n'); z=[x for x in d if 'app: doom' not in x and 'name: doom' not in x]; open('build/doom-hunt.in.yaml','w').write('\n---\n'.join(z+[open('../../examples/doom-hunt.yaml').read()]))" \
+	    && $(LLM) manifest --template build/doom-hunt.in.yaml --modules build/modules --out build/doom-hunt.yaml \
 	    || echo "build/doom.yaml and build/wordsketch.yaml need the wordsketch and llm-diffusion modules in build/modules/ (make -C ../wordsketch modules, make -C ../llm-diffusion build/llm-diffusion.wasm; or fetch a cluster's from /apis/kube32.io/v1/images/<sha256>); build/doom-only.yaml has the DOOM pods alone"
 
 upload: $(BLOBS)
 	@cardputer=$$($(KUBECTL) $(if $(SERVER),--server $(SERVER)) get nodes -l kube32.io/board=cardputer -o name | head -1 | cut -d/ -f2); \
 	control=$$($(KUBECTL) $(if $(SERVER),--server $(SERVER)) get nodes -l node-role.kubernetes.io/control-plane -o name | head -1 | cut -d/ -f2); \
-	for b in doom-sim:$$control doom-wad:$$control doom-web:$$control doom-view:$$cardputer doom-pack:$$cardputer; do \
+	for b in doom-sim:$$control doom-wad:$$control doom-web:$$control doom-view:$$cardputer doom-pack:$$cardputer \
+	         doom-target:$$control doom-target:$$cardputer doom-reaper:$$control; do \
 	  name=$${b%%:*}; node=$${b#*:}; size=$$(wc -c < build/blobs/$$name | tr -d ' '); \
 	  echo "$$name ($$size B) -> $$node"; \
 	  $(KUBECTL) $(if $(SERVER),--server $(SERVER)) replace --raw "/api/v1/nodes/$$node/proxy/blobs/$$name?size=$$size" -f build/blobs/$$name || exit 1; \
@@ -171,6 +197,13 @@ verify-net: build/net_check build/net_check-frames build/doom.wasm build/doom-si
 	./build/net_check-frames build/doom-sim-240.wasm build/doom.wasm build/wad/doom1-e1m1-sim.wad $(WAD) --tics 3000 --screenblocks 11 \
 	    --frames-max $(FRAMES_MAX)
 
+# The hunt (port/hunt.c): the sim pod against a stand-in for the cluster, kills, replacements and
+# self-kills, with the interpreter as the boards build it
+build/hunt_check: bench/hunt_check.cpp $(REPO)/build/libwasm3_opframes.a
+	$(BENCH_CXX) $(OPFRAMES_DEFS) -o $@ $< $(REPO)/src/runtime/pod_memory_pool.cpp $(REPO)/src/osal/system_posix.cpp $(REPO)/build/libwasm3_opframes.a
+verify-hunt: build/hunt_check build/doom-sim-240.wasm build/wad/doom1-e1m1-sim.wad
+	./build/hunt_check build/doom-sim-240.wasm build/wad/doom1-e1m1-sim.wad --kills 60 --self 4 --frames-max $(FRAMES_MAX)
+
 # The pod's deepest call, in the interpreter's operation frames: a board's interpreter runs a call on a
 # 64 KiB native stack. With the sound traversal recursing, this course's deepest call took 1,435 frames,
 # and the devkit's pod ran out of that stack in k32_handle; it now takes about 1,080
@@ -185,7 +218,7 @@ $(BUILD)/engine/%.o: doomgeneric/%.c
 	@mkdir -p $(BUILD)/engine
 	$(CLANG) $(ENGINE_CFLAGS) -c $< -o $@
 
-$(BUILD)/port/%.o: port/%.c port/include/k32libc.h port/net.h ../../include/runtime/k32_app_abi.h
+$(BUILD)/port/%.o: port/%.c port/include/k32libc.h port/net.h port/hunt.h ../../include/runtime/k32_app_abi.h
 	@mkdir -p $(BUILD)/port
 	$(CLANG) $(CFLAGS) -Wall -Wno-unused-function -c $< -o $@
 
@@ -214,4 +247,4 @@ bench: build/doombench build/doombench-fast
 clean:
 	rm -rf build
 
-.PHONY: all stats sim view check verify verify-net pods manifest upload bench clean FORCE
+.PHONY: all stats sim view check verify verify-net verify-hunt pods manifest upload bench clean FORCE

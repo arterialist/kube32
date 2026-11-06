@@ -1,0 +1,242 @@
+# The hunt: DOOM on the boards (examples/doom.yaml) shoots the cluster it runs
+# on. Every demon on the map is a pod, and killing it deletes the pod through
+# the API server; the Deployment starts a replacement, which comes back as a
+# new demon. One demon, a red marine, is doom-sim itself. The game is a single
+# player's: POST /doom/join answers 409.
+#
+#   doom-sim     control plane: DOOM_HUNT=1 (port/hunt.c)
+#   doom-view    Cardputer: the screen, with pod names
+#   doom-reaper  control plane: turns kill events into DELETEs by name. It
+#                reaches the API server on the node's loopback address
+#   zombie       control plane: pods that announce themselves on doom.pods
+#   imp          Cardputer: the same pod. One fits beside doom-view
+#
+#   make -C apps/doom pods manifest
+#   make -C apps/doom upload SERVER=http://<control-plane-ip>:6443
+#   kubectl --context kube32 apply -f apps/doom/build/doom-hunt.yaml
+#   curl -s http://<control-plane-ip>/doom/hunt
+#
+# build/doom-hunt.yaml starts with the wordsketch and llm-diffusion pods of
+# examples/doom.yaml at 0 replicas; apps/doom/build/doom.yaml and
+# wordsketch.yaml stop the hunt's pods again.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: doom-sim
+  namespace: default
+  labels: {app: doom, tier: sim}
+spec:
+  replicas: 1
+  strategy: {type: Recreate}
+  selector:
+    matchLabels: {app: doom, tier: sim}
+  template:
+    metadata:
+      labels: {app: doom, tier: sim}
+      annotations:
+        kube32.io/blobs: doom-wad
+        kube32.io/event-topics: doom.keys,doom.pods,doom.reaped
+        kube32.io/tick-interval: "50ms"
+        kube32.io/execution-budget: "off"
+        kube32.io/core: "1"                # the worker the reaper is not on
+        kube32.io/wasm-stack: "6Ki"        # 3 KiB in use: the rest of the default 16 KiB leaves room for the pods
+    spec:
+      enableServiceLinks: false            # no Service variables: a start lists no Services
+      nodeSelector:
+        node-role.kubernetes.io/control-plane: ""
+      containers:
+        - name: sim
+          image: wasm://blob/doom-sim
+          ports: [{name: http, containerPort: 7000}]
+          env:
+            - {name: DOOM_HUNT, value: "1"}
+            - {name: DOOM_IWAD, value: "doom1.wad"}
+            - {name: DOOM_WAD_BLOB, value: "doom-wad"}
+            - {name: DOOM_ARGS, value: "-warp 1 1 -skill 3 -kb 224"}
+            - {name: DOOM_SCREENBLOCKS, value: "11"}
+            - {name: DOOM_DETAIL, value: "1"}
+            - {name: DOOM_FPS, value: "4"}
+            - name: POD_NAME
+              valueFrom: {fieldRef: {fieldPath: metadata.name}}
+            - name: NODE_NAME
+              valueFrom: {fieldRef: {fieldPath: spec.nodeName}}
+          resources:
+            requests: {memory: 640Ki, esp32.io/psram: 640Ki, hardware.kube32.io/ipc: "1"}
+            limits: {memory: 640Ki, esp32.io/psram: 640Ki}
+          securityContext:
+            capabilities: {add: ["CHANNEL_IPC"]}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: doom-view
+  namespace: default
+  labels: {app: doom, tier: view}
+spec:
+  replicas: 1
+  strategy: {type: Recreate}
+  selector:
+    matchLabels: {app: doom, tier: view}
+  template:
+    metadata:
+      labels: {app: doom, tier: view}
+      annotations:
+        kube32.io/blobs: doom-pack
+        kube32.io/event-topics: doom.draw
+        kube32.io/tick-interval: "50ms"
+        kube32.io/execution-budget: "off"
+    spec:
+      enableServiceLinks: false            # no Service variables: a start lists no Services
+      nodeSelector:
+        kube32.io/board: cardputer
+      containers:
+        - name: view
+          image: wasm://blob/doom-view
+          ports: [{name: http, containerPort: 7000}]
+          env:
+            - {name: DOOM_PACK_BLOB, value: "doom-pack"}
+            - {name: DOOM_KEYS_TOPIC, value: "doom.keys"}
+          resources:
+            requests:
+              memory: 32Ki
+              hardware.kube32.io/tft-display: "1"
+              hardware.kube32.io/keyboard: "1"
+              hardware.kube32.io/ipc: "1"
+            limits: {memory: 32Ki}
+          securityContext:
+            capabilities: {add: ["DISPLAY", "KEYBOARD", "CHANNEL_IPC"]}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: doom-reaper
+  namespace: default
+  labels: {app: doom-hunt, tier: reaper}
+spec:
+  replicas: 1
+  strategy: {type: Recreate}
+  selector:
+    matchLabels: {app: doom-hunt, tier: reaper}
+  template:
+    metadata:
+      labels: {app: doom-hunt, tier: reaper}
+      annotations:
+        kube32.io/event-topics: doom.kill
+        kube32.io/core: "0"
+    spec:
+      enableServiceLinks: false            # no Service variables: a start lists no Services
+      nodeSelector:
+        node-role.kubernetes.io/control-plane: ""
+      containers:
+        - name: reaper
+          image: wasm://blob/doom-reaper
+          ports: [{name: http, containerPort: 7000}]
+          env:
+            - {name: API_SERVER, value: "http://127.0.0.1:6443"}
+          resources:
+            requests: {memory: 4Ki, esp32.io/psram: 4Ki, hardware.kube32.io/ipc: "1"}
+            limits: {memory: 4Ki, esp32.io/psram: 4Ki}
+          securityContext:
+            capabilities: {add: ["CHANNEL_IPC", "SERVICE_CALL"]}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: zombie
+  namespace: default
+  labels: {app: doom-hunt, tier: zombie}
+spec:
+  replicas: 4
+  strategy: {type: Recreate}
+  selector:
+    matchLabels: {app: doom-hunt, tier: zombie}
+  template:
+    metadata:
+      labels: {app: doom-hunt, tier: zombie}
+    spec:
+      enableServiceLinks: false            # no Service variables: a start lists no Services
+      nodeSelector:
+        node-role.kubernetes.io/control-plane: ""
+      containers:
+        - name: target
+          image: wasm://blob/doom-target
+          env:
+            - name: POD_NAME
+              valueFrom: {fieldRef: {fieldPath: metadata.name}}
+            - name: NODE_NAME
+              valueFrom: {fieldRef: {fieldPath: spec.nodeName}}
+          resources:
+            requests: {memory: 1Ki, esp32.io/psram: 1Ki, hardware.kube32.io/ipc: "1"}
+            limits: {memory: 1Ki, esp32.io/psram: 1Ki}
+          securityContext:
+            capabilities: {add: ["CHANNEL_IPC"]}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: imp
+  namespace: default
+  labels: {app: doom-hunt, tier: imp}
+spec:
+  replicas: 1
+  strategy: {type: Recreate}
+  selector:
+    matchLabels: {app: doom-hunt, tier: imp}
+  template:
+    metadata:
+      labels: {app: doom-hunt, tier: imp}
+    spec:
+      enableServiceLinks: false            # no Service variables: a start lists no Services
+      nodeSelector:
+        kube32.io/board: cardputer
+      containers:
+        - name: target
+          image: wasm://blob/doom-target
+          env:
+            - name: POD_NAME
+              valueFrom: {fieldRef: {fieldPath: metadata.name}}
+            - name: NODE_NAME
+              valueFrom: {fieldRef: {fieldPath: spec.nodeName}}
+          resources:
+            requests: {memory: 1Ki, hardware.kube32.io/ipc: "1"}
+            limits: {memory: 1Ki}
+          securityContext:
+            capabilities: {add: ["CHANNEL_IPC"]}
+---
+apiVersion: v1
+kind: Service
+metadata: {name: doom-sim, namespace: default}
+spec:
+  selector: {app: doom, tier: sim}
+  ports: [{name: http, port: 80, targetPort: http}]
+---
+apiVersion: v1
+kind: Service
+metadata: {name: doom-view, namespace: default}
+spec:
+  selector: {app: doom, tier: view}
+  ports: [{name: http, port: 80, targetPort: http}]
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: doom
+  namespace: default
+  annotations:
+    kube32.io/event-stream: "/doom/events=doom.tics"
+spec:
+  rules:
+    - http:
+        paths:
+          - path: /doom
+            pathType: Prefix
+            backend:
+              service:
+                name: doom-sim
+                port: {number: 80}
+          - path: /doom-view
+            pathType: Prefix
+            backend:
+              service:
+                name: doom-view
+                port: {number: 80}

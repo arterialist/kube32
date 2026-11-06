@@ -247,9 +247,10 @@ double atan2(double y, double x) { (void)y; (void)x; return 0; }
 
 static char logline[512];
 static uint32_t loglen;
+int k32_libc_quiet;     /* the pod writes no log lines (port/hunt.c) */
 
 static void log_flush(void) {
-    if (loglen) k32_log(logline, loglen);
+    if (loglen && !k32_libc_quiet) k32_log(logline, loglen);
     loglen = 0;
 }
 
@@ -260,6 +261,7 @@ static void log_char(char c) {
 }
 
 _Noreturn void exit(int code) {
+    k32_libc_quiet = 0;
     log_flush();
     char m[32];
     int n = snprintf(m, sizeof m, "exit(%d)", code);

@@ -146,6 +146,61 @@ spec:
             limits:
               memory: 256Ki
 ---
+# ---- the hunt's pods (examples/doom-hunt.yaml) at 0 replicas: this apply stops the hunt ----
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: doom-reaper
+  namespace: default
+  labels: {app: doom-hunt, tier: reaper}
+spec:
+  replicas: 0
+  strategy: {type: Recreate}
+  selector:
+    matchLabels: {app: doom-hunt, tier: reaper}
+  template:
+    metadata:
+      labels: {app: doom-hunt, tier: reaper}
+    spec:
+      containers:
+        - {name: reaper, image: wasm://blob/doom-reaper}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: zombie
+  namespace: default
+  labels: {app: doom-hunt, tier: zombie}
+spec:
+  replicas: 0
+  strategy: {type: Recreate}
+  selector:
+    matchLabels: {app: doom-hunt, tier: zombie}
+  template:
+    metadata:
+      labels: {app: doom-hunt, tier: zombie}
+    spec:
+      containers:
+        - {name: target, image: wasm://blob/doom-target}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: imp
+  namespace: default
+  labels: {app: doom-hunt, tier: imp}
+spec:
+  replicas: 0
+  strategy: {type: Recreate}
+  selector:
+    matchLabels: {app: doom-hunt, tier: imp}
+  template:
+    metadata:
+      labels: {app: doom-hunt, tier: imp}
+    spec:
+      containers:
+        - {name: target, image: wasm://blob/doom-target}
+---
 # ---- wordsketch ----
 apiVersion: apps/v1
 kind: Deployment

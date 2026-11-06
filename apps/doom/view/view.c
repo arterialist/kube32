@@ -17,7 +17,9 @@
  * s d move and turn, space uses, f fires, enter and escape pass through.
  *
  * Along the bottom it draws the status bar's numbers the sim appends to
- * each draw list: the ammo of the weapon up, health, armor, and the keys. */
+ * each draw list: the ammo of the weapon up, health, armor, and the keys.
+ * In the hunt (port/hunt.c) a record after them names pods: a line along the
+ * top, and a tag over each demon in sight. */
 #include <stdint.h>
 #include "runtime/k32_app_abi.h"
 #include "drawlist.h"
@@ -25,6 +27,7 @@
 #define VIEW_W 240
 #define BAND_ROWS 27            /* 5 bands of a 135-row view */
 #define LIST_BYTES 12288        /* the sim's cap at 240 wide (Makefile: LIST_BYTES) */
+#define NAMES_BYTES 256        /* the hunt's record (port/hunt.h: HUNT_RECORD_MAX) */
 #define HEAD_BYTES 4096
 
 /* the tiny libc clang expects for a freestanding module */
@@ -32,7 +35,7 @@ void* memcpy(void* d, const void* s, unsigned long n) { uint8_t* a = d; const ui
 void* memset(void* d, int c, unsigned long n) { uint8_t* a = d; while (n--) *a++ = (uint8_t)c; return d; }
 static unsigned slen(const char* s) { unsigned n = 0; while (s[n]) n++; return n; }
 
-static uint8_t list[LIST_BYTES + 64];   /* the topic comes first, then the message */
+static uint8_t list[LIST_BYTES + NAMES_BYTES + 64];   /* the topic comes first, then the message */
 static uint8_t band[VIEW_W * BAND_ROWS];
 static uint8_t head[HEAD_BYTES];
 static uint16_t pal[256];
@@ -57,10 +60,11 @@ static const uint16_t font[] = {   /* 3 x 5, a row of 3 bits each, top row first
     075557, 026227, 071747, 071717, 055711, 074717, 074757, 071111, 075757, 075717,   /* 0 .. 9 */
     051245,                                                                                /* % */
 };
-enum { C_BACK, C_AMMO, C_HEALTH, C_ARMOR1, C_ARMOR2, C_DIM, C_BLUE, C_YELLOW, C_RED, C_COLORS };
+enum { C_BACK, C_AMMO, C_HEALTH, C_ARMOR1, C_ARMOR2, C_DIM, C_BLUE, C_YELLOW, C_RED, C_WHITE, C_ORANGE, C_COLORS };
 static uint8_t hud_color[C_COLORS];
 static const uint8_t hud_rgb[C_COLORS][3] = {
     {0, 0, 0}, {255, 215, 0}, {220, 40, 40}, {60, 200, 60}, {80, 120, 255}, {150, 150, 150}, {40, 80, 255}, {255, 230, 0}, {230, 0, 0},
+    {255, 255, 255}, {255, 140, 0},
 };
 static uint8_t hud[12];
 static int hud_valid;
@@ -97,6 +101,74 @@ static void hud_draw(int32_t y0, uint32_t rows) {
     if (keys & 077) hud_fill(y0, rows, 202, HUD_Y, 36, HUD_ROWS, hud_color[C_BACK]);
     for (int k = 0; k < 3; k++)   /* blue, yellow, red: a card or a skull key */
         if (keys >> k & 011) hud_fill(y0, rows, 205 + 11 * k, HUD_Y + 2, 8, 8, hud_color[C_BLUE + k]);
+}
+
+/* ---- the hunt's names ---- */
+static const char text_chars[] = " -.@0123456789abcdefghijklmnopqrstuvwxyzDEIKLNTW";
+static const uint8_t text_font[][5] = {   /* 5 columns of 7 rows, a bit a row, top row in bit 0 */
+    {0x00,0x00,0x00,0x00,0x00}, {0x00,0x08,0x08,0x08,0x00}, {0x00,0x00,0x40,0x00,0x00}, {0x3e,0x41,0x5d,0x55,0x1e}, {0x3e,0x51,0x49,0x45,0x3e}, {0x00,0x42,0x7f,0x40,0x00},
+    {0x42,0x61,0x51,0x49,0x46}, {0x22,0x41,0x49,0x49,0x36}, {0x18,0x14,0x12,0x7f,0x10}, {0x27,0x45,0x45,0x45,0x39}, {0x3c,0x4a,0x49,0x49,0x30}, {0x01,0x71,0x09,0x05,0x03},
+    {0x36,0x49,0x49,0x49,0x36}, {0x06,0x49,0x49,0x29,0x1e}, {0x20,0x54,0x54,0x54,0x78}, {0x7f,0x44,0x44,0x44,0x38}, {0x38,0x44,0x44,0x44,0x20}, {0x38,0x44,0x44,0x44,0x7f},
+    {0x38,0x54,0x54,0x54,0x18}, {0x08,0x7e,0x09,0x01,0x02}, {0x0c,0x52,0x52,0x52,0x3e}, {0x7f,0x04,0x04,0x04,0x78}, {0x00,0x44,0x7d,0x40,0x00}, {0x20,0x40,0x44,0x3d,0x00},
+    {0x7f,0x10,0x28,0x44,0x00}, {0x00,0x41,0x7f,0x40,0x00}, {0x7c,0x04,0x18,0x04,0x78}, {0x7c,0x04,0x04,0x04,0x78}, {0x38,0x44,0x44,0x44,0x38}, {0x7e,0x12,0x12,0x12,0x0c},
+    {0x0c,0x12,0x12,0x12,0x7e}, {0x7c,0x08,0x04,0x04,0x08}, {0x48,0x54,0x54,0x54,0x24}, {0x04,0x3f,0x44,0x40,0x20}, {0x3c,0x40,0x40,0x20,0x7c}, {0x1c,0x20,0x40,0x20,0x1c},
+    {0x3c,0x40,0x30,0x40,0x3c}, {0x44,0x28,0x10,0x28,0x44}, {0x0e,0x50,0x50,0x50,0x3e}, {0x44,0x64,0x54,0x4c,0x44}, {0x7f,0x41,0x41,0x22,0x1c}, {0x7f,0x49,0x49,0x49,0x41},
+    {0x00,0x41,0x7f,0x41,0x00}, {0x7f,0x08,0x14,0x22,0x41}, {0x7f,0x40,0x40,0x40,0x40}, {0x7f,0x02,0x04,0x08,0x7f}, {0x01,0x01,0x7f,0x01,0x01}, {0x7f,0x20,0x18,0x20,0x7f},
+};
+#define TEXT_W 6                /* a glyph and the gap after it */
+#define TEXT_H 7
+#define LINE_ROWS 9             /* the line: rows 0 .. 8 */
+static const uint8_t text_color[] = {C_WHITE, C_ORANGE, C_RED, C_ARMOR1};
+static const uint8_t* names;    /* the record in the frame being drawn, or 0 */
+static uint32_t names_len;
+
+static void text_put(int32_t y0, uint32_t rows, int x, int y, const uint8_t* s, unsigned n, uint8_t color) {
+    if (y + TEXT_H <= y0 || y >= y0 + (int32_t)rows) return;
+    for (unsigned i = 0; i < n; i++, x += TEXT_W) {
+        unsigned g = 0;
+        while (text_chars[g] && text_chars[g] != (char)s[i]) g++;
+        if (!text_chars[g] || x < 0 || x + 5 > VIEW_W) continue;
+        for (int c = 0; c < 5; c++) {
+            const uint8_t bits = text_font[g][c];
+            for (int r = 0; bits >> r; r++) {
+                const int yy = y + r;
+                if (bits >> r & 1 && yy >= y0 && yy < y0 + (int32_t)rows) band[(yy - y0) * VIEW_W + x + c] = color;
+            }
+        }
+    }
+}
+/* A tag, centred over the sprite: its text with a dark edge, or white on a red box for the sim */
+static void tag_put(int32_t y0, uint32_t rows, int x, int y, const uint8_t* s, unsigned n, unsigned color) {
+    x -= (int)(n * TEXT_W) / 2;
+    if (x < 1) x = 1;
+    if (x + (int)(n * TEXT_W) > VIEW_W) x = VIEW_W - (int)(n * TEXT_W);
+    y -= TEXT_H + 2;
+    if (y < LINE_ROWS + 1) y = LINE_ROWS + 1;
+    if (color == 2) {
+        hud_fill(y0, rows, x - 1, y - 1, (int)(n * TEXT_W) + 1, TEXT_H + 2, hud_color[C_RED]);
+        text_put(y0, rows, x, y, s, n, hud_color[C_WHITE]);
+        return;
+    }
+    text_put(y0, rows, x + 1, y + 1, s, n, hud_color[C_BACK]);
+    text_put(y0, rows, x, y, s, n, hud_color[text_color[color]]);
+}
+static void names_draw(int32_t y0, uint32_t rows) {
+    if (!names) return;
+    const uint8_t* p = names + 2;
+    const uint8_t* end = names + names_len;
+    const unsigned color = p[0] < sizeof text_color ? p[0] : 0, n = p[1];
+    p += 2;
+    if (p + n >= end) return;
+    if (n && y0 < LINE_ROWS) {
+        hud_fill(y0, rows, 0, 0, VIEW_W, LINE_ROWS, hud_color[color == 2 ? C_RED : C_BACK]);
+        text_put(y0, rows, 2, 1, p, n, hud_color[color == 2 ? C_WHITE : text_color[color]]);
+    }
+    p += n;
+    unsigned tags = *p++;
+    while (tags-- && p + 4 <= end && p + 4 + p[3] <= end) {
+        tag_put(y0, rows, p[0], p[1], p + 4, p[3], p[2] < sizeof text_color ? p[2] : 0);
+        p += 4 + p[3];
+    }
 }
 
 int32_t dl_host_columns(uint8_t* dst, uint32_t stride, int32_t y0, uint32_t rows, const void* records, uint32_t n, uint32_t colormap,
@@ -155,6 +227,12 @@ K32_EXPORT("k32_event") int32_t k32_event(uint32_t topic, uint32_t topic_len, ui
     const uint32_t vh = msg[8], entries = (uint32_t)(msg[4] | msg[5] << 8);
     hud_valid = entries + sizeof hud <= len && msg[entries] == 'H' && msg[entries + 1] >= sizeof hud;
     if (hud_valid) memcpy(hud, msg + entries, sizeof hud);
+    names = 0;
+    if (hud_valid && entries + hud[1] + 4 <= len && msg[entries + hud[1]] == 'P') {
+        names = msg + entries + hud[1];
+        names_len = names[1];
+        if (entries + hud[1] + names_len > len) names = 0;
+    }
     for (uint32_t y0 = 0; draw && y0 < vh; y0 += BAND_ROWS) {
         const uint32_t rows = vh - y0 < BAND_ROWS ? vh - y0 : BAND_ROWS;
         const int64_t t0 = k32_time_ms();
@@ -165,6 +243,7 @@ K32_EXPORT("k32_event") int32_t k32_event(uint32_t topic, uint32_t topic_len, ui
             for (uint32_t r = 0; r < rows; r++)
                 for (uint32_t x = VIEW_W / 2; x-- > 0;) band[r * VIEW_W + 2 * x] = band[r * VIEW_W + 2 * x + 1] = band[r * VIEW_W + x];
         hud_draw((int32_t)y0, rows);
+        names_draw((int32_t)y0, rows);
         k32_display_blit_pal(0, (int32_t)y0, VIEW_W, (int32_t)rows, band, pal);
         draw_ms += (uint32_t)(t1 - t0);
         blit_ms += (uint32_t)(k32_time_ms() - t1);
