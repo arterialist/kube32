@@ -292,7 +292,8 @@ int main() {
         slow.gas_budget_per_call = 0;
         k32test::deploy(*rt, "default/slow", wasm, 64 * 1024, "", slow);
         std::thread busy([] { k32test::call_pod("default/slow", "/wait"); });
-        assert(wait_for([] { uint32_t age = 0; return !AppPodHost::instance().in_flight(age).empty(); }));
+        // The oldest call in flight is this pod's: another pod's call would let freeze find the pod idle
+        assert(wait_for([] { uint32_t age = 0; return AppPodHost::instance().in_flight(age).find("default/slow") != std::string::npos; }));
         std::string why;
         assert(host.freeze("default/slow", 50, why) == -1 && !host.is_frozen("default/slow"));
         std::cout << "[timeout] " << why << std::endl;
