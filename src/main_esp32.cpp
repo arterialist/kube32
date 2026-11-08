@@ -36,7 +36,9 @@
 #include "models/device.hpp"
 #include "kubelet/metrics_provider.hpp"
 #include "esp_sntp.h"
+#if __has_include("soc/rtc_cntl_reg.h")
 #include "soc/rtc_cntl_reg.h"
+#endif
 #include "esp_timer.h"
 #include "freertos/task.h"
 #include "api/http_server.hpp"
@@ -994,7 +996,7 @@ static void improv_command(Console& con, const NodeIdentity& ident, const std::s
         break;
     }
     case improv::kDeviceInfo:
-        improv_send(con, improv::rpc_result(improv::kDeviceInfo, {"kube32", kube32::api::firmware_version(), "ESP32-S3", ident.name}));
+        improv_send(con, improv::rpc_result(improv::kDeviceInfo, {"kube32", kube32::api::firmware_version(), kube32::hal::chip_display_name(), ident.name}));
         break;
     case improv::kScanNetworks: {
         // One result per network name, the strongest first; an empty one ends the list
@@ -1408,10 +1410,16 @@ void console_task(void* arg) {
             } else if (line == "K32_CMD:BOOTLOADER") {
                 // Reboot into the ROM serial bootloader so a host can flash with
                 // "--before no-reset" when the USB auto-reset does not work.
+#ifdef RTC_CNTL_FORCE_DOWNLOAD_BOOT
                 con.write("K32_OK entering download mode\n", 30);
                 vTaskDelay(pdMS_TO_TICKS(100));
+#endif
+#ifdef RTC_CNTL_FORCE_DOWNLOAD_BOOT
                 REG_WRITE(RTC_CNTL_OPTION1_REG, RTC_CNTL_FORCE_DOWNLOAD_BOOT);
                 esp_restart();
+#else
+                con.write("K32_ERR no software entry to download mode on this chip\n", 56);
+#endif
             } else if (line.rfind("K32_CMD:SDKHZ:", 0) == 0) {
                 // The card's SPI clock in kHz from the next boot on; 0 for the 20 MHz default
                 const uint32_t khz = static_cast<uint32_t>(std::strtoul(line.c_str() + 14, nullptr, 10));
@@ -1637,7 +1645,7 @@ void install_hardware_hooks(bool has_display) {
 
 void print_banner(const NodeIdentity& id) {
     printf("\n================================================================\n");
-    printf("  KUBE32  Kubernetes control plane + Wasm runtime on ESP32-S3\n");
+    printf("  KUBE32  Kubernetes control plane + Wasm runtime on %s\n", kube32::hal::chip_display_name().c_str());
     printf("================================================================\n");
     printf("[BOOT] MAC %s -> %s (%s%s%s)\n", id.mac.c_str(), id.name.c_str(), id.is_control_plane ? "control-plane" : "worker",
            id.has_psram ? ", psram" : "", id.has_display ? ", display board" : "");
