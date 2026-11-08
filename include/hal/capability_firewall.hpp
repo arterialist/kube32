@@ -1,5 +1,6 @@
 #pragma once
 
+#include "hal/chip_caps.hpp"
 #include "hal/hal_types.hpp"
 #include "hal/pod_buses.hpp"
 #include "hal/pod_rmt.hpp"
@@ -11,23 +12,6 @@
 #include <vector>
 
 namespace kube32::hal {
-
-// ESP32-S3 pads: GPIO 0-21 and 26-48 (the chip has no GPIO 22-25).
-constexpr uint64_t KUBE32_CHIP_GPIO_MASK = ((1ULL << 22) - 1) | (((1ULL << 49) - 1) & ~((1ULL << 26) - 1));
-// Reserved on every board: pin 0 (boot strapping), 19-20 (native USB),
-// 26-32 (SPI flash and quad PSRAM), 43-44 (UART0 console).
-constexpr uint64_t KUBE32_RESERVED_GPIO_MASK =
-    (1ULL << 0) | (0x7FULL << 26) | (1ULL << 43) | (1ULL << 44) | (1ULL << 19) | (1ULL << 20);
-constexpr uint64_t KUBE32_SAFE_GPIO_MASK = KUBE32_CHIP_GPIO_MASK & ~KUBE32_RESERVED_GPIO_MASK;
-// Reserved pins a pod may still claim as an input (esp32.io/gpio-input-<n>):
-// GPIO 0, the boot button of most boards. Reading it, with a pull-up or not,
-// leaves boot strapping as it is.
-constexpr uint64_t KUBE32_INPUT_GPIO_MASK = 1ULL << 0;
-// ADC1 channel N samples GPIO N+1 (channels 0-9).
-constexpr uint32_t KUBE32_ADC1_CHANNELS = 10;
-// The chip's two I2C controllers, and UART1/UART2 (UART0 is the console).
-constexpr uint8_t KUBE32_CHIP_I2C_MASK = 0x3;
-constexpr uint8_t KUBE32_CHIP_UART_MASK = 0x6;
 
 // Pins a bus runs on: SDA/SCL for I2C, TX/RX for UART; -1 when unset.
 struct BusPins {

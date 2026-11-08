@@ -1,6 +1,9 @@
 #include "hal/capability_firewall.hpp"
 #include "models/kube_models.hpp"
 #include "osal/thread.hpp"
+#if defined(ESP_PLATFORM)
+#include "esp_adc/adc_oneshot.h"
+#endif
 #include <cctype>
 #include <iostream>
 
@@ -53,6 +56,25 @@ uint32_t CapabilityFirewall::onboard_devices() const {
     return profile_.onboard_devices;
 }
 
+int adc1_channel_gpio(uint32_t ch) {
+#if defined(ESP_PLATFORM)
+    int io = -1;
+    return adc_oneshot_channel_to_io(ADC_UNIT_1, static_cast<adc_channel_t>(ch), &io) == ESP_OK ? io : -1;
+#else
+    return static_cast<int>(ch) + 1;
+#endif
+}
+
+std::string chip_display_name() {
+#if defined(ESP_PLATFORM)
+    std::string t = CONFIG_IDF_TARGET;
+#else
+    std::string t = "esp32s3";
+#endif
+    for (char& c : t) c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+    return t.size() > 5 ? t.substr(0, 5) + "-" + t.substr(5) : t;
+}
+
 uint64_t CapabilityFirewall::claimable_gpio_mask_locked() const {
     return KUBE32_SAFE_GPIO_MASK & ~profile_.reserved_gpio_mask;
 }
@@ -61,7 +83,8 @@ uint16_t CapabilityFirewall::claimable_adc1_mask_locked() const {
     uint64_t pins = claimable_gpio_mask_locked();
     uint16_t mask = 0;
     for (uint32_t ch = 0; ch < KUBE32_ADC1_CHANNELS; ++ch) {
-        if (pins & (1ULL << (ch + 1))) mask |= static_cast<uint16_t>(1U << ch);
+        const int gpio = adc1_channel_gpio(ch);
+        if (gpio >= 0 && gpio < 64 && (pins & (1ULL << gpio))) mask |= static_cast<uint16_t>(1U << ch);
     }
     return mask;
 }
@@ -537,12 +560,12 @@ bool CapabilityFirewall::register_pod_locked(const std::string& pod_id, const st
                         }
                         if (ch >= KUBE32_ADC1_CHANNELS) {
                             cleanup_claimed();
-                            out_error = "Invalid ADC1 channel: " + std::to_string(ch) + " (Max 9)";
+                            out_error = "Invalid ADC1 channel: " + std::to_string(ch) + " (Max " + std::to_string(KUBE32_ADC1_CHANNELS - 1) + ")";
                             return false;
                         }
                         if ((claimable_adc1_mask_locked() & (1U << ch)) == 0) {
                             cleanup_claimed();
-                            out_error = "Security Violation: ADC1 channel " + std::to_string(ch) + " (GPIO " + std::to_string(ch + 1) +
+                            out_error = "Security Violation: ADC1 channel " + std::to_string(ch) + " (GPIO " + std::to_string(adc1_channel_gpio(ch)) +
                                         ") is used by the " + profile_.name + " board.";
                             return false;
                         }
@@ -573,9 +596,9 @@ bool CapabilityFirewall::register_pod_locked(const std::string& pod_id, const st
                             out_error = "Invalid I2C bus key format: " + key;
                             return false;
                         }
-                        if (bus >= 2) {
+                        if (bus >= 8 || (KUBE32_CHIP_I2C_MASK & (1U << bus)) == 0) {
                             cleanup_claimed();
-                            out_error = "Invalid I2C bus: " + std::to_string(bus) + " (ESP32-S3 has buses 0 and 1)";
+                            out_error = "Invalid I2C bus: " + std::to_string(bus) + " (the chip has " + std::to_string(__builtin_popcount(KUBE32_CHIP_I2C_MASK)) + " I2C buses)";
                             return false;
                         }
                         if ((profile_.i2c_bus_mask & (1U << bus)) == 0) {

@@ -1,4 +1,5 @@
 #include "models/device.hpp"
+#include "hal/chip_caps.hpp"
 
 #include <cstdio>
 
@@ -27,8 +28,8 @@ const DeviceDriver kDrivers[] = {
     {"switch", DeviceBus::Gpio, 0, 0, "", kDriverMemory, 30000, "pin", false, nullptr, 0, {}},
 };
 
-// ESP32-S3 pads: GPIO 0-21 and 26-48
-bool chip_gpio(int64_t pin) { return (pin >= 0 && pin <= 21) || (pin >= 26 && pin <= 48); }
+// The chip's pads
+bool chip_gpio(int64_t pin) { return pin >= 0 && pin < 64 && (hal::KUBE32_CHIP_GPIO_MASK & (1ULL << pin)) != 0; }
 
 bool config_key(const std::string& k) {
     if (k.empty() || k.size() > 63) return false;
@@ -142,7 +143,7 @@ bool parse_device_spec(const JsonValue* spec, DeviceSpec& out, std::string& why)
         if (i2c) {
             if (const JsonValue* b = i2c->get("bus")) {
                 int64_t bus = -1;
-                if (!json_int(*b, bus) || bus < 0 || bus > 1) { why = "spec.i2c.bus: Invalid value: " + json_text(*b) + ": the ESP32-S3 has I2C buses 0 and 1"; return false; }
+                if (!json_int(*b, bus) || bus < 0 || bus > 7 || (hal::KUBE32_CHIP_I2C_MASK & (1U << bus)) == 0) { why = "spec.i2c.bus: Invalid value: " + json_text(*b) + ": not an I2C bus of this chip"; return false; }
                 out.i2c.bus = static_cast<uint8_t>(bus);
             }
             if (const JsonValue* a = i2c->get("address")) {
@@ -187,7 +188,7 @@ bool parse_device_spec(const JsonValue* spec, DeviceSpec& out, std::string& why)
             }
             int64_t gpio = -1;
             if (!json_int(kv.second, gpio) || !chip_gpio(gpio)) {
-                why = "spec.pins." + kv.first + ": Invalid value: " + json_text(kv.second) + ": an ESP32-S3 GPIO (0-21, 26-48)";
+                why = "spec.pins." + kv.first + ": Invalid value: " + json_text(kv.second) + ": not a GPIO of this chip";
                 return false;
             }
             // GPIO 0 straps the boot mode: read, never driven
