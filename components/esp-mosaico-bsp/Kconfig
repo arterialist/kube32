@@ -1,0 +1,65 @@
+menu "ESP-Mosaico BSP"
+
+    config BSP_DISPLAY_ENABLE
+        bool "Enable BSP display support"
+        default y
+
+    config BSP_DISPLAY_LVGL_ENABLE
+        bool "Enable LVGL display adapter"
+        depends on BSP_DISPLAY_ENABLE
+        default y
+        help
+            Disable for GSP or other renderers using the raw panel and touch
+            interfaces. The renderer owns synchronization in that mode.
+
+    config BSP_CO5300_ENABLE_TE
+        bool "Enable CO5300 TE anti-tearing synchronization"
+        depends on BSP_DISPLAY_ENABLE
+        default y
+        help
+            Enable the CO5300 tearing-effect output and connect GPIO43 to the
+            esp_lvgl_adapter TE synchronization path. The BSP default display
+            configuration uses TE_SYNC when this option is enabled.
+
+            Disable this option to omit the CO5300 TE-enable command and use
+            the normal SPI display path without a TE interrupt.
+
+    config BSP_LCD_QSPI_DRIVE_CAP
+        int "QSPI LCD bus pin drive strength (0-3)"
+        range 0 3
+        default 2
+        help
+            GPIO drive capability for the CO5300 QSPI bus pins: SCL and DATA0-DATA3.
+            Lower values reduce edge rate and RF emissions (useful for Wi-Fi/BLE
+            coexistence). 0 = weakest (GPIO_DRIVE_CAP_0), 3 = strongest.
+            Default is 2 (GPIO_DRIVE_CAP_DEFAULT).
+
+    choice BSP_NAND_FLASH_CLOCK
+        prompt "Default SPI NAND clock frequency"
+        default BSP_NAND_FLASH_CLOCK_80M
+        help
+            Default working clock: 80 MHz. Select 40 MHz if needed.
+            Used when bsp_nand_flash_init() has no clock specified;
+            an explicit clock_speed_hz takes precedence.
+            QIO/QOUT bootstrap remains capped at 20 MHz.
+
+        config BSP_NAND_FLASH_CLOCK_40M
+            bool "40 MHz"
+
+        config BSP_NAND_FLASH_CLOCK_80M
+            bool "80 MHz"
+    endchoice
+
+    config BSP_MOTOR_ENABLE_PWM
+        bool "Enable LEDC PWM motor control"
+        default y
+
+    config BSP_VCC_3V3_RAMP_MS
+        int "VCC_3V3 soft-start ramp time (ms)"
+        range 0 1000
+        default 50
+        help
+            Sweep the duty cycle on the VCC_3V3 enable GPIO over this time so the
+            high-side switch opens gradually. Set to 0 to drive the pin directly.
+
+endmenu

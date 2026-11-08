@@ -1,0 +1,13 @@
+# ESP-Mosaico 16 MB: the factory's first 2 MiB stay exactly as shipped (otadata,
+# phy_init, sysmeta, vibe_mode, coredump); kube32 starts at 0x200000
+# Name,      Type, SubType,  Offset,    Size,      Flags
+otadata,     data, ota,      0x9000,    0x2000,
+phy_init,    data, phy,      0xb000,    0x1000,
+sysmeta,     data, nvs,      0xc000,    0x14000,
+vibe_mode,   app,  test,     0x20000,   0x1c0000,
+coredump,    data, coredump, 0x1e0000,  0x20000,
+nvs,         data, nvs,      0x200000,  0x10000,
+ota_0,       app,  ota_0,    0x210000,  0x500000,
+ota_1,       app,  ota_1,    0x710000,  0x500000,
+journal,     data, 0x40,     0xc10000,  0x100000,
+storage,     data, fat,      0xd10000,  0x2f0000,

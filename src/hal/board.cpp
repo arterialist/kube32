@@ -79,8 +79,16 @@ public:
 
 }  // namespace
 
+#if CONFIG_IDF_TARGET_ESP32S31
+Board* kit_board();
+#endif
+
 Board* board_for(std::string_view name) {
     static CardputerBoard cardputer;
+#if CONFIG_IDF_TARGET_ESP32S31
+    // The kit's image has one board: an empty profile selects it as well
+    if (name.empty() || name == "esp-mosaico" || name == "kit") return kit_board();
+#endif
     if (name == "cardputer" || name == "display") return &cardputer;
     return nullptr;
 }

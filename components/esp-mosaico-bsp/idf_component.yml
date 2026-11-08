@@ -1,0 +1,52 @@
+version: "0.2.0"
+description: Board Support Package for ESP-Mosaico
+license: Apache-2.0
+
+targets:
+  - esp32s31
+
+tags:
+  - bsp
+
+dependencies:
+  idf: ">=6.2"
+
+  espressif/esp_lvgl_adapter:
+    version: "0.6.2"
+    public: true
+    rules:
+      - if: $CONFIG{BSP_DISPLAY_ENABLE} == True && $CONFIG{BSP_DISPLAY_LVGL_ENABLE} == True
+
+  lvgl/lvgl:
+    version: "^9.5.0,<9.6.0"
+    rules:
+      - if: $CONFIG{BSP_DISPLAY_ENABLE} == True && $CONFIG{BSP_DISPLAY_LVGL_ENABLE} == True
+
+  espressif/esp_lcd_co5300: ^2.2
+
+  espressif/esp_lcd_touch_cst9220: ^0.1
+
+  espressif/spi_nand_flash:
+    version: "==1.4.4"
+    override_path: ../espressif__spi_nand_flash
+    public: true
+
+  espressif/esp_codec_dev:
+    version: "~1.6"
+    public: true
+
+  espressif/button:
+    version: "^4"
+    public: true
+
+  espressif/bmi270_sensor:
+    version: "^0.4.1"
+    public: true
+
+  espressif/bmm150:
+    version: "1.1.0"
+    public: true
+
+  espressif/bq27220:
+    version: "^0.1.1~1"
+    public: true

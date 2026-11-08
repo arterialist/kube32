@@ -69,6 +69,7 @@ set(KUBE32_APP_SRCS
     hal/pod_rmt.cpp
     hal/tft_keyboard_hardware.cpp
     hal/board.cpp
+    hal/board_kit.cpp
     hal/firmware_slots.cpp
     ipc/channel.cpp
     kubelet/kube_api_client.cpp
@@ -133,6 +134,13 @@ set(KUBE32_APP_SRCS
     main_esp32.cpp
 )
 
+# The vendor BSP builds on this one target
+idf_build_get_property(kube32_target IDF_TARGET)
+set(KUBE32_BOARD_REQUIRES)
+if(kube32_target STREQUAL "esp32s31")
+    list(APPEND KUBE32_BOARD_REQUIRES esp-mosaico-bsp esp_lcd esp_driver_i2s espressif__esp_lcd_touch espressif__esp_codec_dev)
+endif()
+
 idf_component_register(
     SRCS ${KUBE32_APP_SRCS} ${WASM3_SRCS}
     INCLUDE_DIRS 
@@ -167,6 +175,7 @@ idf_component_register(
         mbedtls
         app_update
         bootloader_support
+        ${KUBE32_BOARD_REQUIRES}
 )
 
 # What the firmware needs from every build system: PlatformIO adds the same

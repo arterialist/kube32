@@ -171,10 +171,15 @@ NodeIdentity detect_identity() {
     }
     bool control_plane = id.has_psram;
     if (role[0]) control_plane = (std::strcmp(role, "control-plane") == 0);
+#if CONFIG_IDF_TARGET_ESP32S31
+    id.board = kube32::hal::board_for(board);
+    id.has_display = id.board != nullptr;
+#else
     if (board[0]) {
         id.board = kube32::hal::board_for(board);
         id.has_display = id.board != nullptr;
     }
+#endif
     id.is_control_plane = control_plane;
     char derived[16];
     snprintf(derived, sizeof(derived), "esp32-%02x%02x%02x", mac[3], mac[4], mac[5]);
