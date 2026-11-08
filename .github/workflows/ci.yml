@@ -32,7 +32,8 @@ jobs:
         run: cmake --build build --parallel 4
       - name: Test
         # A per-test timeout turns a hang into a failure instead of a stalled job.
-        run: ctest --test-dir build --output-on-failure --timeout 300 --parallel 4
+        # The macOS runners have three cores, and several tests assert on timing.
+        run: ctest --test-dir build --output-on-failure --timeout 300 --parallel ${{ matrix.os == 'macos-15' && 2 || 4 }}
 
   tessera:
     name: Tessera native tests (db, api, web)
