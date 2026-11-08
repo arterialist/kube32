@@ -65,7 +65,7 @@ kubectl apply -f apps/wordsketch/build/wordsketch.yaml
 kubectl apply -f apps/doom/build/doom.yaml
 ```
 
-From the apply to every pod rolled out, a switch takes 12 to 15 s on a home network. Busy networks have taken up to 28 s.
+From the apply to every pod rolled out, a switch takes 12 to 15 s on a home network. Busy networks have taken up to 45 s.
 
 ## The hunt
 
