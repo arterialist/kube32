@@ -31,7 +31,7 @@ MemoryStats MemoryManager::get_stats() {
     stats.sram_total = heap_caps_get_total_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
     stats.sram_free = heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
     stats.sram_min_free = heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
-#if CONFIG_SPIRAM_SUPPORT || CONFIG_ESP32S3_SPIRAM_SUPPORT
+#if CONFIG_SPIRAM
     stats.psram_total = heap_caps_get_total_size(MALLOC_CAP_SPIRAM);
     stats.psram_free = heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
     stats.psram_min_free = heap_caps_get_minimum_free_size(MALLOC_CAP_SPIRAM);

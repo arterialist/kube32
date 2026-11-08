@@ -22,7 +22,7 @@ size_t System::get_min_free_heap_bytes() {
 }
 
 size_t System::get_free_psram_bytes() {
-#if CONFIG_SPIRAM_SUPPORT || CONFIG_ESP32S3_SPIRAM_SUPPORT
+#if CONFIG_SPIRAM
     return heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
 #else
     return 0;
@@ -30,7 +30,7 @@ size_t System::get_free_psram_bytes() {
 }
 
 size_t System::get_total_psram_bytes() {
-#if CONFIG_SPIRAM_SUPPORT || CONFIG_ESP32S3_SPIRAM_SUPPORT
+#if CONFIG_SPIRAM
     return heap_caps_get_total_size(MALLOC_CAP_SPIRAM);
 #else
     return 0;
