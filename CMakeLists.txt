@@ -22,6 +22,10 @@ if(KUBE32_BUILD_FIRMWARE)
     # ==========================================================================
     # ESP-IDF Target (Microcontroller Firmware)
     # ==========================================================================
+    # PlatformIO passes its own component directories
+    if(NOT DEFINED EXTRA_COMPONENT_DIRS)
+        set(EXTRA_COMPONENT_DIRS ${CMAKE_CURRENT_LIST_DIR}/src)
+    endif()
     include($ENV{IDF_PATH}/tools/cmake/project.cmake)
     project(kube32)
     message(STATUS "[Kube32] Building for Target: ${IDF_TARGET} (ESP-IDF / FreeRTOS)")

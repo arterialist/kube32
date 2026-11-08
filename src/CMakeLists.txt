@@ -21,6 +21,21 @@ set(WASM3_SRCS
     ${CMAKE_CURRENT_LIST_DIR}/../third_party/wasm3/source/m3_xxh64.c
 )
 
+# The embedded image and bundle tables are generated at configure time, and
+# again whenever an image changes (PlatformIO also refreshes them before each
+# build, in tools/pio_embed.py).
+if(NOT CMAKE_BUILD_EARLY_EXPANSION)
+    idf_build_get_property(kube32_python PYTHON)
+    set(kube32_root ${CMAKE_CURRENT_LIST_DIR}/..)
+    execute_process(COMMAND ${kube32_python} ${kube32_root}/tools/embed_assets.py --esp
+                    WORKING_DIRECTORY ${kube32_root} RESULT_VARIABLE kube32_embed_rc)
+    if(NOT kube32_embed_rc EQUAL 0)
+        message(FATAL_ERROR "tools/embed_assets.py failed")
+    endif()
+    file(GLOB_RECURSE kube32_image_files CONFIGURE_DEPENDS ${kube32_root}/images/*)
+    set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS ${kube32_root}/tools/embed_assets.py ${kube32_image_files})
+endif()
+
 set(KUBE32_APP_SRCS
     bench/bench_kernels.c
     api/http_server.cpp
@@ -147,6 +162,25 @@ idf_component_register(
         app_update
         bootloader_support
 )
+
+# What the firmware needs from every build system: PlatformIO adds the same
+# from platformio.ini, a plain idf.py build gets them from here.
+target_compile_definitions(${COMPONENT_LIB} PRIVATE
+    KUBE32_TARGET_ESP32=1
+    d_m3CodePageAlignSize=4096
+    d_m3HasExceptionHandling=0
+    d_m3HasTypedRefs=0
+    d_m3HasStackSwitching=0
+    d_m3HasSnapshots=0
+    d_m3HasGasMetering=1
+    d_m3MaxFunctionStackHeight=1024
+    d_m3RecordBacktraces=0
+    d_m3ParseNameSection=0
+    d_m3MaxDuplicateFunctionImpl=1
+    d_m3MaxNativeStack=98304
+    d_m3NativeStackMargin=6144
+)
+target_compile_options(${COMPONENT_LIB} PRIVATE -Wno-format)
 
 # Control plane, object store and kubelet code runs on requests and changes,
 # not per Wasm instruction: compile it for size. The interpreter, runtime,

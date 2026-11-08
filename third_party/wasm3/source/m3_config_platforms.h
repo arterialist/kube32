@@ -302,7 +302,7 @@ typedef int8_t         i8;
 #endif
 
 // Microcontrollers and other bare-metal targets, and any RTOS
-#if defined(ARDUINO) || defined(PARTICLE) || defined(PLATFORMIO) || defined(__MBED__) || \
+#if defined(ARDUINO) || defined(PARTICLE) || defined(PLATFORMIO) || defined(ESP_PLATFORM) || defined(__MBED__) || \
   defined(ESP8266) || defined(ESP32) || defined(BLUE_PILL) || defined(WM_W600) || defined(FOMU)
 #  ifndef d_m3VerboseErrorMessages
 #    define d_m3VerboseErrorMessages             0

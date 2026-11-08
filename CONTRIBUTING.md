@@ -43,6 +43,14 @@ pio run -e esp32s3
 
 The pre-build script `tools/pio_embed.py` generates `src/embedded/embedded_blobs_esp.cpp` from `images/`. Build artifacts `bootloader.bin`, `partitions.bin`, and `firmware.bin` are written to `.pio/build/esp32s3/`. The factory application partition is 3 MB.
 
+A plain ESP-IDF build works too, from an environment set up by ESP-IDF's `export.sh`. The build directory holds its own `sdkconfig`, so one checkout can build several targets:
+
+```bash
+idf.py -B build-esp32s3 -DIDF_TARGET=esp32s3 -DSDKCONFIG=build-esp32s3/sdkconfig build
+```
+
+`tools/embed_assets.py` generates the embedded tables at configure time. ESP-IDF fails the build when the image does not fit the smallest app slot of `partitions.csv`, as `tools/pio_slot_check.py` does under PlatformIO. To build the simulator from a shell where `IDF_PATH` is set, pass `-DKUBE32_BUILD_FIRMWARE=OFF` to CMake.
+
 ### Example apps and Rust SDK
 
 Build the Tessera pods and web bundle:

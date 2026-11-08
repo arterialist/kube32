@@ -27,3 +27,10 @@ src/embedded/embedded_files.cmake
 
 # Python package builds (uv build python)
 dist/
+
+# idf.py builds
+/sdkconfig
+/sdkconfig.old
+/build-*/
+/managed_components/
+/dependencies.lock
