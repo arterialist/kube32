@@ -468,8 +468,8 @@ struct Wasm3Sizes {
     uint32_t constants;     // d_m3MaxConstantTableSize
 };
 
-// The ESP32-S3 build's: 32-bit pointers and slots, PlatformIO's
-// microcontroller configuration of wasm3 (m3_config_platforms.h)
+// A microcontroller build's: 32-bit pointers and slots, the embedded
+// configuration of wasm3 (m3_config_platforms.h)
 constexpr Wasm3Sizes kBoardSizes{4, 4, 64, 176, 60, 176, 56, 16, 20, 20, 16, 6168, 64};
 
 #if defined(ESP_PLATFORM)

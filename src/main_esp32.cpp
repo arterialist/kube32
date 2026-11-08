@@ -1,4 +1,4 @@
-// Kube32 firmware entry point for ESP32-S3.
+// Kube32 firmware entry point.
 //
 // One image boots both cluster roles. A board with PSRAM becomes the control
 // plane and any other board a worker; the NVS key "role" (K32_CMD:ROLE:)
@@ -1730,7 +1730,7 @@ void cluster_task(void* pv) {
         // One stack for the interpreter, while a contiguous block still
         // exists: every call into a pod (k32_init, k32_handle, k32_tick,
         // k32_event) runs on it, so the threads that make those calls need
-        // no large stacks of their own. Xtensa has no tail calls, so the
+        // no large stacks of their own. Xtensa makes no tail calls, so the
         // interpreter holds a native frame per instruction until a function
         // returns: a request handler needs 20-40 KB.
         kube32_pool_reserve_stack(28672);

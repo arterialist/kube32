@@ -196,11 +196,11 @@ list(FILTER KUBE32_SIZE_SRCS INCLUDE REGEX "^(api|controller|scheduler|storage|k
 # Every request parses and writes JSON and Tables: keep those at -O2.
 list(FILTER KUBE32_SIZE_SRCS EXCLUDE REGEX "^api/(http_server|table_serializer|protobuf_body)\\.cpp$")
 set_source_files_properties(${KUBE32_SIZE_SRCS} PROPERTIES COMPILE_OPTIONS "-Os")
-# The ESP32-S3 loads and stores at any address in hardware: a Wasm memory
-# access is one instruction instead of a byte-wise copy
+# The cores load and store at any address in hardware: a Wasm memory access
+# is one instruction instead of a byte-wise copy
 set_source_files_properties(${WASM3_SRCS} PROPERTIES COMPILE_OPTIONS "-mno-strict-align")
 # The pods' linear algebra computes the bits kube32-sim computes: no fused
-# multiply-adds (the LX7 FPU has madd.s)
+# multiply-adds (the FPUs have fmadd)
 set_source_files_properties(runtime/pod_linalg.cpp PROPERTIES COMPILE_OPTIONS "-ffp-contract=off")
 
 # Build identity for GET /version (commit, tree state, build time); see
