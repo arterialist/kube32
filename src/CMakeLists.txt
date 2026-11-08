@@ -90,6 +90,7 @@ set(KUBE32_APP_SRCS
     models/migration.cpp
     net/mdns_discovery.cpp
     net/network_manager.cpp
+    net/wifi_tx_lock.cpp
     net/openeth_network_manager.cpp
     net/network_policy.cpp
     osal/condition_variable_posix.cpp
@@ -180,6 +181,10 @@ idf_component_register(
         bootloader_support
         ${KUBE32_BOARD_REQUIRES}
 )
+
+# ESP-NOW's insert into the Wi-Fi driver's TX queue runs under the driver's lock
+# (src/net/wifi_tx_lock.cpp)
+target_link_options(${COMPONENT_LIB} INTERFACE "-Wl,--wrap=ieee80211_post_hmac_tx")
 
 # The USB OTG console needs TinyUSB, fetched only when it is on (idf_component.yml)
 idf_component_optional_requires(PRIVATE espressif__esp_tinyusb)

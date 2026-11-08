@@ -306,10 +306,10 @@ private:
 
 // A worker without PSRAM whose kubelet has had no answer from the API server
 // for kStallRestartMs while the largest free block of its internal heap is
-// under kStallLargestBlock restarts: its Wi-Fi driver, short of a buffer once,
-// keeps every receive buffer and the node stays NotReady even while the
-// control plane's HELLOs still arrive. A restart brings the heap back whole and
-// the kubelet starts its pods again. A control plane that is away leaves the
+// under kStallLargestBlock restarts: a Wi-Fi driver that has stopped sending
+// holds every TX buffer, and the node stays NotReady even while the control
+// plane's HELLOs still arrive. A restart brings the heap back whole and the
+// kubelet starts its pods again. A control plane that is away leaves the
 // heap as it is and causes no restart. `since_ms` is when the kubelet started.
 constexpr uint64_t kStallRestartMs = 90000;
 constexpr size_t kStallLargestBlock = 12 * 1024;

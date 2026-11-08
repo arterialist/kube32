@@ -323,8 +323,6 @@ public:
     // 1 (the default): UDP whenever the node's address is known, else
     // ESP-NOW; 0: ESP-NOW to a node heard over ESP-NOW in the last
     // K32C_ESPNOW_FRESH_MS, else UDP; 2: ESP-NOW whenever its MAC is known.
-    // A stream of messages over ESP-NOW stops a board without PSRAM from
-    // receiving data frames: its Wi-Fi driver keeps every dynamic RX buffer
     enum class Route : uint8_t { Auto = 0, Udp = 1, EspNow = 2 };
     void set_route(Route r) { route_.store(static_cast<uint8_t>(r)); }
     Route route() const { return static_cast<Route>(route_.load()); }

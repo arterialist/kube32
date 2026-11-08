@@ -6,6 +6,7 @@ All notable changes to this project will be documented in this file. The format 
 
 ### Fixed
 
+- A Wi-Fi station no longer stops sending while it goes on receiving, which ended in the kubelet's stall restart on boards without PSRAM. ESP-NOW's send path linked its frames into the Wi-Fi driver's TX queue without the driver's lock; the firmware now holds the lock for that insert.
 - `k32_log` on a node out of memory drops the line instead of aborting the node.
 - wordsketch's modules link with `--stack-first`. Without it a newer linker put `wordsketch-listen`'s stack above the pod's 20 KiB limit, and the pod trapped in `k32_init`.
 
