@@ -18,6 +18,7 @@
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include <algorithm>
 #include <cstring>
 
 static const char* TAG = "Kube32Net";
@@ -45,22 +46,29 @@ std::atomic<bool> s_rejoin_held{false};
 // sockets would take the driver's whole buffer count, leaving none for the
 // access point's frames (a key handshake then times out and the station
 // drops off the network).
-esp_netif_recv_ret_t station_input_copy(void* h, void* buffer, size_t len, void* l2_buff) {
+#if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(6, 0, 0)
+using station_input_ret_t = esp_err_t;
+#define KUBE32_NETIF_RET(code) (code)
+#else
+using station_input_ret_t = esp_netif_recv_ret_t;
+#define KUBE32_NETIF_RET(code) ESP_NETIF_OPTIONAL_RETURN_CODE(code)
+#endif
+station_input_ret_t station_input_copy(void* h, void* buffer, size_t len, void* l2_buff) {
     struct netif* netif = static_cast<struct netif*>(h);
     void* esp_netif = netif->state;
     if (!buffer || !netif_is_up(netif)) {
         if (l2_buff) esp_netif_free_rx_buffer(esp_netif, l2_buff);
-        return ESP_NETIF_OPTIONAL_RETURN_CODE(ESP_FAIL);
+        return KUBE32_NETIF_RET(ESP_FAIL);
     }
     struct pbuf* p = pbuf_alloc(PBUF_RAW, static_cast<u16_t>(len), PBUF_RAM);
     if (p) std::memcpy(p->payload, buffer, len);
     esp_netif_free_rx_buffer(esp_netif, l2_buff);
-    if (!p) return ESP_NETIF_OPTIONAL_RETURN_CODE(ESP_ERR_NO_MEM);
+    if (!p) return KUBE32_NETIF_RET(ESP_ERR_NO_MEM);
     if (netif->input(p, netif) != ERR_OK) {
         pbuf_free(p);
-        return ESP_NETIF_OPTIONAL_RETURN_CODE(ESP_FAIL);
+        return KUBE32_NETIF_RET(ESP_FAIL);
     }
-    return ESP_NETIF_OPTIONAL_RETURN_CODE(ESP_OK);
+    return KUBE32_NETIF_RET(ESP_OK);
 }
 
 esp_netif_t* create_station_netif() {
@@ -233,8 +241,9 @@ public:
     // Networks with several APs under one name: the station joins the
     // strongest, not the first one a scan finds
     void fill_station_config(wifi_config_t& cfg) const {
-        std::strncpy(reinterpret_cast<char*>(cfg.sta.ssid), config_.ssid.c_str(), sizeof(cfg.sta.ssid));
-        std::strncpy(reinterpret_cast<char*>(cfg.sta.password), config_.password.c_str(), sizeof(cfg.sta.password));
+        // At most the field's size: the driver reads SSID and password by length, not as C strings
+        std::memcpy(cfg.sta.ssid, config_.ssid.data(), std::min(config_.ssid.size(), sizeof(cfg.sta.ssid)));
+        std::memcpy(cfg.sta.password, config_.password.data(), std::min(config_.password.size(), sizeof(cfg.sta.password)));
         cfg.sta.scan_method = WIFI_ALL_CHANNEL_SCAN;
         cfg.sta.sort_method = WIFI_CONNECT_AP_BY_SIGNAL;
         cfg.sta.failure_retry_cnt = 2;
@@ -324,8 +333,8 @@ public:
         }
 
         wifi_config_t ap_cfg = {};
-        std::strncpy(reinterpret_cast<char*>(ap_cfg.ap.ssid), config_.ap_ssid.c_str(), sizeof(ap_cfg.ap.ssid));
-        std::strncpy(reinterpret_cast<char*>(ap_cfg.ap.password), config_.ap_password.c_str(), sizeof(ap_cfg.ap.password));
+        std::memcpy(ap_cfg.ap.ssid, config_.ap_ssid.data(), std::min(config_.ap_ssid.size(), sizeof(ap_cfg.ap.ssid)));
+        std::memcpy(ap_cfg.ap.password, config_.ap_password.data(), std::min(config_.ap_password.size(), sizeof(ap_cfg.ap.password)));
         ap_cfg.ap.ssid_len = config_.ap_ssid.length();
         ap_cfg.ap.max_connection = 3;
         ap_cfg.ap.authmode = WIFI_AUTH_WPA2_PSK;
@@ -346,8 +355,8 @@ public:
             prepare_ap_dhcp();
         }
         wifi_config_t ap_cfg = {};
-        std::strncpy(reinterpret_cast<char*>(ap_cfg.ap.ssid), config_.ap_ssid.c_str(), sizeof(ap_cfg.ap.ssid));
-        std::strncpy(reinterpret_cast<char*>(ap_cfg.ap.password), config_.ap_password.c_str(), sizeof(ap_cfg.ap.password));
+        std::memcpy(ap_cfg.ap.ssid, config_.ap_ssid.data(), std::min(config_.ap_ssid.size(), sizeof(ap_cfg.ap.ssid)));
+        std::memcpy(ap_cfg.ap.password, config_.ap_password.data(), std::min(config_.ap_password.size(), sizeof(ap_cfg.ap.password)));
         ap_cfg.ap.ssid_len = config_.ap_ssid.length();
         ap_cfg.ap.max_connection = 4;
         ap_cfg.ap.authmode = WIFI_AUTH_WPA2_PSK;

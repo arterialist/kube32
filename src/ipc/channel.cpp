@@ -363,8 +363,10 @@ public:
         wifi_mode_t mode = WIFI_MODE_NULL;
         esp_wifi_get_mode(&mode);
         wifi_interface_t ifx = (mode == WIFI_MODE_AP || mode == WIFI_MODE_APSTA) ? WIFI_IF_AP : WIFI_IF_STA;
+#if ESP_IDF_VERSION < ESP_IDF_VERSION_VAL(6, 0, 0)
         esp_wifi_config_espnow_rate(ifx, WIFI_PHY_RATE_24M);
         if (mode == WIFI_MODE_APSTA) esp_wifi_config_espnow_rate(WIFI_IF_STA, WIFI_PHY_RATE_24M);
+#endif
         ifx_ = ifx;
         // Broadcast peer for HELLO frames
         static const uint8_t bcast[6] = {0xff, 0xff, 0xff, 0xff, 0xff, 0xff};
@@ -407,6 +409,13 @@ private:
         peer_info.encrypt = false;
         peer_info.ifidx = ifx_;
         esp_now_add_peer(&peer_info);
+#if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(6, 0, 0)
+        // The rate is set per peer here
+        esp_now_rate_config_t rate = {};
+        rate.phymode = WIFI_PHY_MODE_11G;
+        rate.rate = WIFI_PHY_RATE_24M;
+        esp_now_set_peer_rate_config(mac, &rate);
+#endif
     }
 
     static void send_callback(const wifi_tx_info_t* info, esp_now_send_status_t status) {
