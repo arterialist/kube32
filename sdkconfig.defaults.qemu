@@ -1,0 +1,4 @@
+# Runs under Espressif's QEMU with -nic user,model=open_eth: the network is the
+# emulated OpenCores MAC, and the flash and the console are QEMU's
+CONFIG_ETH_ENABLED=y
+CONFIG_ETH_USE_OPENETH=y

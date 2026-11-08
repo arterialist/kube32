@@ -113,7 +113,8 @@ bool Thread::start(EntryFn entry, void* arg, const Config& config) {
         impl_->join_sem = xSemaphoreCreateBinary();
     }
 
-    BaseType_t core = (config.core_affinity < 0) ? tskNO_AFFINITY : config.core_affinity;
+    // A core this chip does not have: no affinity (single-core targets)
+    BaseType_t core = (config.core_affinity < 0 || config.core_affinity >= portNUM_PROCESSORS) ? tskNO_AFFINITY : config.core_affinity;
     BaseType_t rc = pdFAIL;
     if (config.stack_buffer) {
         // Caller-owned stack (reserved at boot): a static task. Control blocks
@@ -230,7 +231,8 @@ bool Thread::current_cpu_time_us(uint64_t&) { return false; }
 #endif
 
 bool Thread::create(EntryFn entry, void* arg, const Config& config) {
-    BaseType_t core = (config.core_affinity < 0) ? tskNO_AFFINITY : config.core_affinity;
+    // A core this chip does not have: no affinity (single-core targets)
+    BaseType_t core = (config.core_affinity < 0 || config.core_affinity >= portNUM_PROCESSORS) ? tskNO_AFFINITY : config.core_affinity;
     struct TempContext {
         EntryFn fn;
         void* user_arg;

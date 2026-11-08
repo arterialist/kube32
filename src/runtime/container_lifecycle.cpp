@@ -31,6 +31,9 @@
 #endif
 
 #if defined(ESP_PLATFORM)
+#if defined(__riscv)
+#include "riscv/rvruntime-frames.h"
+#endif
 #include "esp_expression_with_stack.h"
 #include "freertos/semphr.h"
 #endif
@@ -110,6 +113,66 @@ static std::mutex s_interp_mutex;
 static SemaphoreHandle_t s_interp_lock = nullptr;
 static const mem::FunctionRef<void()>* s_interp_fn = nullptr;
 static void interp_trampoline() { if (s_interp_fn) (*s_interp_fn)(); }
+
+#if defined(__riscv)
+// ESP-IDF's esp_execute_shared_stack_function saves its function argument on
+// the old stack and reads it back after switching SP when GCC 15 optimizes
+// it. The same switch here keeps the argument in a callee-saved register.
+extern "C" void esp_hw_stack_guard_monitor_start(void);
+extern "C" void esp_hw_stack_guard_monitor_stop(void);
+extern "C" void esp_hw_stack_guard_set_bounds(uint32_t sp_min, uint32_t sp_max);
+
+static void call_on_shared_stack(SemaphoreHandle_t lock, void* stack_base, size_t size, void (*function)(void)) {
+    auto* tcb = reinterpret_cast<StaticTask_t*>(xTaskGetCurrentTaskHandle());
+    xSemaphoreTake(lock, portMAX_DELAY);
+    static portMUX_TYPE spinlock = portMUX_INITIALIZER_UNLOCKED;
+    portENTER_CRITICAL(&spinlock);
+    auto* stack = static_cast<StackType_t*>(stack_base);
+    memset(stack, 0xa5, size);
+    auto* top = reinterpret_cast<StackType_t*>((reinterpret_cast<uintptr_t>(stack) + size + 15) & ~static_cast<uintptr_t>(15)) -
+                RV_STK_FRMSZ / sizeof(StackType_t);
+    void* task_sp_min = tcb->pxDummy6;
+    void* task_sp_max = tcb->pxDummy8;
+    tcb->pxDummy6 = stack;
+    tcb->pxDummy8 = top;
+#if CONFIG_FREERTOS_WATCHPOINT_END_OF_STACK
+    vPortSetStackWatchpoint(stack);
+#endif
+#if CONFIG_ESP_SYSTEM_HW_STACK_GUARD
+    esp_hw_stack_guard_monitor_stop();
+    esp_hw_stack_guard_set_bounds(reinterpret_cast<uint32_t>(tcb->pxDummy6), reinterpret_cast<uint32_t>(tcb->pxDummy8));
+#endif
+    register void (*const fn)(void) asm("s9") = function;
+    register StackType_t* const new_sp asm("s10") = top;
+    __asm__ volatile(
+        "mv t0, sp\n"
+        "mv sp, s10\n"
+        "addi sp, sp, -16\n"
+        "sw t0, 0(sp)\n"
+        : : "r"(new_sp) : "t0", "memory");
+#if CONFIG_ESP_SYSTEM_HW_STACK_GUARD
+    esp_hw_stack_guard_monitor_start();
+#endif
+    portEXIT_CRITICAL(&spinlock);
+    __asm__ volatile("jalr s9\n" : : "r"(fn) : "ra", "t0", "t1", "t2", "t3", "t4", "t5", "t6", "a0", "a1", "a2", "a3", "a4", "a5", "a6", "a7", "memory");
+    portENTER_CRITICAL(&spinlock);
+#if CONFIG_ESP_SYSTEM_HW_STACK_GUARD
+    esp_hw_stack_guard_monitor_stop();
+#endif
+    __asm__ volatile("lw sp, 0(sp)\n" : : : "memory");
+    tcb->pxDummy6 = task_sp_min;
+    tcb->pxDummy8 = task_sp_max;
+#if CONFIG_FREERTOS_WATCHPOINT_END_OF_STACK
+    vPortSetStackWatchpoint(task_sp_min);
+#endif
+#if CONFIG_ESP_SYSTEM_HW_STACK_GUARD
+    esp_hw_stack_guard_set_bounds(reinterpret_cast<uint32_t>(task_sp_min), reinterpret_cast<uint32_t>(task_sp_max));
+    esp_hw_stack_guard_monitor_start();
+#endif
+    portEXIT_CRITICAL(&spinlock);
+    xSemaphoreGive(lock);
+}
+#endif
 #endif
 
 void run_on_interpreter_stack(mem::FunctionRef<void()> fn) {
@@ -120,7 +183,11 @@ void run_on_interpreter_stack(mem::FunctionRef<void()> fn) {
         std::lock_guard<std::mutex> lock(s_interp_mutex);
         if (!s_interp_lock) s_interp_lock = xSemaphoreCreateMutex();
         s_interp_fn = &fn;
+#if defined(__riscv)
+        call_on_shared_stack(s_interp_lock, stack, size, interp_trampoline);
+#else
         esp_execute_shared_stack_function(s_interp_lock, stack, size, interp_trampoline);
+#endif
         s_interp_fn = nullptr;
         return;
     }

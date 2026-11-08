@@ -485,7 +485,14 @@ private:
 
 void hold_station_rejoin(bool hold) { s_rejoin_held.store(hold); }
 
+#if CONFIG_ETH_USE_OPENETH
+std::unique_ptr<NetworkManager> create_openeth_network_manager();
+#endif
+
 std::unique_ptr<NetworkManager> create_network_manager() {
+#if CONFIG_ETH_USE_OPENETH
+    return create_openeth_network_manager();
+#endif
 #if defined(KUBE32_TARGET_ESP32)
     return std::make_unique<EspNetworkManager>();
 #else

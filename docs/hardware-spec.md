@@ -85,6 +85,10 @@ Layout in `partitions.csv` for 8 MB flash:
 | `journal` | `0x6A0000` | 1 MB | Raw object store journal (`data`, subtype `0x40`), used when no microSD card is mounted |
 | `storage` | `0x7A0000` | 384 KB | FAT filesystem with wear levelling at `/data`, used when no microSD card is mounted |
 
+## Other targets
+
+The firmware also builds with ESP-IDF 6.1 for the ESP32-C3 (`sdkconfig.defaults.esp32c3`, 4 MB flash, one app slot, no firmware rollouts) and the ESP32-P4 (`sdkconfig.defaults.esp32p4`), with `idf.py -DIDF_TARGET=<target>` as in [CONTRIBUTING.md](https://github.com/arterialist/kube32/blob/main/CONTRIBUTING.md#firmware). Neither image has run on a board yet. An ESP32-C3 image built with `sdkconfig.defaults.qemu` boots in Espressif's QEMU (`-nic user,model=open_eth`), joins a control plane over the emulated Ethernet and runs pods. The ESP32-P4 has no radio, so a P4 node has no network in this firmware yet.
+
 ## Configuration notes
 
 Settings in `platformio.ini` and `sdkconfig.defaults`:
