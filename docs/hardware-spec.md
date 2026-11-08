@@ -89,6 +89,17 @@ Layout in `partitions.csv` for 8 MB flash:
 
 The firmware also builds with ESP-IDF 6.1 for the ESP32-C3 (`sdkconfig.defaults.esp32c3`, 4 MB flash, one app slot, no firmware rollouts) and the ESP32-P4 (`sdkconfig.defaults.esp32p4`), with `idf.py -DIDF_TARGET=<target>` as in [CONTRIBUTING.md](https://github.com/arterialist/kube32/blob/main/CONTRIBUTING.md#firmware). Neither image has run on a board yet. An ESP32-C3 image built with `sdkconfig.defaults.qemu` boots in Espressif's QEMU (`-nic user,model=open_eth`), joins a control plane over the emulated Ethernet and runs pods. The ESP32-P4 has no radio, so a P4 node has no network in this firmware yet.
 
+## Console over USB OTG
+
+On a board whose USB port is wired to the USB OTG peripheral rather than USB-Serial/JTAG, the node's console runs as a CDC-ACM port. Build with `CONFIG_KUBE32_CONSOLE_USB_OTG` (`sdkconfig.defaults.usb-otg`: `idf.py -DSDKCONFIG_DEFAULTS="sdkconfig.defaults;sdkconfig.defaults.usb-otg"`). `K32_CMD:*` lines, the log stream and `tools/kube32_serial_gateway.py` run over it without a USB-serial adapter. It is off by default: the default console stays USB-Serial/JTAG.
+
+- The port is TinyUSB CDC-ACM (Espressif VID 303A, product string `Kube32 Console`), full speed on the ESP32-S3 and high speed where the chip's controller is. It has no reset wiring: DTR and RTS only tell the node a host opened the port, so `esptool --before default-reset` cannot reach it.
+- Boot and panic output stays on UART0. Output after `app_main` starts also goes to a 4 KiB ring (`CONFIG_KUBE32_CONSOLE_USB_OTG_RING_BYTES`). The first host to open the port gets it, oldest first, after a line saying how many bytes were lost when the ring overflowed. The second-stage bootloader's lines, output printed before `app_main`, and panic dumps go to UART0 only.
+- Nothing waits for a host: output with nobody reading stays in the ring, the oldest whole lines dropping first; a slow host loses new log lines, but frames (the gateway's data) wait up to their timeout and are never split.
+- `K32_CMD:BOOTLOADER` detaches from USB and resets into the ROM's download mode. Run esptool on the ROM's own port with `--before no-reset`: on the ESP32-S3 that is the USB-Serial/JTAG port, which comes back in place of the CDC port.
+- A boot after a crash stays on USB-Serial/JTAG on chips where OTG and USB-Serial/JTAG share the USB PHY, so a crash loop cannot take the port away. `CONFIG_KUBE32_CONSOLE_USB_OTG_GUARD_SECONDS` restarts the node on USB-Serial/JTAG when no console line arrives over OTG for that long after boot, for bringing up a board with no other way back.
+- The port takes 7 KB of internal RAM statically and 7 to 8 KB when it starts (measured on an ESP32-S3: tasks, the ring and TinyUSB's buffers), which is tight on a board without PSRAM.
+
 ## Configuration notes
 
 Settings in `platformio.ini` and `sdkconfig.defaults`:

@@ -11,6 +11,7 @@ All notable changes to this project will be documented in this file. The format 
 
 ### Added
 
+- A node's console can run over USB OTG (CDC-ACM) on boards without USB-Serial/JTAG on their port ([docs/hardware-spec.md](docs/hardware-spec.md#console-over-usb-otg)).
 - ESP-IDF 6.1 builds for the ESP32-C3 and the ESP32-P4, and a plain `idf.py` build beside PlatformIO ([docs/hardware-spec.md](docs/hardware-spec.md#other-targets)). An ESP32-C3 image boots under QEMU, joins a control plane and runs pods.
 - `k32_display_info` and `k32_touch_read` (`hardware.kube32.io/touch`) for pods.
 - The hunt ([docs/examples/doom.md](docs/examples/doom.md#the-hunt), `examples/doom-hunt.yaml`): DOOM shoots the cluster it runs on. Every demon on the map is a pod, a kill deletes the pod through the API server, and the Deployment's replacement comes back as a new demon. One demon is `doom-sim` itself; killing it restarts the game. The Cardputer's screen names the pods. The idea comes from KubeDoom.

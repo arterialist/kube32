@@ -21,6 +21,7 @@
 #include "tinyusb.h"
 #include "tinyusb_cdc_acm.h"
 #include "tinyusb_default_config.h"
+#include "device/usbd.h"
 
 #if !SOC_USB_UTMI_PHY_NUM
 #include "hal/usb_serial_jtag_ll.h"
@@ -305,6 +306,10 @@ bool write_frame(const char* data, size_t len, uint32_t timeout_ms) {
 }
 
 void prepare_download_reset() {
+    // The host must see the device leave: without a detach the ROM's device
+    // answers at address 0 while the host keeps using the old one
+    tud_disconnect();
+    vTaskDelay(pdMS_TO_TICKS(200));
 #if !SOC_USB_UTMI_PHY_NUM
     // The ROM talks to the host through USB-Serial/JTAG
     give_phy_to_usb_serial_jtag();
