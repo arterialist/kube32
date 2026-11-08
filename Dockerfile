@@ -16,6 +16,9 @@
 # --build-context sim-binary=<dir>, so the image holds the released bytes.
 
 ARG ALPINE_VERSION=3.22
+# Distroless has no linux/riscv64 image: build that platform with
+# --build-arg RUNTIME_BASE=alpine:3.22
+ARG RUNTIME_BASE=gcr.io/distroless/static-debian12:nonroot
 
 FROM alpine:${ALPINE_VERSION} AS build
 RUN apk add --no-cache build-base cmake linux-headers openssl-dev openssl-libs-static python3
@@ -37,7 +40,7 @@ ARG TARGETOS
 ARG TARGETARCH
 COPY --from=build /build/kube32-sim /${TARGETOS}-${TARGETARCH}/kube32-sim
 
-FROM gcr.io/distroless/static-debian12:nonroot
+FROM ${RUNTIME_BASE}
 ARG TARGETOS
 ARG TARGETARCH
 LABEL org.opencontainers.image.title="kube32-sim" \
