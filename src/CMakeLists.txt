@@ -88,6 +88,7 @@ set(KUBE32_APP_SRCS
     models/migration.cpp
     net/mdns_discovery.cpp
     net/network_manager.cpp
+    net/openeth_network_manager.cpp
     net/network_policy.cpp
     osal/condition_variable_posix.cpp
     osal/mutex_posix.cpp
@@ -145,6 +146,7 @@ idf_component_register(
         nvs_flash
         esp_event
         esp_netif
+        esp_eth
         esp_hw_support
         lwip
         vfs

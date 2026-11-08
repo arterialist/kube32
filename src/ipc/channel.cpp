@@ -13,6 +13,9 @@
 
 #if defined(KUBE32_TARGET_ESP32)
 #include "soc/soc_caps.h"
+// ESP-NOW needs the radio: chips without Wi-Fi, and a node on the emulated
+// Ethernet, carry channels over UDP alone
+#define KUBE32_HAS_ESPNOW (SOC_WIFI_SUPPORTED && !CONFIG_ETH_USE_OPENETH)
 #include "esp_now.h"
 #include "esp_wifi.h"
 #include "esp_mac.h"
@@ -348,7 +351,7 @@ private:
 // =============================================================================
 // Transport Implementations: EspNowTransport (ESP32-S3 Target)
 // =============================================================================
-#if defined(KUBE32_TARGET_ESP32) && SOC_WIFI_SUPPORTED
+#if defined(KUBE32_TARGET_ESP32) && KUBE32_HAS_ESPNOW
 class EspNowTransport : public IChannelTransport {
 public:
     EspNowTransport() = default;
@@ -476,7 +479,7 @@ bool ChannelManager::init(uint32_t node_id, uint16_t base_udp_port) {
     osal::LockGuard guard(mutex_);
     if (initialized_) return true;
 
-#if defined(KUBE32_TARGET_ESP32) && SOC_WIFI_SUPPORTED
+#if defined(KUBE32_TARGET_ESP32) && KUBE32_HAS_ESPNOW
     transport_ = std::make_unique<DualTransport>(node_id, base_udp_port);
 #else
     transport_ = std::make_unique<PeerUdpTransport>(node_id, base_udp_port);
