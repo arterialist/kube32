@@ -1,0 +1,11 @@
+# ==============================================================================
+# Kube32 ESP32-C3 4MB Flash Partition Table
+# ==============================================================================
+# 4 MB holds one image: no second slot for firmware rollouts
+# Name,      Type, SubType, Offset,   Size,     Flags
+nvs,         data, nvs,     0x9000,   0x8000,
+otadata,     data, ota,     0x11000,  0x2000,
+phy_init,    data, phy,     0x13000,  0x1000,
+ota_0,       app,  ota_0,   0x20000,  0x3B0000,
+journal,     data, 0x40,    0x3D0000, 0x20000,
+storage,     data, fat,     0x3F0000, 0x10000,
