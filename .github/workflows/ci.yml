@@ -230,3 +230,22 @@ jobs:
         run: pip install platformio==6.1.18
       - name: pio run -e esp32s3
         run: pio run -e esp32s3
+
+  firmware-idf:
+    name: Firmware (ESP-IDF 6.1, ${{ matrix.target }})
+    runs-on: ubuntu-24.04
+    container: espressif/idf:v6.1
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [esp32c3, esp32p4]
+    env:
+      IDF_COMPONENT_MANAGER: "0"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: idf.py build
+        shell: bash
+        run: |
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          . "$IDF_PATH/export.sh"
+          idf.py -B "build-${{ matrix.target }}" -DIDF_TARGET="${{ matrix.target }}" -DSDKCONFIG="build-${{ matrix.target }}/sdkconfig" build
