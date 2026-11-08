@@ -6,10 +6,13 @@ All notable changes to this project will be documented in this file. The format 
 
 ### Fixed
 
+- `k32_log` on a node out of memory drops the line instead of aborting the node.
 - wordsketch's modules link with `--stack-first`. Without it a newer linker put `wordsketch-listen`'s stack above the pod's 20 KiB limit, and the pod trapped in `k32_init`.
 
 ### Added
 
+- ESP-IDF 6.1 builds for the ESP32-C3 and the ESP32-P4, and a plain `idf.py` build beside PlatformIO ([docs/hardware-spec.md](docs/hardware-spec.md#other-targets)). An ESP32-C3 image boots under QEMU, joins a control plane and runs pods.
+- `k32_display_info` and `k32_touch_read` (`hardware.kube32.io/touch`) for pods.
 - The hunt ([docs/examples/doom.md](docs/examples/doom.md#the-hunt), `examples/doom-hunt.yaml`): DOOM shoots the cluster it runs on. Every demon on the map is a pod, a kill deletes the pod through the API server, and the Deployment's replacement comes back as a new demon. One demon is `doom-sim` itself; killing it restarts the game. The Cardputer's screen names the pods. The idea comes from KubeDoom.
 - Blob images ([docs/app-development.md](docs/app-development.md#blob-image-wasmblobname)): `image: wasm://blob/<name>` runs a module in place from the node's flash blob store. The kubelet parses and compiles it from the mapping and keeps the blob open while the pod runs, so the module's bytes take no pod memory and no Pod Overhead; a blob replaced or removed meanwhile keeps its old bytes for that pod. `kube32-podsize` reports what a module takes of a node by the API server's estimate, held in RAM and read from flash.
 - Software-rasterizer kernels ([docs/app-development.md](docs/app-development.md#raster-kernels)): `k32_raster_columns` and `k32_raster_spans` draw textured columns, the posts of patch columns and spans of a paletted 2.5D renderer into a band of an 8-bit frame through a light table, with the texels in the pod's memory or read in place from a mapped blob. `k32_display_blit` and `k32_display_blit_pal` ([docs/peripherals.md](docs/peripherals.md)) put RGB565 pixels, or palette indices through 256 entries, on a node's screen.
