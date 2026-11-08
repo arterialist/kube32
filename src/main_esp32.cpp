@@ -39,6 +39,9 @@
 #if __has_include("soc/rtc_cntl_reg.h")
 #include "soc/rtc_cntl_reg.h"
 #endif
+#if __has_include("soc/lp_system_reg.h")
+#include "soc/lp_system_reg.h"
+#endif
 #include "esp_timer.h"
 #include "freertos/task.h"
 #include "api/http_server.hpp"
@@ -66,6 +69,9 @@
 #include "osal/system.hpp"
 #include "osal/socket.hpp"
 #include "hal/board.hpp"
+#if CONFIG_KUBE32_CONSOLE_USB_OTG
+#include "hal/usb_otg_console.hpp"
+#endif
 #include "hal/sd_card.hpp"
 #include "hal/node_storage.hpp"
 #include "storage/flash_log.hpp"
@@ -280,7 +286,15 @@ bool read_nvs_wifi(std::string& ssid, std::string& pass) {
 struct Console {
     bool uart_enabled{false};
     bool last_from_usb{true};
+    bool use_otg{false};
     void init(bool usb_only) {
+#if CONFIG_KUBE32_CONSOLE_USB_OTG
+        use_otg = kube32::hal::usb_otg_console::start();
+        if (use_otg) {
+            init_uart(usb_only);
+            return;
+        }
+#endif
         if (!usb_serial_jtag_is_driver_installed()) {
             // A reset other than power-on keeps the USB link of the boot
             // before, and the clock changes at app start can leave it
@@ -316,6 +330,9 @@ struct Console {
         // the driver's interrupt handler, and the port stops answering until
         // the board is power cycled.
         usb_serial_jtag_vfs_use_driver();
+        init_uart(usb_only);
+    }
+    void init_uart(bool usb_only) {
         uart_enabled = !usb_only;
         if (uart_enabled) {
             if (!uart_is_driver_installed(UART_NUM_0)) {
@@ -328,24 +345,36 @@ struct Console {
             uart_vfs_dev_use_driver(UART_NUM_0);
         }
     }
+    int usb_read(char* buf, size_t cap, uint32_t timeout_ms) {
+#if CONFIG_KUBE32_CONSOLE_USB_OTG
+        if (use_otg) return kube32::hal::usb_otg_console::read(buf, cap, timeout_ms);
+#endif
+        return usb_serial_jtag_read_bytes(buf, cap, pdMS_TO_TICKS(timeout_ms));
+    }
     // Waits on the port that carried the last bytes and only polls the other.
     // The USB-Serial/JTAG driver drops what arrives while its receive ring
     // (4 KiB) is full, so a wait on UART0 while a request streams in over USB
     // would lose part of it; UART0's own 8 KiB ring holds a line meanwhile.
     int read(char* buf, size_t cap, uint32_t timeout_ms) {
-        if (!uart_enabled) return usb_serial_jtag_read_bytes(buf, cap, pdMS_TO_TICKS(timeout_ms));
+        if (!uart_enabled) return usb_read(buf, cap, timeout_ms);
         const TickType_t wait = pdMS_TO_TICKS(timeout_ms);
-        int n = usb_serial_jtag_read_bytes(buf, cap, last_from_usb ? wait : 0);
+        int n = usb_read(buf, cap, last_from_usb ? timeout_ms : 0);
         if (n > 0) { last_from_usb = true; return n; }
         n = uart_read_bytes(UART_NUM_0, buf, cap, last_from_usb ? 0 : wait);
         if (n > 0) { last_from_usb = false; return n; }
         if (!last_from_usb) {
-            n = usb_serial_jtag_read_bytes(buf, cap, 0);
+            n = usb_read(buf, cap, 0);
             if (n > 0) last_from_usb = true;
         }
         return n;
     }
     void write(const char* data, size_t len) {
+#if CONFIG_KUBE32_CONSOLE_USB_OTG
+        if (use_otg && (last_from_usb || !uart_enabled)) {
+            kube32::hal::usb_otg_console::write(data, len);
+            return;
+        }
+#endif
         if (last_from_usb || !uart_enabled) {
             // The driver takes a write whole or not at all, and never one
             // larger than its TX ring
@@ -363,6 +392,11 @@ struct Console {
     // One frame in one driver write: log output can surround it but never
     // split it. The frame must fit the TX ring (4096 or 2048 bytes on USB).
     bool write_frame(const char* data, size_t len, uint32_t timeout_ms) {
+#if CONFIG_KUBE32_CONSOLE_USB_OTG
+        if (use_otg && (last_from_usb || !uart_enabled)) {
+            return kube32::hal::usb_otg_console::write_frame(data, len, timeout_ms);
+        }
+#endif
         if (last_from_usb || !uart_enabled) {
             return usb_serial_jtag_write_bytes(data, len, pdMS_TO_TICKS(timeout_ms)) == static_cast<int>(len);
         }
@@ -1425,12 +1459,17 @@ void console_task(void* arg) {
             } else if (line == "K32_CMD:BOOTLOADER") {
                 // Reboot into the ROM serial bootloader so a host can flash with
                 // "--before no-reset" when the USB auto-reset does not work.
-#ifdef RTC_CNTL_FORCE_DOWNLOAD_BOOT
+#if defined(RTC_CNTL_FORCE_DOWNLOAD_BOOT) || defined(LP_SYSTEM_REG_FORCE_DOWNLOAD_BOOT)
                 con.write("K32_OK entering download mode\n", 30);
                 vTaskDelay(pdMS_TO_TICKS(100));
+#if CONFIG_KUBE32_CONSOLE_USB_OTG
+                kube32::hal::usb_otg_console::prepare_download_reset();
 #endif
 #ifdef RTC_CNTL_FORCE_DOWNLOAD_BOOT
                 REG_WRITE(RTC_CNTL_OPTION1_REG, RTC_CNTL_FORCE_DOWNLOAD_BOOT);
+#else
+                REG_SET_BIT(LP_SYSTEM_REG_SYS_CTRL_REG, LP_SYSTEM_REG_FORCE_DOWNLOAD_BOOT);
+#endif
                 esp_restart();
 #else
                 con.write("K32_ERR no software entry to download mode on this chip\n", 56);
@@ -2649,6 +2688,9 @@ void cluster_task(void* pv) {
 } // namespace
 
 extern "C" void app_main() {
+#if CONFIG_KUBE32_CONSOLE_USB_OTG
+    kube32::hal::usb_otg_console::early_init();
+#endif
     esp_err_t ret = nvs_flash_init();
     if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
         ESP_ERROR_CHECK(nvs_flash_erase());

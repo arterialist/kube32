@@ -1,0 +1,6 @@
+dependencies:
+  # The USB OTG console (CONFIG_KUBE32_CONSOLE_USB_OTG); no other build fetches it
+  espressif/esp_tinyusb:
+    version: "~2.4.0"
+    rules:
+      - if: "$CONFIG{KUBE32_CONSOLE_USB_OTG} == True"

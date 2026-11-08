@@ -1,0 +1,7 @@
+# The node's console over USB OTG (CDC-ACM) instead of USB-Serial/JTAG:
+#   idf.py -DSDKCONFIG_DEFAULTS="sdkconfig.defaults;sdkconfig.defaults.usb-otg" ...
+CONFIG_KUBE32_CONSOLE_USB_OTG=y
+CONFIG_TINYUSB_CDC_ENABLED=y
+CONFIG_TINYUSB_DESC_PRODUCT_STRING="Kube32 Console"
+CONFIG_TINYUSB_DESC_MANUFACTURER_STRING="Kube32"
+CONFIG_TINYUSB_DESC_CDC_STRING="Kube32 Console"

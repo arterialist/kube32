@@ -1,0 +1,35 @@
+menu "Kube32"
+
+    config KUBE32_CONSOLE_USB_OTG
+        bool "Run the node console over USB OTG (CDC-ACM)"
+        default n
+        depends on SOC_USB_OTG_SUPPORTED
+        help
+            The console port is a TinyUSB CDC-ACM device on the USB OTG
+            peripheral instead of USB-Serial/JTAG: for boards whose USB port
+            is wired to OTG. K32_CMD lines, the log stream and the serial
+            gateway run over it. UART0 keeps the boot and panic output. Needs
+            CONFIG_TINYUSB_CDC_ENABLED (sdkconfig.defaults.usb-otg).
+
+    config KUBE32_CONSOLE_USB_OTG_GUARD_SECONDS
+        int "Seconds to wait for a console line before going back to USB-Serial/JTAG"
+        default 0
+        range 0 3600
+        depends on KUBE32_CONSOLE_USB_OTG
+        help
+            On chips where OTG and USB-Serial/JTAG share the USB PHY: when no
+            console line arrives over OTG this long after boot, the node
+            restarts with the PHY given back to USB-Serial/JTAG for one boot.
+            For bring-up of a board with no other way back; 0 is off.
+
+    config KUBE32_CONSOLE_USB_OTG_RING_BYTES
+        int "Console output kept for a host, in bytes"
+        default 4096
+        range 1024 65536
+        depends on KUBE32_CONSOLE_USB_OTG
+        help
+            Output waits here for the CDC port, and while no host has the
+            port open the newest output stays here for the next host: the
+            boot log, for one. Internal RAM.
+
+endmenu

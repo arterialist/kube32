@@ -69,6 +69,7 @@ set(KUBE32_APP_SRCS
     hal/pod_rmt.cpp
     hal/tft_keyboard_hardware.cpp
     hal/board.cpp
+    hal/usb_otg_console.cpp
     hal/firmware_slots.cpp
     ipc/channel.cpp
     kubelet/kube_api_client.cpp
@@ -170,6 +171,9 @@ idf_component_register(
         app_update
         bootloader_support
 )
+
+# The USB OTG console needs TinyUSB, fetched only when it is on (idf_component.yml)
+idf_component_optional_requires(PRIVATE espressif__esp_tinyusb)
 
 # What the firmware needs from every build system: PlatformIO adds the same
 # from platformio.ini, a plain idf.py build gets them from here.
