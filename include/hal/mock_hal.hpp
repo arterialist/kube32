@@ -149,6 +149,10 @@ public:
     int32_t adc1_read(uint32_t channel);
     void set_mock_adc_value(uint32_t channel, uint32_t raw_value);
 
+    // Touch panel: the points k32_touch_read reports until they change
+    void set_mock_touch_points(const std::vector<TouchPoint>& points);
+    int32_t touch_read(TouchPoint* out, uint32_t max);
+
     // I2C Operations
     // A transfer reaches the device at `addr` on the bus itself or behind a
     // selected multiplexer channel; two devices answering the same address
@@ -208,6 +212,8 @@ private:
 
     std::mutex i2c_mutex_;
     std::map<std::pair<uint32_t, uint8_t>, std::shared_ptr<MockI2cDevice>> i2c_devices_;
+    std::mutex touch_mutex_;
+    std::vector<TouchPoint> touch_points_;
     // The device a transfer to `addr` on `bus` reaches: nullptr with HAL_ERR_NODEV, or HAL_ERR_IO for two
     std::shared_ptr<MockI2cDevice> i2c_target(uint32_t bus, uint8_t addr, int32_t& err);
 

@@ -531,6 +531,18 @@ int32_t MockHal::adc1_read(uint32_t channel) {
     return static_cast<int32_t>(adc1_values_[channel].load());
 }
 
+void MockHal::set_mock_touch_points(const std::vector<TouchPoint>& points) {
+    std::lock_guard<std::mutex> lock(touch_mutex_);
+    touch_points_ = points;
+}
+
+int32_t MockHal::touch_read(TouchPoint* out, uint32_t max) {
+    std::lock_guard<std::mutex> lock(touch_mutex_);
+    const uint32_t n = std::min<uint32_t>(max, static_cast<uint32_t>(touch_points_.size()));
+    for (uint32_t i = 0; i < n; ++i) out[i] = touch_points_[i];
+    return static_cast<int32_t>(n);
+}
+
 void MockHal::set_mock_adc_value(uint32_t channel, uint32_t raw_value) {
     if (channel < 16) {
         adc1_values_[channel].store(raw_value);

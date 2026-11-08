@@ -20,7 +20,8 @@ The firewall reads `resources.requests`, or `resources.limits` when `requests` i
 | `esp32.io/uart: "<count>"` | None | `<count>` free UART ports |
 | `esp32.io/rmt-tx: "1"` | None | One RMT (infrared) transmit channel and its pin: `esp32_rmt_send` |
 | `esp32.io/rmt-rx: "1"` | None | One RMT (infrared) receive channel and its pin: `esp32_rmt_receive` |
-| `hardware.kube32.io/tft-display: "1"` | `DISPLAY`, `TFT_DISPLAY` | `k32_display_text`, `k32_display_rect`, `k32_display_bar`, `k32_display_blit`, `k32_display_blit_pal` |
+| `hardware.kube32.io/tft-display: "1"` | `DISPLAY`, `TFT_DISPLAY` | `k32_display_text`, `k32_display_rect`, `k32_display_bar`, `k32_display_blit`, `k32_display_blit_pal`, `k32_display_info` |
+| `hardware.kube32.io/touch: "1"` | `TOUCH` | `k32_touch_read` |
 | `hardware.kube32.io/keyboard: "1"` | `KEYBOARD` | `k32_key_read` |
 | `hardware.kube32.io/speaker: "1"` | `SPEAKER`, `AUDIO` | `k32_tone`, `k32_audio_play` |
 | `hardware.kube32.io/microphone: "1"` | `MICROPHONE`, `MIC` | `k32_mic_read` |
@@ -38,7 +39,7 @@ Pods share each device that a `hardware.kube32.io/*` resource grants, and a pod 
 | --- | --- |
 | `hardware.kube32.io/ipc` | Every node |
 | `hardware.kube32.io/chip-temp` | Every node: the ESP32-S3's internal sensor, a stand-in in the simulator |
-| `hardware.kube32.io/tft-display`, `keyboard`, `speaker`, `microphone` | Boards with the devices on board (the Cardputer profile) |
+| `hardware.kube32.io/tft-display`, `keyboard`, `speaker`, `microphone`, `touch` | Boards with the devices on board (the Cardputer profile has a display, keyboard, speaker and microphone) |
 | `hardware.kube32.io/sd` | Nodes with a mounted microSD card ([storage](storage.md)) |
 
 A resource that a node no longer has (a card taken out, a board profile changed between boots) is set to `null` in the next status write and leaves the Node. The scheduler does not filter on these resources; the firewall checks the grants at admission.

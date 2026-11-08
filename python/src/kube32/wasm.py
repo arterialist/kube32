@@ -44,6 +44,8 @@ APP_IMPORTS = {
     "k32_tone": "i(iii)",
     "k32_audio_play": "i(iiii)",
     "k32_mic_read": "i(iii)",
+    "k32_display_info": "i(iii)",
+    "k32_touch_read": "i(ii)",
     "k32_fs_open": "i(iii)",
     "k32_fs_read": "i(iii)",
     "k32_fs_write": "i(iii)",
@@ -127,6 +129,8 @@ HARDWARE_FOR_IMPORT = {
     "k32_tone": "speaker",
     "k32_audio_play": "speaker",
     "k32_mic_read": "microphone",
+    "k32_display_info": "display",
+    "k32_touch_read": "touch",
     "k32_event_emit": "ipc",
     "k32_publish": "ipc",
     "kube32_channel_open": "ipc",
@@ -149,12 +153,13 @@ HARDWARE = {
     "keyboard": ("hardware.kube32.io/keyboard", "KEYBOARD"),
     "speaker": ("hardware.kube32.io/speaker", "SPEAKER"),
     "microphone": ("hardware.kube32.io/microphone", "MICROPHONE"),
+    "touch": ("hardware.kube32.io/touch", "TOUCH"),
     "ipc": ("hardware.kube32.io/ipc", "CHANNEL_IPC"),
     "sd": ("hardware.kube32.io/sd", "SD"),
     "service-call": (None, "SERVICE_CALL"),   # k32_http_call: a capability only, no resource
     "chip-temp": ("hardware.kube32.io/chip-temp", "CHIP_TEMP"),
 }
-HARDWARE_ORDER = ("ipc", "display", "keyboard", "speaker", "microphone", "sd", "service-call", "chip-temp")
+HARDWARE_ORDER = ("ipc", "display", "keyboard", "speaker", "microphone", "touch", "sd", "service-call", "chip-temp")
 HARDWARE_ALIASES = {"tft-display": "display", "tft": "display", "channel_ipc": "ipc", "channels": "ipc", "sd-card": "sd", "mic": "microphone",
                     "service_call": "service-call", "http": "service-call"}
 
@@ -776,7 +781,7 @@ def hardware_for_name(text):
     name = text.strip().lower()
     name = HARDWARE_ALIASES.get(name, name)
     if name not in HARDWARE:
-        raise ValueError("unknown hardware '%s' (expected display, keyboard, speaker, microphone, ipc, sd, service-call, chip-temp or none)" % text.strip())
+        raise ValueError("unknown hardware '%s' (expected display, keyboard, speaker, microphone, touch, ipc, sd, service-call, chip-temp or none)" % text.strip())
     return name
 
 

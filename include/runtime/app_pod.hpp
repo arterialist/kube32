@@ -9,6 +9,7 @@
 // published on the channel topics named in its kube32.io/event-topics
 // annotation (from any node); pods that export k32_tick get a 1 Hz callback.
 
+#include "hal/hal_types.hpp"
 #include "runtime/container_lifecycle.hpp"
 #include "runtime/pod_snapshot.hpp"
 #include "osal/mutex.hpp"
@@ -136,6 +137,10 @@ struct AppPlatformHooks {
     std::function<int32_t(const int16_t* samples, uint32_t count, uint32_t rate, uint32_t vol)> audio_play;
     // k32_mic_read: up to max samples into out (any alignment)
     std::function<int32_t(int16_t* out, uint32_t max, uint32_t timeout_ms)> mic_read;
+    // k32_display_info: the panel's size and pixel format
+    std::function<int32_t(hal::DisplayInfo& info)> display_info;
+    // k32_touch_read: up to max points now touching, the count (0: nothing touches)
+    std::function<int32_t(hal::TouchPoint* out, uint32_t max)> touch_read;
     std::function<uint32_t()> random;
     std::function<int32_t(const std::string& pod_id, std::string_view topic, const uint8_t* data, size_t len)> event_emit;
     // k32_http_call: resolves the Service and performs the call. Returns the

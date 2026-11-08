@@ -677,6 +677,54 @@ static const void* raw_audio_play(IM3Runtime rt, IM3ImportContext ictx, uint64_t
     return m3Err_none;
 }
 
+// k32_display_info(width, height, format) -> K32_OK or K32_ERR_*
+static const void* raw_display_info(IM3Runtime rt, IM3ImportContext ictx, uint64_t* sp, void* mem) {
+    int32_t& ret = *reinterpret_cast<int32_t*>(sp);
+    const uint32_t w_off = static_cast<uint32_t>(sp[1]), h_off = static_cast<uint32_t>(sp[2]), f_off = static_cast<uint32_t>(sp[3]);
+    const std::string& pod_id = pod_for(rt, ictx);
+    if (!hal::CapabilityFirewall::instance().check_permission(pod_id, hal::PeripheralType::Display, 0, hal::AccessMode::Read)) {
+        ret = hal::HAL_ERR_PERM;
+        return m3Err_none;
+    }
+    if (!guest_range_ok(mem, w_off, 4) || !guest_range_ok(mem, h_off, 4) || !guest_range_ok(mem, f_off, 4)) {
+        ret = hal::HAL_ERR_FAULT;
+        return m3Err_none;
+    }
+    hal::DisplayInfo info;
+    const int32_t rc = s_hooks.display_info ? s_hooks.display_info(info) : hal::HAL_ERR_NODEV;
+    if (rc != 0) {
+        ret = rc;
+        return m3Err_none;
+    }
+    std::memcpy(static_cast<uint8_t*>(mem) + w_off, &info.width, 4);
+    std::memcpy(static_cast<uint8_t*>(mem) + h_off, &info.height, 4);
+    std::memcpy(static_cast<uint8_t*>(mem) + f_off, &info.format, 4);
+    ret = hal::HAL_OK;
+    return m3Err_none;
+}
+
+// k32_touch_read(points, max_points) -> points touching now, or K32_ERR_*
+static const void* raw_touch_read(IM3Runtime rt, IM3ImportContext ictx, uint64_t* sp, void* mem) {
+    int32_t& ret = *reinterpret_cast<int32_t*>(sp);
+    const uint32_t off = static_cast<uint32_t>(sp[1]);
+    uint32_t max = static_cast<uint32_t>(sp[2]);
+    const std::string& pod_id = pod_for(rt, ictx);
+    if (!hal::CapabilityFirewall::instance().check_permission(pod_id, hal::PeripheralType::Touch, 0, hal::AccessMode::Read)) {
+        ret = hal::HAL_ERR_PERM;
+        return m3Err_none;
+    }
+    if (max > 10) max = 10;
+    if (!guest_range_ok(mem, off, max * sizeof(hal::TouchPoint))) {
+        ret = hal::HAL_ERR_FAULT;
+        return m3Err_none;
+    }
+    hal::TouchPoint points[10];
+    int32_t n = s_hooks.touch_read ? s_hooks.touch_read(points, max) : hal::HAL_ERR_NODEV;
+    if (n > 0) std::memcpy(static_cast<uint8_t*>(mem) + off, points, static_cast<size_t>(n) * sizeof(hal::TouchPoint));
+    ret = n;
+    return m3Err_none;
+}
+
 // k32_mic_read(out, max_samples, timeout_ms) -> samples or K32_ERR_*
 static const void* raw_mic_read(IM3Runtime rt, IM3ImportContext ictx, uint64_t* sp, void* mem) {
     const std::string& pod_id = pod_for(rt, ictx);
@@ -823,6 +871,8 @@ void link_app_host_functions(IM3Module module, const std::string& pod_id) {
     m3_LinkRawFunction(module, "env", "k32_tone",         "i(iii)",     &raw_tone);
     m3_LinkRawFunction(module, "env", "k32_audio_play",   "i(iiii)",    &raw_audio_play);
     m3_LinkRawFunction(module, "env", "k32_mic_read",     "i(iii)",     &raw_mic_read);
+    m3_LinkRawFunction(module, "env", "k32_display_info", "i(iii)",     &raw_display_info);
+    m3_LinkRawFunction(module, "env", "k32_touch_read",   "i(ii)",      &raw_touch_read);
     m3_LinkRawFunction(module, "env", "k32_fs_open",      "i(iii)",     &raw_fs_open);
     m3_LinkRawFunction(module, "env", "k32_fs_read",      "i(iii)",     &raw_fs_read);
     m3_LinkRawFunction(module, "env", "k32_fs_write",     "i(iii)",     &raw_fs_write);

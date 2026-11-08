@@ -34,7 +34,8 @@ enum class PeripheralType : uint8_t {
     RmtTx    = 10,  // RMT (IR) transmit channel (esp32.io/rmt-tx)
     RmtRx    = 11,  // RMT (IR) receive channel (esp32.io/rmt-rx)
     ChipTemp = 12,  // The chip's temperature sensor (hardware.kube32.io/chip-temp)
-    Microphone = 13 // On-board PDM microphone (hardware.kube32.io/microphone)
+    Microphone = 13, // On-board PDM microphone (hardware.kube32.io/microphone)
+    Touch    = 14   // On-board touch panel (hardware.kube32.io/touch)
 };
 
 enum class AccessMode : uint8_t {
@@ -67,6 +68,23 @@ constexpr uint32_t KUBE32_CAP_RMT_TX   = (1U << 6);   // esp32_rmt_send on the p
 constexpr uint32_t KUBE32_CAP_RMT_RX   = (1U << 7);   // esp32_rmt_receive from the pod's RMT RX channel
 constexpr uint32_t KUBE32_CAP_CHIP_TEMP = (1U << 8);  // esp32_chip_temp_read
 constexpr uint32_t KUBE32_CAP_MICROPHONE = (1U << 9); // k32_mic_read
+constexpr uint32_t KUBE32_CAP_TOUCH    = (1U << 10);  // k32_touch_read
+
+// A board's display, reported by k32_display_info (width 0: none)
+constexpr int32_t KUBE32_DISPLAY_RGB565 = 1;
+struct DisplayInfo {
+    int32_t width{0};
+    int32_t height{0};
+    int32_t format{0};
+};
+
+// One touch point reported by k32_touch_read
+struct TouchPoint {
+    int32_t x{0};
+    int32_t y{0};
+    uint32_t id{0};        // finger, stable while it stays down
+    uint32_t pressure{0};
+};
 
 // 24-Byte Ultra-Compact Device Grant Representation
 #pragma pack(push, 1)

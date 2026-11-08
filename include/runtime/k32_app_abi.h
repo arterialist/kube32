@@ -545,6 +545,7 @@ K32_IMPORT("k32_raster_spans") int32_t k32_raster_spans(uint8_t* dst, uint32_t d
  *   hardware.kube32.io/keyboard: "1"     -> k32_key_read
  *   hardware.kube32.io/speaker: "1"      -> k32_tone, k32_audio_play
  *   hardware.kube32.io/microphone: "1"   -> k32_mic_read
+ *   hardware.kube32.io/touch: "1"        -> k32_touch_read
  * Calls without the grant return K32_ERR_PERM and are logged as violations.
  *
  * The speaker plays at most K32_SPEAKER_MAX_PCT percent of full scale:
@@ -578,6 +579,16 @@ K32_IMPORT("k32_key_read")     int32_t k32_key_read(void);    /* next key code (
 K32_IMPORT("k32_tone")         int32_t k32_tone(uint32_t freq_hz, uint32_t duration_ms, uint32_t volume_pct);
 K32_IMPORT("k32_audio_play")   int32_t k32_audio_play(const int16_t* samples, uint32_t count, uint32_t sample_rate, uint32_t volume_pct);
 K32_IMPORT("k32_mic_read")     int32_t k32_mic_read(int16_t* out, uint32_t max_samples, uint32_t timeout_ms);
+/* The panel's size and pixel format (K32_DISPLAY_RGB565); K32_ERR_NODEV on a node without one */
+#define K32_DISPLAY_RGB565 1
+K32_IMPORT("k32_display_info") int32_t k32_display_info(int32_t* width, int32_t* height, int32_t* format);
+/* Up to max_points points touching the panel now: their count, 0 when nothing touches */
+typedef struct {
+    int32_t x, y;
+    uint32_t id;
+    uint32_t pressure;
+} k32_touch_point_t;
+K32_IMPORT("k32_touch_read")   int32_t k32_touch_read(k32_touch_point_t* points, uint32_t max_points);
 
 /* ---- Pod storage imports, gated by hardware.kube32.io/sd -------------- */
 K32_IMPORT("k32_fs_open")   int32_t k32_fs_open(const char* path, uint32_t path_len, uint32_t flags);   /* fd (0..3) or error */

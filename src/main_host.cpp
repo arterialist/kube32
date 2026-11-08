@@ -548,6 +548,18 @@ int main(int argc, char* argv[]) {
     kube32::ipc::ChannelManager::instance().start_background(2000);
     // Pods may emit events and print to the stand-in display from their first call
     kube32::app::install_default_platform_hooks();
+    {
+        // The stand-in display's size and the mock touch panel (MockHal)
+        kube32::runtime::AppPlatformHooks hooks = kube32::runtime::app_platform_hooks();
+        hooks.display_info = [](kube32::hal::DisplayInfo& info) -> int32_t {
+            info = {240, 135, kube32::hal::KUBE32_DISPLAY_RGB565};
+            return kube32::hal::HAL_OK;
+        };
+        hooks.touch_read = [](kube32::hal::TouchPoint* out, uint32_t max) -> int32_t {
+            return kube32::hal::MockHal::instance().touch_read(out, max);
+        };
+        kube32::runtime::set_app_platform_hooks(hooks);
+    }
     if (!opts.sim_mic.empty() && !install_sim_mic(opts.sim_mic)) return 2;
 
     // Local image registry from the embedded table

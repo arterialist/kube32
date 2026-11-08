@@ -54,6 +54,7 @@ struct NodeTelemetry {
     bool sd_present{false};
     bool has_display{false};
     bool has_keyboard{false};
+    bool has_touch{false};
     bool has_speaker{false};
     bool has_microphone{false};
     bool has_chip_temp{false};
