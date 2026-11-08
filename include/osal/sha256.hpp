@@ -11,7 +11,12 @@
 #include <string_view>
 
 #if defined(ESP_PLATFORM)
+#include "mbedtls/build_info.h"
+#if MBEDTLS_VERSION_MAJOR >= 4
+#include "psa/crypto.h"
+#else
 #include "mbedtls/sha256.h"
+#endif
 #endif
 
 namespace kube32::osal {
@@ -37,7 +42,9 @@ public:
     static bool valid_hex(std::string_view text);
 
 private:
-#if defined(ESP_PLATFORM)
+#if defined(ESP_PLATFORM) && MBEDTLS_VERSION_MAJOR >= 4
+    psa_hash_operation_t op_;
+#elif defined(ESP_PLATFORM)
     mbedtls_sha256_context ctx_;
 #else
     uint32_t state_[8];

@@ -4,7 +4,28 @@
 
 namespace kube32::osal {
 
-#if defined(ESP_PLATFORM)
+#if defined(ESP_PLATFORM) && MBEDTLS_VERSION_MAJOR >= 4
+
+Sha256::Sha256() : op_(PSA_HASH_OPERATION_INIT) { reset(); }
+
+Sha256::~Sha256() { psa_hash_abort(&op_); }
+
+void Sha256::reset() {
+    psa_hash_abort(&op_);
+    psa_hash_setup(&op_, PSA_ALG_SHA_256);
+}
+
+void Sha256::update(const void* data, size_t len) { psa_hash_update(&op_, static_cast<const uint8_t*>(data), len); }
+
+Sha256::Digest Sha256::finish() {
+    Digest d{};
+    size_t n = 0;
+    psa_hash_finish(&op_, d.data(), d.size(), &n);
+    reset();
+    return d;
+}
+
+#elif defined(ESP_PLATFORM)
 
 Sha256::Sha256() {
     mbedtls_sha256_init(&ctx_);

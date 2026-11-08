@@ -17,16 +17,21 @@
 #include <lwip/inet.h>
 
 #include "esp_crt_bundle.h"
+#include "mbedtls/build_info.h"
+#include "mbedtls/asn1write.h"
 #include "mbedtls/base64.h"
-#include "mbedtls/ctr_drbg.h"
-#include "mbedtls/ecp.h"
-#include "mbedtls/entropy.h"
 #include "mbedtls/error.h"
 #include "mbedtls/net_sockets.h"
-#include "mbedtls/oid.h"
 #include "mbedtls/pk.h"
 #include "mbedtls/ssl.h"
 #include "mbedtls/x509_crt.h"
+#if MBEDTLS_VERSION_MAJOR >= 4
+#include "psa/crypto.h"
+#else
+#include "mbedtls/ctr_drbg.h"
+#include "mbedtls/ecp.h"
+#include "mbedtls/entropy.h"
+#endif
 
 #include "esp_heap_caps.h"
 
@@ -45,9 +50,11 @@ extern "C" void esp_mbedtls_mem_free(void* ptr) {
 namespace kube32::osal {
 
 struct TlsServer::Impl {
+#if MBEDTLS_VERSION_MAJOR < 4
     mbedtls_entropy_context entropy;
     mbedtls_ctr_drbg_context drbg;
     std::mutex rng_mutex;   // the DRBG is shared by every handshake
+#endif
     mbedtls_pk_context key;
     mbedtls_x509_crt cert;
     mbedtls_ssl_config conf;
@@ -56,11 +63,26 @@ struct TlsServer::Impl {
 
 namespace {
 
+#if MBEDTLS_VERSION_MAJOR < 4
 int locked_random(void* p, unsigned char* out, size_t len) {
     auto* impl = static_cast<TlsServer::Impl*>(p);
     std::lock_guard<std::mutex> lock(impl->rng_mutex);
     return mbedtls_ctr_drbg_random(&impl->drbg, out, len);
 }
+#endif
+
+// 16 random bytes for a certificate's serial number
+bool random_serial(TlsServer::Impl& impl, unsigned char (&serial)[16]) {
+#if MBEDTLS_VERSION_MAJOR >= 4
+    (void)impl;
+    return psa_generate_random(serial, sizeof(serial)) == PSA_SUCCESS;
+#else
+    return locked_random(&impl, serial, sizeof(serial)) == 0;
+#endif
+}
+
+// id-kp-serverAuth (1.3.6.1.5.5.7.3.1)
+const char kServerAuthOid[] = "\x2B\x06\x01\x05\x05\x07\x03\x01";
 
 std::string mbedtls_message(int rc) {
     char buf[96];
@@ -75,7 +97,11 @@ bool make_certificate(TlsServer::Impl& impl, const std::vector<std::string>& dns
     mbedtls_x509write_cert crt;
     mbedtls_x509write_crt_init(&crt);
     unsigned char serial[16];
-    locked_random(&impl, serial, sizeof(serial));
+    if (!random_serial(impl, serial)) {
+        error = "certificate: no random bytes for the serial number";
+        mbedtls_x509write_crt_free(&crt);
+        return false;
+    }
     serial[0] &= 0x7F;   // positive
     std::vector<mbedtls_x509_san_list> sans(dns.size() + ips.size());
     std::vector<std::array<unsigned char, 4>> ip_bytes(ips.size());
@@ -104,8 +130,8 @@ bool make_certificate(TlsServer::Impl& impl, const std::vector<std::string>& dns
     mbedtls_asn1_sequence eku;
     std::memset(&eku, 0, sizeof(eku));
     eku.buf.tag = MBEDTLS_ASN1_OID;
-    eku.buf.p = reinterpret_cast<unsigned char*>(const_cast<char*>(MBEDTLS_OID_SERVER_AUTH));
-    eku.buf.len = MBEDTLS_OID_SIZE(MBEDTLS_OID_SERVER_AUTH);
+    eku.buf.p = reinterpret_cast<unsigned char*>(const_cast<char*>(kServerAuthOid));
+    eku.buf.len = sizeof(kServerAuthOid) - 1;
 
     int rc = 0;
     mbedtls_x509write_crt_set_version(&crt, MBEDTLS_X509_CRT_VERSION_3);
@@ -123,7 +149,11 @@ bool make_certificate(TlsServer::Impl& impl, const std::vector<std::string>& dns
         (rc = mbedtls_x509write_crt_set_authority_key_identifier(&crt)) == 0 &&
         (sans.empty() || (rc = mbedtls_x509write_crt_set_subject_alternative_name(&crt, sans.data())) == 0)) {
         std::vector<unsigned char> buf(2048);
+#if MBEDTLS_VERSION_MAJOR >= 4
+        rc = mbedtls_x509write_crt_der(&crt, buf.data(), buf.size());
+#else
         rc = mbedtls_x509write_crt_der(&crt, buf.data(), buf.size(), locked_random, &impl);
+#endif
         if (rc > 0) out_der.assign(reinterpret_cast<const char*>(buf.data() + buf.size() - rc), static_cast<size_t>(rc));
     }
     mbedtls_x509write_crt_free(&crt);
@@ -155,8 +185,10 @@ TlsServer::~TlsServer() {
     mbedtls_ssl_config_free(&impl_->conf);
     mbedtls_x509_crt_free(&impl_->cert);
     mbedtls_pk_free(&impl_->key);
+#if MBEDTLS_VERSION_MAJOR < 4
     mbedtls_ctr_drbg_free(&impl_->drbg);
     mbedtls_entropy_free(&impl_->entropy);
+#endif
 }
 
 const std::string& TlsServer::certificate_pem() const { return impl_->pem; }
@@ -167,31 +199,55 @@ std::unique_ptr<TlsServer> TlsServer::create(const std::vector<std::string>& dns
                                              const Loader& load, const Saver& save, std::string& error) {
     std::unique_ptr<TlsServer> server(new TlsServer());
     Impl& impl = *server->impl_;
-    mbedtls_entropy_init(&impl.entropy);
-    mbedtls_ctr_drbg_init(&impl.drbg);
     mbedtls_pk_init(&impl.key);
     mbedtls_x509_crt_init(&impl.cert);
     mbedtls_ssl_config_init(&impl.conf);
+#if MBEDTLS_VERSION_MAJOR >= 4
+    int rc = 0;
+    if (psa_crypto_init() != PSA_SUCCESS) { error = "random generator: PSA Crypto did not start"; return nullptr; }
+#else
+    mbedtls_entropy_init(&impl.entropy);
+    mbedtls_ctr_drbg_init(&impl.drbg);
     static const char kPers[] = "kube32-apiserver";
     int rc = mbedtls_ctr_drbg_seed(&impl.drbg, mbedtls_entropy_func, &impl.entropy,
                                    reinterpret_cast<const unsigned char*>(kPers), sizeof(kPers) - 1);
     if (rc != 0) { error = "random generator: " + mbedtls_message(rc); return nullptr; }
+#endif
 
     std::string key_der, cert_der;
     bool loaded = load && load(key_der, cert_der) && !key_der.empty() && !cert_der.empty() &&
+#if MBEDTLS_VERSION_MAJOR >= 4
+                  mbedtls_pk_parse_key(&impl.key, reinterpret_cast<const unsigned char*>(key_der.data()), key_der.size(), nullptr, 0) == 0 &&
+#else
                   mbedtls_pk_parse_key(&impl.key, reinterpret_cast<const unsigned char*>(key_der.data()), key_der.size(),
                                        nullptr, 0, locked_random, &impl) == 0 &&
+#endif
                   mbedtls_x509_crt_parse_der(&impl.cert, reinterpret_cast<const unsigned char*>(cert_der.data()), cert_der.size()) == 0;
     if (!loaded) {
         mbedtls_pk_free(&impl.key);
         mbedtls_pk_init(&impl.key);
         mbedtls_x509_crt_free(&impl.cert);
         mbedtls_x509_crt_init(&impl.cert);
+#if MBEDTLS_VERSION_MAJOR >= 4
+        // A P-256 key made by PSA and copied out: mbedTLS 4 keeps no raw ECP context
+        psa_key_attributes_t attr = PSA_KEY_ATTRIBUTES_INIT;
+        psa_set_key_type(&attr, PSA_KEY_TYPE_ECC_KEY_PAIR(PSA_ECC_FAMILY_SECP_R1));
+        psa_set_key_bits(&attr, 256);
+        psa_set_key_algorithm(&attr, PSA_ALG_ECDSA(PSA_ALG_SHA_256));
+        psa_set_key_usage_flags(&attr, PSA_KEY_USAGE_SIGN_HASH | PSA_KEY_USAGE_EXPORT);
+        mbedtls_svc_key_id_t key_id = MBEDTLS_SVC_KEY_ID_INIT;
+        if (psa_generate_key(&attr, &key_id) != PSA_SUCCESS) { error = "key: PSA key generation failed"; return nullptr; }
+        rc = mbedtls_pk_copy_from_psa(key_id, &impl.key);
+        psa_destroy_key(key_id);
+        psa_reset_key_attributes(&attr);
+        if (rc != 0) { error = "key: " + mbedtls_message(rc); return nullptr; }
+#else
         if ((rc = mbedtls_pk_setup(&impl.key, mbedtls_pk_info_from_type(MBEDTLS_PK_ECKEY))) != 0 ||
             (rc = mbedtls_ecp_gen_key(MBEDTLS_ECP_DP_SECP256R1, mbedtls_pk_ec(impl.key), locked_random, &impl)) != 0) {
             error = "key: " + mbedtls_message(rc);
             return nullptr;
         }
+#endif
         std::vector<unsigned char> buf(512);
         rc = mbedtls_pk_write_key_der(&impl.key, buf.data(), buf.size());
         if (rc <= 0) { error = "key: " + mbedtls_message(rc); return nullptr; }
@@ -214,7 +270,9 @@ std::unique_ptr<TlsServer> TlsServer::create(const std::vector<std::string>& dns
         error = "configuration: " + mbedtls_message(rc);
         return nullptr;
     }
+#if MBEDTLS_VERSION_MAJOR < 4
     mbedtls_ssl_conf_rng(&impl.conf, locked_random, &impl);
+#endif
     mbedtls_ssl_conf_authmode(&impl.conf, MBEDTLS_SSL_VERIFY_NONE);
     return server;
 }
@@ -223,9 +281,11 @@ std::unique_ptr<TlsServer> TlsServer::create(const std::vector<std::string>& dns
 // Client
 // ---------------------------------------------------------------------------
 struct TlsClient::Impl {
+#if MBEDTLS_VERSION_MAJOR < 4
     mbedtls_entropy_context entropy;
     mbedtls_ctr_drbg_context drbg;
     std::mutex rng_mutex;
+#endif
     mbedtls_x509_crt roots;   // extra roots; the bundle covers the public CAs
     mbedtls_ssl_config conf;
 };
@@ -239,11 +299,13 @@ extern "C" int esp_crt_verify_callback(void* buf, mbedtls_x509_crt* crt, int dep
 namespace kube32::osal {
 namespace {
 
+#if MBEDTLS_VERSION_MAJOR < 4
 int client_random(void* p, unsigned char* out, size_t len) {
     auto* impl = static_cast<TlsClient::Impl*>(p);
     std::lock_guard<std::mutex> lock(impl->rng_mutex);
     return mbedtls_ctr_drbg_random(&impl->drbg, out, len);
 }
+#endif
 
 bool time_before(const mbedtls_x509_time& a, const mbedtls_x509_time& b) {
     const int x[] = {a.year, a.mon, a.day, a.hour, a.min, a.sec};
@@ -281,26 +343,35 @@ TlsClient::TlsClient() : impl_(std::make_unique<Impl>()) {}
 TlsClient::~TlsClient() {
     mbedtls_ssl_config_free(&impl_->conf);
     mbedtls_x509_crt_free(&impl_->roots);
+#if MBEDTLS_VERSION_MAJOR < 4
     mbedtls_ctr_drbg_free(&impl_->drbg);
     mbedtls_entropy_free(&impl_->entropy);
+#endif
 }
 
 std::unique_ptr<TlsClient> TlsClient::create(const std::string& extra_roots_pem, std::string& error) {
     std::unique_ptr<TlsClient> client(new TlsClient());
     Impl& impl = *client->impl_;
-    mbedtls_entropy_init(&impl.entropy);
-    mbedtls_ctr_drbg_init(&impl.drbg);
     mbedtls_x509_crt_init(&impl.roots);
     mbedtls_ssl_config_init(&impl.conf);
+#if MBEDTLS_VERSION_MAJOR >= 4
+    int rc = 0;
+    if (psa_crypto_init() != PSA_SUCCESS) { error = "random generator: PSA Crypto did not start"; return nullptr; }
+#else
+    mbedtls_entropy_init(&impl.entropy);
+    mbedtls_ctr_drbg_init(&impl.drbg);
     static const char kPers[] = "kube32-egress";
     int rc = mbedtls_ctr_drbg_seed(&impl.drbg, mbedtls_entropy_func, &impl.entropy,
                                    reinterpret_cast<const unsigned char*>(kPers), sizeof(kPers) - 1);
     if (rc != 0) { error = "random generator: " + mbedtls_message(rc); return nullptr; }
+#endif
     if ((rc = mbedtls_ssl_config_defaults(&impl.conf, MBEDTLS_SSL_IS_CLIENT, MBEDTLS_SSL_TRANSPORT_STREAM, MBEDTLS_SSL_PRESET_DEFAULT)) != 0) {
         error = "configuration: " + mbedtls_message(rc);
         return nullptr;
     }
+#if MBEDTLS_VERSION_MAJOR < 4
     mbedtls_ssl_conf_rng(&impl.conf, client_random, &impl);
+#endif
     mbedtls_ssl_conf_authmode(&impl.conf, MBEDTLS_SSL_VERIFY_REQUIRED);
     if (esp_crt_bundle_attach(&impl.conf) != ESP_OK) {
         error = "the certificate bundle cannot be read";
