@@ -38,6 +38,10 @@ const BuildInfo& build_info() {
 #endif
 #if defined(__XTENSA__)
         "xtensa",
+#elif defined(__riscv) && __riscv_xlen == 32
+        "riscv32",
+#elif defined(__riscv) && __riscv_xlen == 64
+        "riscv64",
 #elif defined(__aarch64__) || defined(__arm64__)
         "arm64",
 #elif defined(__x86_64__)
