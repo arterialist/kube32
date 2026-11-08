@@ -319,7 +319,9 @@ struct Console {
         uart_enabled = !usb_only;
         if (uart_enabled) {
             if (!uart_is_driver_installed(UART_NUM_0)) {
-                uart_driver_install(UART_NUM_0, 8192, 8192, 0, nullptr, 0);
+                // Small rings on a board without PSRAM, whose internal RAM pods need
+                const int ring = heap_caps_get_total_size(MALLOC_CAP_SPIRAM) > 0 ? 8192 : 1024;
+                uart_driver_install(UART_NUM_0, ring, ring, 0, nullptr, 0);
             }
             // Route printf/ESP_LOG through the driver so a log line and a protocol
             // frame can never interleave byte-wise.
@@ -1726,7 +1728,9 @@ void cluster_task(void* pv) {
     // Without PSRAM, reserve one Wasm page (+ interpreter headroom) now, before
     // Wi-Fi and lwIP fragment the heap, so a 64 KiB pod can still be placed.
     if (!ident.has_psram) {
-        kube32_pool_reserve(80 * 1024);
+        // Chips with less internal RAM (ESP32-C3) keep a smaller block
+        const bool small_ram = heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT) < 260 * 1024;
+        kube32_pool_reserve((small_ram ? 56 : 80) * 1024);
         // One stack for the interpreter, while a contiguous block still
         // exists: every call into a pod (k32_init, k32_handle, k32_tick,
         // k32_event) runs on it, so the threads that make those calls need
