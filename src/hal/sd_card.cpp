@@ -31,7 +31,11 @@ static constexpr int PIN_SD_MOSI = 14;
 static constexpr int PIN_SD_MISO = 39;
 static constexpr int PIN_SD_SCK  = 40;
 static constexpr int PIN_SD_CS   = 12;
+#if SOC_SPI_PERIPH_NUM > 2
 static constexpr spi_host_device_t SD_SPI_HOST = SPI3_HOST;
+#else
+static constexpr spi_host_device_t SD_SPI_HOST = SPI2_HOST;
+#endif
 static constexpr const char* SD_MOUNT_POINT = "/sd";
 
 static sdmmc_card_t* s_card = nullptr;

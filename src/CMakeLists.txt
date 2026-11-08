@@ -150,8 +150,13 @@ idf_component_register(
         vfs
         driver
         esp_driver_gpio
+        esp_driver_i2c
+        esp_driver_i2s
+        esp_driver_ledc
         esp_driver_rmt
         esp_driver_tsens
+        esp_driver_uart
+        esp_driver_usb_serial_jtag
         esp_lcd
         esp_adc
         esp_driver_spi
@@ -181,7 +186,7 @@ target_compile_definitions(${COMPONENT_LIB} PRIVATE
     d_m3MaxNativeStack=98304
     d_m3NativeStackMargin=6144
 )
-target_compile_options(${COMPONENT_LIB} PRIVATE -Wno-format)
+target_compile_options(${COMPONENT_LIB} PRIVATE -Wno-format -Wno-missing-field-initializers)
 
 # Control plane, object store and kubelet code runs on requests and changes,
 # not per Wasm instruction: compile it for size. The interpreter, runtime,

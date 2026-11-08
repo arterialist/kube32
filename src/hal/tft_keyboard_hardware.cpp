@@ -125,8 +125,8 @@ bool init_display_and_backlight() {
     }
 
     esp_lcd_panel_io_spi_config_t io_config = {};
-    io_config.cs_gpio_num = PIN_LCD_CS;
-    io_config.dc_gpio_num = PIN_LCD_DC;
+    io_config.cs_gpio_num = static_cast<gpio_num_t>(PIN_LCD_CS);
+    io_config.dc_gpio_num = static_cast<gpio_num_t>(PIN_LCD_DC);
     io_config.spi_mode = 0;
     io_config.pclk_hz = 40 * 1000 * 1000;
     io_config.trans_queue_depth = 4;
@@ -140,7 +140,7 @@ bool init_display_and_backlight() {
     }
 
     esp_lcd_panel_dev_config_t panel_config = {};
-    panel_config.reset_gpio_num = PIN_LCD_RST;
+    panel_config.reset_gpio_num = static_cast<gpio_num_t>(PIN_LCD_RST);
     panel_config.rgb_ele_order = LCD_RGB_ELEMENT_ORDER_RGB;
     panel_config.bits_per_pixel = 16;
     ret = esp_lcd_new_panel_st7789(s_io_handle, &panel_config, &s_panel_handle);

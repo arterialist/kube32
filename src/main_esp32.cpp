@@ -1542,8 +1542,12 @@ void console_task(void* arg) {
                 con.write("K32_OK tcp\n", 11);
             } else if (line == "K32_CMD:BTALL") {
                 // Backtrace of every task, for a host to addr2line: where each one waits
+#if CONFIG_IDF_TARGET_ARCH_XTENSA
                 esp_backtrace_print_all_tasks(24);
                 con.write("K32_OK btall\n", 13);
+#else
+                con.write("K32_ERR backtraces of every task need an Xtensa target\n", 55);
+#endif
             } else if (line == "K32_CMD:TASKS") {
                 // FreeRTOS task table: state, priority, core, stack high-water mark,
                 // cumulative run time (run-time statistics are enabled in sdkconfig).

@@ -80,7 +80,9 @@ bool mount_internal_flash(std::string& error) {
     cfg.disk_status_check_enable = false;
     cfg.use_one_fat = true;
     esp_err_t r = esp_vfs_fat_spiflash_mount_rw_wl(kFlashMount, kFlashPartition, &cfg, &s_wl);
+#if CONFIG_SPIRAM
     if (psram) heap_caps_malloc_extmem_enable(CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL);
+#endif
     if (r != ESP_OK) {
         s_wl = WL_INVALID_HANDLE;
         error = std::string("internal flash partition \"") + kFlashPartition + "\": " + esp_err_to_name(r);
