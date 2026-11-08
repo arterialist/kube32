@@ -174,8 +174,12 @@ idf_component_register(
 )
 
 # ESP-NOW's insert into the Wi-Fi driver's TX queue runs under the driver's lock
-# (src/net/wifi_tx_lock.cpp)
-target_link_options(${COMPONENT_LIB} INTERFACE "-Wl,--wrap=ieee80211_post_hmac_tx")
+# (src/net/wifi_tx_lock.cpp). Only the driver's libraries, later on the link
+# line, refer to the wrapper, so -u pulls it out of this component's archive.
+if(CONFIG_SOC_WIFI_SUPPORTED)
+    target_link_options(${COMPONENT_LIB} INTERFACE
+        "-Wl,--wrap=ieee80211_post_hmac_tx" "-Wl,-u,__wrap_ieee80211_post_hmac_tx")
+endif()
 
 # The USB OTG console needs TinyUSB, fetched only when it is on (idf_component.yml)
 idf_component_optional_requires(PRIVATE espressif__esp_tinyusb)
