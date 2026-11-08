@@ -65,7 +65,7 @@
 #include "osal/thread.hpp"
 #include "osal/system.hpp"
 #include "osal/socket.hpp"
-#include "hal/tft_keyboard_hardware.hpp"
+#include "hal/board.hpp"
 #include "hal/sd_card.hpp"
 #include "hal/node_storage.hpp"
 #include "storage/flash_log.hpp"
@@ -113,6 +113,7 @@
 #include "driver/uart_vfs.h"
 
 static const char* TAG = "Kube32";
+static kube32::hal::Board* s_board = nullptr;   // on-board peripherals, nullptr on a bare board
 
 // Role selection is capability based: the board with external PSRAM hosts the
 // control plane, the API server, the ingress and the large data pod; a board
@@ -127,6 +128,7 @@ namespace {
 struct NodeIdentity {
     bool is_control_plane{true};
     bool has_display{false};
+    kube32::hal::Board* board{nullptr};   // on-board peripherals of the board profile
     bool has_psram{false};
     std::string name;
     uint32_t id{1};       // channel node id, from the MAC address
@@ -169,7 +171,10 @@ NodeIdentity detect_identity() {
     }
     bool control_plane = id.has_psram;
     if (role[0]) control_plane = (std::strcmp(role, "control-plane") == 0);
-    if (board[0]) id.has_display = (std::strcmp(board, "cardputer") == 0 || std::strcmp(board, "display") == 0);
+    if (board[0]) {
+        id.board = kube32::hal::board_for(board);
+        id.has_display = id.board != nullptr;
+    }
     id.is_control_plane = control_plane;
     char derived[16];
     snprintf(derived, sizeof(derived), "esp32-%02x%02x%02x", mac[3], mac[4], mac[5]);
@@ -521,6 +526,10 @@ static void console_blobread(Console& con, std::string args) {
 // Records the microphone for args ms (100..10000) and prints its level per
 // 250 ms: the mean (DC offset), the RMS and the peak around that mean
 static void console_mic(Console& con, const std::string& args) {
+    if (!s_board) {
+        con.write("K32_ERR no microphone\n", 22);
+        return;
+    }
     int ms = std::atoi(args.c_str());
     if (ms < 100) ms = 100;
     if (ms > 10000) ms = 10000;
@@ -537,13 +546,13 @@ static void console_mic(Console& con, const std::string& args) {
     int32_t err = 0;
     char l[160];
     // The decimator settles in its first few milliseconds: not counted
-    const int32_t first = kube32::hal::mic_read(buf, 500, 200);
+    const int32_t first = s_board->mic_read(buf, 500, 200);
     if (first <= 0) {
         char e[64];
         con.write(e, static_cast<size_t>(snprintf(e, sizeof(e), "K32_MIC first read: %d\n", (int)first)));
     }
     while (got_total < total) {
-        const int32_t n = kube32::hal::mic_read(buf, std::min<uint32_t>(500, total - got_total), 200);
+        const int32_t n = s_board->mic_read(buf, std::min<uint32_t>(500, total - got_total), 200);
         if (n <= 0) { err = n; break; }
         for (int32_t i = 0; i < n; ++i) {
             const int32_t v = buf[i];
@@ -568,7 +577,7 @@ static void console_mic(Console& con, const std::string& args) {
         }
         got_total += static_cast<uint32_t>(n);
     }
-    kube32::hal::mic_read(buf, 0, 0);
+    s_board->mic_read(buf, 0, 0);
     const uint32_t counted = got_total - in_window;
     const double mean = counted ? static_cast<double>(sum) / counted : 0.0;
     const double var = counted ? static_cast<double>(sumsq) / counted - mean * mean : 0.0;
@@ -1363,7 +1372,11 @@ void console_task(void* arg) {
                 if (n < 1) n = 1;
                 if (n > 200) n = 200;
                 uint64_t t0 = kube32::osal::System::get_uptime_ms();
-                for (int i = 0; i < n; ++i) kube32::hal::play_tone(880 + (i % 4) * 110, 20, 15);
+                if (!s_board) {
+                    con.write("K32_ERR no speaker\n", 19);
+                    continue;
+                }
+                for (int i = 0; i < n; ++i) s_board->tone(880 + (i % 4) * 110, 20, 15);
                 char l[64];
                 int ll = snprintf(l, sizeof(l), "K32_OK %d tone(s) in %u ms\n", n, (unsigned)(kube32::osal::System::get_uptime_ms() - t0));
                 con.write(l, static_cast<size_t>(ll));
@@ -1439,7 +1452,7 @@ void console_task(void* arg) {
                 console_run_deep(con, [&] { console_blobread(con, line.substr(17)); });
             } else if (line.rfind("K32_CMD:MICGAIN:", 0) == 0) {
                 // The microphone's digital gain until the next boot (1 to 64)
-                kube32::hal::mic_set_gain(static_cast<uint32_t>(std::strtoul(line.c_str() + 16, nullptr, 10)));
+                if (s_board) s_board->mic_set_gain(static_cast<uint32_t>(std::strtoul(line.c_str() + 16, nullptr, 10)));
                 con.write("K32_OK mic gain\n", 16);
             } else if (line.rfind("K32_CMD:MIC:", 0) == 0) {
                 console_run_deep(con, [&] { console_mic(con, line.substr(12)); });
@@ -1461,7 +1474,8 @@ void console_task(void* arg) {
                 con.write("K32_OK sd\n", 10);
             } else if (line == "K32_CMD:KEYPOP") {
                 // Pops one key from the matrix queue on the host side (bypasses pods)
-                int k = kube32::hal::keyboard_pop();
+                int k = s_board ? s_board->key_read() : -1;
+                if (k < 0) k = -1;
                 char l[48];
                 int ll = snprintf(l, sizeof(l), "K32_OK keypop=%d\n", k);
                 con.write(l, static_cast<size_t>(ll));
@@ -1566,7 +1580,7 @@ void console_task(void* arg) {
                         char e = text[++i];
                         c = (e == 'n') ? '\n' : (e == 'b') ? '\b' : (e == 't') ? '\t' : e;
                     }
-                    kube32::hal::keyboard_inject(c);
+                    if (s_board) s_board->key_inject(c);
                     n++;
                 }
                 char l[48];
@@ -1605,39 +1619,34 @@ void console_task(void* arg) {
 // ---------------------------------------------------------------------------
 // Hardware hooks for pods on the display node
 // ---------------------------------------------------------------------------
-void install_hardware_hooks(bool has_display) {
+void install_hardware_hooks(kube32::hal::Board* board) {
     kube32::runtime::AppPlatformHooks hooks;
     hooks.random = []() -> uint32_t { return esp_random(); };
-    if (has_display) {
-        hooks.display_text = [](int32_t x, int32_t y, const char* text, size_t len, uint32_t fg, uint32_t bg) -> int32_t {
-            kube32::hal::display_draw_string_n(x, y, text, len, static_cast<uint16_t>(fg), static_cast<uint16_t>(bg));
-            return 0;
+    if (board) {
+        hooks.display_text = [board](int32_t x, int32_t y, const char* text, size_t len, uint32_t fg, uint32_t bg) -> int32_t {
+            return board->display_text(x, y, text, len, static_cast<uint16_t>(fg), static_cast<uint16_t>(bg));
         };
-        hooks.display_rect = [](int32_t x, int32_t y, int32_t w, int32_t h, uint32_t color) -> int32_t {
-            kube32::hal::display_fill_rect(x, y, w, h, static_cast<uint16_t>(color));
-            return 0;
+        hooks.display_rect = [board](int32_t x, int32_t y, int32_t w, int32_t h, uint32_t color) -> int32_t {
+            return board->display_rect(x, y, w, h, static_cast<uint16_t>(color));
         };
-        hooks.display_bar = [](int32_t x, int32_t y, int32_t w, int32_t h, uint32_t pct, uint32_t fg, uint32_t bg) -> int32_t {
-            kube32::hal::display_draw_bar(x, y, w, h, pct, static_cast<uint16_t>(fg), static_cast<uint16_t>(bg));
-            return 0;
+        hooks.display_bar = [board](int32_t x, int32_t y, int32_t w, int32_t h, uint32_t pct, uint32_t fg, uint32_t bg) -> int32_t {
+            return board->display_bar(x, y, w, h, pct, static_cast<uint16_t>(fg), static_cast<uint16_t>(bg));
         };
-        hooks.display_blit = [](int32_t x, int32_t y, int32_t w, int32_t h, const uint16_t* pixels) -> int32_t {
-            kube32::hal::display_blit(x, y, w, h, pixels);
-            return 0;
+        hooks.display_blit = [board](int32_t x, int32_t y, int32_t w, int32_t h, const uint16_t* pixels) -> int32_t {
+            return board->display_blit(x, y, w, h, pixels);
         };
-        hooks.key_read = []() -> int32_t {
-            int k = kube32::hal::keyboard_pop();
-            return (k < 0) ? -11 : k;
+        hooks.display_info = [board](kube32::hal::DisplayInfo& info) -> int32_t {
+            info = board->display_info();
+            return info.width > 0 ? kube32::hal::HAL_OK : kube32::hal::HAL_ERR_NODEV;
         };
-        hooks.tone = [](uint32_t f, uint32_t ms, uint32_t vol) -> int32_t {
-            kube32::hal::play_tone(f, ms, static_cast<uint8_t>(vol));
-            return 0;
+        hooks.touch_read = [board](kube32::hal::TouchPoint* out, uint32_t max) -> int32_t { return board->touch_read(out, max); };
+        hooks.key_read = [board]() -> int32_t { return board->key_read(); };
+        hooks.tone = [board](uint32_t f, uint32_t ms, uint32_t vol) -> int32_t { return board->tone(f, ms, vol); };
+        hooks.audio_play = [board](const int16_t* samples, uint32_t count, uint32_t rate, uint32_t vol) -> int32_t {
+            return board->audio_play(samples, count, rate, vol);
         };
-        hooks.audio_play = [](const int16_t* samples, uint32_t count, uint32_t rate, uint32_t vol) -> int32_t {
-            return kube32::hal::audio_play(samples, count, rate, vol);
-        };
-        hooks.mic_read = [](int16_t* out, uint32_t max, uint32_t timeout_ms) -> int32_t {
-            return kube32::hal::mic_read(out, max, timeout_ms);
+        hooks.mic_read = [board](int16_t* out, uint32_t max, uint32_t timeout_ms) -> int32_t {
+            return board->mic_read(out, max, timeout_ms);
         };
     }
     kube32::runtime::set_app_platform_hooks(hooks);
@@ -1771,11 +1780,8 @@ void cluster_task(void* pv) {
 
     // Peripherals of the integrated display board
     bool has_display = false;
-    if (ident.has_display) {
-        has_display = kube32::hal::init_display_and_backlight();
-        kube32::hal::init_speaker();
-        kube32::hal::init_keyboard_scanner();
-    }
+    s_board = ident.board;
+    if (s_board) has_display = s_board->init();
     // Node storage: the microSD card of the display board (its own SPI bus,
     // FAT at /sd) when one is inserted, otherwise the internal flash
     // "storage" partition (FAT with wear levelling at /data). One of the two.
@@ -1846,33 +1852,15 @@ void cluster_task(void* pv) {
         }
         kube32::storage::set_node_blob_stores(flash_blobs.get(), ident.has_display ? &card_blobs : nullptr);
     }
-    install_hardware_hooks(has_display);
+    install_hardware_hooks(has_display ? ident.board : nullptr);
     kube32::app::install_default_platform_hooks();   // event_emit through the channel layer
     // What pods may claim: the chip's pins minus those the board's own
     // peripherals use, and the buses the board has pins for. A bare devkit
     // offers both I2C controllers and UART1/UART2 (defaults: I2C0 on GPIO
-    // 8/9, UART1 on 17/18). The Cardputer's only free connector is the Grove
-    // port (GPIO 2 and 1), so it offers I2C0 or UART1 there. Its IR LED
-    // hangs on GPIO 44, the UART0 RX pad: the board wires nothing else to it
-    // and its console is the USB port, so an RMT TX channel may drive it
-    // (the default TX pin); on a devkit the pad belongs to the USB-UART
-    // bridge and stays reserved.
+    // 8/9, UART1 on 17/18); a board profile describes its own (Board::describe).
     {
         kube32::hal::BoardProfile profile;
-        profile.name = ident.has_display ? "cardputer" : "generic";
-        if (ident.has_display) {
-            profile.reserved_gpio_mask = kube32::hal::peripheral_gpio_mask() | kube32::hal::sd_gpio_mask();
-            profile.i2c_bus_mask = 0x1;
-            profile.i2c_pins[0] = {2, 1};     // Grove SDA, SCL
-            profile.i2c_pins[1] = {};
-            profile.uart_port_mask = 0x2;
-            profile.uart_pins[1] = {2, 1};    // Grove TX, RX
-            profile.rmt_tx_pin_mask = 1ULL << 44;
-            profile.rmt_tx_default_pin = 44;  // IR LED
-            // ST7789 panel, matrix keyboard, I2S speaker, PDM microphone
-            profile.onboard_devices = kube32::hal::KUBE32_CAP_DISPLAY | kube32::hal::KUBE32_CAP_KEYBOARD | kube32::hal::KUBE32_CAP_SPEAKER |
-                                      kube32::hal::KUBE32_CAP_MICROPHONE;
-        }
+        if (ident.board) ident.board->describe(profile);
         kube32::hal::CapabilityFirewall::instance().set_board_profile(profile);
     }
     log_memory("after peripherals");
@@ -2010,7 +1998,7 @@ void cluster_task(void* pv) {
     const std::string api_token = read_nvs_str("token");
     s_api_token_set = valid_token(api_token);
     if (s_api_token_set) kubelet_cfg.api_token = api_token;
-    kubelet_cfg.node_labels["kube32.io/board"] = ident.has_display ? "cardputer" : "generic";
+    kubelet_cfg.node_labels["kube32.io/board"] = ident.board ? ident.board->name() : "generic";
     // Devices answering on the board's I2C pins become node labels, and the
     // parts identified among them a node annotation for the Device controller
     static kube32::hal::I2cDiscovery discovery;
@@ -2405,14 +2393,14 @@ void cluster_task(void* pv) {
             });
         printf("[WORKER] kubelet -> http://%s:6443\n", api_host.c_str());
         if (has_display) {
-            kube32::hal::display_fill_rect(0, 0, kube32::hal::LCD_WIDTH, 18, 0x194B);
             // The boot screen stays product-neutral on purpose: what runs the
             // board is not announced on the display, the apps draw their own UI.
-            kube32::hal::display_draw_string(6, 5, "ready", kube32::hal::COLOR_GREEN, 0x194B);
-            std::string l = ip;
-            kube32::hal::display_draw_string(6, 28, l.c_str(), kube32::hal::COLOR_WHITE, kube32::hal::COLOR_BG_DARK);
+            constexpr uint16_t kBanner = 0x194B, kGreen = 0x07E0, kWhite = 0xFFFF, kCyan = 0x07FF, kDark = 0x10A2;
+            s_board->display_rect(0, 0, s_board->display_info().width, 18, kBanner);
+            s_board->display_text(6, 5, "ready", 5, kGreen, kBanner);
+            s_board->display_text(6, 28, ip.c_str(), ip.size(), kWhite, kDark);
             std::string app_url = "http://" + api_host + "/";
-            kube32::hal::display_draw_string(6, 40, app_url.c_str(), kube32::hal::COLOR_CYAN, kube32::hal::COLOR_BG_DARK);
+            s_board->display_text(6, 40, app_url.c_str(), app_url.size(), kCyan, kDark);
         }
     }
     log_memory("cluster services up");

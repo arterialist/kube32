@@ -68,6 +68,7 @@ set(KUBE32_APP_SRCS
     hal/chip_temp.cpp
     hal/pod_rmt.cpp
     hal/tft_keyboard_hardware.cpp
+    hal/board.cpp
     hal/firmware_slots.cpp
     ipc/channel.cpp
     kubelet/kube_api_client.cpp
