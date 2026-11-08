@@ -12,7 +12,7 @@
 #include "sdkconfig.h"
 #include "soc/soc_caps.h"
 
-#if SOC_WIFI_SUPPORTED && !CONFIG_ETH_USE_OPENETH
+#if SOC_WIFI_SUPPORTED
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
@@ -33,4 +33,4 @@ int __wrap_ieee80211_post_hmac_tx(void* eb) {
 
 }  // extern "C"
 
-#endif  // SOC_WIFI_SUPPORTED && !CONFIG_ETH_USE_OPENETH
+#endif  // SOC_WIFI_SUPPORTED
