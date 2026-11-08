@@ -7,20 +7,24 @@ cmake_minimum_required(VERSION 3.16.0)
 # ------------------------------------------------------------------------------
 # Target Detection: ESP-IDF vs Host Simulation
 # ------------------------------------------------------------------------------
-if(DEFINED ENV{IDF_PATH} OR DEFINED ESP_PLATFORM OR DEFINED PLATFORMIO_BUILD_DIR)
-    set(KUBE32_IS_ESP32 TRUE)
-else()
-    set(KUBE32_IS_ESP32 FALSE)
+# PlatformIO and idf.py build the firmware. -DKUBE32_BUILD_FIRMWARE=ON or OFF
+# picks one or the other when the environment says otherwise, for example a
+# simulator build from a shell with IDF_PATH set.
+if(NOT DEFINED KUBE32_BUILD_FIRMWARE)
+    if(DEFINED ENV{IDF_PATH} OR DEFINED ESP_PLATFORM OR DEFINED PLATFORMIO_BUILD_DIR)
+        set(KUBE32_BUILD_FIRMWARE ON)
+    else()
+        set(KUBE32_BUILD_FIRMWARE OFF)
+    endif()
 endif()
 
-if(KUBE32_IS_ESP32)
+if(KUBE32_BUILD_FIRMWARE)
     # ==========================================================================
-    # ESP-IDF Target (ESP32-S3 Microcontroller Firmware)
+    # ESP-IDF Target (Microcontroller Firmware)
     # ==========================================================================
-    message(STATUS "[Kube32] Building for Target: ESP32-S3 (ESP-IDF / FreeRTOS)")
-    
     include($ENV{IDF_PATH}/tools/cmake/project.cmake)
     project(kube32)
+    message(STATUS "[Kube32] Building for Target: ${IDF_TARGET} (ESP-IDF / FreeRTOS)")
 
 else()
     # ==========================================================================
