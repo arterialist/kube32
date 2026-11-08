@@ -375,8 +375,12 @@ static const void* raw_log(IM3Runtime rt, IM3ImportContext ictx, uint64_t* sp, v
     std::string_view text(static_cast<const char*>(mem) + off, len);
     while (!text.empty() && (text.back() == '\n' || text.back() == '\r')) text.remove_suffix(1);
     printf("[POD %s] %.*s\n", pod_id.c_str(), static_cast<int>(text.size()), text.data());
-    // The pod's log ring is what `kubectl logs` serves
-    PodLogStore::runtime().append(pod_id, text);
+    // The pod's log ring is what `kubectl logs` serves. A line that finds no
+    // memory is dropped: an exception must not leave through wasm3's C frames.
+    try {
+        PodLogStore::runtime().append(pod_id, text);
+    } catch (...) {
+    }
     return m3Err_none;
 }
 
