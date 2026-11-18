@@ -27,7 +27,7 @@ Use `kubectl` and k9s to manage the cluster. Use the tools below to run the host
 | `--node-name <name>` | `esp32-master` | Control-plane or standalone node name. |
 | `--kubelet-name <name>` | `esp32-node-01` | Kubelet node name in `standalone` mode. |
 | `--workers <a,b,...>` | `esp32-node-02` | In-process worker node names in `standalone` mode; pass `""` for a single control-plane node with no in-process workers (for a separate worker process or a physical board). |
-| `--board <board>` | `generic` | `kube32.io/board` label for this process's kubelet. |
+| `--board <board>` | `generic` | `kube32.io/board` label for this process's kubelet. On Linux, `cardputer-zero` also gives the process's nodes that board's devices ([below](#linux-boards)). |
 | `--worker-board <board>` | `cardputer` | `kube32.io/board` label for in-process workers. |
 | `--node-ip <ip\|auto>` | `auto` for a worker whose API server is not on this host, else `127.0.0.1` | Address the nodes report, which is the pod IP other nodes dial; pass a LAN address so physical boards can reach pods on the simulator. `auto` is the local address that the system uses to reach the API server, kept current when the network changes ([below](#following-the-network)). |
 | `--psram <size>` | `1284Ki`; workers reserve none | PSRAM pool to model (for example `8Mi`). Passing `0` explicitly models a board without PSRAM (see below). |
@@ -36,6 +36,13 @@ Use `kubectl` and k9s to manage the cluster. Use the tools below to run the host
 | `--system-reserved <size>` | `16Ki` (`24Ki` with `--psram 0`) | Memory the modelled heap keeps back for the system, the equivalent of a board's `K32_CMD:SYSRESERVE`. Pods are never given it: allocatable `memory` and `esp32.io/psram` leave it out, and the Node reports it in the `kube32.io/system-reserved` annotation. It takes effect with `--heap-budget` or `--psram 0`. A control plane board keeps `192Ki`. |
 | `--sim-i2c <parts>` | none | Simulated I2C parts on bus 0 of this process's node, for example `pahub,bme688@2,miniscale@3,rfid@4`. The format is `<part>[:0x<address>][@<PaHub channel>]`, and the parts are `pahub`, `bme688`, `miniscale` and `rfid`. Discovery finds them and drivers read them ([Devices](devices.md#compute-on-a-laptop)). |
 | `--sim-mic <file>` | none | What `k32_mic_read` hears on this process's nodes: 16 kHz mono 16-bit PCM, raw or WAV. The file plays in real time from the first read and loops; as on the board, the microphone keeps the last 64 ms between reads and starts afresh after a read with no samples asked for or a second without reads. |
+| `--fb <device>` | none | Linux: the framebuffer pods draw on, at 16 or 32 bits a pixel ([below](#linux-boards)). |
+| `--keyboard-dev <device>` | none | Linux: the evdev keyboard `k32_key_read` reads. |
+| `--keymap <us\|cardputer-zero>` | `us` | The characters of the keyboard's keys. |
+| `--i2c-bus <n>=<device>` | none | Linux: pod I2C bus `n` (`0` or `1`) on an I2C adapter, for example `0=/dev/i2c-1`. Repeatable. |
+| `--thermal <dir>` | none | Linux: the thermal zone `esp32_chip_temp_read` reads, for example `/sys/class/thermal/thermal_zone0`. |
+| `--backlight <dir>` | none | Linux: a backlight the node turns on when it takes the panel and finds it off, for example `/sys/class/backlight/<name>`. |
+| `--screen-owner <unit>` | none | Linux: a systemd user unit, such as a launcher, that has the panel and the keyboard while no pod uses them. |
 | `--ingress-port <port>` | off (`0`) | Ingress controller HTTP port. |
 | `--pod-port <port>` | `7000` | Pod HTTP server port on every node. |
 | `--node-id <id>` | `0` | Node ID for UDP IPC channels. |
@@ -46,6 +53,21 @@ Use `kubectl` and k9s to manage the cluster. Use the tools below to run the host
 | `--eviction-timeout <ms>` | `30000` | Add `node.kubernetes.io/unreachable:NoExecute` after this many milliseconds without a heartbeat; pods are evicted once their matching `tolerationSeconds` (default `300` s) elapses. |
 | `--reconcile-interval <ms>` | `1000` | Shortest time between two passes of a controller or the scheduler, in milliseconds. They run a pass after a change and every 30 s without one. |
 | `-h`, `--help` | | Print all options with defaults and exit `0`. |
+
+### Linux boards
+
+On a Linux single-board computer, the process's nodes use the board's own screen, keyboard, I2C buses and SoC temperature ([Linux boards](hardware-spec.md#linux-boards)). `--board cardputer-zero` names the M5Stack Cardputer Zero's devices, and the device flags describe any other board or replace a preset's device. A value of `none` leaves a device out. Without a preset or a device flag, and on hosts other than Linux, the peripherals stay simulated.
+
+```sh
+# the Cardputer Zero
+kube32-sim --role worker --join http://<control plane>:6443 --node-name zero --board cardputer-zero
+# a Raspberry Pi with an SPI panel and a USB keyboard, I2C on the header
+kube32-sim --role worker --join http://<control plane>:6443 --node-name pi --board pi-panel \
+  --fb /dev/fb1 --keyboard-dev /dev/input/by-id/<keyboard>-event-kbd \
+  --i2c-bus 0=/dev/i2c-1 --thermal /sys/class/thermal/thermal_zone0
+# the Cardputer Zero beside its launcher: the I2C bus and the temperature only
+kube32-sim --role worker --join http://<control plane>:6443 --node-name zero --board cardputer-zero --fb none --keyboard-dev none
+```
 
 ### Following the network
 

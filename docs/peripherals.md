@@ -38,8 +38,8 @@ Pods share each device that a `hardware.kube32.io/*` resource grants, and a pod 
 | Resource | Advertised by |
 | --- | --- |
 | `hardware.kube32.io/ipc` | Every node |
-| `hardware.kube32.io/chip-temp` | Every node: the ESP32-S3's internal sensor, a stand-in in the simulator |
-| `hardware.kube32.io/tft-display`, `keyboard`, `speaker`, `microphone`, `touch` | Boards with the devices on board (the Cardputer profile has a display, keyboard, speaker and microphone) |
+| `hardware.kube32.io/chip-temp` | Every node: the ESP32-S3's internal sensor, a stand-in in the simulator. A node on a [Linux board](hardware-spec.md#linux-boards) reads its SoC's thermal zone and advertises the grant only when the zone can be read |
+| `hardware.kube32.io/tft-display`, `keyboard`, `speaker`, `microphone`, `touch` | Boards with the devices on board (the Cardputer profile has a display, keyboard, speaker and microphone; a Linux board, the framebuffer and keyboard that opened) |
 | `hardware.kube32.io/sd` | Nodes with a mounted microSD card ([storage](storage.md)) |
 
 A resource that a node no longer has (a card taken out, a board profile changed between boots) is set to `null` in the next status write and leaves the Node. The scheduler does not filter on these resources; the firewall checks the grants at admission.
@@ -81,7 +81,7 @@ Error codes (`include/runtime/k32_app_abi.h`, `include/hal/hal_types.hpp`):
 
 ### Cardputer display, keypad, speaker, and microphone
 
-Nodes running the `cardputer` board profile, selected with `K32_CMD:BOARD:cardputer`, expose the M5Stack Cardputer's built-in 240x135 ST7789 display, 56-key matrix, NS4168 I2S speaker, and SPM1423 PDM microphone (`src/runtime/app_pod.cpp`, `src/hal/tft_keyboard_hardware.cpp`). On nodes without this profile, these functions return `K32_ERR_NODEV` (`-19`).
+Nodes running the `cardputer` board profile, selected with `K32_CMD:BOARD:cardputer`, expose the M5Stack Cardputer's built-in 240x135 ST7789 display, 56-key matrix, NS4168 I2S speaker, and SPM1423 PDM microphone (`src/runtime/app_pod.cpp`, `src/hal/tft_keyboard_hardware.cpp`). On nodes without this profile, these functions return `K32_ERR_NODEV` (`-19`). A node on a [Linux board](hardware-spec.md#linux-boards) serves the display and keyboard functions with the board's own panel and keyboard, at the panel's size.
 
 | Import | Wasm signature | C declaration | Behavior |
 | --- | --- | --- | --- |
@@ -90,7 +90,8 @@ Nodes running the `cardputer` board profile, selected with `K32_CMD:BOARD:cardpu
 | `k32_display_blit` | `i(iiiii)` | `int32_t k32_display_blit(int32_t x, int32_t y, int32_t w, int32_t h, const uint16_t* rgb565)` | Copies `w x h` RGB565 pixels, row after row, to `x, y`; the part outside the screen is dropped. `w` and `h` are 1 to 1024. |
 | `k32_display_blit_pal` | `i(iiiiii)` | `int32_t k32_display_blit_pal(int32_t x, int32_t y, int32_t w, int32_t h, const uint8_t* idx, const uint16_t* pal565)` | The same from 8-bit palette indices through 256 RGB565 entries: a paletted frame (such as one the [raster kernels](app-development.md#raster-kernels) draw) reaches the screen without the pod converting it. |
 | `k32_display_bar` | `i(iiiiiii)` | `int32_t k32_display_bar(int32_t x, int32_t y, int32_t w, int32_t h, uint32_t pct, uint32_t fg565, uint32_t bg565)` | Draws a horizontal bar at `x, y, w, h` filled to `pct` from `0` to `100`. |
-| `k32_key_read` | `i()` | `int32_t k32_key_read(void)` | Pops the next ASCII key code from the 16-entry scanner queue, or `K32_ERR_AGAIN` (`-11`) when empty. |
+| `k32_display_info` | `i(iii)` | `int32_t k32_display_info(int32_t* width, int32_t* height, int32_t* format)` | Stores the panel's size in pixels and the format the drawing calls take (`1`, RGB565). A pod that asks draws on any panel: 240x135 on the Cardputer, 320x170 on the Cardputer Zero. |
+| `k32_key_read` | `i()` | `int32_t k32_key_read(void)` | Pops the next key code from the 16-entry scanner queue, or `K32_ERR_AGAIN` (`-11`) when empty. Printable keys return ASCII, Enter `\n`, Backspace `\b`, Tab `\t`, Esc `27`, and the arrows `U`, `D`, `L` and `R` (Fn with `;`, `.`, `,` and `/` on the Cardputer). |
 | `k32_tone` | `i(iii)` | `int32_t k32_tone(uint32_t freq_hz, uint32_t duration_ms, uint32_t volume_pct)` | Plays a square-wave tone at `freq_hz` for `duration_ms`, capped at `2000`, at `volume_pct` (`0` to `100`) of the speaker's ceiling. |
 | `k32_audio_play` | `i(iiii)` | `int32_t k32_audio_play(const int16_t* samples, uint32_t count, uint32_t sample_rate, uint32_t volume_pct)` | Queues `count` signed 16-bit mono samples at `sample_rate` (`8000` to `48000` Hz), at most one second of them per call, at `volume_pct` of the ceiling. Returns the number queued once they are in the output buffer. |
 | `k32_mic_read` | `i(iii)` | `int32_t k32_mic_read(int16_t* out, uint32_t max_samples, uint32_t timeout_ms)` | Copies up to `max_samples` (at most `16000`) samples of 16 kHz signed 16-bit mono PCM from the microphone to `out`, waiting up to `timeout_ms` (at most `1000`). Returns the number copied. |
@@ -129,8 +130,9 @@ When the annotation is omitted, the bus uses the board profile's default pins. C
 | --- | --- | --- |
 | `generic` | 33 GPIO, 10 ADC, 2 I2C (`0`, `1`), 2 UART (`1`, `2`) | `I2C0` SDA 8, SCL 9; `I2C1` none; `UART1` TX 17, RX 18; `UART2` none |
 | `cardputer` | 11 GPIO, 3 ADC, 1 I2C (`0`), 1 UART (`1`) | `I2C0` SDA 2, SCL 1; `UART1` TX 2, RX 1 |
+| `cardputer-zero` (Linux) | 1 I2C (`0`) | `I2C0` is `/dev/i2c-1`, on the pins the kernel set up |
 
-On the Cardputer, `I2C0` and `UART1` share the Grove port pins GPIO 2 and GPIO 1, so only one of the two can be claimed at a time.
+On the Cardputer, `I2C0` and `UART1` share the Grove port pins GPIO 2 and GPIO 1, so only one of the two can be claimed at a time. On a [Linux board](hardware-spec.md#linux-boards) the kernel sets each bus's pins and speed: a claim takes no pins, and a `kube32.io/i2c-bus-<n>` annotation is refused.
 
 ### Driver lifecycle
 

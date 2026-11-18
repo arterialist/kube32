@@ -55,6 +55,16 @@ The board profile, set at boot from NVS key `board` via `K32_CMD:BOARD:cardputer
 
 The `cardputer` profile reserves pins 33 to 38 for the LCD, 41 and 42 for I2S, 3 to 9, 11, 13, and 15 for the key matrix, and 12, 14, 39, and 40 for the microSD bus. It offers GPIO 44, a UART0 pin the board wires only to its IR LED, to RMT TX channels. The `atoms3-lite` profile reserves every pin except the Grove port (1, 2), the header (5 to 8, 38, 39) and the button (41). It offers GPIO 4, its IR LED, to RMT TX channels. An ADC1 channel is claimable only when its pin, `GPIO channel + 1`, is claimable.
 
+### Linux boards
+
+A node on a [Linux board](../hardware-spec.md#linux-boards) (`kube32-sim --board cardputer-zero`, or the device flags) describes the board in the same profile. The kernel owns the SoC's pins, so the profile reserves every GPIO and offers no ADC1 channel, UART or RMT channel. Its I2C buses are fixed buses (`BoardProfile::i2c_fixed_mask`): the kernel set their pins and speed, so an `esp32.io/i2c-bus-<n>` claim or a device grant takes no pins, and a `kube32.io/i2c-bus-<n>` annotation is refused. The addresses that kernel drivers hold (`BoardProfile::i2c_reserved`, read from `/sys/bus/i2c/devices`) stay with the kernel:
+
+* a pod that claims the bus whole finds no device there: its transfers to them return `K32_ERR_NODEV`, as to an empty address, so a bus scan runs unchanged;
+* a `kube32.io/i2c-device` grant that names one, as its address or its multiplexer, is refused at admission;
+* discovery skips them, on the bus and behind multiplexers.
+
+The node advertises `hardware.kube32.io/chip-temp` only when the board reads its SoC's temperature (`BoardProfile::chip_temp`).
+
 ## Limitations
 
 * `KUBE32_RESERVED_GPIO_MASK` does not block strapping pins 3, 45, and 46 or octal PSRAM pins 33 to 37.
