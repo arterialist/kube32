@@ -1,6 +1,6 @@
 # clusterview
 
-clusterview shows the cluster on a board's screen: the nodes and whether they are Ready, the hardware each one offers, the node of each selected pod, readings from selected Services, and the last messages on selected channel topics. It reads everything from the API server and the Services with `k32_http_call`, so it runs on any node with a screen. It sizes its layout from `k32_display_info`: the Cardputer Zero's 320x170 panel and the Cardputer's 240x135 one both work.
+clusterview shows the cluster on a board's screen: the nodes and whether they are Ready, the hardware each one offers, the node of each selected pod, readings from selected Services, and the last messages on selected channel topics. It reads everything from the API server and the Services with `k32_http_call`, so it runs on any node with a screen. It sizes its layout from `k32_display_info`, for the Cardputer Zero's 320x170 panel as for the Cardputer's 240x135 one (see [Memory](#memory) for the Cardputer).
 
 ```sh
 make -C apps/clusterview        # writes images/sd/clusterview.wasm and build/clusterview.yaml
@@ -61,4 +61,4 @@ The pod scans the answers in place for the fields it needs. It keeps up to 8 nod
 
 ## Memory
 
-The pod's memory limit is 16 KiB: a 1.5 KiB stack and 13 KiB of data, mostly the 4 KiB answer buffer and the node and pod tables. The build checks this size after the link step. On a board without PSRAM the pod takes about 44 KB of the 80 KiB pod pool with its 19 KB module inline. A full redraw costs about 9.3 million gas units; large text is drawn again only when it changes.
+The pod's memory limit is 16 KiB: a 1.5 KiB stack and 13 KiB of data, mostly the 4 KiB answer buffer and the node and pod tables. The build checks this size after the link step. By the API server's estimate (`kube32-podsize images/sd/clusterview.wasm --memory 16`), the pod takes 93 KiB of a node with its 19 KB module inline or on a card, and 75 KiB with the module embedded in the firmware (`kube32 embed`). A Cardputer offers pods 80 KiB, so it runs the pod only as an embedded image. A full redraw costs about 9.3 million gas units; large text is drawn again only when it changes.

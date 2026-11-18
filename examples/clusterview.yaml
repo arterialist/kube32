@@ -11,9 +11,10 @@
 #   kubectl --context kube32 apply -f apps/clusterview/build/clusterview.yaml
 #   kubectl --context kube32 logs -f clusterview
 #
-# The pod sizes its layout from the screen (k32_display_info): it runs on the
-# Cardputer Zero's 320x170 panel and on the Cardputer's 240x135 one
-# (kube32.io/board: cardputer). It reads the API server at
+# The pod sizes its layout from the screen (k32_display_info), the Cardputer
+# Zero's 320x170 panel or the Cardputer's 240x135 one. A Cardputer's 80 KiB
+# of pod memory holds it only as an embedded image (apps/clusterview/README.md).
+# It reads the API server at
 # KUBERNETES_SERVICE_HOST:KUBERNETES_SERVICE_PORT, which the kubelet sets in
 # every pod; set API_URL (and API_TOKEN when the server has a token) to read
 # another.
