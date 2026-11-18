@@ -427,6 +427,59 @@ static void test_play() {
     assert(peak > 700 && peak < 1100);
 }
 
+// A card that sounds only a while after a start: the stream starts with
+// silence, a call waits no longer for it, and a stream held open after a
+// sound takes the next one at once
+static void test_lead_in() {
+    auto owned = std::make_unique<FakeCard>();
+    FakeCard& card = *owned;
+    LinuxAudioConfig cfg = fake_config();
+    cfg.speaker_lead_in_ms = 150;
+    cfg.speaker_hold_ms = 400;
+    LinuxAudio audio(cfg, std::move(owned));
+    std::string why;
+    assert(audio.open(why));
+
+    auto t0 = Clock::now();
+    assert(audio.tone(1000, 200, 10) == HAL_OK);
+    const long took = since_ms(t0);
+    std::cout << "a 200 ms tone after a 150 ms lead-in: the call took " << took << " ms" << std::endl;
+    assert(took < 100);   // the Cardputer's takes about 104 ms
+
+    auto sound_span = [&](size_t& first, size_t& last) {
+        std::lock_guard<std::mutex> lk(card.mu);
+        first = last = 0;
+        bool any = false;
+        for (size_t i = 0; i < card.played.size(); ++i) {
+            if (std::fabs(card.played[i]) < 50) continue;
+            if (!any) first = i;
+            any = true;
+            last = i;
+        }
+        return any;
+    };
+    wait_for([&] { size_t f, l; return sound_span(f, l) && card.played.size() > l + 4800; }, 1500);
+    size_t first = 0, last = 0;
+    assert(sound_span(first, last));
+    std::cout << "sound from frame " << first << " to " << last << std::endl;
+    assert(first >= 7200 - 100 && first < 7200 + 500);
+    assert(last - first > 9400 && last - first < 9700);
+
+    // Held open: the next sound needs no lead-in
+    std::this_thread::sleep_for(milliseconds(150));
+    assert(card.out_opens == 1 && card.out_closes == 0);
+    {
+        std::lock_guard<std::mutex> lk(card.mu);
+        card.played.clear();
+    }
+    assert(audio.tone(1000, 50, 10) == HAL_OK);
+    wait_for([&] { size_t f, l; return sound_span(f, l) && card.played.size() > l + 480; }, 1000);
+    assert(sound_span(first, last));
+    assert(card.out_opens == 1 && first < 2400);
+    wait_for([&] { return card.out_closes == 1; }, 1500);
+    assert(card.out_closes == 1);
+}
+
 // Another process holding the device, and a board without one
 static void test_busy_and_missing() {
     auto owned = std::make_unique<FakeCard>();
@@ -559,6 +612,7 @@ int main() {
     test_ring();
     test_control_values();
     test_play();
+    test_lead_in();
     test_busy_and_missing();
     test_mic();
     test_turns();

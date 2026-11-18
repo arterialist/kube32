@@ -29,6 +29,11 @@ struct LinuxAudioConfig {
     int capture_channel = -1;   // the microphone's channel in a capture frame, -1: the mean of all of them
     uint32_t mic_unity_gain = 16;   // the mic_set_gain value that keeps the codec's level
     bool full_duplex = false;   // the microphone records while the speaker plays (false: the speaker comes first)
+    // Silence a playback stream starts with, for a card that sounds only a
+    // while after a start; the output queue grows by as much, so a call
+    // never waits longer for it
+    uint32_t speaker_lead_in_ms = 0;
+    uint32_t speaker_hold_ms = 30;  // how long the stream stays open after the last sound
 };
 
 // The M5Stack Cardputer Zero: speaker and microphone on its ES8389 codec

@@ -26,20 +26,21 @@
 
 namespace kube32::hal {
 
+// The codec's registers return to their power-up values when it powers up,
+// and a control written while it is off does not reach it: the levels here
+// are those values, and the microphone's gain is applied in software.
 LinuxAudioConfig cardputer_zero_audio() {
     LinuxAudioConfig c;
     c.card_name = "ES8389Audio";
     c.controls = {
-        {"Speaker Switch", "on"},                    // the speaker amplifier
+        {"Speaker Switch", "on"},                    // the amplifier, fed from the left output
         // 0 dB: a sample's full scale is the DAC's, so the ceiling holds
         {"DACL Playback Volume", "191"},
         {"DACR Playback Volume", "191"},
-        {"OUTL MUX", "Normal"},
-        {"OUTR MUX", "Normal"},
-        // The on-board analog microphone, differential into the left PGA
+        // The analog microphone on the left ADC (the machine driver picks
+        // the PGA input from the headphone jack)
         {"Mic Jack Switch", "on"},
         {"ADC MUX", "AMIC"},
-        {"PGAL Select", "DifferentialL"},
         {"ADCL PGA Volume", "8"},                    // +24 dB
         {"ADCL Capture Volume", "191"},              // 0 dB
         {"ALC Capture Switch", "ALC OFF"},           // a fixed gain, as on the Cardputer
@@ -51,6 +52,12 @@ LinuxAudioConfig cardputer_zero_audio() {
         {"IF ADCDACR Mixer ADCR DACR Mixer", "off"},
     };
     c.capture_channel = 0;
+    // At +24 dB the codec's samples sit where the Cardputer's PDM decimator's
+    // do (a quiet room at about 15 rms): the Cardputer's gain applies as is
+    c.mic_unity_gain = 1;
+    // The output sounds 140 to 200 ms after a stream starts
+    c.speaker_lead_in_ms = 200;
+    c.speaker_hold_ms = 1000;
     return c;
 }
 
@@ -351,7 +358,6 @@ namespace {
 using Clock = std::chrono::steady_clock;
 using std::chrono::milliseconds;
 
-constexpr auto kSpeakerTail = milliseconds(30);   // the stream closes this long after the last sample
 constexpr uint32_t kFifoMs = 56;                  // with the stream's 40 ms: a call returns with about 96 ms to play
 constexpr auto kMicIdle = std::chrono::seconds(1);
 constexpr uint32_t kChunk = 256;                  // samples a call converts at a time
@@ -400,7 +406,7 @@ struct LinuxAudio::Impl {
     std::deque<float> fifo;
     size_t fifo_cap = 0;
     bool s_calling = false, s_failed = false;
-    bool s_running = false;             // sound went in since the stream opened
+    bool s_running = false;             // the stream has had frames since it opened
     Clock::time_point written_until{}, sound_until{};   // when the stream has played what it holds, and its last sound
     Resampler s_rs;                     // under speaker_call
     uint64_t s_rs_open = 0;
@@ -429,7 +435,9 @@ struct LinuxAudio::Impl {
 
 void LinuxAudio::Impl::speaker_loop() {
     name_thread("k32_speaker");
+    const auto hold = milliseconds(cfg.speaker_hold_ms);
     std::unique_ptr<PcmStream> out;
+    size_t lead_in = 0;   // frames of silence still to start the stream with
     std::vector<float> chunk;
     std::vector<uint8_t> frames;
     std::unique_lock<std::mutex> lk(smu);
@@ -457,10 +465,8 @@ void LinuxAudio::Impl::speaker_loop() {
         // What the stream holds plays within its length from now
         written_until = std::min(std::max(written_until, now) + frames_time(n, s_fmt.rate),
                                  now + frames_time(s_fmt.buffer_frames, s_fmt.rate));
-        if (sound) {
-            sound_until = written_until;
-            s_running = true;
-        }
+        if (sound) sound_until = written_until;
+        s_running = true;
         return true;
     };
     while (!quit) {
@@ -476,7 +482,8 @@ void LinuxAudio::Impl::speaker_loop() {
             if (opened) {
                 out = std::move(opened);
                 s_fmt = out->format();
-                fifo_cap = std::max<size_t>(s_fmt.rate * kFifoMs / 1000, s_fmt.period_frames);
+                lead_in = static_cast<size_t>(s_fmt.rate) * cfg.speaker_lead_in_ms / 1000;
+                fifo_cap = std::max<size_t>(s_fmt.rate * kFifoMs / 1000, s_fmt.period_frames) + lead_in;
                 written_until = sound_until = Clock::now();
                 s_running = false;
                 ++s_opens;
@@ -486,6 +493,13 @@ void LinuxAudio::Impl::speaker_loop() {
                 s_state = Stream::Closed;
             }
             s_change.notify_all();
+            continue;
+        }
+        if (lead_in) {
+            const size_t n = std::min<size_t>(lead_in, s_fmt.period_frames);
+            chunk.assign(n, 0.0f);
+            lead_in -= n;
+            write(n, false);
             continue;
         }
         const auto now = Clock::now();
@@ -500,7 +514,7 @@ void LinuxAudio::Impl::speaker_loop() {
             write(n, true);
             continue;
         }
-        if (idle && now >= sound_until + kSpeakerTail) {
+        if (idle && now >= sound_until + hold) {
             lk.unlock();
             out.reset();
             lk.lock();
@@ -521,8 +535,8 @@ void LinuxAudio::Impl::speaker_loop() {
             s_wake.wait(lk);
             continue;
         }
-        auto until = s_running ? written_until - period : sound_until + kSpeakerTail;
-        if (idle) until = std::min(until, sound_until + kSpeakerTail);
+        auto until = s_running ? written_until - period : sound_until + hold;
+        if (idle) until = std::min(until, sound_until + hold);
         s_wake.wait_until(lk, until);
     }
     lk.unlock();
