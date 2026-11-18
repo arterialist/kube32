@@ -175,6 +175,7 @@ else()
         src/hal/linux/linux_board.cpp
         src/hal/linux/linux_display.cpp
         src/hal/linux/linux_i2c.cpp
+        src/hal/linux/linux_ir.cpp
         src/hal/linux/linux_keyboard.cpp
         src/runtime/host_functions.cpp
         src/runtime/container_lifecycle.cpp

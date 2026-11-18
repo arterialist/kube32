@@ -41,6 +41,8 @@ bool linux_board_preset(std::string_view name, LinuxBoardConfig& out) {
         // the ST7789 panel and the TCA8418 keyboard, and its launcher has the
         // screen while no pod uses it. Its own parts (keyboard, codec, RTC,
         // IO expander, fuel gauge, IMU) sit on i2c-1 under kernel drivers.
+        // The IR receiver (gpio-ir overlay, BCM 13) and LED (gpio-ir-tx, BCM
+        // 12) go by their device tree nodes: their lircN follows probe order.
         out = LinuxBoardConfig{};
         out.name = "cardputer-zero";
         out.framebuffer = "/dev/fb_lcd";
@@ -51,6 +53,8 @@ bool linux_board_preset(std::string_view name, LinuxBoardConfig& out) {
         out.thermal = "/sys/class/thermal/thermal_zone0";
         out.screen_owner = "APPLaunch.service";
         out.audio = cardputer_zero_audio();
+        out.ir_rx = "/sys/devices/platform/ir-receiver@d";
+        out.ir_tx = "/sys/devices/platform/gpio-ir-transmitter@c";
         return true;
     }
     return false;
@@ -77,6 +81,7 @@ void LinuxBoard::close() {
     watch_wake_.notify_all();
     if (watcher_.joinable()) watcher_.join();
     give_back();
+    if (ir_rx_) ir_rx_->stop();
     std::unique_lock<std::shared_mutex> audio(audio_mutex_);
     audio_.reset();
 }
@@ -94,6 +99,8 @@ bool LinuxBoard::init() {
     for (const auto& bus : config_.i2c) all = open_i2c(bus.first, bus.second) && all;
     if (!config_.thermal.empty()) all = open_thermal() && all;
     if (config_.audio) all = open_audio() && all;
+    if (!config_.ir_rx.empty()) all = open_ir(RmtDir::Rx, config_.ir_rx) && all;
+    if (!config_.ir_tx.empty()) all = open_ir(RmtDir::Tx, config_.ir_tx) && all;
     if (display_present_ || keyboard_present_) {
         if (config_.screen_owner.empty()) {
             take_from_owner();
@@ -259,7 +266,8 @@ HostI2cAdapter* LinuxBoard::i2c_adapter(uint8_t bus) const {
 
 void LinuxBoard::describe(BoardProfile& profile) const {
     // The kernel owns the SoC's pins: pods claim none of them, as GPIO, ADC,
-    // UART or RMT. The buses that opened run as the kernel set them up.
+    // UART or RMT pins. The buses and IR devices that opened run as the
+    // kernel set them up.
     profile.name = config_.name;
     profile.reserved_gpio_mask = KUBE32_CHIP_GPIO_MASK;
     profile.uart_port_mask = 0;
@@ -267,6 +275,7 @@ void LinuxBoard::describe(BoardProfile& profile) const {
     profile.rmt_tx_pin_mask = 0;
     profile.rmt_tx_default_pin = -1;
     profile.rmt_rx_default_pin = -1;
+    profile.rmt_fixed_mask = static_cast<uint8_t>((ir_tx_ ? rmt_dir_bit(RmtDir::Tx) : 0) | (ir_rx_ ? rmt_dir_bit(RmtDir::Rx) : 0));
     profile.i2c_bus_mask = 0;
     for (uint8_t bus = 0; bus < 2; ++bus) {
         profile.i2c_pins[bus] = {};

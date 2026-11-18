@@ -2,17 +2,20 @@
 
 // A Linux single-board computer's own devices for a kube32-sim node: the
 // panel through its framebuffer, the keyboard through evdev, I2C buses
-// through /dev/i2c-N and the SoC's temperature through a thermal zone. The
-// pod API reaches them as it reaches a Cardputer's: the same font, the same
-// key codes, the same I2C transfers. A preset names the devices of a known
-// board (cardputer-zero); kube32-sim's flags describe any other.
+// through /dev/i2c-N, the SoC's temperature through a thermal zone and the
+// infrared transmitter and receiver through LIRC. The pod API reaches them as
+// it reaches a Cardputer's: the same font, the same key codes, the same I2C
+// transfers and IR frames. A preset names the devices of a known board
+// (cardputer-zero); kube32-sim's flags describe any other.
 //
-// The devices are opened on Linux only. The drawing, the key translation and
-// the reading of sysfs build on every host, so that tests run anywhere.
+// The devices are opened on Linux only. The drawing, the key translation, the
+// framing of IR samples and the reading of sysfs build on every host, so
+// that tests run anywhere.
 
 #include "hal/board.hpp"
 #include "hal/linux_audio.hpp"
 #include "hal/pod_buses.hpp"
+#include "hal/pod_rmt.hpp"
 
 #include <atomic>
 #include <bitset>
@@ -27,6 +30,7 @@
 #include <string>
 #include <string_view>
 #include <thread>
+#include <vector>
 
 namespace kube32::hal {
 
@@ -55,6 +59,10 @@ struct LinuxBoardConfig {
     std::string screen_owner;
     // The speaker and microphone (hal/linux_audio.hpp); none: no audio
     std::optional<LinuxAudioConfig> audio;
+    // The infrared receiver and transmitter: a LIRC device (/dev/lircN), or
+    // the sysfs directory of the kernel device that has one; empty: none
+    std::string ir_rx;
+    std::string ir_tx;
     std::string sysfs{"/sys"};            // where the kernel lists its I2C devices
 };
 
@@ -143,6 +151,101 @@ private:
     std::bitset<128> reserved_;
 };
 
+// LIRC mode2 samples (linux/lirc.h): the kind in the top byte, microseconds
+// below it
+constexpr uint32_t kLircSpace = 0x00000000;
+constexpr uint32_t kLircPulse = 0x01000000;
+constexpr uint32_t kLircTimeout = 0x03000000;
+constexpr uint32_t kLircOverflow = 0x04000000;
+constexpr uint32_t kLircKindMask = 0xFF000000;
+constexpr uint32_t kLircValueMask = 0x00FFFFFF;
+
+// Cuts a LIRC receiver's mode2 samples into frames as an RMT receiver
+// captures them (hal/pod_rmt.hpp): a frame starts with a pulse, spaces before
+// it are skipped, samples of one kind in a row are one duration (at most
+// 65535 us), and a space of idle_us, or the driver's timeout report, ends it
+// without that space. An overflow report loses the frame being received;
+// carrier reports are skipped. A frame keeps its first kRmtMaxDurations + 1
+// durations, so that the receiver's queue drops a longer one as too long.
+class LircFramer {
+public:
+    explicit LircFramer(uint32_t idle_us) : idle_us_(idle_us) {}
+    // Takes one sample; true when it ended a frame, which frame() holds
+    // until the next sample
+    bool feed(uint32_t sample);
+    const std::vector<uint16_t>& frame() const { return frame_; }
+
+private:
+    void append(uint32_t us);
+    bool finish();
+
+    uint32_t idle_us_;
+    std::vector<uint16_t> frame_;   // the frame being received; empty before its first pulse
+    uint32_t space_us_{0};          // the space after the last pulse so far
+    bool ended_{false};
+};
+
+// A frame as LIRC_MODE_PULSE writes it: up to its last mark, as a write must
+// hold an odd count of durations, pulse first. Returns that count and sets
+// `trailing_us` to the space after the last mark, which the sender waits
+// out itself (0 when the frame ends with a mark).
+size_t lirc_pulse_frame(const uint16_t* durations, size_t count, uint32_t* out, uint32_t& trailing_us);
+
+// The LIRC device of `device`: a device node as it is; for a sysfs
+// directory (the kernel device, /sys/devices/platform/<name>, or its
+// rc/rcN), /dev/lircN after the lircN the kernel lists below it. Empty for
+// a directory without one.
+std::string lirc_device_node(const std::string& device);
+
+// A board's infrared transmitter, a LIRC device in LIRC_MODE_PULSE. The
+// carrier and the duty cycle are set before every frame, where the driver
+// lets them be set; others keep the driver's own.
+class LinuxIrTransmitter final : public HostIrTransmitter {
+public:
+    LinuxIrTransmitter(std::string device, int fd, uint32_t features);
+    ~LinuxIrTransmitter() override;
+    const std::string& device() const override { return device_; }
+    bool configure(const RmtAssignment& a, std::string& err) override;
+    int32_t send(const uint16_t* durations, size_t count) override;
+
+private:
+    // Sets the carrier and the duty cycle where the driver can; false with
+    // `err` set when it refuses them
+    bool apply(std::string& err);
+
+    std::string device_;
+    int fd_;
+    uint32_t features_;
+    uint32_t carrier_hz_{kRmtDefaultCarrierHz};
+    uint32_t duty_pct_{kRmtDefaultDutyPct};
+};
+
+// A board's infrared receiver, a LIRC device in LIRC_MODE_MODE2: while
+// started, a thread reads its samples and hands the frames a LircFramer
+// cuts to the sink. The driver's receive timeout, shared by everyone reading
+// the device, is idle_us while the receiver runs and goes back after.
+class LinuxIrReceiver final : public HostIrReceiver {
+public:
+    LinuxIrReceiver(std::string device, int fd, uint32_t features);
+    ~LinuxIrReceiver() override;
+    const std::string& device() const override { return device_; }
+    bool start(const RmtAssignment& a, Sink sink, std::string& err) override;
+    void stop() override;
+
+private:
+    void run(uint32_t idle_us);
+
+    std::string device_;
+    int fd_;
+    uint32_t features_;
+    std::mutex mutex_;   // start and stop
+    std::thread thread_;
+    int wake_[2]{-1, -1};   // a byte written stops the thread
+    Sink sink_;
+    bool timeout_set_{false};
+    uint32_t saved_timeout_{0};
+};
+
 // The panel and the keyboard belong to the node, or, on a board with a
 // screen owner (a launcher's systemd user unit), to the node only while pods
 // use them: the first drawing call or key read of a pod stops the owner and
@@ -160,8 +263,9 @@ public:
     // configured device opened. Without a screen owner the node takes the
     // panel and the keyboard now.
     bool init() override;
-    // No GPIO, ADC, UART or RMT; the I2C buses that opened, with the addresses
-    // their kernel drivers hold; the display and keyboard when they opened
+    // No GPIO, ADC or UART; the I2C buses that opened, with the addresses
+    // their kernel drivers hold; one RMT channel on each infrared device that
+    // opened; the display and keyboard when they opened
     void describe(BoardProfile& profile) const override;
 
     DisplayInfo display_info() const override;
@@ -190,9 +294,9 @@ public:
     // them so, and a sound call takes them for the speaker the owner holds.
     void take_from_owner();
     // The node on its way out: the panel and the keyboard go back to the
-    // screen owner for good, the mixer controls the audio set go back as they
-    // were, and the display, key and sound calls of pods still running answer
-    // HAL_ERR_NODEV
+    // screen owner for good, the mixer controls the audio set and the IR
+    // receiver's timeout go back as they were, and the display, key and sound
+    // calls of pods still running answer HAL_ERR_NODEV
     void close();
 
     // The adapter of pod bus `bus`, nullptr when the board has none
@@ -202,6 +306,9 @@ public:
     bool has_chip_temp() const { return !temp_path_.empty(); }
     bool has_speaker() const { return speaker_present_; }
     bool has_microphone() const { return microphone_present_; }
+    // The infrared devices that opened, nullptr for none
+    HostIrTransmitter* ir_transmitter() const { return ir_tx_.get(); }
+    HostIrReceiver* ir_receiver() const { return ir_rx_.get(); }
     // The thermal zone in milli-degrees Celsius: HAL_OK, HAL_ERR_NODEV without
     // one, HAL_ERR_IO when it cannot be read
     int32_t chip_temp_read(int32_t& out_milli_c) const;
@@ -222,6 +329,7 @@ private:
     bool open_i2c(uint8_t bus, const std::string& device);
     bool open_thermal();
     bool open_audio();
+    bool open_ir(RmtDir dir, const std::string& spec);
     // A speaker call `sound` on the audio, after the take from the owner
     template <typename Sound>
     int32_t speaker_call(Sound sound);
@@ -276,6 +384,9 @@ private:
     std::unique_ptr<LinuxAudio> audio_;
     bool speaker_present_{false};
     bool microphone_present_{false};
+
+    std::unique_ptr<LinuxIrTransmitter> ir_tx_;
+    std::unique_ptr<LinuxIrReceiver> ir_rx_;
 };
 
 }  // namespace kube32::hal
