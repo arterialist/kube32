@@ -188,7 +188,7 @@ kubectl --context kube32 get nodes -L i2c.kube32.io/0x28
 
 ## Infrared (RMT)
 
-The ESP32-S3 RMT peripheral sends and captures pulse trains, the signal of infrared remote controls. A pod claims one transmit channel (`esp32.io/rmt-tx: "1"`), one receive channel (`esp32.io/rmt-rx: "1"`), or one of each. The chip has four channels of each direction; a node advertises at most four of each and only as many as it has pins for, so a profile without a claimable pin for a direction advertises none of it.
+The ESP32-S3 RMT peripheral sends and captures pulse trains, the signal of infrared remote controls. A pod claims one transmit channel (`esp32.io/rmt-tx: "1"`), one receive channel (`esp32.io/rmt-rx: "1"`), or one of each. The chip has four channels of each direction; a node advertises at most four of each and only as many as it has pins for, so a profile without a claimable pin for a direction advertises none of it. A Linux board offers one channel of each direction on its own infrared devices ([below](#infrared-on-a-linux-board)).
 
 ### Pins and settings
 
@@ -212,6 +212,7 @@ metadata:
 | --- | --- | --- | --- |
 | `generic` | 4 RMT TX, 4 RMT RX | None | None |
 | `cardputer` | 4 RMT TX, 4 RMT RX | GPIO 44, the built-in IR LED | None |
+| `cardputer-zero` (Linux) | 1 RMT TX, 1 RMT RX | The board's IR LED, no pin | The board's IR receiver, no pin |
 
 Channel pins are claimed like bus pins: admission fails when the chip or the board reserves the pin, when another pod holds it, or when the claim names no pin and the board has no default (`RMT RX has no default pin on the cardputer board: set annotation kube32.io/rmt-rx: "pin=<n>"`).
 
@@ -246,6 +247,24 @@ A receive channel allocates its 1 KiB queue and a 192-byte capture block from in
 The firmware builds the RMT driver's interrupt handlers and encoders into flash instead of IRAM (`CONFIG_RMT_*_IN_IRAM` off in `sdkconfig.defaults`): an IR symbol lasts hundreds of microseconds, so a cache miss costs nothing.
 
 On the host simulator the channels keep the same lifecycle and queue. `MockHal::get_rmt_tx_frames(pin)` returns the frames sent on a pin, `hal::rmt_inject(pin, ...)` hands a frame to the receiver on a pin, and `MockHal::set_rmt_loopback(true)` delivers every frame sent to the node's receivers, as an LED facing them would.
+
+### Infrared on a Linux board
+
+A [Linux board](hardware-spec.md#linux-boards) runs the channels on the kernel's LIRC devices: `--ir-tx` names the transmitter and `--ir-rx` the receiver, and the `cardputer-zero` preset sets both. The node advertises one RMT TX channel when the transmitter opens and one RMT RX channel when the receiver opens. The kernel wires the LED and the receiver, so a claim takes no pin, and an annotation that names one is refused:
+
+```
+RMT RX runs on the cardputer-zero board's own receiver: annotation kube32.io/rmt-rx cannot set a pin
+```
+
+The other settings apply where the driver supports them:
+
+| Setting | On a Linux board |
+| --- | --- |
+| `carrier`, `duty` | Set with `LIRC_SET_SEND_CARRIER` and `LIRC_SET_SEND_DUTY_CYCLE` before every frame. When the driver refuses a value, the pod is not admitted and the event names the device's error. A driver without these controls sends with its own carrier, and the node logs that when it opens the device. |
+| `active` | Ignored. The kernel driver knows the receiver's polarity and reports every mark as a pulse. |
+| `idle_us` | The receiver's timeout (`LIRC_SET_REC_TIMEOUT`) while the pod holds the channel, and the longest space inside a frame. The device's previous timeout comes back when the channel is released. |
+
+Frames follow the rules [above](#frames): at most 512 durations, at most 500 ms for a frame sent, and the same queue, drop counts and `K32_ERR_AGAIN`. `esp32_rmt_send` writes the frame up to its last mark in `LIRC_MODE_PULSE`, as the kernel takes an odd count of durations. The write returns once the driver has sent the frame, and the call then waits out a final space. The receiver reads `LIRC_MODE_MODE2` samples on a thread of its own from admission until release. A frame starts with a pulse, samples of one kind in a row make one duration, and a duration above 65535 µs counts as 65535. The driver's timeout report, or a space of `idle_us`, ends the frame without that space. A frame in progress when the driver reports an overflow is lost. Samples that arrived before the claim are discarded.
 
 ### Example: IR remote
 

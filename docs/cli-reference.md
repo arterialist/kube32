@@ -44,6 +44,8 @@ Use `kubectl` and k9s to manage the cluster. Use the tools below to run the host
 | `--backlight <dir>` | none | Linux: a backlight the node turns on when it takes the panel and finds it off, for example `/sys/class/backlight/<name>`. |
 | `--screen-owner <unit>` | none | Linux: a systemd user unit, such as a launcher, that has the panel and the keyboard while no pod uses them. |
 | `--audio-card <name>` | none | Linux: the ALSA card, by its id in `/proc/asound/cards`, whose first playback and capture devices are the speaker and microphone. |
+| `--ir-rx <device>` | none | Linux: the infrared receiver `esp32_rmt_receive` reads, a LIRC device such as `/dev/lirc1`, or the sysfs directory of its kernel device, such as `/sys/devices/platform/ir-receiver@d`. |
+| `--ir-tx <device>` | none | Linux: the infrared transmitter `esp32_rmt_send` drives, a LIRC device such as `/dev/lirc0`, or the sysfs directory of its kernel device. |
 | `--ingress-port <port>` | off (`0`) | Ingress controller HTTP port. |
 | `--pod-port <port>` | `7000` | Pod HTTP server port on every node. |
 | `--node-id <id>` | `0` | Node ID for UDP IPC channels. |
@@ -57,7 +59,7 @@ Use `kubectl` and k9s to manage the cluster. Use the tools below to run the host
 
 ### Linux boards
 
-On a Linux single-board computer, the process's nodes use the board's own screen, keyboard, I2C buses, SoC temperature, speaker and microphone ([Linux boards](hardware-spec.md#linux-boards)). `--board cardputer-zero` names the M5Stack Cardputer Zero's devices, and the device flags describe any other board or replace a preset's device. A value of `none` leaves a device out. Without a preset or a device flag, and on hosts other than Linux, the peripherals stay simulated. The devices go to a `worker` process's node, or to a `standalone` process's own kubelet. A standalone process on a Linux board starts no in-process workers unless `--workers` names some. A `control-plane` process leaves the devices alone.
+On a Linux single-board computer, the process's nodes use the board's own screen, keyboard, I2C buses, SoC temperature, speaker, microphone and infrared LED and receiver ([Linux boards](hardware-spec.md#linux-boards)). `--board cardputer-zero` names the M5Stack Cardputer Zero's devices, and the device flags describe any other board or replace a preset's device. A value of `none` leaves a device out. Without a preset or a device flag, and on hosts other than Linux, the peripherals stay simulated. The devices go to a `worker` process's node, or to a `standalone` process's own kubelet. A standalone process on a Linux board starts no in-process workers unless `--workers` names some. A `control-plane` process leaves the devices alone.
 
 ```sh
 # the Cardputer Zero
