@@ -12,6 +12,7 @@ All notable changes to this project will be documented in this file. The format 
 
 ### Added
 
+- The `atoms3-lite` board profile for the M5Stack AtomS3 Lite ([docs/hardware-spec.md](docs/hardware-spec.md#atoms3-lite-pins)): pods can claim the Grove port, the six header pins and the button, and the IR LED is the default RMT TX pin. A profile without a screen no longer mounts the Cardputer's microSD bus or draws the boot screen.
 - A node's console can run over USB OTG (CDC-ACM) on boards without USB-Serial/JTAG on their port ([docs/hardware-spec.md](docs/hardware-spec.md#console-over-usb-otg)).
 - ESP-IDF 6.1 builds for the ESP32-C3 and the ESP32-P4, and a plain `idf.py` build beside PlatformIO ([docs/hardware-spec.md](docs/hardware-spec.md#other-targets)). An ESP32-C3 image boots under QEMU, joins a control plane and runs pods.
 - `k32_display_info` and `k32_touch_read` (`hardware.kube32.io/touch`) for pods.

@@ -19,17 +19,18 @@ public:
 
     // The kube32.io/board label of the node
     virtual const char* name() const = 0;
-    // Brings up the peripherals; false when the display did not answer, and
-    // the node then offers pods none of them
+    // Brings up the peripherals; false when they did not answer (the
+    // display, on a board with one), and the node then offers pods none of them
     virtual bool init() = 0;
     // The pins the board keeps, the buses it offers and its on-board devices
     virtual void describe(BoardProfile& profile) const = 0;
 
-    virtual DisplayInfo display_info() const = 0;
-    virtual int32_t display_text(int32_t x, int32_t y, const char* text, size_t len, uint16_t fg, uint16_t bg) = 0;
-    virtual int32_t display_rect(int32_t x, int32_t y, int32_t w, int32_t h, uint16_t color) = 0;
-    virtual int32_t display_bar(int32_t x, int32_t y, int32_t w, int32_t h, uint32_t pct, uint16_t fg, uint16_t bg) = 0;
-    virtual int32_t display_blit(int32_t x, int32_t y, int32_t w, int32_t h, const uint16_t* pixels) = 0;
+    // A board without a screen answers a zero size and HAL_ERR_NODEV
+    virtual DisplayInfo display_info() const { return {}; }
+    virtual int32_t display_text(int32_t, int32_t, const char*, size_t, uint16_t, uint16_t) { return HAL_ERR_NODEV; }
+    virtual int32_t display_rect(int32_t, int32_t, int32_t, int32_t, uint16_t) { return HAL_ERR_NODEV; }
+    virtual int32_t display_bar(int32_t, int32_t, int32_t, int32_t, uint32_t, uint16_t, uint16_t) { return HAL_ERR_NODEV; }
+    virtual int32_t display_blit(int32_t, int32_t, int32_t, int32_t, const uint16_t*) { return HAL_ERR_NODEV; }
 
     // The next key, or HAL_ERR_AGAIN; a board without keys answers HAL_ERR_NODEV
     virtual int32_t key_read() { return HAL_ERR_NODEV; }

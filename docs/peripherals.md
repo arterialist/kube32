@@ -306,6 +306,7 @@ The ESP32-S3 provides GPIO 0 to 21 and 26 to 48. The firewall blocks claims on r
 
 * Every board (`KUBE32_RESERVED_GPIO_MASK`) reserves GPIO `0` for boot strapping, `19` and `20` for native USB, `26` to `32` for SPI flash and quad PSRAM, and `43` and `44` for the UART0 console. The `cardputer` profile offers GPIO `44` to RMT TX channels for its IR LED. A pod can claim GPIO `0` as an input pin (`esp32.io/gpio-input-0`) to read the boot button.
 * The `cardputer` profile also reserves LCD SPI pins `33` to `38`, I2S speaker pins `41` to `43`, microphone data pin `46`, keyboard matrix pins `3` to `9`, `11`, `13`, and `15`, and microSD SPI pins `12`, `14`, `39`, and `40`.
+* The `atoms3-lite` profile offers only its Grove pins `1` and `2`, header pins `5` to `8`, `38` and `39`, and button pin `41`. It reserves the rest, including RGB LED pin `35`, and offers IR LED pin `4` to RMT TX channels.
 
 An ADC1 channel `N` from `0` to `9` is claimable only when its pad, GPIO `N + 1`, is claimable by the board profile.
 

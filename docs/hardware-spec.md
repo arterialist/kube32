@@ -11,12 +11,13 @@ A board with PSRAM defaults to the control plane. A board without PSRAM defaults
 
 ## Board profiles and labels
 
-Select the peripheral profile with `K32_CMD:BOARD:cardputer|generic`:
+Select the peripheral profile with `K32_CMD:BOARD:cardputer|atoms3-lite|generic`:
 
 | Profile | Labels | Allocatable peripherals | Default bus pins |
 | --- | --- | --- | --- |
 | `generic` | `kube32.io/board: generic` | 33 GPIO, 10 ADC, 2 I2C, 2 UART, chip temperature | I2C0 on GPIO 8/9, UART1 on GPIO 17/18 |
 | `cardputer` | `kube32.io/board: cardputer` | 11 GPIO, 3 ADC, 1 I2C, 1 UART, chip temperature | I2C0 or UART1 on Grove port GPIO 2/1 |
+| `atoms3-lite` | `kube32.io/board: atoms3-lite` | 9 GPIO, 6 ADC, 1 I2C, 1 UART, chip temperature | I2C0 or UART1 on Grove port GPIO 2/1; RMT TX on GPIO 4 (IR LED) |
 
 Control plane nodes also carry the `node-role.kubernetes.io/control-plane` label, and worker nodes carry `node-role.kubernetes.io/worker`.
 
@@ -28,6 +29,23 @@ Control plane nodes also carry the `node-role.kubernetes.io/control-plane` label
 | NS4168 I2S speaker | BCLK 41, DATA 42, LRCK 43 |
 | Key matrix | address lines 8, 9, 11; row inputs 13, 15, 3, 4, 5, 6, 7 |
 | microSD on SPI3, 20 MHz | MOSI 14, MISO 39, SCK 40, CS 12 |
+
+## AtomS3 Lite pins
+
+The M5Stack AtomS3 Lite is an ESP32-S3 with 8 MB of flash and no PSRAM, so it joins as a worker. It has no screen and no microSD slot: node storage is the internal flash partition. The `atoms3-lite` profile offers pods only the pins a user can reach, plus the button:
+
+| Function | GPIO |
+| --- | --- |
+| Grove port (HY2.0-4P) | yellow 2, white 1 |
+| Header | 5, 6, 7, 8, 38, 39 |
+| Button, low when pressed | 41 (`button` driver: `pull: up`, `active: low`) |
+| IR LED, the default RMT TX pin | 4 |
+| WS2812 RGB LED, reserved | 35 |
+
+```sh
+# on the Atom's console
+K32_CMD:BOARD:atoms3-lite
+```
 
 ## Memory budget
 

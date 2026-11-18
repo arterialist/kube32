@@ -127,7 +127,7 @@ static kube32::hal::Board* s_board = nullptr;   // on-board peripherals, nullptr
 // NVS ("board" = "cardputer" enables the ST7789 display, matrix keyboard and
 // I2S speaker). Both can be set over the console:
 //   K32_CMD:ROLE:control-plane|worker|auto
-//   K32_CMD:BOARD:cardputer|generic
+//   K32_CMD:BOARD:cardputer|atoms3-lite|generic
 
 namespace {
 
@@ -179,7 +179,11 @@ NodeIdentity detect_identity() {
     if (role[0]) control_plane = (std::strcmp(role, "control-plane") == 0);
     if (board[0]) {
         id.board = kube32::hal::board_for(board);
-        id.has_display = id.board != nullptr;
+        if (id.board) {
+            kube32::hal::BoardProfile profile;
+            id.board->describe(profile);
+            id.has_display = (profile.onboard_devices & kube32::hal::KUBE32_CAP_DISPLAY) != 0;
+        }
     }
     id.is_control_plane = control_plane;
     char derived[16];
@@ -1352,7 +1356,7 @@ void console_task(void* arg) {
                 vTaskDelay(pdMS_TO_TICKS(200));
                 esp_restart();
             } else if (line.rfind("K32_CMD:BOARD:", 0) == 0 || line.rfind("K32_CMD:ROLE:", 0) == 0 || line.rfind("K32_CMD:AP:", 0) == 0 || line.rfind("K32_CMD:API:", 0) == 0) {
-                // Profile keys: board=<cardputer|generic>, role=<auto|worker>, ap=<on|off>, api=<control plane host|auto>
+                // Profile keys: board=<cardputer|atoms3-lite|generic>, role=<auto|worker>, ap=<on|off>, api=<control plane host|auto>
                 bool is_board = line.rfind("K32_CMD:BOARD:", 0) == 0;
                 bool is_ap = line.rfind("K32_CMD:AP:", 0) == 0;
                 bool is_api = line.rfind("K32_CMD:API:", 0) == 0;
@@ -1826,9 +1830,9 @@ void cluster_task(void* pv) {
            (unsigned)kube32_pool_block_size(), (unsigned)kube32_pool_psram_reserve(), (unsigned)kube32::mem::large_blocks_stats().size);
 
     // Peripherals of the integrated display board
-    bool has_display = false;
     s_board = ident.board;
-    if (s_board) has_display = s_board->init();
+    const bool board_ready = s_board && s_board->init();
+    const bool has_display = board_ready && ident.has_display;
     // Node storage: the microSD card of the display board (its own SPI bus,
     // FAT at /sd) when one is inserted, otherwise the internal flash
     // "storage" partition (FAT with wear levelling at /data). One of the two.
@@ -1899,7 +1903,7 @@ void cluster_task(void* pv) {
         }
         kube32::storage::set_node_blob_stores(flash_blobs.get(), ident.has_display ? &card_blobs : nullptr);
     }
-    install_hardware_hooks(has_display ? ident.board : nullptr);
+    install_hardware_hooks(board_ready ? ident.board : nullptr);
     kube32::app::install_default_platform_hooks();   // event_emit through the channel layer
     // What pods may claim: the chip's pins minus those the board's own
     // peripherals use, and the buses the board has pins for. A bare devkit
