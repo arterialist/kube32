@@ -39,7 +39,7 @@ Pods share each device that a `hardware.kube32.io/*` resource grants, and a pod 
 | --- | --- |
 | `hardware.kube32.io/ipc` | Every node |
 | `hardware.kube32.io/chip-temp` | Every node: the ESP32-S3's internal sensor, a stand-in in the simulator. A node on a [Linux board](hardware-spec.md#linux-boards) reads its SoC's thermal zone and advertises the grant only when the zone can be read |
-| `hardware.kube32.io/tft-display`, `keyboard`, `speaker`, `microphone`, `touch` | Boards with the devices on board (the Cardputer profile has a display, keyboard, speaker and microphone; a Linux board, the framebuffer and keyboard that opened) |
+| `hardware.kube32.io/tft-display`, `keyboard`, `speaker`, `microphone`, `touch` | Boards with the devices on board (the Cardputer profile has a display, keyboard, speaker and microphone; a Linux board, the framebuffer, keyboard and sound card that opened) |
 | `hardware.kube32.io/sd` | Nodes with a mounted microSD card ([storage](storage.md)) |
 
 A resource that a node no longer has (a card taken out, a board profile changed between boots) is set to `null` in the next status write and leaves the Node. The scheduler does not filter on these resources; the firewall checks the grants at admission.
@@ -81,7 +81,7 @@ Error codes (`include/runtime/k32_app_abi.h`, `include/hal/hal_types.hpp`):
 
 ### Cardputer display, keypad, speaker, and microphone
 
-Nodes running the `cardputer` board profile, selected with `K32_CMD:BOARD:cardputer`, expose the M5Stack Cardputer's built-in 240x135 ST7789 display, 56-key matrix, NS4168 I2S speaker, and SPM1423 PDM microphone (`src/runtime/app_pod.cpp`, `src/hal/tft_keyboard_hardware.cpp`). On nodes without this profile, these functions return `K32_ERR_NODEV` (`-19`). A node on a [Linux board](hardware-spec.md#linux-boards) serves the display and keyboard functions with the board's own panel and keyboard, at the panel's size.
+Nodes running the `cardputer` board profile, selected with `K32_CMD:BOARD:cardputer`, expose the M5Stack Cardputer's built-in 240x135 ST7789 display, 56-key matrix, NS4168 I2S speaker, and SPM1423 PDM microphone (`src/runtime/app_pod.cpp`, `src/hal/tft_keyboard_hardware.cpp`). On nodes without this profile, these functions return `K32_ERR_NODEV` (`-19`). A node on a [Linux board](hardware-spec.md#linux-boards) serves the display, keyboard, speaker and microphone functions with the board's own panel, keyboard and sound card, the display at the panel's size.
 
 | Import | Wasm signature | C declaration | Behavior |
 | --- | --- | --- | --- |

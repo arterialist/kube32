@@ -211,11 +211,12 @@ else()
     )
 
     # A Linux board's speaker and microphone, through the kernel's ALSA devices
+    # (the portable part builds on every host, as the board layer's does)
     set(KUBE32_LINUX_AUDIO_SRCS src/hal/linux/linux_audio.cpp)
     if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
         list(APPEND KUBE32_LINUX_AUDIO_SRCS src/hal/linux/linux_audio_alsa.cpp)
-        list(APPEND KUBE32_CORE_SRCS ${KUBE32_LINUX_AUDIO_SRCS})
     endif()
+    list(APPEND KUBE32_CORE_SRCS ${KUBE32_LINUX_AUDIO_SRCS})
 
     # Embedded images (images/*.wasm) and static bundles (images/web/<bundle>/)
     # are turned into a generated source so the host simulator serves the same

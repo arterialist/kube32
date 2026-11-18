@@ -43,6 +43,7 @@ Use `kubectl` and k9s to manage the cluster. Use the tools below to run the host
 | `--thermal <dir>` | none | Linux: the thermal zone `esp32_chip_temp_read` reads, for example `/sys/class/thermal/thermal_zone0`. |
 | `--backlight <dir>` | none | Linux: a backlight the node turns on when it takes the panel and finds it off, for example `/sys/class/backlight/<name>`. |
 | `--screen-owner <unit>` | none | Linux: a systemd user unit, such as a launcher, that has the panel and the keyboard while no pod uses them. |
+| `--audio-card <name>` | none | Linux: the ALSA card, by its id in `/proc/asound/cards`, whose first playback and capture devices are the speaker and microphone. |
 | `--ingress-port <port>` | off (`0`) | Ingress controller HTTP port. |
 | `--pod-port <port>` | `7000` | Pod HTTP server port on every node. |
 | `--node-id <id>` | `0` | Node ID for UDP IPC channels. |
@@ -56,7 +57,7 @@ Use `kubectl` and k9s to manage the cluster. Use the tools below to run the host
 
 ### Linux boards
 
-On a Linux single-board computer, the process's nodes use the board's own screen, keyboard, I2C buses and SoC temperature ([Linux boards](hardware-spec.md#linux-boards)). `--board cardputer-zero` names the M5Stack Cardputer Zero's devices, and the device flags describe any other board or replace a preset's device. A value of `none` leaves a device out. Without a preset or a device flag, and on hosts other than Linux, the peripherals stay simulated. The devices go to a `worker` process's node, or to a `standalone` process's own kubelet. A standalone process on a Linux board starts no in-process workers unless `--workers` names some. A `control-plane` process leaves the devices alone.
+On a Linux single-board computer, the process's nodes use the board's own screen, keyboard, I2C buses, SoC temperature, speaker and microphone ([Linux boards](hardware-spec.md#linux-boards)). `--board cardputer-zero` names the M5Stack Cardputer Zero's devices, and the device flags describe any other board or replace a preset's device. A value of `none` leaves a device out. Without a preset or a device flag, and on hosts other than Linux, the peripherals stay simulated. The devices go to a `worker` process's node, or to a `standalone` process's own kubelet. A standalone process on a Linux board starts no in-process workers unless `--workers` names some. A `control-plane` process leaves the devices alone.
 
 ```sh
 # the Cardputer Zero
@@ -64,7 +65,7 @@ kube32-sim --role worker --join http://<control plane>:6443 --node-name zero --b
 # a Raspberry Pi with an SPI panel and a USB keyboard, I2C on the header
 kube32-sim --role worker --join http://<control plane>:6443 --node-name pi --board pi-panel \
   --fb /dev/fb1 --keyboard-dev /dev/input/by-id/<keyboard>-event-kbd \
-  --i2c-bus 0=/dev/i2c-1 --thermal /sys/class/thermal/thermal_zone0
+  --i2c-bus 0=/dev/i2c-1 --thermal /sys/class/thermal/thermal_zone0 --audio-card <card id>
 # the Cardputer Zero beside its launcher: the I2C bus and the temperature only
 kube32-sim --role worker --join http://<control plane>:6443 --node-name zero --board cardputer-zero --fb none --keyboard-dev none
 ```

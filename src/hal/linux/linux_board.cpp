@@ -50,6 +50,7 @@ bool linux_board_preset(std::string_view name, LinuxBoardConfig& out) {
         out.i2c[0] = "/dev/i2c-1";
         out.thermal = "/sys/class/thermal/thermal_zone0";
         out.screen_owner = "APPLaunch.service";
+        out.audio = cardputer_zero_audio();
         return true;
     }
     return false;
@@ -76,6 +77,8 @@ void LinuxBoard::close() {
     watch_wake_.notify_all();
     if (watcher_.joinable()) watcher_.join();
     give_back();
+    std::unique_lock<std::shared_mutex> audio(audio_mutex_);
+    audio_.reset();
 }
 
 bool LinuxBoard::init() {
@@ -90,6 +93,7 @@ bool LinuxBoard::init() {
     }
     for (const auto& bus : config_.i2c) all = open_i2c(bus.first, bus.second) && all;
     if (!config_.thermal.empty()) all = open_thermal() && all;
+    if (config_.audio) all = open_audio() && all;
     if (display_present_ || keyboard_present_) {
         if (config_.screen_owner.empty()) {
             take_from_owner();
@@ -187,6 +191,59 @@ bool LinuxBoard::open_thermal() {
     return true;
 }
 
+bool LinuxBoard::open_audio() {
+    auto audio = std::make_unique<LinuxAudio>(*config_.audio);
+    std::string why;
+    if (!audio->open(why)) {
+        printf("[BOARD] audio: %s; the node offers no speaker or microphone\n", why.c_str());
+        return false;
+    }
+    speaker_present_ = audio->has_speaker();
+    microphone_present_ = audio->has_microphone();
+    audio_ = std::move(audio);
+    printf("[BOARD] audio:%s%s\n", speaker_present_ ? " speaker" : "", microphone_present_ ? " microphone" : "");
+    return true;
+}
+
+template <typename Sound>
+int32_t LinuxBoard::speaker_call(Sound sound) {
+    if (!speaker_present_) return HAL_ERR_NODEV;
+    // The owner's audio server closes the speaker only once it has been idle
+    // a while (5 s for the Cardputer Zero's PipeWire): a sound right after
+    // the take waits for it, up to 6 s
+    const bool fresh = !taken_.load() && !config_.screen_owner.empty();
+    take_from_owner();
+    const auto until = std::chrono::steady_clock::now() + std::chrono::seconds(6);
+    for (;;) {
+        int32_t rc = HAL_ERR_NODEV;
+        {
+            std::shared_lock<std::shared_mutex> lock(audio_mutex_);
+            if (audio_) rc = sound(*audio_);
+        }
+        if (rc != HAL_ERR_BUSY || !fresh || std::chrono::steady_clock::now() >= until) return rc;
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    }
+}
+
+int32_t LinuxBoard::tone(uint32_t freq_hz, uint32_t duration_ms, uint32_t volume_pct) {
+    return speaker_call([&](LinuxAudio& a) { return a.tone(freq_hz, duration_ms, volume_pct); });
+}
+
+int32_t LinuxBoard::audio_play(const int16_t* samples, uint32_t count, uint32_t rate, uint32_t volume_pct) {
+    return speaker_call([&](LinuxAudio& a) { return a.play(samples, count, rate, volume_pct); });
+}
+
+int32_t LinuxBoard::mic_read(int16_t* out, uint32_t max_samples, uint32_t timeout_ms) {
+    if (!microphone_present_) return HAL_ERR_NODEV;
+    std::shared_lock<std::shared_mutex> lock(audio_mutex_);
+    return audio_ ? audio_->mic_read(out, max_samples, timeout_ms) : HAL_ERR_NODEV;
+}
+
+void LinuxBoard::mic_set_gain(uint32_t gain) {
+    std::shared_lock<std::shared_mutex> lock(audio_mutex_);
+    if (audio_) audio_->mic_set_gain(gain);
+}
+
 int32_t LinuxBoard::chip_temp_read(int32_t& out_milli_c) const {
     if (temp_path_.empty()) return HAL_ERR_NODEV;
     long milli = 0;
@@ -219,7 +276,8 @@ void LinuxBoard::describe(BoardProfile& profile) const {
         profile.i2c_reserved[bus] = i2c_[bus]->reserved();
     }
     profile.i2c_fixed_mask = profile.i2c_bus_mask;
-    profile.onboard_devices = (has_display() ? KUBE32_CAP_DISPLAY : 0) | (has_keyboard() ? KUBE32_CAP_KEYBOARD : 0);
+    profile.onboard_devices = (has_display() ? KUBE32_CAP_DISPLAY : 0) | (has_keyboard() ? KUBE32_CAP_KEYBOARD : 0) |
+                              (has_speaker() ? KUBE32_CAP_SPEAKER : 0) | (has_microphone() ? KUBE32_CAP_MICROPHONE : 0);
     profile.chip_temp = has_chip_temp();
 }
 

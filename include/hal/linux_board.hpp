@@ -11,6 +11,7 @@
 // the reading of sysfs build on every host, so that tests run anywhere.
 
 #include "hal/board.hpp"
+#include "hal/linux_audio.hpp"
 #include "hal/pod_buses.hpp"
 
 #include <atomic>
@@ -21,6 +22,8 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <optional>
+#include <shared_mutex>
 #include <string>
 #include <string_view>
 #include <thread>
@@ -50,6 +53,8 @@ struct LinuxBoardConfig {
     // A systemd user unit that has the panel and the keyboard while no pod
     // uses them (a launcher); empty: the node keeps them from its start
     std::string screen_owner;
+    // The speaker and microphone (hal/linux_audio.hpp); none: no audio
+    std::optional<LinuxAudioConfig> audio;
     std::string sysfs{"/sys"};            // where the kernel lists its I2C devices
 };
 
@@ -168,6 +173,12 @@ public:
     int32_t key_read() override;
     void key_inject(char c) override;
 
+    // The speaker calls take the speaker from the screen owner first
+    int32_t tone(uint32_t freq_hz, uint32_t duration_ms, uint32_t volume_pct) override;
+    int32_t audio_play(const int16_t* samples, uint32_t count, uint32_t rate, uint32_t volume_pct) override;
+    int32_t mic_read(int16_t* out, uint32_t max_samples, uint32_t timeout_ms) override;
+    void mic_set_gain(uint32_t gain) override;
+
     // The boards' ready screen: the node's address and the cluster's app URL,
     // on a panel the node keeps (no screen owner). The first drawing call
     // after it clears the panel to black, so that a pod drawing on less than
@@ -179,8 +190,9 @@ public:
     // them so, and a sound call takes them for the speaker the owner holds.
     void take_from_owner();
     // The node on its way out: the panel and the keyboard go back to the
-    // screen owner for good, and the display and key calls of pods still
-    // running answer HAL_ERR_NODEV
+    // screen owner for good, the mixer controls the audio set go back as they
+    // were, and the display, key and sound calls of pods still running answer
+    // HAL_ERR_NODEV
     void close();
 
     // The adapter of pod bus `bus`, nullptr when the board has none
@@ -188,6 +200,8 @@ public:
     bool has_display() const { return display_present_; }
     bool has_keyboard() const { return keyboard_present_; }
     bool has_chip_temp() const { return !temp_path_.empty(); }
+    bool has_speaker() const { return speaker_present_; }
+    bool has_microphone() const { return microphone_present_; }
     // The thermal zone in milli-degrees Celsius: HAL_OK, HAL_ERR_NODEV without
     // one, HAL_ERR_IO when it cannot be read
     int32_t chip_temp_read(int32_t& out_milli_c) const;
@@ -207,6 +221,10 @@ private:
     bool probe_keyboard();
     bool open_i2c(uint8_t bus, const std::string& device);
     bool open_thermal();
+    bool open_audio();
+    // A speaker call `sound` on the audio, after the take from the owner
+    template <typename Sound>
+    int32_t speaker_call(Sound sound);
     // The panel and the keyboard back to the screen owner, starting it again
     void give_back();
     // Gives them back once no pod holds a display, keyboard or speaker grant
@@ -252,6 +270,12 @@ private:
 
     std::unique_ptr<LinuxI2cAdapter> i2c_[2];
     std::string temp_path_;
+
+    // Calls hold it shared; close() holds it to let the audio go
+    std::shared_mutex audio_mutex_;
+    std::unique_ptr<LinuxAudio> audio_;
+    bool speaker_present_{false};
+    bool microphone_present_{false};
 };
 
 }  // namespace kube32::hal

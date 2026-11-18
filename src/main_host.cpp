@@ -312,7 +312,7 @@ struct SimOptions {
     std::string sim_i2c;                   // simulated I2C parts on this process's bus 0 (MockHal::attach_parts)
     std::string sim_mic;                   // 16 kHz mono 16-bit PCM (raw or WAV) the microphone hears, looped
     // A Linux board's devices over the --board preset (Linux hosts); "none" leaves one out
-    std::optional<std::string> fb, keyboard_dev, keymap, backlight, thermal, screen_owner;
+    std::optional<std::string> fb, keyboard_dev, keymap, backlight, thermal, screen_owner, audio_card;
     std::vector<std::pair<uint8_t, std::string>> i2c_buses;   // --i2c-bus <n>=<device|none>
     // A file standing in for the board's flash blob region (<data-dir>/blobs.img):
     // the size of a board's app slot by default, 0 for none
@@ -364,7 +364,8 @@ static void print_sim_usage(std::ostream& out) {
            "                              in real time and looped\n"
            "\n"
            "Linux boards (the process's nodes use the board's own devices; a value of none leaves one out):\n"
-           "  --board cardputer-zero      the M5Stack Cardputer Zero's screen, keyboard, I2C bus and temperature\n"
+           "  --board cardputer-zero      the M5Stack Cardputer Zero's screen, keyboard, I2C bus, temperature,\n"
+           "                              speaker and microphone\n"
            "  --fb <device>               framebuffer pods draw on, e.g. /dev/fb0 (16 or 32 bits a pixel)\n"
            "  --keyboard-dev <device>     evdev keyboard k32_key_read reads, e.g. /dev/input/event0\n"
            "  --keymap <us|cardputer-zero>  characters of the keyboard's keys (default us)\n"
@@ -373,6 +374,7 @@ static void print_sim_usage(std::ostream& out) {
            "  --backlight <dir>           backlight turned on when it is off, e.g. /sys/class/backlight/<name>\n"
            "  --screen-owner <unit>       systemd user unit (a launcher) that has the screen and keyboard while no\n"
            "                              pod uses them; the node stops it while pods do (cardputer-zero: APPLaunch)\n"
+           "  --audio-card <name>         ALSA card (its id in /proc/asound/cards) of the speaker and microphone\n"
            "\n"
            "Traffic:\n"
            "  --ingress-port <port>       Ingress controller port (default off)\n"
@@ -448,6 +450,7 @@ static SimOptions parse_sim_args(int argc, char* argv[]) {
         else if (arg == "--backlight" && i + 1 < argc) opts.backlight = argv[++i];
         else if (arg == "--thermal" && i + 1 < argc) opts.thermal = argv[++i];
         else if (arg == "--screen-owner" && i + 1 < argc) opts.screen_owner = argv[++i];
+        else if (arg == "--audio-card" && i + 1 < argc) opts.audio_card = argv[++i];
         else if (arg == "--keymap" && i + 1 < argc) {
             kube32::hal::LinuxKeymap keymap;
             opts.keymap = argv[++i];
@@ -555,11 +558,12 @@ static kube32::hal::LinuxBoard* install_linux_board(const SimOptions& opts) {
     kube32::hal::LinuxBoardConfig cfg;
     const bool preset = kube32::hal::linux_board_preset(opts.board, cfg);
     const bool flags =
-        opts.fb || opts.keyboard_dev || opts.keymap || opts.backlight || opts.thermal || opts.screen_owner || !opts.i2c_buses.empty();
+        opts.fb || opts.keyboard_dev || opts.keymap || opts.backlight || opts.thermal || opts.screen_owner || opts.audio_card ||
+        !opts.i2c_buses.empty();
     if (!preset && !flags) return nullptr;
 #if !defined(__linux__)
     if (flags) {
-        std::cerr << "kube32-sim: --fb, --keyboard-dev, --keymap, --i2c-bus, --thermal, --backlight and --screen-owner need a Linux host"
+        std::cerr << "kube32-sim: --fb, --keyboard-dev, --keymap, --i2c-bus, --thermal, --backlight, --screen-owner and --audio-card need a Linux host"
                   << std::endl;
         std::exit(2);
     }
@@ -581,6 +585,14 @@ static kube32::hal::LinuxBoard* install_linux_board(const SimOptions& opts) {
     set(opts.backlight, cfg.backlight);
     set(opts.thermal, cfg.thermal);
     set(opts.screen_owner, cfg.screen_owner);
+    if (opts.audio_card) {
+        // A card the preset does not describe gets the defaults of hal/linux_audio.hpp
+        if (*opts.audio_card == "none") cfg.audio.reset();
+        else if (!cfg.audio || cfg.audio->card_name != *opts.audio_card) {
+            cfg.audio = kube32::hal::LinuxAudioConfig{};
+            cfg.audio->card_name = *opts.audio_card;
+        }
+    }
     if (opts.keymap) kube32::hal::parse_linux_keymap(*opts.keymap, cfg.keymap);
     for (const auto& bus : opts.i2c_buses) {
         if (bus.second == "none") cfg.i2c.erase(bus.first);
@@ -601,7 +613,8 @@ static kube32::hal::LinuxBoard* install_linux_board(const SimOptions& opts) {
         kube32::hal::set_host_chip_temp([board](int32_t& milli_c) { return board->chip_temp_read(milli_c); });
     }
     std::cout << "[BOARD] " << cfg.name << ": " << (board->has_display() ? "display, " : "") << (board->has_keyboard() ? "keyboard, " : "")
-              << __builtin_popcount(profile.i2c_bus_mask) << " I2C bus(es)" << (board->has_chip_temp() ? ", chip temperature" : "")
+              << __builtin_popcount(profile.i2c_bus_mask) << " I2C bus(es)" << (board->has_chip_temp() ? ", chip temperature" : "") << (board->has_speaker() ? ", speaker" : "")
+              << (board->has_microphone() ? ", microphone" : "")
               << "; no GPIO, ADC, UART or RMT" << std::endl;
     return board;
 #endif
