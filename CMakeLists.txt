@@ -648,6 +648,12 @@ else()
     target_compile_definitions(test_pod_snapshot PRIVATE KUBE32_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}")
     add_test(NAME test_pod_snapshot COMMAND test_pod_snapshot)
 
+    # The clusterview example against an API server, drawing into memory
+    add_executable(test_clusterview_app tests/test_clusterview_app.cpp)
+    target_link_libraries(test_clusterview_app PRIVATE kube32_core)
+    target_compile_definitions(test_clusterview_app PRIVATE KUBE32_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}")
+    add_test(NAME test_clusterview_app COMMAND test_clusterview_app)
+
     # The rfid example against a simulated MFRC522; pod tick intervals
     add_executable(test_rfid_app
         tests/test_rfid_app.cpp
