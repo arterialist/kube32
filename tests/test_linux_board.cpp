@@ -319,7 +319,7 @@ void test_profile_and_capacity() {
 }
 
 // An I2C bus that acknowledges `present` and records every address it sees
-class FakeAdapter : public HostI2cAdapter {
+class RecordingAdapter : public HostI2cAdapter {
 public:
     const std::string& device() const override { return name_; }
     int32_t write(uint8_t addr, const uint8_t*, size_t len) override {
@@ -337,7 +337,7 @@ public:
     std::vector<uint8_t> seen;
 
 private:
-    std::string name_{"fake-i2c"};
+    std::string name_{"test-i2c"};
 };
 
 void test_admission_and_transfers() {
@@ -365,9 +365,9 @@ void test_admission_and_transfers() {
     assert(!fw.register_pod("default/p", pod("", R"("kube32.io/i2c-device":"bus=0,addr=0x34")"), err));
     assert(err.find("0x34") != std::string::npos);
 
-    FakeAdapter fake;
-    fake.present = {0x34, 0x40, 0x68};
-    set_host_i2c_adapter(0, &fake);
+    RecordingAdapter adapter;
+    adapter.present = {0x34, 0x40, 0x68};
+    set_host_i2c_adapter(0, &adapter);
 
     // Discovery: the bus's own devices, not the kernel's
     I2cDiscovery discovery;
@@ -375,8 +375,8 @@ void test_admission_and_transfers() {
     const auto labels = discovery.labels();
     assert(labels.count("i2c.kube32.io/0x40") && labels.at("i2c.kube32.io/0x40") == "bus-0");
     assert(!labels.count("i2c.kube32.io/0x34") && !labels.count("i2c.kube32.io/0x68"));
-    assert(std::find(fake.seen.begin(), fake.seen.end(), 0x34) == fake.seen.end());
-    assert(std::find(fake.seen.begin(), fake.seen.end(), 0x68) == fake.seen.end());
+    assert(std::find(adapter.seen.begin(), adapter.seen.end(), 0x34) == adapter.seen.end());
+    assert(std::find(adapter.seen.begin(), adapter.seen.end(), 0x68) == adapter.seen.end());
 
     // The whole bus: transfers reach the adapter; the kernel's addresses
     // have no device for the pod
@@ -388,12 +388,12 @@ void test_admission_and_transfers() {
     assert(fw.check_i2c("default/p", 0, 0x40, AccessMode::Write, loc) == I2cAccess::Bus);
     assert(fw.check_i2c("default/p", 0, 0x34, AccessMode::Write, loc) == I2cAccess::Absent);
     const uint8_t reg = 0x01;
-    fake.seen.clear();
+    adapter.seen.clear();
     assert(i2c_bus_write(0, 0x40, &reg, 1) == 1);
     uint8_t got[2] = {};
     assert(i2c_bus_read(0, 0x40, got, 2) == 2 && got[0] == 0x5A);
     assert(i2c_bus_write(0, 0x41, nullptr, 0) == HAL_ERR_NODEV);
-    assert(fake.seen.size() == 3 && fake.seen[0] == 0x40);
+    assert(adapter.seen.size() == 3 && adapter.seen[0] == 0x40);
     fw.unregister_pod("default/p");
 
     // A device grant: the bus is shared without pins
