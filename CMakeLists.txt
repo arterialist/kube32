@@ -210,6 +210,13 @@ else()
         ${CMAKE_BINARY_DIR}/generated/embedded_blobs.cpp
     )
 
+    # A Linux board's speaker and microphone, through the kernel's ALSA devices
+    set(KUBE32_LINUX_AUDIO_SRCS src/hal/linux/linux_audio.cpp)
+    if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+        list(APPEND KUBE32_LINUX_AUDIO_SRCS src/hal/linux/linux_audio_alsa.cpp)
+        list(APPEND KUBE32_CORE_SRCS ${KUBE32_LINUX_AUDIO_SRCS})
+    endif()
+
     # Embedded images (images/*.wasm) and static bundles (images/web/<bundle>/)
     # are turned into a generated source so the host simulator serves the same
     # bytes as the firmware.
@@ -680,6 +687,12 @@ else()
     )
     target_link_libraries(test_firmware_rollout PRIVATE kube32_core)
     add_test(NAME test_firmware_rollout COMMAND test_firmware_rollout)
+
+    # A Linux board's speaker and microphone on a simulated sound card: the
+    # conversions, the mixer values and the Cardputer's audio semantics
+    add_executable(test_linux_audio tests/test_linux_audio.cpp ${KUBE32_LINUX_AUDIO_SRCS})
+    target_link_libraries(test_linux_audio PRIVATE pthread)
+    add_test(NAME test_linux_audio COMMAND test_linux_audio)
 
 endif()
 
