@@ -118,7 +118,7 @@ On a Linux single-board computer, `kube32-sim` runs a node that gives pods the b
 | `esp32.io/i2c-bus-<n>`, `kube32.io/i2c-device`, discovery | `/dev/i2c-N` with `I2C_RDWR`. The kernel sets the bus's pins and speed, so a claim takes no pins, and a `kube32.io/i2c-bus-<n>` annotation is refused. An address whose `/sys/bus/i2c/devices/<N>-00<hh>/driver` exists belongs to a kernel driver: a pod that holds the bus finds no device there (`K32_ERR_NODEV`), a device grant that names it is refused, and discovery skips it. |
 | `hardware.kube32.io/chip-temp`: `esp32_chip_temp_read` | The thermal zone's `temp`, the SoC's temperature. |
 
-The node offers no GPIO, ADC, UART or RMT, because the kernel owns the SoC's pins, and no speaker or microphone. Its Node has no `kube32.io/simulator` label, so the Device controller places drivers on its buses as on a board's. The board serves every node of the process: run it as a worker, or standalone with `--workers ""`.
+The node offers no GPIO, ADC, UART or RMT, because the kernel owns the SoC's pins, and no speaker or microphone. Its Node has no `kube32.io/simulator` label, so the Device controller places drivers on its buses as on a board's. The board's devices are one node's. A `worker` process is that node. A `standalone` process is the cluster's control plane, and its own kubelet (`--kubelet-name`) is that node. A standalone process on a Linux board runs no in-process workers unless `--workers` names some, and those would share the devices. A `control-plane` process runs no kubelet and leaves the devices alone.
 
 The node keeps the panel and the keyboard from its start and shows the ready screen, the node's address and the cluster's app URL, until a pod draws. On a board with a screen owner (`--screen-owner`, a launcher's systemd user unit), they stay with the launcher until a pod draws or reads a key. The node then stops the launcher, clears the panel and grabs the keyboard. Stopping the launcher also frees what else it holds: on the Cardputer Zero, the audio server keeps the speaker busy while the launcher runs. Once no pod holds the display, keyboard or speaker grant, the node lets go of them within a second and starts the launcher again.
 
@@ -135,7 +135,7 @@ The M5Stack Cardputer Zero (Raspberry Pi CM0, 320x170 ST7789 panel, TCA8418 keyb
 | Chip temperature | `/sys/class/thermal/thermal_zone0` |
 | Screen owner | `APPLaunch.service`, the board's launcher |
 
-The keyboard's Sym layer sends key codes that the board's console keymap turns into symbols, and the `cardputer-zero` keymap returns those symbols: Sym+Q is `~`, Sym+1 is `!`. Fn+F, Fn+Z, Fn+X and Fn+C are the arrows.
+The keyboard's Sym layer sends key codes that the board's console keymap turns into symbols, and the `cardputer-zero` keymap returns those symbols: Sym+Q is `~`, Sym+1 is `!`. Fn+F, Fn+Z, Fn+X and Fn+C are the up, left, down and right arrows.
 
 A pod that draws for the Cardputer's 240x135 screen without asking `k32_display_info` draws in the panel's top left corner, on black.
 
@@ -146,15 +146,16 @@ mkdir -p ~/.local/bin ~/.config/kube32 ~/.config/systemd/user
 cp kube32-sim ~/.local/bin/
 cp packaging/cardputer-zero/kube32-node.service ~/.config/systemd/user/
 cat > ~/.config/kube32/node.env <<'EOF'
-KUBE32_JOIN=http://<control plane address>:6443
-KUBE32_NODE_NAME=cardputer-zero
+KUBE32_ARGS=--role worker --join http://<control plane address>:6443 --node-name cardputer-zero
 EOF
 systemctl --user daemon-reload
 systemctl --user enable --now kube32-node
 journalctl --user -u kube32-node -f
 ```
 
-The unit starts with the user's systemd instance, which the board's image starts at boot (`loginctl enable-linger`). The node keeps its storage in `~/.local/share/kube32`. When the node stops, the unit starts the launcher again in case the pods had the screen.
+`KUBE32_ARGS` holds the role and the cluster, split into arguments at spaces. For the cluster's control plane with a node of its own, use `KUBE32_ARGS=--role standalone --kubelet-name cardputer-zero --node-ip auto --enable-flash`. The unit adds `--board cardputer-zero` and the data directory, `~/.local/share/kube32`.
+
+The unit starts with the user's systemd instance, which the board's image starts at boot (`loginctl enable-linger`). When the node stops, the unit starts the launcher again in case the pods had the screen.
 
 ## Console over USB OTG
 

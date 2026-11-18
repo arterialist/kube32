@@ -288,6 +288,7 @@ struct SimOptions {
     // Standalone: the control plane's own kubelet and the in-process workers
     std::string kubelet_name{"esp32-node-01"};
     std::vector<std::string> workers{"esp32-node-02"};
+    bool workers_set{false};               // --workers given
     std::string board{"generic"};          // kube32.io/board of this process's kubelet (worker role)
     std::string worker_board{"cardputer"}; // kube32.io/board of the in-process workers
     std::string token;                     // API bearer token (also KUBE32_API_TOKEN)
@@ -416,6 +417,7 @@ static SimOptions parse_sim_args(int argc, char* argv[]) {
         else if (arg == "--kubelet-name" && i + 1 < argc) opts.kubelet_name = argv[++i];
         else if (arg == "--workers" && i + 1 < argc) {
             opts.workers.clear();
+            opts.workers_set = true;
             std::string list = argv[++i];
             size_t start = 0;
             while (start <= list.size()) {
@@ -545,8 +547,9 @@ static std::shared_ptr<kube32::hal::FileFirmwareSlots> sim_slots(const std::stri
 // the preset of --board with the device flags over it. The pods' display,
 // keyboard, I2C and chip temperature calls reach the board, and the nodes
 // offer what opened and nothing else. nullptr when the process simulates
-// its peripherals.
-static std::unique_ptr<kube32::hal::LinuxBoard> s_linux_board;
+// its peripherals. It lives to the process's end: the threads of pods still
+// running call into it while the process stops.
+static kube32::hal::LinuxBoard* s_linux_board = nullptr;
 
 static kube32::hal::LinuxBoard* install_linux_board(const SimOptions& opts) {
     kube32::hal::LinuxBoardConfig cfg;
@@ -563,6 +566,12 @@ static kube32::hal::LinuxBoard* install_linux_board(const SimOptions& opts) {
     std::cout << "[BOARD] " << opts.board << " has Linux devices; on this host its peripherals are simulated" << std::endl;
     return nullptr;
 #else
+    if (opts.role == "control-plane") {
+        // No node of this process runs pods; a worker process on the board may
+        std::cout << "[BOARD] " << opts.board << ": the control-plane role runs no kubelet and leaves the board's devices alone"
+                  << " (standalone runs the control plane with a node on them)" << std::endl;
+        return nullptr;
+    }
     cfg.name = opts.board;
     auto set = [](const std::optional<std::string>& flag, std::string& device) {
         if (flag) device = *flag == "none" ? std::string() : *flag;
@@ -577,8 +586,8 @@ static kube32::hal::LinuxBoard* install_linux_board(const SimOptions& opts) {
         if (bus.second == "none") cfg.i2c.erase(bus.first);
         else cfg.i2c[bus.first] = bus.second;
     }
-    s_linux_board = std::make_unique<kube32::hal::LinuxBoard>(cfg);
-    kube32::hal::LinuxBoard* board = s_linux_board.get();
+    s_linux_board = new kube32::hal::LinuxBoard(cfg);
+    kube32::hal::LinuxBoard* board = s_linux_board;
     board->init();
 
     kube32::runtime::AppPlatformHooks hooks = kube32::runtime::app_platform_hooks();
@@ -598,13 +607,10 @@ static kube32::hal::LinuxBoard* install_linux_board(const SimOptions& opts) {
 #endif
 }
 
-// Once the kubelets have stopped: the board's devices close, and a screen
-// owner gets the panel back, before the process's singletons go
+// Once the kubelets have stopped: a screen owner gets the panel back for
+// good, whatever the pods still running draw meanwhile
 static void release_linux_board() {
-    if (!s_linux_board) return;
-    for (uint8_t bus = 0; bus < 2; ++bus) kube32::hal::set_host_i2c_adapter(bus, nullptr);
-    kube32::hal::set_host_chip_temp(nullptr);
-    s_linux_board.reset();
+    if (s_linux_board) s_linux_board->close();
 }
 
 int main(int argc, char* argv[]) {
@@ -667,6 +673,13 @@ int main(int argc, char* argv[]) {
         kube32::runtime::set_app_platform_hooks(hooks);
     }
     kube32::hal::LinuxBoard* linux_board = install_linux_board(opts);
+    if (linux_board && opts.role == "standalone") {
+        // The board's devices are one node's: in-process workers would
+        // advertise them too and draw on the same panel
+        if (!opts.workers_set) opts.workers.clear();
+        else if (!opts.workers.empty())
+            std::cout << "[BOARD] the in-process workers share the board's devices with " << opts.kubelet_name << std::endl;
+    }
     if (!opts.sim_mic.empty() && !install_sim_mic(opts.sim_mic)) return 2;
 
     // Local image registry from the embedded table
@@ -1258,6 +1271,11 @@ int main(int argc, char* argv[]) {
             worker_kubelets.push_back(std::make_unique<kube32::kubelet::Kubelet>(wcfg, *wasm_runtime));
             worker_kubelets.back()->start();
             std::cout << "[INIT] Kubelet running for simulated node " << worker << " (worker)." << std::endl;
+        }
+        // The node's address and its apps' URL (the Ingress, else the API server)
+        if (linux_board) {
+            const uint16_t app_port = opts.ingress_port > 0 ? opts.ingress_port : opts.port;
+            linux_board->show_ready(node_ip, "http://" + node_ip + (app_port == 80 ? "" : ":" + std::to_string(app_port)) + "/");
         }
     }
 

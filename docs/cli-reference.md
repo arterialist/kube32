@@ -26,7 +26,7 @@ Use `kubectl` and k9s to manage the cluster. Use the tools below to run the host
 | `--enable-flash` | off | Persist the object store journal in `<data-dir>/kube32/store/journal.img`. |
 | `--node-name <name>` | `esp32-master` | Control-plane or standalone node name. |
 | `--kubelet-name <name>` | `esp32-node-01` | Kubelet node name in `standalone` mode. |
-| `--workers <a,b,...>` | `esp32-node-02` | In-process worker node names in `standalone` mode; pass `""` for a single control-plane node with no in-process workers (for a separate worker process or a physical board). |
+| `--workers <a,b,...>` | `esp32-node-02`, none on a [Linux board](#linux-boards) | In-process worker node names in `standalone` mode; pass `""` for a single control-plane node with no in-process workers (for a separate worker process or a physical board). |
 | `--board <board>` | `generic` | `kube32.io/board` label for this process's kubelet. On Linux, `cardputer-zero` also gives the process's nodes that board's devices ([below](#linux-boards)). |
 | `--worker-board <board>` | `cardputer` | `kube32.io/board` label for in-process workers. |
 | `--node-ip <ip\|auto>` | `auto` for a worker whose API server is not on this host, else `127.0.0.1` | Address the nodes report, which is the pod IP other nodes dial; pass a LAN address so physical boards can reach pods on the simulator. `auto` is the local address that the system uses to reach the API server, kept current when the network changes ([below](#following-the-network)). |
@@ -56,7 +56,7 @@ Use `kubectl` and k9s to manage the cluster. Use the tools below to run the host
 
 ### Linux boards
 
-On a Linux single-board computer, the process's nodes use the board's own screen, keyboard, I2C buses and SoC temperature ([Linux boards](hardware-spec.md#linux-boards)). `--board cardputer-zero` names the M5Stack Cardputer Zero's devices, and the device flags describe any other board or replace a preset's device. A value of `none` leaves a device out. Without a preset or a device flag, and on hosts other than Linux, the peripherals stay simulated.
+On a Linux single-board computer, the process's nodes use the board's own screen, keyboard, I2C buses and SoC temperature ([Linux boards](hardware-spec.md#linux-boards)). `--board cardputer-zero` names the M5Stack Cardputer Zero's devices, and the device flags describe any other board or replace a preset's device. A value of `none` leaves a device out. Without a preset or a device flag, and on hosts other than Linux, the peripherals stay simulated. The devices go to a `worker` process's node, or to a `standalone` process's own kubelet. A standalone process on a Linux board starts no in-process workers unless `--workers` names some. A `control-plane` process leaves the devices alone.
 
 ```sh
 # the Cardputer Zero

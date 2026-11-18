@@ -1,27 +1,31 @@
-# A kube32 node on the M5Stack Cardputer Zero: kube32-sim as a worker with the
-# board's screen, keyboard, I2C bus and SoC temperature, run by the user's
-# systemd instance. docs/hardware-spec.md#cardputer-zero installs it.
+# A kube32 node on the M5Stack Cardputer Zero: kube32-sim with the board's
+# screen, keyboard, I2C bus and SoC temperature, run by the user's systemd
+# instance. docs/hardware-spec.md#cardputer-zero installs it.
 #
-# ~/.config/kube32/node.env names the API server and the node:
+# ~/.config/kube32/node.env holds the role and the cluster, split into
+# arguments at spaces. A worker:
 #
-#   KUBE32_JOIN=http://<control plane address>:6443
-#   KUBE32_NODE_NAME=cardputer-zero
+#   KUBE32_ARGS=--role worker --join http://<control plane address>:6443 --node-name cardputer-zero
+#
+# or the cluster's control plane with a node of its own:
+#
+#   KUBE32_ARGS=--role standalone --kubelet-name cardputer-zero --node-ip auto --enable-flash
 #
 # The launcher (APPLaunch.service) keeps the screen until a pod draws or reads
 # a key. The node stops the launcher then and starts it again once no pod
-# holds the display or keyboard grant.
+# holds the display, keyboard or speaker grant.
 
 [Unit]
 Description=kube32 node (Cardputer Zero)
 
 [Service]
 EnvironmentFile=%h/.config/kube32/node.env
-ExecStart=%h/.local/bin/kube32-sim --role worker --join ${KUBE32_JOIN} --node-name ${KUBE32_NODE_NAME} --board cardputer-zero --data-dir %h/.local/share/kube32
+ExecStart=%h/.local/bin/kube32-sim $KUBE32_ARGS --board cardputer-zero --data-dir %h/.local/share/kube32
 # A node that ends while its pods have the screen gives it back here
 ExecStopPost=-/usr/bin/systemctl --user --no-block start APPLaunch.service
 Restart=on-failure
 RestartSec=5
-# On SIGTERM the worker leaves the cluster: its pods move within 20 s
+# On SIGTERM a worker leaves the cluster: its pods move within 20 s
 TimeoutStopSec=40
 
 [Install]
