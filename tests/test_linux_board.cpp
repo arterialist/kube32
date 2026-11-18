@@ -1,15 +1,18 @@
 // Linux boards: the pods' drawing calls on framebuffer memory (16 and 32 bits
 // a pixel, clipped to the panel), evdev key codes as a Cardputer's key codes
 // (US layout, the Cardputer Zero's Sym layer), the addresses kernel drivers
-// hold in a sysfs tree, and what such a board offers pods and the Node: no
-// GPIO, ADC, UART or RMT, its I2C buses without pins and without the kernel's
-// addresses, and only the devices that opened.
+// hold in a sysfs tree, LIRC samples cut into IR frames, and what such a
+// board offers pods and the Node: no GPIO, ADC or UART, its I2C buses without
+// pins and without the kernel's addresses, one RMT channel on each IR device
+// without a pin, and only the devices that opened.
 #include "hal/capability_firewall.hpp"
 #include "hal/display_font.hpp"
 #include "hal/i2c_discovery.hpp"
 #include "hal/key_codes.hpp"
 #include "hal/linux_board.hpp"
+#include "hal/mock_hal.hpp"
 #include "hal/pod_buses.hpp"
+#include "hal/pod_rmt.hpp"
 #include "kubelet/node_status_reporter.hpp"
 
 #include <algorithm>
@@ -414,6 +417,7 @@ void test_preset() {
     assert(cfg.name == "cardputer-zero" && cfg.keymap == LinuxKeymap::CardputerZero);
     assert(cfg.i2c.size() == 1 && cfg.i2c.at(0) == "/dev/i2c-1" && !cfg.framebuffer.empty() && !cfg.keyboard.empty());
     assert(cfg.screen_owner == "APPLaunch.service");
+    assert(cfg.ir_rx == "/sys/devices/platform/ir-receiver@d" && cfg.ir_tx == "/sys/devices/platform/gpio-ir-transmitter@c");
 }
 
 // The watcher gives the screen back once no pod holds a display or keyboard
@@ -434,6 +438,313 @@ void test_capability_held() {
     fw.reset();
 }
 
+// The mode2 samples of `durations` (mark first) as a LIRC receiver reads
+// them: the gap before the frame, the frame, the driver's timeout
+std::vector<uint32_t> mode2(const std::vector<uint16_t>& durations, uint32_t gap_us = 250000, uint32_t timeout_us = 12000) {
+    std::vector<uint32_t> out{kLircSpace | gap_us};
+    for (size_t i = 0; i < durations.size(); ++i) out.push_back(((i & 1) == 0 ? kLircPulse : kLircSpace) | durations[i]);
+    out.push_back(kLircTimeout | timeout_us);
+    return out;
+}
+
+std::vector<uint16_t> nec_frame(uint8_t addr, uint8_t cmd) {
+    std::vector<uint16_t> f{9000, 4500};
+    const uint32_t bits = addr | (static_cast<uint32_t>(addr ^ 0xff) << 8) | (static_cast<uint32_t>(cmd) << 16) | (static_cast<uint32_t>(cmd ^ 0xff) << 24);
+    for (int i = 0; i < 32; ++i) {
+        f.push_back(560);
+        f.push_back((bits >> i) & 1 ? 1690 : 560);
+    }
+    f.push_back(560);
+    return f;
+}
+
+// The frames a framer cuts from `samples`
+std::vector<std::vector<uint16_t>> frames_of(LircFramer& framer, const std::vector<uint32_t>& samples) {
+    std::vector<std::vector<uint16_t>> out;
+    for (uint32_t s : samples) {
+        if (framer.feed(s)) out.push_back(framer.frame());
+    }
+    return out;
+}
+
+void test_lirc_framer() {
+    const std::vector<uint16_t> nec = nec_frame(0x04, 0x08);
+    assert(nec.size() == 67);
+    {
+        // The gap before the frame and the timeout after it are no durations
+        LircFramer f(12000);
+        const auto got = frames_of(f, mode2(nec));
+        assert(got.size() == 1 && got[0] == nec);
+    }
+    {
+        // Two frames, each ended by the timeout; samples before a pulse are skipped
+        LircFramer f(12000);
+        std::vector<uint32_t> samples{kLircTimeout | 12000, kLircSpace | 3000};
+        for (uint32_t s : mode2(nec)) samples.push_back(s);
+        for (uint32_t s : mode2({9000, 2250, 560}, 40000)) samples.push_back(s);
+        const auto got = frames_of(f, samples);
+        assert(got.size() == 2 && got[0] == nec && got[1] == std::vector<uint16_t>({9000, 2250, 560}));
+    }
+    {
+        // Without a timeout report a space of idle_us ends the frame, without the space
+        LircFramer f(8000);
+        const auto got = frames_of(f, {kLircPulse | 9000, kLircSpace | 2250, kLircPulse | 560, kLircSpace | 7999, kLircPulse | 560,
+                                       kLircSpace | 8000, kLircPulse | 600, kLircSpace | 600, kLircPulse | 600, kLircTimeout | 8000});
+        assert(got.size() == 2);
+        assert(got[0] == std::vector<uint16_t>({9000, 2250, 560, 7999, 560}));
+        assert(got[1] == std::vector<uint16_t>({600, 600, 600}));
+    }
+    {
+        // Samples of one kind in a row are one duration, at most 65535 us;
+        // carrier reports are skipped
+        LircFramer f(12000);
+        const auto got = frames_of(f, {kLircPulse | 5000, kLircPulse | 4000, 0x02000000 | 38000, kLircSpace | 2000, kLircSpace | 2500,
+                                       kLircPulse | 60000, kLircPulse | 60000, kLircTimeout | 12000});
+        assert(got.size() == 1 && got[0] == std::vector<uint16_t>({9000, 4500, 65535}));
+    }
+    {
+        // An overflow loses the frame being received; the next one counts
+        LircFramer f(12000);
+        const auto got = frames_of(f, {kLircPulse | 9000, kLircSpace | 4500, kLircOverflow, kLircPulse | 560, kLircTimeout | 12000});
+        assert(got.size() == 1 && got[0] == std::vector<uint16_t>({560}));
+    }
+    {
+        // A frame keeps kRmtMaxDurations + 1 durations, enough for the queue to see it is too long
+        LircFramer f(12000);
+        auto got = frames_of(f, mode2(std::vector<uint16_t>(kRmtMaxDurations + 41, 500)));
+        assert(got.size() == 1 && got[0] == std::vector<uint16_t>(kRmtMaxDurations + 1, 500));
+        got = frames_of(f, mode2(std::vector<uint16_t>(kRmtMaxDurations - 1, 500)));
+        assert(got.size() == 1 && got[0].size() == kRmtMaxDurations - 1);
+    }
+    std::cout << "[PASS] test_lirc_framer" << std::endl;
+}
+
+void test_lirc_pulse_frame() {
+    uint32_t out[kRmtMaxDurations];
+    uint32_t trailing = 7;
+    const uint16_t odd[] = {9000, 4500, 560};
+    assert(lirc_pulse_frame(odd, 3, out, trailing) == 3 && trailing == 0 && out[0] == 9000 && out[1] == 4500 && out[2] == 560);
+    // A frame ending in a space: written up to its last mark, the space waited out
+    const uint16_t even[] = {9000, 2250, 560, 40000};
+    assert(lirc_pulse_frame(even, 4, out, trailing) == 3 && trailing == 40000 && out[2] == 560);
+    const uint16_t one[] = {65535};
+    assert(lirc_pulse_frame(one, 1, out, trailing) == 1 && trailing == 0 && out[0] == 65535);
+    std::cout << "[PASS] test_lirc_pulse_frame" << std::endl;
+}
+
+void test_lirc_device_node() {
+    const std::string root = temp_dir();
+    // The kernel device, its rc device and the lirc node below it
+    make_dirs(root + "/sys/devices/platform/ir-receiver@d/rc/rc2/lirc1");
+    make_dirs(root + "/sys/devices/platform/ir-receiver@d/rc/rc2/input2");
+    make_dirs(root + "/sys/devices/platform/gpio-ir-transmitter@c/rc/rc1/lirc0");
+    make_dirs(root + "/sys/devices/platform/hdmi/rc/rc0/input0");
+    assert(lirc_device_node(root + "/sys/devices/platform/ir-receiver@d") == "/dev/lirc1");
+    assert(lirc_device_node(root + "/sys/devices/platform/ir-receiver@d/rc/rc2") == "/dev/lirc1");
+    assert(lirc_device_node(root + "/sys/devices/platform/gpio-ir-transmitter@c") == "/dev/lirc0");
+    assert(lirc_device_node(root + "/sys/devices/platform/hdmi").empty());   // an rc device without LIRC
+    assert(lirc_device_node(root + "/sys/devices/platform").empty());
+    // A device node, or a name that is not there, is taken as it is
+    assert(lirc_device_node("/dev/lirc3") == "/dev/lirc3");
+    write_file(root + "/lirc-rx", "");
+    assert(lirc_device_node(root + "/lirc-rx") == root + "/lirc-rx");
+
+    // A board whose IR devices are not there offers no RMT
+    LinuxBoardConfig cfg = test_board(root);
+    cfg.ir_rx = root + "/sys/devices/platform/hdmi";
+    cfg.ir_tx = root + "/dev/lirc9";
+    LinuxBoard board(cfg);
+    assert(!board.init());
+    assert(!board.ir_receiver() && !board.ir_transmitter());
+    BoardProfile profile;
+    board.describe(profile);
+    assert(profile.rmt_fixed_mask == 0 && profile.rmt_tx_pin_mask == 0 && profile.rmt_tx_default_pin == -1 && profile.rmt_rx_default_pin == -1);
+    std::cout << "[PASS] test_lirc_device_node" << std::endl;
+}
+
+// Stand-ins for a board's LIRC transmitter and receiver
+class RecordingTransmitter : public HostIrTransmitter {
+public:
+    const std::string& device() const override { return name; }
+    bool configure(const RmtAssignment& a, std::string& err) override {
+        if (refuse) {
+            err = "cannot set the carrier";
+            return false;
+        }
+        carrier_hz = a.carrier_hz;
+        duty_pct = a.duty_pct;
+        return true;
+    }
+    int32_t send(const uint16_t* d, size_t n) override {
+        sent.emplace_back(d, d + n);
+        return static_cast<int32_t>(n);
+    }
+    std::string name{"/dev/lirc0"};
+    bool refuse{false};
+    uint32_t carrier_hz{0};
+    uint32_t duty_pct{0};
+    std::vector<std::vector<uint16_t>> sent;
+};
+
+class RecordingReceiver : public HostIrReceiver {
+public:
+    const std::string& device() const override { return name; }
+    bool start(const RmtAssignment& a, Sink s, std::string&) override {
+        idle_us = a.idle_us;
+        sink = std::move(s);
+        starts++;
+        return true;
+    }
+    void stop() override {
+        if (sink) stops++;
+        sink = nullptr;
+    }
+    // The device reads `samples`: what a LircFramer cuts goes to the sink
+    void hear(const std::vector<uint32_t>& samples) {
+        LircFramer framer(idle_us);
+        for (uint32_t s : samples) {
+            if (framer.feed(s) && sink) sink(framer.frame().data(), framer.frame().size());
+        }
+    }
+    std::string name{"/dev/lirc1"};
+    Sink sink;
+    uint32_t idle_us{0};
+    int starts{0};
+    int stops{0};
+};
+
+std::vector<uint16_t> receive_frame(const std::string& pod_id, int32_t& rc, RmtDrops* drops = nullptr) {
+    uint8_t buf[2 * kRmtMaxDurations];
+    rc = rmt_receive(pod_id, buf, kRmtMaxDurations, drops);
+    std::vector<uint16_t> out;
+    for (int32_t i = 0; i < rc; ++i) out.push_back(static_cast<uint16_t>(buf[2 * i] | (buf[2 * i + 1] << 8)));
+    return out;
+}
+
+int32_t send_frame(const std::string& pod_id, const std::vector<uint16_t>& frame) {
+    std::vector<uint8_t> bytes;
+    for (uint16_t d : frame) {
+        bytes.push_back(static_cast<uint8_t>(d));
+        bytes.push_back(static_cast<uint8_t>(d >> 8));
+    }
+    return rmt_send(pod_id, bytes.data(), static_cast<uint32_t>(frame.size()));
+}
+
+// A board's own IR devices: one channel of each direction, claims without
+// pins, the annotations' settings, and frames through the devices into the
+// pod's queue with the RMT queue's limits
+void test_ir_admission_and_frames() {
+    auto& fw = CapabilityFirewall::instance();
+    fw.reset();
+    MockHal::instance().reset();
+    BoardProfile p;
+    p.name = "cardputer-zero";
+    p.reserved_gpio_mask = KUBE32_CHIP_GPIO_MASK;
+    p.uart_port_mask = 0;
+    p.i2c_bus_mask = 0;
+    p.rmt_fixed_mask = rmt_dir_bit(RmtDir::Tx) | rmt_dir_bit(RmtDir::Rx);
+    fw.set_board_profile(p);
+    RecordingTransmitter tx;
+    RecordingReceiver rx;
+    set_host_ir(&tx, &rx);
+
+    assert(fw.claimable_gpio_mask() == 0 && fw.claimable_rmt_tx_count() == 1 && fw.claimable_rmt_rx_count() == 1);
+    kubelet::NodeStatusReporter reporter("zero", "192.0.2.10");
+    reporter.set_max_pods(4);
+    const std::string node = reporter.build_registration_json(reporter.collect_telemetry());
+    for (const char* list : {"capacity", "allocatable"}) {
+        const std::string r = resource_list(node, list);
+        assert(r.find("\"esp32.io/rmt-tx\":\"1\"") != std::string::npos && r.find("\"esp32.io/rmt-rx\":\"1\"") != std::string::npos);
+        assert(r.find("esp32.io/gpio") == std::string::npos);
+    }
+
+    // A pin in an annotation is refused; so are an unknown setting and a malformed annotation
+    std::string err;
+    assert(!fw.register_pod("default/ir", pod(R"("esp32.io/rmt-rx":"1")", R"("kube32.io/rmt-rx":"pin=1")"), err));
+    assert(err == "RMT RX runs on the cardputer-zero board's own receiver: annotation kube32.io/rmt-rx cannot set a pin");
+    assert(!fw.register_pod("default/ir", pod(R"("esp32.io/rmt-tx":"1")", R"("kube32.io/rmt-tx":"pin=44,carrier=38000")"), err));
+    assert(err.find("own transmitter") != std::string::npos);
+    assert(!fw.register_pod("default/ir", pod(R"("esp32.io/rmt-tx":"1")", R"("kube32.io/rmt-tx":"freq=38000")"), err));
+    assert(err.find("unknown setting") != std::string::npos);
+    assert(!fw.register_pod("default/ir", pod(R"("esp32.io/rmt-tx":"1")", R"("kube32.io/rmt-tx":"38000")"), err));
+    assert(err.find("[carrier=<Hz>][,duty=<percent>]") != std::string::npos);
+    assert(fw.get_allocated_rmt_tx_count() == 0 && fw.get_allocated_rmt_rx_count() == 0 && rx.starts == 0);
+
+    // The defaults, no pin claimed: the channels run on the devices
+    assert(fw.register_pod("default/ir", pod(R"("esp32.io/rmt-tx":"1","esp32.io/rmt-rx":"1")"), err));
+    const auto rmt = fw.pod_rmt("default/ir");
+    assert(rmt.size() == 2 && rmt[0].pin == kBoardWiredPin && rmt[1].pin == kBoardWiredPin);
+    assert(fw.get_allocated_gpio_mask() == 0);
+    assert(tx.carrier_hz == kRmtDefaultCarrierHz && tx.duty_pct == kRmtDefaultDutyPct);
+    assert(rx.starts == 1 && rx.idle_us == kRmtDefaultIdleUs && rx.sink);
+    // One channel of each: a second pod is refused while the first holds it
+    assert(!fw.register_pod("default/ir2", pod(R"("esp32.io/rmt-rx":"1")"), err));
+    assert(err == "Insufficient allocatable RMT RX channels: requested 1, available 0");
+
+    // Sending: the frame goes out of the device, not to MockHal
+    const std::vector<uint16_t> nec = nec_frame(0x04, 0x08);
+    assert(send_frame("default/ir", nec) == 67);
+    assert(tx.sent.size() == 1 && tx.sent[0] == nec && MockHal::instance().get_rmt_tx_frames(kBoardWiredPin).empty());
+    assert(rmt_state("default/ir", RmtDir::Tx).frames == 1);
+    assert(send_frame("default/ir", std::vector<uint16_t>(513, 100)) == HAL_ERR_INVAL);
+    assert(send_frame("default/ir", std::vector<uint16_t>(9, 60000)) == HAL_ERR_INVAL);
+    assert(tx.sent.size() == 1);
+
+    // Receiving: frames the device reads reach the queue in order
+    int32_t rc = 0;
+    RmtDrops drops;
+    assert(receive_frame("default/ir", rc).empty() && rc == HAL_ERR_AGAIN);
+    const std::vector<uint16_t> repeat{9000, 2250, 560};
+    const std::vector<uint16_t> long_mark{40000, 600, 600};   // a mark above one RMT symbol half
+    std::vector<uint32_t> samples = mode2(nec);
+    for (uint32_t s : mode2(repeat, 40000)) samples.push_back(s);
+    for (uint32_t s : mode2(long_mark, 40000)) samples.push_back(s);
+    rx.hear(samples);
+    assert(rmt_state("default/ir", RmtDir::Rx).frames == 3);
+    assert(receive_frame("default/ir", rc) == nec && rc == 67);
+    assert(receive_frame("default/ir", rc) == repeat && rc == 3);
+    assert(receive_frame("default/ir", rc) == long_mark && rc == 3);
+    assert(receive_frame("default/ir", rc).empty() && rc == HAL_ERR_AGAIN);
+    // The queue's limits: frames past kRmtRxQueueFrames, and frames too long, are dropped and counted
+    samples.clear();
+    for (uint32_t i = 0; i < kRmtRxQueueFrames + 2; ++i) {
+        for (uint32_t s : mode2(repeat, 40000)) samples.push_back(s);
+    }
+    rx.hear(samples);
+    assert(rmt_state("default/ir", RmtDir::Rx).frames == kRmtRxQueueFrames);
+    receive_frame("default/ir", rc, &drops);
+    assert(rc == 3 && drops.queue_full == 2 && drops.too_long == 0);
+    while (rc != HAL_ERR_AGAIN) receive_frame("default/ir", rc);
+    rx.hear(mode2(std::vector<uint16_t>(kRmtMaxDurations + 1, 500)));
+    rx.hear(mode2(std::vector<uint16_t>(kRmtMaxDurations - 1, 500)));
+    assert(receive_frame("default/ir", rc, &drops).size() == kRmtMaxDurations - 1 && drops.too_long == 1 && drops.queue_full == 0);
+
+    // Release stops the receiver; the channels are free again
+    fw.unregister_pod("default/ir");
+    assert(rx.stops == 1 && !rx.sink);
+    assert(receive_frame("default/ir", rc).empty() && rc == HAL_ERR_NODEV);
+    assert(fw.get_allocated_rmt_tx_count() == 0 && fw.get_allocated_rmt_rx_count() == 0);
+
+    // The annotations' settings reach the devices
+    assert(fw.register_pod("default/ir", pod(R"("esp32.io/rmt-tx":"1","esp32.io/rmt-rx":"1")",
+                                             R"("kube32.io/rmt-tx":"carrier=36000,duty=50","kube32.io/rmt-rx":"active=low,idle_us=8000")"),
+                           err));
+    assert(tx.carrier_hz == 36000 && tx.duty_pct == 50 && rx.idle_us == 8000 && rx.starts == 2);
+    fw.unregister_pod("default/ir");
+
+    // A transmitter that refuses the settings: the pod is not admitted and keeps nothing
+    tx.refuse = true;
+    assert(!fw.register_pod("default/ir", pod(R"("esp32.io/rmt-tx":"1","esp32.io/rmt-rx":"1")"), err));
+    assert(err == "cannot set the carrier");
+    assert(fw.get_allocated_rmt_tx_count() == 0 && fw.get_allocated_rmt_rx_count() == 0 && !rx.sink);
+    assert(!rmt_state("default/ir", RmtDir::Tx).installed && !rmt_state("default/ir", RmtDir::Rx).installed);
+
+    set_host_ir(nullptr, nullptr);
+    fw.reset();
+    MockHal::instance().reset();
+    std::cout << "[PASS] test_ir_admission_and_frames" << std::endl;
+}
+
 }  // namespace
 
 int main() {
@@ -447,6 +758,10 @@ int main() {
     test_admission_and_transfers();
     test_preset();
     test_capability_held();
+    test_lirc_framer();
+    test_lirc_pulse_frame();
+    test_lirc_device_node();
+    test_ir_admission_and_frames();
     std::cout << "test_linux_board: all passed" << std::endl;
     return 0;
 }
