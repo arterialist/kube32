@@ -58,6 +58,17 @@ bool linux_board_preset(std::string_view name, LinuxBoardConfig& out) {
 LinuxBoard::LinuxBoard(LinuxBoardConfig config) : config_(std::move(config)) {}
 
 LinuxBoard::~LinuxBoard() {
+    close();
+    if (framebuffer_fd_ >= 0) ::close(framebuffer_fd_);
+}
+
+void LinuxBoard::close() {
+    {
+        // A take after this one finds the board closed
+        std::lock_guard<std::mutex> lock(take_mutex_);
+        if (closed_.load()) return;
+        closed_.store(true);
+    }
     {
         std::lock_guard<std::mutex> lock(watch_mutex_);
         watch_stop_ = true;
@@ -65,7 +76,6 @@ LinuxBoard::~LinuxBoard() {
     watch_wake_.notify_all();
     if (watcher_.joinable()) watcher_.join();
     give_back();
-    if (framebuffer_fd_ >= 0) ::close(framebuffer_fd_);
 }
 
 bool LinuxBoard::init() {
@@ -94,7 +104,7 @@ bool LinuxBoard::init() {
 void LinuxBoard::take_from_owner() {
     if (taken_.load()) return;
     std::lock_guard<std::mutex> lock(take_mutex_);
-    if (taken_.load()) return;
+    if (taken_.load() || closed_.load()) return;
     const std::string& owner = config_.screen_owner;
     if (!owner.empty() && !systemctl_user({"stop", owner})) {
         printf("[BOARD] cannot stop %s; it may draw over the pods\n", owner.c_str());

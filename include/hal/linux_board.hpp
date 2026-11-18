@@ -178,6 +178,10 @@ public:
     // returns at once when the node has them. The display and key calls take
     // them so, and a sound call takes them for the speaker the owner holds.
     void take_from_owner();
+    // The node on its way out: the panel and the keyboard go back to the
+    // screen owner for good, and the display and key calls of pods still
+    // running answer HAL_ERR_NODEV
+    void close();
 
     // The adapter of pod bus `bus`, nullptr when the board has none
     HostI2cAdapter* i2c_adapter(uint8_t bus) const;
@@ -221,6 +225,7 @@ private:
 
     std::mutex take_mutex_;
     std::atomic<bool> taken_{false};
+    std::atomic<bool> closed_{false};   // set under take_mutex_
     std::thread watcher_;
     std::mutex watch_mutex_;
     std::condition_variable watch_wake_;

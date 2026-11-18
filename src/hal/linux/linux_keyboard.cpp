@@ -77,6 +77,15 @@ const KeyChar* find_key(const KeyChar (&table)[N], uint16_t code) {
     return nullptr;
 }
 
+#if defined(__linux__)
+// musl's ioctl takes an int request, glibc's an unsigned long, and the evdev
+// requests with a length in them do not fit an int: passed as a parameter,
+// they convert without a constant overflow. The kernel reads 32 bits of it.
+int evdev_ioctl(int fd, unsigned long request, void* arg) {
+    return ::ioctl(fd, request, arg);
+}
+#endif
+
 }  // namespace
 
 bool parse_linux_keymap(std::string_view name, LinuxKeymap& out) {
@@ -117,7 +126,7 @@ void LinuxBoard::push_key(int code) {
 }
 
 int32_t LinuxBoard::key_read() {
-    if (!keyboard_present_) return HAL_ERR_NODEV;
+    if (!keyboard_present_ || closed_.load()) return HAL_ERR_NODEV;
     take_from_owner();
     std::lock_guard<std::mutex> lock(key_mutex_);
     if (key_tail_ == key_head_) return HAL_ERR_AGAIN;
@@ -140,8 +149,8 @@ bool LinuxBoard::probe_keyboard() {
     }
     unsigned long types = 0;
     char name[64] = {};
-    const bool keys = ::ioctl(fd, EVIOCGBIT(0, sizeof(types)), &types) >= 0 && (types & (1UL << EV_KEY)) != 0;
-    ::ioctl(fd, EVIOCGNAME(sizeof(name) - 1), name);
+    const bool keys = evdev_ioctl(fd, EVIOCGBIT(0, sizeof(types)), &types) >= 0 && (types & (1UL << EV_KEY)) != 0;
+    evdev_ioctl(fd, EVIOCGNAME(sizeof(name) - 1), name);
     ::close(fd);
     if (!keys) {
         printf("[BOARD] keyboard %s: not a keyboard; the node offers no keyboard\n", dev.c_str());
