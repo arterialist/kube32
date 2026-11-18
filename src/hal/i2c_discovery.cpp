@@ -75,12 +75,14 @@ void identify(const models::I2cLocation& loc, models::DiscoveredPart& part) {
 }
 
 // Addresses that answer at `route` (its multiplexer channel selected), less
-// `skip`; false when the bus stretched the clock past three probes
+// `skip` and the board's own; false when the bus stretched the clock past
+// three probes
 bool probe_all(const models::I2cLocation& route, const std::vector<uint8_t>& skip, std::vector<uint8_t>& out) {
     int timeouts = 0;
     models::I2cLocation loc = route;
+    const CapabilityFirewall& fw = CapabilityFirewall::instance();
     for (uint8_t addr = kFirstAddress; addr <= kLastAddress; ++addr) {
-        if (std::find(skip.begin(), skip.end(), addr) != skip.end()) continue;
+        if (std::find(skip.begin(), skip.end(), addr) != skip.end() || fw.i2c_address_reserved(route.bus, addr)) continue;
         loc.address = addr;
         const int32_t r = i2c_device_write(loc, nullptr, 0);
         if (r == HAL_OK) out.push_back(addr);

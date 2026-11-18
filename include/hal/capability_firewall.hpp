@@ -9,6 +9,7 @@
 #include <string>
 #include <map>
 #include <array>
+#include <bitset>
 #include <vector>
 
 namespace kube32::hal {
@@ -20,8 +21,8 @@ struct BusPins {
 };
 
 // What the board around the chip takes for itself and which buses it offers.
-// Set once at boot from the board profile (main_esp32.cpp); the defaults
-// describe a bare devkit.
+// Set once at boot from the board profile (main_esp32.cpp, and main_host.cpp
+// on a Linux board); the defaults describe a bare devkit.
 struct BoardProfile {
     std::string name{"generic"};
     uint64_t reserved_gpio_mask{0};                    // pins wired to on-board peripherals
@@ -32,6 +33,15 @@ struct BoardProfile {
     // needs pins in the pod's annotations.
     BusPins i2c_pins[2]{{8, 9}, {}};
     BusPins uart_pins[3]{{}, {17, 18}, {}};
+    // I2C buses whose pins and speed the board sets (a Linux I2C adapter):
+    // a claim or device grant of one takes no pins, and no annotation sets them
+    uint8_t i2c_fixed_mask{0};
+    // Addresses on each bus that the board's own drivers hold: pods' transfers
+    // to them are denied, no device grant names them and discovery skips them
+    std::bitset<128> i2c_reserved[2];
+    // The board reads its chip's temperature: the Node advertises
+    // hardware.kube32.io/chip-temp
+    bool chip_temp{true};
     // RMT (IR) channels run on claimable pins and, for TX, also on the pins
     // of rmt_tx_pin_mask: an IR LED on a pad the chip mask reserves (a
     // console UART pin the board leaves unused). The default pins serve a
@@ -173,6 +183,8 @@ public:
     uint32_t i2c_sharers(uint8_t bus) const;
     // A pod's device grant holds the address at `loc`
     bool i2c_device_granted(const models::I2cLocation& loc) const;
+    // The board's own drivers hold `addr` on `bus` (BoardProfile::i2c_reserved)
+    bool i2c_address_reserved(uint8_t bus, uint8_t addr) const;
 
     // Reset all allocations and the board profile (used in test teardown)
     void reset();

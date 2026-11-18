@@ -112,8 +112,8 @@ NodeTelemetry NodeStatusReporter::collect_telemetry() const {
     t.has_speaker = (onboard & hal::KUBE32_CAP_SPEAKER) != 0;
     t.has_microphone = (onboard & hal::KUBE32_CAP_MICROPHONE) != 0;
     // The ESP32-S3's own sensor (hal/chip_temp.hpp); the simulator's HAL
-    // stands in for it
-    t.has_chip_temp = true;
+    // stands in for it, a Linux board reads its SoC's when it can
+    t.has_chip_temp = fw.board_profile().chip_temp;
 
     return t;
 }

@@ -4,7 +4,9 @@
 // identified parts for the Device controller.
 //
 // A scan probes addresses 0x08-0x77 with zero-length writes on every I2C
-// controller the board offers on default pins (BoardProfile::i2c_pins). A
+// controller the board offers on default pins (BoardProfile::i2c_pins) or on
+// pins of its own (BoardProfile::i2c_fixed_mask), leaving out the addresses
+// the board's drivers hold (BoardProfile::i2c_reserved). A
 // free bus is lent by the capability firewall for the scan and pod admission
 // waits for it; a bus shared by device grants (kube32.io/i2c-device) is
 // scanned as it is installed, transfer by transfer under the same bus lock

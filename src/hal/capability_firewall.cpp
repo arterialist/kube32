@@ -5,6 +5,7 @@
 #include "esp_adc/adc_oneshot.h"
 #endif
 #include <cctype>
+#include <cstdio>
 #include <iostream>
 
 namespace kube32::hal {
@@ -44,6 +45,7 @@ void CapabilityFirewall::set_board_profile(const BoardProfile& profile) {
     profile_.i2c_bus_mask &= KUBE32_CHIP_I2C_MASK;
     profile_.uart_port_mask &= KUBE32_CHIP_UART_MASK;
     profile_.rmt_tx_pin_mask &= KUBE32_CHIP_GPIO_MASK;
+    profile_.i2c_fixed_mask &= profile_.i2c_bus_mask;
 }
 
 BoardProfile CapabilityFirewall::board_profile() const {
@@ -283,10 +285,12 @@ bool CapabilityFirewall::lend_i2c_bus(uint8_t bus, BusPins& out_pins, bool* out_
     }
     if (out_shared) *out_shared = false;
     const BusPins pins = profile_.i2c_pins[bus];
-    if (pins.a < 0 || pins.b < 0) return false;
-    const uint64_t claimable = claimable_gpio_mask_locked();
-    for (int8_t pin : {pins.a, pins.b}) {
-        if ((claimable & (1ULL << pin)) == 0 || !gpio_owners_[pin].empty()) return false;
+    if ((profile_.i2c_fixed_mask & (1U << bus)) == 0) {
+        if (pins.a < 0 || pins.b < 0) return false;
+        const uint64_t claimable = claimable_gpio_mask_locked();
+        for (int8_t pin : {pins.a, pins.b}) {
+            if ((claimable & (1ULL << pin)) == 0 || !gpio_owners_[pin].empty()) return false;
+        }
     }
     lent_i2c_mask_ |= static_cast<uint8_t>(1U << bus);
     out_pins = pins;
@@ -307,6 +311,11 @@ void CapabilityFirewall::return_i2c_bus(uint8_t bus) {
 uint32_t CapabilityFirewall::i2c_sharers(uint8_t bus) const {
     osal::LockGuard guard(mutex_);
     return bus < 2 ? i2c_sharers_[bus] : 0;
+}
+
+bool CapabilityFirewall::i2c_address_reserved(uint8_t bus, uint8_t addr) const {
+    osal::LockGuard guard(mutex_);
+    return bus < 2 && addr < 128 && profile_.i2c_reserved[bus].test(addr);
 }
 
 bool CapabilityFirewall::i2c_device_granted(const models::I2cLocation& loc) const {
@@ -345,6 +354,13 @@ bool CapabilityFirewall::claim_i2c_device(const std::string& pod_id, const std::
         out_error = "I2C bus " + n + " is not offered by the " + profile_.name + " board";
         return false;
     }
+    for (uint8_t addr : {out_loc.address, out_loc.mux}) {
+        if (addr == 0 || !profile_.i2c_reserved[bus].test(addr)) continue;
+        char hex[8];
+        snprintf(hex, sizeof(hex), "0x%02x", addr);
+        out_error = "I2C" + n + " address " + hex + " is used by the " + profile_.name + " board";
+        return false;
+    }
     if (grant.i2c_bus_mask & (1U << bus)) {
         out_error = "The pod claims I2C bus " + n + " whole (esp32.io/i2c-bus-" + n + ") and a device on it (kube32.io/i2c-device): claim one or the other";
         return false;
@@ -362,7 +378,7 @@ bool CapabilityFirewall::claim_i2c_device(const std::string& pod_id, const std::
         out_error = "I2C" + n + " device " + models::i2c_location_text(out_loc) + " is granted to " + kv.first;
         return false;
     }
-    if (i2c_sharers_[bus] == 0 && i2c_shared_scans_[bus] == 0) {
+    if (i2c_sharers_[bus] == 0 && i2c_shared_scans_[bus] == 0 && (profile_.i2c_fixed_mask & (1U << bus)) == 0) {
         // The first grant: the bus runs on the board's default pins
         const BusPins pins = profile_.i2c_pins[bus];
         if (pins.a < 0 || pins.b < 0) {
@@ -1086,8 +1102,18 @@ bool CapabilityFirewall::claim_bus_pins(const std::string& pod_id, const DeviceG
             b.kind = k.kind;
             b.index = static_cast<uint8_t>(n);
             b.speed = k.speed_default;
-            int32_t pa = k.defaults[n].a, pb = k.defaults[n].b;
             auto it = annotations.find(key);
+            if (k.kind == BusKind::I2c && (profile_.i2c_fixed_mask & (1U << n)) != 0) {
+                // The board set the bus's pins and speed: nothing to claim or choose
+                if (it != annotations.end()) {
+                    out_error = label + " runs on the " + profile_.name + " board's own pins and speed: annotation " + key + " cannot set them";
+                    return false;
+                }
+                b.pin_a = b.pin_b = kBoardWiredPin;
+                out_buses.push_back(b);
+                continue;
+            }
+            int32_t pa = k.defaults[n].a, pb = k.defaults[n].b;
             if (it != annotations.end()) {
                 std::map<std::string, uint32_t> v;
                 if (!parse_bus_spec(it->second, v) || !v.count(k.pin_a) || !v.count(k.pin_b)) {
@@ -1343,11 +1369,13 @@ bool CapabilityFirewall::check_permission(const std::string& pod_id, PeripheralT
 I2cAccess CapabilityFirewall::check_i2c(const std::string& pod_id, uint32_t bus, uint32_t addr, AccessMode mode, models::I2cLocation& out_device) {
     osal::LockGuard guard(mutex_);
     auto it = pod_records_.find(pod_id);
+    // The board's own drivers' addresses are out of every pod's reach
+    const bool reserved = bus < 2 && addr < 128 && profile_.i2c_reserved[bus].test(addr);
     if (it != pod_records_.end()) {
         const PodSecurityRecord& r = it->second;
-        if (r.grant.is_i2c_permitted(bus)) return I2cAccess::Bus;
+        if (!reserved && r.grant.is_i2c_permitted(bus)) return I2cAccess::Bus;
         // The granted address only: never the multiplexer, never a neighbour
-        if (r.has_i2c_device && r.i2c_device.bus == bus && r.i2c_device.address == addr) {
+        if (!reserved && r.has_i2c_device && r.i2c_device.bus == bus && r.i2c_device.address == addr) {
             out_device = r.i2c_device;
             return I2cAccess::Device;
         }
