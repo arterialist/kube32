@@ -8,6 +8,7 @@
 #include "runtime/pod_raster.hpp"
 #include "runtime/pod_blobs.hpp"
 #include "runtime/k32_app_abi.h"
+#include "hal/board.hpp"
 #include "hal/capability_firewall.hpp"
 #include "ipc/channel.hpp"
 #include "osal/system.hpp"
@@ -160,6 +161,33 @@ void set_app_platform_hooks(AppPlatformHooks hooks) {
 
 const AppPlatformHooks& app_platform_hooks() {
     return s_hooks;
+}
+
+void set_board_hooks(AppPlatformHooks& hooks, hal::Board& board) {
+    hal::Board* b = &board;
+    hooks.display_text = [b](int32_t x, int32_t y, const char* text, size_t len, uint32_t fg, uint32_t bg) -> int32_t {
+        return b->display_text(x, y, text, len, static_cast<uint16_t>(fg), static_cast<uint16_t>(bg));
+    };
+    hooks.display_rect = [b](int32_t x, int32_t y, int32_t w, int32_t h, uint32_t color) -> int32_t {
+        return b->display_rect(x, y, w, h, static_cast<uint16_t>(color));
+    };
+    hooks.display_bar = [b](int32_t x, int32_t y, int32_t w, int32_t h, uint32_t pct, uint32_t fg, uint32_t bg) -> int32_t {
+        return b->display_bar(x, y, w, h, pct, static_cast<uint16_t>(fg), static_cast<uint16_t>(bg));
+    };
+    hooks.display_blit = [b](int32_t x, int32_t y, int32_t w, int32_t h, const uint16_t* pixels) -> int32_t {
+        return b->display_blit(x, y, w, h, pixels);
+    };
+    hooks.display_info = [b](hal::DisplayInfo& info) -> int32_t {
+        info = b->display_info();
+        return info.width > 0 ? hal::HAL_OK : hal::HAL_ERR_NODEV;
+    };
+    hooks.touch_read = [b](hal::TouchPoint* out, uint32_t max) -> int32_t { return b->touch_read(out, max); };
+    hooks.key_read = [b]() -> int32_t { return b->key_read(); };
+    hooks.tone = [b](uint32_t f, uint32_t ms, uint32_t vol) -> int32_t { return b->tone(f, ms, vol); };
+    hooks.audio_play = [b](const int16_t* samples, uint32_t count, uint32_t rate, uint32_t vol) -> int32_t {
+        return b->audio_play(samples, count, rate, vol);
+    };
+    hooks.mic_read = [b](int16_t* out, uint32_t max, uint32_t timeout_ms) -> int32_t { return b->mic_read(out, max, timeout_ms); };
 }
 
 // -----------------------------------------------------------------------------

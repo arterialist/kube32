@@ -1671,33 +1671,7 @@ void console_task(void* arg) {
 void install_hardware_hooks(kube32::hal::Board* board) {
     kube32::runtime::AppPlatformHooks hooks;
     hooks.random = []() -> uint32_t { return esp_random(); };
-    if (board) {
-        hooks.display_text = [board](int32_t x, int32_t y, const char* text, size_t len, uint32_t fg, uint32_t bg) -> int32_t {
-            return board->display_text(x, y, text, len, static_cast<uint16_t>(fg), static_cast<uint16_t>(bg));
-        };
-        hooks.display_rect = [board](int32_t x, int32_t y, int32_t w, int32_t h, uint32_t color) -> int32_t {
-            return board->display_rect(x, y, w, h, static_cast<uint16_t>(color));
-        };
-        hooks.display_bar = [board](int32_t x, int32_t y, int32_t w, int32_t h, uint32_t pct, uint32_t fg, uint32_t bg) -> int32_t {
-            return board->display_bar(x, y, w, h, pct, static_cast<uint16_t>(fg), static_cast<uint16_t>(bg));
-        };
-        hooks.display_blit = [board](int32_t x, int32_t y, int32_t w, int32_t h, const uint16_t* pixels) -> int32_t {
-            return board->display_blit(x, y, w, h, pixels);
-        };
-        hooks.display_info = [board](kube32::hal::DisplayInfo& info) -> int32_t {
-            info = board->display_info();
-            return info.width > 0 ? kube32::hal::HAL_OK : kube32::hal::HAL_ERR_NODEV;
-        };
-        hooks.touch_read = [board](kube32::hal::TouchPoint* out, uint32_t max) -> int32_t { return board->touch_read(out, max); };
-        hooks.key_read = [board]() -> int32_t { return board->key_read(); };
-        hooks.tone = [board](uint32_t f, uint32_t ms, uint32_t vol) -> int32_t { return board->tone(f, ms, vol); };
-        hooks.audio_play = [board](const int16_t* samples, uint32_t count, uint32_t rate, uint32_t vol) -> int32_t {
-            return board->audio_play(samples, count, rate, vol);
-        };
-        hooks.mic_read = [board](int16_t* out, uint32_t max, uint32_t timeout_ms) -> int32_t {
-            return board->mic_read(out, max, timeout_ms);
-        };
-    }
+    if (board) kube32::runtime::set_board_hooks(hooks, *board);
     kube32::runtime::set_app_platform_hooks(hooks);
 }
 

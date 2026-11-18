@@ -30,6 +30,10 @@
 typedef struct M3Module* IM3Module;
 typedef struct M3Runtime* IM3Runtime;
 
+namespace kube32::hal {
+class Board;
+}
+
 namespace kube32::runtime {
 
 struct AppRequest {
@@ -148,6 +152,9 @@ struct AppPlatformHooks {
     std::function<int32_t(const ServiceCallRequest& req, BufferResponseSink& sink)> service_call;
 };
 void set_app_platform_hooks(AppPlatformHooks hooks);
+// Points the display, touch, keyboard, speaker and microphone hooks at
+// `board`'s devices (hal/board.hpp); a device it lacks answers HAL_ERR_NODEV
+void set_board_hooks(AppPlatformHooks& hooks, hal::Board& board);
 void set_app_request_logging(bool verbose);
 const AppPlatformHooks& app_platform_hooks();
 
