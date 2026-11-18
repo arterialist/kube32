@@ -108,6 +108,15 @@ The speaker never plays louder than `K32_SPEAKER_MAX_PCT` (25) percent of full s
 
 The microphone's clock (GPIO 43) is the speaker's word clock, and the microphone's data line is GPIO 46. Only I2S0 has a PDM receiver, so the two share one controller and one runs at a time. The speaker comes first: playback stops a recording, and `k32_mic_read` waits for playback to end and returns `K32_ERR_BUSY` (`-16`) when it is still playing after `timeout_ms`. A channel exists only while sound moves; between sounds the node holds the speaker's pins low and keeps no audio buffers.
 
+### Speaker and microphone on a Linux board
+
+On a Linux board such as the Cardputer Zero, `kube32-sim` reaches the sound card through the kernel's ALSA devices in `/dev/snd` (`src/hal/linux/linux_audio.cpp`), and the four imports keep the semantics above: the same ceiling, the same return values, a 16 kHz microphone with a 64 ms buffer, and the speaker before the microphone. The node converts to the format the codec takes (48 kHz stereo on the Cardputer Zero's ES8389) and back. What differs:
+
+* Other processes may use the card: `k32_tone` and `k32_audio_play` return `K32_ERR_BUSY` while one holds the speaker, such as a PipeWire server with a client stream, and `k32_mic_read` while one holds the microphone.
+* `k32_tone` returns `K32_ERR_IO` when the card fails a write, where the Cardputer returns `0` in every case.
+* The Cardputer Zero's output sounds only about 200 ms after a stream starts, so a sound after a pause begins with that much silence. The output queue grows by the same amount, so a call never waits longer than on the Cardputer, and the stream stays open for a second after a sound, so the next one starts at once.
+* The board profile sets the codec's mixer controls when the node starts and puts them back when it stops.
+
 ## Bus configuration and driver lifecycle
 
 ### Pin annotations and board defaults

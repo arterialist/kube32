@@ -1,7 +1,7 @@
 // A Linux board's speaker and microphone (hal/linux_audio.hpp): the volume
 // ceiling, k32_tone's samples, the resampler and the frame formats, the
 // microphone's conditioning and buffer, the mixer values, and the
-// Cardputer's semantics on a sound card simulated in real time.
+// Cardputer's semantics on a sound card simulated at its own pace.
 
 #include "hal/hal_types.hpp"
 #include "hal/linux_audio.hpp"
@@ -260,9 +260,9 @@ static void test_control_values() {
     assert(parse_control_value(mux, "Line 1P", v, why) && v[0] == 1);
 }
 
-// A sound card in software, in real time: playback takes frames at its
+// A sound card in software that keeps time: playback takes frames at its
 // rate through a buffer, capture delivers a tone on channel 0
-struct FakeCard : AudioCard {
+struct SimCard : AudioCard {
     PcmFormat out_fmt{SampleFormat::S32_LE, 2, 48000, 480, 1920};
     PcmFormat in_fmt{SampleFormat::S32_LE, 2, 48000, 480, 3840};
     bool playback = true, capture = true;
@@ -278,13 +278,13 @@ struct FakeCard : AudioCard {
     std::unique_ptr<PcmStream> open(bool in, int& err) override;
 };
 
-struct FakeOut : PcmStream {
-    FakeCard& card;
+struct SimPlayback : PcmStream {
+    SimCard& card;
     Clock::time_point t0;
     uint64_t written = 0;
     bool started = false;
-    explicit FakeOut(FakeCard& c) : card(c) {}
-    ~FakeOut() override { ++card.out_closes; }
+    explicit SimPlayback(SimCard& c) : card(c) {}
+    ~SimPlayback() override { ++card.out_closes; }
     const PcmFormat& format() const override { return card.out_fmt; }
     uint64_t played(Clock::time_point now) const {
         return started ? static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(now - t0).count()) * card.out_fmt.rate / 1000000 : 0;
@@ -314,12 +314,12 @@ struct FakeOut : PcmStream {
     int32_t read(uint8_t*, uint32_t, int) override { return -EINVAL; }
 };
 
-struct FakeIn : PcmStream {
-    FakeCard& card;
+struct SimCapture : PcmStream {
+    SimCard& card;
     Clock::time_point t0 = Clock::now();
     uint64_t taken = 0;
-    explicit FakeIn(FakeCard& c) : card(c) {}
-    ~FakeIn() override { ++card.in_closes; }
+    explicit SimCapture(SimCard& c) : card(c) {}
+    ~SimCapture() override { ++card.in_closes; }
     const PcmFormat& format() const override { return card.in_fmt; }
     uint64_t made() const {
         return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(Clock::now() - t0).count()) * card.in_fmt.rate / 1000000;
@@ -343,20 +343,20 @@ struct FakeIn : PcmStream {
     }
 };
 
-std::unique_ptr<PcmStream> FakeCard::open(bool in, int& err) {
+std::unique_ptr<PcmStream> SimCard::open(bool in, int& err) {
     if (busy) {
         err = -EBUSY;
         return nullptr;
     }
     if (in) {
         ++in_opens;
-        return std::make_unique<FakeIn>(*this);
+        return std::make_unique<SimCapture>(*this);
     }
     ++out_opens;
-    return std::make_unique<FakeOut>(*this);
+    return std::make_unique<SimPlayback>(*this);
 }
 
-static LinuxAudioConfig fake_config(bool full_duplex = false) {
+static LinuxAudioConfig sim_config(bool full_duplex = false) {
     LinuxAudioConfig c;
     c.capture_channel = 0;
     c.full_duplex = full_duplex;
@@ -375,9 +375,9 @@ static long since_ms(Clock::time_point t) {
 // k32_audio_play blocks until about 96 ms are left to play, at most the
 // ceiling reaches the card, and the stream closes once the sound is out
 static void test_play() {
-    auto owned = std::make_unique<FakeCard>();
-    FakeCard& card = *owned;
-    LinuxAudio audio(fake_config(), std::move(owned));
+    auto owned = std::make_unique<SimCard>();
+    SimCard& card = *owned;
+    LinuxAudio audio(sim_config(), std::move(owned));
     std::string why;
     assert(audio.open(why) && audio.has_speaker() && audio.has_microphone());
 
@@ -431,9 +431,9 @@ static void test_play() {
 // silence, a call waits no longer for it, and a stream held open after a
 // sound takes the next one at once
 static void test_lead_in() {
-    auto owned = std::make_unique<FakeCard>();
-    FakeCard& card = *owned;
-    LinuxAudioConfig cfg = fake_config();
+    auto owned = std::make_unique<SimCard>();
+    SimCard& card = *owned;
+    LinuxAudioConfig cfg = sim_config();
     cfg.speaker_lead_in_ms = 150;
     cfg.speaker_hold_ms = 400;
     LinuxAudio audio(cfg, std::move(owned));
@@ -482,10 +482,10 @@ static void test_lead_in() {
 
 // Another process holding the device, and a board without one
 static void test_busy_and_missing() {
-    auto owned = std::make_unique<FakeCard>();
-    FakeCard& card = *owned;
+    auto owned = std::make_unique<SimCard>();
+    SimCard& card = *owned;
     card.busy = true;
-    LinuxAudio audio(fake_config(), std::move(owned));
+    LinuxAudio audio(sim_config(), std::move(owned));
     std::string why;
     assert(audio.open(why));
     int16_t buf[160] = {};
@@ -495,20 +495,20 @@ static void test_busy_and_missing() {
     card.busy = false;
     assert(audio.mic_read(buf, 160, 100) == 160);
 
-    auto none = std::make_unique<FakeCard>();
+    auto none = std::make_unique<SimCard>();
     none->playback = false;
-    LinuxAudio mic_only(fake_config(), std::move(none));
+    LinuxAudio mic_only(sim_config(), std::move(none));
     assert(mic_only.open(why) && !mic_only.has_speaker() && mic_only.has_microphone());
     assert(mic_only.play(buf, 160, 16000, 10) == HAL_ERR_NODEV);
     assert(mic_only.tone(1000, 50, 10) == HAL_ERR_NODEV);
 
-    auto silent = std::make_unique<FakeCard>();
+    auto silent = std::make_unique<SimCard>();
     silent->playback = silent->capture = false;
-    LinuxAudio nothing(fake_config(), std::move(silent));
+    LinuxAudio nothing(sim_config(), std::move(silent));
     assert(!nothing.open(why) && !why.empty());
     assert(nothing.mic_read(buf, 160, 10) == HAL_ERR_NODEV);
 
-    LinuxAudio unopened(fake_config(), std::make_unique<FakeCard>());
+    LinuxAudio unopened(sim_config(), std::make_unique<SimCard>());
     assert(unopened.play(buf, 160, 16000, 10) == HAL_ERR_NODEV);
 }
 
@@ -522,9 +522,9 @@ static double rms16(const int16_t* v, size_t n) {
 // the last 64 ms kept between reads, a fresh start after max 0 or a second
 // without reads
 static void test_mic() {
-    auto owned = std::make_unique<FakeCard>();
-    FakeCard& card = *owned;
-    LinuxAudio audio(fake_config(), std::move(owned));
+    auto owned = std::make_unique<SimCard>();
+    SimCard& card = *owned;
+    LinuxAudio audio(sim_config(), std::move(owned));
     std::string why;
     assert(audio.open(why));
     std::vector<int16_t> buf(16000);
@@ -576,9 +576,9 @@ static void test_mic() {
 static void test_turns() {
     std::vector<int16_t> sound(4800, 1000), buf(1600);
     {
-        auto owned = std::make_unique<FakeCard>();
-        FakeCard& card = *owned;
-        LinuxAudio audio(fake_config(), std::move(owned));
+        auto owned = std::make_unique<SimCard>();
+        SimCard& card = *owned;
+        LinuxAudio audio(sim_config(), std::move(owned));
         std::string why;
         assert(audio.open(why));
         assert(audio.mic_read(buf.data(), 160, 1000) == 160);
@@ -592,9 +592,9 @@ static void test_turns() {
         assert(card.in_opens == 2);
     }
     {
-        auto owned = std::make_unique<FakeCard>();
-        FakeCard& card = *owned;
-        LinuxAudio audio(fake_config(true), std::move(owned));
+        auto owned = std::make_unique<SimCard>();
+        SimCard& card = *owned;
+        LinuxAudio audio(sim_config(true), std::move(owned));
         std::string why;
         assert(audio.open(why));
         assert(audio.mic_read(buf.data(), 160, 1000) == 160);

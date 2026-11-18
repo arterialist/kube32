@@ -546,8 +546,8 @@ void LinuxAudio::Impl::speaker_loop() {
 int32_t LinuxAudio::Impl::speaker_play(const int16_t* samples, uint32_t count, uint32_t rate, int32_t gain_q15) {
     if (!cfg.full_duplex) mic_stop();   // the speaker comes first: playback stops a recording
     std::unique_lock<std::mutex> lk(smu);
-    // Marked first: a stream opened for this call does not close or start
-    // on silence before the samples come
+    // Marked first: a stream opened for this call stays open until its
+    // samples have come
     s_calling = true;
     s_failed = false;
     if (s_state == Stream::Closed) {
