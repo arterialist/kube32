@@ -18,16 +18,25 @@
 // On the host simulator the channels are a stub with the same lifecycle and
 // queue: MockHal records the frames sent, rmt_inject hands a receiver a frame,
 // and with MockHal's IR loopback on every frame sent also reaches the
-// node's receivers.
+// node's receivers. A host with its own infrared devices (a Linux board's
+// LIRC transmitter and receiver, set_host_ir) runs the channels on them
+// instead: frames go out of its LED and come in from its receiver, into the
+// same queue.
 
 #include <cstddef>
 #include <cstdint>
 #include <string>
 #include <vector>
+#if !defined(ESP_PLATFORM)
+#include <functional>
+#endif
 
 namespace kube32::hal {
 
 enum class RmtDir : uint8_t { Tx, Rx };
+
+// The bit of direction `dir` in a mask of directions (BoardProfile::rmt_fixed_mask)
+constexpr uint8_t rmt_dir_bit(RmtDir dir) { return dir == RmtDir::Tx ? 0x1 : 0x2; }
 
 struct RmtAssignment {
     RmtDir dir{RmtDir::Tx};
@@ -94,6 +103,39 @@ RmtState rmt_state(const std::string& pod_id, RmtDir dir);
 // Simulator: a frame arriving at the receiver on `pin`, mark first, as the
 // RMT peripheral captures it. False when no receiver runs on the pin.
 bool rmt_inject(uint32_t pin, const uint16_t* durations, size_t count);
+
+// A host's own infrared transmitter (a Linux board's LIRC device). One pod
+// holds it at a time.
+class HostIrTransmitter {
+public:
+    virtual ~HostIrTransmitter() = default;
+    virtual const std::string& device() const = 0;   // for the log
+    // Takes the carrier and duty cycle of `a` for the frames that follow;
+    // false with `err` set when the device refuses them
+    virtual bool configure(const RmtAssignment& a, std::string& err) = 0;
+    // Sends one frame (mark, space, mark, ...) and returns once it is out,
+    // a last space included: `count`, or a negative HAL_ERR_*
+    virtual int32_t send(const uint16_t* durations, size_t count) = 0;
+};
+
+// A host's own infrared receiver. One pod holds it at a time.
+class HostIrReceiver {
+public:
+    // A captured frame, mark first, as a pod receives it. Called on the
+    // receiver's thread.
+    using Sink = std::function<void(const uint16_t* durations, size_t count)>;
+    virtual ~HostIrReceiver() = default;
+    virtual const std::string& device() const = 0;
+    // Hands every frame that starts from now on to `sink`, frames ended by a
+    // space of a.idle_us; false with `err` set when the device cannot start
+    virtual bool start(const RmtAssignment& a, Sink sink, std::string& err) = 0;
+    // Returns once `sink` is no longer called
+    virtual void stop() = 0;
+};
+
+// Channels created from now on run on `tx` and `rx` (nullptr: the stub).
+// Set before pods run.
+void set_host_ir(HostIrTransmitter* tx, HostIrReceiver* rx);
 #endif
 
 } // namespace kube32::hal

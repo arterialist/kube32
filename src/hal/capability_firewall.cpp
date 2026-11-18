@@ -46,6 +46,7 @@ void CapabilityFirewall::set_board_profile(const BoardProfile& profile) {
     profile_.uart_port_mask &= KUBE32_CHIP_UART_MASK;
     profile_.rmt_tx_pin_mask &= KUBE32_CHIP_GPIO_MASK;
     profile_.i2c_fixed_mask &= profile_.i2c_bus_mask;
+    profile_.rmt_fixed_mask &= rmt_dir_bit(RmtDir::Tx) | rmt_dir_bit(RmtDir::Rx);
 }
 
 BoardProfile CapabilityFirewall::board_profile() const {
@@ -115,6 +116,7 @@ uint8_t CapabilityFirewall::claimable_i2c_mask() const {
 }
 
 uint32_t CapabilityFirewall::claimable_rmt_count_locked(RmtDir dir) const {
+    if (profile_.rmt_fixed_mask & rmt_dir_bit(dir)) return 1;
     uint64_t pins = claimable_gpio_mask_locked();
     if (dir == RmtDir::Tx) pins |= profile_.rmt_tx_pin_mask;
     uint32_t n = 0;
@@ -1169,7 +1171,10 @@ bool CapabilityFirewall::claim_rmt_pins(const std::string& pod_id, const DeviceG
         if (!grant.has_capability(tx ? KUBE32_CAP_RMT_TX : KUBE32_CAP_RMT_RX)) continue;
         const std::string label = tx ? "RMT TX" : "RMT RX";
         const std::string key = tx ? "kube32.io/rmt-tx" : "kube32.io/rmt-rx";
-        const char* want = tx ? "pin=<n>[,carrier=<Hz>][,duty=<percent>]" : "pin=<n>[,active=low|high][,idle_us=<n>]";
+        // The board's own transmitter or receiver: no pin to claim or choose
+        const bool fixed = (profile_.rmt_fixed_mask & rmt_dir_bit(dir)) != 0;
+        const char* want = tx ? (fixed ? "[carrier=<Hz>][,duty=<percent>]" : "pin=<n>[,carrier=<Hz>][,duty=<percent>]")
+                              : (fixed ? "[active=low|high][,idle_us=<n>]" : "pin=<n>[,active=low|high][,idle_us=<n>]");
         if (allocated_rmt_count_locked(dir) >= claimable_rmt_count_locked(dir)) {
             out_error = "Insufficient allocatable " + label + " channels: requested 1, available 0";
             return false;
@@ -1180,16 +1185,22 @@ bool CapabilityFirewall::claim_rmt_pins(const std::string& pod_id, const DeviceG
         a.duty_pct = kRmtDefaultDutyPct;
         a.active_low = true;
         a.idle_us = kRmtDefaultIdleUs;
-        int32_t pin = tx ? profile_.rmt_tx_default_pin : profile_.rmt_rx_default_pin;
+        int32_t pin = fixed ? kBoardWiredPin : tx ? profile_.rmt_tx_default_pin : profile_.rmt_rx_default_pin;
         auto it = annotations.find(key);
         if (it != annotations.end()) {
             std::map<std::string, std::string> v;
             uint32_t n = 0;
-            if (!parse_settings(it->second, v) || !v.count("pin") || !parse_setting_uint(v["pin"], n)) {
+            const bool parsed = parse_settings(it->second, v);
+            if (parsed && fixed && v.count("pin")) {
+                out_error = label + " runs on the " + profile_.name + (tx ? " board's own transmitter" : " board's own receiver") + ": annotation " +
+                            key + " cannot set a pin";
+                return false;
+            }
+            if (!parsed || (!fixed && (!v.count("pin") || !parse_setting_uint(v["pin"], n)))) {
                 out_error = "Invalid " + key + " \"" + it->second + "\" (want \"" + want + "\")";
                 return false;
             }
-            pin = static_cast<int32_t>(n < 64 ? n : 64);
+            if (!fixed) pin = static_cast<int32_t>(n < 64 ? n : 64);
             for (const auto& kv : v) {
                 const std::string& name = kv.first;
                 if (name == "pin") continue;
@@ -1227,7 +1238,9 @@ bool CapabilityFirewall::claim_rmt_pins(const std::string& pod_id, const DeviceG
             out_error = label + " has no default pin on the " + profile_.name + " board: set annotation " + key + ": \"pin=<n>\"";
             return false;
         }
-        if (!claim_pin(pod_id, static_cast<uint32_t>(pin), label, tx ? profile_.rmt_tx_pin_mask : 0, out_claimed_pins, out_error)) return false;
+        if (!fixed && !claim_pin(pod_id, static_cast<uint32_t>(pin), label, tx ? profile_.rmt_tx_pin_mask : 0, out_claimed_pins, out_error)) {
+            return false;
+        }
         a.pin = static_cast<uint8_t>(pin);
         out_rmt.push_back(a);
     }

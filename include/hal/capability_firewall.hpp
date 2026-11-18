@@ -49,6 +49,11 @@ struct BoardProfile {
     uint64_t rmt_tx_pin_mask{0};
     int8_t rmt_tx_default_pin{-1};
     int8_t rmt_rx_default_pin{-1};
+    // RMT directions (rmt_dir_bit) whose one channel the board runs on its
+    // own device (a Linux board's infrared transmitter and receiver): the
+    // direction offers that channel, a claim takes no pin and its annotation
+    // names none
+    uint8_t rmt_fixed_mask{0};
     // On-board devices the board has (KUBE32_CAP_DISPLAY, KUBE32_CAP_KEYBOARD,
     // KUBE32_CAP_SPEAKER): the Node advertises their hardware.kube32.io/* grants
     uint32_t onboard_devices{0};
@@ -105,7 +110,8 @@ public:
     //   kube32.io/rmt-tx: "pin=<n>[,carrier=<Hz>][,duty=<percent>]"
     //   kube32.io/rmt-rx: "pin=<n>[,active=low|high][,idle_us=<n>]"
     // or the board profile's default pin, and are claimed and installed the
-    // same way.
+    // same way. A direction the board runs on its own device
+    // (BoardProfile::rmt_fixed_mask) takes the settings without a pin.
     //
     // A device grant (annotation kube32.io/i2c-device:
     // "bus=<n>,addr=0x<hh>[,mux=0x<hh>:<channel>]") gives the pod one address
@@ -160,7 +166,8 @@ public:
     uint8_t  claimable_uart_mask() const;
     // RMT channels pods can claim on this board (esp32.io/rmt-tx and
     // esp32.io/rmt-rx capacity): one per pin a channel can use, at most the
-    // chip's four of each direction
+    // chip's four of each direction; one for a direction the board runs on
+    // its own device
     uint32_t claimable_rmt_tx_count() const;
     uint32_t claimable_rmt_rx_count() const;
     // BoardProfile::onboard_devices
