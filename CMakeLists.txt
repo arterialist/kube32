@@ -172,6 +172,10 @@ else()
         src/hal/pod_rmt.cpp
         src/hal/mock_hal.cpp
         src/hal/firmware_slots.cpp
+        src/hal/linux/linux_board.cpp
+        src/hal/linux/linux_display.cpp
+        src/hal/linux/linux_i2c.cpp
+        src/hal/linux/linux_keyboard.cpp
         src/runtime/host_functions.cpp
         src/runtime/container_lifecycle.cpp
         src/runtime/wasm_runtime.cpp
@@ -451,6 +455,14 @@ else()
     )
     target_link_libraries(test_hal_peripherals PRIVATE kube32_core)
     add_test(NAME test_hal_peripherals COMMAND test_hal_peripherals)
+
+    # Linux boards: drawing and clipping, key translation, the kernel's I2C
+    # addresses in sysfs, what such a board offers pods and the Node advertises
+    add_executable(test_linux_board
+        tests/test_linux_board.cpp
+    )
+    target_link_libraries(test_linux_board PRIVATE kube32_core)
+    add_test(NAME test_linux_board COMMAND test_linux_board)
 
     # 14. Container termination of non-yielding guests and pin rollback
     add_executable(test_container_termination
