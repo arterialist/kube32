@@ -54,6 +54,19 @@ std::string lirc_entry(const std::string& dir) {
     return found;
 }
 
+#if defined(__linux__)
+// glibc takes the request as an unsigned long, musl as an int
+#if defined(__GLIBC__)
+using IoctlRequest = unsigned long;
+#else
+using IoctlRequest = int;
+#endif
+
+int lirc_ioctl(int fd, unsigned long request, uint32_t* arg) {
+    return ::ioctl(fd, static_cast<IoctlRequest>(request), arg);
+}
+#endif
+
 }  // namespace
 
 bool LircFramer::feed(uint32_t sample) {
@@ -144,12 +157,12 @@ bool LinuxIrTransmitter::configure(const RmtAssignment& a, std::string& err) {
 bool LinuxIrTransmitter::apply(std::string& err) {
 #if defined(__linux__)
     uint32_t v = carrier_hz_;
-    if ((features_ & LIRC_CAN_SET_SEND_CARRIER) && ::ioctl(fd_, LIRC_SET_SEND_CARRIER, &v) < 0) {
+    if ((features_ & LIRC_CAN_SET_SEND_CARRIER) && lirc_ioctl(fd_, LIRC_SET_SEND_CARRIER, &v) < 0) {
         err = "cannot set the carrier of " + device_ + " to " + std::to_string(carrier_hz_) + " Hz: " + std::strerror(errno);
         return false;
     }
     v = duty_pct_;
-    if ((features_ & LIRC_CAN_SET_SEND_DUTY_CYCLE) && ::ioctl(fd_, LIRC_SET_SEND_DUTY_CYCLE, &v) < 0) {
+    if ((features_ & LIRC_CAN_SET_SEND_DUTY_CYCLE) && lirc_ioctl(fd_, LIRC_SET_SEND_DUTY_CYCLE, &v) < 0) {
         err = "cannot set the duty cycle of " + device_ + " to " + std::to_string(duty_pct_) + "%: " + std::strerror(errno);
         return false;
     }
@@ -209,17 +222,17 @@ bool LinuxIrReceiver::start(const RmtAssignment& a, Sink sink, std::string& err)
     timeout_set_ = false;
     if (features_ & LIRC_CAN_SET_REC_TIMEOUT) {
         uint32_t want = a.idle_us, lo = 0, hi = 0;
-        if (::ioctl(fd_, LIRC_GET_MIN_TIMEOUT, &lo) == 0 && want < lo) want = lo;
-        if (::ioctl(fd_, LIRC_GET_MAX_TIMEOUT, &hi) == 0 && hi > 0 && want > hi) want = hi;
+        if (lirc_ioctl(fd_, LIRC_GET_MIN_TIMEOUT, &lo) == 0 && want < lo) want = lo;
+        if (lirc_ioctl(fd_, LIRC_GET_MAX_TIMEOUT, &hi) == 0 && hi > 0 && want > hi) want = hi;
         uint32_t before = 0;
-        const bool known = ::ioctl(fd_, LIRC_GET_REC_TIMEOUT, &before) == 0;
-        if (::ioctl(fd_, LIRC_SET_REC_TIMEOUT, &want) == 0 && known && before != want) {
+        const bool known = lirc_ioctl(fd_, LIRC_GET_REC_TIMEOUT, &before) == 0;
+        if (lirc_ioctl(fd_, LIRC_SET_REC_TIMEOUT, &want) == 0 && known && before != want) {
             saved_timeout_ = before;
             timeout_set_ = true;
         }
     }
     uint32_t on = 1;
-    ::ioctl(fd_, LIRC_SET_REC_TIMEOUT_REPORTS, &on);
+    lirc_ioctl(fd_, LIRC_SET_REC_TIMEOUT_REPORTS, &on);
     // Samples from before the claim are no frame of the pod's
     uint32_t stale[64];
     while (::read(fd_, stale, sizeof(stale)) > 0) {}
@@ -275,7 +288,7 @@ void LinuxIrReceiver::stop() {
     }
     sink_ = nullptr;
 #if defined(__linux__)
-    if (timeout_set_) ::ioctl(fd_, LIRC_SET_REC_TIMEOUT, &saved_timeout_);
+    if (timeout_set_) lirc_ioctl(fd_, LIRC_SET_REC_TIMEOUT, &saved_timeout_);
 #endif
     timeout_set_ = false;
 }
@@ -299,8 +312,8 @@ bool LinuxBoard::open_ir(RmtDir dir, const std::string& spec) {
     uint32_t features = 0;
     uint32_t mode = tx ? LIRC_MODE_PULSE : LIRC_MODE_MODE2;
     const uint32_t needed = tx ? LIRC_CAN_SEND_PULSE : LIRC_CAN_REC_MODE2;
-    if (::ioctl(fd, LIRC_GET_FEATURES, &features) < 0 || (features & needed) == 0 ||
-        ::ioctl(fd, tx ? LIRC_SET_SEND_MODE : LIRC_SET_REC_MODE, &mode) < 0) {
+    if (lirc_ioctl(fd, LIRC_GET_FEATURES, &features) < 0 || (features & needed) == 0 ||
+        lirc_ioctl(fd, tx ? LIRC_SET_SEND_MODE : LIRC_SET_REC_MODE, &mode) < 0) {
         printf("[BOARD] %s %s: not a LIRC %s of raw pulses; the node offers no %s\n", what, name.c_str(), tx ? "transmitter" : "receiver",
                channel);
         ::close(fd);
@@ -313,7 +326,7 @@ bool LinuxBoard::open_ir(RmtDir dir, const std::string& spec) {
     } else {
         ir_rx_ = std::make_unique<LinuxIrReceiver>(device, fd, features);
         uint32_t timeout = 0;
-        if ((features & LIRC_CAN_SET_REC_TIMEOUT) == 0 && ::ioctl(fd, LIRC_GET_REC_TIMEOUT, &timeout) == 0) {
+        if ((features & LIRC_CAN_SET_REC_TIMEOUT) == 0 && lirc_ioctl(fd, LIRC_GET_REC_TIMEOUT, &timeout) == 0) {
             printf("[BOARD] %s %s: frames also end at the driver's timeout, %u us\n", what, name.c_str(), timeout);
         } else {
             printf("[BOARD] %s %s\n", what, name.c_str());
