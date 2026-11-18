@@ -75,7 +75,9 @@ struct PodSecurityRecord {
 enum class I2cAccess : uint8_t {
     Denied,
     Bus,      // the pod claims the bus whole (esp32.io/i2c-bus-N): hal::i2c_bus_*
-    Device    // the pod's device grant: hal::i2c_device_* with the grant's location
+    Device,   // the pod's device grant: hal::i2c_device_* with the grant's location
+    Absent    // an address of the board's own drivers on a bus the pod claims
+              // whole: the bus it was given has no device there (HAL_ERR_NODEV)
 };
 
 class CapabilityFirewall {
@@ -126,8 +128,9 @@ public:
     // Gatekeeper Enforcement Check (O(1) fast path)
     bool check_permission(const std::string& pod_id, PeripheralType type, uint32_t pin_or_port, AccessMode mode);
     // A transfer of the pod to `addr` on I2C bus `bus`: the whole bus, its
-    // device grant (`out_device` set to the granted location), or denied and
-    // logged as a violation
+    // device grant (`out_device` set to the granted location), an address
+    // the board keeps on a bus the pod claims whole, or denied and logged as
+    // a violation
     I2cAccess check_i2c(const std::string& pod_id, uint32_t bus, uint32_t addr, AccessMode mode, models::I2cLocation& out_device);
 
     // Context Pointer Lookup for Wasm3 Userdata Binding
@@ -162,6 +165,8 @@ public:
     uint32_t claimable_rmt_rx_count() const;
     // BoardProfile::onboard_devices
     uint32_t onboard_devices() const;
+    // A pod's grant holds one of `capabilities` (KUBE32_CAP_*)
+    bool capability_held(uint32_t capabilities) const;
     uint32_t get_allocated_rmt_tx_count() const;
     uint32_t get_allocated_rmt_rx_count() const;
     // Buses (with pins) the pod was admitted with

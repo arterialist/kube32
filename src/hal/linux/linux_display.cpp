@@ -137,7 +137,7 @@ void FrameCanvas::text(int x, int y, const char* s, size_t len, uint16_t fg, uin
     }
 }
 
-bool LinuxBoard::open_display() {
+bool LinuxBoard::probe_display() {
     const std::string& dev = config_.framebuffer;
 #if defined(__linux__)
     const int fd = ::open(dev.c_str(), O_RDWR | O_CLOEXEC);
@@ -152,44 +152,64 @@ bool LinuxBoard::open_display() {
         ::close(fd);
         return false;
     }
-    const size_t bytes = fix.smem_len ? fix.smem_len : static_cast<size_t>(fix.line_length) * var.yres_virtual;
-    void* map = ::mmap(nullptr, bytes, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
-    if (map == MAP_FAILED) {
-        printf("[BOARD] display %s: cannot map it (%s); the node offers no display\n", dev.c_str(), std::strerror(errno));
-        ::close(fd);
-        return false;
-    }
-    PixelLayout layout;
-    layout.bits = static_cast<uint8_t>(var.bits_per_pixel);
-    layout.red_offset = static_cast<uint8_t>(var.red.offset);
-    layout.red_length = static_cast<uint8_t>(var.red.length);
-    layout.green_offset = static_cast<uint8_t>(var.green.offset);
-    layout.green_length = static_cast<uint8_t>(var.green.length);
-    layout.blue_offset = static_cast<uint8_t>(var.blue.offset);
-    layout.blue_length = static_cast<uint8_t>(var.blue.length);
+    Panel p;
+    p.width = static_cast<int>(var.xres);
+    p.height = static_cast<int>(var.yres);
+    p.stride = fix.line_length;
     // The visible part of a panned framebuffer
-    uint8_t* visible = static_cast<uint8_t*>(map) + static_cast<size_t>(var.yoffset) * fix.line_length +
-                       static_cast<size_t>(var.xoffset) * (var.bits_per_pixel / 8);
-    const size_t needed = static_cast<size_t>(var.yoffset + var.yres) * fix.line_length;
-    if (needed > bytes || !canvas_.attach(visible, static_cast<int>(var.xres), static_cast<int>(var.yres), fix.line_length, layout)) {
+    p.offset = static_cast<size_t>(var.yoffset) * fix.line_length + static_cast<size_t>(var.xoffset) * (var.bits_per_pixel / 8);
+    p.bytes = fix.smem_len ? fix.smem_len : static_cast<size_t>(fix.line_length) * var.yres_virtual;
+    p.layout.bits = static_cast<uint8_t>(var.bits_per_pixel);
+    p.layout.red_offset = static_cast<uint8_t>(var.red.offset);
+    p.layout.red_length = static_cast<uint8_t>(var.red.length);
+    p.layout.green_offset = static_cast<uint8_t>(var.green.offset);
+    p.layout.green_length = static_cast<uint8_t>(var.green.length);
+    p.layout.blue_offset = static_cast<uint8_t>(var.blue.offset);
+    p.layout.blue_length = static_cast<uint8_t>(var.blue.length);
+    const bool drawable = (p.layout.bits == 16 || p.layout.bits == 32) && p.width > 0 && p.height > 0 &&
+                          p.stride >= static_cast<size_t>(p.width) * (p.layout.bits / 8) &&
+                          p.offset + static_cast<size_t>(p.height) * p.stride <= p.bytes;
+    if (!drawable) {
         printf("[BOARD] display %s: %u bits a pixel, %ux%u; the node draws on 16 and 32 and offers no display\n", dev.c_str(),
                var.bits_per_pixel, var.xres, var.yres);
-        ::munmap(map, bytes);
         ::close(fd);
         return false;
     }
-    framebuffer_ = static_cast<uint8_t*>(map);
-    framebuffer_bytes_ = bytes;
     framebuffer_fd_ = fd;
-    // The background of the boards' ready screen, over what the panel showed
-    canvas_.rect(0, 0, canvas_.width(), canvas_.height(), 0x10A2);
-    printf("[BOARD] display %s: %dx%d, %u bits a pixel\n", dev.c_str(), canvas_.width(), canvas_.height(), var.bits_per_pixel);
-    if (!config_.backlight.empty()) backlight_on();
+    panel_ = p;
+    printf("[BOARD] display %s: %dx%d, %u bits a pixel\n", dev.c_str(), p.width, p.height, var.bits_per_pixel);
     return true;
 #else
     printf("[BOARD] display %s: framebuffers are Linux devices; the node offers no display\n", dev.c_str());
     return false;
 #endif
+}
+
+bool LinuxBoard::map_display_locked() {
+#if defined(__linux__)
+    void* map = ::mmap(nullptr, panel_.bytes, PROT_READ | PROT_WRITE, MAP_SHARED, framebuffer_fd_, 0);
+    if (map == MAP_FAILED) {
+        printf("[BOARD] display %s: cannot map it (%s)\n", config_.framebuffer.c_str(), std::strerror(errno));
+        return false;
+    }
+    framebuffer_ = static_cast<uint8_t*>(map);
+    canvas_.attach(framebuffer_ + panel_.offset, panel_.width, panel_.height, panel_.stride, panel_.layout);
+    // Nothing the panel showed before stays beside a pod's drawing
+    canvas_.rect(0, 0, panel_.width, panel_.height, 0x0000);
+    if (!config_.backlight.empty()) backlight_on();
+    return true;
+#else
+    return false;
+#endif
+}
+
+void LinuxBoard::unmap_display_locked() {
+#if defined(__linux__)
+    if (framebuffer_) ::munmap(framebuffer_, panel_.bytes);
+#endif
+    framebuffer_ = nullptr;
+    canvas_ = FrameCanvas{};
+    showing_ready_ = false;
 }
 
 void LinuxBoard::backlight_on() {
@@ -214,35 +234,66 @@ void LinuxBoard::backlight_on() {
     printf("[BOARD] backlight %s: on at %d of %d\n", dir.c_str(), on, max);
 }
 
+void LinuxBoard::show_ready(const std::string& node_ip, const std::string& app_url) {
+    if (!config_.screen_owner.empty()) return;
+    constexpr uint16_t kBanner = 0x194B, kGreen = 0x07E0, kWhite = 0xFFFF, kCyan = 0x07FF, kDark = 0x10A2;
+    std::lock_guard<std::mutex> lock(display_mutex_);
+    if (!framebuffer_) return;
+    canvas_.rect(0, 0, canvas_.width(), canvas_.height(), kDark);
+    canvas_.rect(0, 0, canvas_.width(), 18, kBanner);
+    canvas_.text(6, 5, "ready", 5, kGreen, kBanner);
+    canvas_.text(6, 28, node_ip.data(), node_ip.size(), kWhite, kDark);
+    canvas_.text(6, 40, app_url.data(), app_url.size(), kCyan, kDark);
+    showing_ready_ = true;
+}
+
+void LinuxBoard::leave_ready_locked() {
+    if (!showing_ready_) return;
+    showing_ready_ = false;
+    canvas_.rect(0, 0, canvas_.width(), canvas_.height(), 0x0000);
+}
+
 DisplayInfo LinuxBoard::display_info() const {
-    if (!framebuffer_) return {};
-    return {canvas_.width(), canvas_.height(), KUBE32_DISPLAY_RGB565};
+    if (!display_present_) return {};
+    return {panel_.width, panel_.height, KUBE32_DISPLAY_RGB565};
 }
 
 int32_t LinuxBoard::display_text(int32_t x, int32_t y, const char* text, size_t len, uint16_t fg, uint16_t bg) {
-    if (!framebuffer_) return HAL_ERR_NODEV;
+    if (!display_present_) return HAL_ERR_NODEV;
+    take_from_owner();
     std::lock_guard<std::mutex> lock(display_mutex_);
+    if (!framebuffer_) return HAL_ERR_NODEV;
+    leave_ready_locked();
     canvas_.text(x, y, text, len, fg, bg);
     return HAL_OK;
 }
 
 int32_t LinuxBoard::display_rect(int32_t x, int32_t y, int32_t w, int32_t h, uint16_t color) {
-    if (!framebuffer_) return HAL_ERR_NODEV;
+    if (!display_present_) return HAL_ERR_NODEV;
+    take_from_owner();
     std::lock_guard<std::mutex> lock(display_mutex_);
+    if (!framebuffer_) return HAL_ERR_NODEV;
+    leave_ready_locked();
     canvas_.rect(x, y, w, h, color);
     return HAL_OK;
 }
 
 int32_t LinuxBoard::display_bar(int32_t x, int32_t y, int32_t w, int32_t h, uint32_t pct, uint16_t fg, uint16_t bg) {
-    if (!framebuffer_) return HAL_ERR_NODEV;
+    if (!display_present_) return HAL_ERR_NODEV;
+    take_from_owner();
     std::lock_guard<std::mutex> lock(display_mutex_);
+    if (!framebuffer_) return HAL_ERR_NODEV;
+    leave_ready_locked();
     canvas_.bar(x, y, w, h, pct, fg, bg);
     return HAL_OK;
 }
 
 int32_t LinuxBoard::display_blit(int32_t x, int32_t y, int32_t w, int32_t h, const uint16_t* pixels) {
-    if (!framebuffer_) return HAL_ERR_NODEV;
+    if (!display_present_) return HAL_ERR_NODEV;
+    take_from_owner();
     std::lock_guard<std::mutex> lock(display_mutex_);
+    if (!framebuffer_) return HAL_ERR_NODEV;
+    leave_ready_locked();
     canvas_.blit(x, y, w, h, pixels);
     return HAL_OK;
 }

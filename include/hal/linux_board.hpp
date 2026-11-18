@@ -15,6 +15,7 @@
 
 #include <atomic>
 #include <bitset>
+#include <condition_variable>
 #include <cstddef>
 #include <cstdint>
 #include <map>
@@ -46,6 +47,9 @@ struct LinuxBoardConfig {
     std::string backlight;                // /sys/class/backlight/<name>, turned on when off; empty: none
     std::map<uint8_t, std::string> i2c;   // pod bus (0, 1) -> /dev/i2c-N
     std::string thermal;                  // /sys/class/thermal/thermal_zoneN; empty: no chip temperature
+    // A systemd user unit that has the panel and the keyboard while no pod
+    // uses them (a launcher); empty: the node keeps them from its start
+    std::string screen_owner;
     std::string sysfs{"/sys"};            // where the kernel lists its I2C devices
 };
 
@@ -134,6 +138,12 @@ private:
     std::bitset<128> reserved_;
 };
 
+// The panel and the keyboard belong to the node, or, on a board with a
+// screen owner (a launcher's systemd user unit), to the node only while pods
+// use them: the first drawing call or key read of a pod stops the owner and
+// takes them, and once no pod holds a display, keyboard or speaker grant they
+// go back and the owner starts again. Stopping the owner also frees what else
+// it holds: the Cardputer Zero's launcher keeps the speaker busy while it runs.
 class LinuxBoard final : public Board {
 public:
     explicit LinuxBoard(LinuxBoardConfig config);
@@ -142,7 +152,8 @@ public:
     const char* name() const override { return config_.name.c_str(); }
     // Opens the configured devices. One line is logged for each device that
     // cannot be opened, and the board does not offer it. True when every
-    // configured device opened.
+    // configured device opened. Without a screen owner the node takes the
+    // panel and the keyboard now.
     bool init() override;
     // No GPIO, ADC, UART or RMT; the I2C buses that opened, with the addresses
     // their kernel drivers hold; the display and keyboard when they opened
@@ -157,33 +168,75 @@ public:
     int32_t key_read() override;
     void key_inject(char c) override;
 
+    // The boards' ready screen: the node's address and the cluster's app URL,
+    // on a panel the node keeps (no screen owner). The first drawing call
+    // after it clears the panel to black, so that a pod drawing on less than
+    // the whole panel shows nothing of it.
+    void show_ready(const std::string& node_ip, const std::string& app_url);
+
+    // Stops the screen owner and gives the node the panel and the keyboard;
+    // returns at once when the node has them. The display and key calls take
+    // them so, and a sound call takes them for the speaker the owner holds.
+    void take_from_owner();
+
     // The adapter of pod bus `bus`, nullptr when the board has none
     HostI2cAdapter* i2c_adapter(uint8_t bus) const;
-    bool has_display() const { return framebuffer_ != nullptr; }
-    bool has_keyboard() const { return keyboard_fd_ >= 0; }
+    bool has_display() const { return display_present_; }
+    bool has_keyboard() const { return keyboard_present_; }
     bool has_chip_temp() const { return !temp_path_.empty(); }
     // The thermal zone in milli-degrees Celsius: HAL_OK, HAL_ERR_NODEV without
     // one, HAL_ERR_IO when it cannot be read
     int32_t chip_temp_read(int32_t& out_milli_c) const;
 
 private:
-    bool open_display();
-    bool open_keyboard();
+    // Where the visible panel is in the framebuffer device
+    struct Panel {
+        int width{0};
+        int height{0};
+        size_t stride{0};
+        size_t offset{0};   // of the visible part, in bytes
+        size_t bytes{0};    // of the whole mapping
+        PixelLayout layout;
+    };
+
+    bool probe_display();
+    bool probe_keyboard();
     bool open_i2c(uint8_t bus, const std::string& device);
     bool open_thermal();
+    // The panel and the keyboard back to the screen owner, starting it again
+    void give_back();
+    // Gives them back once no pod holds a display, keyboard or speaker grant
+    void watch_screen();
+    bool map_display_locked();
+    void unmap_display_locked();
+    void grab_keyboard();
+    void release_keyboard();
     void backlight_on();
     void read_keys();
     void push_key(int code);
+    // Clears the ready screen before a pod's first drawing call; display_mutex_ held
+    void leave_ready_locked();
 
     LinuxBoardConfig config_;
-    mutable std::mutex display_mutex_;
-    uint8_t* framebuffer_{nullptr};
-    size_t framebuffer_bytes_{0};
-    int framebuffer_fd_{-1};
-    FrameCanvas canvas_;
 
+    std::mutex take_mutex_;
+    std::atomic<bool> taken_{false};
+    std::thread watcher_;
+    std::mutex watch_mutex_;
+    std::condition_variable watch_wake_;
+    bool watch_stop_{false};
+
+    mutable std::mutex display_mutex_;
+    bool display_present_{false};
+    int framebuffer_fd_{-1};
+    Panel panel_;
+    uint8_t* framebuffer_{nullptr};   // mapped while the node has the panel
+    FrameCanvas canvas_;
+    bool showing_ready_{false};
+
+    bool keyboard_present_{false};
     int keyboard_fd_{-1};
-    std::atomic<bool> stop_{false};
+    std::atomic<bool> stop_reader_{false};
     std::thread reader_;
     std::mutex key_mutex_;
     // Key presses queue up as on the Cardputer (16 deep); a press arriving

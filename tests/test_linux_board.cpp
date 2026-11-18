@@ -378,14 +378,15 @@ void test_admission_and_transfers() {
     assert(std::find(fake.seen.begin(), fake.seen.end(), 0x34) == fake.seen.end());
     assert(std::find(fake.seen.begin(), fake.seen.end(), 0x68) == fake.seen.end());
 
-    // The whole bus: transfers reach the adapter, except to the kernel's addresses
+    // The whole bus: transfers reach the adapter; the kernel's addresses
+    // have no device for the pod
     assert(fw.register_pod("default/p", pod(R"("esp32.io/i2c-bus-0":"1")"), err));
     const auto buses = fw.pod_buses("default/p");
     assert(buses.size() == 1 && buses[0].pin_a == kBoardWiredPin && buses[0].pin_b == kBoardWiredPin);
     assert(fw.get_allocated_gpio_mask() == 0);
     models::I2cLocation loc;
     assert(fw.check_i2c("default/p", 0, 0x40, AccessMode::Write, loc) == I2cAccess::Bus);
-    assert(fw.check_i2c("default/p", 0, 0x34, AccessMode::Write, loc) == I2cAccess::Denied);
+    assert(fw.check_i2c("default/p", 0, 0x34, AccessMode::Write, loc) == I2cAccess::Absent);
     const uint8_t reg = 0x01;
     fake.seen.clear();
     assert(i2c_bus_write(0, 0x40, &reg, 1) == 1);
@@ -398,6 +399,7 @@ void test_admission_and_transfers() {
     // A device grant: the bus is shared without pins
     assert(fw.register_pod("default/p", pod("", R"("kube32.io/i2c-device":"bus=0,addr=0x40")"), err));
     assert(fw.check_i2c("default/p", 0, 0x40, AccessMode::Read, loc) == I2cAccess::Device && loc.address == 0x40);
+    assert(fw.check_i2c("default/p", 0, 0x34, AccessMode::Read, loc) == I2cAccess::Denied);   // outside its grant
     assert(i2c_device_read(loc, got, 1) == 1);
     fw.unregister_pod("default/p");
 
@@ -411,6 +413,25 @@ void test_preset() {
     assert(linux_board_preset("cardputer-zero", cfg));
     assert(cfg.name == "cardputer-zero" && cfg.keymap == LinuxKeymap::CardputerZero);
     assert(cfg.i2c.size() == 1 && cfg.i2c.at(0) == "/dev/i2c-1" && !cfg.framebuffer.empty() && !cfg.keyboard.empty());
+    assert(cfg.screen_owner == "APPLaunch.service");
+}
+
+// The watcher gives the screen back once no pod holds a display or keyboard
+// grant: the firewall's answer it goes by
+void test_capability_held() {
+    auto& fw = CapabilityFirewall::instance();
+    fw.reset();
+    BoardProfile p;
+    p.onboard_devices = KUBE32_CAP_DISPLAY | KUBE32_CAP_KEYBOARD;
+    fw.set_board_profile(p);
+    const uint32_t screen = KUBE32_CAP_DISPLAY | KUBE32_CAP_KEYBOARD;
+    std::string err;
+    assert(!fw.capability_held(screen));
+    assert(fw.register_pod("default/k", pod(R"("hardware.kube32.io/keyboard":"1")"), err));
+    assert(fw.capability_held(screen) && fw.capability_held(KUBE32_CAP_KEYBOARD) && !fw.capability_held(KUBE32_CAP_DISPLAY));
+    fw.unregister_pod("default/k");
+    assert(!fw.capability_held(screen));
+    fw.reset();
 }
 
 }  // namespace
@@ -425,6 +446,7 @@ int main() {
     test_profile_and_capacity();
     test_admission_and_transfers();
     test_preset();
+    test_capability_held();
     std::cout << "test_linux_board: all passed" << std::endl;
     return 0;
 }

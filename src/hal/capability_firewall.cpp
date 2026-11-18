@@ -58,6 +58,14 @@ uint32_t CapabilityFirewall::onboard_devices() const {
     return profile_.onboard_devices;
 }
 
+bool CapabilityFirewall::capability_held(uint32_t capabilities) const {
+    osal::LockGuard guard(mutex_);
+    for (const auto& kv : pod_records_) {
+        if ((kv.second.grant.capabilities_mask & capabilities) != 0) return true;
+    }
+    return false;
+}
+
 int adc1_channel_gpio(uint32_t ch) {
 #if defined(ESP_PLATFORM)
     int io = -1;
@@ -1369,11 +1377,12 @@ bool CapabilityFirewall::check_permission(const std::string& pod_id, PeripheralT
 I2cAccess CapabilityFirewall::check_i2c(const std::string& pod_id, uint32_t bus, uint32_t addr, AccessMode mode, models::I2cLocation& out_device) {
     osal::LockGuard guard(mutex_);
     auto it = pod_records_.find(pod_id);
-    // The board's own drivers' addresses are out of every pod's reach
+    // The board's own drivers' addresses are out of every pod's reach: a pod
+    // holding the bus whole finds no device there, as on a bus without them
     const bool reserved = bus < 2 && addr < 128 && profile_.i2c_reserved[bus].test(addr);
     if (it != pod_records_.end()) {
         const PodSecurityRecord& r = it->second;
-        if (!reserved && r.grant.is_i2c_permitted(bus)) return I2cAccess::Bus;
+        if (r.grant.is_i2c_permitted(bus)) return reserved ? I2cAccess::Absent : I2cAccess::Bus;
         // The granted address only: never the multiplexer, never a neighbour
         if (!reserved && r.has_i2c_device && r.i2c_device.bus == bus && r.i2c_device.address == addr) {
             out_device = r.i2c_device;

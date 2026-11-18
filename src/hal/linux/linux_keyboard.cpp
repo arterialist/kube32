@@ -8,13 +8,13 @@
 #include <cerrno>
 #include <cstdio>
 #include <cstring>
+#include <unistd.h>
 
 #if defined(__linux__)
 #include <fcntl.h>
 #include <linux/input.h>
 #include <poll.h>
 #include <sys/ioctl.h>
-#include <unistd.h>
 #endif
 
 namespace kube32::hal {
@@ -117,7 +117,8 @@ void LinuxBoard::push_key(int code) {
 }
 
 int32_t LinuxBoard::key_read() {
-    if (keyboard_fd_ < 0) return HAL_ERR_NODEV;
+    if (!keyboard_present_) return HAL_ERR_NODEV;
+    take_from_owner();
     std::lock_guard<std::mutex> lock(key_mutex_);
     if (key_tail_ == key_head_) return HAL_ERR_AGAIN;
     const char c = keys_[key_tail_];
@@ -129,7 +130,7 @@ void LinuxBoard::key_inject(char c) {
     push_key(static_cast<unsigned char>(c));
 }
 
-bool LinuxBoard::open_keyboard() {
+bool LinuxBoard::probe_keyboard() {
     const std::string& dev = config_.keyboard;
 #if defined(__linux__)
     const int fd = ::open(dev.c_str(), O_RDONLY | O_NONBLOCK | O_CLOEXEC);
@@ -138,21 +139,14 @@ bool LinuxBoard::open_keyboard() {
         return false;
     }
     unsigned long types = 0;
-    if (::ioctl(fd, EVIOCGBIT(0, sizeof(types)), &types) < 0 || (types & (1UL << EV_KEY)) == 0) {
-        printf("[BOARD] keyboard %s: not a keyboard; the node offers no keyboard\n", dev.c_str());
-        ::close(fd);
-        return false;
-    }
-    // Key presses go to the pods only, not to a console or a launcher
-    if (::ioctl(fd, EVIOCGRAB, 1) < 0) {
-        printf("[BOARD] keyboard %s: another program holds it (%s); the node offers no keyboard\n", dev.c_str(), std::strerror(errno));
-        ::close(fd);
-        return false;
-    }
     char name[64] = {};
+    const bool keys = ::ioctl(fd, EVIOCGBIT(0, sizeof(types)), &types) >= 0 && (types & (1UL << EV_KEY)) != 0;
     ::ioctl(fd, EVIOCGNAME(sizeof(name) - 1), name);
-    keyboard_fd_ = fd;
-    reader_ = std::thread([this] { read_keys(); });
+    ::close(fd);
+    if (!keys) {
+        printf("[BOARD] keyboard %s: not a keyboard; the node offers no keyboard\n", dev.c_str());
+        return false;
+    }
     printf("[BOARD] keyboard %s: %s\n", dev.c_str(), name[0] ? name : "evdev");
     return true;
 #else
@@ -161,12 +155,44 @@ bool LinuxBoard::open_keyboard() {
 #endif
 }
 
+void LinuxBoard::grab_keyboard() {
+#if defined(__linux__)
+    const std::string& dev = config_.keyboard;
+    const int fd = ::open(dev.c_str(), O_RDONLY | O_NONBLOCK | O_CLOEXEC);
+    if (fd < 0) {
+        printf("[BOARD] keyboard %s: cannot open it (%s); no keys reach the pods\n", dev.c_str(), std::strerror(errno));
+        return;
+    }
+    // Key presses go to the pods only, not to a console or a launcher
+    if (::ioctl(fd, EVIOCGRAB, 1) < 0) {
+        printf("[BOARD] keyboard %s: another program holds it (%s); no keys reach the pods\n", dev.c_str(), std::strerror(errno));
+        ::close(fd);
+        return;
+    }
+    {
+        // Keys pressed while the panel was someone else's are not the pods'
+        std::lock_guard<std::mutex> lock(key_mutex_);
+        key_tail_ = key_head_;
+    }
+    keyboard_fd_ = fd;
+    stop_reader_.store(false);
+    reader_ = std::thread([this] { read_keys(); });
+#endif
+}
+
+void LinuxBoard::release_keyboard() {
+    stop_reader_.store(true);
+    if (reader_.joinable()) reader_.join();
+    if (keyboard_fd_ >= 0) ::close(keyboard_fd_);
+    keyboard_fd_ = -1;
+}
+
 void LinuxBoard::read_keys() {
 #if defined(__linux__)
     KeyTranslator keys(config_.keymap);
     pollfd p{keyboard_fd_, POLLIN, 0};
     input_event events[16];
-    while (!stop_.load()) {
+    while (!stop_reader_.load()) {
         // A timeout lets the board stop the reader
         const int ready = ::poll(&p, 1, 200);
         if (ready <= 0) continue;
