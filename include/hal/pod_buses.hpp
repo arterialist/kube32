@@ -18,7 +18,8 @@
 //
 // On the host simulator the controllers are a stub with the same lifecycle:
 // installing, releasing and the pin/speed bookkeeping behave as on a board;
-// transfers reach the devices registered with MockHal.
+// transfers reach the devices registered with MockHal, or the host's own
+// adapter of the bus (set_host_i2c_adapter) on a Linux board.
 
 #include "models/device.hpp"
 
@@ -31,6 +32,10 @@ namespace kube32::hal {
 
 enum class BusKind : uint8_t { I2c, Uart };
 
+// The pin_a and pin_b of a bus whose pins the board wires itself
+// (BoardProfile::i2c_fixed_mask)
+constexpr uint8_t kBoardWiredPin = 0xFF;
+
 struct BusAssignment {
     BusKind kind{BusKind::I2c};
     uint8_t index{0};      // I2C controller 0/1, UART port 1/2
@@ -41,6 +46,22 @@ struct BusAssignment {
 
 constexpr uint32_t kDefaultI2cHz = 100000;
 constexpr uint32_t kDefaultUartBaud = 115200;
+
+#if !defined(ESP_PLATFORM)
+// A host's own I2C controller (a Linux board's /dev/i2c-N). Its transfers
+// answer as i2c_bus_write and i2c_bus_read do: the byte count, HAL_OK for an
+// acknowledged probe (a zero-length write), or a negative HAL_ERR_*.
+class HostI2cAdapter {
+public:
+    virtual ~HostI2cAdapter() = default;
+    virtual const std::string& device() const = 0;   // for the log
+    virtual int32_t write(uint8_t addr, const uint8_t* data, size_t len) = 0;
+    virtual int32_t read(uint8_t addr, uint8_t* buf, size_t len) = 0;
+};
+// Transfers on bus `bus` go to `adapter` instead of MockHal's devices;
+// nullptr hands the bus back to MockHal. Set before pods run.
+void set_host_i2c_adapter(uint32_t bus, HostI2cAdapter* adapter);
+#endif
 
 // Installs every bus of `buses` for the pod. On failure nothing it installed
 // stays installed and `out_error` says why.

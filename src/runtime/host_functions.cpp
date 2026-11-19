@@ -200,8 +200,8 @@ static const void* raw_esp32_i2c_write(IM3Runtime runtime, IM3ImportContext _ctx
 
     models::I2cLocation device;
     const hal::I2cAccess access = hal::CapabilityFirewall::instance().check_i2c(pod_id, bus, addr, hal::AccessMode::Write, device);
-    if (access == hal::I2cAccess::Denied) {
-        *reinterpret_cast<int32_t*>(_sp) = hal::HAL_ERR_PERM;
+    if (access == hal::I2cAccess::Denied || access == hal::I2cAccess::Absent) {
+        *reinterpret_cast<int32_t*>(_sp) = access == hal::I2cAccess::Denied ? hal::HAL_ERR_PERM : hal::HAL_ERR_NODEV;
         return m3Err_none;
     }
 
@@ -228,8 +228,8 @@ static const void* raw_esp32_i2c_read(IM3Runtime runtime, IM3ImportContext _ctx,
 
     models::I2cLocation device;
     const hal::I2cAccess access = hal::CapabilityFirewall::instance().check_i2c(pod_id, bus, addr, hal::AccessMode::Read, device);
-    if (access == hal::I2cAccess::Denied) {
-        *reinterpret_cast<int32_t*>(_sp) = hal::HAL_ERR_PERM;
+    if (access == hal::I2cAccess::Denied || access == hal::I2cAccess::Absent) {
+        *reinterpret_cast<int32_t*>(_sp) = access == hal::I2cAccess::Denied ? hal::HAL_ERR_PERM : hal::HAL_ERR_NODEV;
         return m3Err_none;
     }
 

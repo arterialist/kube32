@@ -77,6 +77,32 @@ public:
     void mic_set_gain(uint32_t gain) override { hal::mic_set_gain(gain); }
 };
 
+// The M5Stack AtomS3 Lite: no screen, no PSRAM. It breaks out the Grove port
+// (GPIO 2 and 1) and six header pins (5, 6, 7, 8, 38, 39); its button is on
+// GPIO 41 (low when pressed), its IR LED on GPIO 4 and its WS2812 LED on
+// GPIO 35. Pods may claim only the pins a user can reach and the button.
+class AtomS3LiteBoard final : public Board {
+public:
+    const char* name() const override { return "atoms3-lite"; }
+
+    bool init() override { return true; }
+
+    void describe(BoardProfile& profile) const override {
+        constexpr uint64_t reachable = (1ULL << 1) | (1ULL << 2) | (1ULL << 5) | (1ULL << 6) | (1ULL << 7) |
+                                       (1ULL << 8) | (1ULL << 38) | (1ULL << 39) | (1ULL << 41);
+        profile.name = name();
+        profile.reserved_gpio_mask = KUBE32_CHIP_GPIO_MASK & ~reachable;
+        profile.i2c_bus_mask = 0x1;
+        profile.i2c_pins[0] = {2, 1};     // Grove SDA, SCL
+        profile.i2c_pins[1] = {};
+        profile.uart_port_mask = 0x2;
+        profile.uart_pins[1] = {2, 1};    // Grove TX, RX
+        profile.rmt_tx_pin_mask = 1ULL << 4;
+        profile.rmt_tx_default_pin = 4;   // IR LED
+        profile.onboard_devices = 0;
+    }
+};
+
 }  // namespace
 
 #if CONFIG_IDF_TARGET_ESP32S31
@@ -85,11 +111,13 @@ Board* kit_board();
 
 Board* board_for(std::string_view name) {
     static CardputerBoard cardputer;
+    static AtomS3LiteBoard atoms3_lite;
 #if CONFIG_IDF_TARGET_ESP32S31
-    // The kit's image has one board: an empty profile selects it as well
-    if (name.empty() || name == "esp-mosaico" || name == "kit") return kit_board();
+    // Kit pins differ from other boards with this chip: the kit is selected by name only
+    if (name == "esp-mosaico" || name == "kit") return kit_board();
 #endif
     if (name == "cardputer" || name == "display") return &cardputer;
+    if (name == "atoms3-lite") return &atoms3_lite;
     return nullptr;
 }
 

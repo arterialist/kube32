@@ -38,8 +38,8 @@ Pods share each device that a `hardware.kube32.io/*` resource grants, and a pod 
 | Resource | Advertised by |
 | --- | --- |
 | `hardware.kube32.io/ipc` | Every node |
-| `hardware.kube32.io/chip-temp` | Every node: the ESP32-S3's internal sensor, a stand-in in the simulator |
-| `hardware.kube32.io/tft-display`, `keyboard`, `speaker`, `microphone`, `touch` | Boards with the devices on board (the Cardputer profile has a display, keyboard, speaker and microphone) |
+| `hardware.kube32.io/chip-temp` | Every node: the ESP32-S3's internal sensor, a stand-in in the simulator. A node on a [Linux board](hardware-spec.md#linux-boards) reads its SoC's thermal zone and advertises the grant only when the zone can be read |
+| `hardware.kube32.io/tft-display`, `keyboard`, `speaker`, `microphone`, `touch` | Boards with the devices on board (the Cardputer profile has a display, keyboard, speaker and microphone; a Linux board, the framebuffer, keyboard and sound card that opened) |
 | `hardware.kube32.io/sd` | Nodes with a mounted microSD card ([storage](storage.md)) |
 
 A resource that a node no longer has (a card taken out, a board profile changed between boots) is set to `null` in the next status write and leaves the Node. The scheduler does not filter on these resources; the firewall checks the grants at admission.
@@ -81,7 +81,7 @@ Error codes (`include/runtime/k32_app_abi.h`, `include/hal/hal_types.hpp`):
 
 ### Cardputer display, keypad, speaker, and microphone
 
-Nodes running the `cardputer` board profile, selected with `K32_CMD:BOARD:cardputer`, expose the M5Stack Cardputer's built-in 240x135 ST7789 display, 56-key matrix, NS4168 I2S speaker, and SPM1423 PDM microphone (`src/runtime/app_pod.cpp`, `src/hal/tft_keyboard_hardware.cpp`). On nodes without this profile, these functions return `K32_ERR_NODEV` (`-19`).
+Nodes running the `cardputer` board profile, selected with `K32_CMD:BOARD:cardputer`, expose the M5Stack Cardputer's built-in 240x135 ST7789 display, 56-key matrix, NS4168 I2S speaker, and SPM1423 PDM microphone (`src/runtime/app_pod.cpp`, `src/hal/tft_keyboard_hardware.cpp`). On nodes without this profile, these functions return `K32_ERR_NODEV` (`-19`). A node on a [Linux board](hardware-spec.md#linux-boards) serves the display, keyboard, speaker and microphone functions with the board's own panel, keyboard and sound card, the display at the panel's size.
 
 | Import | Wasm signature | C declaration | Behavior |
 | --- | --- | --- | --- |
@@ -90,7 +90,8 @@ Nodes running the `cardputer` board profile, selected with `K32_CMD:BOARD:cardpu
 | `k32_display_blit` | `i(iiiii)` | `int32_t k32_display_blit(int32_t x, int32_t y, int32_t w, int32_t h, const uint16_t* rgb565)` | Copies `w x h` RGB565 pixels, row after row, to `x, y`; the part outside the screen is dropped. `w` and `h` are 1 to 1024. |
 | `k32_display_blit_pal` | `i(iiiiii)` | `int32_t k32_display_blit_pal(int32_t x, int32_t y, int32_t w, int32_t h, const uint8_t* idx, const uint16_t* pal565)` | The same from 8-bit palette indices through 256 RGB565 entries: a paletted frame (such as one the [raster kernels](app-development.md#raster-kernels) draw) reaches the screen without the pod converting it. |
 | `k32_display_bar` | `i(iiiiiii)` | `int32_t k32_display_bar(int32_t x, int32_t y, int32_t w, int32_t h, uint32_t pct, uint32_t fg565, uint32_t bg565)` | Draws a horizontal bar at `x, y, w, h` filled to `pct` from `0` to `100`. |
-| `k32_key_read` | `i()` | `int32_t k32_key_read(void)` | Pops the next ASCII key code from the 16-entry scanner queue, or `K32_ERR_AGAIN` (`-11`) when empty. |
+| `k32_display_info` | `i(iii)` | `int32_t k32_display_info(int32_t* width, int32_t* height, int32_t* format)` | Stores the panel's size in pixels and the format the drawing calls take (`1`, RGB565). A pod that asks draws on any panel: 240x135 on the Cardputer, 320x170 on the Cardputer Zero. |
+| `k32_key_read` | `i()` | `int32_t k32_key_read(void)` | Pops the next key code from the 16-entry scanner queue, or `K32_ERR_AGAIN` (`-11`) when empty. Printable keys return ASCII, Enter `\n`, Backspace `\b`, Tab `\t`, Esc `27`, and the arrows `U`, `D`, `L` and `R` (Fn with `;`, `.`, `,` and `/` on the Cardputer). |
 | `k32_tone` | `i(iii)` | `int32_t k32_tone(uint32_t freq_hz, uint32_t duration_ms, uint32_t volume_pct)` | Plays a square-wave tone at `freq_hz` for `duration_ms`, capped at `2000`, at `volume_pct` (`0` to `100`) of the speaker's ceiling. |
 | `k32_audio_play` | `i(iiii)` | `int32_t k32_audio_play(const int16_t* samples, uint32_t count, uint32_t sample_rate, uint32_t volume_pct)` | Queues `count` signed 16-bit mono samples at `sample_rate` (`8000` to `48000` Hz), at most one second of them per call, at `volume_pct` of the ceiling. Returns the number queued once they are in the output buffer. |
 | `k32_mic_read` | `i(iii)` | `int32_t k32_mic_read(int16_t* out, uint32_t max_samples, uint32_t timeout_ms)` | Copies up to `max_samples` (at most `16000`) samples of 16 kHz signed 16-bit mono PCM from the microphone to `out`, waiting up to `timeout_ms` (at most `1000`). Returns the number copied. |
@@ -106,6 +107,15 @@ The speaker never plays louder than `K32_SPEAKER_MAX_PCT` (25) percent of full s
 `k32_mic_read` starts the microphone, which records into a 64 ms buffer between calls and stops one second after the last one; `max_samples` `0` stops it at once. The samples come with the PDM decimator's DC offset removed (a high-pass at 2.5 Hz) and 24 dB of gain, saturating at full scale: speech at 30 cm peaks at several thousand, and a quiet room's floor is about 270 RMS. The first 100 ms after the microphone starts read as silence while the offset settles. `K32_CMD:MICGAIN:<n>` sets the gain factor (1 to 64, 16 by default) until the next boot. Pods that hold the grant share one stream of samples.
 
 The microphone's clock (GPIO 43) is the speaker's word clock, and the microphone's data line is GPIO 46. Only I2S0 has a PDM receiver, so the two share one controller and one runs at a time. The speaker comes first: playback stops a recording, and `k32_mic_read` waits for playback to end and returns `K32_ERR_BUSY` (`-16`) when it is still playing after `timeout_ms`. A channel exists only while sound moves; between sounds the node holds the speaker's pins low and keeps no audio buffers.
+
+### Speaker and microphone on a Linux board
+
+On a Linux board such as the Cardputer Zero, `kube32-sim` reaches the sound card through the kernel's ALSA devices in `/dev/snd` (`src/hal/linux/linux_audio.cpp`), and the four imports keep the semantics above: the same ceiling, the same return values, a 16 kHz microphone with a 64 ms buffer, and the speaker before the microphone. The node converts to the format the codec takes (48 kHz stereo on the Cardputer Zero's ES8389) and back. What differs:
+
+* Other processes may use the card: `k32_tone` and `k32_audio_play` return `K32_ERR_BUSY` while one holds the speaker, such as a PipeWire server with a client stream, and `k32_mic_read` while one holds the microphone.
+* `k32_tone` returns `K32_ERR_IO` when the card fails a write, where the Cardputer returns `0` in every case.
+* The Cardputer Zero's output sounds only about 200 ms after a stream starts, so a sound after a pause begins with that much silence. The output queue grows by the same amount, so a call never waits longer than on the Cardputer, and the stream stays open for a second after a sound, so the next one starts at once.
+* The board profile sets the codec's mixer controls when the node starts and puts them back when it stops.
 
 ## Bus configuration and driver lifecycle
 
@@ -129,8 +139,9 @@ When the annotation is omitted, the bus uses the board profile's default pins. C
 | --- | --- | --- |
 | `generic` | 33 GPIO, 10 ADC, 2 I2C (`0`, `1`), 2 UART (`1`, `2`) | `I2C0` SDA 8, SCL 9; `I2C1` none; `UART1` TX 17, RX 18; `UART2` none |
 | `cardputer` | 11 GPIO, 3 ADC, 1 I2C (`0`), 1 UART (`1`) | `I2C0` SDA 2, SCL 1; `UART1` TX 2, RX 1 |
+| `cardputer-zero` (Linux) | 1 I2C (`0`) | `I2C0` is `/dev/i2c-1`, on the pins the kernel set up |
 
-On the Cardputer, `I2C0` and `UART1` share the Grove port pins GPIO 2 and GPIO 1, so only one of the two can be claimed at a time.
+On the Cardputer, `I2C0` and `UART1` share the Grove port pins GPIO 2 and GPIO 1, so only one of the two can be claimed at a time. On a [Linux board](hardware-spec.md#linux-boards) the kernel sets each bus's pins and speed: a claim takes no pins, and a `kube32.io/i2c-bus-<n>` annotation is refused.
 
 ### Driver lifecycle
 
@@ -177,7 +188,7 @@ kubectl --context kube32 get nodes -L i2c.kube32.io/0x28
 
 ## Infrared (RMT)
 
-The ESP32-S3 RMT peripheral sends and captures pulse trains, the signal of infrared remote controls. A pod claims one transmit channel (`esp32.io/rmt-tx: "1"`), one receive channel (`esp32.io/rmt-rx: "1"`), or one of each. The chip has four channels of each direction; a node advertises at most four of each and only as many as it has pins for, so a profile without a claimable pin for a direction advertises none of it.
+The ESP32-S3 RMT peripheral sends and captures pulse trains, the signal of infrared remote controls. A pod claims one transmit channel (`esp32.io/rmt-tx: "1"`), one receive channel (`esp32.io/rmt-rx: "1"`), or one of each. The chip has four channels of each direction; a node advertises at most four of each and only as many as it has pins for, so a profile without a claimable pin for a direction advertises none of it. A Linux board offers one channel of each direction on its own infrared devices ([below](#infrared-on-a-linux-board)).
 
 ### Pins and settings
 
@@ -201,6 +212,7 @@ metadata:
 | --- | --- | --- | --- |
 | `generic` | 4 RMT TX, 4 RMT RX | None | None |
 | `cardputer` | 4 RMT TX, 4 RMT RX | GPIO 44, the built-in IR LED | None |
+| `cardputer-zero` (Linux) | 1 RMT TX, 1 RMT RX | The board's IR LED, no pin | The board's IR receiver, no pin |
 
 Channel pins are claimed like bus pins: admission fails when the chip or the board reserves the pin, when another pod holds it, or when the claim names no pin and the board has no default (`RMT RX has no default pin on the cardputer board: set annotation kube32.io/rmt-rx: "pin=<n>"`).
 
@@ -235,6 +247,24 @@ A receive channel allocates its 1 KiB queue and a 192-byte capture block from in
 The firmware builds the RMT driver's interrupt handlers and encoders into flash instead of IRAM (`CONFIG_RMT_*_IN_IRAM` off in `sdkconfig.defaults`): an IR symbol lasts hundreds of microseconds, so a cache miss costs nothing.
 
 On the host simulator the channels keep the same lifecycle and queue. `MockHal::get_rmt_tx_frames(pin)` returns the frames sent on a pin, `hal::rmt_inject(pin, ...)` hands a frame to the receiver on a pin, and `MockHal::set_rmt_loopback(true)` delivers every frame sent to the node's receivers, as an LED facing them would.
+
+### Infrared on a Linux board
+
+A [Linux board](hardware-spec.md#linux-boards) runs the channels on the kernel's LIRC devices: `--ir-tx` names the transmitter and `--ir-rx` the receiver, and the `cardputer-zero` preset sets both. The node advertises one RMT TX channel when the transmitter opens and one RMT RX channel when the receiver opens. The kernel wires the LED and the receiver, so a claim takes no pin, and an annotation that names one is refused:
+
+```
+RMT RX runs on the cardputer-zero board's own receiver: annotation kube32.io/rmt-rx cannot set a pin
+```
+
+The other settings apply where the driver supports them:
+
+| Setting | On a Linux board |
+| --- | --- |
+| `carrier`, `duty` | Set with `LIRC_SET_SEND_CARRIER` and `LIRC_SET_SEND_DUTY_CYCLE` before every frame. When the driver refuses a value, the pod is not admitted and the event names the device's error. A driver without these controls sends with its own carrier, and the node logs that when it opens the device. |
+| `active` | Ignored. The kernel driver knows the receiver's polarity and reports every mark as a pulse. |
+| `idle_us` | The receiver's timeout (`LIRC_SET_REC_TIMEOUT`) while the pod holds the channel, and the longest space inside a frame. The device's previous timeout comes back when the channel is released. |
+
+Frames follow the rules [above](#frames): at most 512 durations, at most 500 ms for a frame sent, and the same queue, drop counts and `K32_ERR_AGAIN`. `esp32_rmt_send` writes the frame up to its last mark in `LIRC_MODE_PULSE`, as the kernel takes an odd count of durations. The write returns once the driver has sent the frame, and the call then waits out a final space. The receiver reads `LIRC_MODE_MODE2` samples on a thread of its own from admission until release. A frame starts with a pulse, samples of one kind in a row make one duration, and a duration above 65535 µs counts as 65535. The driver's timeout report, or a space of `idle_us`, ends the frame without that space. A frame in progress when the driver reports an overflow is lost. Samples that arrived before the claim are discarded.
 
 ### Example: IR remote
 
@@ -306,6 +336,7 @@ The ESP32-S3 provides GPIO 0 to 21 and 26 to 48. The firewall blocks claims on r
 
 * Every board (`KUBE32_RESERVED_GPIO_MASK`) reserves GPIO `0` for boot strapping, `19` and `20` for native USB, `26` to `32` for SPI flash and quad PSRAM, and `43` and `44` for the UART0 console. The `cardputer` profile offers GPIO `44` to RMT TX channels for its IR LED. A pod can claim GPIO `0` as an input pin (`esp32.io/gpio-input-0`) to read the boot button.
 * The `cardputer` profile also reserves LCD SPI pins `33` to `38`, I2S speaker pins `41` to `43`, microphone data pin `46`, keyboard matrix pins `3` to `9`, `11`, `13`, and `15`, and microSD SPI pins `12`, `14`, `39`, and `40`.
+* The `atoms3-lite` profile offers only its Grove pins `1` and `2`, header pins `5` to `8`, `38` and `39`, and button pin `41`. It reserves the rest, including RGB LED pin `35`, and offers IR LED pin `4` to RMT TX channels.
 
 An ADC1 channel `N` from `0` to `9` is claimable only when its pad, GPIO `N + 1`, is claimable by the board profile.
 

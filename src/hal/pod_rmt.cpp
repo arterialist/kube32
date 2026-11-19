@@ -48,6 +48,8 @@ struct TxSlot {
     uint32_t count{0};
     uint32_t index{0};
     uint32_t left{0};
+#else
+    HostIrTransmitter* host{nullptr};   // the host's transmitter the channel runs on; null: the stub
 #endif
 };
 
@@ -83,6 +85,7 @@ struct RxSlot {
     RxSlot() { portMUX_INITIALIZE(&lock); }
 #else
     std::mutex lock;
+    HostIrReceiver* host{nullptr};   // the host's receiver the channel runs on; null: the stub
 #endif
 };
 
@@ -95,6 +98,10 @@ RxSlot* s_rx[kRmtChannels];
 std::mutex s_registry;
 std::atomic<uint32_t> s_tx_installs{0};
 std::atomic<uint32_t> s_rx_installs{0};
+#if !defined(ESP_PLATFORM)
+std::atomic<HostIrTransmitter*> s_host_tx{nullptr};
+std::atomic<HostIrReceiver*> s_host_rx{nullptr};
+#endif
 
 void queue_lock(RxSlot& s) {
 #if defined(ESP_PLATFORM)
@@ -175,6 +182,11 @@ void rx_commit(RxSlot& s) {
     s.started = s.ended = s.last_mark = false;
     s.dropping = 0;
 }
+
+#if !defined(ESP_PLATFORM)
+// A host receiver's frame into the queue (below)
+void deliver(RxSlot& s, const uint16_t* durations, size_t count);
+#endif
 
 void* alloc_internal(size_t bytes) {
 #if defined(ESP_PLATFORM)
@@ -306,7 +318,17 @@ bool install_tx(TxSlot& s, const std::string& pod_id, const RmtAssignment& a, si
            (unsigned)a.carrier_hz, a.duty_pct, (unsigned)(free_before > free_after ? free_before - free_after : 0));
 #else
     (void)free_before;
-    printf("[HAL] RMT TX installed for %s: GPIO %u, carrier %u Hz at %u%%\n", pod_id.c_str(), a.pin, (unsigned)a.carrier_hz, a.duty_pct);
+    s.host = s_host_tx.load();
+    if (s.host) {
+        if (!s.host->configure(a, err)) {
+            s.host = nullptr;
+            return false;
+        }
+        printf("[HAL] RMT TX installed for %s: %s, carrier %u Hz at %u%%\n", pod_id.c_str(), s.host->device().c_str(), (unsigned)a.carrier_hz,
+               a.duty_pct);
+    } else {
+        printf("[HAL] RMT TX installed for %s: GPIO %u, carrier %u Hz at %u%%\n", pod_id.c_str(), a.pin, (unsigned)a.carrier_hz, a.duty_pct);
+    }
 #endif
     s.state.installed = true;
     s.state.owner = pod_id;
@@ -325,8 +347,12 @@ void release_tx(TxSlot& s) {
     s.encoder = nullptr;
     s.chan = nullptr;
     gpio_reset_pin(static_cast<gpio_num_t>(s.state.config.pin));
-#endif
     printf("[HAL] RMT TX on GPIO %u released by %s\n", s.state.config.pin, s.state.owner.c_str());
+#else
+    if (s.host) printf("[HAL] RMT TX on %s released by %s\n", s.host->device().c_str(), s.state.owner.c_str());
+    else printf("[HAL] RMT TX on GPIO %u released by %s\n", s.state.config.pin, s.state.owner.c_str());
+    s.host = nullptr;
+#endif
     s.state.installed = false;
     s.state.owner.clear();
 }
@@ -394,8 +420,24 @@ bool install_rx(RxSlot& s, const std::string& pod_id, const RmtAssignment& a, si
     s.closing = false;
     queue_unlock(s);
     (void)free_before;
-    printf("[HAL] RMT RX installed for %s: GPIO %u, active %s, idle %u us\n", pod_id.c_str(), a.pin, a.active_low ? "low" : "high",
-           (unsigned)a.idle_us);
+    s.host = s_host_rx.load();
+    if (s.host) {
+        // The receiver's thread fills the queue as the RMT interrupt does
+        RxSlot* slot = &s;
+        if (!s.host->start(a, [slot](const uint16_t* d, size_t n) { deliver(*slot, d, n); }, err)) {
+            s.host = nullptr;
+            queue_lock(s);
+            s.closing = true;
+            s.ring = nullptr;
+            queue_unlock(s);
+            std::free(ring);
+            return false;
+        }
+        printf("[HAL] RMT RX installed for %s: %s, idle %u us\n", pod_id.c_str(), s.host->device().c_str(), (unsigned)a.idle_us);
+    } else {
+        printf("[HAL] RMT RX installed for %s: GPIO %u, active %s, idle %u us\n", pod_id.c_str(), a.pin, a.active_low ? "low" : "high",
+               (unsigned)a.idle_us);
+    }
 #endif
     s.state.installed = true;
     s.state.owner = pod_id;
@@ -417,6 +459,8 @@ void release_rx(RxSlot& s) {
     rmt_del_channel(s.chan);
     s.chan = nullptr;
     s.armed = false;
+#else
+    if (s.host) s.host->stop();   // its thread no longer delivers
 #endif
     queue_lock(s);
     uint16_t* ring = s.ring;
@@ -428,8 +472,12 @@ void release_rx(RxSlot& s) {
     heap_caps_free(s.block);
     s.block = nullptr;
     gpio_reset_pin(static_cast<gpio_num_t>(s.state.config.pin));
-#endif
     printf("[HAL] RMT RX on GPIO %u released by %s\n", s.state.config.pin, s.state.owner.c_str());
+#else
+    if (s.host) printf("[HAL] RMT RX on %s released by %s\n", s.host->device().c_str(), s.state.owner.c_str());
+    else printf("[HAL] RMT RX on GPIO %u released by %s\n", s.state.config.pin, s.state.owner.c_str());
+    s.host = nullptr;
+#endif
     s.state.installed = false;
     s.state.owner.clear();
 }
@@ -603,6 +651,12 @@ int32_t rmt_send(const std::string& pod_id, const uint8_t* durations, uint32_t c
 #else
     uint16_t frame[kRmtMaxDurations];
     for (uint32_t k = 0; k < count; ++k) frame[k] = load_le16(durations + 2 * k);
+    if (s.host) {
+        const int32_t r = s.host->send(frame, count);
+        if (r < 0) return r;
+        s.state.frames++;
+        return static_cast<int32_t>(count);
+    }
     MockHal::instance().rmt_transmit(s.state.config.pin, frame, count, s.state.config.carrier_hz);
     if (MockHal::instance().rmt_loopback()) {
         // The node's receivers see the LED
@@ -673,6 +727,11 @@ RmtState rmt_state(const std::string& pod_id, RmtDir dir) {
 }
 
 #if !defined(ESP_PLATFORM)
+void set_host_ir(HostIrTransmitter* tx, HostIrReceiver* rx) {
+    s_host_tx.store(tx);
+    s_host_rx.store(rx);
+}
+
 bool rmt_inject(uint32_t pin, const uint16_t* durations, size_t count) {
     for (unsigned i = 0; i < kRmtChannels; ++i) {
         RxSlot* s = slot_of(s_rx, i, nullptr);

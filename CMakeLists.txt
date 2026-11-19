@@ -172,6 +172,11 @@ else()
         src/hal/pod_rmt.cpp
         src/hal/mock_hal.cpp
         src/hal/firmware_slots.cpp
+        src/hal/linux/linux_board.cpp
+        src/hal/linux/linux_display.cpp
+        src/hal/linux/linux_i2c.cpp
+        src/hal/linux/linux_ir.cpp
+        src/hal/linux/linux_keyboard.cpp
         src/runtime/host_functions.cpp
         src/runtime/container_lifecycle.cpp
         src/runtime/wasm_runtime.cpp
@@ -205,6 +210,14 @@ else()
         src/kubelet/firmware_agent.cpp
         ${CMAKE_BINARY_DIR}/generated/embedded_blobs.cpp
     )
+
+    # A Linux board's speaker and microphone, through the kernel's ALSA devices
+    # (the portable part builds on every host, as the board layer's does)
+    set(KUBE32_LINUX_AUDIO_SRCS src/hal/linux/linux_audio.cpp)
+    if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+        list(APPEND KUBE32_LINUX_AUDIO_SRCS src/hal/linux/linux_audio_alsa.cpp)
+    endif()
+    list(APPEND KUBE32_CORE_SRCS ${KUBE32_LINUX_AUDIO_SRCS})
 
     # Embedded images (images/*.wasm) and static bundles (images/web/<bundle>/)
     # are turned into a generated source so the host simulator serves the same
@@ -452,6 +465,14 @@ else()
     target_link_libraries(test_hal_peripherals PRIVATE kube32_core)
     add_test(NAME test_hal_peripherals COMMAND test_hal_peripherals)
 
+    # Linux boards: drawing and clipping, key translation, the kernel's I2C
+    # addresses in sysfs, what such a board offers pods and the Node advertises
+    add_executable(test_linux_board
+        tests/test_linux_board.cpp
+    )
+    target_link_libraries(test_linux_board PRIVATE kube32_core)
+    add_test(NAME test_linux_board COMMAND test_linux_board)
+
     # 14. Container termination of non-yielding guests and pin rollback
     add_executable(test_container_termination
         tests/test_container_termination.cpp
@@ -628,6 +649,12 @@ else()
     target_compile_definitions(test_pod_snapshot PRIVATE KUBE32_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}")
     add_test(NAME test_pod_snapshot COMMAND test_pod_snapshot)
 
+    # The clusterview example against an API server, drawing into memory
+    add_executable(test_clusterview_app tests/test_clusterview_app.cpp)
+    target_link_libraries(test_clusterview_app PRIVATE kube32_core)
+    target_compile_definitions(test_clusterview_app PRIVATE KUBE32_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}")
+    add_test(NAME test_clusterview_app COMMAND test_clusterview_app)
+
     # The rfid example against a simulated MFRC522; pod tick intervals
     add_executable(test_rfid_app
         tests/test_rfid_app.cpp
@@ -668,6 +695,12 @@ else()
     )
     target_link_libraries(test_firmware_rollout PRIVATE kube32_core)
     add_test(NAME test_firmware_rollout COMMAND test_firmware_rollout)
+
+    # A Linux board's speaker and microphone on a simulated sound card: the
+    # conversions, the mixer values and the Cardputer's audio semantics
+    add_executable(test_linux_audio tests/test_linux_audio.cpp ${KUBE32_LINUX_AUDIO_SRCS})
+    target_link_libraries(test_linux_audio PRIVATE pthread)
+    add_test(NAME test_linux_audio COMMAND test_linux_audio)
 
 endif()
 

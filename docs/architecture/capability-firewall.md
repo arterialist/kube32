@@ -39,20 +39,31 @@ Set pins and speeds in `metadata.annotations`, or omit the annotation to use the
 
 Buses without board defaults require an annotation. See `examples/i2cscan.yaml` and `apps/i2cscan`.
 
-RMT channels take their pin the same way, from `kube32.io/rmt-tx: "pin=<n>[,carrier=<Hz>][,duty=<percent>]"` and `kube32.io/rmt-rx: "pin=<n>[,active=low|high][,idle_us=<n>]"` or the board default (GPIO 44, the IR LED, for TX on the `cardputer` profile; no other defaults). The firewall admits at most four channels of each direction, and the driver is created while the pod runs. See [peripherals](../peripherals.md#infrared-rmt), `examples/irremote.yaml`, and `apps/irremote`.
+RMT channels take their pin the same way, from `kube32.io/rmt-tx: "pin=<n>[,carrier=<Hz>][,duty=<percent>]"` and `kube32.io/rmt-rx: "pin=<n>[,active=low|high][,idle_us=<n>]"` or the board default (the IR LED for TX: GPIO 44 on the `cardputer` profile, GPIO 4 on `atoms3-lite`; no other defaults). The firewall admits at most four channels of each direction, and the driver is created while the pod runs. See [peripherals](../peripherals.md#infrared-rmt), `examples/irremote.yaml`, and `apps/irremote`.
 
 ## Board profiles and reserved pins
 
 The ESP32-S3 provides GPIO 0 to 21 and 26 to 48. `KUBE32_RESERVED_GPIO_MASK` in `include/hal/capability_firewall.hpp` reserves pins 0, 19, 20, 26 to 32, 43, and 44 on every board for boot strapping, native USB, SPI flash, quad PSRAM, and UART0.
 
-The board profile, set at boot from NVS key `board` via `K32_CMD:BOARD:cardputer|generic`, reserves on-board peripheral pins and sets node capacity:
+The board profile, set at boot from NVS key `board` via `K32_CMD:BOARD:cardputer|atoms3-lite|generic`, reserves on-board peripheral pins and sets node capacity:
 
 | Profile | GPIO | ADC1 | I2C | UART | RMT TX / RX | Default pins |
 | --- | --- | --- | --- | --- | --- | --- |
 | `generic` | 33 | 10 | 2 | 2 | 4 / 4 | I2C0 on GPIO 8/9, UART1 on GPIO 17/18 |
 | `cardputer` | 11 | 3 | 1 | 1 | 4 / 4 | Grove port GPIO 2/1 shared by I2C0 and UART1; RMT TX on GPIO 44 (IR LED) |
+| `atoms3-lite` | 9 | 6 | 1 | 1 | 4 / 4 | Grove port GPIO 2/1 shared by I2C0 and UART1; RMT TX on GPIO 4 (IR LED) |
 
-The `cardputer` profile reserves pins 33 to 38 for the LCD, 41 and 42 for I2S, 3 to 9, 11, 13, and 15 for the key matrix, and 12, 14, 39, and 40 for the microSD bus. It offers GPIO 44, a UART0 pin the board wires only to its IR LED, to RMT TX channels. An ADC1 channel is claimable only when its pin, `GPIO channel + 1`, is claimable.
+The `cardputer` profile reserves pins 33 to 38 for the LCD, 41 and 42 for I2S, 3 to 9, 11, 13, and 15 for the key matrix, and 12, 14, 39, and 40 for the microSD bus. It offers GPIO 44, a UART0 pin the board wires only to its IR LED, to RMT TX channels. The `atoms3-lite` profile reserves every pin except the Grove port (1, 2), the header (5 to 8, 38, 39) and the button (41). It offers GPIO 4, its IR LED, to RMT TX channels. An ADC1 channel is claimable only when its pin, `GPIO channel + 1`, is claimable.
+
+### Linux boards
+
+A node on a [Linux board](../hardware-spec.md#linux-boards) (`kube32-sim --board cardputer-zero`, or the device flags) describes the board in the same profile. The kernel owns the SoC's pins, so the profile reserves every GPIO and offers no ADC1 channel, UART or RMT channel. Its I2C buses are fixed buses (`BoardProfile::i2c_fixed_mask`): the kernel set their pins and speed, so an `esp32.io/i2c-bus-<n>` claim or a device grant takes no pins, and a `kube32.io/i2c-bus-<n>` annotation is refused. The addresses that kernel drivers hold (`BoardProfile::i2c_reserved`, read from `/sys/bus/i2c/devices`) stay with the kernel:
+
+* a pod that claims the bus whole finds no device there: its transfers to them return `K32_ERR_NODEV`, as to an empty address, so a bus scan runs unchanged;
+* a `kube32.io/i2c-device` grant that names one, as its address or its multiplexer, is refused at admission;
+* discovery skips them, on the bus and behind multiplexers.
+
+The node advertises `hardware.kube32.io/chip-temp` only when the board reads its SoC's temperature (`BoardProfile::chip_temp`).
 
 ## Limitations
 

@@ -5,6 +5,7 @@
 #include "esp_adc/adc_oneshot.h"
 #endif
 #include <cctype>
+#include <cstdio>
 #include <iostream>
 
 namespace kube32::hal {
@@ -44,6 +45,8 @@ void CapabilityFirewall::set_board_profile(const BoardProfile& profile) {
     profile_.i2c_bus_mask &= KUBE32_CHIP_I2C_MASK;
     profile_.uart_port_mask &= KUBE32_CHIP_UART_MASK;
     profile_.rmt_tx_pin_mask &= KUBE32_CHIP_GPIO_MASK;
+    profile_.i2c_fixed_mask &= profile_.i2c_bus_mask;
+    profile_.rmt_fixed_mask &= rmt_dir_bit(RmtDir::Tx) | rmt_dir_bit(RmtDir::Rx);
 }
 
 BoardProfile CapabilityFirewall::board_profile() const {
@@ -54,6 +57,14 @@ BoardProfile CapabilityFirewall::board_profile() const {
 uint32_t CapabilityFirewall::onboard_devices() const {
     osal::LockGuard guard(mutex_);
     return profile_.onboard_devices;
+}
+
+bool CapabilityFirewall::capability_held(uint32_t capabilities) const {
+    osal::LockGuard guard(mutex_);
+    for (const auto& kv : pod_records_) {
+        if ((kv.second.grant.capabilities_mask & capabilities) != 0) return true;
+    }
+    return false;
 }
 
 int adc1_channel_gpio(uint32_t ch) {
@@ -105,6 +116,7 @@ uint8_t CapabilityFirewall::claimable_i2c_mask() const {
 }
 
 uint32_t CapabilityFirewall::claimable_rmt_count_locked(RmtDir dir) const {
+    if (profile_.rmt_fixed_mask & rmt_dir_bit(dir)) return 1;
     uint64_t pins = claimable_gpio_mask_locked();
     if (dir == RmtDir::Tx) pins |= profile_.rmt_tx_pin_mask;
     uint32_t n = 0;
@@ -283,10 +295,12 @@ bool CapabilityFirewall::lend_i2c_bus(uint8_t bus, BusPins& out_pins, bool* out_
     }
     if (out_shared) *out_shared = false;
     const BusPins pins = profile_.i2c_pins[bus];
-    if (pins.a < 0 || pins.b < 0) return false;
-    const uint64_t claimable = claimable_gpio_mask_locked();
-    for (int8_t pin : {pins.a, pins.b}) {
-        if ((claimable & (1ULL << pin)) == 0 || !gpio_owners_[pin].empty()) return false;
+    if ((profile_.i2c_fixed_mask & (1U << bus)) == 0) {
+        if (pins.a < 0 || pins.b < 0) return false;
+        const uint64_t claimable = claimable_gpio_mask_locked();
+        for (int8_t pin : {pins.a, pins.b}) {
+            if ((claimable & (1ULL << pin)) == 0 || !gpio_owners_[pin].empty()) return false;
+        }
     }
     lent_i2c_mask_ |= static_cast<uint8_t>(1U << bus);
     out_pins = pins;
@@ -307,6 +321,11 @@ void CapabilityFirewall::return_i2c_bus(uint8_t bus) {
 uint32_t CapabilityFirewall::i2c_sharers(uint8_t bus) const {
     osal::LockGuard guard(mutex_);
     return bus < 2 ? i2c_sharers_[bus] : 0;
+}
+
+bool CapabilityFirewall::i2c_address_reserved(uint8_t bus, uint8_t addr) const {
+    osal::LockGuard guard(mutex_);
+    return bus < 2 && addr < 128 && profile_.i2c_reserved[bus].test(addr);
 }
 
 bool CapabilityFirewall::i2c_device_granted(const models::I2cLocation& loc) const {
@@ -345,6 +364,13 @@ bool CapabilityFirewall::claim_i2c_device(const std::string& pod_id, const std::
         out_error = "I2C bus " + n + " is not offered by the " + profile_.name + " board";
         return false;
     }
+    for (uint8_t addr : {out_loc.address, out_loc.mux}) {
+        if (addr == 0 || !profile_.i2c_reserved[bus].test(addr)) continue;
+        char hex[8];
+        snprintf(hex, sizeof(hex), "0x%02x", addr);
+        out_error = "I2C" + n + " address " + hex + " is used by the " + profile_.name + " board";
+        return false;
+    }
     if (grant.i2c_bus_mask & (1U << bus)) {
         out_error = "The pod claims I2C bus " + n + " whole (esp32.io/i2c-bus-" + n + ") and a device on it (kube32.io/i2c-device): claim one or the other";
         return false;
@@ -362,7 +388,7 @@ bool CapabilityFirewall::claim_i2c_device(const std::string& pod_id, const std::
         out_error = "I2C" + n + " device " + models::i2c_location_text(out_loc) + " is granted to " + kv.first;
         return false;
     }
-    if (i2c_sharers_[bus] == 0 && i2c_shared_scans_[bus] == 0) {
+    if (i2c_sharers_[bus] == 0 && i2c_shared_scans_[bus] == 0 && (profile_.i2c_fixed_mask & (1U << bus)) == 0) {
         // The first grant: the bus runs on the board's default pins
         const BusPins pins = profile_.i2c_pins[bus];
         if (pins.a < 0 || pins.b < 0) {
@@ -1086,8 +1112,18 @@ bool CapabilityFirewall::claim_bus_pins(const std::string& pod_id, const DeviceG
             b.kind = k.kind;
             b.index = static_cast<uint8_t>(n);
             b.speed = k.speed_default;
-            int32_t pa = k.defaults[n].a, pb = k.defaults[n].b;
             auto it = annotations.find(key);
+            if (k.kind == BusKind::I2c && (profile_.i2c_fixed_mask & (1U << n)) != 0) {
+                // The board set the bus's pins and speed: nothing to claim or choose
+                if (it != annotations.end()) {
+                    out_error = label + " runs on the " + profile_.name + " board's own pins and speed: annotation " + key + " cannot set them";
+                    return false;
+                }
+                b.pin_a = b.pin_b = kBoardWiredPin;
+                out_buses.push_back(b);
+                continue;
+            }
+            int32_t pa = k.defaults[n].a, pb = k.defaults[n].b;
             if (it != annotations.end()) {
                 std::map<std::string, uint32_t> v;
                 if (!parse_bus_spec(it->second, v) || !v.count(k.pin_a) || !v.count(k.pin_b)) {
@@ -1135,7 +1171,10 @@ bool CapabilityFirewall::claim_rmt_pins(const std::string& pod_id, const DeviceG
         if (!grant.has_capability(tx ? KUBE32_CAP_RMT_TX : KUBE32_CAP_RMT_RX)) continue;
         const std::string label = tx ? "RMT TX" : "RMT RX";
         const std::string key = tx ? "kube32.io/rmt-tx" : "kube32.io/rmt-rx";
-        const char* want = tx ? "pin=<n>[,carrier=<Hz>][,duty=<percent>]" : "pin=<n>[,active=low|high][,idle_us=<n>]";
+        // The board's own transmitter or receiver: no pin to claim or choose
+        const bool fixed = (profile_.rmt_fixed_mask & rmt_dir_bit(dir)) != 0;
+        const char* want = tx ? (fixed ? "[carrier=<Hz>][,duty=<percent>]" : "pin=<n>[,carrier=<Hz>][,duty=<percent>]")
+                              : (fixed ? "[active=low|high][,idle_us=<n>]" : "pin=<n>[,active=low|high][,idle_us=<n>]");
         if (allocated_rmt_count_locked(dir) >= claimable_rmt_count_locked(dir)) {
             out_error = "Insufficient allocatable " + label + " channels: requested 1, available 0";
             return false;
@@ -1146,16 +1185,22 @@ bool CapabilityFirewall::claim_rmt_pins(const std::string& pod_id, const DeviceG
         a.duty_pct = kRmtDefaultDutyPct;
         a.active_low = true;
         a.idle_us = kRmtDefaultIdleUs;
-        int32_t pin = tx ? profile_.rmt_tx_default_pin : profile_.rmt_rx_default_pin;
+        int32_t pin = fixed ? kBoardWiredPin : tx ? profile_.rmt_tx_default_pin : profile_.rmt_rx_default_pin;
         auto it = annotations.find(key);
         if (it != annotations.end()) {
             std::map<std::string, std::string> v;
             uint32_t n = 0;
-            if (!parse_settings(it->second, v) || !v.count("pin") || !parse_setting_uint(v["pin"], n)) {
+            const bool parsed = parse_settings(it->second, v);
+            if (parsed && fixed && v.count("pin")) {
+                out_error = label + " runs on the " + profile_.name + (tx ? " board's own transmitter" : " board's own receiver") + ": annotation " +
+                            key + " cannot set a pin";
+                return false;
+            }
+            if (!parsed || (!fixed && (!v.count("pin") || !parse_setting_uint(v["pin"], n)))) {
                 out_error = "Invalid " + key + " \"" + it->second + "\" (want \"" + want + "\")";
                 return false;
             }
-            pin = static_cast<int32_t>(n < 64 ? n : 64);
+            if (!fixed) pin = static_cast<int32_t>(n < 64 ? n : 64);
             for (const auto& kv : v) {
                 const std::string& name = kv.first;
                 if (name == "pin") continue;
@@ -1193,7 +1238,9 @@ bool CapabilityFirewall::claim_rmt_pins(const std::string& pod_id, const DeviceG
             out_error = label + " has no default pin on the " + profile_.name + " board: set annotation " + key + ": \"pin=<n>\"";
             return false;
         }
-        if (!claim_pin(pod_id, static_cast<uint32_t>(pin), label, tx ? profile_.rmt_tx_pin_mask : 0, out_claimed_pins, out_error)) return false;
+        if (!fixed && !claim_pin(pod_id, static_cast<uint32_t>(pin), label, tx ? profile_.rmt_tx_pin_mask : 0, out_claimed_pins, out_error)) {
+            return false;
+        }
         a.pin = static_cast<uint8_t>(pin);
         out_rmt.push_back(a);
     }
@@ -1343,11 +1390,14 @@ bool CapabilityFirewall::check_permission(const std::string& pod_id, PeripheralT
 I2cAccess CapabilityFirewall::check_i2c(const std::string& pod_id, uint32_t bus, uint32_t addr, AccessMode mode, models::I2cLocation& out_device) {
     osal::LockGuard guard(mutex_);
     auto it = pod_records_.find(pod_id);
+    // The board's own drivers' addresses are out of every pod's reach: a pod
+    // holding the bus whole finds no device there, as on a bus without them
+    const bool reserved = bus < 2 && addr < 128 && profile_.i2c_reserved[bus].test(addr);
     if (it != pod_records_.end()) {
         const PodSecurityRecord& r = it->second;
-        if (r.grant.is_i2c_permitted(bus)) return I2cAccess::Bus;
+        if (r.grant.is_i2c_permitted(bus)) return reserved ? I2cAccess::Absent : I2cAccess::Bus;
         // The granted address only: never the multiplexer, never a neighbour
-        if (r.has_i2c_device && r.i2c_device.bus == bus && r.i2c_device.address == addr) {
+        if (!reserved && r.has_i2c_device && r.i2c_device.bus == bus && r.i2c_device.address == addr) {
             out_device = r.i2c_device;
             return I2cAccess::Device;
         }

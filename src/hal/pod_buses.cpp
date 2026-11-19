@@ -3,6 +3,7 @@
 #include "hal/mock_hal.hpp"
 
 #include <algorithm>
+#include <atomic>
 #include <cstdio>
 #include <mutex>
 
@@ -47,6 +48,10 @@ struct UartSlot {
 
 I2cSlot s_i2c[2];
 UartSlot s_uart[3];   // index = port; 0 is the console and never handed out
+
+#if !defined(ESP_PLATFORM)
+std::atomic<HostI2cAdapter*> s_host_i2c[2]{};
+#endif
 
 #if defined(ESP_PLATFORM)
 int32_t esp_to_hal(esp_err_t e) {
@@ -106,6 +111,11 @@ int32_t raw_write(I2cSlot& s, unsigned index, uint8_t addr, const uint8_t* data,
     e = i2c_master_transmit(dev, data, len, 100);
     return e == ESP_OK ? static_cast<int32_t>(len) : i2c_failed(s, index, addr, e);
 #else
+    if (HostI2cAdapter* adapter = s_host_i2c[index].load()) {
+        const int32_t r = adapter->write(addr, data, len);
+        if (r < 0) s.mux_known = 0;
+        return r;
+    }
     static const uint8_t none = 0;
     int32_t r = MockHal::instance().i2c_write(index, addr, len ? data : &none, len);
     if (len == 0) return r == HAL_ERR_NODEV ? HAL_ERR_NODEV : HAL_OK;   // any answer is an acknowledge
@@ -122,7 +132,8 @@ int32_t raw_read(I2cSlot& s, unsigned index, uint8_t addr, uint8_t* buf, size_t 
     e = i2c_master_receive(dev, buf, len, 100);
     return e == ESP_OK ? static_cast<int32_t>(len) : i2c_failed(s, index, addr, e);
 #else
-    int32_t r = MockHal::instance().i2c_read(index, addr, buf, len);
+    HostI2cAdapter* adapter = s_host_i2c[index].load();
+    int32_t r = adapter ? adapter->read(addr, buf, len) : MockHal::instance().i2c_read(index, addr, buf, len);
     if (r < 0) s.mux_known = 0;
     return r;
 #endif
@@ -188,7 +199,14 @@ bool install_i2c(I2cSlot& s, const std::string& pod_id, const BusAssignment& b, 
     s.state.mux_writes = 0;
     s.muxes = 0;
     s.mux_known = 0;
-    if (log) printf("[HAL] I2C%u installed for %s: SDA %u, SCL %u, %u Hz\n", b.index, pod_id.c_str(), b.pin_a, b.pin_b, (unsigned)s.state.speed);
+    if (!log) return true;
+#if !defined(ESP_PLATFORM)
+    if (HostI2cAdapter* adapter = s_host_i2c[b.index].load()) {
+        printf("[HAL] I2C%u installed for %s: %s\n", b.index, pod_id.c_str(), adapter->device().c_str());
+        return true;
+    }
+#endif
+    printf("[HAL] I2C%u installed for %s: SDA %u, SCL %u, %u Hz\n", b.index, pod_id.c_str(), b.pin_a, b.pin_b, (unsigned)s.state.speed);
     return true;
 }
 
@@ -260,6 +278,12 @@ void release_uart(UartSlot& s, unsigned index) {
 }
 
 } // namespace
+
+#if !defined(ESP_PLATFORM)
+void set_host_i2c_adapter(uint32_t bus, HostI2cAdapter* adapter) {
+    if (bus < 2) s_host_i2c[bus].store(adapter);
+}
+#endif
 
 bool bus_install(const std::string& pod_id, const std::vector<BusAssignment>& buses, std::string& out_error) {
     std::vector<const BusAssignment*> done;

@@ -1,0 +1,57 @@
+# clusterview: the cluster on a board's screen. The nodes and whether they
+# are Ready, the hardware each offers, the node of each pod that
+# POD_SELECTOR selects, a reading of the scale's Service, and the last IR
+# codes on the channel topic ir.received (apps/irremote).
+#
+# The module travels inline. make -C apps/clusterview writes
+# apps/clusterview/build/clusterview.yaml, this manifest with the module in
+# place of "@clusterview.wasm":
+#
+#   make -C apps/clusterview
+#   kubectl --context kube32 apply -f apps/clusterview/build/clusterview.yaml
+#   kubectl --context kube32 logs -f clusterview
+#
+# The pod sizes its layout from the screen (k32_display_info), the Cardputer
+# Zero's 320x170 panel or the Cardputer's 240x135 one. A Cardputer's 80 KiB
+# of pod memory holds it only as an embedded image (apps/clusterview/README.md).
+# It reads the API server at
+# KUBERNETES_SERVICE_HOST:KUBERNETES_SERVICE_PORT, which the kubelet sets in
+# every pod; set API_URL (and API_TOKEN when the server has a token) to read
+# another.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: clusterview
+  namespace: default
+  labels:
+    app: clusterview
+  annotations:
+    kube32.io/wasm-base64: "@clusterview.wasm"
+    kube32.io/event-topics: ir.received   # messages shown with their age
+spec:
+  nodeSelector:
+    kube32.io/board: cardputer-zero
+  restartPolicy: Always
+  containers:
+    - name: clusterview
+      image: wasm://inline/clusterview
+      env:
+        - name: TITLE
+          value: kube32
+        - name: POD_SELECTOR                # the pods whose node is shown
+          value: "app in (irremote,room-monitor)"
+        - name: READING_1                   # <label> <url> <JSON field> [<unit>]
+          value: "scale http://kitchen-scale/ weight_g g"
+        - name: TOPICS                      # shown until a message arrives
+          value: ir.received
+        - name: REFRESH_MS
+          value: "2000"
+      resources:
+        requests:
+          memory: 16Ki                      # linear memory: 1.5 KiB stack, 13 KiB data and buffers
+          hardware.kube32.io/tft-display: "1"
+        limits:
+          memory: 16Ki
+      securityContext:
+        capabilities:
+          add: ["DISPLAY", "SERVICE_CALL"]

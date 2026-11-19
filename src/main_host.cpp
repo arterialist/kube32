@@ -1,7 +1,11 @@
 #include "osal/socket.hpp"
 #include "hal/sd_card.hpp"
 #include "hal/i2c_discovery.hpp"
+#include "hal/capability_firewall.hpp"
+#include "hal/chip_temp.hpp"
+#include "hal/linux_board.hpp"
 #include "hal/mock_hal.hpp"
+#include "hal/pod_buses.hpp"
 #include "hal/node_storage.hpp"
 #include "storage/flash_log.hpp"
 #include "osal/thread.hpp"
@@ -60,6 +64,7 @@
 #include <iostream>
 #include <atomic>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -283,6 +288,7 @@ struct SimOptions {
     // Standalone: the control plane's own kubelet and the in-process workers
     std::string kubelet_name{"esp32-node-01"};
     std::vector<std::string> workers{"esp32-node-02"};
+    bool workers_set{false};               // --workers given
     std::string board{"generic"};          // kube32.io/board of this process's kubelet (worker role)
     std::string worker_board{"cardputer"}; // kube32.io/board of the in-process workers
     std::string token;                     // API bearer token (also KUBE32_API_TOKEN)
@@ -305,6 +311,9 @@ struct SimOptions {
     int64_t psram_bytes{-1};
     std::string sim_i2c;                   // simulated I2C parts on this process's bus 0 (MockHal::attach_parts)
     std::string sim_mic;                   // 16 kHz mono 16-bit PCM (raw or WAV) the microphone hears, looped
+    // A Linux board's devices over the --board preset (Linux hosts); "none" leaves one out
+    std::optional<std::string> fb, keyboard_dev, keymap, backlight, thermal, screen_owner, audio_card, ir_rx, ir_tx;
+    std::vector<std::pair<uint8_t, std::string>> i2c_buses;   // --i2c-bus <n>=<device|none>
     // A file standing in for the board's flash blob region (<data-dir>/blobs.img):
     // the size of a board's app slot by default, 0 for none
     size_t blob_region_bytes{0x340000};
@@ -354,6 +363,23 @@ static void print_sim_usage(std::ostream& out) {
            "  --sim-mic <file>            what k32_mic_read hears: 16 kHz mono 16-bit PCM, raw or WAV, played\n"
            "                              in real time and looped\n"
            "\n"
+           "Linux boards (the process's nodes use the board's own devices; a value of none leaves one out):\n"
+           "  --board cardputer-zero      the M5Stack Cardputer Zero's screen, keyboard, I2C bus, temperature,\n"
+           "                              speaker, microphone and IR receiver and LED\n"
+           "  --fb <device>               framebuffer pods draw on, e.g. /dev/fb0 (16 or 32 bits a pixel)\n"
+           "  --keyboard-dev <device>     evdev keyboard k32_key_read reads, e.g. /dev/input/event0\n"
+           "  --keymap <us|cardputer-zero>  characters of the keyboard's keys (default us)\n"
+           "  --i2c-bus <n>=<device>      pod I2C bus n (0 or 1) on an adapter, e.g. 0=/dev/i2c-1; repeatable\n"
+           "  --thermal <dir>             thermal zone of esp32_chip_temp_read, e.g. /sys/class/thermal/thermal_zone0\n"
+           "  --backlight <dir>           backlight turned on when it is off, e.g. /sys/class/backlight/<name>\n"
+           "  --screen-owner <unit>       systemd user unit (a launcher) that has the screen and keyboard while no\n"
+           "                              pod uses them; the node stops it while pods do (cardputer-zero: APPLaunch)\n"
+           "  --audio-card <name>         ALSA card (its id in /proc/asound/cards) of the speaker and microphone\n"
+           "  --ir-rx <device>            LIRC IR receiver of esp32_rmt_receive, e.g. /dev/lirc1, or the sysfs\n"
+           "                              directory of its kernel device\n"
+           "  --ir-tx <device>            LIRC IR transmitter of esp32_rmt_send, e.g. /dev/lirc0, or the sysfs\n"
+           "                              directory of its kernel device\n"
+           "\n"
            "Traffic:\n"
            "  --ingress-port <port>       Ingress controller port (default off)\n"
            "  --pod-port <port>           pod HTTP server port (default 7000)\n"
@@ -397,6 +423,7 @@ static SimOptions parse_sim_args(int argc, char* argv[]) {
         else if (arg == "--kubelet-name" && i + 1 < argc) opts.kubelet_name = argv[++i];
         else if (arg == "--workers" && i + 1 < argc) {
             opts.workers.clear();
+            opts.workers_set = true;
             std::string list = argv[++i];
             size_t start = 0;
             while (start <= list.size()) {
@@ -422,6 +449,30 @@ static SimOptions parse_sim_args(int argc, char* argv[]) {
         }
         else if (arg == "--sim-i2c" && i + 1 < argc) opts.sim_i2c = argv[++i];
         else if (arg == "--sim-mic" && i + 1 < argc) opts.sim_mic = argv[++i];
+        else if (arg == "--fb" && i + 1 < argc) opts.fb = argv[++i];
+        else if (arg == "--keyboard-dev" && i + 1 < argc) opts.keyboard_dev = argv[++i];
+        else if (arg == "--backlight" && i + 1 < argc) opts.backlight = argv[++i];
+        else if (arg == "--thermal" && i + 1 < argc) opts.thermal = argv[++i];
+        else if (arg == "--screen-owner" && i + 1 < argc) opts.screen_owner = argv[++i];
+        else if (arg == "--audio-card" && i + 1 < argc) opts.audio_card = argv[++i];
+        else if (arg == "--ir-rx" && i + 1 < argc) opts.ir_rx = argv[++i];
+        else if (arg == "--ir-tx" && i + 1 < argc) opts.ir_tx = argv[++i];
+        else if (arg == "--keymap" && i + 1 < argc) {
+            kube32::hal::LinuxKeymap keymap;
+            opts.keymap = argv[++i];
+            if (!kube32::hal::parse_linux_keymap(*opts.keymap, keymap)) {
+                std::cerr << "kube32-sim: --keymap takes us or cardputer-zero\n";
+                std::exit(2);
+            }
+        }
+        else if (arg == "--i2c-bus" && i + 1 < argc) {
+            const std::string v = argv[++i];
+            if (v.size() < 3 || (v[0] != '0' && v[0] != '1') || v[1] != '=') {
+                std::cerr << "kube32-sim: --i2c-bus takes <0|1>=<device> or <0|1>=none, e.g. 0=/dev/i2c-1\n";
+                std::exit(2);
+            }
+            opts.i2c_buses.emplace_back(static_cast<uint8_t>(v[0] - '0'), v.substr(2));
+        }
         else if (arg == "--blob-region" && i + 1 < argc) opts.blob_region_bytes = static_cast<size_t>(kube32::models::parse_quantity(argv[++i]));
         else if (arg == "--pod-cores" && i + 1 < argc) {
             opts.pod_cores = std::atoi(argv[++i]);
@@ -501,6 +552,91 @@ static std::shared_ptr<kube32::hal::FileFirmwareSlots> sim_slots(const std::stri
     return std::make_shared<kube32::hal::FileFirmwareSlots>(dir, builtin);
 }
 
+// A Linux board's own devices for this process's nodes (hal/linux_board.hpp):
+// the preset of --board with the device flags over it. The pods' display,
+// keyboard, I2C and chip temperature calls reach the board, and the nodes
+// offer what opened and nothing else. nullptr when the process simulates
+// its peripherals. It lives to the process's end: the threads of pods still
+// running call into it while the process stops.
+static kube32::hal::LinuxBoard* s_linux_board = nullptr;
+
+static kube32::hal::LinuxBoard* install_linux_board(const SimOptions& opts) {
+    kube32::hal::LinuxBoardConfig cfg;
+    const bool preset = kube32::hal::linux_board_preset(opts.board, cfg);
+    const bool flags =
+        opts.fb || opts.keyboard_dev || opts.keymap || opts.backlight || opts.thermal || opts.screen_owner || opts.audio_card || opts.ir_rx ||
+        opts.ir_tx || !opts.i2c_buses.empty();
+    if (!preset && !flags) return nullptr;
+#if !defined(__linux__)
+    if (flags) {
+        std::cerr << "kube32-sim: --fb, --keyboard-dev, --keymap, --i2c-bus, --thermal, --backlight, --screen-owner, --audio-card, --ir-rx and"
+                     " --ir-tx need a Linux host"
+                  << std::endl;
+        std::exit(2);
+    }
+    std::cout << "[BOARD] " << opts.board << " has Linux devices; on this host its peripherals are simulated" << std::endl;
+    return nullptr;
+#else
+    if (opts.role == "control-plane") {
+        // No node of this process runs pods; a worker process on the board may
+        std::cout << "[BOARD] " << opts.board << ": the control-plane role runs no kubelet and leaves the board's devices alone"
+                  << " (standalone runs the control plane with a node on them)" << std::endl;
+        return nullptr;
+    }
+    cfg.name = opts.board;
+    auto set = [](const std::optional<std::string>& flag, std::string& device) {
+        if (flag) device = *flag == "none" ? std::string() : *flag;
+    };
+    set(opts.fb, cfg.framebuffer);
+    set(opts.keyboard_dev, cfg.keyboard);
+    set(opts.backlight, cfg.backlight);
+    set(opts.thermal, cfg.thermal);
+    set(opts.screen_owner, cfg.screen_owner);
+    set(opts.ir_rx, cfg.ir_rx);
+    set(opts.ir_tx, cfg.ir_tx);
+    if (opts.audio_card) {
+        // A card the preset does not describe gets the defaults of hal/linux_audio.hpp
+        if (*opts.audio_card == "none") cfg.audio.reset();
+        else if (!cfg.audio || cfg.audio->card_name != *opts.audio_card) {
+            cfg.audio = kube32::hal::LinuxAudioConfig{};
+            cfg.audio->card_name = *opts.audio_card;
+        }
+    }
+    if (opts.keymap) kube32::hal::parse_linux_keymap(*opts.keymap, cfg.keymap);
+    for (const auto& bus : opts.i2c_buses) {
+        if (bus.second == "none") cfg.i2c.erase(bus.first);
+        else cfg.i2c[bus.first] = bus.second;
+    }
+    s_linux_board = new kube32::hal::LinuxBoard(cfg);
+    kube32::hal::LinuxBoard* board = s_linux_board;
+    board->init();
+
+    kube32::runtime::AppPlatformHooks hooks = kube32::runtime::app_platform_hooks();
+    kube32::runtime::set_board_hooks(hooks, *board);
+    kube32::runtime::set_app_platform_hooks(hooks);
+    kube32::hal::BoardProfile profile;
+    board->describe(profile);
+    kube32::hal::CapabilityFirewall::instance().set_board_profile(profile);
+    for (uint8_t bus = 0; bus < 2; ++bus) kube32::hal::set_host_i2c_adapter(bus, board->i2c_adapter(bus));
+    kube32::hal::set_host_ir(board->ir_transmitter(), board->ir_receiver());
+    if (board->has_chip_temp()) {
+        kube32::hal::set_host_chip_temp([board](int32_t& milli_c) { return board->chip_temp_read(milli_c); });
+    }
+    std::cout << "[BOARD] " << cfg.name << ": " << (board->has_display() ? "display, " : "") << (board->has_keyboard() ? "keyboard, " : "")
+              << __builtin_popcount(profile.i2c_bus_mask) << " I2C bus(es)" << (board->has_chip_temp() ? ", chip temperature" : "") << (board->has_speaker() ? ", speaker" : "")
+              << (board->has_microphone() ? ", microphone" : "") << (board->ir_receiver() ? ", IR receiver" : "")
+              << (board->ir_transmitter() ? ", IR transmitter" : "")
+              << (board->ir_receiver() || board->ir_transmitter() ? "; no GPIO, ADC or UART" : "; no GPIO, ADC, UART or RMT") << std::endl;
+    return board;
+#endif
+}
+
+// Once the kubelets have stopped: a screen owner gets the panel back for
+// good, whatever the pods still running draw meanwhile
+static void release_linux_board() {
+    if (s_linux_board) s_linux_board->close();
+}
+
 int main(int argc, char* argv[]) {
     std::signal(SIGINT, signal_handler);
     std::signal(SIGTERM, signal_handler);
@@ -559,6 +695,14 @@ int main(int argc, char* argv[]) {
             return kube32::hal::MockHal::instance().touch_read(out, max);
         };
         kube32::runtime::set_app_platform_hooks(hooks);
+    }
+    kube32::hal::LinuxBoard* linux_board = install_linux_board(opts);
+    if (linux_board && opts.role == "standalone") {
+        // The board's devices are one node's: in-process workers would
+        // advertise them too and draw on the same panel
+        if (!opts.workers_set) opts.workers.clear();
+        else if (!opts.workers.empty())
+            std::cout << "[BOARD] the in-process workers share the board's devices with " << opts.kubelet_name << std::endl;
     }
     if (!opts.sim_mic.empty() && !install_sim_mic(opts.sim_mic)) return 2;
 
@@ -712,7 +856,8 @@ int main(int argc, char* argv[]) {
         kubelet_cfg.heartbeat_interval_ms = opts.lease_interval_ms;
         kubelet_cfg.api_token = opts.token;
         kubelet_cfg.node_labels["kube32.io/board"] = opts.board;
-        kubelet_cfg.node_labels[kube32::models::kLabelSimulator] = "true";
+        // A Linux board's buses and devices are the board's own
+        if (!linux_board) kubelet_cfg.node_labels[kube32::models::kLabelSimulator] = "true";
         static kube32::hal::I2cDiscovery discovery;
         kubelet_cfg.node_label_source = [] {
             discovery.scan();
@@ -779,6 +924,7 @@ int main(int argc, char* argv[]) {
 
         std::cout << "[READY] Kubelet worker agent running for " << opts.node_name
                   << " -> connected to http://" << master_host << ":" << master_port << std::endl;
+        if (linux_board) linux_board->show_ready(node_ip, "http://" + master_host + "/");
 
         // As on the boards: an API server that has not answered for
         // kApiSilenceBeforeFollowMs while the control plane announces another
@@ -853,6 +999,7 @@ int main(int argc, char* argv[]) {
                      "/apis/coordination.k8s.io/v1/namespaces/kube-node-lease/leases/" + opts.node_name, "", "application/json");
             std::cout << "[LEAVE] deleted Node " << opts.node_name << ": HTTP " << node_st << std::endl;
         }
+        release_linux_board();
         kube32::ipc::ChannelManager::instance().shutdown();
         kube32::osal::Socket::cleanup_networking();
         return 0;
@@ -1113,7 +1260,7 @@ int main(int argc, char* argv[]) {
         kubelet_cfg.heartbeat_interval_ms = opts.lease_interval_ms;
         kubelet_cfg.api_token = opts.token;
         kubelet_cfg.node_labels["kube32.io/board"] = opts.board;
-        kubelet_cfg.node_labels[kube32::models::kLabelSimulator] = "true";
+        if (!linux_board) kubelet_cfg.node_labels[kube32::models::kLabelSimulator] = "true";
         // The simulator's own buses belong to this node, not to the extra workers
         static kube32::hal::I2cDiscovery discovery;
         kubelet_cfg.node_label_source = [] {
@@ -1138,6 +1285,7 @@ int main(int argc, char* argv[]) {
             wcfg.node_name = worker;
             wcfg.control_plane = false;
             wcfg.node_labels["kube32.io/board"] = opts.worker_board;
+            wcfg.node_labels[kube32::models::kLabelSimulator] = "true";
             wcfg.node_label_source = nullptr;
             wcfg.node_annotation_source = nullptr;
             wcfg.node_label_prefix.clear();
@@ -1147,6 +1295,11 @@ int main(int argc, char* argv[]) {
             worker_kubelets.push_back(std::make_unique<kube32::kubelet::Kubelet>(wcfg, *wasm_runtime));
             worker_kubelets.back()->start();
             std::cout << "[INIT] Kubelet running for simulated node " << worker << " (worker)." << std::endl;
+        }
+        // The node's address and its apps' URL (the Ingress, else the API server)
+        if (linux_board) {
+            const uint16_t app_port = opts.ingress_port > 0 ? opts.ingress_port : opts.port;
+            linux_board->show_ready(node_ip, "http://" + node_ip + (app_port == 80 ? "" : ":" + std::to_string(app_port)) + "/");
         }
     }
 
@@ -1209,6 +1362,7 @@ int main(int argc, char* argv[]) {
     if (pod_server) pod_server->stop();
     if (local_kubelet) local_kubelet->stop();
     for (auto& k : worker_kubelets) k->stop();
+    release_linux_board();
     mdns->stop_service_announcement();
     server->stop();
     checkpoints.stop();

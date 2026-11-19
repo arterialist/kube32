@@ -11,12 +11,13 @@ A board with PSRAM defaults to the control plane. A board without PSRAM defaults
 
 ## Board profiles and labels
 
-Select the peripheral profile with `K32_CMD:BOARD:cardputer|generic`:
+Select the peripheral profile with `K32_CMD:BOARD:cardputer|atoms3-lite|generic`:
 
 | Profile | Labels | Allocatable peripherals | Default bus pins |
 | --- | --- | --- | --- |
 | `generic` | `kube32.io/board: generic` | 33 GPIO, 10 ADC, 2 I2C, 2 UART, chip temperature | I2C0 on GPIO 8/9, UART1 on GPIO 17/18 |
 | `cardputer` | `kube32.io/board: cardputer` | 11 GPIO, 3 ADC, 1 I2C, 1 UART, chip temperature | I2C0 or UART1 on Grove port GPIO 2/1 |
+| `atoms3-lite` | `kube32.io/board: atoms3-lite` | 9 GPIO, 6 ADC, 1 I2C, 1 UART, chip temperature | I2C0 or UART1 on Grove port GPIO 2/1; RMT TX on GPIO 4 (IR LED) |
 
 Control plane nodes also carry the `node-role.kubernetes.io/control-plane` label, and worker nodes carry `node-role.kubernetes.io/worker`.
 
@@ -28,6 +29,23 @@ Control plane nodes also carry the `node-role.kubernetes.io/control-plane` label
 | NS4168 I2S speaker | BCLK 41, DATA 42, LRCK 43 |
 | Key matrix | address lines 8, 9, 11; row inputs 13, 15, 3, 4, 5, 6, 7 |
 | microSD on SPI3, 20 MHz | MOSI 14, MISO 39, SCK 40, CS 12 |
+
+## AtomS3 Lite pins
+
+The M5Stack AtomS3 Lite is an ESP32-S3 with 8 MB of flash and no PSRAM, so it joins as a worker. It has no screen and no microSD slot: node storage is the internal flash partition. The `atoms3-lite` profile offers pods only the pins a user can reach, plus the button:
+
+| Function | GPIO |
+| --- | --- |
+| Grove port (HY2.0-4P) | yellow 2, white 1 |
+| Header | 5, 6, 7, 8, 38, 39 |
+| Button, low when pressed | 41 (`button` driver: `pull: up`, `active: low`) |
+| IR LED, the default RMT TX pin | 4 |
+| WS2812 RGB LED, reserved | 35 |
+
+```sh
+# on the Atom's console
+K32_CMD:BOARD:atoms3-lite
+```
 
 ## Memory budget
 
@@ -88,6 +106,60 @@ Layout in `partitions.csv` for 8 MB flash:
 ## Other targets
 
 The firmware also builds with ESP-IDF 6.1 for the ESP32-C3 (`sdkconfig.defaults.esp32c3`, 4 MB flash, one app slot, no firmware rollouts) and the ESP32-P4 (`sdkconfig.defaults.esp32p4`), with `idf.py -DIDF_TARGET=<target>` as in [CONTRIBUTING.md](https://github.com/arterialist/kube32/blob/main/CONTRIBUTING.md#firmware). Neither image has run on a board yet. An ESP32-C3 image built with `sdkconfig.defaults.qemu` boots in Espressif's QEMU (`-nic user,model=open_eth`), joins a control plane over the emulated Ethernet and runs pods. The ESP32-P4 has no radio, so a P4 node has no network in this firmware yet.
+
+## Linux boards
+
+On a Linux single-board computer, `kube32-sim` runs a node that gives pods the board's own devices through the same pod API as a Cardputer. `--board` names a preset (`cardputer-zero`), and [flags](cli-reference.md#linux-boards) describe any other board. A device that does not open gets one log line, and the Node does not advertise it.
+
+| Pods use | The node reaches |
+| --- | --- |
+| `hardware.kube32.io/tft-display`: `k32_display_*` | The framebuffer, mapped, at 16 bits a pixel (RGB565) or 32 bits (XRGB8888 and the other channel layouts the driver reports). `k32_display_info` answers the panel's size, and every call clips to it. Text uses the Cardputer's 6x8 font. |
+| `hardware.kube32.io/keyboard`: `k32_key_read` | The evdev keyboard, grabbed so that key presses reach only the pods. A press returns the code a Cardputer returns: ASCII, `\n` for Enter, `\b` for Backspace and Delete, `\t` for Tab, `27` for Esc, and `U`, `D`, `L`, `R` for the arrows. Shift and Caps Lock work as on a US keyboard. A held key returns its code once, and function and media keys return none. |
+| `esp32.io/i2c-bus-<n>`, `kube32.io/i2c-device`, discovery | `/dev/i2c-N` with `I2C_RDWR`. The kernel sets the bus's pins and speed, so a claim takes no pins, and a `kube32.io/i2c-bus-<n>` annotation is refused. An address whose `/sys/bus/i2c/devices/<N>-00<hh>/driver` exists belongs to a kernel driver: a pod that holds the bus finds no device there (`K32_ERR_NODEV`), a device grant that names it is refused, and discovery skips it. |
+| `hardware.kube32.io/chip-temp`: `esp32_chip_temp_read` | The thermal zone's `temp`, the SoC's temperature. |
+| `hardware.kube32.io/speaker`, `microphone`: `k32_tone`, `k32_audio_play`, `k32_mic_read` | The sound card's PCM devices in `/dev/snd`, with the Cardputer's semantics ([Speaker and microphone on a Linux board](peripherals.md#speaker-and-microphone-on-a-linux-board)). |
+| `esp32.io/rmt-tx`, `esp32.io/rmt-rx`: `esp32_rmt_send`, `esp32_rmt_receive` | The infrared transmitter and receiver, LIRC devices in `/dev`: one channel of each, claimed without a pin ([Infrared on a Linux board](peripherals.md#infrared-on-a-linux-board)). |
+
+The node offers no GPIO, ADC or UART, and no RMT channel on a pin, because the kernel owns the SoC's pins. Its Node has no `kube32.io/simulator` label, so the Device controller places drivers on its buses as on a board's. The board's devices are one node's. A `worker` process is that node. A `standalone` process is the cluster's control plane, and its own kubelet (`--kubelet-name`) is that node. A standalone process on a Linux board runs no in-process workers unless `--workers` names some, and those would share the devices. A `control-plane` process runs no kubelet and leaves the devices alone.
+
+The node keeps the panel and the keyboard from its start and shows the ready screen, the node's address and the cluster's app URL, until a pod draws. On a board with a screen owner (`--screen-owner`, a launcher's systemd user unit), they stay with the launcher until a pod draws or reads a key. The node then stops the launcher, clears the panel and grabs the keyboard. Stopping the launcher also frees what else it holds: on the Cardputer Zero, the audio server keeps the speaker busy while the launcher runs and closes it 5 seconds after the launcher stops, so the first sound after the hand-off waits up to that long. Once no pod holds the display, keyboard or speaker grant, the node lets go of them within a second and starts the launcher again.
+
+### Cardputer Zero
+
+The M5Stack Cardputer Zero (Raspberry Pi CM0, 320x170 ST7789 panel, TCA8418 keyboard, Debian) runs a node with `--board cardputer-zero`:
+
+| Device | Path |
+| --- | --- |
+| Panel, 320x170 RGB565 | `/dev/fb_lcd`, the board's udev name for the ST7789 framebuffer |
+| Keyboard | `/dev/input/cardputer-zero-internal`, keymap `cardputer-zero` |
+| Backlight | `/sys/class/backlight/backlight`, turned on when the node takes the panel and finds it off |
+| Pod I2C bus 0 | `/dev/i2c-1`. The board's own parts on it belong to kernel drivers: codec `0x10`, RTC `0x32`, keyboard `0x34`, IO expander `0x4f`, fuel gauge `0x55` and IMU `0x68` |
+| Chip temperature | `/sys/class/thermal/thermal_zone0` |
+| IR receiver | `/sys/devices/platform/ir-receiver@d`, the `gpio-ir` receiver on BCM 13. The node opens the LIRC device the kernel lists below it, because the `lircN` numbers follow the drivers' probe order |
+| IR LED | `/sys/devices/platform/gpio-ir-transmitter@c`, the `gpio-ir-tx` transmitter on BCM 12, which sets the carrier and the duty cycle |
+| Screen owner | `APPLaunch.service`, the board's launcher |
+
+The keyboard's Sym layer sends key codes that the board's console keymap turns into symbols, and the `cardputer-zero` keymap returns those symbols: Sym+Q is `~`, Sym+1 is `!`. Fn+F, Fn+Z, Fn+X and Fn+C are the up, left, down and right arrows.
+
+A pod that draws for the Cardputer's 240x135 screen without asking `k32_display_info` draws in the panel's top left corner, on black.
+
+Install the node as a systemd user unit. Copy a `linux-arm64` `kube32-sim` (a [release](releases.md) archive, or `docker build --platform linux/arm64 --target sim-binary --output type=local,dest=dist .` on another machine) to the board, then on the board:
+
+```sh
+mkdir -p ~/.local/bin ~/.config/kube32 ~/.config/systemd/user
+cp kube32-sim ~/.local/bin/
+cp packaging/cardputer-zero/kube32-node.service ~/.config/systemd/user/
+cat > ~/.config/kube32/node.env <<'EOF'
+KUBE32_ARGS=--role worker --join http://<control plane address>:6443 --node-name cardputer-zero
+EOF
+systemctl --user daemon-reload
+systemctl --user enable --now kube32-node
+journalctl --user -u kube32-node -f
+```
+
+`KUBE32_ARGS` holds the role and the cluster, split into arguments at spaces. For the cluster's control plane with a node of its own, use `KUBE32_ARGS=--role standalone --kubelet-name cardputer-zero --node-ip auto --enable-flash`. The unit adds `--board cardputer-zero` and the data directory, `~/.local/share/kube32`.
+
+The unit starts with the user's systemd instance, which the board's image starts at boot (`loginctl enable-linger`). When the node stops, the unit starts the launcher again in case the pods had the screen.
 
 ## Console over USB OTG
 

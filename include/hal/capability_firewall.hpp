@@ -9,6 +9,7 @@
 #include <string>
 #include <map>
 #include <array>
+#include <bitset>
 #include <vector>
 
 namespace kube32::hal {
@@ -20,8 +21,8 @@ struct BusPins {
 };
 
 // What the board around the chip takes for itself and which buses it offers.
-// Set once at boot from the board profile (main_esp32.cpp); the defaults
-// describe a bare devkit.
+// Set once at boot from the board profile (main_esp32.cpp, and main_host.cpp
+// on a Linux board); the defaults describe a bare devkit.
 struct BoardProfile {
     std::string name{"generic"};
     uint64_t reserved_gpio_mask{0};                    // pins wired to on-board peripherals
@@ -32,6 +33,15 @@ struct BoardProfile {
     // needs pins in the pod's annotations.
     BusPins i2c_pins[2]{{8, 9}, {}};
     BusPins uart_pins[3]{{}, {17, 18}, {}};
+    // I2C buses whose pins and speed the board sets (a Linux I2C adapter):
+    // a claim or device grant of one takes no pins, and no annotation sets them
+    uint8_t i2c_fixed_mask{0};
+    // Addresses on each bus that the board's own drivers hold: pods' transfers
+    // to them are denied, no device grant names them and discovery skips them
+    std::bitset<128> i2c_reserved[2];
+    // The board reads its chip's temperature: the Node advertises
+    // hardware.kube32.io/chip-temp
+    bool chip_temp{true};
     // RMT (IR) channels run on claimable pins and, for TX, also on the pins
     // of rmt_tx_pin_mask: an IR LED on a pad the chip mask reserves (a
     // console UART pin the board leaves unused). The default pins serve a
@@ -39,6 +49,11 @@ struct BoardProfile {
     uint64_t rmt_tx_pin_mask{0};
     int8_t rmt_tx_default_pin{-1};
     int8_t rmt_rx_default_pin{-1};
+    // RMT directions (rmt_dir_bit) whose one channel the board runs on its
+    // own device (a Linux board's infrared transmitter and receiver): the
+    // direction offers that channel, a claim takes no pin and its annotation
+    // names none
+    uint8_t rmt_fixed_mask{0};
     // On-board devices the board has (KUBE32_CAP_DISPLAY, KUBE32_CAP_KEYBOARD,
     // KUBE32_CAP_SPEAKER): the Node advertises their hardware.kube32.io/* grants
     uint32_t onboard_devices{0};
@@ -65,7 +80,9 @@ struct PodSecurityRecord {
 enum class I2cAccess : uint8_t {
     Denied,
     Bus,      // the pod claims the bus whole (esp32.io/i2c-bus-N): hal::i2c_bus_*
-    Device    // the pod's device grant: hal::i2c_device_* with the grant's location
+    Device,   // the pod's device grant: hal::i2c_device_* with the grant's location
+    Absent    // an address of the board's own drivers on a bus the pod claims
+              // whole: the bus it was given has no device there (HAL_ERR_NODEV)
 };
 
 class CapabilityFirewall {
@@ -93,7 +110,8 @@ public:
     //   kube32.io/rmt-tx: "pin=<n>[,carrier=<Hz>][,duty=<percent>]"
     //   kube32.io/rmt-rx: "pin=<n>[,active=low|high][,idle_us=<n>]"
     // or the board profile's default pin, and are claimed and installed the
-    // same way.
+    // same way. A direction the board runs on its own device
+    // (BoardProfile::rmt_fixed_mask) takes the settings without a pin.
     //
     // A device grant (annotation kube32.io/i2c-device:
     // "bus=<n>,addr=0x<hh>[,mux=0x<hh>:<channel>]") gives the pod one address
@@ -116,8 +134,9 @@ public:
     // Gatekeeper Enforcement Check (O(1) fast path)
     bool check_permission(const std::string& pod_id, PeripheralType type, uint32_t pin_or_port, AccessMode mode);
     // A transfer of the pod to `addr` on I2C bus `bus`: the whole bus, its
-    // device grant (`out_device` set to the granted location), or denied and
-    // logged as a violation
+    // device grant (`out_device` set to the granted location), an address
+    // the board keeps on a bus the pod claims whole, or denied and logged as
+    // a violation
     I2cAccess check_i2c(const std::string& pod_id, uint32_t bus, uint32_t addr, AccessMode mode, models::I2cLocation& out_device);
 
     // Context Pointer Lookup for Wasm3 Userdata Binding
@@ -147,11 +166,14 @@ public:
     uint8_t  claimable_uart_mask() const;
     // RMT channels pods can claim on this board (esp32.io/rmt-tx and
     // esp32.io/rmt-rx capacity): one per pin a channel can use, at most the
-    // chip's four of each direction
+    // chip's four of each direction; one for a direction the board runs on
+    // its own device
     uint32_t claimable_rmt_tx_count() const;
     uint32_t claimable_rmt_rx_count() const;
     // BoardProfile::onboard_devices
     uint32_t onboard_devices() const;
+    // A pod's grant holds one of `capabilities` (KUBE32_CAP_*)
+    bool capability_held(uint32_t capabilities) const;
     uint32_t get_allocated_rmt_tx_count() const;
     uint32_t get_allocated_rmt_rx_count() const;
     // Buses (with pins) the pod was admitted with
@@ -173,6 +195,8 @@ public:
     uint32_t i2c_sharers(uint8_t bus) const;
     // A pod's device grant holds the address at `loc`
     bool i2c_device_granted(const models::I2cLocation& loc) const;
+    // The board's own drivers hold `addr` on `bus` (BoardProfile::i2c_reserved)
+    bool i2c_address_reserved(uint8_t bus, uint8_t addr) const;
 
     // Reset all allocations and the board profile (used in test teardown)
     void reset();

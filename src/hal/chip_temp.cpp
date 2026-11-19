@@ -37,8 +37,14 @@ int32_t chip_temp_read(int32_t& out_milli_c) {
 
 #else
 
+static std::function<int32_t(int32_t&)> s_host_sensor;
+
+void set_host_chip_temp(std::function<int32_t(int32_t& out_milli_c)> read) {
+    s_host_sensor = std::move(read);
+}
+
 int32_t chip_temp_read(int32_t& out_milli_c) {
-    return MockHal::instance().chip_temp_read(out_milli_c);
+    return s_host_sensor ? s_host_sensor(out_milli_c) : MockHal::instance().chip_temp_read(out_milli_c);
 }
 
 #endif
