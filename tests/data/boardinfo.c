@@ -1,5 +1,6 @@
 /* boardinfo: the test pod of tests/test_board_api.cpp. GET /info answers with
- * what k32_display_info and k32_touch_read return.
+ * what k32_display_info and k32_touch_read return, and what k32_led_set
+ * returns for LED 0 set to 0x102030.
  *
  * Build: clang --target=wasm32 -Os -nostdlib -ffreestanding -mcpu=mvp -c boardinfo.c -o boardinfo.o
  *        rust-lld -flavor wasm --no-entry --export-dynamic --allow-undefined --stack-first \
@@ -43,6 +44,7 @@ K32_EXPORT("k32_handle") int32_t k32_handle(uint32_t ptr, uint32_t len) {
     put(",\"f\":"); put_i(f);
     put(",\"touches\":"); put_i(touches);
     if (touches > 0) { put(",\"x\":"); put_i(p[0].x); put(",\"y\":"); put_i(p[0].y); put(",\"id\":"); put_i((int32_t)p[0].id); }
+    put(",\"led\":"); put_i(k32_led_set(0, 0x102030));
     put("}");
     k32_resp_begin(200, "application/json", 16);
     k32_resp_write(out, out_len);
