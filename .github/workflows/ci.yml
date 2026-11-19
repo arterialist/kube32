@@ -232,17 +232,30 @@ jobs:
         run: pio run -e esp32s3
 
   firmware-idf:
-    name: Firmware (ESP-IDF 6.1, ${{ matrix.target }})
+    name: Firmware (ESP-IDF ${{ matrix.idf }}, ${{ matrix.target }})
     runs-on: ubuntu-24.04
-    container: espressif/idf:v6.1
+    container: espressif/idf:${{ matrix.image }}
     strategy:
       fail-fast: false
       matrix:
-        target: [esp32c3, esp32p4]
+        include:
+          - { target: esp32c3, idf: "6.1", image: v6.1 }
+          - { target: esp32p4, idf: "6.1", image: v6.1 }
+          # No ESP-IDF release supports the ESP32-S31 yet: master at a fixed commit
+          - { target: esp32s31, idf: master, image: latest, idf_ref: 7b9cc1ac79f865983f59bb8ff3ff43eb74ff1dbe }
     env:
       IDF_COMPONENT_MANAGER: "0"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: ESP-IDF at ${{ matrix.idf_ref }}
+        if: matrix.idf_ref
+        shell: bash
+        run: |
+          cd "$IDF_PATH"
+          git fetch --depth 1 origin "${{ matrix.idf_ref }}"
+          git checkout --force FETCH_HEAD
+          git submodule update --init --recursive --depth 1 --jobs 8
+          ./install.sh "${{ matrix.target }}"
       - name: idf.py build
         shell: bash
         run: |
