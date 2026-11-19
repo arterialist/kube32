@@ -7,6 +7,7 @@
 //! | `display_*`        | `hardware.kube32.io/tft-display: "1"` | `DISPLAY`  |
 //! | `key_read`         | `hardware.kube32.io/keyboard: "1"`    | `KEYBOARD` |
 //! | `tone`             | `hardware.kube32.io/speaker: "1"`     | `SPEAKER`  |
+//! | `led_set`          | `hardware.kube32.io/led: "1"`         | `LED`      |
 //! | `rmt_send`         | `esp32.io/rmt-tx: "1"`                | none       |
 //! | `rmt_receive`      | `esp32.io/rmt-rx: "1"`                | none       |
 //! | `chip_temp_milli_c` | `hardware.kube32.io/chip-temp: "1"`  | `CHIP_TEMP` |
@@ -76,6 +77,15 @@ pub fn key_read() -> Result<Option<u8>, Error> {
 /// Plays a tone. The host clamps `duration_ms` to 2000 and `volume_pct` to 100.
 pub fn tone(freq_hz: u32, duration_ms: u32, volume_pct: u32) -> Result<(), Error> {
     let rc = unsafe { abi::k32_tone(freq_hz, duration_ms, volume_pct) };
+    Error::from_rc(rc).map(|_| ())
+}
+
+/// Sets the board's addressable RGB LED `index` (`0` on a board with one) to
+/// `0xRRGGBB`, `0` for off. The LED keeps the color until the next call, and
+/// pods that hold the grant share it. `Error::Invalid` for an index past the
+/// board's LEDs, `Error::NoDevice` on a node without one.
+pub fn led_set(index: u32, rgb: u32) -> Result<(), Error> {
+    let rc = unsafe { abi::k32_led_set(index, rgb) };
     Error::from_rc(rc).map(|_| ())
 }
 

@@ -239,7 +239,7 @@ The `Makefile` of a C project compiles every `.c` file with `clang --target=wasm
 | Feature of `kube32-sdk` | Provides |
 | --- | --- |
 | `panic-handler` (default) | `#[panic_handler]` that logs through `k32_log` and traps |
-| `hardware` | `hardware::{display_text, display_rect, display_bar, key_read, tone, rgb565, rmt_send, rmt_receive}` |
+| `hardware` | `hardware::{display_text, display_rect, display_bar, key_read, tone, led_set, rgb565, rmt_send, rmt_receive}` |
 | `fs` | `fs::{File, list, remove}` over `k32_fs_*` |
 | `linalg` | `linalg::{matvec_i8, matvec_i4, matvec_f32_i8, vecmat_f32_i8, softmax_f32, expf}` |
 

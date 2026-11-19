@@ -29,7 +29,7 @@
 //! * `panic-handler` (default): a `#[panic_handler]` that logs through
 //!   `k32_log` and traps.
 //! * `hardware`: [`hardware`] wraps `k32_display_*`, `k32_key_read`,
-//!   `k32_tone` and the infrared imports `esp32_rmt_send` and
+//!   `k32_tone`, `k32_led_set` and the infrared imports `esp32_rmt_send` and
 //!   `esp32_rmt_receive`.
 //! * `fs`: [`fs`] wraps the `k32_fs_*` imports (pod storage on the microSD card).
 //! * `linalg`: [`linalg`] wraps the native products for quantized neural
