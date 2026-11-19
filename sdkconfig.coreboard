@@ -1,0 +1,7 @@
+# Function-CoreBoard-1 (WROOM-3, 16 MB flash, 16 MB PSRAM): applied after
+# sdkconfig.defaults.esp32s31. Its Type-C "USB Serial/JTAG" port carries the
+# console, as on the S3 boards; no kit flash layout to keep.
+# CONFIG_KUBE32_CONSOLE_USB_OTG is not set
+# CONFIG_TINYUSB_CDC_ENABLED is not set
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions-coreboard.csv"
+CONFIG_PARTITION_TABLE_FILENAME="partitions-coreboard.csv"
