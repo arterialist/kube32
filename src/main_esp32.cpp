@@ -127,7 +127,7 @@ static kube32::hal::Board* s_board = nullptr;   // on-board peripherals, nullptr
 // NVS ("board" = "cardputer" enables the ST7789 display, matrix keyboard and
 // I2S speaker). Both can be set over the console:
 //   K32_CMD:ROLE:control-plane|worker|auto
-//   K32_CMD:BOARD:cardputer|atoms3-lite|generic
+//   K32_CMD:BOARD:cardputer|atoms3-lite|s31-coreboard|generic
 
 namespace {
 
@@ -1356,7 +1356,7 @@ void console_task(void* arg) {
                 vTaskDelay(pdMS_TO_TICKS(200));
                 esp_restart();
             } else if (line.rfind("K32_CMD:BOARD:", 0) == 0 || line.rfind("K32_CMD:ROLE:", 0) == 0 || line.rfind("K32_CMD:AP:", 0) == 0 || line.rfind("K32_CMD:API:", 0) == 0) {
-                // Profile keys: board=<cardputer|atoms3-lite|generic>, role=<auto|worker>, ap=<on|off>, api=<control plane host|auto>
+                // Profile keys: board=<cardputer|atoms3-lite|s31-coreboard|generic>, role=<auto|worker>, ap=<on|off>, api=<control plane host|auto>
                 bool is_board = line.rfind("K32_CMD:BOARD:", 0) == 0;
                 bool is_ap = line.rfind("K32_CMD:AP:", 0) == 0;
                 bool is_api = line.rfind("K32_CMD:API:", 0) == 0;

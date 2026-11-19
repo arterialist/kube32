@@ -69,6 +69,8 @@ set(KUBE32_APP_SRCS
     hal/pod_rmt.cpp
     hal/tft_keyboard_hardware.cpp
     hal/board.cpp
+    hal/es8311_audio.cpp
+    hal/addressable_led.cpp
     hal/usb_otg_console.cpp
     hal/firmware_slots.cpp
     ipc/channel.cpp

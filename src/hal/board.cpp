@@ -5,6 +5,11 @@
 #include "hal/sd_card.hpp"
 #include "hal/tft_keyboard_hardware.hpp"
 
+#if CONFIG_IDF_TARGET_ESP32S31
+#include "hal/addressable_led.hpp"
+#include "hal/es8311_audio.hpp"
+#endif
+
 namespace kube32::hal {
 
 namespace {
@@ -103,6 +108,61 @@ public:
     }
 };
 
+#if CONFIG_IDF_TARGET_ESP32S31
+// The Espressif ESP32-S31-Function-CoreBoard-1 (ESP32-S31-WROOM-3 module): an
+// ES8311 codec with an NS4150B amplifier and an on-board microphone, a WS2812
+// LED on GPIO 60 (through a level shifter, not inverted), the boot button on
+// GPIO 61, and a gigabit Ethernet PHY. Header J2 breaks out GPIO 0-3, 4,
+// 20-25, 35-40, 42-49 and 58-61. The PHY takes GPIO 4-19 (GPIO 4 is its
+// interrupt line, also on the header), the codec 50-57, the USB-to-UART
+// bridge 58 and 59 (UART0) and the LED 60. Pods may claim the other header
+// pins; 36 and 37 (strapping) and 61 as inputs only.
+class S31CoreBoard final : public Board {
+public:
+    const char* name() const override { return "s31-coreboard"; }
+
+    bool init() override {
+        audio_ok_ = audio_.init();
+        led_ok_ = led_.init();
+        return true;
+    }
+
+    void describe(BoardProfile& profile) const override {
+        constexpr uint64_t header = 0xFULL | (0x3FULL << 20) | (0x3FULL << 35) | (0xFFULL << 42) | (1ULL << 61);
+        profile.name = name();
+        profile.reserved_gpio_mask = KUBE32_CHIP_GPIO_MASK & ~header;
+        profile.i2c_bus_mask = 0x3;
+        profile.i2c_pins[0] = {2, 3};     // J2 pins 7 and 10
+        profile.i2c_pins[1] = {};
+        profile.uart_port_mask = 0x6;
+        profile.uart_pins[1] = {38, 39};  // J2 pins 22 and 21
+        profile.uart_pins[2] = {};
+        profile.rmt_tx_board_channels = led_ok_ ? 1 : 0;
+        profile.onboard_devices = (audio_ok_ ? KUBE32_CAP_SPEAKER | KUBE32_CAP_MICROPHONE : 0) | (led_ok_ ? KUBE32_CAP_LED : 0);
+    }
+
+    int32_t tone(uint32_t freq_hz, uint32_t duration_ms, uint32_t volume_pct) override {
+        return audio_ok_ ? audio_.tone(freq_hz, duration_ms, volume_pct) : HAL_ERR_NODEV;
+    }
+    int32_t audio_play(const int16_t* samples, uint32_t count, uint32_t sample_rate, uint32_t volume_pct) override {
+        return audio_ok_ ? audio_.play(samples, count, sample_rate, volume_pct) : HAL_ERR_NODEV;
+    }
+    int32_t mic_read(int16_t* out, uint32_t max_samples, uint32_t timeout_ms) override {
+        return audio_ok_ ? audio_.mic_read(out, max_samples, timeout_ms) : HAL_ERR_NODEV;
+    }
+    void mic_set_gain(uint32_t gain) override { audio_.mic_set_gain(gain); }
+    int32_t led_set(uint32_t index, uint32_t rgb) override { return led_ok_ ? led_.set(index, rgb) : HAL_ERR_NODEV; }
+
+private:
+    // ES8311 control on ESP_I2C_SDA/SCL, I2S on I2S_MCLK/SCLK/LRCK/DSDIN/ASDOUT,
+    // NS4150B enable on PA_CTRL (schematic nets)
+    Es8311Audio audio_{{51, 50, 0x18, 52, 53, 55, 56, 54, 57}};
+    AddressableLed led_{60, 1};
+    bool audio_ok_{false};
+    bool led_ok_{false};
+};
+#endif  // CONFIG_IDF_TARGET_ESP32S31
+
 }  // namespace
 
 Board* board_for(std::string_view name) {
@@ -110,6 +170,10 @@ Board* board_for(std::string_view name) {
     static AtomS3LiteBoard atoms3_lite;
     if (name == "cardputer" || name == "display") return &cardputer;
     if (name == "atoms3-lite") return &atoms3_lite;
+#if CONFIG_IDF_TARGET_ESP32S31
+    static S31CoreBoard s31_coreboard;
+    if (name == "s31-coreboard") return &s31_coreboard;
+#endif
     return nullptr;
 }
 
