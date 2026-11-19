@@ -145,6 +145,8 @@ struct AppPlatformHooks {
     std::function<int32_t(hal::DisplayInfo& info)> display_info;
     // k32_touch_read: up to max points now touching, the count (0: nothing touches)
     std::function<int32_t(hal::TouchPoint* out, uint32_t max)> touch_read;
+    // k32_led_set: LED `index` of the board to 0xRRGGBB
+    std::function<int32_t(uint32_t index, uint32_t rgb)> led_set;
     std::function<uint32_t()> random;
     std::function<int32_t(const std::string& pod_id, std::string_view topic, const uint8_t* data, size_t len)> event_emit;
     // k32_http_call: resolves the Service and performs the call. Returns the
@@ -152,7 +154,7 @@ struct AppPlatformHooks {
     std::function<int32_t(const ServiceCallRequest& req, BufferResponseSink& sink)> service_call;
 };
 void set_app_platform_hooks(AppPlatformHooks hooks);
-// Points the display, touch, keyboard, speaker and microphone hooks at
+// Points the display, touch, keyboard, speaker, microphone and LED hooks at
 // `board`'s devices (hal/board.hpp); a device it lacks answers HAL_ERR_NODEV
 void set_board_hooks(AppPlatformHooks& hooks, hal::Board& board);
 void set_app_request_logging(bool verbose);

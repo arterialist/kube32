@@ -188,6 +188,7 @@ void set_board_hooks(AppPlatformHooks& hooks, hal::Board& board) {
         return b->audio_play(samples, count, rate, vol);
     };
     hooks.mic_read = [b](int16_t* out, uint32_t max, uint32_t timeout_ms) -> int32_t { return b->mic_read(out, max, timeout_ms); };
+    hooks.led_set = [b](uint32_t index, uint32_t rgb) -> int32_t { return b->led_set(index, rgb); };
 }
 
 // -----------------------------------------------------------------------------
@@ -753,6 +754,20 @@ static const void* raw_touch_read(IM3Runtime rt, IM3ImportContext ictx, uint64_t
     return m3Err_none;
 }
 
+// k32_led_set(index, rgb) -> K32_OK or K32_ERR_*
+static const void* raw_led_set(IM3Runtime rt, IM3ImportContext ictx, uint64_t* sp, void*) {
+    int32_t& ret = *reinterpret_cast<int32_t*>(sp);
+    const std::string& pod_id = pod_for(rt, ictx);
+    if (!hal::CapabilityFirewall::instance().check_permission(pod_id, hal::PeripheralType::Led, 0, hal::AccessMode::Write)) {
+        ret = hal::HAL_ERR_PERM;
+        return m3Err_none;
+    }
+    const uint32_t index = static_cast<uint32_t>(sp[1]);
+    const uint32_t rgb = static_cast<uint32_t>(sp[2]) & 0xFFFFFFu;
+    ret = s_hooks.led_set ? s_hooks.led_set(index, rgb) : hal::HAL_ERR_NODEV;
+    return m3Err_none;
+}
+
 // k32_mic_read(out, max_samples, timeout_ms) -> samples or K32_ERR_*
 static const void* raw_mic_read(IM3Runtime rt, IM3ImportContext ictx, uint64_t* sp, void* mem) {
     const std::string& pod_id = pod_for(rt, ictx);
@@ -901,6 +916,7 @@ void link_app_host_functions(IM3Module module, const std::string& pod_id) {
     m3_LinkRawFunction(module, "env", "k32_mic_read",     "i(iii)",     &raw_mic_read);
     m3_LinkRawFunction(module, "env", "k32_display_info", "i(iii)",     &raw_display_info);
     m3_LinkRawFunction(module, "env", "k32_touch_read",   "i(ii)",      &raw_touch_read);
+    m3_LinkRawFunction(module, "env", "k32_led_set",      "i(ii)",      &raw_led_set);
     m3_LinkRawFunction(module, "env", "k32_fs_open",      "i(iii)",     &raw_fs_open);
     m3_LinkRawFunction(module, "env", "k32_fs_read",      "i(iii)",     &raw_fs_read);
     m3_LinkRawFunction(module, "env", "k32_fs_write",     "i(iii)",     &raw_fs_write);

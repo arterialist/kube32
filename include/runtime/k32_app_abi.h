@@ -546,6 +546,7 @@ K32_IMPORT("k32_raster_spans") int32_t k32_raster_spans(uint8_t* dst, uint32_t d
  *   hardware.kube32.io/speaker: "1"      -> k32_tone, k32_audio_play
  *   hardware.kube32.io/microphone: "1"   -> k32_mic_read
  *   hardware.kube32.io/touch: "1"        -> k32_touch_read
+ *   hardware.kube32.io/led: "1"          -> k32_led_set
  * Calls without the grant return K32_ERR_PERM and are logged as violations.
  *
  * The speaker plays at most K32_SPEAKER_MAX_PCT percent of full scale:
@@ -589,6 +590,11 @@ typedef struct {
     uint32_t pressure;
 } k32_touch_point_t;
 K32_IMPORT("k32_touch_read")   int32_t k32_touch_read(k32_touch_point_t* points, uint32_t max_points);
+/* Sets the board's addressable RGB LED `index` (0 for a board with one) to
+ * 0xRRGGBB, 0 for off. It keeps the color until the next call. Returns 0,
+ * K32_ERR_INVAL for an index past the board's LEDs, K32_ERR_BUSY while pods
+ * hold every RMT TX channel, or K32_ERR_NODEV on a node without one. */
+K32_IMPORT("k32_led_set")      int32_t k32_led_set(uint32_t index, uint32_t rgb);
 
 /* ---- Pod storage imports, gated by hardware.kube32.io/sd -------------- */
 K32_IMPORT("k32_fs_open")   int32_t k32_fs_open(const char* path, uint32_t path_len, uint32_t flags);   /* fd (0..3) or error */
@@ -636,7 +642,7 @@ K32_IMPORT("esp32_gpio_write")    int32_t esp32_gpio_write(uint32_t pin, uint32_
 K32_IMPORT("esp32_gpio_read")     int32_t esp32_gpio_read(uint32_t pin);                      /* level 0 or 1, or error */
 
 /* ---- Chip temperature, gated by hardware.kube32.io/chip-temp ------------
- * The ESP32-S3's internal sensor (the die, not the room: it reads above
+ * The chip's internal sensor (the die, not the room: it reads above
  * ambient while the radio is busy). Stores milli-degrees Celsius in
  * *out_milli_c and returns 0, or K32_ERR_PERM, K32_ERR_FAULT, K32_ERR_NODEV,
  * K32_ERR_IO. */

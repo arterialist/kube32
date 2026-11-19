@@ -54,8 +54,12 @@ struct BoardProfile {
     // direction offers that channel, a claim takes no pin and its annotation
     // names none
     uint8_t rmt_fixed_mask{0};
+    // RMT TX channels the board's own devices keep (an addressable LED):
+    // pods may claim the chip's other channels
+    uint8_t rmt_tx_board_channels{0};
     // On-board devices the board has (KUBE32_CAP_DISPLAY, KUBE32_CAP_KEYBOARD,
-    // KUBE32_CAP_SPEAKER): the Node advertises their hardware.kube32.io/* grants
+    // KUBE32_CAP_SPEAKER, KUBE32_CAP_LED): the Node advertises their
+    // hardware.kube32.io/* grants
     uint32_t onboard_devices{0};
 };
 
@@ -166,8 +170,8 @@ public:
     uint8_t  claimable_uart_mask() const;
     // RMT channels pods can claim on this board (esp32.io/rmt-tx and
     // esp32.io/rmt-rx capacity): one per pin a channel can use, at most the
-    // chip's four of each direction; one for a direction the board runs on
-    // its own device
+    // chip's four of each direction less the TX channels the board keeps;
+    // one for a direction the board runs on its own device
     uint32_t claimable_rmt_tx_count() const;
     uint32_t claimable_rmt_rx_count() const;
     // BoardProfile::onboard_devices

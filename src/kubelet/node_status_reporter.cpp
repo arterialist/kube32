@@ -109,6 +109,7 @@ NodeTelemetry NodeStatusReporter::collect_telemetry() const {
     t.has_display = (onboard & hal::KUBE32_CAP_DISPLAY) != 0;
     t.has_keyboard = (onboard & hal::KUBE32_CAP_KEYBOARD) != 0;
     t.has_touch = (onboard & hal::KUBE32_CAP_TOUCH) != 0;
+    t.has_led = (onboard & hal::KUBE32_CAP_LED) != 0;
     t.has_speaker = (onboard & hal::KUBE32_CAP_SPEAKER) != 0;
     t.has_microphone = (onboard & hal::KUBE32_CAP_MICROPHONE) != 0;
     // The ESP32-S3's own sensor (hal/chip_temp.hpp); the simulator's HAL
@@ -125,7 +126,7 @@ static const char* const kOptionalResources[] = {
     "esp.io/adc", "esp32.io/adc", "esp.io/rmt-tx", "esp32.io/rmt-tx", "esp.io/rmt-rx", "esp32.io/rmt-rx",
     "hardware.kube32.io/ipc", "hardware.kube32.io/tft-display", "hardware.kube32.io/keyboard",
     "hardware.kube32.io/speaker", "hardware.kube32.io/chip-temp", "hardware.kube32.io/sd", "hardware.kube32.io/microphone",
-    "hardware.kube32.io/touch",
+    "hardware.kube32.io/touch", "hardware.kube32.io/led",
 };
 static constexpr size_t kOptionalCount = sizeof(kOptionalResources) / sizeof(kOptionalResources[0]);
 static_assert(kOptionalCount <= 32, "one bit per resource in a uint32_t");
@@ -225,6 +226,7 @@ static uint32_t append_resources(Out& json, const NodeTelemetry& t, bool capacit
         if (t.has_display) count("hardware.kube32.io/tft-display", t.pods_capacity);
         if (t.has_keyboard) count("hardware.kube32.io/keyboard", t.pods_capacity);
         if (t.has_touch) count("hardware.kube32.io/touch", t.pods_capacity);
+        if (t.has_led) count("hardware.kube32.io/led", t.pods_capacity);
         if (t.has_speaker) count("hardware.kube32.io/speaker", t.pods_capacity);
         if (t.has_microphone) count("hardware.kube32.io/microphone", t.pods_capacity);
         if (t.has_chip_temp) count("hardware.kube32.io/chip-temp", t.pods_capacity);

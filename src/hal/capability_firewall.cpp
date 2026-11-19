@@ -121,7 +121,9 @@ uint32_t CapabilityFirewall::claimable_rmt_count_locked(RmtDir dir) const {
     if (dir == RmtDir::Tx) pins |= profile_.rmt_tx_pin_mask;
     uint32_t n = 0;
     for (; pins; pins &= pins - 1) n++;
-    return n < kRmtChannels ? n : kRmtChannels;
+    uint32_t channels = kRmtChannels;
+    if (dir == RmtDir::Tx) channels -= profile_.rmt_tx_board_channels < kRmtChannels ? profile_.rmt_tx_board_channels : kRmtChannels;
+    return n < channels ? n : channels;
 }
 
 uint32_t CapabilityFirewall::allocated_rmt_count_locked(RmtDir dir) const {
@@ -725,6 +727,9 @@ bool CapabilityFirewall::register_pod_locked(const std::string& pod_id, const st
                     else if (key == "hardware.kube32.io/touch") {
                         if (val_str != "0") grant.capabilities_mask |= KUBE32_CAP_TOUCH;
                     }
+                    else if (key == "hardware.kube32.io/led") {
+                        if (val_str != "0") grant.capabilities_mask |= KUBE32_CAP_LED;
+                    }
                     else if (key == "hardware.kube32.io/chip-temp") {
                         if (val_str != "0") grant.capabilities_mask |= KUBE32_CAP_CHIP_TEMP;
                     }
@@ -735,7 +740,7 @@ bool CapabilityFirewall::register_pod_locked(const std::string& pod_id, const st
                 }
             }
 
-            // securityContext.capabilities.add: [CHANNEL_IPC, DISPLAY, KEYBOARD, SPEAKER, MICROPHONE, TOUCH, SD, SERVICE_CALL, CHIP_TEMP]
+            // securityContext.capabilities.add: [CHANNEL_IPC, DISPLAY, KEYBOARD, SPEAKER, MICROPHONE, TOUCH, LED, SD, SERVICE_CALL, CHIP_TEMP]
             for (const auto& c : containers->arr_val) {
                 if (!c.is_object()) continue;
                 const models::JsonValue* sc = c.get("securityContext");
@@ -753,6 +758,7 @@ bool CapabilityFirewall::register_pod_locked(const std::string& pod_id, const st
                     else if (name == "SPEAKER" || name == "AUDIO") grant.capabilities_mask |= KUBE32_CAP_SPEAKER;
                     else if (name == "MICROPHONE" || name == "MIC") grant.capabilities_mask |= KUBE32_CAP_MICROPHONE;
                     else if (name == "TOUCH") grant.capabilities_mask |= KUBE32_CAP_TOUCH;
+                    else if (name == "LED") grant.capabilities_mask |= KUBE32_CAP_LED;
                     else if (name == "SD" || name == "SD_CARD") sd_requested = true;
                     else if (name == "SERVICE_CALL") grant.capabilities_mask |= KUBE32_CAP_SERVICE_CALL;
                     else if (name == "CHIP_TEMP") grant.capabilities_mask |= KUBE32_CAP_CHIP_TEMP;
@@ -1363,6 +1369,9 @@ bool CapabilityFirewall::check_permission(const std::string& pod_id, PeripheralT
         case PeripheralType::Touch:
             permitted = grant.has_capability(KUBE32_CAP_TOUCH);
             break;
+        case PeripheralType::Led:
+            permitted = grant.has_capability(KUBE32_CAP_LED);
+            break;
         case PeripheralType::SdCard:
             permitted = grant.has_capability(KUBE32_CAP_SD);
             break;
@@ -1447,7 +1456,7 @@ void CapabilityFirewall::log_violation(const std::string& pod_id, PeripheralType
     static int logged = 0;
     if (logged >= 16) return;
     logged++;
-    static const char* const names[] = {"gpio", "adc", "i2c", "uart", "ipc", "display", "keyboard", "speaker", "sd", "service-call", "rmt-tx", "rmt-rx", "chip-temp", "microphone", "touch"};   // PeripheralType order
+    static const char* const names[] = {"gpio", "adc", "i2c", "uart", "ipc", "display", "keyboard", "speaker", "sd", "service-call", "rmt-tx", "rmt-rx", "chip-temp", "microphone", "touch", "led"};   // PeripheralType order
     unsigned ti = static_cast<unsigned>(type);
     std::cout << "[FIREWALL] denied " << pod_id << ": " << (ti < sizeof(names) / sizeof(names[0]) ? names[ti] : "peripheral")
               << " " << target;
