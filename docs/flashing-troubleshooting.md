@@ -26,7 +26,7 @@ pio run -e esp32s3
 bash scripts/flash.sh <serial port> 921600
 ```
 
-`scripts/flash.sh <serial port> [baud]` defaults to `460800` baud and reads `KUBE32_SERIAL_PORT` when you omit the port argument. The script locates `pio` on `PATH`, then in `$PLATFORMIO_CORE_DIR/penv/bin` or `~/.platformio/penv/bin`. It runs `esptool` from PlatformIO's virtualenv or from a system `python3` with `esptool` installed.
+`scripts/flash.sh <serial port> [baud]` defaults to `460800` baud and reads `KUBE32_SERIAL_PORT` when you omit the port argument. The script locates `pio` on `PATH`, then in `$PLATFORMIO_CORE_DIR/penv/bin` or `~/.platformio/penv/bin`. It runs `esptool` from PlatformIO's virtualenv or from a system `python3` with `esptool` installed. `scripts/flash.sh --build <directory> <serial port>` flashes an `idf.py` build instead, of any target, and takes the chip and the offsets from the build directory; the ESP32-S31 needs esptool 5.6 or later ([ESP32-S31](hardware-spec.md#esp32-s31)).
 
 - Writes `bootloader.bin` at `0x0`, `partitions.bin` at `0x8000`, an erased `otadata` at `0x11000`, and `firmware.bin` into the `ota_0` app slot at `0x20000` from `.pio/build/esp32s3/` in `dio` mode with an 8 MB flash size, using the offsets from `partitions.csv`. The board boots the flashed image. This leaves NVS and the object store journal untouched. Runs `pio run` if the binaries are missing.
 - Writes 256-byte blocks with a 1.5 ms pause on CH340 USB-UART bridges, vendor ID `0x1a86`. Uses `esptool` defaults on native USB-Serial/JTAG ports.

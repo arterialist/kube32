@@ -6,7 +6,7 @@ Use `kubectl` and k9s to manage the cluster. Use the tools below to run the host
 | --- | --- |
 | `kube32` | Flash boards, open their serial console, run the simulator, create, build, check, deploy, embed, and push Wasm pods and node storage files, roll out firmware, checkpoint and move pods, and serve the cluster's Devices to AI agents over MCP ([Install](install.md)) |
 | `kube32-sim` | Run control-plane and worker nodes as host processes |
-| `scripts/flash.sh` | Build and flash firmware to an ESP32-S3 board from a checkout |
+| `scripts/flash.sh` | Build and flash firmware to an ESP32-S3 board from a checkout, or flash an `idf.py` build of any target |
 | `tools/tessera_loadtest.py` | Run concurrent HTTP load tests against a Tessera ingress |
 | `tools/embed_assets.py`, `tools/pio_embed.py` | Generate embedded Wasm image and web asset tables |
 
@@ -159,13 +159,14 @@ Build if needed and flash one board over serial from a checkout, see [Flashing](
 
 ```
 scripts/flash.sh <serial port> [baud]
+scripts/flash.sh --build <idf.py build directory> <serial port> [baud]
 ```
 
 - Uses `<serial port>` or `KUBE32_SERIAL_PORT`, and defaults to `460800` baud.
-- Locates `pio` on `PATH` or in `${PLATFORMIO_CORE_DIR:-~/.platformio}/penv/bin`, and `esptool` in PlatformIO's virtualenv or system `python3`.
-- Runs `pio run -e esp32s3` if `bootloader.bin`, `partitions.bin`, or `firmware.bin` is missing from `.pio/build/esp32s3/`.
-- Writes the bootloader at `0x0`, the partition table at `0x8000`, an erased `otadata`, and the firmware into the first app slot, at the offsets in `partitions.csv`.
-- Writes 256-byte paced blocks on CH340 bridges, vendor ID `0x1a86`. Uses `KUBE32_FLASH_BEFORE`, default `default-reset`, and `KUBE32_FLASH_AFTER`, default `hard-reset` on CH340 and `watchdog-reset` on native USB.
+- Locates `pio` on `PATH` or in `${PLATFORMIO_CORE_DIR:-~/.platformio}/penv/bin`. Runs `esptool` from the first of `$KUBE32_PYTHON`, PlatformIO's virtualenv and system `python3` whose esptool is new enough for the chip: 5.6 or later for the ESP32-S31.
+- Without `--build`, runs `pio run -e esp32s3` if `bootloader.bin`, `partitions.bin`, or `firmware.bin` is missing from `.pio/build/esp32s3/`, then writes the bootloader at `0x0`, the partition table at `0x8000`, an erased `otadata`, and the firmware into the first app slot, at the offsets in `partitions.csv`.
+- With `--build`, flashes the `idf.py` build in that directory for the target it was built for: the parts and offsets its `flash_args` lists, the same set (on the ESP32-S31, the bootloader at `0x2000`).
+- Writes 256-byte paced blocks on CH340 bridges, vendor ID `0x1a86`. Uses `KUBE32_FLASH_BEFORE`, default `default-reset`, and `KUBE32_FLASH_AFTER`, default `watchdog-reset` on an ESP32-S3's native USB and `hard-reset` otherwise.
 
 ## kube32 gateway
 

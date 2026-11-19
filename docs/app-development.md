@@ -519,7 +519,7 @@ Key flags for `kube32 deploy`:
 
 * `--replace`: deletes an existing pod of the same name (`kubectl delete pod <name> --wait=true`) before creating the new one. The kubelet does not restart a running pod when its manifest changes in place.
 * `--memory <qty>` and `--psram <qty>`: set `requests.memory`, `limits.memory`, and `esp32.io/psram`.
-* `--hardware <list>`: comma-separated list of `ipc,display,keyboard,speaker,sd,service-call,chip-temp` or `none` (default: inferred from the module's imports).
+* `--hardware <list>`: comma-separated list of `ipc,display,keyboard,speaker,microphone,touch,led,sd,service-call,chip-temp` or `none` (default: inferred from the module's imports).
 * `--sd-claim <claim>`: volume claim name when `sd` is used (default: pod name).
 * `--image <wasm://...>`: references an SD or embedded image instead of attaching `kube32.io/wasm-base64`.
 * `--dry-run`: prints the generated Pod YAML without calling `kubectl`.
