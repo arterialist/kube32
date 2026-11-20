@@ -45,27 +45,141 @@ static void test_local_address() {
 // ---------------------------------------------------------------------------
 // The follow decision
 // ---------------------------------------------------------------------------
-static void test_follow_decision() {
-    using net::should_follow_announced_api;
+using Announcements = std::vector<net::ApiAnnouncement>;
+
+// Probes that answer at the addresses in `up`, and the addresses asked
+struct Probes {
+    std::vector<std::string> up;
+    std::vector<std::string> asked;
+    bool operator()(const std::string& host) {
+        asked.push_back(host);
+        for (const auto& u : up) if (u == host) return true;
+        return false;
+    }
+};
+
+static const std::string kHome = "198.51.100.1";
+static constexpr uint64_t kT = 1000000;   // the uptime of the last answer
+
+// A follower that dials its home address and heard `cp` announce it while it answered
+static net::ApiFollower known_follower() {
+    net::ApiFollower f(kHome, kHome);
+    Probes p;
+    assert(f.poll(kT, kT, 0, {{"cp", kHome, kT - 1000}}, p).empty());
+    assert(f.control_plane() == "cp" && p.asked.empty());
+    return f;
+}
+
+static void test_follow_waits_for_silence() {
     using net::kApiSilenceBeforeFollowMs;
     assert(kApiSilenceBeforeFollowMs == 30000);
-    const uint64_t heard = 100000;
-
-    // Not before 30 s of silence
-    assert(!should_follow_announced_api(heard, heard, "198.51.100.2", "198.51.100.1"));
-    assert(!should_follow_announced_api(heard + 5000, heard, "198.51.100.2", "198.51.100.1"));
-    assert(!should_follow_announced_api(heard + kApiSilenceBeforeFollowMs, heard, "198.51.100.2", "198.51.100.1"));
-    // A clock that reads before the last answer is no silence
-    assert(!should_follow_announced_api(heard - 1, heard, "198.51.100.2", "198.51.100.1"));
-    // Once the silence is longer than that, to another address
-    assert(should_follow_announced_api(heard + kApiSilenceBeforeFollowMs + 1, heard, "198.51.100.2", "198.51.100.1"));
-    assert(should_follow_announced_api(heard + 600000, heard, "198.51.100.2", "198.51.100.1"));
-    assert(should_follow_announced_api(heard + 600000, 0, "198.51.100.2", "kube32.example"));
+    net::ApiFollower f(kHome, "");
+    assert(f.home() == kHome && f.current() == kHome && f.control_plane().empty());
+    Probes p{{"203.0.113.2"}, {}};
+    auto heard = [](uint64_t now) { return Announcements{{"cp", "203.0.113.2", now - 1000}}; };
+    // Not before 30 s of silence, nor on a clock that reads before the last answer
+    assert(f.poll(kT + 5000, kT, 0, heard(kT + 5000), p).empty());
+    assert(f.poll(kT + kApiSilenceBeforeFollowMs, kT, 0, heard(kT + kApiSilenceBeforeFollowMs), p).empty());
+    assert(f.poll(kT - 1, kT, 0, heard(kT), p).empty());
+    // A later start of the silence counts
+    assert(f.poll(kT + 40000, kT, kT + 20000, heard(kT + 40000), p).empty());
+    assert(p.asked.empty());
+    // After it, to the announced address that answers; its announcer is the control plane
+    assert(f.poll(kT + kApiSilenceBeforeFollowMs + 1, kT, 0, heard(kT + kApiSilenceBeforeFollowMs + 1), p) == "203.0.113.2");
+    assert(f.current() == "203.0.113.2" && f.home() == kHome && f.control_plane() == "cp");
+    assert(p.asked == std::vector<std::string>{"203.0.113.2"});
     // Never to nothing, never to the address already dialed
-    assert(!should_follow_announced_api(heard + 600000, heard, "", "198.51.100.1"));
-    assert(!should_follow_announced_api(heard + 600000, heard, "198.51.100.1", "198.51.100.1"));
-    assert(!should_follow_announced_api(heard + 600000, heard, "", ""));
+    net::ApiFollower g(kHome, kHome);
+    Probes q{{kHome, "203.0.113.2"}, {}};
+    assert(g.poll(kT + 600000, kT, 0, {{"cp", "", kT + 599000}, {"cp", kHome, kT + 599000}}, q).empty());
+    assert(q.asked.empty() && g.current() == kHome);
+    std::cout << "[PASS] test_follow_waits_for_silence" << std::endl;
+}
 
+// The control plane joins a network the worker cannot reach and announces
+// its address there: no API server answers at it, and the worker stays
+static void test_unreachable_announcement_not_followed() {
+    net::ApiFollower f = known_follower();
+    Probes p;   // nothing answers
+    const uint64_t now = kT + 31000;
+    assert(f.poll(now, kT, 0, {{"cp", "203.0.113.9", now - 500}}, p).empty());
+    assert(f.current() == kHome && p.asked == std::vector<std::string>{"203.0.113.9"});
+    // Probed again 10 s later, not before
+    assert(f.poll(now + 5000, kT, 0, {{"cp", "203.0.113.9", now + 4000}}, p).empty());
+    assert(p.asked.size() == 1);
+    assert(f.poll(now + net::kApiProbeIntervalMs, kT, 0, {{"cp", "203.0.113.9", now + 9000}}, p).empty());
+    assert(p.asked.size() == 2 && f.current() == kHome);
+    // An HTTP server that is not a kube32 API server is the same case
+    assert(!net::is_kube32_version(200, "{\"major\":\"1\",\"minor\":\"33\",\"gitVersion\":\"v1.33.0\"}"));
+    assert(!net::is_kube32_version(404, "{\"kube32Version\":\"x\"}"));
+    assert(net::is_kube32_version(200, "{\"major\":\"1\",\"kube32Version\":\"0.1.0\"}"));
+    std::cout << "[PASS] test_unreachable_announcement_not_followed" << std::endl;
+}
+
+static void test_stale_announcement_ignored() {
+    net::ApiFollower f = known_follower();
+    Probes p{{"203.0.113.2"}, {}};
+    const uint64_t now = kT + 60000;
+    // Its last HELLO with the address is older than kApiAnnouncementFreshMs
+    assert(f.poll(now, kT, 0, {{"cp", "203.0.113.2", now - net::kApiAnnouncementFreshMs - 1}}, p).empty());
+    assert(p.asked.empty() && f.current() == kHome);
+    // Heard again: followed
+    assert(f.poll(now + net::kApiProbeIntervalMs, kT, 0, {{"cp", "203.0.113.2", now + 9000}}, p) == "203.0.113.2");
+    std::cout << "[PASS] test_stale_announcement_ignored" << std::endl;
+}
+
+static void test_other_peer_ignored() {
+    net::ApiFollower f = known_follower();
+    Probes p{{"203.0.113.7", "203.0.113.8"}, {}};
+    const uint64_t now = kT + 31000;
+    // Another node announces an address that answers: it is not this worker's control plane
+    assert(f.poll(now, kT, 0, {{"cp", kHome, kT}, {"other", "203.0.113.7", now - 100}}, p).empty());
+    assert(p.asked.empty() && f.current() == kHome && f.control_plane() == "cp");
+    // The control plane's own announcement among them is followed
+    assert(f.poll(now + net::kApiProbeIntervalMs, kT, 0, {{"other", "203.0.113.7", now + 9900}, {"cp", "203.0.113.8", now + 9000}}, p) ==
+           "203.0.113.8");
+    assert(p.asked == std::vector<std::string>{"203.0.113.8"});
+    // While none is known, any peer's announcement counts, once it answers
+    net::ApiFollower g(kHome, kHome);
+    Probes q{{"203.0.113.7"}, {}};
+    assert(g.poll(now, 0, kT, {{"other", "203.0.113.7", now - 100}}, q) == "203.0.113.7");
+    assert(g.control_plane() == "other");
+    std::cout << "[PASS] test_other_peer_ignored" << std::endl;
+}
+
+// A worker that followed an address goes back to the one it was given
+static void test_return_home() {
+    // As after a restart with the address followed (a board stores both)
+    net::ApiFollower f(kHome, "203.0.113.2", "cp");
+    assert(f.current() == "203.0.113.2" && f.control_plane() == "cp");
+    Probes p{{kHome}, {}};
+    const uint64_t now = kT + 31000;
+    // The followed address is silent and nobody announces it; the home address answers
+    assert(f.poll(now, kT, 0, {}, p) == kHome);
+    assert(f.current() == kHome && p.asked == std::vector<std::string>{kHome});
+    // The home address is tried before an announced one
+    net::ApiFollower g(kHome, "203.0.113.2", "cp");
+    Probes q{{"203.0.113.3"}, {}};
+    assert(g.poll(now, kT, 0, {{"cp", "203.0.113.3", now - 100}}, q) == "203.0.113.3");
+    assert((q.asked == std::vector<std::string>{kHome, "203.0.113.3"}));
+    assert(g.home() == kHome);
+    std::cout << "[PASS] test_return_home" << std::endl;
+}
+
+// The control plane's DHCP lease changes: it announces its new address, which answers
+static void test_control_plane_moves() {
+    net::ApiFollower f = known_follower();
+    Probes p{{"198.51.100.77"}, {}};
+    const uint64_t now = kT + 45000;
+    assert(f.poll(now, kT, 0, {{"cp", "198.51.100.77", now - 2000}}, p) == "198.51.100.77");
+    assert(f.current() == "198.51.100.77" && f.home() == kHome && f.control_plane() == "cp");
+    // It answers there, and stays the control plane
+    assert(f.poll(now + 3000, now + 2000, now, {{"cp", "198.51.100.77", now + 2500}}, p).empty());
+    assert(f.control_plane() == "cp" && f.current() == "198.51.100.77");
+    std::cout << "[PASS] test_control_plane_moves" << std::endl;
+}
+
+static void test_loopback_host() {
     assert(net::is_loopback_host("127.0.0.1"));
     assert(net::is_loopback_host("127.0.0.2"));
     assert(net::is_loopback_host("localhost"));
@@ -74,7 +188,7 @@ static void test_follow_decision() {
     assert(!net::is_loopback_host("1127.0.0.1"));
     assert(!net::is_loopback_host(""));
     assert(!net::is_loopback_host("127."));
-    std::cout << "[PASS] test_follow_decision" << std::endl;
+    std::cout << "[PASS] test_loopback_host" << std::endl;
 }
 
 // ---------------------------------------------------------------------------
@@ -116,41 +230,50 @@ static const ipc::PeerInfo* find_peer(const std::vector<ipc::PeerInfo>& peers, u
     return nullptr;
 }
 
+static const net::ApiAnnouncement* find_announcement(const Announcements& all, const std::string& name) {
+    for (const auto& a : all) if (a.node_name == name) return &a;
+    return nullptr;
+}
+
 static void test_hello_api_address() {
     auto& mgr = ipc::ChannelManager::instance();
     mgr.shutdown();                       // no peers left by an earlier test
     mgr.set_local_identity(7, "worker-a");
-    assert(mgr.announced_api().empty());
+    assert(mgr.api_announcements().empty());
 
     // A worker's HELLO has no address; a control plane's has one
     hear(hello_frame(11, "worker-b", "", false), "198.51.100.20");
-    assert(mgr.announced_api().empty());
+    assert(mgr.api_announcements().empty());
+    const uint64_t before = osal::System::get_uptime_ms();
     hear(hello_frame(12, "cp-old", "198.51.100.1", true), "198.51.100.1");
-    assert(mgr.announced_api() == "198.51.100.1");
+    Announcements all = mgr.api_announcements();
+    assert(all.size() == 1 && all[0].node_name == "cp-old" && all[0].address == "198.51.100.1" && all[0].heard_ms >= before);
     const auto peers = mgr.peers();
     const ipc::PeerInfo* cp = find_peer(peers, 12);
     assert(cp && cp->node_name == "cp-old" && cp->api_address == "198.51.100.1" && cp->endpoint.ip_address == "198.51.100.1");
     const ipc::PeerInfo* w = find_peer(peers, 11);
     assert(w && w->node_name == "worker-b" && w->api_address.empty());
 
-    // The control plane heard last wins
+    // Each peer's announcement, with the uptime of its last HELLO
     osal::Thread::sleep_ms(5);
     hear(hello_frame(13, "cp-new", "203.0.113.2", true), "203.0.113.2");
-    assert(mgr.announced_api() == "203.0.113.2");
-    osal::Thread::sleep_ms(5);
-    hear(hello_frame(12, "cp-old", "198.51.100.1", true), "198.51.100.1");
-    assert(mgr.announced_api() == "198.51.100.1");
+    all = mgr.api_announcements();
+    assert(all.size() == 2);
+    const net::ApiAnnouncement* old_cp = find_announcement(all, "cp-old");
+    const net::ApiAnnouncement* new_cp = find_announcement(all, "cp-new");
+    assert(old_cp && new_cp && new_cp->address == "203.0.113.2" && new_cp->heard_ms > old_cp->heard_ms);
 
     // A control plane that stops announcing takes its address back
     osal::Thread::sleep_ms(5);
     hear(hello_frame(13, "cp-new", "", false), "203.0.113.2");
-    assert(mgr.announced_api() == "198.51.100.1");
+    all = mgr.api_announcements();
+    assert(all.size() == 1 && all[0].node_name == "cp-old");
     // The node's own HELLO, from another socket of this process, is ignored
     hear(hello_frame(7, "worker-a", "203.0.113.9", true), "203.0.113.9");
-    assert(mgr.announced_api() == "198.51.100.1");
+    assert(mgr.api_announcements().size() == 1);
     // A name followed by an empty address
     hear(hello_frame(14, "cp-x", "", true), "203.0.113.3");
-    assert(mgr.announced_api() == "198.51.100.1");
+    assert(mgr.api_announcements().size() == 1);
     std::cout << "[PASS] test_hello_api_address" << std::endl;
 }
 
@@ -190,7 +313,8 @@ static void test_hello_roundtrip() {
     // This frame is the control plane's: another node hears it
     mgr.set_local_identity(41, "worker-c");
     hear(with_api, "203.0.113.4");
-    assert(mgr.announced_api() == "203.0.113.4");
+    const Announcements heard = mgr.api_announcements();
+    assert(heard.size() == 1 && heard[0].node_name == "cp-test" && heard[0].address == "203.0.113.4");
 
     mgr.set_local_identity(id, "cp-test");
     mgr.set_announced_api("");
@@ -199,7 +323,7 @@ static void test_hello_roundtrip() {
     assert(without_api.size() < with_api.size());
     mgr.set_local_identity(41, "worker-c");
     hear(without_api, "203.0.113.4");
-    assert(mgr.announced_api().empty());
+    assert(mgr.api_announcements().empty());
 
     mgr.shutdown();
     std::cout << "[PASS] test_hello_roundtrip" << std::endl;
@@ -375,15 +499,47 @@ static void test_service_gateway_repoint() {
     std::cout << "[PASS] test_service_gateway_repoint" << std::endl;
 }
 
+// ---------------------------------------------------------------------------
+// The probe: GET /version, answered as a kube32 API server answers it
+// ---------------------------------------------------------------------------
+static void test_api_server_probe() {
+    Listener kube32_api("{\"major\":\"1\",\"minor\":\"33\",\"gitVersion\":\"v1.33.0-kube32\",\"kube32Version\":\"0.1.0\"}");
+    Listener other_http("{\"major\":\"1\",\"minor\":\"33\",\"gitVersion\":\"v1.33.0\"}");
+    assert(net::api_server_answers("127.0.0.1", kube32_api.port()));
+    assert(kube32_api.heads().size() == 1 && kube32_api.heads()[0].find("GET /version HTTP/1.") == 0);
+    assert(!net::api_server_answers("127.0.0.1", other_http.port()));
+    assert(other_http.heads().size() == 1);
+
+    // A port nothing listens on is refused at once
+    osal::Socket probe;
+    assert(probe.create(osal::SocketType::Tcp) && probe.bind("127.0.0.1", 0));
+    const uint16_t closed = probe.local_port();
+    probe.close();
+    assert(!net::api_server_answers("127.0.0.1", closed));
+    // An address nothing answers at takes no longer than the probe's timeout
+    const uint64_t t0 = osal::System::get_uptime_ms();
+    assert(!net::api_server_answers("192.0.2.1", 6443, 500));
+    assert(osal::System::get_uptime_ms() - t0 < 1500);
+    assert(!net::api_server_answers("", 6443, 500));
+    std::cout << "[PASS] test_api_server_probe" << std::endl;
+}
+
 int main() {
     osal::Socket::init_networking();
     test_local_address();
-    test_follow_decision();
+    test_follow_waits_for_silence();
+    test_unreachable_announcement_not_followed();
+    test_stale_announcement_ignored();
+    test_other_peer_ignored();
+    test_return_home();
+    test_control_plane_moves();
+    test_loopback_host();
     test_hello_api_address();
     test_hello_roundtrip();
     test_http_client_repoint();
     test_kubelet_repoint();
     test_service_gateway_repoint();
+    test_api_server_probe();
     osal::Socket::cleanup_networking();
     std::cout << "[ALL PASS] test_api_follow" << std::endl;
     return 0;
