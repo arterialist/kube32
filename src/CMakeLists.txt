@@ -94,6 +94,7 @@ set(KUBE32_APP_SRCS
     net/wifi_tx_lock.cpp
     net/openeth_network_manager.cpp
     net/network_policy.cpp
+    net/api_follow.cpp
     osal/condition_variable_posix.cpp
     osal/mutex_posix.cpp
     osal/socket_posix.cpp
@@ -265,6 +266,7 @@ set_source_files_properties(
     ${CMAKE_CURRENT_LIST_DIR}/app/service_client.cpp
     ${CMAKE_CURRENT_LIST_DIR}/app/egress_policy.cpp
     ${CMAKE_CURRENT_LIST_DIR}/net/network_policy.cpp
+    ${CMAKE_CURRENT_LIST_DIR}/net/api_follow.cpp
     ${CMAKE_CURRENT_LIST_DIR}/runtime/pod_assets.cpp
     ${CMAKE_CURRENT_LIST_DIR}/api/firmware_api.cpp
     ${CMAKE_CURRENT_LIST_DIR}/controller/firmware_rollout_controller.cpp

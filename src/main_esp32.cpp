@@ -51,6 +51,7 @@
 #include "embedded/embedded_blobs.hpp"
 #include "kubelet/kubelet.hpp"
 #include "ipc/channel.hpp"
+#include "net/api_follow.hpp"
 #include "net/network_manager.hpp"
 #include "app/ingress_controller.hpp"
 #include "app/pod_server.hpp"
@@ -258,6 +259,15 @@ bool read_nvs_blob(const char* key, std::string& out) {
     }
     nvs_close(h);
     return ok;
+}
+
+// Writes one string to the "k32" NVS namespace; "" erases the key.
+void write_nvs_str(const char* key, const std::string& value) {
+    nvs_handle_t h;
+    if (nvs_open("k32", NVS_READWRITE, &h) != ESP_OK) return;
+    if (value.empty()) nvs_erase_key(h, key); else nvs_set_str(h, key, value.c_str());
+    nvs_commit(h);
+    nvs_close(h);
 }
 
 void write_nvs_blob(const char* key, const std::string& value) {
@@ -1366,6 +1376,8 @@ void console_task(void* arg) {
                     const char* key = is_board ? "board" : (is_ap ? "ap" : (is_api ? "api" : "role"));
                     if (value.empty() || value == "auto" || value == "generic" || value == "on") nvs_erase_key(h, key);
                     else nvs_set_str(h, key, value.c_str());
+                    // A new home address: the address followed and the control plane known go
+                    if (is_api) { nvs_erase_key(h, "apifollow"); nvs_erase_key(h, "apicp"); }
                     nvs_commit(h);
                     nvs_close(h);
                 }
@@ -1898,11 +1910,14 @@ void cluster_task(void* pv) {
     wifi_cfg.password = ap_password;
     std::string uplink_ssid, uplink_pass;
     // Stored Wi-Fi credentials put the node on an existing network instead of
-    // the cluster access point. A worker there dials K32_CMD:API:<host>, and
-    // follows the address the control plane announces when that one is silent.
+    // the cluster access point. A worker there dials K32_CMD:API:<host>, its
+    // home address, or an address its control plane announced that answered
+    // when the home address was silent ("apifollow", net::ApiFollower).
     bool uplink = read_nvs_wifi(uplink_ssid, uplink_pass);
-    std::string api_host = read_nvs_str("api");
-    if (api_host.empty()) api_host = "192.168.4.1";
+    std::string api_home = read_nvs_str("api");
+    if (api_home.empty()) api_home = "192.168.4.1";
+    std::string api_host = read_nvs_str("apifollow");
+    if (api_host.empty()) api_host = api_home;
     // K32_CMD:AP:off turns the cluster access point off (uplink only), useful
     // when a misbehaving station keeps flapping and disturbing the radio.
     bool ap_enabled = true;
@@ -2604,18 +2619,23 @@ void cluster_task(void* pv) {
                     restarts = 0;
                 }
                 const uint64_t heard = std::max(kubelet->last_sync_ok_ms(), quiet_since);
-                // A control plane that announces another address than the one
-                // this worker dials (it joined another network, or its DHCP
-                // lease changed): store that address and start again with it
-                const std::string announced = kube32::ipc::ChannelManager::instance().announced_api();
-                if (now - heard > 30000 && !announced.empty() && announced != api_host) {
-                    nvs_handle_t h;
-                    if (nvs_open("k32", NVS_READWRITE, &h) == ESP_OK) {
-                        nvs_set_str(h, "api", announced.c_str());
-                        nvs_commit(h);
-                        nvs_close(h);
-                    }
-                    printf("[NET] no answer from %s; the control plane announces %s, restarting with it\n", api_host.c_str(), announced.c_str());
+                // Silent for 30 s: the home address, or the address the control
+                // plane announces (it joined another network, or its DHCP lease
+                // changed), once a kube32 API server answers there. The worker
+                // stores the address followed beside its home address and
+                // starts again with it.
+                static kube32::net::ApiFollower follower(api_home, api_host, read_nvs_str("apicp"));
+                const std::string known = follower.control_plane();
+                const std::string next = follower.poll(now, kubelet->last_sync_ok_ms(), quiet_since,
+                    kube32::ipc::ChannelManager::instance().api_announcements(), [&](const std::string& host) {
+                        kube32::osal::System::feed_watchdog();
+                        return net_mgr->station_has_ip() && kube32::net::api_server_answers(host, 6443);
+                    });
+                if (follower.control_plane() != known) write_nvs_str("apicp", follower.control_plane());
+                if (!next.empty()) {
+                    write_nvs_str("apifollow", next == api_home ? std::string() : next);
+                    printf("[NET] no answer from %s; %s %s answers, restarting with it\n", api_host.c_str(),
+                           next == api_home ? "the home address" : "the announced address", next.c_str());
                     fflush(stdout);
                     esp_restart();
                 }

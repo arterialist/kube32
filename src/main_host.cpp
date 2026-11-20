@@ -80,8 +80,8 @@ static void signal_handler(int sig) {
 }
 
 // The API server a worker dials. The kubelet's threads and the main loop read
-// it; the main loop replaces it when the control plane announces another
-// address.
+// it; the follow thread replaces it with the home address or an address the
+// control plane announces (net::ApiFollower).
 class ApiEndpoint {
 public:
     ApiEndpoint(std::string host, uint16_t port) : host_(std::move(host)), port_(port) {}
@@ -926,27 +926,33 @@ int main(int argc, char* argv[]) {
                   << " -> connected to http://" << master_host << ":" << master_port << std::endl;
         if (linux_board) linux_board->show_ready(node_ip, "http://" + master_host + "/");
 
-        // As on the boards: an API server that has not answered for
-        // kApiSilenceBeforeFollowMs while the control plane announces another
-        // address (it joined another network, or its address changed) is
-        // dialed at that address, at the same port. Pods keep running.
-        uint64_t quiet_since = kube32::osal::System::get_uptime_ms();
-        uint64_t next_follow_check = 0;
-        auto follow_announced_api = [&] {
-            const uint64_t now = kube32::osal::System::get_uptime_ms();
-            if (now < next_follow_check) return;
-            next_follow_check = now + 1000;
-            const std::string announced = kube32::ipc::ChannelManager::instance().announced_api();
-            const std::string current = api.host();
-            if (!kube32::net::should_follow_announced_api(now, std::max(kubelet->last_sync_ok_ms(), quiet_since), announced, current)) return;
-            std::cout << "[NET] no answer from " << current << "; the control plane announces " << announced << ", switching" << std::endl;
-            const uint16_t port = api.port();
-            api.set_host(announced);
-            api_client->set_server(announced, port);
-            kubelet->set_api_server(announced, port);
-            service_client.set_gateway(announced, port);
-            quiet_since = now;
-        };
+        // As on the boards (net::ApiFollower): after kApiSilenceBeforeFollowMs
+        // without an answer the worker dials its --join address again, or the
+        // address its control plane announces, once a kube32 API server
+        // answers there, at the same port. Pods keep running, and are ticked
+        // while the probes wait on a thread of their own.
+        std::atomic<bool> following{true};
+        std::thread follow_thread([&] {
+            kube32::net::ApiFollower follower(master_host, master_host);
+            uint64_t quiet_since = kube32::osal::System::get_uptime_ms();
+            while (following.load()) {
+                kube32::osal::Thread::sleep_ms(1000);
+                const uint64_t now = kube32::osal::System::get_uptime_ms();
+                const std::string from = follower.current();
+                const uint16_t port = api.port();
+                const std::string next = follower.poll(now, kubelet->last_sync_ok_ms(), quiet_since,
+                    kube32::ipc::ChannelManager::instance().api_announcements(),
+                    [port](const std::string& host) { return kube32::net::api_server_answers(host, port); });
+                if (next.empty()) continue;
+                std::cout << "[NET] no answer from " << from << "; " << (next == follower.home() ? "the home address " : "the announced address ")
+                          << next << " answers, switching" << std::endl;
+                api.set_host(next);
+                api_client->set_server(next, port);
+                kubelet->set_api_server(next, port);
+                service_client.set_gateway(next, port);
+                quiet_since = now;
+            }
+        });
 
         kube32::app::PodServerOptions po;
         po.port = opts.pod_port;
@@ -967,13 +973,14 @@ int main(int argc, char* argv[]) {
         while (g_sim_running.load()) {
             tick();
             rejoin();
-            follow_announced_api();
             if (worker_slots->reboot_requested()) {
                 std::cout << "[SIM] " << opts.node_name << " switched firmware slots: start kube32-sim again to boot it" << std::endl;
                 rebooting = true;
                 break;
             }
         }
+        following.store(false);
+        follow_thread.join();
         // A signal: the worker leaves the cluster while its kubelet and pod
         // server still serve the moves
         bool emptied = false;

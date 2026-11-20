@@ -1205,14 +1205,13 @@ void ChannelManager::set_announced_api(const std::string& address) {
     announced_api_ = address;
 }
 
-std::string ChannelManager::announced_api() const {
+std::vector<net::ApiAnnouncement> ChannelManager::api_announcements() const {
     osal::LockGuard guard(peer_mutex_);
-    const PeerInfo* latest = nullptr;
+    std::vector<net::ApiAnnouncement> out;
     for (const auto& kv : peers_) {
-        if (kv.second.api_address.empty()) continue;
-        if (!latest || kv.second.last_seen_ms > latest->last_seen_ms) latest = &kv.second;
+        if (!kv.second.api_address.empty()) out.push_back({kv.second.node_name, kv.second.api_address, kv.second.last_seen_ms});
     }
-    return latest ? latest->api_address : std::string();
+    return out;
 }
 
 uint64_t ChannelManager::last_ip_hello_ms(const std::string& ip) const {
