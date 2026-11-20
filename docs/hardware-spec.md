@@ -17,7 +17,7 @@ Select the peripheral profile with `K32_CMD:BOARD:cardputer|atoms3-lite|s31-core
 | --- | --- | --- | --- |
 | `generic` | `kube32.io/board: generic` | 33 GPIO, 10 ADC, 2 I2C, 2 UART, chip temperature | I2C0 on GPIO 8/9, UART1 on GPIO 17/18 |
 | `cardputer` | `kube32.io/board: cardputer` | 11 GPIO, 3 ADC, 1 I2C, 1 UART, chip temperature | I2C0 or UART1 on Grove port GPIO 2/1 |
-| `atoms3-lite` | `kube32.io/board: atoms3-lite` | 9 GPIO, 6 ADC, 1 I2C, 1 UART, chip temperature | I2C0 or UART1 on Grove port GPIO 2/1; RMT TX on GPIO 4 (IR LED) |
+| `atoms3-lite` | `kube32.io/board: atoms3-lite` | 9 GPIO, 6 ADC, 1 I2C, 1 UART, 3 RMT TX, RGB LED, chip temperature | I2C0 or UART1 on Grove port GPIO 2/1; RMT TX on GPIO 4 (IR LED) |
 | `s31-coreboard` | `kube32.io/board: s31-coreboard` | 22 GPIO and 3 input-only pins, 8 ADC, 2 I2C, 2 UART, 3 RMT TX, speaker, microphone, RGB LED, chip temperature | I2C0 on GPIO 2/3, UART1 on GPIO 38/39 |
 
 Control plane nodes also carry the `node-role.kubernetes.io/control-plane` label, and worker nodes carry `node-role.kubernetes.io/worker`.
@@ -33,7 +33,7 @@ Control plane nodes also carry the `node-role.kubernetes.io/control-plane` label
 
 ## AtomS3 Lite pins
 
-The M5Stack AtomS3 Lite is an ESP32-S3 with 8 MB of flash and no PSRAM, so it joins as a worker. It has no screen and no microSD slot: node storage is the internal flash partition. The `atoms3-lite` profile offers pods only the pins a user can reach, plus the button:
+The M5Stack AtomS3 Lite is an ESP32-S3 with 8 MB of flash and no PSRAM, so it joins as a worker. It has no screen and no microSD slot: node storage is the internal flash partition. The `atoms3-lite` profile drives the RGB LED and offers pods only the pins a user can reach, plus the button:
 
 | Function | GPIO |
 | --- | --- |
@@ -41,7 +41,7 @@ The M5Stack AtomS3 Lite is an ESP32-S3 with 8 MB of flash and no PSRAM, so it jo
 | Header | 5, 6, 7, 8, 38, 39 |
 | Button, low when pressed | 41 (`button` driver: `pull: up`, `active: low`) |
 | IR LED, the default RMT TX pin | 4 |
-| WS2812 RGB LED, reserved | 35 |
+| WS2812C RGB LED, from the 3.3 V rail with no enable pin (`k32_led_set`) | 35 |
 
 ```sh
 # on the Atom's console

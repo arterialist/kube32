@@ -41,7 +41,7 @@ Set pins and speeds in `metadata.annotations`, or omit the annotation to use the
 
 Buses without board defaults require an annotation. See `examples/i2cscan.yaml` and `apps/i2cscan`.
 
-RMT channels take their pin the same way, from `kube32.io/rmt-tx: "pin=<n>[,carrier=<Hz>][,duty=<percent>]"` and `kube32.io/rmt-rx: "pin=<n>[,active=low|high][,idle_us=<n>]"` or the board default (the IR LED for TX: GPIO 44 on the `cardputer` profile, GPIO 4 on `atoms3-lite`; no other defaults). The firewall admits at most four channels of each direction, less the TX channels the board keeps for its own devices (`BoardProfile::rmt_tx_board_channels`: one on `s31-coreboard`, for its RGB LED), and the driver is created while the pod runs. See [peripherals](../peripherals.md#infrared-rmt), `examples/irremote.yaml`, and `apps/irremote`.
+RMT channels take their pin the same way, from `kube32.io/rmt-tx: "pin=<n>[,carrier=<Hz>][,duty=<percent>]"` and `kube32.io/rmt-rx: "pin=<n>[,active=low|high][,idle_us=<n>]"` or the board default (the IR LED for TX: GPIO 44 on the `cardputer` profile, GPIO 4 on `atoms3-lite`; no other defaults). The firewall admits at most four channels of each direction, less the TX channels the board keeps for its own devices (`BoardProfile::rmt_tx_board_channels`: one on `atoms3-lite` and `s31-coreboard`, for their RGB LED), and the driver is created while the pod runs. See [peripherals](../peripherals.md#infrared-rmt), `examples/irremote.yaml`, and `apps/irremote`.
 
 ## Board profiles and reserved pins
 
@@ -53,10 +53,10 @@ The board profile, set at boot from NVS key `board` via `K32_CMD:BOARD:cardputer
 | --- | --- | --- | --- | --- | --- | --- |
 | `generic` | 33 | 10 | 2 | 2 | 4 / 4 | I2C0 on GPIO 8/9, UART1 on GPIO 17/18 |
 | `cardputer` | 11 | 3 | 1 | 1 | 4 / 4 | Grove port GPIO 2/1 shared by I2C0 and UART1; RMT TX on GPIO 44 (IR LED) |
-| `atoms3-lite` | 9 | 6 | 1 | 1 | 4 / 4 | Grove port GPIO 2/1 shared by I2C0 and UART1; RMT TX on GPIO 4 (IR LED) |
+| `atoms3-lite` | 9 | 6 | 1 | 1 | 3 / 4 | Grove port GPIO 2/1 shared by I2C0 and UART1; RMT TX on GPIO 4 (IR LED) |
 | `s31-coreboard` | 22 | 8 | 2 | 2 | 3 / 4 | I2C0 on GPIO 2/3, UART1 on GPIO 38/39 |
 
-The `cardputer` profile reserves pins 33 to 38 for the LCD, 41 and 42 for I2S, 3 to 9, 11, 13, and 15 for the key matrix, and 12, 14, 39, and 40 for the microSD bus. It offers GPIO 44, a UART0 pin the board wires only to its IR LED, to RMT TX channels. The `atoms3-lite` profile reserves every pin except the Grove port (1, 2), the header (5 to 8, 38, 39) and the button (41). It offers GPIO 4, its IR LED, to RMT TX channels. The `s31-coreboard` profile (ESP32-S31) reserves the Ethernet PHY's pins 4 to 19, the codec's 50 to 57 and the RGB LED's 60, and offers the other pins on the board's header. An ADC1 channel is claimable only when its pin is claimable: `GPIO channel + 1` on the ESP32-S3, `GPIO channel + 42` on the ESP32-S31.
+The `cardputer` profile reserves pins 33 to 38 for the LCD, 41 and 42 for I2S, 3 to 9, 11, 13, and 15 for the key matrix, and 12, 14, 39, and 40 for the microSD bus. It offers GPIO 44, a UART0 pin the board wires only to its IR LED, to RMT TX channels. The `atoms3-lite` profile reserves every pin except the Grove port (1, 2), the header (5 to 8, 38, 39) and the button (41), and drives the RGB LED on 35. It offers GPIO 4, its IR LED, to RMT TX channels. The `s31-coreboard` profile (ESP32-S31) reserves the Ethernet PHY's pins 4 to 19, the codec's 50 to 57 and the RGB LED's 60, and offers the other pins on the board's header. An ADC1 channel is claimable only when its pin is claimable: `GPIO channel + 1` on the ESP32-S3, `GPIO channel + 42` on the ESP32-S31.
 
 ### Linux boards
 

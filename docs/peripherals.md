@@ -40,7 +40,7 @@ Pods share each device that a `hardware.kube32.io/*` resource grants, and a pod 
 | --- | --- |
 | `hardware.kube32.io/ipc` | Every node |
 | `hardware.kube32.io/chip-temp` | Every node: the chip's internal sensor, a stand-in in the simulator. A node on a [Linux board](hardware-spec.md#linux-boards) reads its SoC's thermal zone and advertises the grant only when the zone can be read |
-| `hardware.kube32.io/tft-display`, `keyboard`, `speaker`, `microphone`, `touch`, `led` | Boards with the devices on board (the Cardputer profile has a display, keyboard, speaker and microphone; the `s31-coreboard` profile a speaker, microphone and RGB LED; a Linux board, the framebuffer, keyboard and sound card that opened) |
+| `hardware.kube32.io/tft-display`, `keyboard`, `speaker`, `microphone`, `touch`, `led` | Boards with the devices on board (the Cardputer profile has a display, keyboard, speaker and microphone; the `s31-coreboard` profile a speaker, microphone and RGB LED; the `atoms3-lite` profile an RGB LED; a Linux board, the framebuffer, keyboard and sound card that opened) |
 | `hardware.kube32.io/sd` | Nodes with a mounted microSD card ([storage](storage.md)) |
 
 A resource that a node no longer has (a card taken out, a board profile changed between boots) is set to `null` in the next status write and leaves the Node. The scheduler does not filter on these resources; the firewall checks the grants at admission.
@@ -135,7 +135,16 @@ A pod with `hardware.kube32.io/led: "1"` or the `LED` capability sets the board'
 | --- | --- | --- | --- |
 | `k32_led_set` | `i(ii)` | `int32_t k32_led_set(uint32_t index, uint32_t rgb)` | Sets LED `index` (`0` on a board with one) to the color `0xRRGGBB`, `0` for off. Returns `0`, `K32_ERR_INVAL` for an index past the board's LEDs, or `K32_ERR_NODEV` on a node without one. |
 
-The `s31-coreboard` profile has one WS2812 LED, on GPIO 60. The node keeps one RMT TX channel for it from boot, so the board offers pods three RMT TX channels, and sends each color to the LED as a WS2812 frame. The LED has an import of its own because WS2812 bits last 0.3 and 0.9 microseconds, and the pods' RMT channels count durations in whole microseconds.
+The `s31-coreboard` profile has one WS2812 LED, on GPIO 60, and the `atoms3-lite` profile one WS2812C LED, on GPIO 35. The node keeps one RMT TX channel for the LED from boot, so each of these boards offers pods three RMT TX channels, and sends each color to the LED as a WS2812 frame (green, red, blue).
+
+`apps/ledcycle` sets LED 0 to red, green, blue, white and off, one color a tick from its start, logs what each call returned, and answers the results on `GET /` (`{"step":5,"rc":[0,0,0,0,0]}` on a board with the LED):
+
+```sh
+make -C apps/ledcycle
+kube32 deploy images/sd/ledcycle.wasm --name ledcycle --node <node>
+kubectl logs ledcycle    # ledcycle: red 0x400000 rc 0 ... ledcycle: off 0x000000 rc 0
+kubectl delete pod ledcycle
+``` The LED has an import of its own because WS2812 bits last 0.3 and 0.9 microseconds, and the pods' RMT channels count durations in whole microseconds.
 
 ## Bus configuration and driver lifecycle
 
@@ -209,7 +218,7 @@ kubectl --context kube32 get nodes -L i2c.kube32.io/0x28
 
 ## Infrared (RMT)
 
-The ESP32-S3 RMT peripheral sends and captures pulse trains, the signal of infrared remote controls. A pod claims one transmit channel (`esp32.io/rmt-tx: "1"`), one receive channel (`esp32.io/rmt-rx: "1"`), or one of each. The chip has four channels of each direction (the ESP32-S31 too); a node advertises at most four of each and only as many as it has pins for, so a profile without a claimable pin for a direction advertises none of it. A board that keeps a TX channel for its own device advertises one fewer: the `s31-coreboard` profile keeps one for its [RGB LED](#rgb-led). A Linux board offers one channel of each direction on its own infrared devices ([below](#infrared-on-a-linux-board)).
+The ESP32-S3 RMT peripheral sends and captures pulse trains, the signal of infrared remote controls. A pod claims one transmit channel (`esp32.io/rmt-tx: "1"`), one receive channel (`esp32.io/rmt-rx: "1"`), or one of each. The chip has four channels of each direction (the ESP32-S31 too); a node advertises at most four of each and only as many as it has pins for, so a profile without a claimable pin for a direction advertises none of it. A board that keeps a TX channel for its own device advertises one fewer: the `atoms3-lite` and `s31-coreboard` profiles keep one for their [RGB LED](#rgb-led). A Linux board offers one channel of each direction on its own infrared devices ([below](#infrared-on-a-linux-board)).
 
 ### Pins and settings
 
@@ -233,6 +242,7 @@ metadata:
 | --- | --- | --- | --- |
 | `generic` | 4 RMT TX, 4 RMT RX | None | None |
 | `cardputer` | 4 RMT TX, 4 RMT RX | GPIO 44, the built-in IR LED | None |
+| `atoms3-lite` | 3 RMT TX, 4 RMT RX | GPIO 4, the built-in IR LED | None |
 | `cardputer-zero` (Linux) | 1 RMT TX, 1 RMT RX | The board's IR LED, no pin | The board's IR receiver, no pin |
 
 Channel pins are claimed like bus pins: admission fails when the chip or the board reserves the pin, when another pod holds it, or when the claim names no pin and the board has no default (`RMT RX has no default pin on the cardputer board: set annotation kube32.io/rmt-rx: "pin=<n>"`).
@@ -357,7 +367,7 @@ The ESP32-S3 provides GPIO 0 to 21 and 26 to 48. The firewall blocks claims on r
 
 * Every board (`KUBE32_RESERVED_GPIO_MASK`) reserves GPIO `0` for boot strapping, `19` and `20` for native USB, `26` to `32` for SPI flash and quad PSRAM, and `43` and `44` for the UART0 console. The `cardputer` profile offers GPIO `44` to RMT TX channels for its IR LED. A pod can claim GPIO `0` as an input pin (`esp32.io/gpio-input-0`) to read the boot button.
 * The `cardputer` profile also reserves LCD SPI pins `33` to `38`, I2S speaker pins `41` to `43`, microphone data pin `46`, keyboard matrix pins `3` to `9`, `11`, `13`, and `15`, and microSD SPI pins `12`, `14`, `39`, and `40`.
-* The `atoms3-lite` profile offers only its Grove pins `1` and `2`, header pins `5` to `8`, `38` and `39`, and button pin `41`. It reserves the rest, including RGB LED pin `35`, and offers IR LED pin `4` to RMT TX channels.
+* The `atoms3-lite` profile offers only its Grove pins `1` and `2`, header pins `5` to `8`, `38` and `39`, and button pin `41`. It reserves the rest, including RGB LED pin `35`, which the node drives for `k32_led_set`, and offers IR LED pin `4` to RMT TX channels.
 
 An ADC1 channel `N` from `0` to `9` is claimable only when its pad, GPIO `N + 1`, is claimable by the board profile.
 
