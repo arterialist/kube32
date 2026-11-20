@@ -2,11 +2,11 @@
 
 #if defined(KUBE32_TARGET_ESP32)
 
+#include "hal/addressable_led.hpp"
 #include "hal/sd_card.hpp"
 #include "hal/tft_keyboard_hardware.hpp"
 
 #if CONFIG_IDF_TARGET_ESP32S31
-#include "hal/addressable_led.hpp"
 #include "hal/es8311_audio.hpp"
 #endif
 
@@ -84,13 +84,17 @@ public:
 
 // The M5Stack AtomS3 Lite: no screen, no PSRAM. It breaks out the Grove port
 // (GPIO 2 and 1) and six header pins (5, 6, 7, 8, 38, 39); its button is on
-// GPIO 41 (low when pressed), its IR LED on GPIO 4 and its WS2812 LED on
-// GPIO 35. Pods may claim only the pins a user can reach and the button.
+// GPIO 41 (low when pressed), its IR LED on GPIO 4 and its WS2812C LED on
+// GPIO 35 (powered from the 3.3 V rail, no enable pin) for k32_led_set.
+// Pods may claim only the pins a user can reach and the button.
 class AtomS3LiteBoard final : public Board {
 public:
     const char* name() const override { return "atoms3-lite"; }
 
-    bool init() override { return true; }
+    bool init() override {
+        led_ok_ = led_.init();
+        return true;
+    }
 
     void describe(BoardProfile& profile) const override {
         constexpr uint64_t reachable = (1ULL << 1) | (1ULL << 2) | (1ULL << 5) | (1ULL << 6) | (1ULL << 7) |
@@ -104,8 +108,15 @@ public:
         profile.uart_pins[1] = {2, 1};    // Grove TX, RX
         profile.rmt_tx_pin_mask = 1ULL << 4;
         profile.rmt_tx_default_pin = 4;   // IR LED
-        profile.onboard_devices = 0;
+        profile.rmt_tx_board_channels = led_ok_ ? 1 : 0;
+        profile.onboard_devices = led_ok_ ? KUBE32_CAP_LED : 0;
     }
+
+    int32_t led_set(uint32_t index, uint32_t rgb) override { return led_ok_ ? led_.set(index, rgb) : HAL_ERR_NODEV; }
+
+private:
+    AddressableLed led_{35, 1};
+    bool led_ok_{false};
 };
 
 #if CONFIG_IDF_TARGET_ESP32S31
