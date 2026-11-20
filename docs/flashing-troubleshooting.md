@@ -81,7 +81,7 @@ Profile commands write to the `k32` NVS namespace, return `K32_OK ..., rebooting
 | Command | Effect |
 | --- | --- |
 | `K32_CMD:WIFI:<ssid>:<password>` | Join a 2.4 GHz network as a station. The station picks the strongest access point with that name and roams to one at least 10 dB stronger when signal drops below -70 dBm. The SSID cannot contain `:`. `K32_CMD:WIFI:` erases credentials. |
-| `K32_CMD:API:<host>` | Set the control plane address for a worker, default `192.168.4.1`. `auto` erases it. A worker that gets no answer there switches to the address the control plane announces over ESP-NOW. |
+| `K32_CMD:API:<host>` | Set a worker's home control plane address, default `192.168.4.1`. `auto` erases it. A worker whose API server has not answered for 30 seconds dials its home address again, or the address its control plane announces in HELLO frames, once a kube32 API server answers there. It stores an address it follows beside the home address and restarts, and comes back to the home address when that answers again ([Following the network](cli-reference.md#following-the-network)). `K32_CMD:API` clears the followed address and the control plane the worker knows. |
 | `K32_CMD:AP:off` | Disable the `Kube32-Cluster` access point on the control plane. `on` erases the setting. |
 | `K32_CMD:APPASS:<password>` | Set the `Kube32-Cluster` access point password (8 to 63 printable characters) on the control plane and on each worker that joins the access point. An empty value erases the password, and the control plane generates a replacement on its next boot. |
 | `K32_CMD:APPASS` | Print the stored access point password as `K32_APPASS <password>`. |

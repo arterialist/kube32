@@ -6,6 +6,7 @@ All notable changes to this project will be documented in this file. The format 
 
 ### Fixed
 
+- A worker follows an API server address that its control plane announces only once a kube32 API server answers `GET /version` there, and only from a HELLO of the last 15 seconds sent by the control plane it knows. A control plane on a network the workers cannot reach, such as a phone hotspot behind NAT, announced its address there, and its workers switched to that address, stored it in place of the address set with `K32_CMD:API` and kept dialing it. A board now stores the address it follows beside its home address, and a worker dials its home address again when that answers ([docs/cli-reference.md](docs/cli-reference.md#following-the-network)).
 - `esp32_adc_read` on a chip whose ADC has one input range (the ESP32-S31) reads at that range instead of failing with `K32_ERR_NODEV`.
 - A Wi-Fi station no longer stops sending while it goes on receiving, which ended in the kubelet's stall restart on boards without PSRAM. ESP-NOW's send path linked its frames into the Wi-Fi driver's TX queue without the driver's lock; the firmware now holds the lock for that insert.
 - `k32_log` on a node out of memory drops the line instead of aborting the node.
