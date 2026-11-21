@@ -45,6 +45,8 @@ extern "C" {
     pub fn k32_key_read() -> i32;
     pub fn k32_tone(freq_hz: u32, duration_ms: u32, volume_pct: u32) -> i32;
     pub fn k32_led_set(index: u32, rgb: u32) -> i32;
+    // The devices the pod's current step needs (hardware-following pods)
+    pub fn k32_need(resources: *const u8, len: u32) -> i32;
 
     // Pod storage on the microSD card, gated by hardware.kube32.io/sd
     pub fn k32_fs_open(path: *const u8, path_len: u32, flags: u32) -> i32;
@@ -150,6 +152,7 @@ mod stubs {
     pub unsafe fn k32_key_read() -> i32 { no_host() }
     pub unsafe fn k32_tone(freq_hz: u32, duration_ms: u32, volume_pct: u32) -> i32 { no_host() }
     pub unsafe fn k32_led_set(index: u32, rgb: u32) -> i32 { no_host() }
+    pub unsafe fn k32_need(resources: *const u8, len: u32) -> i32 { no_host() }
     pub unsafe fn k32_fs_open(path: *const u8, path_len: u32, flags: u32) -> i32 { no_host() }
     pub unsafe fn k32_fs_read(fd: i32, buf: *mut u8, len: u32) -> i32 { no_host() }
     pub unsafe fn k32_fs_write(fd: i32, buf: *const u8, len: u32) -> i32 { no_host() }
