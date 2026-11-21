@@ -2,7 +2,7 @@
 
 A running request pod can move to another node and continue with its state. The pod does not start again: its counters, buffers and clock carry over, and `k32_init` does not run a second time. A pod moves on request, when a node is drained, when its node runs short of memory, when a faster node joins or leaves, and to the node that has the hardware its current step needs. A pod with periodic checkpoints comes back on another node when its node is lost.
 
-Nodes of any architecture take part. A pod saved on an ESP32-S3 restores on another board or on a `kube32-sim` worker on a laptop, and the other way round.
+Nodes of any architecture take part. A pod saved on an ESP32-S3 restores on another board or on a `kube32-sim` worker on a laptop, and the other way round. The module computes the same bits on every node, floating point included ([Wasm runtime](architecture/wasm-runtime.md#floating-point)), so a pod that integrates a simulation continues after a move exactly as it would have where it was.
 
 ## What moves
 

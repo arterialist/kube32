@@ -153,6 +153,10 @@ wasm3 on the ESP32-S3 also uses the native stack. The compiler makes no tail cal
 
 Every host-initiated call (`k32_init`, `k32_alloc`, `k32_handle`, `k32_tick`, `k32_event`) gets a fresh wasm3 gas budget, defaulting to `4,000,000,000` units. The [linear algebra](#linear-algebra) imports charge the budget for their work. Override it with the pod annotation `kube32.io/execution-budget: "<units>"` or disable metering with `"off"` (or `"0"`). Unmetered pods compile without gas checks and cannot be interrupted mid-call when stopped.
 
+### Floating point
+
+`f32` and `f64` operations round to nearest, ties to even, on every node, as Wasm requires, and every call into a pod begins in that rounding mode. A module computes the same bits on every node, apart from the payload bits of NaN results: two copies of a simulation on different boards, or one that [moves](#moving-to-another-node) between them, keep identical state. [Wasm runtime](architecture/wasm-runtime.md#floating-point) describes how the boards keep the rounding mode of each task.
+
 ### Restart policy and exit codes
 
 Pods support `restartPolicy: Always`, `OnFailure`, and `Never`. Failed or restarting containers back off starting at 10 s, doubling on each crash up to 5 minutes (`CrashLoopBackOff`), and reset the back-off after 10 minutes of running. Container status records `lastState`, `restartCount`, and `BackOff` events. Blocking host calls (sleep, channel receive, tone, HTTP call) abort early when the kubelet stops a container, and deleting a pod reclaims its memory.
