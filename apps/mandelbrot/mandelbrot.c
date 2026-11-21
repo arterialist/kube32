@@ -433,7 +433,7 @@ static void send_bmp(void) {
         for (uint32_t b = 0; b < 4; b++) io[sizes[i] + b] = (char)(sizes[i + 1] >> (8 * b));
     for (uint32_t i = 0; i < 256; i++) {
         const uint32_t rgb = color(i >> 4, i & 15);
-        put_le((rgb & 0xFF) << 16 | (rgb & 0xFF00) | rgb >> 16, 4);   /* B, G, R, 0 */
+        put_le(rgb, 4);   /* 0x00RRGGBB little-endian: B, G, R, 0 */
     }
     for (uint32_t y = 0; y < H; y++) {
         if (io_len + stride > IO_CAP) flush();
