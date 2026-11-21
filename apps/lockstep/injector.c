@@ -44,7 +44,7 @@ static uint32_t level_prev, pressed, press_pending, presses, last_poll, shown = 
 static int32_t last_rc;
 static char io[512];
 static uint32_t io_len;
-static char answer[64];
+static char answer[384];   /* the lane's /fault reply and the voter's verdict */
 static char req[1024];
 
 static uint32_t slen(const char* s) { uint32_t n = 0; while (s[n]) n++; return n; }
