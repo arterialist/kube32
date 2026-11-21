@@ -19,6 +19,8 @@ constexpr uint64_t kApiAnnouncementFreshMs = 15000;
 // often, each with one GET /version of at most kApiProbeTimeoutMs.
 constexpr uint64_t kApiProbeIntervalMs = 10000;
 constexpr uint32_t kApiProbeTimeoutMs = 1500;
+// Announced addresses tried in one check, newest announcement first
+constexpr size_t kApiProbesPerPoll = 4;
 
 // The latest HELLO of a peer that announces an API server address
 struct ApiAnnouncement {
@@ -30,8 +32,8 @@ struct ApiAnnouncement {
 // Which API server address a worker dials. `home` is the address it was
 // given (K32_CMD:API, --join) and `current` the one it dials now. After
 // kApiSilenceBeforeFollowMs without an answer the worker tries its home
-// address, then the address in the latest fresh announcement of its control
-// plane, and dials the first that answers as a kube32 API server. Its
+// address, then the addresses in the fresh announcements of its control
+// plane, newest first, and dials the first that answers as a kube32 API server. Its
 // control plane is the peer that announces the address the worker dials
 // while that address answers; until one has, any peer's announcement counts.
 class ApiFollower {
@@ -57,7 +59,7 @@ private:
     std::string home_;
     std::string current_;
     std::string control_plane_;
-    std::string noted_;   // the last refusal logged: each is logged once
+    std::vector<std::string> noted_;   // refusals logged since the last switch: each is logged once
     uint64_t next_probe_ms_{0};
 };
 

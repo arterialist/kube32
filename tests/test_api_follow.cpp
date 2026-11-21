@@ -147,6 +147,27 @@ static void test_other_peer_ignored() {
     std::cout << "[PASS] test_other_peer_ignored" << std::endl;
 }
 
+// A peer that announces an unreachable address more often than the control
+// plane announces its own does not keep the worker from following it
+static void test_noisy_peer_does_not_hide_control_plane() {
+    // As after K32_CMD:API to an address where nothing answers: no control plane known
+    net::ApiFollower f("192.0.2.1", "192.0.2.1");
+    Probes p{{"198.51.100.5"}, {}};
+    const uint64_t now = kT + 31000;
+    const Announcements heard{{"cp", "198.51.100.5", now - 2000}, {"bogus", "192.0.2.77", now - 100}, {"bogus", "192.0.2.77", now - 1100}};
+    assert(f.poll(now, kT, 0, heard, p) == "198.51.100.5");
+    assert((p.asked == std::vector<std::string>{"192.0.2.77", "198.51.100.5"}));
+    assert(f.control_plane() == "cp");
+    // At most kApiProbesPerPoll announced addresses in one check
+    net::ApiFollower g("192.0.2.1", "192.0.2.1");
+    Probes q;
+    Announcements many;
+    for (int i = 0; i < 6; ++i) many.push_back({"n" + std::to_string(i), "192.0.2." + std::to_string(10 + i), now - 100 * i});
+    assert(g.poll(now, kT, 0, many, q).empty());
+    assert(q.asked.size() == net::kApiProbesPerPoll && q.asked[0] == "192.0.2.10");
+    std::cout << "[PASS] test_noisy_peer_does_not_hide_control_plane" << std::endl;
+}
+
 // A worker that followed an address goes back to the one it was given
 static void test_return_home() {
     // As after a restart with the address followed (a board stores both)
@@ -531,6 +552,7 @@ int main() {
     test_unreachable_announcement_not_followed();
     test_stale_announcement_ignored();
     test_other_peer_ignored();
+    test_noisy_peer_does_not_hide_control_plane();
     test_return_home();
     test_control_plane_moves();
     test_loopback_host();

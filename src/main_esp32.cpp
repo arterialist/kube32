@@ -2371,6 +2371,10 @@ void cluster_task(void* pv) {
         kubelet_cfg.api_server_port = 6443;
         // The control plane may sit on another access point: reach it over UDP too
         kube32::ipc::ChannelManager::instance().add_seed_peer(api_host, 7400);
+        // A control plane that has moved, or one without ESP-NOW such as a
+        // Linux board, has no address for this worker: the broadcast reaches
+        // it, it adds this worker as a peer and its HELLO announces its address
+        kube32::ipc::ChannelManager::instance().add_seed_peer("255.255.255.255", 7400);
 
         // The pod HTTP server: the ingress controller and other nodes' service
         // calls reach request-handling pods here, and it is the kubelet
