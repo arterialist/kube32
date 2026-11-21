@@ -1,0 +1,102 @@
+# mandelbrot: one image rendered across CPU architectures. The pod renders a
+# Mandelbrot set a row at a time and keeps it in its memory; moved to another
+# node, it goes on at the next row there. Each row keeps the node that
+# rendered it, and the rows of each platform (kubernetes.io/os and
+# kubernetes.io/arch of the node) take their own hue, so the image comes out
+# striped by the nodes it visited.
+#
+# The module travels inline. make -C apps/mandelbrot writes
+# apps/mandelbrot/build/mandelbrot.yaml, this manifest with the module in
+# place of "@mandelbrot.wasm":
+#
+#   make -C apps/mandelbrot
+#   kubectl --context kube32 apply -f apps/mandelbrot/build/mandelbrot.yaml
+#   kube32 move mandelbrot --to <node>
+#
+# Open http://<control-plane-ip>/mandelbrot/ to watch it; the Ingress follows
+# the pod to whichever node it runs on. The defaults render 256x192 at a row
+# every 300 ms of pod time, about 58 s for the image.
+#
+# The pod reads its Pod and its Node from the API server at
+# KUBERNETES_SERVICE_HOST:KUBERNETES_SERVICE_PORT, which the kubelet sets in
+# every pod; set API_URL (and API_TOKEN when the server has a token) to read
+# another.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: mandelbrot
+  namespace: default
+  labels:
+    app: mandelbrot
+  annotations:
+    kube32.io/wasm-base64: "@mandelbrot.wasm"
+    kube32.io/migration: OnDrain        # moves on request and on a drain
+    kube32.io/tick-interval: 100ms      # ticks often enough for TICK_MS
+    kube32.io/wasm-stack: 1Ki           # operand stack; the deepest call needs a few hundred bytes
+spec:
+  restartPolicy: Always
+  containers:
+    - name: mandelbrot
+      image: wasm://inline/mandelbrot
+      ports:
+        - containerPort: 7000
+          name: http
+      env:
+        - name: API_URL                 # the kubelet sets these in every pod
+          value: http://$(KUBERNETES_SERVICE_HOST):$(KUBERNETES_SERVICE_PORT)
+        - name: POD_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.name
+        - name: POD_NAMESPACE
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.namespace
+        - name: WIDTH
+          value: "256"
+        - name: HEIGHT
+          value: "192"
+        - name: ROWS_PER_TICK
+          value: "1"
+        - name: TICK_MS                 # pod time between render steps
+          value: "300"
+        - name: MAX_ITER
+          value: "128"
+      resources:
+        requests:
+          memory: 32Ki                  # 1 KiB stack, 6.2 KiB data, 24.2 KiB image
+        limits:
+          memory: 32Ki
+      securityContext:
+        capabilities:
+          add: ["SERVICE_CALL"]         # reads its Pod and Node
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: mandelbrot
+  namespace: default
+spec:
+  selector:
+    app: mandelbrot
+  ports:
+    - name: http
+      port: 80
+      targetPort: 7000
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: mandelbrot
+  namespace: default
+spec:
+  rules:
+    - http:
+        paths:
+          - path: /mandelbrot
+            pathType: Prefix
+            backend:
+              service:
+                name: mandelbrot
+                port:
+                  number: 80
