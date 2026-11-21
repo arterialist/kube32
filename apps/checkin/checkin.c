@@ -23,8 +23,11 @@
  *   GET /        {"step":"<step>","node":"<node>","weight_g":<g>,"label":"<label>",
  *                 "trail":["<node of each step>",...],"moves":<n>,
  *                 "need":<k32_need>,"display":<rc>,"led":<rc>,"tone":<rc>}
- *                display, led and tone: what k32_display_info (at the start
- *                on each node), k32_led_set and k32_tone last returned
+ *                display, led and tone: what k32_display_info, k32_led_set
+ *                and k32_tone last returned
+ *   GET /probe   the same after a k32_display_info call on this node:
+ *                K32_OK where the pod holds the display, K32_ERR_PERM where
+ *                the node has none (the firewall logs the refusal)
  *   POST /again  a new record from step 1, once the last one is logged
  *
  * Built into images/sd/checkin.wasm (not embedded); examples/checkin.yaml
@@ -111,9 +114,10 @@ static NOINLINE int32_t need(const char* key, const char* def) {
     return need_rc;
 }
 
-static NOINLINE void log_step(void) {
+/* Step `done` is over: where it ran and the record so far */
+static NOINLINE void log_step(int done) {
     out_len = 0;
-    put("step "); put(step_names[step]); put(" on "); put(trail[step - 1]);
+    put("step "); put(step_names[done]); put(" done on "); put(trail[done - 1]);
     put(": weight "); put_int(weight_g); put(" g, label \""); put(label); put("\"");
     log_out();
 }
@@ -157,8 +161,8 @@ static void weigh(void) {
     /* A long answer still has the reading near its start */
     const int ok = rc == 200 || (rc == K32_ERR_TOOBIG && k32_http_status() == 200);
     if (ok && parse_field(env("SCALE_FIELD", "weight_g"), got, &weight_g)) {
+        log_step(WEIGH);
         step = LABEL;
-        log_step();
         return;
     }
     if (t - weigh_since < WEIGH_WAIT_MS) return;
@@ -186,7 +190,11 @@ static void draw_label_line(int cursor) {
     k32_display_text(8, 52, out, out_len, WHITE, BLACK);
 }
 
-static void size_display(void);
+/* The panel of this node: K32_OK where the pod holds the display here */
+static void size_display(void) {
+    int32_t fmt = 0;
+    display_rc = k32_display_info(&screen_w, &screen_h, &fmt);
+}
 
 static void draw_label_screen(void) {
     size_display();
@@ -244,8 +252,8 @@ static void take_label(void) {
     }
     /* The screen keeps this once the pod has gone on */
     text(76, "saved: on to the speaker   ", AMBER);
+    log_step(LABEL);
     step = CONFIRM;
-    log_step();
 }
 
 /* ---- Step 3: the weight's digits as tones, the LED --------------------------- */
@@ -282,8 +290,8 @@ static void confirm(void) {
         esp32_delay_ms(120);
     }
     k32_led_set(0, 0);   /* the LED stays as it is left when the pod goes */
+    log_step(CONFIRM);
     step = LOG;
-    log_step();
 }
 
 /* ---- Step 4: the record -------------------------------------------------------- */
@@ -309,16 +317,9 @@ static void start(void) {
     for (int i = 0; i < 4; i++) trail[i][0] = 0;
 }
 
-/* The panel of this node, when the pod holds the display here */
-static void size_display(void) {
-    int32_t fmt = 0;
-    display_rc = k32_display_info(&screen_w, &screen_h, &fmt);
-}
-
 K32_EXPORT("k32_init") int32_t k32_init(void) {
     start();
     moves = 0;
-    size_display();
     return 0;
 }
 
@@ -328,7 +329,6 @@ K32_EXPORT("k32_restored") int32_t k32_restored(void) {
     moves++;
     drawn = 0;
     waiting = 0;
-    size_display();
     out_len = 0;
     put("restored on "); put(env("NODE_NAME", "?")); put(" at step "); put(step_names[step]);
     log_out();
@@ -350,6 +350,7 @@ K32_EXPORT("k32_tick") int32_t k32_tick(uint32_t now) {
 K32_EXPORT("k32_handle") int32_t k32_handle(uint32_t ptr, uint32_t len) {
     const char* req = (const char*)(uintptr_t)ptr;
     if (len >= 11 && req[0] == 'P' && req[6] == 'a' && req[7] == 'g' && step == DONE) start();
+    if (len >= 10 && req[0] == 'G' && req[5] == 'p') size_display();   /* GET /probe */
     out_len = 0;
     put("{\"step\":"); put_str(step_names[step]);
     put(",\"node\":"); put_str(env("NODE_NAME", "?"));
