@@ -393,17 +393,20 @@ void Kubelet::patch_node_annotations() {
 
 void Kubelet::record_pod_needs() {
     runtime::AppPodHost& host = runtime::AppPodHost::instance();
-    for (const auto& n : host.unrecorded_needs()) {
-        const size_t slash = n.first.find('/');
-        if (slash == std::string::npos) continue;
-        const std::string patch = std::string("{\"metadata\":{\"annotations\":{\"") + models::kAnnotationNeeds + "\":\"" +
-                                  models::devices_text(n.second) + "\"}}}";
-        if (!api_client_->patch_pod_status(n.first.substr(0, slash), n.first.substr(slash + 1), patch)) {
+    std::string key;
+    uint32_t devices = 0;
+    // A pod whose need changes meanwhile comes up again; a few a pass
+    for (int n = 0; n < 8 && host.unrecorded_need(key, devices); ++n) {
+        const size_t slash = key.find('/');
+        const std::string text = models::devices_text(devices);
+        if (slash == std::string::npos ||
+            !api_client_->patch_pod_status(key.substr(0, slash), key.substr(slash + 1),
+                                           "{\"metadata\":{\"annotations\":{\"kube32.io/needs\":\"" + text + "\"}}}")) {
             need_retry_ms_ = osal::System::get_uptime_ms() + 1000;
             return;
         }
-        host.need_recorded(n.first, n.second);
-        std::cout << "[KUBELET] " << n.first << ": needs " << (n.second ? models::devices_text(n.second) : std::string("no hardware")) << std::endl;
+        host.need_recorded(key, devices);
+        printf("[KUBELET] %s: needs %s\n", key.c_str(), devices ? text.c_str() : "no hardware");
     }
 }
 

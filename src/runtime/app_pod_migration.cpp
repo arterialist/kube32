@@ -39,13 +39,15 @@ int32_t AppPodHost::need(const std::string& pod_id, std::string_view list) {
     return here ? K32_OK : K32_NEED_MOVING;
 }
 
-std::vector<std::pair<std::string, uint32_t>> AppPodHost::unrecorded_needs() const {
-    std::vector<std::pair<std::string, uint32_t>> out;
+bool AppPodHost::unrecorded_need(std::string& pod_id, uint32_t& devices) const {
     osal::LockGuard guard(mutex_);
     for (const auto& kv : migration_) {
-        if (kv.second.need != kv.second.recorded) out.emplace_back(kv.first, kv.second.need);
+        if (kv.second.need == kv.second.recorded) continue;
+        pod_id = kv.first;
+        devices = kv.second.need;
+        return true;
     }
-    return out;
+    return false;
 }
 
 void AppPodHost::need_recorded(const std::string& pod_id, uint32_t devices) {

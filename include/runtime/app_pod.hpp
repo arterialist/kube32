@@ -337,8 +337,9 @@ public:
     // or a K32_ERR_*). A hardware-following pod's need is kept for the
     // kubelet to record on the Pod.
     int32_t need(const std::string& pod_id, std::string_view list);
-    // The needs of this node's pods that their Pods do not show yet
-    std::vector<std::pair<std::string, uint32_t>> unrecorded_needs() const;
+    // A need of this node's pods that its Pod does not show yet; false when
+    // every Pod shows its pod's need
+    bool unrecorded_need(std::string& pod_id, uint32_t& devices) const;
     // The Pod shows `devices` as the pod's need
     void need_recorded(const std::string& pod_id, uint32_t devices);
 

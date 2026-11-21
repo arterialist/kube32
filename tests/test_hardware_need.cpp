@@ -136,6 +136,12 @@ void test_grants() {
 
 std::string need(const std::string& pod_id, const std::string& list) { return k32test::call_pod(pod_id, "/need", "POST", list).body; }
 std::string rc(int32_t v) { return "{\"need\":" + std::to_string(v) + "}"; }
+// The need the kubelet would record next, "<pod> <devices>", empty for none
+std::string unrecorded() {
+    std::string pod;
+    uint32_t devices = 0;
+    return runtime::AppPodHost::instance().unrecorded_need(pod, devices) ? pod + " " + models::devices_text(devices) : std::string();
+}
 
 void deploy(runtime::WasmRuntime& rt, const std::string& pod_id, const std::string& manifest, uint32_t recorded = 0) {
     std::string err;
@@ -166,19 +172,18 @@ void test_need_call() {
 
     // A following pod on a node with an LED only
     deploy(rt, "default/job", pod(kFollow, requests));
-    CHECK(host.unrecorded_needs().empty());
+    CHECK(unrecorded().empty());
     CHECK(need("default/job", "led") == rc(K32_OK));
     CHECK(need("default/job", "hardware.kube32.io/led, LED") == rc(K32_OK));
-    CHECK(host.unrecorded_needs().size() == 1 && host.unrecorded_needs()[0].second == hal::KUBE32_CAP_LED);
+    CHECK(unrecorded() == "default/job hardware.kube32.io/led");
     CHECK(need("default/job", "") == rc(K32_OK));
-    CHECK(host.unrecorded_needs().empty());   // back to what the Pod shows
+    CHECK(unrecorded().empty());   // back to what the Pod shows
     CHECK(need("default/job", "DISPLAY,keyboard") == rc(K32_NEED_MOVING));
-    const auto pending = host.unrecorded_needs();
-    CHECK(pending.size() == 1 && pending[0].first == "default/job" && pending[0].second == (hal::KUBE32_CAP_DISPLAY | hal::KUBE32_CAP_KEYBOARD));
-    host.need_recorded("default/job", pending[0].second);
-    CHECK(host.unrecorded_needs().empty());
+    CHECK(unrecorded() == "default/job hardware.kube32.io/tft-display,hardware.kube32.io/keyboard");
+    host.need_recorded("default/job", hal::KUBE32_CAP_DISPLAY | hal::KUBE32_CAP_KEYBOARD);
+    CHECK(unrecorded().empty());
     CHECK(need("default/job", "DISPLAY,keyboard") == rc(K32_NEED_MOVING));   // asked again: still not met, nothing new to record
-    CHECK(host.unrecorded_needs().empty());
+    CHECK(unrecorded().empty());
     // Not listed, no device, too long
     CHECK(need("default/job", "speaker") == rc(K32_ERR_PERM));
     CHECK(need("default/job", "led,esp32.io/gpio-4") == rc(K32_ERR_INVAL));
@@ -186,14 +191,14 @@ void test_need_call() {
     // The firewall refuses what the node lacks, though the spec lists it
     CHECK(k32test::call_pod("default/job", "/info").body == "{\"info\":-1,\"w\":0,\"h\":0,\"f\":0,\"touches\":-1,\"led\":0}");
     CHECK(rt.terminate("default/job"));
-    CHECK(host.unrecorded_needs().empty());
+    CHECK(unrecorded().empty());
 
     // Restored where its Pod records a need: the same need records nothing
     set_devices(hal::KUBE32_CAP_DISPLAY | hal::KUBE32_CAP_KEYBOARD);
     deploy(rt, "default/job", pod(kFollow + R"(,"kube32.io/needs":"hardware.kube32.io/tft-display,hardware.kube32.io/keyboard")", requests),
            hal::KUBE32_CAP_DISPLAY | hal::KUBE32_CAP_KEYBOARD);
     CHECK(need("default/job", "DISPLAY,KEYBOARD") == rc(K32_OK));
-    CHECK(host.unrecorded_needs().empty());
+    CHECK(unrecorded().empty());
     CHECK(k32test::call_pod("default/job", "/info").body == "{\"info\":0,\"w\":240,\"h\":135,\"f\":1,\"touches\":-1,\"led\":-1}");
     CHECK(rt.terminate("default/job"));
 
@@ -202,7 +207,7 @@ void test_need_call() {
     deploy(rt, "default/plain", pod("", requests));
     CHECK(need("default/plain", "led") == rc(K32_OK));
     CHECK(need("default/plain", "tft-display") == rc(K32_ERR_NODEV));
-    CHECK(host.unrecorded_needs().empty());
+    CHECK(unrecorded().empty());
     CHECK(rt.terminate("default/plain"));
     set_devices(0);
     runtime::set_app_platform_hooks(runtime::AppPlatformHooks{});

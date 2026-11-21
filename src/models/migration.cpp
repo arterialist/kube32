@@ -6,10 +6,12 @@ namespace kube32::models {
 
 namespace {
 
-std::string annotation(const JsonValue& obj, const char* key) {
+// The value in place, empty when absent
+std::string_view annotation(const JsonValue& obj, const char* key) {
     const JsonValue* meta = obj.get("metadata");
     const JsonValue* ann = meta ? meta->get("annotations") : nullptr;
-    return ann ? ann->get_string(key, "") : std::string();
+    const JsonValue* v = ann ? ann->get(key) : nullptr;
+    return v && v->is_string() ? std::string_view(v->str_val) : std::string_view();
 }
 
 constexpr std::string_view kHardwarePrefix = "hardware.kube32.io/";
@@ -98,25 +100,30 @@ uint32_t node_devices(const JsonValue& node) {
     uint32_t devices = 0;
     for (size_t i = 0; res && res->is_object() && i < res->obj_val.size(); ++i) {
         const auto& kv = res->obj_val[i];
-        if (kv.first.rfind(kHardwarePrefix.data(), 0) != 0) continue;
-        const std::string value = kv.second.is_string() ? kv.second.str_val : std::to_string(static_cast<long long>(kv.second.num_val));
-        if (parse_quantity(value) > 0) devices |= device_bit(kv.first);
+        // A count the kubelet writes ("8"), a number, or "0" when it has none
+        const JsonValue& v = kv.second;
+        if (v.is_string() ? !v.str_val.empty() && v.str_val != "0" : v.num_val > 0) devices |= device_bit(kv.first);
     }
     return devices;
 }
 
 int preferred_rank(const JsonValue& pod, const JsonValue& node) {
-    const std::string list = annotation(pod, kAnnotationPreferNodes);
     const JsonValue* meta = node.get("metadata");
+    const JsonValue* name = meta ? meta->get("name") : nullptr;
     const JsonValue* labels = meta ? meta->get("labels") : nullptr;
-    const std::string name = meta ? meta->get_string("name", "") : std::string();
     int rank = 0, found = -1;
-    for_each_entry(list, [&](std::string_view entry) {
+    for_each_entry(annotation(pod, kAnnotationPreferNodes), [&](std::string_view entry) {
         const size_t eq = entry.find('=');
-        const bool match = eq == std::string_view::npos
-            ? entry == name
-            : labels && labels->get(std::string(trim(entry.substr(0, eq)))) &&
-                  labels->get_string(std::string(trim(entry.substr(0, eq))), "") == trim(entry.substr(eq + 1));
+        bool match = false;
+        if (eq == std::string_view::npos) {
+            match = name && name->is_string() && entry == name->str_val;
+        } else {
+            const std::string_view key = trim(entry.substr(0, eq)), value = trim(entry.substr(eq + 1));
+            for (size_t i = 0; labels && labels->is_object() && i < labels->obj_val.size() && !match; ++i) {
+                const auto& kv = labels->obj_val[i];
+                match = kv.first == key && kv.second.is_string() && kv.second.str_val == value;
+            }
+        }
         if (match) found = rank;
         ++rank;
         return !match;
@@ -125,7 +132,7 @@ int preferred_rank(const JsonValue& pod, const JsonValue& node) {
 }
 
 MigrationPolicy migration_policy(const JsonValue& pod) {
-    const std::string p = annotation(pod, kAnnotationMigration);
+    const std::string_view p = annotation(pod, kAnnotationMigration);
     if (p == "Never") return MigrationPolicy::Never;
     if (p == "Auto") return MigrationPolicy::Auto;
     return MigrationPolicy::OnDrain;

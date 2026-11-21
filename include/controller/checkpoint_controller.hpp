@@ -174,7 +174,7 @@ private:
     std::map<std::string, uint64_t> auto_moved_;      // ns/pod -> when an Auto policy last moved it
     std::map<std::string, uint64_t> pressure_moved_;  // node -> when memory pressure last moved a pod off it
     std::map<std::string, uint64_t> need_moved_;      // ns/pod -> when its hardware need last moved it
-    std::map<std::string, std::string> need_failed_;  // ns/pod -> the need its last MoveFailed named
+    std::map<std::string, uint64_t> need_failed_;     // ns/pod -> the devices its last MoveFailed named
     ReconcileTrigger trigger_;
     std::unique_ptr<osal::Thread> thread_;
     std::atomic<bool> running_{false};
