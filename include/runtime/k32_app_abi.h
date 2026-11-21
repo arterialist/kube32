@@ -227,6 +227,11 @@ static inline float k32_expf(float x) {
     return p * scale;
 }
 
+/* k32_need (below): the node lacks a device the list names and the pod
+ * moves to one that has them; the longest list it takes */
+#define K32_NEED_MOVING     1
+#define K32_NEED_MAX_BYTES  256
+
 /* Modes for esp32_gpio_set_mode */
 #define K32_GPIO_INPUT          0
 #define K32_GPIO_OUTPUT         1
@@ -595,6 +600,37 @@ K32_IMPORT("k32_touch_read")   int32_t k32_touch_read(k32_touch_point_t* points,
  * K32_ERR_INVAL for an index past the board's LEDs, K32_ERR_BUSY while pods
  * hold every RMT TX channel, or K32_ERR_NODEV on a node without one. */
 K32_IMPORT("k32_led_set")      int32_t k32_led_set(uint32_t index, uint32_t rgb);
+
+/* ---- Hardware-following pods (docs/migration.md) ----------------------
+ * A pod with the annotations kube32.io/migration: Auto and
+ * kube32.io/placement: hardware lists in its spec every on-board device it
+ * uses over its life (hardware.kube32.io/tft-display, keyboard, touch,
+ * speaker, microphone, led, chip-temp, or their capabilities). On each node
+ * it holds the grants of those the node has. k32_need tells the node which
+ * of them the pod's current step needs: a comma-separated list of resource
+ * names ("hardware.kube32.io/speaker"), the part after
+ * "hardware.kube32.io/" ("speaker") or capability names ("SPEAKER"); an
+ * empty list for none. The call returns at once:
+ *
+ *   K32_OK           the pod holds every named grant on this node
+ *   K32_NEED_MOVING  the node lacks one: the kubelet records the need on the
+ *                    Pod (annotation kube32.io/needs) and the control plane
+ *                    moves the pod, with its state, to a node that has them.
+ *                    The pod runs on until it is frozen; k32_restored runs
+ *                    on the new node, where k32_need with the same list
+ *                    returns K32_OK. Until then it returns K32_NEED_MOVING.
+ *   K32_ERR_PERM     the spec does not list a named device
+ *   K32_ERR_NODEV    the node lacks one and the pod does not follow its
+ *                    hardware
+ *   K32_ERR_INVAL    an entry names no on-board device, or the list is
+ *                    longer than K32_NEED_MAX_BYTES
+ *   K32_ERR_FAULT    the list is outside linear memory
+ *
+ * The node records each change of the need, met or not, so the Pod shows
+ * the current one. The hardware's state stays on the node it was set on: a
+ * pod turns the LED off and lets its sound end before it needs other
+ * hardware, and sets the hardware up again in k32_restored. */
+K32_IMPORT("k32_need")         int32_t k32_need(const char* resources, uint32_t len);
 
 /* ---- Pod storage imports, gated by hardware.kube32.io/sd -------------- */
 K32_IMPORT("k32_fs_open")   int32_t k32_fs_open(const char* path, uint32_t path_len, uint32_t flags);   /* fd (0..3) or error */

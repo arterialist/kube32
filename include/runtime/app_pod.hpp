@@ -332,6 +332,17 @@ public:
     // kRestoreErrorPrefix); -2 when k32_restored returned non-zero (`why`).
     int restore_pod(const std::string& pod_id, const SnapshotStream& stream, std::string& why);
 
+    // Hardware-following pods (docs/migration.md#hardware-following-pods) --
+    // k32_need: the result for the devices `list` names (K32_OK, K32_NEED_MOVING
+    // or a K32_ERR_*). A hardware-following pod's need is kept for the
+    // kubelet to record on the Pod.
+    int32_t need(const std::string& pod_id, std::string_view list);
+    // A need of this node's pods that its Pod does not show yet; false when
+    // every Pod shows its pod's need
+    bool unrecorded_need(std::string& pod_id, uint32_t& devices) const;
+    // The Pod shows `devices` as the pod's need
+    void need_recorded(const std::string& pod_id, uint32_t devices);
+
 private:
     AppPodHost() = default;
     struct Entry {
@@ -366,6 +377,8 @@ private:
     struct MigrationInfo {
         std::string container;
         std::vector<std::string> blockers;
+        uint32_t need{0};       // the devices of the pod's last k32_need
+        uint32_t recorded{0};   // the devices its Pod's kube32.io/needs names
     };
     std::map<std::string, MigrationInfo> migration_;
     void set_busy(const std::string& pod_id, const char* fn);

@@ -43,7 +43,7 @@ Pods share each device that a `hardware.kube32.io/*` resource grants, and a pod 
 | `hardware.kube32.io/tft-display`, `keyboard`, `speaker`, `microphone`, `touch`, `led` | Boards with the devices on board (the Cardputer profile has a display, keyboard, speaker and microphone; the `s31-coreboard` profile a speaker, microphone and RGB LED; the `atoms3-lite` profile an RGB LED; a Linux board, the framebuffer, keyboard and sound card that opened) |
 | `hardware.kube32.io/sd` | Nodes with a mounted microSD card ([storage](storage.md)) |
 
-A resource that a node no longer has (a card taken out, a board profile changed between boots) is set to `null` in the next status write and leaves the Node. The scheduler does not filter on these resources; the firewall checks the grants at admission.
+A resource that a node no longer has (a card taken out, a board profile changed between boots) is set to `null` in the next status write and leaves the Node. The scheduler does not filter on these resources; the firewall checks the grants at admission. A [hardware-following pod](migration.md#hardware-following-pods) is the exception: the scheduler binds it to a node with the devices of its current step, and on each node the firewall grants it the devices it lists that the node has.
 
 ## Host functions
 

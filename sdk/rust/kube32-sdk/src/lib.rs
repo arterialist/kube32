@@ -16,7 +16,7 @@
 //! ```
 //!
 //! The macro exports `k32_alloc` and `k32_handle` (plus `k32_init`,
-//! `k32_tick`, `k32_event` when given); the host looks them up by name
+//! `k32_restored`, `k32_tick`, `k32_event` when given); the host looks them up by name
 //! (`include/runtime/k32_app_abi.h`). Build with
 //! `cargo build --release --target wasm32-unknown-unknown` and the link flags
 //! in `sdk/rust/.cargo/config.toml`, or with `tools/kube32-cli build`.
@@ -29,8 +29,8 @@
 //! * `panic-handler` (default): a `#[panic_handler]` that logs through
 //!   `k32_log` and traps.
 //! * `hardware`: [`hardware`] wraps `k32_display_*`, `k32_key_read`,
-//!   `k32_tone`, `k32_led_set` and the infrared imports `esp32_rmt_send` and
-//!   `esp32_rmt_receive`.
+//!   `k32_tone`, `k32_led_set`, `k32_need` and the infrared imports
+//!   `esp32_rmt_send` and `esp32_rmt_receive`.
 //! * `fs`: [`fs`] wraps the `k32_fs_*` imports (pod storage on the microSD card).
 //! * `linalg`: [`linalg`] wraps the native products for quantized neural
 //!   networks (`k32_matvec_*`, `k32_matmul_*`, `k32_vecmat_f32_i8`,
@@ -213,13 +213,14 @@ macro_rules! __k32_alloc_bytes {
 }
 
 /// Exports the request-pod entry points. Keys are optional but must appear
-/// in this order: `alloc` (buffer size in bytes), `init`, `handle`, `tick`,
-/// `event`.
+/// in this order: `alloc` (buffer size in bytes), `init`, `restored`,
+/// `handle`, `tick`, `event`.
 ///
 /// ```ignore
 /// kube32_app! {
 ///     alloc: 4096,              // optional, default DEFAULT_ALLOC_BYTES
 ///     init: init,               // fn() -> i32
+///     restored: restored,       // fn() -> i32, instead of init after a move (docs/migration.md)
 ///     handle: handle,           // fn(&Request) -> i32
 ///     tick: tick,               // fn(uptime_ms: u32) -> i32   (1 when more work is pending)
 ///     event: on_event,          // fn(topic: &str, data: &[u8]) -> i32
@@ -230,6 +231,7 @@ macro_rules! kube32_app {
     (
         $(alloc: $alloc:expr,)?
         $(init: $init:path,)?
+        $(restored: $restored:path,)?
         $(handle: $handle:path,)?
         $(tick: $tick:path,)?
         $(event: $event:path,)?
@@ -250,6 +252,14 @@ macro_rules! kube32_app {
             #[no_mangle]
             pub extern "C" fn k32_init() -> i32 {
                 let f: fn() -> i32 = $init;
+                f()
+            }
+        )?
+
+        $(
+            #[no_mangle]
+            pub extern "C" fn k32_restored() -> i32 {
+                let f: fn() -> i32 = $restored;
                 f()
             }
         )?

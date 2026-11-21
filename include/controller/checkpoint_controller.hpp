@@ -36,7 +36,13 @@
 // kube32.io/placement: fastest to the node with the highest
 // kube32.io/interp-mops when it is at least twice as fast. A move of such a
 // pod without a target (an eviction) goes to the fastest node that fits.
-// Auto moves happen at most once per pod per auto_cooldown_ms.
+// Auto moves happen at most once per pod per auto_cooldown_ms. With
+// kube32.io/placement: hardware the pod moves, at most once per
+// need_cooldown_ms, to the node the scheduler picks for the devices its step
+// needs (kube32.io/needs, which its kubelet records from k32_need) when its
+// node lacks one of them; when no node has them, a MoveFailed event names
+// the need once and a pass after a Node change tries again (trigger label
+// hardware).
 //
 // kube32.io/checkpoint-interval takes a Save checkpoint (label
 // kube32.io/trigger: periodic) of a running pod at that interval (at least
@@ -94,6 +100,7 @@ struct CheckpointControllerConfig {
     uint32_t keep_ms{3600000};               // finished Save, Move and Failed checkpoints are kept this long
     uint32_t auto_cooldown_ms{600000};
     uint32_t pressure_cooldown_ms{60000};
+    uint32_t need_cooldown_ms{3000};         // between two moves a pod's hardware need asks for
     uint32_t min_interval_ms{10000};
     // Wall clock in Unix milliseconds, 0 while unset. Empty: osal::System.
     std::function<uint64_t()> unix_time_ms;
@@ -132,6 +139,11 @@ private:
     void give_up(Ckpt& ck, const std::string& message, const std::vector<std::string>& blockers = {});
     void finish_restores(Pods& pods, const std::vector<Node>& nodes, const std::vector<Ckpt>& cks);
     void policies(Pods& pods, const std::vector<Node>& nodes, const std::vector<Ckpt>& cks, uint64_t now);
+    // A hardware-following pod `key` (ns/name) on `here`: a Move to the node
+    // the scheduler picks for its need when `here` lacks part of it, at most
+    // once per need_cooldown_ms; a MoveFailed event, once for each need, when
+    // no node has it. True when the pod moves or waits for its cooldown.
+    bool follow_need(const models::JsonValue& pod, const std::string& key, const Node& here, uint64_t now);
     void retention(Pods& pods, const std::vector<Ckpt>& cks, uint64_t now);
     std::string pick_target(const Ckpt& ck, const models::JsonValue& pod, const std::vector<Node>& nodes, std::string& why);
     // The pod's state from its kubelet into the checkpoint's data: POST
@@ -161,6 +173,8 @@ private:
     std::map<std::string, uint64_t> last_periodic_;   // ns/pod -> when its last periodic checkpoint was asked for
     std::map<std::string, uint64_t> auto_moved_;      // ns/pod -> when an Auto policy last moved it
     std::map<std::string, uint64_t> pressure_moved_;  // node -> when memory pressure last moved a pod off it
+    std::map<std::string, uint64_t> need_moved_;      // ns/pod -> when its hardware need last moved it
+    std::map<std::string, uint64_t> need_failed_;     // ns/pod -> the devices its last MoveFailed named
     ReconcileTrigger trigger_;
     std::unique_ptr<osal::Thread> thread_;
     std::atomic<bool> running_{false};

@@ -2,6 +2,7 @@
 #include "api/event_recorder.hpp"
 #include "controller/reconcile_trigger.hpp"
 #include "models/kube_models.hpp"
+#include "models/migration.hpp"
 #include "osal/system.hpp"
 #include "osal/thread.hpp"
 
@@ -775,6 +776,10 @@ private:
         }
 
         ResourceSpec pod_req = pod_resource_requests(pod_doc);
+        // A hardware-following pod fits only nodes with its current need;
+        // kube32.io/prefer-nodes ranks the nodes that fit any pod
+        const uint32_t need = models::follows_hardware(pod_doc) ? models::pod_needs(pod_doc) : 0;
+        const bool prefers = in_out_pod_json.find(models::kAnnotationPreferNodes) != std::string::npos;
 
         // Fetch all nodes
         std::vector<std::string> node_jsons;
@@ -784,6 +789,8 @@ private:
             std::string name;
             std::string ip{"127.0.0.1"};
             int64_t total_score{0};
+            uint32_t devices{0};   // its on-board devices, read for a pod with a need
+            int rank{-1};          // the first kube32.io/prefer-nodes entry it matches
         };
 
         std::vector<Candidate> qualified;
@@ -806,6 +813,8 @@ private:
             if (addrs && addrs->is_array() && !addrs->arr_val.empty()) {
                 n_info[i].ip = addrs->arr_val[0].get_string("address", "127.0.0.1");
             }
+            if (need) n_info[i].devices = models::node_devices(n_doc);
+            if (prefers) n_info[i].rank = models::preferred_rank(pod_doc, n_doc);
         }
         std::map<std::string, ResourceSpec> used_by_node = allocated_by_node(store_, node_versions, exclude_pod_key);
 
@@ -827,12 +836,17 @@ private:
                     break;
                 }
             }
+            if (const uint32_t missing = need & ~n_info[i].devices; passes && missing) {
+                passes = false;
+                reasons["Insufficient " + models::devices_text(missing & (0u - missing))]++;   // the first one missing
+            }
 
             if (passes) {
                 Candidate cand = n_info[i];
 
-                // Calculate score
-                int64_t score_sum = 0;
+                // Calculate score. A preferred node's rank outweighs the
+                // scorers' 0 to 100.
+                int64_t score_sum = cand.rank < 0 ? 0 : 1000 * (64 - std::min(cand.rank, 63));
                 for (const auto& s_entry : scorers_) {
                     score_sum += static_cast<int64_t>(s_entry.first->score(in_out_pod_json, n_json, pod_req, node_alloc, node_used) * s_entry.second);
                 }

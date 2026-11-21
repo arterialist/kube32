@@ -768,6 +768,15 @@ static const void* raw_led_set(IM3Runtime rt, IM3ImportContext ictx, uint64_t* s
     return m3Err_none;
 }
 
+// k32_need(resources, len) -> K32_OK, K32_NEED_MOVING or K32_ERR_*
+static const void* raw_need(IM3Runtime rt, IM3ImportContext ictx, uint64_t* sp, void* mem) {
+    const uint32_t off = static_cast<uint32_t>(sp[1]), len = static_cast<uint32_t>(sp[2]);
+    *reinterpret_cast<int32_t*>(sp) = guest_range_ok(mem, off, len)
+        ? AppPodHost::instance().need(pod_for(rt, ictx), std::string_view(static_cast<const char*>(mem) + off, len))
+        : K32_ERR_FAULT;
+    return m3Err_none;
+}
+
 // k32_mic_read(out, max_samples, timeout_ms) -> samples or K32_ERR_*
 static const void* raw_mic_read(IM3Runtime rt, IM3ImportContext ictx, uint64_t* sp, void* mem) {
     const std::string& pod_id = pod_for(rt, ictx);
@@ -917,6 +926,7 @@ void link_app_host_functions(IM3Module module, const std::string& pod_id) {
     m3_LinkRawFunction(module, "env", "k32_display_info", "i(iii)",     &raw_display_info);
     m3_LinkRawFunction(module, "env", "k32_touch_read",   "i(ii)",      &raw_touch_read);
     m3_LinkRawFunction(module, "env", "k32_led_set",      "i(ii)",      &raw_led_set);
+    m3_LinkRawFunction(module, "env", "k32_need",         "i(ii)",      &raw_need);
     m3_LinkRawFunction(module, "env", "k32_fs_open",      "i(iii)",     &raw_fs_open);
     m3_LinkRawFunction(module, "env", "k32_fs_read",      "i(iii)",     &raw_fs_read);
     m3_LinkRawFunction(module, "env", "k32_fs_write",     "i(iii)",     &raw_fs_write);

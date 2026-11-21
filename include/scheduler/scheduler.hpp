@@ -177,6 +177,13 @@ public:
                   const ResourceSpec& node_allocated) override;
 };
 
+// Besides the predicates and scorers, every evaluation reads two pod
+// annotations with the node documents it parses anyway: a hardware-following
+// pod (kube32.io/placement: hardware) fits only a node that offers every
+// device of its current step (kube32.io/needs), whatever else its spec lists
+// ("Insufficient hardware.kube32.io/<device>"), and with
+// kube32.io/prefer-nodes a node that matches an earlier entry scores above
+// one that matches a later entry or none, whatever the scorers say.
 class Scheduler {
 public:
     virtual ~Scheduler() = default;
