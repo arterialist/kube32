@@ -1,7 +1,8 @@
 #pragma once
 
 // Build identity of this binary, as served by GET /version and used for the
-// kubernetes.io/arch node label.
+// kubernetes.io/arch and kubernetes.io/os node labels and the Node's
+// status.nodeInfo.architecture and operatingSystem.
 
 #include <string>
 
@@ -16,7 +17,7 @@ struct BuildInfo {
     const char* build_date;      // RFC 3339 UTC time the build info was generated
     std::string compiler;        // compiler name and version, e.g. "gcc 14.2.0"
     const char* os;              // "darwin", "linux" or "freertos"
-    const char* arch;            // "arm64", "amd64" or "xtensa"
+    const char* arch;            // "arm64", "amd64", "xtensa" or "riscv32"
 };
 
 const BuildInfo& build_info();

@@ -20,7 +20,7 @@ Select the peripheral profile with `K32_CMD:BOARD:cardputer|atoms3-lite|s31-core
 | `atoms3-lite` | `kube32.io/board: atoms3-lite` | 9 GPIO, 6 ADC, 1 I2C, 1 UART, 3 RMT TX, RGB LED, chip temperature | I2C0 or UART1 on Grove port GPIO 2/1; RMT TX on GPIO 4 (IR LED) |
 | `s31-coreboard` | `kube32.io/board: s31-coreboard` | 22 GPIO and 3 input-only pins, 8 ADC, 2 I2C, 2 UART, 3 RMT TX, speaker, microphone, RGB LED, chip temperature | I2C0 on GPIO 2/3, UART1 on GPIO 38/39 |
 
-Control plane nodes also carry the `node-role.kubernetes.io/control-plane` label, and worker nodes carry `node-role.kubernetes.io/worker`.
+Control plane nodes also carry the `node-role.kubernetes.io/control-plane` label, and worker nodes carry `node-role.kubernetes.io/worker`. Every node carries `kubernetes.io/arch` (`xtensa` on the ESP32-S3, `riscv32` on the RISC-V chips) and `kubernetes.io/os` (`freertos` on a board), the same values as its `status.nodeInfo.architecture` and `operatingSystem` ([Node labels and system info](api-reference.md#node-labels-and-system-info)).
 
 ## Cardputer pins
 

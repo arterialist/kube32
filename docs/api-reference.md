@@ -112,6 +112,35 @@ See [Pod migration](migration.md) for the phases and the retention of Checkpoint
 | `kube32.io/interp-mops` | Kubelet, once at boot | The interpreter's speed: millions of wasm3 operations per second on a fixed integer kernel, timed on the stack and memory the node gives pods: the fastest of 10 runs a random 25 to 75 ms apart, by the CPU time the interpreter ran, e.g. `"6.88"` on a Cardputer |
 | `kube32.io/interp-check` | Kubelet, once at boot | `ok` when the interpreter computes 64-bit integer values right on a fixed module: a global, `i64.load` in each form, locals and arguments over a call, and a host call's result. Otherwise `failed: <step>`, and pods on the node get wrong 64-bit values |
 
+## Node labels and system info
+
+Every kubelet sets these labels on its Node when it registers, and again over a Node that outlived it:
+
+| Label | Value |
+| --- | --- |
+| `kubernetes.io/hostname` | The node's name |
+| `kubernetes.io/arch` | The CPU architecture the node's build runs on: `xtensa` (ESP32-S3), `riscv32` (ESP32-S31, ESP32-C3, ESP32-P4), `arm64` or `amd64` (`kube32-sim`) |
+| `kubernetes.io/os` | `freertos` on a board, `linux` or `darwin` for `kube32-sim` by its host |
+| `node-role.kubernetes.io/control-plane`, `node-role.kubernetes.io/worker` | The node's role, empty value |
+| `kube32.io/board` | The board profile ([Board profiles and labels](hardware-spec.md#board-profiles-and-labels)) |
+
+The architecture and OS names follow Go's `GOARCH` and `GOOS` where Go has one; Xtensa and 32-bit RISC-V have none, so they are `xtensa` and `riscv32`. Heartbeats leave labels as they are, so a label a user sets stays.
+
+`status.nodeInfo` carries the same build facts:
+
+| Field | Value |
+| --- | --- |
+| `architecture` | As `kubernetes.io/arch` |
+| `operatingSystem` | As `kubernetes.io/os` |
+| `osImage` | `kube32 <version> (<ESP-IDF version or host OS>)` |
+| `kernelVersion` | `FreeRTOS <version>` on a board, the host kernel's release for `kube32-sim` |
+| `kubeletVersion` | `v1.33.0-kube32` |
+| `containerRuntimeVersion` | `wasm3://<version>` |
+
+```
+kubectl --context kube32 get nodes -L kubernetes.io/arch,kubernetes.io/os
+```
+
 ## kubectl and k9s
 
 `kubectl` and `k9s` work without extra flags. Supported commands include `get`, `describe`, `apply`, `create`, `delete`, `patch`, `scale`, `logs`, `top`, `events`, `cordon`, `uncordon`, `drain` and `auth can-i`.

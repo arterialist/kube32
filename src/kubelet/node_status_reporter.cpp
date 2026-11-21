@@ -325,6 +325,8 @@ void NodeStatusReporter::append_registration(Out& json, const NodeTelemetry& tel
     json += node_name_;
     json += "\",\"kubernetes.io/arch\":\"";
     json += api::build_info().arch;
+    json += "\",\"kubernetes.io/os\":\"";
+    json += api::build_info().os;
     json += "\",";
     for (const auto& kv : labels_) {
         json += "\"";
@@ -374,6 +376,10 @@ void NodeStatusReporter::append_registration(Out& json, const NodeTelemetry& tel
     json += osal::System::get_kernel_version();
     json += "\",\"containerRuntimeVersion\":\"wasm3://";
     json += M3_VERSION;
+    json += "\",\"operatingSystem\":\"";
+    json += api::build_info().os;
+    json += "\",\"architecture\":\"";
+    json += api::build_info().arch;
     json += "\"},";
     // Over a Node from an earlier boot, every resource this boot does not have goes
     const uint32_t clear = as_patch ? ~0u : 0u;

@@ -84,7 +84,8 @@ struct KubeletConfig {
     std::string api_token;                 // bearer token for the API server, empty when it has none
     size_t api_max_body{0};                // largest API response kept in memory (0: no limit)
     // Labels the node sets on its Node object besides kubernetes.io/hostname,
-    // kubernetes.io/arch and the role label (for example kube32.io/board).
+    // kubernetes.io/arch, kubernetes.io/os and the role label (for example
+    // kube32.io/board).
     std::map<std::string, std::string> node_labels;
     // Labels the node finds on itself (attached hardware), read before
     // registering and every node_label_refresh_ms after; changes are patched
