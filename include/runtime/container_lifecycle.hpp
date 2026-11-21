@@ -95,6 +95,15 @@ TrapReport describe_trap(const char* trap, const TrapContext& ctx);
 // from the heap.
 void run_on_interpreter_stack(mem::FunctionRef<void()> fn);
 
+// Every call into a pod's module begins here: the thread rounds floating
+// point to nearest, ties to even, as Wasm requires, whatever mode it held.
+// A thread found in another mode is set back, counted and, the first time,
+// logged with the pod's id.
+void begin_wasm_call(const std::string& pod_id);
+
+// The calls that began in another rounding mode (begin_wasm_call)
+uint32_t rounding_mode_resets();
+
 // Whether a module loading now gets the compiler's scratch lent from the
 // shared interpreter stack (boards without PSRAM) instead of allocating it.
 bool compile_scratch_lent();
