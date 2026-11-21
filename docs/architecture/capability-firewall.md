@@ -30,6 +30,12 @@ The firewall reads `resources.requests`, or `resources.limits` if `requests` is 
 
 A volume declared with `persistentVolumeClaim` grants `k32_fs_*` on the node storage root without `hardware.kube32.io/sd`. Adding `hardware.kube32.io/sd: "1"`, `SD`, or a `kube32.io/sd` volume requires a mounted microSD card. Unrecognized capability names in `securityContext.capabilities.add` are ignored.
 
+## Hardware-following pods
+
+A pod with the annotations `kube32.io/migration: Auto` and `kube32.io/placement: hardware` lists every on-board device of its life ([Hardware-following pods](../migration.md#hardware-following-pods)). On each node, its grant holds the devices it lists that the node has: the board profile's on-board devices (`BoardProfile::onboard_devices`) and, where the board reads it, the chip's temperature. Admission does not fail for a listed device the node lacks; a call to it returns `K32_ERR_PERM` and logs a violation, as any ungranted call does. The record keeps the devices the spec lists (`PodSecurityRecord::listed_devices`), which `k32_need` checks a step's list against: a device outside them is `K32_ERR_PERM`. Pins, buses, channels, I2C device grants and volumes are claimed as for any pod.
+
+The on-board devices hold no per-pod state in the firewall: a grant is a bit of the pod's record. When the kubelet stops a pod that moved away, `unregister_pod` drops the record and the node's devices are free for other pods.
+
 ## Buses and pin annotations
 
 Claiming an I2C bus or UART port claims its two GPIO pins and installs the ESP-IDF `i2c_master` or `uart_driver_install` driver while the pod runs. Calling `esp32_i2c_write` with length `0` probes an address, returning `0` on ACK or `-19` when no device answers.

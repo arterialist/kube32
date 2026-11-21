@@ -95,11 +95,13 @@ See [Pod migration](migration.md) for the phases and the retention of Checkpoint
 | Annotation | On | Meaning |
 | --- | --- | --- |
 | `kube32.io/migration` | Pod | `OnDrain` (default), `Never` or `Auto`. See [Policies](migration.md#policies) |
-| `kube32.io/placement` | Pod | `fastest`: with `Auto`, run on the fastest node, by `kube32.io/interp-mops` |
+| `kube32.io/placement` | Pod | With `Auto`: `fastest` runs the pod on the fastest node, by `kube32.io/interp-mops`; `hardware` on a node with the devices its current step needs. See [Hardware-following pods](migration.md#hardware-following-pods) |
+| `kube32.io/needs` | Pod | The devices the current step of a hardware-following pod needs: resource names such as `hardware.kube32.io/speaker`, comma-separated, empty for none. The pod's kubelet writes it from `k32_need`; the scheduler and the Checkpoint controller place the pod by it |
+| `kube32.io/prefer-nodes` | Pod | Nodes the scheduler prefers among those that fit the pod, best first: node names or `<label>=<value>`, comma-separated. A node that matches an earlier entry wins over the other scores |
 | `kube32.io/checkpoint-interval` | Pod | Save the pod's state at this interval (`"60s"`, `"5m"`), 10 s at the least |
 | `kube32.io/restore-from` | Pod | The Checkpoint the kubelet restores the pod from. The Checkpoint controller and the node lifecycle controller set it and remove it once the pod runs |
 | `kube32.io/interp-mops` | Node | Interpreter speed the node measured at boot, millions of wasm3 operations per second |
-| `kube32.io/trigger` (label) | Checkpoint | What created it: `periodic`, `eviction`, `memory-pressure` or `placement` |
+| `kube32.io/trigger` (label) | Checkpoint | What created it: `periodic`, `eviction`, `memory-pressure`, `placement` or `hardware` |
 
 `POST /apis/kube32.io/v1/egress` is the egress gateway: it makes the `https://` calls of pods on workers, for nodes only. See [Networking](networking.md#egress-gateway).
 
