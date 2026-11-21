@@ -21,6 +21,7 @@
 #include "m3_host.h"
 
 #include <iostream>
+#include <cstdio>
 #include <cstring>
 #include <algorithm>
 #include <vector>
@@ -28,6 +29,11 @@
 #if defined(ESP_PLATFORM)
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#if defined(__XTENSA__)
+#include "xtensa/config/core-isa.h"
+#endif
+#else
+#include <cfenv>
 #endif
 
 #if defined(ESP_PLATFORM)
@@ -122,6 +128,14 @@ extern "C" void esp_hw_stack_guard_monitor_start(void);
 extern "C" void esp_hw_stack_guard_monitor_stop(void);
 extern "C" void esp_hw_stack_guard_set_bounds(uint32_t sp_min, uint32_t sp_max);
 
+#if SOC_CPU_COPROC_NUM > 0
+// The FreeRTOS port saves a task's coprocessor registers (FPU, hardware
+// loops, PIE) lazily, in areas it finds from a table just below the task's
+// end of stack (TCB pxEndOfStack), and allocates those areas from the low
+// end of the stack on first use
+extern "C" RvCoprocSaveArea* pxPortGetCoprocArea(StaticTask_t* task, bool allocate, int coproc);
+#endif
+
 static void call_on_shared_stack(SemaphoreHandle_t lock, void* stack_base, size_t size, void (*function)(void)) {
     auto* tcb = reinterpret_cast<StaticTask_t*>(xTaskGetCurrentTaskHandle());
     xSemaphoreTake(lock, portMAX_DELAY);
@@ -131,6 +145,23 @@ static void call_on_shared_stack(SemaphoreHandle_t lock, void* stack_base, size_
     memset(stack, 0xa5, size);
     auto* top = reinterpret_cast<StackType_t*>((reinterpret_cast<uintptr_t>(stack) + size + 15) & ~static_cast<uintptr_t>(15)) -
                 RV_STK_FRMSZ / sizeof(StackType_t);
+    StackType_t* sp_start = top;
+#if SOC_CPU_COPROC_NUM > 0
+    // The TCB's stack bounds name the shared stack during the call (stack
+    // guard, overflow checks), so the port looks for the coprocessor table
+    // below its end. A copy of the task's table goes there, above the call's
+    // frames, and its save areas stay in the task's own stack, allocated
+    // before the switch: an FPU context switch during the call saves and
+    // restores this task's registers, rounding mode included, where they
+    // belong. Without the copy the port reads the table from the call's own
+    // frames and loads fcsr from wherever they point.
+    RvCoprocSaveArea* own = nullptr;
+    for (int i = 0; i < SOC_CPU_COPROC_NUM; ++i) own = pxPortGetCoprocArea(tcb, true, i);
+    auto* copy = reinterpret_cast<RvCoprocSaveArea*>((reinterpret_cast<uintptr_t>(top) - sizeof(RvCoprocSaveArea)) & ~static_cast<uintptr_t>(15));
+    *copy = *own;
+    sp_start = reinterpret_cast<StackType_t*>(copy);
+#endif
+    // Read after the allocation above, which raises the task's stack start
     void* task_sp_min = tcb->pxDummy6;
     void* task_sp_max = tcb->pxDummy8;
     tcb->pxDummy6 = stack;
@@ -143,7 +174,7 @@ static void call_on_shared_stack(SemaphoreHandle_t lock, void* stack_base, size_
     esp_hw_stack_guard_set_bounds(reinterpret_cast<uint32_t>(tcb->pxDummy6), reinterpret_cast<uint32_t>(tcb->pxDummy8));
 #endif
     register void (*const fn)(void) asm("s9") = function;
-    register StackType_t* const new_sp asm("s10") = top;
+    register StackType_t* const new_sp asm("s10") = sp_start;
     __asm__ volatile(
         "mv t0, sp\n"
         "mv sp, s10\n"
@@ -160,6 +191,9 @@ static void call_on_shared_stack(SemaphoreHandle_t lock, void* stack_base, size_
     esp_hw_stack_guard_monitor_stop();
 #endif
     __asm__ volatile("lw sp, 0(sp)\n" : : : "memory");
+#if SOC_CPU_COPROC_NUM > 0
+    *own = *copy;   // the coprocessors the call began to use
+#endif
     tcb->pxDummy6 = task_sp_min;
     tcb->pxDummy8 = task_sp_max;
 #if CONFIG_FREERTOS_WATCHPOINT_END_OF_STACK
@@ -193,6 +227,46 @@ void run_on_interpreter_stack(mem::FunctionRef<void()> fn) {
     }
 #endif
     fn();
+}
+
+static std::atomic<uint32_t> s_rounding_resets{0};
+
+uint32_t rounding_mode_resets() { return s_rounding_resets.load(); }
+
+// Sets the thread's floating-point rounding mode to round to nearest, ties
+// to even, as Wasm requires; true when it was another one (`found`). Covers
+// the target's FPU (RISC-V F: frm, which libgcc's soft-float doubles read
+// too; Xtensa FP: FCR) and the host's floating-point environment.
+static bool round_to_nearest(uint32_t& found) {
+#if defined(__riscv) && defined(__riscv_flen)
+    __asm__ volatile("frrm %0" : "=r"(found));
+    if (found == 0) return false;
+    __asm__ volatile("fsrm zero");
+    return true;
+#elif defined(__XTENSA__) && XCHAL_HAVE_FP
+    uint32_t fcr = 0;
+    __asm__ volatile("rur.fcr %0" : "=r"(fcr));
+    found = fcr & 3;
+    if (found == 0) return false;
+    __asm__ volatile("wur.fcr %0" : : "r"(fcr & ~3u));
+    return true;
+#elif !defined(ESP_PLATFORM)
+    const int mode = std::fegetround();
+    found = static_cast<uint32_t>(mode);
+    if (mode == FE_TONEAREST) return false;
+    std::fesetround(FE_TONEAREST);
+    return true;
+#else
+    (void)found;
+    return false;
+#endif
+}
+
+void begin_wasm_call(const std::string& pod_id) {
+    uint32_t found = 0;
+    if (round_to_nearest(found) && s_rounding_resets.fetch_add(1) == 0) {
+        printf("[RUNTIME] %s: a call began in rounding mode 0x%x, set to round-to-nearest\n", pod_id.c_str(), (unsigned)found);
+    }
 }
 
 static osal::RecursiveMutex s_wasm3_global_mutex;
@@ -602,6 +676,7 @@ void ContainerLifecycleController::run_entry_point() {
 
     if (entry_fn) {
         runtime->lastMemoryGrowError = m3Err_none;
+        begin_wasm_call(config_.pod_id);
         M3Result r = m3_CallV(entry_fn);
 
         if (r == m3Err_none) {
@@ -955,6 +1030,7 @@ int32_t ContainerLifecycleController::call_function(const std::string& fn_name, 
         const uint8_t* base = static_cast<const uint8_t*>(m3_HostStackBase());
         native_left = (base && base < here) ? static_cast<uint64_t>(here - base) : 0;
         on_interpreter = kube32_interp_stack_base_for(here) != nullptr;
+        begin_wasm_call(config_.pod_id);
         if (argc == 0) {
             call_r = m3_CallV(fn);
         } else if (argc == 1) {

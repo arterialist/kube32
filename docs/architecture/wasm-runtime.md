@@ -82,6 +82,14 @@ Boards without PSRAM keep one `k32_tick` thread and one `k32_events` thread on c
 
 Every call into a pod (`k32_init`, `k32_alloc`, `k32_handle`, `k32_tick`, `k32_event`) starts with a fresh wasm3 gas budget, default 4,000,000,000 units. The pod annotation `kube32.io/execution-budget` sets the unit count, or `"off"` or `"0"` to disable metering. Unmetered pods run 25 to 60 percent faster, but their calls cannot be interrupted mid-call. Stopping a pod interrupts metered guest loops and wakes blocking host calls (`esp32_delay_ms`, `kube32_channel_recv`, `k32_tone`, `k32_http_call`).
 
+## Floating point
+
+`f32` and `f64` operations round to nearest, ties to even, on every node, as Wasm requires. The ESP32-S3 and ESP32-S31 compute `f32` in their single-precision FPUs and `f64` in libgcc's software routines. `kube32-sim` uses the host's FPU. A module computes the same bits on every node, apart from the payload bits of NaN results, so a pod that integrates a simulation continues it bit for bit after a [move](../migration.md).
+
+Every call into a pod, the entry point of an entry-point pod included, begins in round-to-nearest. A calling thread found in another rounding mode is set back to it, and the node logs the first such call: `[RUNTIME] <pod>: a call began in rounding mode 0x<mode>, set to round-to-nearest`. The mode is the FPU's `frm` field on RISC-V, its `FCR` rounding bits on Xtensa, and the host's floating-point environment in `kube32-sim`.
+
+On the ESP32-S31, libgcc's software doubles take their rounding mode from `frm`, so the FPU's state belongs to every task that runs pods. The FreeRTOS port saves a task's FPU, hardware-loop and PIE registers lazily, in save areas it finds through a table just below the end of the task's stack. A call that switches onto the shared interpreter stack places a copy of that table above its own frames there, with the save areas allocated in the task's own stack beforehand, and copies it back when the call returns. An FPU context switch during the call then saves and restores the task's registers, rounding mode included, in the task's save areas.
+
 ## Traps and exit codes
 
 Guest faults terminate the container and leave the node running. Container status messages include the wasm3 trap text.
