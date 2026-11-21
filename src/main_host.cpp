@@ -728,6 +728,7 @@ int main(int argc, char* argv[]) {
             hooks.led_set = [](uint32_t index, uint32_t rgb) -> int32_t {
                 if (index != 0) return kube32::hal::HAL_ERR_INVAL;
                 std::printf("[LED] #%06x\n", static_cast<unsigned>(rgb));
+                std::fflush(stdout);   // as the other stand-ins print: whole lines, at once
                 return kube32::hal::HAL_OK;
             };
             kube32::runtime::set_app_platform_hooks(hooks);
