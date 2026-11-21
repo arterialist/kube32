@@ -1,0 +1,103 @@
+# voter: votes on the three lanes of examples/lockstep.yaml, checkpoint by
+# checkpoint, bit for bit. A lane whose state differs from the other two is
+# outvoted at the first checkpoint that differs; the voted state goes on with
+# two of three. The voter answers each lane's report with the target step, so
+# the lanes advance in lockstep at RATE steps a second.
+#
+# The module travels inline. make -C apps/voter writes
+# apps/voter/build/voter.yaml, this manifest with the module in place of
+# "@voter.wasm":
+#
+#   make -C apps/voter
+#   kubectl --context kube32 apply -f apps/voter/build/voter.yaml
+#
+# It runs on the control plane node, whose screen shows the pendulum of the
+# voted state with each lane's arms over it in the lane's colour and a row per
+# lane. Its keyboard injects faults (a lane's name) and repairs (r). The page
+# is at http://<control-plane-ip>/voter/ (port 8088 on a Linux board that
+# serves its Ingress there). A repair copies a lane of the majority into the
+# outvoted lane with a Copy checkpoint, which the voter creates through the
+# API server at KUBERNETES_SERVICE_HOST:KUBERNETES_SERVICE_PORT; set API_TOKEN
+# when the server has a token. apps/voter/README.md describes the vote.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: voter
+  namespace: default
+  labels:
+    app: voter
+  annotations:
+    kube32.io/wasm-base64: "@voter.wasm"
+    kube32.io/tick-interval: 100ms      # a frame on the screen every tick
+    kube32.io/wasm-stack: 8Ki
+spec:
+  nodeSelector:
+    node-role.kubernetes.io/control-plane: ""
+  restartPolicy: Always
+  containers:
+    - name: voter
+      image: wasm://inline/voter
+      ports:
+        - containerPort: 7000
+          name: http
+      env:
+        - name: API_URL                 # the kubelet sets these in every pod
+          value: http://$(KUBERNETES_SERVICE_HOST):$(KUBERNETES_SERVICE_PORT)
+        - name: POD_NAMESPACE
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.namespace
+        - name: LANES
+          value: a,b,c
+        - name: CHECK_EVERY             # as the lanes' CHECK_EVERY
+          value: "100"
+        - name: RATE                    # target steps a second: 0.25 s of pendulum time
+          value: "250"
+        - name: LEAD                    # steps the target runs ahead of the slowest lane
+          value: "400"
+        - name: LOST_MS                 # silence after which a lane leaves the vote
+          value: "8000"
+        - name: AUTO_REPAIR_S           # repair a lane outvoted or lagging this long; 0 never
+          value: "20"
+        - name: FAULT_BIT               # what a key and /fault flip without ?bit=; bit 40 is
+          value: "48"                   # outvoted as fast but takes seconds to show on the pendulum
+      resources:
+        requests:
+          memory: 192Ki                 # 8 KiB stack, 141 KiB data, frame and tables
+          hardware.kube32.io/tft-display: "1"
+          hardware.kube32.io/keyboard: "1"
+        limits:
+          memory: 192Ki
+      securityContext:
+        capabilities:
+          add: ["DISPLAY", "KEYBOARD", "SERVICE_CALL"]
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: voter
+  namespace: default
+spec:
+  selector:
+    app: voter
+  ports:
+    - name: http
+      port: 80
+      targetPort: 7000
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: voter
+  namespace: default
+spec:
+  rules:
+    - http:
+        paths:
+          - path: /voter
+            pathType: Prefix
+            backend:
+              service:
+                name: voter
+                port:
+                  number: 80

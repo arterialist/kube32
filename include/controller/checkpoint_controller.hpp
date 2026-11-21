@@ -22,12 +22,23 @@
 // is; a move the eviction API asked for then deletes the pod as an eviction
 // does.
 //
-// Phases: Pending, Saving, then Saved (Save) or Moving and Completed (Move);
-// Failed with a message, and the blockers when the pod cannot move. The
-// target is spec.target.nodeName, or the node the scheduler picks with
-// spec.target.nodeSelector added, never the source node and never one that
-// is cordoned or not Ready. Events on the pod: Checkpointed, Moving, Moved,
-// MoveFailed, CheckpointFailed, Restored.
+// Copy: a snapshot of the pod left running, then one store write replaces
+// another pod that runs the same module (spec.target.podName) as a move
+// replaces a pod, restored from the data. It stays on its node while that
+// node is Ready and spec.target names no node; else it goes to
+// spec.target.nodeName or the node the scheduler picks (with
+// spec.target.nodeSelector added). Copying ends Completed once it runs; a
+// RestoreError, a Failed pod or no Running within move_deadline_ms starts it
+// afresh and the copy is Failed. The target pod takes part as the pod does:
+// it must be able to move, and no other checkpoint of it may run meanwhile.
+//
+// Phases: Pending, Saving, then Saved (Save), Moving and Completed (Move) or
+// Copying and Completed (Copy); Failed with a message, and the blockers when
+// the pod cannot move. The target of a Move is spec.target.nodeName, or the
+// node the scheduler picks with spec.target.nodeSelector added, never the
+// source node and never one that is cordoned or not Ready. Events on the
+// pod: Checkpointed, Moving, Moved, MoveFailed, CheckpointFailed, Restored;
+// on the target pod of a Copy: Copying, Copied, CopyFailed.
 //
 // Policies (pod annotation kube32.io/migration): OnDrain (default) moves on
 // eviction only; Never never moves and is never checkpointed by policy;
@@ -126,7 +137,8 @@ private:
 
     std::vector<Node> load_nodes();
     static const Node* node(const std::vector<Node>& nodes, const std::string& name);
-    // A checkpoint of pod `ns/pod` under way (`started_only`: Saving or Moving)
+    // A checkpoint of pod `ns/pod`, or a Copy into it, under way
+    // (`started_only`: Saving, Moving or Copying)
     static bool busy(const std::vector<Ckpt>& cks, const std::string& ns, const std::string& pod, bool started_only);
     static std::string container_of(const Ckpt& ck, const models::JsonValue& pod);
     // What keeps the pod from moving: runtime::static_migration_blockers, and
@@ -134,6 +146,11 @@ private:
     static std::vector<std::string> blockers(const std::string& json, const models::JsonValue& pod);
     void begin(Ckpt& ck, Pods& pods, const std::vector<Node>& nodes, uint64_t now);
     void watch_move(Ckpt& ck, Pods& pods, const std::vector<Node>& nodes, uint64_t now);
+    // The target pod of a Copy at `key`, restoring since `since`
+    void watch_copy(Ckpt& ck, const models::JsonValue& pod, const std::string& key, const std::vector<Node>& nodes, uint64_t now, uint64_t since);
+    // The node the target pod `dst` of a Copy restores on, empty with `why`
+    // when none fits
+    std::string copy_target(const Ckpt& ck, const models::JsonValue& dst, const std::vector<Node>& nodes, std::string& why);
     void fail(Ckpt& ck, const std::string& message, const std::vector<std::string>& blockers = {});
     // fail(), and for a move the eviction API asked for, the eviction
     void give_up(Ckpt& ck, const std::string& message, const std::vector<std::string>& blockers = {});

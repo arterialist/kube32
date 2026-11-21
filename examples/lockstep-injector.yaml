@@ -1,0 +1,65 @@
+# lockstep-injector: a fault button for lane b of examples/lockstep.yaml on
+# an ESP32-S31-Function-CoreBoard-1 (the s31-coreboard profile). A press of
+# the board's boot button calls GET /fault of the lane on the same board,
+# which flips one bit of the lane's state (fault injection); the voter of
+# examples/voter.yaml outvotes the lane at its next checkpoint. The board's
+# RGB LED is green while the voter counts the lane with the majority, red
+# while it is outvoted, amber while no vote covers it, blue while the voter
+# does not answer.
+#
+# The module travels inline. make -C apps/lockstep writes
+# apps/lockstep/build/lockstep-injector.yaml, this manifest with the module
+# in place of "@lockstep-injector.wasm":
+#
+#   make -C apps/lockstep
+#   kubectl --context kube32 apply -f apps/lockstep/build/lockstep-injector.yaml
+#
+# For the button alone, drop hardware.kube32.io/led and set LED to off. On a
+# board whose button is on another pin, set BUTTON_PIN and request
+# esp32.io/gpio-input-<pin> instead.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: lockstep-injector
+  namespace: default
+  labels:
+    app: lockstep-injector
+  annotations:
+    kube32.io/wasm-base64: "@lockstep-injector.wasm"
+    kube32.io/tick-interval: 50ms       # reads the button every 50 ms
+    kube32.io/wasm-stack: 1Ki
+spec:
+  nodeSelector:
+    kube32.io/board: s31-coreboard      # the board of lane b
+  restartPolicy: Always
+  containers:
+    - name: injector
+      image: wasm://inline/lockstep-injector
+      ports:
+        - containerPort: 7000
+          name: http
+      env:
+        - name: LANE
+          value: b
+        - name: FAULT_URL               # lane b's fault injection, on this board
+          value: http://lockstep-b/fault
+        - name: STATUS_URL              # the voter's verdict on lane b
+          value: http://voter/lane?name=b
+        - name: BUTTON_PIN              # the boot button, low when pressed
+          value: "61"
+        - name: ACTIVE
+          value: low
+        - name: LED
+          value: "on"
+        - name: POLL_MS
+          value: "500"
+      resources:
+        requests:
+          memory: 8Ki                   # 2 KiB stack, 2.6 KiB data and buffers
+          esp32.io/gpio-input-61: "1"
+          hardware.kube32.io/led: "1"
+        limits:
+          memory: 8Ki
+      securityContext:
+        capabilities:
+          add: ["SERVICE_CALL"]         # calls the lane and the voter

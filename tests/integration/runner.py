@@ -58,6 +58,7 @@ SUITE_MAPPING = {
         "tests.integration.cluster.test_pod_migration",
         "tests.integration.cluster.test_mandelbrot_migration",
         "tests.integration.cluster.test_hardware_following",
+        "tests.integration.cluster.test_lockstep_vote",
         "tests.integration.cluster.test_api_follow",
     ],
     "federation": [

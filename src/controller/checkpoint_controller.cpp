@@ -73,6 +73,15 @@ std::string need_reason(const std::string& trigger, const JsonValue& pod) {
     return need ? str_cat({" for its need ", models::devices_text(need)}) : std::string();
 }
 
+// The module a pod runs: the digest of its inline module, else its first
+// container's image
+std::string module_of(const JsonValue& pod) {
+    if (const std::string& sha = annotation(pod, "kube32.io/wasm-sha256"); !sha.empty()) return sha;
+    const JsonValue* spec = pod.get("spec");
+    const JsonValue* cs = spec ? spec->get("containers") : nullptr;
+    return cs && cs->is_array() && !cs->arr_val.empty() ? cs->arr_val[0].get_string("image", "") : std::string();
+}
+
 // Running with every container running, as the kubelet reports it
 bool runs(const JsonValue& pod) {
     const JsonValue* st = pod.get("status");
@@ -169,10 +178,13 @@ struct CheckpointController::Node {
 struct CheckpointController::Ckpt {
     std::string key, ns, name, uid, trigger;
     std::string action, pod, container, target;   // spec: action, podName, containerName, target.nodeName
+    std::string target_pod;                       // spec.target.podName: the pod a Copy restores into
     std::string phase, node, new_pod;             // status: phase, nodeName (where the pod ran), newPodName
     uint64_t version{0};
     JsonValue doc;
-    bool active() const { return phase.empty() || phase == "Pending" || phase == "Saving" || phase == "Moving"; }
+    bool active() const { return phase.empty() || phase == "Pending" || phase == "Saving" || phase == "Moving" || phase == "Copying"; }
+    // Pod `name` takes part: the pod saved, or the pod a Copy restores into
+    bool involves(const std::string& name) const { return pod == name || (action == "Copy" && target_pod == name); }
 };
 
 // The pods of a pass, each parsed when first asked for
@@ -189,8 +201,9 @@ struct CheckpointController::Pods {
         }
         return d.is_object() ? &d : nullptr;
     }
+    bool written(const std::string& key) const { return std::find(touched.begin(), touched.end(), key) != touched.end(); }
     size_t find(const std::string& key) const {
-        if (std::find(touched.begin(), touched.end(), key) != touched.end()) return keys.size();
+        if (written(key)) return keys.size();
         return static_cast<size_t>(std::find(keys.begin(), keys.end(), key) - keys.begin());
     }
     // The pod at `key`, null when it is gone or was written in this pass
@@ -337,6 +350,7 @@ void CheckpointController::reconcile(uint64_t now) {
             c.pod = spec.get_string("podName", "");
             c.container = spec.get_string("containerName", "");
             c.target = field(spec, "target", "nodeName");
+            c.target_pod = field(spec, "target", "podName");
             c.phase = field(c.doc, "status", "phase");
             c.node = field(c.doc, "status", "nodeName");
             c.new_pod = field(c.doc, "status", "newPodName");
@@ -352,6 +366,7 @@ void CheckpointController::reconcile(uint64_t now) {
         for (const auto& ck : cks) {
             named.insert(kPodPrefix + ck.ns + "/" + ck.pod);
             if (!ck.new_pod.empty()) named.insert(kPodPrefix + ck.ns + "/" + ck.new_pod);
+            if (!ck.target_pod.empty()) named.insert(kPodPrefix + ck.ns + "/" + ck.target_pod);
         }
         store_.visit(kPodPrefix, [&](const std::string& key, const std::string& json) {
             const bool read = named.count(key) || json.find(models::kAnnotationRestoreFrom) != std::string::npos ||
@@ -364,7 +379,7 @@ void CheckpointController::reconcile(uint64_t now) {
     }
 
     for (auto& ck : cks) {
-        if (ck.phase == "Moving") watch_move(ck, pods, nodes, now);
+        if (ck.phase == "Moving" || ck.phase == "Copying") watch_move(ck, pods, nodes, now);
         // Only an earlier run leaves one: a pass ends each snapshot it starts
         if (ck.phase != "Saving") continue;
         const JsonValue* pod = pods.get(kPodPrefix + ck.ns + "/" + ck.pod);
@@ -380,6 +395,11 @@ void CheckpointController::reconcile(uint64_t now) {
     Ckpt* next = nullptr;
     for (auto& ck : cks) {
         if (!(ck.phase.empty() || ck.phase == "Pending") || busy(cks, ck.ns, ck.pod, true)) continue;
+        if (ck.action == "Copy" && !ck.target_pod.empty() && busy(cks, ck.ns, ck.target_pod, true)) continue;
+        // A pod this pass wrote starts its checkpoint in the next pass, from what was written
+        if (pods.written(kPodPrefix + ck.ns + "/" + ck.pod) || (!ck.target_pod.empty() && pods.written(kPodPrefix + ck.ns + "/" + ck.target_pod))) {
+            continue;
+        }
         const bool periodic = ck.trigger == "periodic", next_periodic = next && next->trigger == "periodic";
         if (!next || (next_periodic && !periodic) || (next_periodic == periodic && ck.version < next->version)) next = &ck;
     }
@@ -398,7 +418,10 @@ std::vector<std::string> CheckpointController::blockers(const std::string& json,
 
 bool CheckpointController::busy(const std::vector<Ckpt>& cks, const std::string& ns, const std::string& pod, bool started_only) {
     for (const auto& ck : cks) {
-        if (ck.ns == ns && ck.pod == pod && (started_only ? ck.phase == "Saving" || ck.phase == "Moving" : ck.active())) return true;
+        const bool started = ck.phase == "Saving" || ck.phase == "Moving" || ck.phase == "Copying";
+        if (ck.ns != ns || !(started_only ? started : ck.active())) continue;
+        // Once the copy is taken, a Copy holds only the pod it restores into
+        if (ck.phase == "Copying" ? ck.target_pod == pod : ck.involves(pod)) return true;
     }
     return false;
 }
@@ -439,8 +462,8 @@ void CheckpointController::give_up(Ckpt& ck, const std::string& message, const s
 
 void CheckpointController::begin(Ckpt& ck, Pods& pods, const std::vector<Node>& nodes, uint64_t now) {
     const std::string pod_key = kPodPrefix + ck.ns + "/" + ck.pod;
-    const bool move = ck.action == "Move";
-    if (ck.action != "Save" && !move) return give_up(ck, "spec.action must be Save or Move");
+    const bool move = ck.action == "Move", copy = ck.action == "Copy";
+    if (ck.action != "Save" && !move && !copy) return give_up(ck, "spec.action must be Save, Move or Copy");
     const JsonValue* pod = pods.get(pod_key);
     if (!pod) return give_up(ck, str_cat({"pod ", ck.pod, " not found"}));
     const std::string& source = field(*pod, "spec", "nodeName");
@@ -455,6 +478,22 @@ void CheckpointController::begin(Ckpt& ck, Pods& pods, const std::vector<Node>& 
     if (!found.empty()) return give_up(ck, move ? "the pod cannot move" : "the pod cannot be checkpointed", found);
     std::string target, why;
     if (move && (target = pick_target(ck, *pod, nodes, why)).empty()) return give_up(ck, "no node fits: " + why);
+    // A Copy: the pod that takes the state, which runs the same module and
+    // could move itself, and the node it restores on
+    const std::string dst_key = kPodPrefix + ck.ns + "/" + ck.target_pod;
+    std::string dst_uid;
+    if (copy) {
+        if (ck.target_pod.empty()) return give_up(ck, "a Copy names the pod it restores into in spec.target.podName");
+        if (ck.target_pod == ck.pod) return give_up(ck, "spec.target.podName names the pod that is copied");
+        const JsonValue* dst = pods.get(dst_key);
+        if (!dst) return give_up(ck, str_cat({"pod ", ck.target_pod, " not found"}));
+        if (!field(*dst, "metadata", "deletionTimestamp").empty()) return give_up(ck, str_cat({"pod ", ck.target_pod, " is being deleted"}));
+        if (module_of(*dst) != module_of(*pod)) return give_up(ck, str_cat({"pod ", ck.target_pod, " runs another module than pod ", ck.pod}));
+        const std::vector<std::string> held = blockers(*pods.json(dst_key), *dst);
+        if (!held.empty()) return give_up(ck, str_cat({"pod ", ck.target_pod, " cannot take a copied state"}), held);
+        dst_uid = field(*dst, "metadata", "uid");
+        if ((target = copy_target(ck, *dst, nodes, why)).empty()) return give_up(ck, "no node fits: " + why);
+    }
     const std::string reason = need_reason(ck.trigger, *pod);
     const Node* src = node(nodes, source);
     if (!src || !src->port || src->ip.empty()) return give_up(ck, str_cat({"node ", source, " reports no kubelet endpoint"}));
@@ -475,18 +514,38 @@ void CheckpointController::begin(Ckpt& ck, Pods& pods, const std::vector<Node>& 
         if (s.maybe_frozen) thaw(src, ck.ns, ck.pod, container);
         std::string text = str_cat({"checkpoint ", ck.name, ": ", s.error});
         for (const auto& b : s.blockers) text += str_cat({"; ", b});
-        pod_event(ck.ns, ck.pod, uid, move ? "MoveFailed" : "CheckpointFailed", text, true);
+        if (copy) pod_event(ck.ns, ck.target_pod, dst_uid, "CopyFailed", text, true);
+        else pod_event(ck.ns, ck.pod, uid, move ? "MoveFailed" : "CheckpointFailed", text, true);
         return give_up(ck, s.error, s.blockers);
     }
     // The data upload wrote sizeBytes, snapshotSha256, imageSha256 and podTimeMs
     const std::string taken = now_text(wall_ms()), size = std::to_string(s.bytes);
-    if (!move) {
+    if (!move && !copy) {
         update_status(ck.key, {{"phase", "Saved"}, {"takenAt", taken}, {"finishedAt", taken}});
         ck.phase = "Saved";
         pod_event(ck.ns, ck.pod, uid, "Checkpointed", str_cat({"Saved checkpoint ", ck.name, " on node ", source, ": ", size, " bytes in ", took}), false);
         return;
     }
     std::string new_uid;
+    if (copy) {
+        // The target pod, replaced in one write as a move replaces a pod:
+        // its kubelet stops it and the target node restores it from the data
+        if (!rebind(dst_key, target, ck.name, dst_uid, &new_uid)) {
+            const std::string message = str_cat({"pod ", ck.target_pod, " changed during the copy"});
+            pod_event(ck.ns, ck.target_pod, dst_uid, "CopyFailed", str_cat({"checkpoint ", ck.name, ": ", message}), true);
+            return give_up(ck, message);
+        }
+        pods.touched.push_back(dst_key);
+        moving_since_[ck.uid] = now;
+        update_status(ck.key, {{"phase", "Copying"}, {"takenAt", taken}, {"newPodName", ck.target_pod},
+                               {"message", str_cat({"restoring pod ", ck.target_pod, " on node ", target})}});
+        ck.phase = "Copying";
+        pod_event(ck.ns, ck.target_pod, new_uid, "Copying",
+                  str_cat({"Copying the state of pod ", ck.pod, " on node ", source, " into pod ", ck.target_pod, " on node ", target, " with checkpoint ",
+                           ck.name, " (", size, " bytes, taken in ", took, ")"}),
+                  false);
+        return;
+    }
     if (!rebind(pod_key, target, ck.name, uid, &new_uid)) {
         thaw(src, ck.ns, ck.pod, container);
         const std::string message = "the pod changed while it was frozen: it stays on node " + source;
@@ -503,15 +562,19 @@ void CheckpointController::begin(Ckpt& ck, Pods& pods, const std::vector<Node>& 
 }
 
 void CheckpointController::watch_move(Ckpt& ck, Pods& pods, const std::vector<Node>& nodes, uint64_t now) {
+    const bool copy = ck.phase == "Copying";
     const uint64_t since = moving_since_.emplace(ck.uid, now).first->second;
-    const std::string key = kPodPrefix + ck.ns + "/" + (ck.new_pod.empty() ? ck.pod : ck.new_pod);
+    const std::string& replaced = !ck.new_pod.empty() ? ck.new_pod : copy ? ck.target_pod : ck.pod;
+    const std::string key = kPodPrefix + ck.ns + "/" + replaced;
     const JsonValue* pod = pods.get(key);
     pods.touched.push_back(key);
+    const char* what = copy ? "copy" : "move";
     if (!pod || annotation(*pod, models::kAnnotationRestoreFrom) != ck.name) {
-        return fail(ck, pod ? "the pod was changed during the move" : "the pod was deleted during the move");
+        return fail(ck, str_cat({"the pod was ", pod ? "changed" : "deleted", " during the ", what}));
     }
     const std::string& at = field(*pod, "spec", "nodeName");
     const std::string& uid = field(*pod, "metadata", "uid");
+    if (copy) return watch_copy(ck, *pod, key, nodes, now, since);
     if (runs(*pod)) {
         strip_restore(key);
         const std::string message = str_cat({"moved from node ", ck.node, " to node ", at, need_reason(ck.trigger, *pod), " in ", seconds(now - since)});
@@ -539,6 +602,58 @@ void CheckpointController::watch_move(Ckpt& ck, Pods& pods, const std::vector<No
     pod_event(ck.ns, ck.pod, rebound ? new_uid : uid, "MoveFailed", str_cat({"Checkpoint ", ck.name, ": ", message}), true);
 }
 
+void CheckpointController::watch_copy(Ckpt& ck, const JsonValue& pod, const std::string& key, const std::vector<Node>& nodes, uint64_t now,
+                                      uint64_t since) {
+    const std::string& at = field(pod, "spec", "nodeName");
+    const std::string& uid = field(pod, "metadata", "uid");
+    if (runs(pod)) {
+        strip_restore(key);
+        const std::string message = str_cat({"copied the state of pod ", ck.pod, " on node ", ck.node, " into pod ", ck.target_pod, " on node ", at, " in ",
+                                             seconds(now - since)});
+        update_status(ck.key, {{"phase", "Completed"}, {"targetNode", at}, {"message", message}, {"finishedAt", now_text(wall_ms())}});
+        ck.phase = "Completed";
+        moving_since_.erase(ck.uid);
+        pod_event(ck.ns, ck.target_pod, uid, "Copied", str_cat({"Checkpoint ", ck.name, ": ", message}), false);
+        printf("[CKPT] %s/%s: %s\n", ck.ns.c_str(), ck.target_pod.c_str(), message.c_str());
+        return;
+    }
+    std::string why = restore_failure(pod);
+    if (why.empty() && now < since + config_.move_deadline_ms) return trigger_.wake_at(since + config_.move_deadline_ms);
+    if (why.empty()) why = str_cat({"not running on node ", at, " after ", seconds(config_.move_deadline_ms)});
+    // The state it had is gone: it starts afresh where it is bound, when that node is Ready
+    const Node* n = node(nodes, at);
+    std::string new_uid;
+    const bool rebound = rebind(key, n && n->ready ? at : std::string(), std::string(), uid, &new_uid);
+    const std::string message = str_cat({"restore of pod ", ck.target_pod, " on node ", at, " failed (", why, "); ",
+                                         rebound ? "the pod starts afresh" : "the pod could not be started again"});
+    fail(ck, message);
+    moving_since_.erase(ck.uid);
+    pod_event(ck.ns, ck.target_pod, rebound ? new_uid : uid, "CopyFailed", str_cat({"Checkpoint ", ck.name, ": ", message}), true);
+}
+
+std::string CheckpointController::copy_target(const Ckpt& ck, const JsonValue& dst, const std::vector<Node>& nodes, std::string& why) {
+    const std::string& here = field(dst, "spec", "nodeName");
+    const Node* at = node(nodes, here);
+    const JsonValue* target = ck.doc.get("spec")->get("target");
+    const JsonValue* sel = target ? target->get("nodeSelector") : nullptr;
+    const bool selects = sel && sel->is_object() && !sel->obj_val.empty();
+    // Its own node, when nothing else is asked for or when it is the node named
+    if (at && at->ready && !at->unschedulable && !selects && (ck.target.empty() || ck.target == here)) return here;
+    if (!scheduler_) {
+        why = "no scheduler runs";
+        return std::string();
+    }
+    JsonValue copy = dst;
+    JsonValue& spec = child(copy, "spec");
+    for (size_t i = 0; selects && i < sel->obj_val.size(); ++i) child(spec, "nodeSelector").set(sel->obj_val[i].first, sel->obj_val[i].second);
+    set_str(spec, "nodeName", ck.target);
+    // Without a node named, a node other than its own, which is not Ready
+    const scheduler::ScheduleResult r = scheduler_->pick_node(copy.to_string(), ck.target.empty() && !selects ? here : std::string());
+    if (r.scheduled) return r.target_node;
+    why = r.failure_reason;
+    return std::string();
+}
+
 void CheckpointController::finish_restores(Pods& pods, const std::vector<Node>& nodes, const std::vector<Ckpt>& cks) {
     const uint64_t wall = wall_ms();
     for (size_t i = 0; i < pods.jsons.size(); ++i) {
@@ -553,7 +668,7 @@ void CheckpointController::finish_restores(Pods& pods, const std::vector<Node>& 
         for (const auto& c : cks) {
             if (c.ns == ns && c.name == from) ck = &c;
         }
-        if (ck && ck->phase == "Moving") continue;   // watch_move follows it
+        if (ck && (ck->phase == "Moving" || ck->phase == "Copying")) continue;   // watch_move follows it
         if (runs(*pod)) {
             if (!strip_restore(pods.keys[i]) || (ck && ck->phase == "Completed")) continue;
             // The checkpoint's age: from its takenAt, else from when this run saw it finished

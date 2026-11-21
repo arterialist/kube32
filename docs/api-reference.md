@@ -57,7 +57,7 @@ Discovery endpoints accept `GET` and `HEAD`.
 | `authorization.k8s.io/v1` | SelfSubjectAccessReview, SelfSubjectRulesReview | | create | Always returns allowed |
 | `kube32.io/v1` | FirmwareRollout | `fwr` | get, list, watch, create, update, patch, delete | Cluster-scoped. `spec.sha256` names the staged firmware image. The rollout controller updates nodes one at a time and writes `status`. The API server serves the staged image at `/apis/kube32.io/v1/firmware`. See [Firmware updates](firmware-updates.md#api). |
 | `kube32.io/v1` | Device | `dev` | get, list, watch, create, update, patch, delete; `status`; `activate` (create) | A part wired to a node. `spec.driver` must be a driver of the catalog. The API server checks I2C addresses, multiplexer channels, pins, `activation` and `idleSeconds`, and stores addresses as `"0x77"`. A write to the object keeps `status`. A write to `status` changes nothing else. The Device controller runs the driver pod and Service and writes `status`. `POST .../devices/<name>/activate` reports a use of an `OnDemand` Device and stores nothing. See [Devices](devices.md). |
-| `kube32.io/v1` | Checkpoint | `ckpt` | get, list, watch, create, update, patch, delete; `status`, `data` | A pod's snapshot. `spec.podName` is required and `spec.action` is `Save` or `Move`. A write to the object keeps `status`. `GET` and `PUT` of `checkpoints/<name>/data` read and store the snapshot (`application/octet-stream`), kept in memory outside the object store. See [Pod migration](migration.md#checkpoint-objects-and-data). |
+| `kube32.io/v1` | Checkpoint | `ckpt` | get, list, watch, create, update, patch, delete; `status`, `data` | A pod's snapshot. `spec.podName` is required and `spec.action` is `Save`, `Move` or `Copy`; a `Copy` names the pod it restores into in `spec.target.podName`. A write to the object keeps `status`. `GET` and `PUT` of `checkpoints/<name>/data` read and store the snapshot (`application/octet-stream`), kept in memory outside the object store. See [Pod migration](migration.md#checkpoint-objects-and-data). |
 
 ## Eviction
 
@@ -76,10 +76,10 @@ The Checkpoint controller writes `status` of each `kube32.io/v1` Checkpoint. The
 
 | Field | Meaning |
 | --- | --- |
-| `phase` | `Pending`, `Saving`, `Saved` (Save), `Moving`, `Completed` (Move) or `Failed` |
+| `phase` | `Pending`, `Saving`, `Saved` (Save), `Moving`, `Completed` (Move), `Copying`, `Completed` (Copy) or `Failed` |
 | `nodeName` | The node the pod ran on when the snapshot was taken |
-| `targetNode` | Move: the node the replacement runs on |
-| `newPodName` | Move: the replacement's name, the pod's own |
+| `targetNode` | Move: the node the replacement runs on. Copy: the node the target pod restores on |
+| `newPodName` | Move: the replacement's name, the pod's own. Copy: the target pod |
 | `imageSha256` | SHA-256 of the pod's module, from the snapshot |
 | `snapshotSha256` | The snapshot's trailer, the SHA-256 of its bytes before it |
 | `sizeBytes` | Size of the checkpoint's data |
