@@ -148,7 +148,8 @@ class ClusterHarness:
         node_id: int,
         cp_node: SimulatedNode,
         lease_interval_ms: int = 1000,
-        pod_port: int = 0
+        pod_port: int = 0,
+        extra_args: Optional[List[str]] = None
     ) -> SimulatedNode:
         data_dir = f"/tmp/k32_cluster_test_{name}_{os.getpid()}_{int(time.time()*1000)%10000}"
         self.temp_dirs.append(data_dir)
@@ -172,6 +173,8 @@ class ClusterHarness:
         # Workers on one host each need their own pod HTTP server port
         if pod_port:
             cmd += ["--pod-port", str(pod_port)]
+        # Options of this worker alone, such as the devices it offers (--sim-devices)
+        cmd += extra_args or []
 
         proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         node = SimulatedNode("worker", name, node_id, api_port, ipc_port, data_dir)
