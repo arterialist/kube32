@@ -58,7 +58,7 @@ class Output:
 class TestHardwareFollowing(BaseTestCase):
     def setUp(self):
         super().setUp()
-        self.harness = ClusterHarness(base_api_port=17143, base_ipc_port=18000)
+        self.harness = ClusterHarness(base_api_port=17343, base_ipc_port=18300)
         self.out = {}
 
     def tearDown(self):
@@ -66,7 +66,7 @@ class TestHardwareFollowing(BaseTestCase):
         super().tearDown()
 
     def _worker(self, name, node_id, cp, devices, extra=None):
-        w = self.harness.start_worker(name, node_id, cp, lease_interval_ms=500, pod_port=18010 + node_id,
+        w = self.harness.start_worker(name, node_id, cp, lease_interval_ms=500, pod_port=18310 + node_id,
                                       extra_args=["--sim-devices", devices] + (extra or []))
         self.out[name] = Output(w)
         return w
@@ -82,9 +82,10 @@ class TestHardwareFollowing(BaseTestCase):
         pod = self._job(cp) or {}
         return pod.get("spec", {}).get("nodeName") if pod.get("status", {}).get("phase") == "Running" else None
 
-    def _state(self, worker):
-        """GET / of the job through its node's pod server: the record and where its steps ran"""
-        status, body = http("GET", f"http://127.0.0.1:{worker.pod_port}/", headers={"X-Kube32-Pod": "default/checkin"})
+    def _state(self, worker, path="/"):
+        """GET / of the job through its node's pod server: the record and where its steps ran
+        (/probe: after a display call on that node)"""
+        status, body = http("GET", f"http://127.0.0.1:{worker.pod_port}{path}", headers={"X-Kube32-Pod": "default/checkin"})
         return json.loads(body) if status == 200 else None
 
     def _events(self, cp, reason):
@@ -177,13 +178,17 @@ class TestHardwareFollowing(BaseTestCase):
         self.assertEqual((done["weight_g"], done["label"], done["moves"]), (0, "parcel-7", 2))
         self.assertEqual(done["led"], 0)
         self.assertEqual(done["tone"], 0)
-        self.assertEqual(done["display"], -1)                  # listed in the spec, not on this node: K32_ERR_PERM
+        # The display is listed in the spec and not on this node: refused
+        self.assertEqual(self._state(signal, "/probe")["display"], -1)   # K32_ERR_PERM
+        self.wait_for_condition(lambda: self.out["hw-signal"].has("[FIREWALL] denied default/checkin: display"),
+                                timeout=5.0, description="the firewall's refusal on hw-signal")
+        self.assertFalse(self.out["hw-speaker"].has("[FIREWALL]"))      # no display call where the job did not draw
         self.wait_for_condition(lambda: self._job(cp)["metadata"]["annotations"].get("kube32.io/needs") == "",
                                 timeout=5.0, description="no need recorded after the last step")
         self.assertTrue(any("to node hw-signal for its need hardware.kube32.io/speaker,hardware.kube32.io/led" in m
                             for m in self._events(cp, "Moved")))
         self.assertTrue(self.out["hw-signal"].has("[TONE] 523 Hz for 120 ms"))
-        self.assertTrue(self.out["hw-signal"].has("[LED] #004000"))
+        self.wait_for_condition(lambda: self.out["hw-signal"].has("[LED] #004000"), timeout=5.0, description="the LED flash on hw-signal")
         self.assertFalse(self.out["hw-display"].has("[TONE]"))
         self.assertFalse(self.out["hw-speaker"].has("[DISPLAY"))
         self.assertEqual(len(self._events(cp, "MoveFailed")), 1)
