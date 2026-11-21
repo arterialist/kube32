@@ -72,6 +72,9 @@ struct DeploySpec {
     // pod's spec keeps it from moving (static_migration_blockers)
     std::string container_name;
     std::vector<std::string> migration_blockers;
+    // The devices the Pod's kube32.io/needs names (models::parse_devices):
+    // what k32_need of a hardware-following pod is compared with
+    uint32_t recorded_need{0};
     // Start from a snapshot (kube32.io/restore-from) instead of k32_init:
     // called once the module is instantiated, it hands the snapshot's bytes
     // to `feed` as they arrive and returns true when the stream ended whole

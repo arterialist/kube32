@@ -2,6 +2,7 @@
 #include "api/event_recorder.hpp"
 #include "controller/reconcile_trigger.hpp"
 #include "models/kube_models.hpp"
+#include "models/migration.hpp"
 #include "osal/system.hpp"
 #include "osal/thread.hpp"
 
@@ -444,6 +445,24 @@ bool NodeSelectorPredicate::evaluate(const std::string& pod_json,
     return true;
 }
 
+bool NodeHardwarePredicate::evaluate(const std::string& pod_json,
+                                     const std::string& node_json,
+                                     const ResourceSpec&,
+                                     const ResourceSpec&,
+                                     const ResourceSpec&,
+                                     std::string& failure_reason) {
+    if (pod_json.find(models::kAnnotationNeeds) == std::string::npos) return true;
+    models::JsonValue pod_doc, node_doc;
+    std::string err;
+    if (!models::parse_json(pod_json, pod_doc, err) || !pod_doc.is_object() || !models::follows_hardware(pod_doc)) return true;
+    const uint32_t need = models::pod_needs(pod_doc);
+    if (!need) return true;
+    const uint32_t missing = models::parse_json(node_json, node_doc, err) ? need & ~models::node_devices(node_doc) : need;
+    if (!missing) return true;
+    failure_reason = "Insufficient " + models::devices_text(missing & (0u - missing));   // the first one missing
+    return false;
+}
+
 bool NodeNamePredicate::evaluate(const std::string& pod_json,
                                  const std::string& node_json,
                                  const ResourceSpec&,
@@ -502,6 +521,20 @@ int64_t LeastAllocatedScorer::score(const std::string&,
     return (mem_score + gpio_score) / 2;
 }
 
+int64_t PreferredNodesScorer::score(const std::string& pod_json,
+                                    const std::string& node_json,
+                                    const ResourceSpec&,
+                                    const ResourceSpec&,
+                                    const ResourceSpec&) {
+    if (pod_json.find(models::kAnnotationPreferNodes) == std::string::npos) return 0;
+    models::JsonValue pod_doc, node_doc;
+    std::string err;
+    if (!models::parse_json(pod_json, pod_doc, err) || !models::parse_json(node_json, node_doc, err)) return 0;
+    // Above the other scorers' 0 to 100: one rank outweighs them
+    const int rank = models::preferred_rank(pod_doc, node_doc);
+    return rank < 0 ? 0 : 1000 * (64 - std::min(rank, 63));
+}
+
 int64_t BestFitScorer::score(const std::string&,
                              const std::string&,
                              const ResourceSpec& pod_req,
@@ -550,6 +583,7 @@ public:
         add_predicate(std::make_shared<NodeSchedulablePredicate>());
         add_predicate(std::make_shared<NodeNamePredicate>());
         add_predicate(std::make_shared<NodeSelectorPredicate>());
+        add_predicate(std::make_shared<NodeHardwarePredicate>());
         add_predicate(std::make_shared<NodePodCountPredicate>());
         add_predicate(std::make_shared<NodeMemoryPredicate>());
         add_predicate(std::make_shared<NodePSRAMPredicate>());
@@ -561,6 +595,7 @@ public:
         } else {
             add_scorer(std::make_shared<LeastAllocatedScorer>(), 1.0f);
         }
+        add_scorer(std::make_shared<PreferredNodesScorer>(), 1.0f);
     }
 
     ~SchedulerImpl() override {

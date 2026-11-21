@@ -16,6 +16,7 @@
 #include "runtime/pod_memory_pool.h"
 #include "models/kube_models.hpp"
 #include "models/kube_lease.hpp"
+#include "models/migration.hpp"
 #include "osal/system.hpp"
 #include "mem/fixed_text.hpp"
 
@@ -268,6 +269,11 @@ void Kubelet::run_loop() {
                     monitor_and_report_pod_statuses();
                 }
 
+                if (now >= need_retry_ms_) {
+                    step = "pod needs";
+                    record_pod_needs();
+                }
+
                 if (config_.node_label_source && now - last_label_refresh_ms_ >= config_.node_label_refresh_ms) {
                     step = "node labels";
                     refresh_node_labels();
@@ -383,6 +389,22 @@ void Kubelet::patch_node_annotations() {
         annotations_sent_ = api_client_->patch_node_status(config_.node_name, patch);   // tried again next round
     }
     found_annotations_ = std::move(found);
+}
+
+void Kubelet::record_pod_needs() {
+    runtime::AppPodHost& host = runtime::AppPodHost::instance();
+    for (const auto& n : host.unrecorded_needs()) {
+        const size_t slash = n.first.find('/');
+        if (slash == std::string::npos) continue;
+        const std::string patch = std::string("{\"metadata\":{\"annotations\":{\"") + models::kAnnotationNeeds + "\":\"" +
+                                  models::devices_text(n.second) + "\"}}}";
+        if (!api_client_->patch_pod_status(n.first.substr(0, slash), n.first.substr(slash + 1), patch)) {
+            need_retry_ms_ = osal::System::get_uptime_ms() + 1000;
+            return;
+        }
+        host.need_recorded(n.first, n.second);
+        std::cout << "[KUBELET] " << n.first << ": needs " << (n.second ? models::devices_text(n.second) : std::string("no hardware")) << std::endl;
+    }
 }
 
 void Kubelet::refresh_node_labels() {
@@ -1354,6 +1376,7 @@ bool Kubelet::deploy_and_start_pod(const models::KubePod& pod_in, const std::str
     spec.asset_directory = asset_directory;
     spec.container_name = rec.container_name;
     spec.migration_blockers = runtime::static_migration_blockers(manifest_json);
+    if (auto it = pod.annotations.find(models::kAnnotationNeeds); it != pod.annotations.end()) models::parse_devices(it->second, spec.recorded_need);
     // kube32.io/restore-from: the container starts from that Checkpoint's
     // snapshot (docs/migration.md), streamed from the control plane straight
     // into its memory. A container that restarts later starts fresh.

@@ -135,6 +135,20 @@ public:
                   std::string& failure_reason) override;
 };
 
+// A hardware-following pod (kube32.io/placement: hardware) fits a node that
+// offers every device its current step needs (kube32.io/needs), whatever
+// else its spec lists ("Insufficient hardware.kube32.io/<device>")
+class NodeHardwarePredicate : public Predicate {
+public:
+    const char* name() const override { return "NodeHardware"; }
+    bool evaluate(const std::string& pod_json,
+                  const std::string& node_json,
+                  const ResourceSpec& pod_req,
+                  const ResourceSpec& node_allocatable,
+                  const ResourceSpec& node_allocated,
+                  std::string& failure_reason) override;
+};
+
 class NodeNamePredicate : public Predicate {
 public:
     const char* name() const override { return "NodeName"; }
@@ -160,6 +174,18 @@ public:
 class LeastAllocatedScorer : public Scorer {
 public:
     const char* name() const override { return "LeastAllocated"; }
+    int64_t score(const std::string& pod_json,
+                  const std::string& node_json,
+                  const ResourceSpec& pod_req,
+                  const ResourceSpec& node_allocatable,
+                  const ResourceSpec& node_allocated) override;
+};
+
+// kube32.io/prefer-nodes: a node that matches an earlier entry scores above
+// one that matches a later entry or none, whatever the other scores
+class PreferredNodesScorer : public Scorer {
+public:
+    const char* name() const override { return "PreferredNodes"; }
     int64_t score(const std::string& pod_json,
                   const std::string& node_json,
                   const ResourceSpec& pod_req,

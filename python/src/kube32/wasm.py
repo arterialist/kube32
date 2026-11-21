@@ -47,6 +47,7 @@ APP_IMPORTS = {
     "k32_display_info": "i(iii)",
     "k32_touch_read": "i(ii)",
     "k32_led_set": "i(ii)",
+    "k32_need": "i(ii)",
     "k32_fs_open": "i(iii)",
     "k32_fs_read": "i(iii)",
     "k32_fs_write": "i(iii)",

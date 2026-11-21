@@ -66,6 +66,13 @@ std::string seconds(uint64_t ms) {
 
 std::string now_text(uint64_t wall) { return wall ? models::format_rfc3339(wall) : std::string(); }
 
+// " for its need <devices>" for a move the pod's hardware need asked for
+std::string need_reason(const std::string& trigger, const JsonValue& pod) {
+    if (trigger != "hardware") return std::string();
+    const uint32_t need = models::pod_needs(pod);
+    return need ? str_cat({" for its need ", models::devices_text(need)}) : std::string();
+}
+
 // Running with every container running, as the kubelet reports it
 bool runs(const JsonValue& pod) {
     const JsonValue* st = pod.get("status");
@@ -156,6 +163,7 @@ struct CheckpointController::Node {
     uint16_t port{0};
     bool ready{false}, unschedulable{false}, pressure{false};
     double mops{0};
+    uint32_t devices{0};   // the on-board devices it offers (models::node_devices)
 };
 
 struct CheckpointController::Ckpt {
@@ -215,7 +223,7 @@ CheckpointController::CheckpointController(storage::Store& store, scheduler::Sch
     });
     // What load_nodes reads of a Node
     trigger_.watch_fields("/registry/nodes/", [](const JsonValue& node) {
-        std::string seen = annotation(node, models::kAnnotationInterpMops);
+        std::string seen = str_cat({annotation(node, models::kAnnotationInterpMops), " ", std::to_string(models::node_devices(node))});
         if (const JsonValue* spec = node.get("spec"); spec && spec->get_bool("unschedulable", false)) seen += 'u';
         const JsonValue* st = node.get("status");
         if (const JsonValue* cs = st ? st->get("conditions") : nullptr; cs && cs->is_array()) {
@@ -277,6 +285,7 @@ std::vector<CheckpointController::Node> CheckpointController::load_nodes() {
         n.name = field(doc, "metadata", "name");
         n.port = models::node_pod_port(doc);
         n.mops = std::strtod(annotation(doc, models::kAnnotationInterpMops).c_str(), nullptr);
+        n.devices = models::node_devices(doc);
         if (const JsonValue* spec = doc.get("spec")) n.unschedulable = spec->get_bool("unschedulable", false);
         const JsonValue* st = doc.get("status");
         for (const char* list : {"addresses", "conditions"}) {
@@ -446,6 +455,7 @@ void CheckpointController::begin(Ckpt& ck, Pods& pods, const std::vector<Node>& 
     if (!found.empty()) return give_up(ck, move ? "the pod cannot move" : "the pod cannot be checkpointed", found);
     std::string target, why;
     if (move && (target = pick_target(ck, *pod, nodes, why)).empty()) return give_up(ck, "no node fits: " + why);
+    const std::string reason = need_reason(ck.trigger, *pod);
     const Node* src = node(nodes, source);
     if (!src || !src->port || src->ip.empty()) return give_up(ck, str_cat({"node ", source, " reports no kubelet endpoint"}));
     if (!update_status(ck.key, {{"phase", "Saving"}, {"nodeName", source}, {"targetNode", target}})) return;   // deleted meanwhile
@@ -488,7 +498,8 @@ void CheckpointController::begin(Ckpt& ck, Pods& pods, const std::vector<Node>& 
     update_status(ck.key, {{"phase", "Moving"}, {"takenAt", taken}, {"newPodName", ck.pod}, {"message", "restoring on node " + target}});
     ck.phase = "Moving";
     pod_event(ck.ns, ck.pod, new_uid, "Moving",
-              str_cat({"Moving from node ", source, " to node ", target, " with checkpoint ", ck.name, " (", size, " bytes, taken in ", took, ")"}), false);
+              str_cat({"Moving from node ", source, " to node ", target, reason, " with checkpoint ", ck.name, " (", size, " bytes, taken in ", took, ")"}),
+              false);
 }
 
 void CheckpointController::watch_move(Ckpt& ck, Pods& pods, const std::vector<Node>& nodes, uint64_t now) {
@@ -503,7 +514,7 @@ void CheckpointController::watch_move(Ckpt& ck, Pods& pods, const std::vector<No
     const std::string& uid = field(*pod, "metadata", "uid");
     if (runs(*pod)) {
         strip_restore(key);
-        const std::string message = str_cat({"moved from node ", ck.node, " to node ", at, " in ", seconds(now - since)});
+        const std::string message = str_cat({"moved from node ", ck.node, " to node ", at, need_reason(ck.trigger, *pod), " in ", seconds(now - since)});
         update_status(ck.key, {{"phase", "Completed"}, {"targetNode", at}, {"message", message}, {"finishedAt", now_text(wall_ms())}});
         ck.phase = "Completed";
         moving_since_.erase(ck.uid);
@@ -604,6 +615,45 @@ std::string CheckpointController::pick_target(const Ckpt& ck, const JsonValue& p
     return std::string();
 }
 
+bool CheckpointController::follow_need(const JsonValue& pod, const std::string& key, const Node& here, uint64_t now) {
+    const uint32_t need = models::pod_needs(pod);
+    if (!(need & ~here.devices)) {
+        need_failed_.erase(key);
+        return false;
+    }
+    auto last = need_moved_.find(key);
+    if (last != need_moved_.end() && now < last->second + config_.need_cooldown_ms) {
+        trigger_.wake_at(last->second + config_.need_cooldown_ms);
+        return true;
+    }
+    if (!scheduler_) return false;
+    // The scheduler's choice among the other nodes: Ready, schedulable, the
+    // pod's selector, room for it, the need (NodeHardwarePredicate) and
+    // kube32.io/prefer-nodes
+    JsonValue copy = pod;
+    set_str(child(copy, "spec"), "nodeName", "");
+    const scheduler::ScheduleResult r = scheduler_->pick_node(copy.to_string(), here.name);
+    const std::string& ns = field(pod, "metadata", "namespace");
+    const std::string& name = field(pod, "metadata", "name");
+    if (r.scheduled) {
+        create(ns, name, "Move", r.target_node, "hardware");
+        need_moved_[key] = now;
+        need_failed_.erase(key);
+        return true;
+    }
+    // Once for each need: a node that joins or changes runs a pass that tries again
+    const std::string text = models::devices_text(need);
+    if (need_failed_[key] != text) {
+        need_failed_[key] = text;
+        std::string why = r.failure_reason;
+        if (!why.empty() && why.back() == '.') why.pop_back();
+        pod_event(ns, name, field(pod, "metadata", "uid"), "MoveFailed",
+                  str_cat({"No node has ", text, " for the pod's need (", why, "): it runs on node ", here.name, " and moves once a node has it"}),
+                  true);
+    }
+    return false;
+}
+
 void CheckpointController::policies(Pods& pods, const std::vector<Node>& nodes, const std::vector<Ckpt>& cks, uint64_t now) {
     struct Pick {
         std::string node, ns, name;
@@ -632,13 +682,14 @@ void CheckpointController::policies(Pods& pods, const std::vector<Node>& nodes, 
             trigger_.wake_at(last_periodic_[key] + every);
         }
         if (policy != models::MigrationPolicy::Auto) continue;
+        const Node* here = node(nodes, at);
+        if (!here) continue;
+        if (annotation(*pod, models::kAnnotationPlacement) == "hardware" && follow_need(*pod, key, *here, now)) continue;
         auto moved = auto_moved_.find(key);
         if (moved != auto_moved_.end() && now < moved->second + config_.auto_cooldown_ms) {
             trigger_.wake_at(moved->second + config_.auto_cooldown_ms);
             continue;
         }
-        const Node* here = node(nodes, at);
-        if (!here) continue;
         // A node at least twice as fast that takes the pod
         if (annotation(*pod, models::kAnnotationPlacement) == "fastest" && here->mops > 0 && scheduler_) {
             const Node* best = nullptr;
@@ -705,9 +756,11 @@ void CheckpointController::retention(Pods& pods, const std::vector<Ckpt>& cks, u
     for (auto* m : {&done_seen_, &moving_since_}) {
         for (auto it = m->begin(); it != m->end();) it = live.count(it->first) ? std::next(it) : m->erase(it);
     }
-    for (auto* m : {&last_periodic_, &auto_moved_}) {
-        for (auto it = m->begin(); it != m->end();) it = std::find(pods.keys.begin(), pods.keys.end(), kPodPrefix + it->first) != pods.keys.end() ? std::next(it) : m->erase(it);
+    auto gone = [&pods](const std::string& key) { return std::find(pods.keys.begin(), pods.keys.end(), kPodPrefix + key) == pods.keys.end(); };
+    for (auto* m : {&last_periodic_, &auto_moved_, &need_moved_}) {
+        for (auto it = m->begin(); it != m->end();) it = gone(it->first) ? m->erase(it) : std::next(it);
     }
+    for (auto it = need_failed_.begin(); it != need_failed_.end();) it = gone(it->first) ? need_failed_.erase(it) : std::next(it);
 }
 
 CheckpointController::Snapshot CheckpointController::take_snapshot(const Node& node, const Ckpt& ck, const std::string& container, bool frozen) {

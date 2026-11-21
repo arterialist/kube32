@@ -2,6 +2,7 @@
 #include "runtime/container_lifecycle.hpp"
 #include "models/kube_models.hpp"
 #include "models/device.hpp"
+#include "models/migration.hpp"
 #include "osal/sha256.hpp"
 
 #include "wasm3.h"
@@ -500,6 +501,9 @@ std::vector<std::string> static_migration_blockers(std::string_view pod_json) {
     const models::JsonValue* ann = meta ? meta->get("annotations") : nullptr;
     const models::JsonValue* spec = doc.get("spec");
     const models::JsonValue* containers = spec ? spec->get("containers") : nullptr;
+    // A hardware-following pod's device grants go with it: the node it moves
+    // to grants them again (docs/migration.md#hardware-following-pods)
+    const bool follows = models::follows_hardware(doc);
     if (containers && containers->is_array()) {
         for (const auto& c : containers->arr_val) {
             const models::JsonValue* res = c.get("resources");
@@ -508,7 +512,7 @@ std::vector<std::string> static_migration_blockers(std::string_view pod_json) {
                 if (!m || !m->is_object()) continue;
                 for (const auto& kv : m->obj_val) {
                     const std::string& key = kv.first;
-                    if (kv.second.is_string() && kv.second.str_val == "0") continue;
+                    if ((kv.second.is_string() && kv.second.str_val == "0") || (follows && models::device_bit(key))) continue;
                     const bool hw = key.rfind("hardware.kube32.io/", 0) == 0 && key != "hardware.kube32.io/ipc";
                     if (hw || key.rfind("esp32.io/", 0) == 0 || key.rfind("esp.io/", 0) == 0) add("grant " + key);
                 }
@@ -518,7 +522,7 @@ std::vector<std::string> static_migration_blockers(std::string_view pod_json) {
             const models::JsonValue* added = caps ? caps->get("add") : nullptr;
             if (added && added->is_array()) {
                 for (const auto& cap : added->arr_val) {
-                    if (!cap.is_string()) continue;
+                    if (!cap.is_string() || (follows && models::device_bit(cap.str_val))) continue;
                     const std::string& n = cap.str_val;
                     if (n == "DISPLAY" || n == "TFT_DISPLAY" || n == "KEYBOARD" || n == "SPEAKER" || n == "AUDIO" || n == "SD" ||
                         n == "SD_CARD" || n == "CHIP_TEMP") {

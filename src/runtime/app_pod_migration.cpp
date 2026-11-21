@@ -5,7 +5,9 @@
 #include "runtime/app_pod.hpp"
 #include "runtime/k32_app_abi.h"
 #include "runtime/pod_fs.hpp"
+#include "hal/capability_firewall.hpp"
 #include "ipc/channel.hpp"
+#include "models/migration.hpp"
 #include "osal/system.hpp"
 
 #include <cstdio>
@@ -17,6 +19,39 @@ void AppPodHost::set_migration_info(const std::string& pod_id, const DeploySpec&
     MigrationInfo& m = migration_[pod_id];
     m.container = spec.container_name.empty() ? pod_id.substr(pod_id.find('/') + 1) : spec.container_name;
     m.blockers = spec.migration_blockers;
+    m.need = m.recorded = spec.recorded_need;
+}
+
+int32_t AppPodHost::need(const std::string& pod_id, std::string_view list) {
+    uint32_t want = 0, listed = 0, held = 0;
+    bool follows = false;
+    hal::CapabilityFirewall& fw = hal::CapabilityFirewall::instance();
+    if (list.size() > K32_NEED_MAX_BYTES || !models::parse_devices(list, want)) return K32_ERR_INVAL;
+    if (!fw.pod_devices(pod_id, listed, held, follows) || (want & ~listed)) return K32_ERR_PERM;
+    // Met here: the pod holds the grants and the node has the devices
+    const bool here = (want & ~(held & fw.node_devices())) == 0;
+    if (!follows) return here ? K32_OK : K32_ERR_NODEV;
+    {
+        osal::LockGuard guard(mutex_);
+        auto it = migration_.find(pod_id);
+        if (it != migration_.end()) it->second.need = want;
+    }
+    return here ? K32_OK : K32_NEED_MOVING;
+}
+
+std::vector<std::pair<std::string, uint32_t>> AppPodHost::unrecorded_needs() const {
+    std::vector<std::pair<std::string, uint32_t>> out;
+    osal::LockGuard guard(mutex_);
+    for (const auto& kv : migration_) {
+        if (kv.second.need != kv.second.recorded) out.emplace_back(kv.first, kv.second.need);
+    }
+    return out;
+}
+
+void AppPodHost::need_recorded(const std::string& pod_id, uint32_t devices) {
+    osal::LockGuard guard(mutex_);
+    auto it = migration_.find(pod_id);
+    if (it != migration_.end()) it->second.recorded = devices;
 }
 
 // The entry point of a module, null for a request pod

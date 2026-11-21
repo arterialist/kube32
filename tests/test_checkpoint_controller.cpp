@@ -6,7 +6,7 @@
 // thaw after a failure before the replacement, blockers from the spec and
 // from the node, the eviction API, retention, periodic checkpoints, restore
 // after node loss, and the Auto policies (memory pressure, placement
-// fastest) with their cooldowns on a fake clock.
+// fastest, placement hardware) with their cooldowns on a clock the test sets.
 
 #include "api/route_handler.hpp"
 #include "controller/checkpoint_controller.hpp"
@@ -151,11 +151,15 @@ JsonValue parse(const std::string& json) {
     return d;
 }
 
-std::string node_json(const std::string& name, double mops = 0, bool unschedulable = false, bool pressure = false) {
+// `devices`: on-board devices it offers, resource names after hardware.kube32.io/
+std::string node_json(const std::string& name, double mops = 0, bool unschedulable = false, bool pressure = false,
+                      const std::vector<std::string>& devices = {}) {
+    std::string alloc = R"("memory":"300Ki")";
+    for (const auto& d : devices) alloc += R"(,"hardware.kube32.io/)" + d + R"(":"8")";
     return R"({"kind":"Node","metadata":{"name":")" + name + R"(","labels":{"kubernetes.io/hostname":")" + name + R"("},"annotations":{"kube32.io/interp-mops":")" +
            std::to_string(mops) + R"("}},"spec":{"unschedulable":)" + (unschedulable ? "true" : "false") +
            R"(},"status":{"conditions":[{"type":"Ready","status":"True"},{"type":"MemoryPressure","status":")" + (pressure ? "True" : "False") +
-           R"("}],"allocatable":{"memory":"300Ki"},"addresses":[{"type":"InternalIP","address":"127.0.0.1"}],"daemonEndpoints":{"kubeletEndpoint":{"Port":)" +
+           R"("}],"allocatable":{)" + alloc + R"(},"addresses":[{"type":"InternalIP","address":"127.0.0.1"}],"daemonEndpoints":{"kubeletEndpoint":{"Port":)" +
            std::to_string(g_node->port) + "}}}}";
 }
 
@@ -684,6 +688,78 @@ void test_placement_fastest() {
     std::cout << "[PASS] Placement fastest: 2x faster nodes only, one move per ten minutes, back when the node leaves" << std::endl;
 }
 
+// kube32.io/placement: hardware: the pod goes where its step's need is, as
+// soon as its kubelet records the need, a move per need_cooldown_ms at most;
+// MoveFailed once per need when no node has it, a move once one joins
+void test_placement_hardware() {
+    Cluster c({node_json("node-a", 0, false, false, {"tft-display", "keyboard"}), node_json("node-b", 0, false, false, {"speaker"}),
+               node_json("node-c", 0, false, false, {"led"})});
+    const std::string follow = R"("kube32.io/migration":"Auto","kube32.io/placement":"hardware")";
+    const std::string grants = R"("memory":"16Ki","hardware.kube32.io/tft-display":"1","hardware.kube32.io/keyboard":"1","hardware.kube32.io/speaker":"1","hardware.kube32.io/led":"1")";
+    auto needs = [&](const std::string& value) {
+        JsonValue p = c.pod("job");
+        p.get_mut("metadata")->get_mut("annotations")->set(models::kAnnotationNeeds, JsonValue{models::JsonType::String, false, 0, value, {}, {}});
+        c.put("/registry/pods/default/job", p.to_string());
+    };
+    auto move_events = [&](const char* reason) {
+        std::vector<std::string> jsons;
+        c.store->list("/registry/events/", jsons);
+        return std::count_if(jsons.begin(), jsons.end(), [&](const std::string& j) { return parse(j).get_string("reason", "") == reason; });
+    };
+    // Its device grants do not keep it in place; no need: it stays
+    c.put("/registry/pods/default/job", pod_json("job", "node-a", follow, grants));
+    c.pass();
+    CHECK(c.checkpoints().empty());
+    // A need its node has: it stays
+    needs("hardware.kube32.io/tft-display,hardware.kube32.io/keyboard");
+    c.pass();
+    CHECK(c.checkpoints().empty());
+
+    // The speaker: to node-b, the one node that has it
+    needs("hardware.kube32.io/speaker");
+    c.pass();
+    auto cks = c.checkpoints();
+    CHECK(cks.size() == 1);
+    CHECK(cks[0].get("spec")->get("target")->get_string("nodeName", "") == "node-b");
+    CHECK(cks[0].get("metadata")->get("labels")->get_string(models::kLabelTrigger, "") == "hardware");
+    c.pass();
+    CHECK(node_of(c.pod("job")) == "node-b");
+    CHECK(c.event("Moving", "to node node-b for its need hardware.kube32.io/speaker"));
+    c.running("job");
+    c.pass(100);
+    CHECK(c.event("Moved", "to node node-b for its need hardware.kube32.io/speaker in "));
+    // The LED right after: one move per three seconds
+    needs("hardware.kube32.io/led");
+    c.pass(100);
+    CHECK(c.checkpoints().size() == 1);
+    c.pass(3000);
+    cks = c.checkpoints();
+    CHECK(cks.size() == 2);
+    c.pass();
+    CHECK(node_of(c.pod("job")) == "node-c");
+    c.running("job");
+    c.pass();
+
+    // The speaker and the LED: no node has both. One MoveFailed, the pod stays
+    needs("hardware.kube32.io/speaker,hardware.kube32.io/led");
+    c.pass(3000);
+    c.pass(3000);
+    CHECK(c.checkpoints().size() == 2);
+    CHECK(node_of(c.pod("job")) == "node-c");
+    CHECK(move_events("MoveFailed") == 1);
+    CHECK(c.event("MoveFailed", "No node has hardware.kube32.io/speaker,hardware.kube32.io/led for the pod's need (0/3 nodes are available: "));
+    CHECK(c.event("MoveFailed", "it runs on node node-c and moves once a node has it"));
+    // A node with both joins: the pod moves there
+    c.put("/registry/nodes/node-d", node_json("node-d", 0, false, false, {"speaker", "led"}));
+    c.pass();
+    cks = c.checkpoints();
+    CHECK(cks.size() == 3);
+    c.pass();
+    CHECK(node_of(c.pod("job")) == "node-d");
+    CHECK(move_events("MoveFailed") == 1);
+    std::cout << "[PASS] Placement hardware: to the node of the need, one move per three seconds, MoveFailed once, a move when a node has it" << std::endl;
+}
+
 void test_policy_parsing() {
     CHECK(models::parse_duration_ms("60s") == 60000 && models::parse_duration_ms("2m") == 120000 && models::parse_duration_ms("1h") == 3600000);
     CHECK(models::parse_duration_ms("500ms") == 500 && models::parse_duration_ms("750") == 750 && models::parse_duration_ms("x") == 0);
@@ -759,6 +835,7 @@ int main() {
     test_restore_failure_starts_afresh();
     test_memory_pressure();
     test_placement_fastest();
+    test_placement_hardware();
     test_event_driven();
     node.stop();
     std::cout << "All checkpoint controller tests passed" << std::endl;

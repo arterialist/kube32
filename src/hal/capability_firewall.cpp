@@ -1,5 +1,6 @@
 #include "hal/capability_firewall.hpp"
 #include "models/kube_models.hpp"
+#include "models/migration.hpp"
 #include "osal/thread.hpp"
 #if defined(ESP_PLATFORM)
 #include "esp_adc/adc_oneshot.h"
@@ -57,6 +58,21 @@ BoardProfile CapabilityFirewall::board_profile() const {
 uint32_t CapabilityFirewall::onboard_devices() const {
     osal::LockGuard guard(mutex_);
     return profile_.onboard_devices;
+}
+
+uint32_t CapabilityFirewall::node_devices() const {
+    osal::LockGuard guard(mutex_);
+    return profile_.onboard_devices | (profile_.chip_temp ? KUBE32_CAP_CHIP_TEMP : 0);
+}
+
+bool CapabilityFirewall::pod_devices(const std::string& pod_id, uint32_t& listed, uint32_t& held, bool& follows) const {
+    osal::LockGuard guard(mutex_);
+    auto it = pod_records_.find(pod_id);
+    if (it == pod_records_.end()) return false;
+    listed = it->second.listed_devices;
+    held = it->second.grant.capabilities_mask & models::kFollowedDevices;
+    follows = it->second.follows_hardware;
+    return true;
 }
 
 bool CapabilityFirewall::capability_held(uint32_t capabilities) const {
@@ -838,9 +854,17 @@ bool CapabilityFirewall::register_pod_locked(const std::string& pod_id, const st
         return false;
     }
 
+    // A pod that follows its hardware holds the devices it lists that this
+    // node has; on another node, those that one has
+    const uint32_t listed_devices = grant.capabilities_mask & models::kFollowedDevices;
+    const bool follows = models::follows_hardware(doc);
+    if (follows) grant.capabilities_mask &= ~(listed_devices & ~(profile_.onboard_devices | (profile_.chip_temp ? KUBE32_CAP_CHIP_TEMP : 0)));
+
     PodSecurityRecord record;
     record.pod_id = pod_id;
     record.grant = grant;
+    record.listed_devices = listed_devices;
+    record.follows_hardware = follows;
     record.action = SecurityAction::LogAndDeny;
     record.violation_count = 0;
     record.sd_claim = sd_claim;
