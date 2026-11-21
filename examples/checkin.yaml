@@ -1,0 +1,82 @@
+# checkin: a check-in job that follows its hardware from board to board
+# (docs/migration.md#hardware-following-pods). One record, four steps; the
+# weight and the label are the pod's state and travel with it:
+#
+#   1 weigh    no hardware: reads the scale's Service. The Mini Scales unit is
+#              wired to one board and its Device driver serves it; a reading
+#              is one small HTTP request, cheaper than moving the pod.
+#   2 label    display and keyboard: the Cardputer. Typing is a loop of key
+#              reads and redraws; run where the keys are, each key costs a
+#              function call, not a network round trip.
+#   3 confirm  speaker and LED: an ESP32-S31 CoreBoard, the one board with
+#              both. The tones are played in one call with fixed gaps, which
+#              only a local speaker keeps.
+#   4 log      no hardware: the record goes to the pod's log where it is.
+#
+# Each step calls k32_need with its devices. With kube32.io/placement:
+# hardware, the control plane moves the pod to a node that has them, so the
+# job runs on the devkit (Xtensa), the Cardputer (Xtensa) and an S31
+# (RISC-V) in turn. kube32.io/prefer-nodes picks among nodes that have a
+# step's devices: a board without a profile (the devkit) before others for
+# the reading, the Cardputer before the Cardputer Zero for the label. A
+# kube32-sim node is labelled generic too; node names steer the job on a
+# given cluster: kube32.io/prefer-nodes: "devkit, cardputer".
+#
+# SCALE_URL names the scale's Service: a Device named kitchen-scale
+# (docs/devices.md), or the name discovery gave the Mini Scales unit. Without
+# a reading within 20 s the job goes on without a weight.
+#
+# The module travels inline. make -C apps/checkin writes
+# apps/checkin/build/checkin.yaml, this manifest with the module in place of
+# "@checkin.wasm":
+#
+#   make -C apps/checkin
+#   kubectl --context kube32 apply -f apps/checkin/build/checkin.yaml
+#   kubectl --context kube32 get events --field-selector involvedObject.name=checkin -w
+#   kubectl --context kube32 logs -f checkin
+#
+# Set LABEL to take the label without the keyboard. GET / on the pod answers
+# the record and the node of each step; POST /again starts a new record
+# (apps/checkin/checkin.c).
+apiVersion: v1
+kind: Pod
+metadata:
+  name: checkin
+  namespace: default
+  labels:
+    app: checkin
+  annotations:
+    kube32.io/wasm-base64: "@checkin.wasm"
+    kube32.io/migration: Auto
+    kube32.io/placement: hardware
+    kube32.io/prefer-nodes: "kube32.io/board=generic, kube32.io/board=cardputer"
+    kube32.io/tick-interval: 100ms
+spec:
+  enableServiceLinks: false
+  containers:
+    - name: checkin
+      image: wasm://inline/checkin
+      env:
+        - name: NODE_NAME                   # the node of each step, in the record
+          valueFrom:
+            fieldRef:
+              fieldPath: spec.nodeName
+        - name: SCALE_URL                   # the scale's Device Service
+          value: http://kitchen-scale/
+        - name: LABEL                       # non-empty: the label, without the keyboard
+          value: ""
+        - name: VOLUME                      # percent of the speaker's ceiling
+          value: "5"
+      resources:
+        requests:
+          memory: 8Ki                       # linear memory: 2 KiB stack, 2 KiB of data
+          # Every device of the job's life; each node grants those it has
+          hardware.kube32.io/tft-display: "1"
+          hardware.kube32.io/keyboard: "1"
+          hardware.kube32.io/speaker: "1"
+          hardware.kube32.io/led: "1"
+        limits:
+          memory: 8Ki
+      securityContext:
+        capabilities:
+          add: ["SERVICE_CALL"]
