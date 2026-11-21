@@ -143,6 +143,7 @@ Pod migration commands (see [Pod migration](migration.md)) create and read Check
 | --- | --- |
 | `checkpoint <pod>` | Create a `Save` Checkpoint named `<pod>-<suffix>` and wait until it is `Saved` or `Failed`. Prints the size and the node. The pod keeps running. Flags: `-n <ns>`, default `default`, `-c <container>`, `--no-wait`, `--timeout <s>`, default `60`. |
 | `move <pod> [--to <node>]` | Create a `Move` Checkpoint and wait until it is `Completed` or `Failed`. Without `--to` the scheduler picks the node. Prints the move's message, or the reason and each blocker. Flags: `-n <ns>`, `-c <container>`, `--no-wait`, `--timeout <s>`, default `120`. |
+| `copy <pod> --into <pod> [--to <node>]` | Create a `Copy` Checkpoint: the state of the first pod restores into the second, which runs the same module ([Copies](migration.md#copies)). Waits until it is `Completed` or `Failed`. Without `--to` the target pod stays on its node while that node is Ready. Prints the copy's message, or the reason and each blocker. Flags: `-n <ns>`, `-c <container>`, `--no-wait`, `--timeout <s>`, default `120`. |
 | `checkpoints` | List the Checkpoints of a namespace (`-n`, default `default`, or `-A`), oldest first: name, pod, action, phase, node, target, size, trigger and message. |
 
 Exit codes:

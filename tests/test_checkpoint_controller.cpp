@@ -4,7 +4,9 @@
 // Move with every phase, a bare pod and a Deployment's pod moved with one pod
 // counted throughout, rollback after a RestoreError and after the deadline,
 // thaw after a failure before the replacement, blockers from the spec and
-// from the node, the eviction API, retention, periodic checkpoints, restore
+// from the node, Copy into another pod (in place, off a node that is not
+// Ready, to a node named, refusals, a failed restore), the eviction API,
+// retention, periodic checkpoints, restore
 // after node loss, and the Auto policies (memory pressure, placement
 // fastest, placement hardware) with their cooldowns on a clock the test sets.
 
@@ -480,6 +482,131 @@ void test_targets() {
     std::cout << "[PASS] Targets: never the source, never a cordoned node, none fits on one node" << std::endl;
 }
 
+// A Copy checkpoint: `pod`'s state into pod `into`, on `node` when named
+void copy_checkpoint(Cluster& c, const std::string& name, const std::string& pod, const std::string& into, const std::string& node = "") {
+    c.put(std::string(models::kCheckpointPrefix) + "default/" + name,
+          R"({"apiVersion":"kube32.io/v1","kind":"Checkpoint","metadata":{"name":")" + name + R"(","namespace":"default","uid":"ck-)" + name +
+              R"("},"spec":{"podName":")" + pod + R"(","action":"Copy","target":{"podName":")" + into + "\"" +
+              (node.empty() ? "" : R"(,"nodeName":")" + node + "\"") + R"(}},"status":{"phase":"Pending"}})");
+}
+
+std::string not_ready(std::string node) {
+    const std::string ready = R"({"type":"Ready","status":"True"})";
+    node.replace(node.find(ready), ready.size(), R"({"type":"Ready","status":"False"})");
+    return node;
+}
+
+void test_copy_in_place() {
+    Cluster c({node_json("node-a"), node_json("node-b")});
+    c.put("/registry/pods/default/lane-a", pod_json("lane-a", "node-a"));
+    c.put("/registry/pods/default/lane-b", pod_json("lane-b", "node-b"));
+    copy_checkpoint(c, "c1", "lane-a", "lane-b");
+    c.pass();
+    const auto reqs = g_node->take();
+    // The source keeps running: a snapshot with leave=running, no thaw
+    CHECK(has(reqs, "POST /checkpoint/default/lane-a/app?leave=running"));
+    CHECK(has(reqs, "PUT /apis/kube32.io/v1/namespaces/default/checkpoints/c1/data"));
+    CHECK(!has(reqs, "POST /thaw/"));
+    CHECK(c.phase("c1") == "Copying");
+    const JsonValue st = *c.ck("c1").get("status");
+    CHECK(st.get_string("nodeName", "") == "node-a" && st.get_string("targetNode", "") == "node-b" && st.get_string("newPodName", "") == "lane-b");
+    CHECK(node_of(c.pod("lane-a")) == "node-a" && uid_of(c.pod("lane-a")) == "uid-lane-a");
+    CHECK(c.annotation(c.pod("lane-a"), models::kAnnotationRestoreFrom).empty());
+    // The target, replaced on its own node and restored from the copy
+    JsonValue p = c.pod("lane-b");
+    CHECK(node_of(p) == "node-b");
+    CHECK(uid_of(p) != "uid-lane-b");
+    CHECK(c.annotation(p, models::kAnnotationRestoreFrom) == "c1");
+    CHECK(p.get("status")->get_string("phase", "") == "Pending");
+    CHECK(c.event("Copying", "state of pod lane-a on node node-a into pod lane-b on node node-b"));
+    // No other checkpoint of the target starts while it restores
+    c.checkpoint("s1", "lane-b", "Save");
+    c.pass();
+    CHECK(c.phase("c1") == "Copying");
+    CHECK(c.phase("s1").empty() || c.phase("s1") == "Pending");
+    CHECK(!has(g_node->take(), "POST /checkpoint/default/lane-b/"));
+    // The source is free once its snapshot is taken: a Save of it runs meanwhile
+    c.checkpoint("s0", "lane-a", "Save");
+    c.pass();
+    CHECK(c.phase("s0") == "Saved");
+    CHECK(c.phase("c1") == "Copying");
+    CHECK(has(g_node->take(), "POST /checkpoint/default/lane-a/app?leave=running"));
+    c.running("lane-b");
+    c.pass();
+    CHECK(c.phase("c1") == "Completed");
+    p = c.pod("lane-b");
+    CHECK(c.annotation(p, models::kAnnotationRestoreFrom).empty());
+    CHECK(c.event("Copied", "copied the state of pod lane-a on node node-a into pod lane-b on node node-b"));
+    CHECK(!c.event("Restored"));
+    c.pass();
+    CHECK(c.phase("s1") == "Saved");
+    std::cout << "[PASS] Copy: the source runs on and can be saved again, the target restores the copy on its node, Completed" << std::endl;
+}
+
+void test_copy_targets_and_refusals() {
+    Cluster c({node_json("node-a"), not_ready(node_json("node-b")), node_json("node-c"), node_json("node-d")});
+    c.put("/registry/pods/default/lane-a", pod_json("lane-a", "node-a"));
+    c.put("/registry/pods/default/lane-b", pod_json("lane-b", "node-b"));
+    c.put("/registry/pods/default/lane-c", pod_json("lane-c", "node-c"));
+    // Its node is not Ready: the scheduler's pick among the others
+    copy_checkpoint(c, "c1", "lane-a", "lane-b");
+    c.pass();
+    CHECK(c.phase("c1") == "Copying");
+    const std::string at = node_of(c.pod("lane-b"));
+    CHECK(!at.empty() && at != "node-b");
+    // A node named
+    copy_checkpoint(c, "c2", "lane-a", "lane-c", "node-d");
+    c.pass();
+    CHECK(c.phase("c2") == "Copying");
+    CHECK(node_of(c.pod("lane-c")) == "node-d");
+    // Refused: another module, no such pod, the pod itself, a pod that cannot move
+    c.put("/registry/pods/default/other",
+          R"({"kind":"Pod","metadata":{"name":"other","namespace":"default","uid":"uid-other"},"spec":{"nodeName":"node-c","containers":[{"name":"app","image":"wasm://embedded/webhook"}]},)" +
+              kRunning + "}");
+    c.put("/registry/pods/default/keep", pod_json("keep", "node-c", R"("kube32.io/migration":"Never")"));
+    copy_checkpoint(c, "r1", "lane-a", "other");
+    copy_checkpoint(c, "r2", "lane-a", "missing");
+    copy_checkpoint(c, "r3", "lane-a", "lane-a");
+    copy_checkpoint(c, "r4", "lane-a", "keep");
+    for (int i = 0; i < 4; i++) c.pass();
+    CHECK(c.phase("r1") == "Failed" && c.ck("r1").get("status")->get_string("message", "").find("runs another module") != std::string::npos);
+    CHECK(c.phase("r2") == "Failed" && c.ck("r2").get("status")->get_string("message", "") == "pod missing not found");
+    CHECK(c.phase("r3") == "Failed");
+    CHECK(c.phase("r4") == "Failed");
+    const JsonValue r4 = c.ck("r4");
+    const JsonValue* b = r4.get("status")->get("blockers");
+    CHECK(b && b->arr_val.size() == 1 && b->arr_val[0].str_val == "annotation kube32.io/migration: Never");
+    CHECK(uid_of(c.pod("other")) == "uid-other" && uid_of(c.pod("keep")) == "uid-keep");
+    // The API server takes a Copy only with the pod it restores into
+    const std::string body = R"({"apiVersion":"kube32.io/v1","kind":"Checkpoint","metadata":{"name":"v1"},"spec":{"podName":"lane-a","action":"Copy"}})";
+    CHECK(c.call(api::HttpMethod::Post, "/apis/kube32.io/v1/namespaces/default/checkpoints", body).status_code == 422);
+    const std::string save_into = R"({"apiVersion":"kube32.io/v1","kind":"Checkpoint","metadata":{"name":"v2"},"spec":{"podName":"lane-a","action":"Save","target":{"podName":"lane-c"}}})";
+    CHECK(c.call(api::HttpMethod::Post, "/apis/kube32.io/v1/namespaces/default/checkpoints", save_into).status_code == 422);
+    const std::string ok = R"({"apiVersion":"kube32.io/v1","kind":"Checkpoint","metadata":{"name":"v3"},"spec":{"podName":"lane-a","action":"Copy","target":{"podName":"lane-c"}}})";
+    CHECK(c.call(api::HttpMethod::Post, "/apis/kube32.io/v1/namespaces/default/checkpoints", ok).status_code == 201);
+    std::cout << "[PASS] Copy targets: a node that is not Ready is left, a node named is taken; other modules and pods that cannot move are refused" << std::endl;
+}
+
+void test_copy_restore_failure_starts_afresh() {
+    Cluster c({node_json("node-a"), node_json("node-b")});
+    c.put("/registry/pods/default/lane-a", pod_json("lane-a", "node-a"));
+    c.put("/registry/pods/default/lane-b", pod_json("lane-b", "node-b"));
+    copy_checkpoint(c, "c1", "lane-a", "lane-b");
+    c.pass();
+    CHECK(c.phase("c1") == "Copying");
+    const std::string copied_uid = uid_of(c.pod("lane-b"));
+    c.report("lane-b", R"({"phase":"Running","containerStatuses":[{"name":"app","state":{"waiting":{"reason":"RestoreError","message":"memory limit too small"}}}]})");
+    c.pass();
+    CHECK(c.phase("c1") == "Failed");
+    CHECK(c.ck("c1").get("status")->get_string("message", "").find("RestoreError: memory limit too small") != std::string::npos);
+    const JsonValue p = c.pod("lane-b");
+    CHECK(node_of(p) == "node-b" && uid_of(p) != copied_uid);
+    CHECK(c.annotation(p, models::kAnnotationRestoreFrom).empty());
+    CHECK(c.event("CopyFailed", "the pod starts afresh"));
+    CHECK(uid_of(c.pod("lane-a")) == "uid-lane-a");
+    std::cout << "[PASS] Copy whose restore fails: the target starts afresh on its node, Failed" << std::endl;
+}
+
 void test_interrupted_saving() {
     Cluster c({node_json("node-a"), node_json("node-b")});
     c.put("/registry/pods/default/echo", pod_json("echo", "node-a"));
@@ -827,6 +954,9 @@ int main() {
     test_failure_before_replacement_thaws();
     test_blockers();
     test_targets();
+    test_copy_in_place();
+    test_copy_targets_and_refusals();
+    test_copy_restore_failure_starts_afresh();
     test_interrupted_saving();
     test_eviction_api();
     test_retention();

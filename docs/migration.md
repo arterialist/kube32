@@ -1,6 +1,6 @@
 # Pod migration
 
-A running request pod can move to another node and continue with its state. The pod does not start again: its counters, buffers and clock carry over, and `k32_init` does not run a second time. A pod moves on request, when a node is drained, when its node runs short of memory, when a faster node joins or leaves, and to the node that has the hardware its current step needs. A pod with periodic checkpoints comes back on another node when its node is lost.
+A running request pod can move to another node and continue with its state. The pod does not start again: its counters, buffers and clock carry over, and `k32_init` does not run a second time. A pod moves on request, when a node is drained, when its node runs short of memory, when a faster node joins or leaves, and to the node that has the hardware its current step needs. A pod with periodic checkpoints comes back on another node when its node is lost. The state of one pod can also be copied into another pod that runs the same module, which then continues from it ([Copies](#copies)).
 
 Nodes of any architecture take part. A pod saved on an ESP32-S3 restores on another board or on a `kube32-sim` worker on a laptop, and the other way round.
 
@@ -77,6 +77,7 @@ When the replacement fails to restore (`RestoreError`), fails, or does not run w
 | `Saving` | The node freezes the pod and sends its state |
 | `Saved` | A Save checkpoint is stored |
 | `Moving` | The replacement is restoring on the target |
+| `Copying` | The target pod of a [Copy](#copies) is restoring the copied state |
 | `Completed` | The replacement runs on the target |
 | `Failed` | Refused or rolled back, see `status.message` and `status.blockers` |
 
@@ -90,8 +91,42 @@ The controller records each decision as an event on the pod:
 | `Moved` | The replacement runs. The message gives the time from the freeze, and the need as `Moving` does |
 | `MoveFailed` | A move was refused or rolled back, a restore failed, or no node has the devices a hardware-following pod needs |
 | `Restored` | A pod restored outside a move runs: after a node loss or a rollback. The message gives the checkpoint's age |
+| `Copying`, `Copied`, `CopyFailed` | On the target pod of a [Copy](#copies): restoring, running with the copied state (the message gives the time from the snapshot), or refused or failed |
 
 `kube32 checkpoint <pod>` saves a pod's state without moving it. The pod keeps running.
+
+## Copies
+
+A Copy restores the state of a running pod into another pod that runs the same module. The source pod keeps running. The target pod continues from the source's memory, globals and clock, as if it had run the source's history. Replicas of a deterministic computation use it: a replica whose state diverged, that started over, or whose node is gone takes the state of a healthy one and agrees with it again, on any architecture.
+
+```
+kube32 copy replica-a --into replica-c
+```
+
+or create a Checkpoint:
+
+```yaml
+apiVersion: kube32.io/v1
+kind: Checkpoint
+metadata:
+  name: replica-c-from-a
+spec:
+  podName: replica-a        # the pod whose state is copied
+  action: Copy
+  target:
+    podName: replica-c      # the pod that takes it, required
+    nodeName: devkit        # optional, or nodeSelector
+```
+
+The Checkpoint controller carries out the copy:
+
+1. It checks both pods. The source can be checkpointed, and the target can move: neither has a [blocker](#what-keeps-a-pod-from-moving). The target runs the same module (the same `kube32.io/wasm-sha256` for an inline image, else the same image) and is not being deleted.
+2. It picks the target pod's node. The target stays on its node while that node is Ready and `spec.target` names no node. Otherwise it goes to `spec.target.nodeName`, or to the node the scheduler picks with `spec.target.nodeSelector` added to the pod's own, never to its own node when that node is not Ready.
+3. It asks the source's kubelet for a snapshot with the pod left running and stores the bytes as the Checkpoint's data.
+4. It replaces the target pod in one write, as a move replaces a pod: the same name, spec, labels and owners, a new uid, `spec.nodeName` set to the node of step 2 and `kube32.io/restore-from` naming the Checkpoint. The target's kubelet stops the old instance and the node it is bound to restores the copy. `k32_restored` runs there.
+5. Once the target runs, the copy is `Completed` and the annotation is removed. A `RestoreError`, a `Failed` pod or no `Running` within 60 s starts the target afresh where it is bound, and the copy is `Failed`.
+
+The target keeps its own spec: environment, labels, limits, events and channels. Its memory holds the source's values, so `k32_restored` reads again what differs from pod to pod, such as a name or a role from the environment. No other checkpoint of the target starts while the copy restores, and none of the source while its snapshot is taken.
 
 ## Drain and evictions
 
@@ -304,8 +339,8 @@ A pod with the annotation `kube32.io/restore-from: <checkpoint>` starts from tha
 | --- | --- |
 | `spec.podName` | The pod, required |
 | `spec.containerName` | Its container. Default: the only container |
-| `spec.action` | `Save` (the default) or `Move` |
-| `spec.target` | For `Move`: `nodeName` or `nodeSelector` |
+| `spec.action` | `Save` (the default), `Move` or `Copy` |
+| `spec.target` | For `Move`: `nodeName` or `nodeSelector`. For `Copy`: `podName`, the pod that takes the state (required), and optionally `nodeName` or `nodeSelector` |
 | `status.phase` | `Pending`, `Saving`, `Saved`, `Moving`, `Completed` or `Failed` |
 | `status.nodeName`, `status.takenAt` | Where and when the snapshot was taken |
 | `status.sizeBytes`, `status.snapshotSha256`, `status.imageSha256`, `status.podTimeMs` | Facts of the stored snapshot |
@@ -326,7 +361,7 @@ Snapshot data lives in the control plane's memory, outside the object store, up 
 
 `kubectl get checkpoints` prints `NAME`, `POD`, `ACTION`, `PHASE`, `NODE`, `SIZE` and `AGE`. `-o wide` adds `TARGET`, `NEW POD` and `MESSAGE`.
 
-The Checkpoint controller carries out `Save` and `Move` Checkpoints, see [Moves](#moves).
+The Checkpoint controller carries out `Save`, `Move` and `Copy` Checkpoints, see [Moves](#moves) and [Copies](#copies).
 
 ## Limits
 
