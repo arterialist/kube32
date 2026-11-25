@@ -35,8 +35,9 @@
  *
  * On a node with a screen it draws the pendulum of the voted state with each
  * lane's arms over it in the lane's colour, and a row per lane. On a node
- * with a keyboard, a lane's name (or 1..4) injects a fault into that lane and
- * r repairs every outvoted or lagging lane.
+ * with a keyboard, a lane's name (or 1..4) injects a fault into that lane,
+ * r repairs every outvoted or lagging lane, and Esc counts a request to give
+ * the screen back ("leave" in /state), for whatever runs the voter to act on.
  *
  * Environment:
  *   LANES          the lanes, comma-separated (default a,b,c); others that
@@ -98,6 +99,7 @@ static uint32_t now;
 static uint32_t every, rate, lead, lost_ms, start_ms, auto_ms, fault_bit_default;
 static uint32_t started, any_seen, first_seen, voted_any, voted_step, vote_ms, target, target_ms, acc;
 static uint32_t votes, unanimous, last_maj, last_voters, split_logged, last_det = NONE;
+static uint32_t leaves;                  /* Esc presses: requests to give the screen back */
 static uint32_t hist_step[HIST], hist_ok[HIST];
 static uint64_t hist_bits[HIST][4];
 static char api[128], token[160], ns[64];
@@ -1104,6 +1106,7 @@ static NOINLINE void send_state(void) {
     b_s(&b, started ? ",\"started\":true" : ",\"started\":false");
     j_u(&b, ",\"votes\":", votes);
     j_u(&b, ",\"unanimous\":", unanimous);
+    j_u(&b, ",\"leave\":", leaves);
     j_u(&b, ",\"majority\":", last_maj);
     j_u(&b, ",\"voters\":", last_voters);
     b_s(&b, ",\"lanes\":[");
@@ -1248,6 +1251,10 @@ K32_EXPORT("k32_init") int32_t k32_init(void) {
 }
 
 static void on_key(int32_t k) {
+    if (k == 27) {
+        leaves++;
+        return;
+    }
     if (k == 'r' || k == 'R') {
         repair_all();
         return;

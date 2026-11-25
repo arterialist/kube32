@@ -26,7 +26,7 @@ On a node with a screen, the voter draws the same at the screen's size (`k32_dis
 
 A flipped bit is outvoted at the next checkpoint whatever its weight. How soon an outvoted lane's arms part from the others depends on the bit: the example flips bit 48 of theta1, a change of about 0.1 rad that shows at once; bit 40 is a change of a few ten-thousandths of a radian, which the motion takes seconds of pendulum time to grow into a visible gap.
 
-Keys, on a node with a keyboard: a lane's name, or `1` to `4` for the lanes in order, injects a fault into that lane (`FAULT_BIT`); `r` repairs every outvoted or lagging lane.
+Keys, on a node with a keyboard: a lane's name, or `1` to `4` for the lanes in order, injects a fault into that lane (`FAULT_BIT`); `r` repairs every outvoted or lagging lane; Esc adds one to `leave` in `/state`, a request to give the screen back for whatever runs the voter to act on, such as a launcher entry that redeploys it without the screen.
 
 ## The vote
 
@@ -85,7 +85,7 @@ A lane that comes back after its node was lost is repaired by a copy, not by a p
 | Path | Answer |
 | --- | --- |
 | `POST /report` | A lane's report ([Lockstep](../lockstep/README.md#lockstep)) |
-| `/state` | JSON: `step` (the last voted step), `voted`, `bits` and `hash` of the voted state, `target`, `rate`, `every`, `lead`, `started`, `votes`, `unanimous` (votes with every lane identical), `majority` and `voters` of the last vote, `lanes`, `log` |
+| `/state` | JSON: `step` (the last voted step), `voted`, `bits` and `hash` of the voted state, `target`, `rate`, `every`, `lead`, `started`, `votes`, `unanimous` (votes with every lane identical), `leave` (Esc presses), `majority` and `voters` of the last vote, `lanes`, `log` |
 | `/lane?name=<lane>` | One word: `agree`, `outvoted`, `joining`, `behind`, `split`, `lost` or `absent` |
 | `/fault?lane=<lane>[&bit=<n>]` | Fault injection: the lane flips the bit at its next report. `202` |
 | `/repair?lane=<lane>[&from=<lane>][&to=<node>]` | A Copy checkpoint into the lane; `201` with `from` and `checkpoint`, or the error. Without `lane`, every outvoted or lagging lane |
