@@ -52,13 +52,13 @@ A checkpoint is 100 steps, 0.1 s of pendulum time. A bit flipped at step s is ou
 
 ### Lockstep
 
-The voter answers every report with the target step. Once voting starts, the target grows at `RATE` steps a second but stays within `LEAD` steps of the slowest lane in the vote; it holds while no lane is in the vote. A lane slower than `RATE` slows the vote down rather than falling behind it. At the defaults, 250 steps a second and a lead of 400 steps, the lanes run at a quarter of the pendulum's own time, a checkpoint every 0.4 s, within 1.6 s of each other.
+The voter answers every report with the target step and, after the first vote, the last voted step. Once voting starts, the target grows at `RATE` steps a second but stays within `LEAD` steps of the slowest lane in the vote; it holds while no lane is in the vote. A lane slower than `RATE` slows the vote down rather than falling behind it. At the defaults, 250 steps a second and a lead of 400 steps, the lanes run at a quarter of the pendulum's own time, a checkpoint every 0.4 s, within 1.6 s of each other.
 
 ### Lost lanes
 
 A lane that has not reported for `LOST_MS` (8 s) shows `lost` and leaves the vote; the other two vote on, two of three, and the target follows the slower of them. A move or a Wi-Fi stall of a few seconds keeps the vote waiting, not the lane out of it.
 
-A lane that reports again, or a new incarnation of it, is `behind` while its checkpoints are older than the voted step. Each checkpoint the vote has passed is compared with the voted state of its step, while the voter still holds it: a match counts as agreement, a difference outvotes the lane. Once it reaches the voted step, it is in the vote.
+A lane that reports again, or a new incarnation of it, is `behind` while its checkpoints are older than the voted step. It learns so from the voted step in the answer and runs at the full speed of its ticks until it reaches its target, which leads the lanes in the vote by up to `LEAD` steps. Each checkpoint the vote has passed is compared with the voted state of its step, while the voter still holds it: a match counts as agreement, a difference outvotes the lane. Once it reaches the voted step, it is in the vote.
 
 A lane whose pod starts again begins at step 0 and catches up at the speed of its node, since the computation repeats exactly. A repair brings it to the vote at once.
 

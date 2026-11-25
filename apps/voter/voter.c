@@ -8,7 +8,9 @@
  * all differ, have no majority: the difference is detected and no lane is
  * outvoted (split). The voter answers each report with the target step, so
  * the lanes advance in lockstep: the target grows at RATE steps a second and
- * stays within LEAD steps of the slowest lane in the vote.
+ * stays within LEAD steps of the slowest lane in the vote. It also answers
+ * the last voted step, so a lane whose checkpoints the vote has passed runs
+ * to the target at its full speed and reaches the vote.
  *
  * A lane that has not reported for LOST_MS leaves the vote and the others go
  * on. One that comes back, or a new incarnation of one (restarted, or
@@ -780,6 +782,11 @@ static NOINLINE int32_t on_report(const char* b, uint32_t n) {
     if (L->has_latest) {
         b_s(&ab, "ack ");
         b_u(&ab, L->latest);
+        b_c(&ab, '\n');
+    }
+    if (voted_any) {
+        b_s(&ab, "vote ");
+        b_u(&ab, voted_step);
         b_c(&ab, '\n');
     }
     if (L->pending != NONE) {

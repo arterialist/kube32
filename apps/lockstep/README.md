@@ -22,7 +22,7 @@ On an ESP32-S3, an ESP32-S31, `kube32-sim` on Linux on arm64 and `kube32-sim` on
 
 ## Lockstep
 
-The lane advances by step number, not by time. Each tick (`kube32.io/tick-interval: 100ms`) runs up to `STEPS_PER_TICK` steps and never passes the target step that the voter answered last. A lane far behind its target (more than four ticks of steps) ticks again after 10 ms until it is close.
+The lane advances by step number, not by time. Each tick (`kube32.io/tick-interval: 100ms`) runs up to `STEPS_PER_TICK` steps and never passes the target step that the voter answered last. A lane far behind its target (more than four ticks of steps) ticks again after 10 ms until it is close. A lane the vote has passed, one whose last checkpoint the voter holds is older than the voted step, ticks again after 10 ms until it reaches its target: the lanes in the vote trail the target by up to the voter's `LEAD`, so a lane that ran at their pace from four ticks short of the target would stay behind them.
 
 Every `CHECK_EVERY` steps it records a checkpoint: the step and the four `f64` values of the state (theta1, theta2, omega1, omega2) as their bits. It keeps the last 32 and posts those the voter does not hold yet to `VOTER_URL`, eight at most a report, every `REPORT_MS` while it has new checkpoints or waits for its target, and every 2 s otherwise:
 
@@ -38,7 +38,7 @@ fault 12301 40 3120
 c 12300 c00760526fcca8bb 4008c3093858df0f 3ff9b5c3c2d15a0e bfe1d0b8f7f5c3a1
 ```
 
-`inc` names the lane's incarnation and `from` the step it began at; `us` is the time a step takes on this node in microseconds, averaged; `fault` is the step, the bit and the age in milliseconds of the last fault injection, for 120 s after it. The voter answers `target <step>`, `ack <step>` (the last checkpoint it holds of this incarnation) and `fault <bit>` when someone asked it for one. A report that fails is sent again with the next one; the lane logs the first failure and every tenth after it.
+`inc` names the lane's incarnation and `from` the step it began at; `us` is the time a step takes on this node in microseconds, averaged; `fault` is the step, the bit and the age in milliseconds of the last fault injection, for 120 s after it. The voter answers `target <step>`, `ack <step>` (the last checkpoint it holds of this incarnation), `vote <step>` (the last voted step, after the first vote) and `fault <bit>` when someone asked it for one. A report that fails is sent again with the next one; the lane logs the first failure and every tenth after it.
 
 ## Fault injection
 

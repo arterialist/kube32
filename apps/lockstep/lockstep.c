@@ -6,12 +6,16 @@
  * bits. The lane advances by step number, not by time: each tick runs up to
  * STEPS_PER_TICK steps, never past the target step the voter last answered,
  * so lanes on nodes of different speed stay within a few checkpoints of each
- * other; a lane far behind the target ticks again after 10 ms until it is
- * close. Every CHECK_EVERY steps it records a checkpoint, the step and the
- * four f64 values of the state as their bits, and posts the checkpoints the
- * voter does not hold yet to VOTER_URL, at most every REPORT_MS. The voter
- * answers the target step, the last checkpoint it holds of this lane, and a
- * bit to flip when someone asked it for a fault.
+ * other. A lane far behind the target ticks again after 10 ms until it is
+ * close, and a lane the vote has passed (it started over, took a copy or came
+ * back) until it reaches the target: the lanes in the vote trail the target
+ * by up to the voter's LEAD, so a lane that stopped short of the target at
+ * their pace would stay behind them. Every CHECK_EVERY steps it records a
+ * checkpoint, the step and the four f64 values of the state as their bits,
+ * and posts the checkpoints the voter does not hold yet to VOTER_URL, at most
+ * every REPORT_MS. The voter answers the target step, the last voted step,
+ * the last checkpoint it holds of this lane, and a bit to flip when someone
+ * asked it for a fault.
  *
  * The state lives in linear memory and globals, so the lane moves and
  * copies like any request pod (docs/migration.md). k32_restored reads its
@@ -56,6 +60,7 @@ typedef struct {
 static pendulum_t pend;
 static uint32_t step, target;
 static uint32_t acked, has_ack;     /* the last checkpoint the voter holds of this incarnation */
+static uint32_t behind;             /* the last voted step is past that checkpoint */
 static entry_t ring[RING];
 static uint32_t pushed;             /* checkpoints recorded since the incarnation began */
 static uint32_t inc, from;          /* this incarnation: its id and the step it began at */
@@ -237,6 +242,8 @@ static NOINLINE void report(uint32_t now) {
     if (found) target = t;
     const uint32_t a = answer_value("ack", got, 0, &found);
     if (found) { acked = a; has_ack = 1; }
+    const uint32_t v = answer_value("vote", got, 0, &found);
+    behind = found && (!has_ack || acked < v);
     const uint32_t bit = answer_value("fault", got, 0, &found);
     if (found && bit < 256) flip(bit);
 }
@@ -284,7 +291,7 @@ K32_EXPORT("k32_init") int32_t k32_init(void) {
     read_env();
     pendulum_start(&pend);
     step = target = 0;
-    pushed = has_ack = fault_set = 0;
+    pushed = has_ack = behind = fault_set = 0;
     inc = new_inc();
     from = 0;
     push();   /* step 0: every lane starts from the same state */
@@ -297,7 +304,7 @@ K32_EXPORT("k32_restored") int32_t k32_restored(void) {
     read_env();
     inc = new_inc();
     from = step;
-    pushed = has_ack = fault_set = 0;
+    pushed = has_ack = behind = fault_set = 0;
     us_x16 = 0;   /* the step time of this node, not the source's */
     if (step % every == 0) push();
     last_report = (uint32_t)k32_time_ms() - 100000;
@@ -321,9 +328,10 @@ K32_EXPORT("k32_tick") int32_t k32_tick(uint32_t now) {
      * REPORT_MS; a lane between checkpoints every 2 s, so the voter sees it */
     const uint32_t since = now - last_report;
     if (since >= 2000 || (since >= report_ms && (unacked() || !n))) report(now);
-    /* Far behind the target (a lane that started over): the next tick in
-     * 10 ms instead of at the tick interval */
-    return target > step + 4 * per_tick ? 1 : 0;
+    /* Far behind the target (a lane that started over), or passed by the vote
+     * and short of the target: the next tick in 10 ms instead of at the tick
+     * interval */
+    return target > step + 4 * per_tick || (behind && target > step) ? 1 : 0;
 }
 
 K32_EXPORT("k32_handle") int32_t k32_handle(uint32_t ptr, uint32_t len) {
