@@ -101,12 +101,24 @@ public:
     int32_t interact_read(MosaicoInteractInputs& out);
     int32_t interact_ir_send_nec(uint8_t address, uint8_t command);
 
-    // Camera Module operations (thread-safe; opens/streams on demand and closes
-    // immediately after capture so zero DVP DMA and zero ~3.5 MB PSRAM buffers
-    // sit idle between snapshots).
+    // Camera Module operations (thread-safe; opens lazily on first capture and
+    // keeps the DVP stream persistently active for low-latency frame grabs until
+    // shutdown() stops DMA cleanly).
     int32_t camera_info(MosaicoCameraInfo& out);
     int32_t camera_capture_jpeg(std::vector<uint8_t>& out_jpeg, MosaicoCameraInfo* out_info = nullptr, uint8_t quality = 75);
+    int32_t camera_capture_tensor(int8_t* out, uint32_t out_w, uint32_t out_h, uint32_t flags, MosaicoCameraInfo* out_info = nullptr);
     int32_t camera_preview_to_display(Board& board);
+
+    // Pure YUV422 (UYVY or YUYV) strided box downsampler to packed HWC int8
+    // [Y-128, Cb-128, Cr-128] clamped to [-127, 127]. Exposed for unit tests.
+    // rot_q: clockwise 90-deg steps (0=0, 1=90, 2=180, 3=270).
+    // Optional inv_row(row_ptr, row_bytes) callback invalidates CPU cache before
+    // reading each sampled source row from DMA PSRAM.
+    using RowCacheInvFn = void (*)(const uint8_t* row_ptr, size_t row_bytes);
+    static int32_t downsample_yuv422_to_ycbcr_i8(
+        const uint8_t* src, uint32_t src_w, uint32_t src_h, uint32_t bpl, bool is_yuyv,
+        int8_t* dst, uint32_t out_w, uint32_t out_h, uint32_t rot_q,
+        RowCacheInvFn inv_row = nullptr);
 
     // Diagnostics for serial console (K32_CMD:MODULES / CAMERA / INTERACT).
     void print_status() const;

@@ -410,6 +410,11 @@ else()
     target_link_libraries(test_pod_raster PRIVATE kube32_core)
     add_test(NAME test_pod_raster COMMAND test_pod_raster)
 
+    # 10b''. Camera raw YUV422 -> int8 YCbCr tensor downsampler and host stub
+    add_executable(test_camera_tensor tests/test_camera_tensor.cpp)
+    target_link_libraries(test_camera_tensor PRIVATE kube32_core)
+    add_test(NAME test_camera_tensor COMMAND test_camera_tensor)
+
     # 10c'. Blob images (wasm://blob/<name>): modules parsed in place from the flash blob store
     add_executable(test_blob_images tests/test_blob_images.cpp)
     target_link_libraries(test_blob_images PRIVATE kube32_core)

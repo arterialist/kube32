@@ -238,6 +238,13 @@ static inline float k32_expf(float x) {
 #define K32_GPIO_INPUT_PULLUP   2
 #define K32_GPIO_INPUT_PULLDOWN 3
 
+/* Format & clockwise rotation flags for k32_camera_capture_tensor */
+#define K32_CAM_TENSOR_YCBCR_I8  0u
+#define K32_CAM_TENSOR_ROT_0     (0u << 4)
+#define K32_CAM_TENSOR_ROT_90    (1u << 4)
+#define K32_CAM_TENSOR_ROT_180   (2u << 4)
+#define K32_CAM_TENSOR_ROT_270   (3u << 4)
+
 #if defined(__wasm32__)
 #define K32_IMPORT(name) __attribute__((import_module("env"), import_name(name)))
 #define K32_EXPORT(name) __attribute__((export_name(name)))
@@ -711,6 +718,14 @@ K32_IMPORT("k32_interact_ir_send_nec") int32_t k32_interact_ir_send_nec(uint32_t
  * k32_camera_capture_jpeg captures a frame and hardware-JPEG-encodes it into
  * buf (up to cap bytes, returning JPEG size or K32_ERR_TOOBIG); passing
  * buf=0, cap=0 captures and returns the JPEG byte size without copying.
+ * k32_camera_capture_tensor captures a frame from the persistent stream and
+ * natively box-downsamples it into a packed HWC tensor without JPEG encoding.
+ *   flags bits 0..3: format
+ *     K32_CAM_TENSOR_YCBCR_I8 (0): packed HWC int8 [Y-128, Cb-128, Cr-128]
+ *                                  clamped to [-127, 127], BT.601 YCbCr,
+ *                                  size = out_w * out_h * 3 bytes.
+ *   flags bits 4..5: clockwise rotation (0=0 deg, 1=90 deg, 2=180 deg, 3=270 deg).
+ * Returns bytes written (out_w * out_h * 3) or a negative K32_ERR_*.
  * k32_camera_preview (also requires hardware.kube32.io/tft-display) captures
  * a frame and blits an RGB565 preview directly to the 480x480 AMOLED. */
 typedef struct {
@@ -719,9 +734,10 @@ typedef struct {
     uint32_t pixel_format;    /* V4L2 FOURCC */
     uint32_t flags;           /* bit 0: present */
 } k32_camera_info_t;
-K32_IMPORT("k32_camera_info")         int32_t k32_camera_info(k32_camera_info_t* out);
-K32_IMPORT("k32_camera_capture_jpeg") int32_t k32_camera_capture_jpeg(void* buf, uint32_t cap, uint32_t quality);
-K32_IMPORT("k32_camera_preview")      int32_t k32_camera_preview(void);
+K32_IMPORT("k32_camera_info")           int32_t k32_camera_info(k32_camera_info_t* out);
+K32_IMPORT("k32_camera_capture_jpeg")   int32_t k32_camera_capture_jpeg(void* buf, uint32_t cap, uint32_t quality);
+K32_IMPORT("k32_camera_capture_tensor") int32_t k32_camera_capture_tensor(int8_t* out, uint32_t out_w, uint32_t out_h, uint32_t flags);
+K32_IMPORT("k32_camera_preview")        int32_t k32_camera_preview(void);
 
 /* Existing low-level imports (see host_functions.cpp) remain available:
  * esp32_adc_read, esp32_uart_write, esp32_uart_read, esp32_get_time_us,

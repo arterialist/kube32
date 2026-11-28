@@ -1,12 +1,138 @@
 #include "hal/mosaico_modules.hpp"
 #include "hal/board.hpp"
 #include "hal/capability_firewall.hpp"
+#include "runtime/k32_app_abi.h"
 
 #include <algorithm>
 #include <atomic>
 #include <cstdio>
 #include <cstring>
 #include <mutex>
+
+namespace kube32::hal {
+
+int32_t MosaicoModules::downsample_yuv422_to_ycbcr_i8(
+    const uint8_t* src, uint32_t src_w, uint32_t src_h, uint32_t bpl, bool is_yuyv,
+    int8_t* dst, uint32_t out_w, uint32_t out_h, uint32_t rot_q,
+    RowCacheInvFn inv_row) {
+    if (!src || !dst || src_w < 2U || src_h == 0U || out_w == 0U || out_h == 0U ||
+        out_w > 320U || out_h > 240U || rot_q > 3U) {
+        return HAL_ERR_INVAL;
+    }
+    if (bpl < src_w * 2U) {
+        bpl = src_w * 2U;
+    }
+
+    const uint32_t max_mp = src_w >> 1;
+    const bool swapped = (rot_q & 1U) != 0U;
+    const uint32_t src_cells_x = swapped ? out_h : out_w;
+    const uint32_t src_cells_y = swapped ? out_w : out_h;
+
+    // Precompute up to 4 evenly-spaced 4-byte macropixel offsets per horizontal cell
+    // so the inner loop performs zero divisions and only aligned 32-bit loads.
+    uint16_t mp_off[320][4];
+    uint8_t mp_cnt[320];
+    for (uint32_t sx = 0U; sx < src_cells_x; ++sx) {
+        const uint32_t x0 = (sx * src_w) / src_cells_x;
+        const uint32_t x1 = ((sx + 1U) * src_w) / src_cells_x;
+        uint32_t mx0 = x0 >> 1;
+        if (mx0 >= max_mp) mx0 = max_mp - 1U;
+        uint32_t mx1 = (x1 + 1U) >> 1;
+        if (mx1 <= mx0) mx1 = mx0 + 1U;
+        if (mx1 > max_mp) mx1 = max_mp;
+        const uint32_t span = mx1 - mx0;
+        const uint32_t nx = span >= 4U ? 4U : span;
+        mp_cnt[sx] = static_cast<uint8_t>(nx);
+        for (uint32_t k = 0U; k < nx; ++k) {
+            uint32_t mx = mx0 + ((2U * k + 1U) * span) / (2U * nx);
+            if (mx >= max_mp) mx = max_mp - 1U;
+            mp_off[sx][k] = static_cast<uint16_t>(mx * 4U);
+        }
+    }
+
+    auto clamp_i8 = [](int32_t v) -> int8_t {
+        if (v < -127) return -127;
+        if (v > 127) return 127;
+        return static_cast<int8_t>(v);
+    };
+
+    for (uint32_t sy = 0U; sy < src_cells_y; ++sy) {
+        const uint32_t y0 = (sy * src_h) / src_cells_y;
+        uint32_t y1 = ((sy + 1U) * src_h) / src_cells_y;
+        if (y1 <= y0) y1 = std::min(src_h, y0 + 1U);
+        const uint32_t yspan = y1 - y0;
+        const uint32_t ny = yspan >= 2U ? 2U : 1U;
+        const uint32_t ry0 = std::min(src_h - 1U, y0 + (yspan / (2U * ny)));
+        const uint32_t ry1 = (ny == 2U) ? std::min(src_h - 1U, y0 + (3U * yspan) / 4U) : ry0;
+
+        const uint8_t* row0 = src + static_cast<size_t>(ry0) * bpl;
+        const uint8_t* row1 = src + static_cast<size_t>(ry1) * bpl;
+        if (inv_row) {
+            inv_row(row0, bpl);
+            if (ny == 2U && ry1 != ry0) {
+                inv_row(row1, bpl);
+            }
+        }
+
+        for (uint32_t sx = 0U; sx < src_cells_x; ++sx) {
+            const uint32_t nx = mp_cnt[sx];
+            const uint16_t* offs = mp_off[sx];
+            uint32_t sum_y = 0U;
+            uint32_t sum_cb = 0U;
+            uint32_t sum_cr = 0U;
+
+            auto accum_row = [&](const uint8_t* row) {
+                for (uint32_t k = 0U; k < nx; ++k) {
+                    uint32_t mp = 0U;
+                    std::memcpy(&mp, row + offs[k], 4U);
+                    if (!is_yuyv) {
+                        // UYVY little-endian: byte0=U(Cb), byte1=Y0, byte2=V(Cr), byte3=Y1
+                        sum_cb += (mp & 0xFFU);
+                        sum_y  += ((mp >> 8) & 0xFFU) + ((mp >> 24) & 0xFFU);
+                        sum_cr += ((mp >> 16) & 0xFFU);
+                    } else {
+                        // YUYV little-endian: byte0=Y0, byte1=U(Cb), byte2=Y1, byte3=V(Cr)
+                        sum_y  += (mp & 0xFFU) + ((mp >> 16) & 0xFFU);
+                        sum_cb += ((mp >> 8) & 0xFFU);
+                        sum_cr += ((mp >> 24) & 0xFFU);
+                    }
+                }
+            };
+
+            accum_row(row0);
+            if (ny == 2U) {
+                accum_row(row1);
+            }
+
+            const uint32_t cnt = ny * nx;
+            const int32_t y_i8  = static_cast<int32_t>((sum_y + cnt) / (cnt << 1)) - 128;
+            const int32_t cb_i8 = static_cast<int32_t>((sum_cb + (cnt >> 1)) / cnt) - 128;
+            const int32_t cr_i8 = static_cast<int32_t>((sum_cr + (cnt >> 1)) / cnt) - 128;
+
+            uint32_t ox = sx;
+            uint32_t oy = sy;
+            if (rot_q == 1U) {
+                ox = (out_w - 1U) - sy;
+                oy = sx;
+            } else if (rot_q == 2U) {
+                ox = (out_w - 1U) - sx;
+                oy = (out_h - 1U) - sy;
+            } else if (rot_q == 3U) {
+                ox = sy;
+                oy = (out_h - 1U) - sx;
+            }
+
+            int8_t* out_px = dst + (static_cast<size_t>(oy) * out_w + ox) * 3U;
+            out_px[0] = clamp_i8(y_i8);
+            out_px[1] = clamp_i8(cb_i8);
+            out_px[2] = clamp_i8(cr_i8);
+        }
+    }
+
+    return static_cast<int32_t>(out_w * out_h * 3U);
+}
+
+}  // namespace kube32::hal
 
 #if defined(KUBE32_TARGET_ESP32) && CONFIG_IDF_TARGET_ESP32S31
 
@@ -18,6 +144,7 @@
 #include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "esp_system.h"
+#include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 #include "freertos/task.h"
@@ -35,6 +162,7 @@ constexpr uint32_t kDiscoveryWaitMs = 1500;
 constexpr uint32_t kDiscoveryPollMs = 100;
 constexpr uint32_t kCameraFrameTimeoutMs = 1500;
 constexpr uint32_t kCameraCaptureRetries = 6;
+constexpr int64_t  kCameraStaleGapUs = 250000;  // drain queued DMA buffers after >250ms idle
 constexpr uint32_t kJpegTimeoutMs = 1000;
 constexpr size_t kPreviewAlign = 128;
 constexpr uint32_t kPreviewCropMax = 640;
@@ -53,6 +181,8 @@ mosaico_interact_handle_t s_interact{nullptr};
 mosaico_interact_info_t s_interact_info{};
 BaseType_t s_interact_core{0};
 mosaico_camera_handle_t s_camera{nullptr};
+bool s_camera_streaming{false};
+int64_t s_last_capture_us{0};
 MosaicoCameraInfo s_cam_info{};
 MosaicoSlotStatus s_slots[MOSAICO_MODULE_MGR_SLOT_COUNT]{};
 
@@ -153,6 +283,95 @@ void update_cached_camera_info(const mosaico_camera_info_t& info) {
     } else {
         std::snprintf(s_cam_info.sensor, sizeof(s_cam_info.sensor), "DVP");
     }
+}
+
+void invalidate_dma_row(const uint8_t* row_ptr, size_t row_bytes) {
+    // M2C invalidation requires cache-line-aligned address & size (ESP_CACHE_MSYNC_FLAG_UNALIGNED
+    // is rejected for DIR_M2C by IDF's esp_cache_msync). kPreviewAlign (128 B) is a multiple
+    // of every ESP32 cache line size (32/64/128 B).
+    const uintptr_t addr = reinterpret_cast<uintptr_t>(row_ptr);
+    const uintptr_t aligned_start = addr & ~(kPreviewAlign - 1U);
+    const uintptr_t aligned_end = align_up(addr + row_bytes, kPreviewAlign);
+    (void)esp_cache_msync(reinterpret_cast<void*>(aligned_start),
+                          static_cast<size_t>(aligned_end - aligned_start),
+                          ESP_CACHE_MSYNC_FLAG_DIR_M2C | ESP_CACHE_MSYNC_FLAG_INVALIDATE);
+}
+
+// Caller MUST hold s_camera_mutex.
+void stop_camera_stream_locked() {
+    if (s_camera && s_camera_streaming) {
+        (void)mosaico_camera_stop_stream(s_camera);
+        (void)mosaico_camera_close(s_camera);
+    }
+    s_camera_streaming = false;
+    s_last_capture_us = 0;
+}
+
+// Caller MUST hold s_camera_mutex. Opens and starts the persistent DVP stream
+// lazily on first capture; subsequent captures pay zero open/close overhead.
+esp_err_t ensure_camera_streaming_locked() {
+    if (s_camera_streaming) {
+        return ESP_OK;
+    }
+    if (!s_camera || s_shutting_down.load()) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    esp_err_t ret = mosaico_camera_open(s_camera);
+    if (ret != ESP_OK) {
+        ESP_LOGW(TAG, "camera open failed: %s", esp_err_to_name(ret));
+        return ret;
+    }
+    mosaico_camera_info_t cinfo{};
+    (void)mosaico_camera_get_info(s_camera, &cinfo);
+    update_cached_camera_info(cinfo);
+
+    ret = mosaico_camera_start_stream(s_camera);
+    if (ret != ESP_OK) {
+        ESP_LOGW(TAG, "camera start_stream failed: %s", esp_err_to_name(ret));
+        (void)mosaico_camera_close(s_camera);
+        return ret;
+    }
+    s_camera_streaming = true;
+    s_last_capture_us = esp_timer_get_time();
+    ESP_LOGI(TAG, "Persistent camera stream started: %ux%u @ %u fps (bufs=%u, fmt=0x%08x)",
+             (unsigned)cinfo.width, (unsigned)cinfo.height, (unsigned)cinfo.frame_rate,
+             (unsigned)cinfo.buffer_count, (unsigned)cinfo.pixel_format);
+    return ESP_OK;
+}
+
+// Caller MUST hold s_camera_mutex and return the acquired frame via
+// mosaico_camera_return_frame() on ESP_OK.
+esp_err_t acquire_fresh_frame_locked(mosaico_camera_frame_t& out_frame) {
+    esp_err_t ret = ensure_camera_streaming_locked();
+    if (ret != ESP_OK) {
+        return ret;
+    }
+    // If the stream sat idle longer than kCameraStaleGapUs, drain the ring so
+    // the caller gets a fresh live frame rather than an old queued buffer.
+    const int64_t now_us = esp_timer_get_time();
+    if (s_last_capture_us > 0 && (now_us - s_last_capture_us) > kCameraStaleGapUs) {
+        mosaico_camera_info_t cinfo{};
+        (void)mosaico_camera_get_info(s_camera, &cinfo);
+        const uint32_t drain = cinfo.buffer_count > 0 ? cinfo.buffer_count : 2U;
+        if (mosaico_camera_discard_frames(s_camera, drain) != ESP_OK) {
+            stop_camera_stream_locked();
+            ret = ensure_camera_streaming_locked();
+            if (ret != ESP_OK) return ret;
+        }
+    }
+
+    ret = grab_valid_frame(s_camera, out_frame);
+    if (ret != ESP_OK) {
+        ESP_LOGW(TAG, "camera frame grab failed (%s); restarting stream once", esp_err_to_name(ret));
+        stop_camera_stream_locked();
+        ret = ensure_camera_streaming_locked();
+        if (ret != ESP_OK) return ret;
+        ret = grab_valid_frame(s_camera, out_frame);
+    }
+    if (ret == ESP_OK) {
+        s_last_capture_us = esp_timer_get_time();
+    }
+    return ret;
 }
 
 }  // namespace
@@ -309,6 +528,8 @@ void MosaicoModules::shutdown() {
             (void)mosaico_camera_del(s_camera);
             s_camera = nullptr;
         }
+        s_camera_streaming = false;
+        s_last_capture_us = 0;
         s_has_camera.store(false);
     }
 
@@ -486,29 +707,10 @@ int32_t MosaicoModules::camera_capture_jpeg(std::vector<uint8_t>& out_jpeg, Mosa
     std::lock_guard<std::mutex> lock(s_camera_mutex);
     if (!s_camera || s_shutting_down.load()) return HAL_ERR_NODEV;
 
-    esp_err_t ret = mosaico_camera_open(s_camera);
-    if (ret != ESP_OK) {
-        ESP_LOGW(TAG, "camera open failed: %s", esp_err_to_name(ret));
-        return HAL_ERR_IO;
-    }
-
-    mosaico_camera_info_t cinfo{};
-    (void)mosaico_camera_get_info(s_camera, &cinfo);
-    update_cached_camera_info(cinfo);
-
-    ret = mosaico_camera_start_stream(s_camera);
-    if (ret != ESP_OK) {
-        ESP_LOGW(TAG, "camera start_stream failed: %s", esp_err_to_name(ret));
-        (void)mosaico_camera_close(s_camera);
-        return HAL_ERR_IO;
-    }
-
     mosaico_camera_frame_t frame{};
-    ret = grab_valid_frame(s_camera, frame);
+    esp_err_t ret = acquire_fresh_frame_locked(frame);
     if (ret != ESP_OK) {
         ESP_LOGW(TAG, "camera frame capture failed: %s", esp_err_to_name(ret));
-        (void)mosaico_camera_stop_stream(s_camera);
-        (void)mosaico_camera_close(s_camera);
         return ret == ESP_ERR_TIMEOUT ? HAL_ERR_TIMEDOUT : HAL_ERR_IO;
     }
 
@@ -567,10 +769,8 @@ int32_t MosaicoModules::camera_capture_jpeg(std::vector<uint8_t>& out_jpeg, Mosa
         rc = HAL_ERR_INVAL;
     }
 
-    // Always return the borrowed frame BEFORE stopping/closing the stream!
+    // Return the borrowed frame immediately while keeping the stream active.
     (void)mosaico_camera_return_frame(s_camera, &frame);
-    (void)mosaico_camera_stop_stream(s_camera);
-    (void)mosaico_camera_close(s_camera);
 
     if (out_info) {
         std::lock_guard<std::mutex> slock(s_state_mutex);
@@ -578,7 +778,55 @@ int32_t MosaicoModules::camera_capture_jpeg(std::vector<uint8_t>& out_jpeg, Mosa
     }
     if (rc == HAL_OK) {
         ESP_LOGI(TAG, "Captured JPEG snapshot: %ux%u -> %u bytes (Q=%u)",
-                 (unsigned)cinfo.width, (unsigned)cinfo.height, (unsigned)out_jpeg.size(), (unsigned)quality);
+                 (unsigned)frame.width, (unsigned)frame.height, (unsigned)out_jpeg.size(), (unsigned)quality);
+    }
+    return rc;
+}
+
+int32_t MosaicoModules::camera_capture_tensor(int8_t* out, uint32_t out_w, uint32_t out_h, uint32_t flags, MosaicoCameraInfo* out_info) {
+    if (!has_camera()) return HAL_ERR_NODEV;
+    if (!out || out_w == 0U || out_h == 0U || out_w > 320U || out_h > 240U) return HAL_ERR_INVAL;
+    if ((flags & 0xFU) != K32_CAM_TENSOR_YCBCR_I8 || (flags & ~0x3FU) != 0U) return HAL_ERR_INVAL;
+
+    std::lock_guard<std::mutex> lock(s_camera_mutex);
+    if (!s_camera || s_shutting_down.load()) return HAL_ERR_NODEV;
+
+    const int64_t t0 = esp_timer_get_time();
+    mosaico_camera_frame_t frame{};
+    esp_err_t ret = acquire_fresh_frame_locked(frame);
+    if (ret != ESP_OK) {
+        ESP_LOGW(TAG, "camera tensor capture failed: %s", esp_err_to_name(ret));
+        return ret == ESP_ERR_TIMEOUT ? HAL_ERR_TIMEDOUT : HAL_ERR_IO;
+    }
+    const int64_t t1 = esp_timer_get_time();
+
+    int32_t rc = HAL_ERR_INVAL;
+    if (frame.pixel_format == V4L2_PIX_FMT_UYVY || frame.pixel_format == V4L2_PIX_FMT_YUYV) {
+        const uint32_t bpl = frame.bytes_per_line ? frame.bytes_per_line : frame.width * 2U;
+        const bool is_yuyv = (frame.pixel_format == V4L2_PIX_FMT_YUYV);
+        const uint32_t rot_q = (flags >> 4) & 3U;
+        rc = downsample_yuv422_to_ycbcr_i8(
+            static_cast<const uint8_t*>(frame.data),
+            frame.width, frame.height, bpl, is_yuyv,
+            out, out_w, out_h, rot_q, &invalidate_dma_row);
+    } else {
+        ESP_LOGW(TAG, "camera_capture_tensor unsupported pixel format 0x%08x", (unsigned)frame.pixel_format);
+    }
+    const int64_t t2 = esp_timer_get_time();
+
+    (void)mosaico_camera_return_frame(s_camera, &frame);
+    s_last_capture_us = esp_timer_get_time();
+
+    static uint32_t s_tensor_frames = 0;
+    if (++s_tensor_frames == 5U) {
+        ESP_LOGI(TAG, "camera_capture_tensor timing (frame 5): dqbuf=%lld us, downsample=%lld us (%ux%u -> %ux%u)",
+                 (long long)(t1 - t0), (long long)(t2 - t1),
+                 (unsigned)frame.width, (unsigned)frame.height, (unsigned)out_w, (unsigned)out_h);
+    }
+
+    if (out_info) {
+        std::lock_guard<std::mutex> slock(s_state_mutex);
+        *out_info = s_cam_info;
     }
     return rc;
 }
@@ -591,24 +839,9 @@ int32_t MosaicoModules::camera_preview_to_display(Board& board) {
     std::lock_guard<std::mutex> lock(s_camera_mutex);
     if (!s_camera || s_shutting_down.load()) return HAL_ERR_NODEV;
 
-    esp_err_t ret = mosaico_camera_open(s_camera);
-    if (ret != ESP_OK) return HAL_ERR_IO;
-
-    mosaico_camera_info_t cinfo{};
-    (void)mosaico_camera_get_info(s_camera, &cinfo);
-    update_cached_camera_info(cinfo);
-
-    ret = mosaico_camera_start_stream(s_camera);
-    if (ret != ESP_OK) {
-        (void)mosaico_camera_close(s_camera);
-        return HAL_ERR_IO;
-    }
-
     mosaico_camera_frame_t frame{};
-    ret = grab_valid_frame(s_camera, frame);
+    esp_err_t ret = acquire_fresh_frame_locked(frame);
     if (ret != ESP_OK) {
-        (void)mosaico_camera_stop_stream(s_camera);
-        (void)mosaico_camera_close(s_camera);
         return ret == ESP_ERR_TIMEOUT ? HAL_ERR_TIMEDOUT : HAL_ERR_IO;
     }
 
@@ -675,10 +908,8 @@ int32_t MosaicoModules::camera_preview_to_display(Board& board) {
         rc = HAL_ERR_INVAL;
     }
 
-    // Release DVP DMA before blitting so camera and LCD DMA never contend.
+    // Return borrowed frame before blitting; keep the stream active.
     (void)mosaico_camera_return_frame(s_camera, &frame);
-    (void)mosaico_camera_stop_stream(s_camera);
-    (void)mosaico_camera_close(s_camera);
 
     if (rc == HAL_OK && rgb565) {
         rc = board.display_blit(0, 0, static_cast<int32_t>(out_w), static_cast<int32_t>(out_h), rgb565);
@@ -801,6 +1032,7 @@ int32_t MosaicoModules::interact_read(MosaicoInteractInputs&) { return HAL_ERR_N
 int32_t MosaicoModules::interact_ir_send_nec(uint8_t, uint8_t) { return HAL_ERR_NODEV; }
 int32_t MosaicoModules::camera_info(MosaicoCameraInfo&) { return HAL_ERR_NODEV; }
 int32_t MosaicoModules::camera_capture_jpeg(std::vector<uint8_t>&, MosaicoCameraInfo*, uint8_t) { return HAL_ERR_NODEV; }
+int32_t MosaicoModules::camera_capture_tensor(int8_t*, uint32_t, uint32_t, uint32_t, MosaicoCameraInfo*) { return HAL_ERR_NODEV; }
 int32_t MosaicoModules::camera_preview_to_display(Board&) { return HAL_ERR_NODEV; }
 void MosaicoModules::describe(BoardProfile&) const {}
 void MosaicoModules::print_status() const { printf("K32_MODULES unsupported\n"); }

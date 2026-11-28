@@ -1540,12 +1540,13 @@ uint32_t AppPodHost::tick_due(uint64_t now_ms, uint32_t max_wait_ms) {
         Entry* e = find_locked(id);
         if (e) e->next_tick_ms = now_ms + (rc > 0 ? 10 : e->tick_interval_ms);
     }
+    const uint64_t done_ms = osal::System::get_uptime_ms();
     uint64_t wait = max_wait_ms;
     osal::LockGuard guard(mutex_);
     for (const auto& kv : pods_) {
         if (!kv.second.has_tick || !kv.second.ticking || kv.second.frozen) continue;
         const uint64_t next = kv.second.next_tick_ms;
-        wait = std::min<uint64_t>(wait, next > now_ms ? next - now_ms : 0);
+        wait = std::min<uint64_t>(wait, next > done_ms ? next - done_ms : 0);
     }
     return static_cast<uint32_t>(wait);
 }
@@ -1857,12 +1858,13 @@ uint32_t AppPodHost::tick_worker(Worker& w, uint64_t now_ms, uint32_t max_wait_m
             e->next_tick_ms = now_ms + (rc > 0 ? 10 : e->tick_interval_ms);
         }
     }
+    const uint64_t done_ms = osal::System::get_uptime_ms();
     uint64_t wait = max_wait_ms;
     osal::LockGuard guard(mutex_);
     for (const auto& kv : pods_) {
         const Entry& e = kv.second;
         if (e.worker != w.index || !e.has_tick || !e.ticking || e.frozen) continue;
-        wait = std::min<uint64_t>(wait, e.next_tick_ms > now_ms ? e.next_tick_ms - now_ms : 0);
+        wait = std::min<uint64_t>(wait, e.next_tick_ms > done_ms ? e.next_tick_ms - done_ms : 0);
     }
     return static_cast<uint32_t>(wait);
 }
@@ -1905,6 +1907,7 @@ void AppPodHost::worker_main(Worker& w) {
         kube32_interp_stack_add(w.opts.stack_buffer ? w.opts.stack_buffer : pxTaskGetStackStart(nullptr), w.opts.stack_bytes);
     }
 #endif
+    uint64_t last_sleep_ms = osal::System::get_uptime_ms();
     for (;;) {
         uint32_t wait = 1000;
         try {
@@ -1917,6 +1920,8 @@ void AppPodHost::worker_main(Worker& w) {
             printf("[POD] core %d: pass skipped: %s\n", w.opts.core, e.what());   // out of memory: the next pass is a second away
         }
         osal::System::feed_watchdog();
+        const uint64_t loop_ms = osal::System::get_uptime_ms();
+        const bool need_breath = (loop_ms - last_sleep_ms) >= 1000;
         osal::UniqueLock<osal::Mutex> lock(event_mutex_);
         auto ready = [&] {
             if (workers_stop_ || w.kick) return true;
@@ -1925,7 +1930,10 @@ void AppPodHost::worker_main(Worker& w) {
             }
             return false;
         };
-        event_cv_.wait_for(lock, std::max<uint32_t>(wait, 10), ready);
+        if (wait > 0 || need_breath) {
+            event_cv_.wait_for(lock, std::max<uint32_t>(wait, 10), ready);
+            last_sleep_ms = osal::System::get_uptime_ms();
+        }
         w.kick = false;
         if (workers_stop_) return;
     }

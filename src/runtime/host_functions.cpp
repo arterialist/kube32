@@ -643,6 +643,43 @@ static const void* raw_k32_camera_capture_jpeg(IM3Runtime runtime, IM3ImportCont
     return m3Err_none;
 }
 
+// k32_camera_capture_tensor: signature "i(iiii)" -> returns bytes written or K32_ERR_*
+// Captures a raw frame from the persistent camera stream and downsamples it
+// natively into packed HWC int8 YCbCr ([Y-128, Cb-128, Cr-128] in [-127, 127]).
+static const void* raw_k32_camera_capture_tensor(IM3Runtime runtime, IM3ImportContext _ctx, uint64_t* _sp, void* _mem) {
+    (void)_ctx;
+    const uint32_t out_offset = static_cast<uint32_t>(_sp[1]);
+    const uint32_t out_w      = static_cast<uint32_t>(_sp[2]);
+    const uint32_t out_h      = static_cast<uint32_t>(_sp[3]);
+    const uint32_t flags      = static_cast<uint32_t>(_sp[4]);
+    int32_t& ret = *reinterpret_cast<int32_t*>(_sp);
+    const std::string& pod_id = get_pod_ref(runtime);
+
+    if (!hal::CapabilityFirewall::instance().check_permission(pod_id, hal::PeripheralType::Camera, 0, hal::AccessMode::Read)) {
+        ret = hal::HAL_ERR_PERM;
+        return m3Err_none;
+    }
+    if (out_w == 0 || out_h == 0 || out_w > 320 || out_h > 240) {
+        ret = hal::HAL_ERR_INVAL;
+        return m3Err_none;
+    }
+    if ((flags & 0xFu) != K32_CAM_TENSOR_YCBCR_I8 || (flags & ~0x3Fu) != 0u) {
+        ret = hal::HAL_ERR_INVAL;
+        return m3Err_none;
+    }
+    const uint64_t need_bytes = static_cast<uint64_t>(out_w) * static_cast<uint64_t>(out_h) * 3ULL;
+    const size_t mem_size = m3_GetMemorySizeAt(_mem);
+    if (static_cast<uint64_t>(out_offset) + need_bytes > mem_size) {
+        ret = hal::HAL_ERR_FAULT;
+        return m3Err_none;
+    }
+    if (runtime_stop_requested(runtime)) return m3Err_trapOutOfGas;
+
+    int8_t* dst = reinterpret_cast<int8_t*>(static_cast<uint8_t*>(_mem) + out_offset);
+    ret = hal::MosaicoModules::instance().camera_capture_tensor(dst, out_w, out_h, flags);
+    return m3Err_none;
+}
+
 // k32_camera_preview: signature "i()" -> returns 0 or K32_ERR_*
 // Captures one frame and blits RGB565 preview directly to the 480x480 AMOLED.
 static const void* raw_k32_camera_preview(IM3Runtime runtime, IM3ImportContext _ctx, uint64_t* _sp, void* _mem) {
@@ -707,9 +744,10 @@ bool link_host_functions(IM3Module module, const std::string& pod_id) {
     m3_LinkRawFunction(module, "env", "k32_interact_read",        "i(i)",   &raw_k32_interact_read);
     m3_LinkRawFunction(module, "env", "k32_interact_led_set",     "i(ii)",  &raw_k32_interact_led_set);
     m3_LinkRawFunction(module, "env", "k32_interact_ir_send_nec", "i(ii)",  &raw_k32_interact_ir_send_nec);
-    m3_LinkRawFunction(module, "env", "k32_camera_info",          "i(i)",   &raw_k32_camera_info);
-    m3_LinkRawFunction(module, "env", "k32_camera_capture_jpeg",  "i(iii)", &raw_k32_camera_capture_jpeg);
-    m3_LinkRawFunction(module, "env", "k32_camera_preview",       "i()",    &raw_k32_camera_preview);
+    m3_LinkRawFunction(module, "env", "k32_camera_info",           "i(i)",    &raw_k32_camera_info);
+    m3_LinkRawFunction(module, "env", "k32_camera_capture_jpeg",   "i(iii)",  &raw_k32_camera_capture_jpeg);
+    m3_LinkRawFunction(module, "env", "k32_camera_capture_tensor", "i(iiii)", &raw_k32_camera_capture_tensor);
+    m3_LinkRawFunction(module, "env", "k32_camera_preview",        "i()",     &raw_k32_camera_preview);
 
     return true;
 }
