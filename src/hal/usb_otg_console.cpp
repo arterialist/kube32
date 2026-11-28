@@ -129,11 +129,10 @@ void drain_task(void*) {
                 stalled_ms = 0;
                 continue;
             }
-            // TinyUSB's FIFO is full: nobody is reading. A host that has
-            // gone quiet stops holding output back; the ring keeps the newest.
-            vTaskDelay(pdMS_TO_TICKS(10));
+            // TinyUSB's FIFO is full: flush immediately before backing off one tick.
             tinyusb_cdcacm_write_flush(kPort, 0);
-            stalled_ms += 10;
+            vTaskDelay(1);
+            stalled_ms += portTICK_PERIOD_MS;
             if (stalled_ms >= kStallMs) {
                 s_host_open.store(false, std::memory_order_relaxed);
                 stalled_ms = 0;
@@ -268,7 +267,7 @@ bool start() {
         printf("[CONSOLE] the CDC port did not start\n");
         return false;
     }
-    if (xTaskCreate(drain_task, "k32_cdc", kDrainStackBytes, nullptr, 6, &s_drain_task) != pdPASS) return false;
+    if (xTaskCreatePinnedToCore(drain_task, "k32_cdc", kDrainStackBytes, nullptr, 6, &s_drain_task, 0) != pdPASS) return false;
 #if SOC_USB_UTMI_PHY_NUM
     esp_register_shutdown_handler(usb_shutdown);
 #endif

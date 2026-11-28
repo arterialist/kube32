@@ -12,6 +12,8 @@
 #else
 #include <sys/select.h>
 #include <sys/socket.h>
+#include <netinet/in.h>
+#include <netinet/tcp.h>
 #include <netdb.h>
 #include <fcntl.h>
 #include <unistd.h>
@@ -91,7 +93,10 @@ void ConsoleRelay::push(Command c) {
             osal::Thread::Config cfg;
             cfg.name = "k32_relay";
             cfg.stack_size = opts_.stack_size;
-            cfg.priority = 4;
+            cfg.priority = 6;
+#if defined(ESP_PLATFORM)
+            cfg.core_affinity = 0;
+#endif
             cfg.stack_in_psram = opts_.stack_in_psram;
             if (!thread_.start(&ConsoleRelay::entry, this, cfg)) {
                 started_ = false;
@@ -128,7 +133,7 @@ void ConsoleRelay::run() {
             if (s.fd > maxfd) maxfd = s.fd;
         }
         timeval tv{};
-        tv.tv_usec = 50 * 1000;
+        tv.tv_usec = 5 * 1000;
         int ready = ::select(maxfd + 1, &rd, nullptr, nullptr, &tv);
         const uint64_t now = osal::Thread::get_time_ms();
         for (size_t i = 0; i < streams_.size();) {
@@ -253,6 +258,8 @@ int ConsoleRelay::connect_to(uint16_t port) {
         return -1;
     }
     ::fcntl(fd, F_SETFL, flags & ~O_NONBLOCK);
+    int nodelay = 1;
+    ::setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &nodelay, sizeof(nodelay));
     timeval send_timeout{};
     send_timeout.tv_sec = 5;
     ::setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &send_timeout, sizeof(send_timeout));

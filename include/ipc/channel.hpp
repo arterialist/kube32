@@ -505,7 +505,7 @@ private:
     bool deliver_local(const MessagePtr& msg);
     bool deliver_local(uint32_t channel_hash, uint32_t sender_hash, const uint8_t* data, size_t len, bool* nomem = nullptr);
     int32_t send_frames_to(const NodeEndpoint& ep, uint32_t channel_hash, uint32_t sender_hash, uint32_t target_hash, const uint8_t* data, size_t len, uint8_t extra_flags,
-                           size_t max_frame = K32C_MAX_FRAME_LEN);
+                           size_t max_frame = K32C_MAX_FRAME_LEN, int max_retries = 2);
     NodeEndpoint route_to(const PeerInfo& p, uint64_t now_ms) const;
     void dispatch_loop();
     void dispatch_message(const MessagePtr& msg);

@@ -46,6 +46,7 @@ struct NodeStorageInfo {
 bool node_storage_mount(bool has_card_slot, const std::string& flash_directory = std::string());
 
 NodeStorageInfo node_storage_info();
+StorageMedium node_storage_medium();
 const char* storage_medium_name(StorageMedium medium);
 
 // "" when nothing is mounted.

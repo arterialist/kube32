@@ -211,6 +211,12 @@ NodeStorageInfo node_storage_info() {
     return s_info;
 }
 
+StorageMedium node_storage_medium() {
+    std::lock_guard<std::mutex> lock(s_mutex);
+    follow_card_locked();
+    return s_info.medium;
+}
+
 std::string node_storage_root() {
     std::lock_guard<std::mutex> lock(s_mutex);
     follow_card_locked();

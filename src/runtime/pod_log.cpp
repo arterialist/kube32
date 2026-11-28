@@ -5,6 +5,7 @@
 #include "osal/system.hpp"
 #include "osal/thread.hpp"
 
+#include <cerrno>
 #include <cstdio>
 #include <cstdlib>
 #include <dirent.h>
@@ -51,7 +52,16 @@ void PodLogRing::tail(size_t count, std::vector<PodLogRecord>& out) const {
 }
 
 std::string pod_log_storage_root() {
+#if defined(KUBE32_TARGET_ESP32)
+    // Streaming pod logs to internal SPI NOR flash triggers cache-off flash
+    // erases that freeze both CPU cores for tens of milliseconds and wear out
+    // on-chip flash. Persist logs automatically only when an SD card is
+    // mounted; the in-memory rings still serve current and previous logs.
+    if (hal::node_storage_medium() != hal::StorageMedium::SdCard) return std::string();
     return hal::node_storage_root();
+#else
+    return hal::node_storage_root();
+#endif
 }
 
 // ---------------------------------------------------------------------------
@@ -176,6 +186,14 @@ private:
                 }
                 op = std::move(ops_.front());
                 ops_.pop_front();
+                if (op.kind == Op::Append) {
+                    while (!ops_.empty() && ops_.front().kind == Op::Append &&
+                           ops_.front().dir == op.dir && ops_.front().file == op.file &&
+                           op.text.size() + ops_.front().text.size() <= limit_) {
+                        op.text += ops_.front().text;
+                        ops_.pop_front();
+                    }
+                }
                 busy_ = true;
             }
             idle_since = osal::System::get_uptime_ms();
@@ -241,8 +259,12 @@ private:
         const std::string path = dir + "/" + op.file;
         switch (op.kind) {
             case Op::Append: {
-                if (root.empty() || !make_dirs(root, op.dir)) return;
+                if (root.empty()) return;
                 int fd = ::open(path.c_str(), O_WRONLY | O_CREAT | O_APPEND, 0644);
+                if (fd < 0 && errno == ENOENT) {
+                    if (!make_dirs(root, op.dir)) return;
+                    fd = ::open(path.c_str(), O_WRONLY | O_CREAT | O_APPEND, 0644);
+                }
                 if (fd < 0) return;
                 ssize_t w = ::write(fd, op.text.data(), op.text.size());
                 ::close(fd);
@@ -531,7 +553,7 @@ bool PodLogStore::accept_shipped(const std::string& pod_key, uint64_t epoch, con
     if (disk_ && disk_->available()) {
         if (e.disk_pending.empty()) e.disk_pending_since_ms = e.last_write_ms;
         e.disk_pending += format_log_line(rec, true);
-        if (e.disk_pending.size() >= 1024) hand_to_disk_locked(pod_key, e);
+        if (e.disk_pending.size() >= 4096) hand_to_disk_locked(pod_key, e);
         else disk_->kick();
     }
     return true;

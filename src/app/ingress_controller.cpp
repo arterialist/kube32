@@ -27,7 +27,10 @@ bool SseHub::start() {
     osal::Thread::Config cfg;
     cfg.name = "k32_sse";
     cfg.stack_size = 4096;
-    cfg.priority = 4;
+    cfg.priority = 6;
+#if defined(ESP_PLATFORM)
+    cfg.core_affinity = 0;
+#endif
     bool ok = thread_->start([](void* p) { static_cast<SseHub*>(p)->run(); }, this, cfg);
     if (!ok) running_.store(false);
     return ok;
@@ -35,7 +38,12 @@ bool SseHub::start() {
 
 void SseHub::stop() {
     if (running_.load()) {
-        running_.store(false);
+        {
+            osal::LockGuard queue(queue_mutex_);
+            running_.store(false);
+            wake_ = true;
+            queue_cv_.notify_all();
+        }
         if (thread_) { thread_->join(); thread_.reset(); }
     }
     {
@@ -49,18 +57,24 @@ void SseHub::stop() {
 }
 
 void SseHub::add(osal::Socket sock, Subscription sub) {
-    osal::LockGuard guard(mutex_);
-    if (clients_.size() >= max_clients_ && !clients_.empty()) {
-        // Drop the oldest viewer so the newest tab always gets a stream
-        clients_.front().sock.close();
-        clients_.erase(clients_.begin());
+    {
+        osal::LockGuard guard(mutex_);
+        if (clients_.size() >= max_clients_ && !clients_.empty()) {
+            // Drop the oldest viewer so the newest tab always gets a stream
+            clients_.front().sock.close();
+            clients_.erase(clients_.begin());
+        }
+        sock.set_nonblocking(true);
+        sock.set_tcp_nodelay(true);
+        Client c;
+        c.sock = std::move(sock);
+        c.sub = std::move(sub);
+        clients_.push_back(std::move(c));
+        client_count_.store(clients_.size());
     }
-    sock.set_nonblocking(true);
-    Client c;
-    c.sock = std::move(sock);
-    c.sub = std::move(sub);
-    clients_.push_back(std::move(c));
-    client_count_.store(clients_.size());
+    osal::LockGuard queue(queue_mutex_);
+    wake_ = true;
+    queue_cv_.notify_one();
 }
 
 void SseHub::broadcast(uint32_t topic_hash, std::string_view event, std::string_view data) {
@@ -74,6 +88,8 @@ void SseHub::broadcast(uint32_t topic_hash, std::string_view event, std::string_
     events_received_.fetch_add(1, std::memory_order_relaxed);
     if (pending_.size() < kMaxPending) pending_.push_back(std::move(f));
     else events_dropped_.fetch_add(1, std::memory_order_relaxed);
+    wake_ = true;
+    queue_cv_.notify_one();
 }
 
 void SseHub::retain_streams(const std::vector<uint32_t>& stream_ids) {
@@ -197,6 +213,7 @@ void SseHub::run() {
             {
                 osal::LockGuard guard(queue_mutex_);
                 batch.swap(pending_);
+                wake_ = false;
             }
             taken = batch.size();
             uint64_t now = osal::System::get_uptime_ms();
@@ -219,8 +236,11 @@ void SseHub::run() {
             events_dropped_.fetch_add(taken, std::memory_order_relaxed);
         }
         osal::System::feed_watchdog();
-        // A connection with bytes left is written again soon
-        osal::Thread::sleep_ms(backlog ? 10 : 50);
+        // Wake immediately when broadcast()/add() queues work; retry backlog quickly
+        osal::UniqueLock<osal::Mutex> qlock(queue_mutex_);
+        if (running_.load() && pending_.empty() && !wake_) {
+            queue_cv_.wait_for(qlock, backlog ? 10 : 250, [this] { return !running_.load() || !pending_.empty() || wake_; });
+        }
     }
 }
 
@@ -282,6 +302,8 @@ bool IngressController::start() {
     o.workers = opts_.workers;
     o.worker_stack_bytes = opts_.worker_stack;
     o.worker_core_affinity = opts_.core_affinity;
+    o.worker_priority = opts_.worker_priority;
+    o.acceptor_priority = opts_.acceptor_priority;
     o.worker_stack_in_psram = opts_.stacks_in_psram;
     o.keepalive_timeout_ms = 8000;
     o.accept_queue_depth = 8;

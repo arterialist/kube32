@@ -1977,6 +1977,11 @@ void cluster_task(void* pv) {
             kube32_interp_stack_set(interp, interp_size);
             kube32::runtime::AppPodHost::instance().set_event_thread_stack(8192, true);
         }
+        // Generous PSRAM log rings keep kubectl logs (--previous) rich without
+        // writing streaming pod output to internal SPI NOR flash.
+        kube32::runtime::PodLogStore::runtime().set_ring_capacity(16 * 1024);
+        kube32::runtime::PodLogStore::apiserver().set_ring_capacity(16 * 1024);
+        kube32::runtime::PodLogStore::apiserver().set_previous_capacity(4 * 1024);
         // The node's system-reserved PSRAM, which pods' code and structures
         // may not take and allocatable memory leaves out. Large PSRAM boards
         // reserve 2 MiB (control plane) / 1 MiB (worker) so camera capture,
@@ -2217,7 +2222,11 @@ void cluster_task(void* pv) {
     // Without PSRAM pods start one per sync pass: a pass holds what it starts
     kubelet_cfg.max_starts_per_sync = ident.has_psram ? 0 : 1;
     kubelet_cfg.control_plane = ident.is_control_plane;
-    kubelet_cfg.core_affinity = 1;
+    // On PSRAM boards keep background control-plane tasks on Core 0 at prio 4:
+    // below Core 0 pod worker (prio 5) and fast I/O pumps (prio 6), leaving
+    // Core 1 dedicated to real-time pod workers without starving HTTP/API.
+    kubelet_cfg.core_affinity = ident.has_psram ? 0 : 1;
+    kubelet_cfg.task_priority = ident.has_psram ? 4 : 5;
     // K32_CMD:TOKEN: the API server checks it, every kubelet sends it
     const std::string api_token = read_nvs_str("token");
     s_api_token_set = valid_token(api_token);
@@ -2431,7 +2440,9 @@ void cluster_task(void* pv) {
         http_opts.workers = ident.has_psram ? 2 : 1;
         http_opts.worker_stack_bytes = 16384; // pod admission + scheduler run on this stack
         http_opts.worker_stack_in_psram = ident.has_psram;
-        http_opts.worker_core_affinity = 1;
+        http_opts.worker_core_affinity = ident.has_psram ? 0 : 1;
+        http_opts.worker_priority = ident.has_psram ? 4 : 5;
+        http_opts.acceptor_priority = ident.has_psram ? 4 : 6;
         http_opts.name = "k32_api";
         // Watch streams (k9s opens several): one hub thread owns the sockets
         http_opts.watch_streams = ident.has_psram ? 8 : 4;
@@ -2522,7 +2533,9 @@ void cluster_task(void* pv) {
             po.port = 7000;
             po.workers = 1;
             po.worker_stack = kube32_interp_stack_active() ? 16384 : 49152;
-            po.core_affinity = 1;
+            po.core_affinity = ident.has_psram ? 0 : 1;
+            po.worker_priority = ident.has_psram ? 4 : 5;
+            po.acceptor_priority = ident.has_psram ? 4 : 6;
             po.stacks_in_psram = ident.has_psram;
             if (s_api_token_set) po.token = api_token;
             pod_server = std::make_unique<kube32::app::PodServer>(po);
@@ -2548,7 +2561,9 @@ void cluster_task(void* pv) {
         io.workers = 1;
         io.worker_stack = kube32_interp_stack_active() ? (ident.has_psram ? 16384 : 8192) : 65536;
         io.rx_buffer = ident.has_psram ? 4096 : 2560;
-        io.core_affinity = 1;
+        io.core_affinity = ident.has_psram ? 0 : 1;
+        io.worker_priority = ident.has_psram ? 4 : 5;
+        io.acceptor_priority = ident.has_psram ? 4 : 6;
         io.stacks_in_psram = ident.has_psram;
         io.activate_device = activate_device;
         ingress = std::make_unique<kube32::app::IngressController>(io);
@@ -2582,7 +2597,9 @@ void cluster_task(void* pv) {
             po.accept_queue_depth = 1;
             po.max_idle_connections = 2;
         }
-        po.core_affinity = 1;
+        po.core_affinity = ident.has_psram ? 0 : 1;
+        po.worker_priority = ident.has_psram ? 4 : 5;
+        po.acceptor_priority = ident.has_psram ? 4 : 6;
         po.stacks_in_psram = ident.has_psram;
         if (s_api_token_set) po.token = api_token;
         pod_server = std::make_unique<kube32::app::PodServer>(po);
@@ -2677,9 +2694,19 @@ void cluster_task(void* pv) {
         std::vector<kube32::runtime::PodWorkerOptions> workers(2);
         workers[0].core = 1;
         workers[0].pinned = true;
-        workers[0].stack_bytes = 8192;
-        workers[0].stack_in_psram = true;
-        workers[0].priority = 4;
+        workers[0].priority = 5;
+        // Give core 1 its own interpreter stack when PSRAM has room so pod ticks
+        // (including blocking HAL calls) never contend with HTTP k32_handle calls
+        // on the shared interpreter stack.
+        void* w0_stack = kube32_pool_system_alloc(68 * 1024);
+        if (w0_stack) {
+            workers[0].stack_bytes = 68 * 1024;
+            workers[0].stack_buffer = w0_stack;
+            workers[0].own_interpreter_stack = true;
+        } else {
+            workers[0].stack_bytes = 8192;
+            workers[0].stack_in_psram = true;
+        }
         // The interpreter's recursion peaks near 56 KB: the shared stack's
         // 64 KiB and room for the worker's own frames
         workers[1].core = 0;
@@ -2687,7 +2714,7 @@ void cluster_task(void* pv) {
         workers[1].stack_bytes = 68 * 1024;
         workers[1].stack_buffer = kube32_pool_system_alloc(workers[1].stack_bytes);
         workers[1].own_interpreter_stack = true;
-        workers[1].priority = 3;
+        workers[1].priority = 5;
         if (!workers[1].stack_buffer) workers.pop_back();
         pod_workers = kube32::runtime::AppPodHost::instance().start_workers(workers);
         printf("[POD] %u pod worker(s)\n", (unsigned)pod_workers);

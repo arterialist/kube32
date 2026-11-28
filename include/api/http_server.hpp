@@ -32,6 +32,8 @@ struct HttpServerOptions {
     uint32_t workers{2};
     size_t worker_stack_bytes{12288};
     int worker_core_affinity{-1};
+    uint32_t worker_priority{5};
+    uint32_t acceptor_priority{6};
     bool worker_stack_in_psram{false};
     void* worker_stack_buffer{nullptr};    // the first worker runs on this caller-owned stack (worker_stack_bytes)
     uint32_t keepalive_timeout_ms{5000};   // idle time allowed between requests on one connection

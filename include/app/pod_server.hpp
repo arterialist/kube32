@@ -84,6 +84,8 @@ struct PodServerOptions {
     uint32_t max_idle_connections{16};
     int backlog{4};
     int core_affinity{-1};
+    uint32_t worker_priority{5};
+    uint32_t acceptor_priority{6};
     bool stacks_in_psram{false};
     void* stack_buffer{nullptr};             // the (first) worker's stack, owned by the caller (worker_stack bytes)
     std::string token;                       // node storage: bearer token required, empty for none

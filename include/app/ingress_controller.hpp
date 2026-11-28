@@ -29,6 +29,7 @@
 #include "app/service_client.hpp"
 #include "api/http_server.hpp"
 #include "storage/store.hpp"
+#include "osal/condition_variable.hpp"
 #include "osal/mutex.hpp"
 #include "osal/thread.hpp"
 
@@ -108,7 +109,9 @@ private:
     void remove_dead();
 
     mutable osal::Mutex mutex_;          // clients_, presence_sent_
-    osal::Mutex queue_mutex_;            // pending_
+    osal::Mutex queue_mutex_;            // pending_, wake_
+    osal::ConditionVariable queue_cv_;
+    bool wake_{false};
     std::vector<Client> clients_;
     std::atomic<size_t> client_count_{0};
     std::vector<Frame> pending_;
@@ -133,6 +136,8 @@ struct IngressControllerOptions {
     size_t worker_stack{8192};
     size_t rx_buffer{4096};
     int core_affinity{-1};
+    uint32_t worker_priority{5};
+    uint32_t acceptor_priority{6};
     bool stacks_in_psram{false};
 
     uint32_t upstream_timeout_ms{4000};

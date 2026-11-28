@@ -318,7 +318,7 @@ bool HttpServer::start() {
         snprintf(names[i % 8], sizeof(names[0]), "%.9s_w%u", options_.name, i);
         cfg.name = names[i % 8];
         cfg.stack_size = options_.worker_stack_bytes;
-        cfg.priority = 5;
+        cfg.priority = options_.worker_priority;
         cfg.core_affinity = options_.worker_core_affinity;
         cfg.stack_in_psram = options_.worker_stack_in_psram;
         cfg.stack_buffer = (i == 0) ? options_.worker_stack_buffer : nullptr;
@@ -338,7 +338,7 @@ bool HttpServer::start() {
     osal::Thread::Config cfg;
     cfg.name = options_.name;
     cfg.stack_size = 3072;
-    cfg.priority = 6;
+    cfg.priority = options_.acceptor_priority;
     cfg.core_affinity = options_.worker_core_affinity;
     if (!acceptor_thread_->start([](void* p) {
             static_cast<HttpServer*>(p)->run_acceptor();

@@ -393,7 +393,8 @@ public:
         xSemaphoreTake(s_send_sem, 0);
         esp_err_t err = esp_now_send(target.mac_address, frame, len);
         if (err != ESP_OK) return IPC_ERR_IO;
-        if (xSemaphoreTake(s_send_sem, pdMS_TO_TICKS(30)) != pdTRUE) return IPC_ERR_TIMEDOUT;
+        const TickType_t wait_ticks = pdMS_TO_TICKS(10) > 0 ? pdMS_TO_TICKS(10) : 1;
+        if (xSemaphoreTake(s_send_sem, wait_ticks) != pdTRUE) return IPC_ERR_TIMEDOUT;
         return s_last_send_ok ? IPC_OK : IPC_ERR_HOSTUNREACH;
     }
 
@@ -619,7 +620,7 @@ int32_t ChannelManager::send(const std::string& pod_id, int32_t handle, const ui
 }
 
 int32_t ChannelManager::send_frames_to(const NodeEndpoint& ep, uint32_t channel_hash, uint32_t sender_hash, uint32_t target_hash,
-                                       const uint8_t* data, size_t len, uint8_t extra_flags, size_t max_frame) {
+                                       const uint8_t* data, size_t len, uint8_t extra_flags, size_t max_frame, int max_retries) {
     if (!transport_) return IPC_ERR_IO;
     if (len > K32C_MAX_MESSAGE_BYTES) return IPC_ERR_INVAL;
     // A message of up to 224 bytes is one frame every node reads; a larger
@@ -679,9 +680,9 @@ int32_t ChannelManager::send_frames_to(const NodeEndpoint& ep, uint32_t channel_
             }
         }
         int32_t res = transport_->send_frame(ep, frame, frame_bytes + 2);
-        // Two more tries, 2 ms apart (the radio's or lwIP's queue was full,
+        // Retries 2 ms apart (the radio's or lwIP's queue was full,
         // or the peer did not acknowledge): a lost frame loses the message
-        for (int retry = 0; retry < 2 && res != IPC_OK; ++retry) {
+        for (int retry = 0; retry < max_retries && res != IPC_OK; ++retry) {
             stats_.frames_retried.fetch_add(1, std::memory_order_relaxed);
             osal::Thread::sleep_ms(2);
             res = transport_->send_frame(ep, frame, frame_bytes + 2);
@@ -780,8 +781,14 @@ int32_t ChannelManager::publish(const std::string& pod_id, const std::string& to
                 stats_.fanout_skipped.fetch_add(1, std::memory_order_relaxed);
                 continue;
             }
+            const NodeEndpoint ep = route_to(kv.second, now);
+            // Skip silent ESP-NOW peers so unreachable radios do not stall local publish()
+            if (ep.is_espnow && kv.second.last_seen_ms > 0 && now > kv.second.last_seen_ms + 15000u) {
+                stats_.fanout_skipped.fetch_add(1, std::memory_order_relaxed);
+                continue;
+            }
             const bool fresh = now - kv.second.subs_ms <= K32C_SUBS_FRESH_MS;
-            targets.push_back(Target{route_to(kv.second, now), fresh ? kv.second.rx_rate : 0,
+            targets.push_back(Target{ep, fresh ? kv.second.rx_rate : 0,
                                      fresh && kv.second.rx_max_frame ? kv.second.rx_max_frame : static_cast<uint32_t>(K32C_MAX_FRAME_LEN)});
         }
     }
@@ -789,7 +796,8 @@ int32_t ChannelManager::publish(const std::string& pod_id, const std::string& to
         // A peer that announces the bytes a second it takes is sent no
         // faster: the publisher waits (at most K32C_MAX_PACE_WAIT_MS)
         if (t.rate > 0) pace_to(t.ep.node_id, len, t.rate);
-        const int32_t rc = send_frames_to(t.ep, channel_hash, sender_hash, 0, data, len, 0, t.max_frame);
+        const int retries = (t.ep.is_espnow && len <= K32C_MAX_FRAME_LEN) ? 1 : 2;
+        const int32_t rc = send_frames_to(t.ep, channel_hash, sender_hash, 0, data, len, 0, t.max_frame, retries);
         if (rc != IPC_OK && err == IPC_OK) err = rc;
     }
     if (err != IPC_OK) {
@@ -974,18 +982,8 @@ void ChannelManager::dispatch_loop() {
         // Out of memory a frame or a hello is dropped; the dispatcher (and
         // with it every channel subscription on this node) keeps running
         try {
-            uint64_t now = osal::System::get_uptime_ms();
-            if (hello_interval_ms_ > 0 && now - last_hello_ms_ >= hello_interval_ms_) {
-                last_hello_ms_ = now;
-                send_hello();
-                send_subs();
-                subs_changed_.store(false);
-                prune_reassembly(now);
-            } else if (subs_changed_.exchange(false)) {
-                send_subs();
-            }
-            // Frames from the ESP-NOW callback, then the messages they and
-            // the UDP receiver completed
+            // Drain incoming ESP-NOW frames and queued local/remote messages FIRST
+            // so local event dispatch is never stalled behind periodic HELLO/SUBS beacons.
             for (;;) {
                 RawFrame f;
                 {
@@ -1004,20 +1002,35 @@ void ChannelManager::dispatch_loop() {
                     on_frame_received(f.data + 6, f.len - 6u, &src);
                 }
             }
-            MessagePtr msg;
-            {
-                osal::UniqueLock<osal::Mutex> lock(disp_mutex_);
-                if (!msg_queue_.empty()) {
+            for (;;) {
+                MessagePtr msg;
+                {
+                    osal::LockGuard guard(disp_mutex_);
+                    if (msg_queue_.empty()) break;
                     msg = std::move(msg_queue_.front());
                     msg_queue_.pop_front();
-                } else if (rx_count_ == 0 && !subs_changed_.load()) {
+                }
+                dispatch_message(msg);
+            }
+            uint64_t now = osal::System::get_uptime_ms();
+            if (hello_interval_ms_ > 0 && now - last_hello_ms_ >= hello_interval_ms_) {
+                last_hello_ms_ = now;
+                send_hello();
+                send_subs();
+                subs_changed_.store(false);
+                prune_reassembly(now);
+            } else if (subs_changed_.exchange(false)) {
+                send_subs();
+            }
+            {
+                osal::UniqueLock<osal::Mutex> lock(disp_mutex_);
+                if (msg_queue_.empty() && rx_count_ == 0 && !subs_changed_.load()) {
                     disp_ready_ = false;
                     const uint64_t since = osal::System::get_uptime_ms() - last_hello_ms_;
                     const uint32_t wait = hello_interval_ms_ == 0 ? 100 : static_cast<uint32_t>(since >= hello_interval_ms_ ? 1 : std::min<uint64_t>(100, hello_interval_ms_ - since));
                     disp_cv_.wait_for(lock, wait, [this] { return disp_ready_ || subs_changed_.load() || !background_running_.load(); });
                 }
             }
-            if (msg) dispatch_message(msg);
             osal::System::feed_watchdog();
         } catch (const std::bad_alloc&) {
             osal::System::feed_watchdog();
@@ -1061,7 +1074,10 @@ bool ChannelManager::start_background(uint32_t hello_interval_ms, size_t dispatc
     cfg.name = "k32_ipc_disp";
     cfg.stack_size = dispatcher_stack_bytes;
     cfg.stack_in_psram = stack_in_psram;
-    cfg.priority = 5;
+    cfg.priority = 6;
+#if defined(ESP_PLATFORM)
+    cfg.core_affinity = 0;
+#endif
     bool ok = dispatch_thread_->start([](void* p) { static_cast<ChannelManager*>(p)->dispatch_loop(); }, this, cfg);
     if (!ok) background_running_.store(false);
     return ok;
@@ -1118,7 +1134,7 @@ void ChannelManager::send_subs() {
     NodeEndpoint bcast;
     bcast.is_espnow = true;
     std::memset(bcast.mac_address, 0xff, 6);
-    send_frames_to(bcast, hash, sender, 0, payload.data(), payload.size(), 0);
+    send_frames_to(bcast, hash, sender, 0, payload.data(), payload.size(), 0, K32C_MAX_FRAME_LEN, 0);
 #endif
     std::vector<NodeEndpoint> targets;
     {
@@ -1130,7 +1146,7 @@ void ChannelManager::send_subs() {
         }
         for (const auto& ep : seed_peers_) targets.push_back(ep);
     }
-    for (const auto& ep : targets) send_frames_to(ep, hash, sender, 0, payload.data(), payload.size(), 0);
+    for (const auto& ep : targets) send_frames_to(ep, hash, sender, 0, payload.data(), payload.size(), 0, K32C_MAX_FRAME_LEN, 0);
 }
 
 void ChannelManager::handle_subs(const uint8_t* payload, size_t len) {
@@ -1174,7 +1190,7 @@ void ChannelManager::send_hello() {
     NodeEndpoint bcast;
     bcast.is_espnow = true;
     std::memset(bcast.mac_address, 0xff, 6);
-    send_frames_to(bcast, hash, sender, 0, payload, 4 + name_len, K32C_FLAG_PING);
+    send_frames_to(bcast, hash, sender, 0, payload, 4 + name_len, K32C_FLAG_PING, K32C_MAX_FRAME_LEN, 0);
 #endif
     // A HELLO goes over UDP to every node whose address is known: a worker
     // takes the control plane's HELLOs over IP as proof that its link works
@@ -1195,7 +1211,7 @@ void ChannelManager::send_hello() {
         }
         for (const auto& ep : seed_peers_) targets.push_back(ep);
     }
-    for (const auto& ep : targets) send_frames_to(ep, hash, sender, 0, payload, 4 + name_len, K32C_FLAG_PING);
+    for (const auto& ep : targets) send_frames_to(ep, hash, sender, 0, payload, 4 + name_len, K32C_FLAG_PING, K32C_MAX_FRAME_LEN, 0);
 }
 
 void ChannelManager::set_announced_api(const std::string& address) {

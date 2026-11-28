@@ -168,6 +168,8 @@ bool PodServer::start() {
     o.workers = opts_.workers;
     o.worker_stack_bytes = opts_.worker_stack;
     o.worker_core_affinity = opts_.core_affinity;
+    o.worker_priority = opts_.worker_priority;
+    o.acceptor_priority = opts_.acceptor_priority;
     o.worker_stack_in_psram = opts_.stacks_in_psram;
     o.worker_stack_buffer = opts_.stack_buffer;
     o.keepalive_timeout_ms = 15000;
