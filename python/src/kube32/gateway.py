@@ -116,7 +116,9 @@ class Relay:
     def _read_loop(self):
         try:
             while self.alive:
-                data = self.ser.read(4096)
+                waiting = getattr(self.ser, "in_waiting", 0) or 0
+                n = min(4096, waiting) if waiting > 0 else 1
+                data = self.ser.read(n)
                 if data:
                     self.feed(data)
         except (serial.SerialException, OSError, TypeError):
@@ -303,6 +305,10 @@ def make_handler(state, device_port):
     class Proxy(socketserver.BaseRequestHandler):
         def handle(self):
             sock = self.request
+            try:
+                sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+            except OSError:
+                pass
             sock.settimeout(10)
             relay = state["relay"]
             try:
@@ -370,7 +376,7 @@ def open_serial(port):
     ser = serial.Serial()
     ser.port = port
     ser.baudrate = BAUD
-    ser.timeout = 0.2
+    ser.timeout = 0.05
     ser.dsrdtr = True
     ser.rts = False
     ser.open()

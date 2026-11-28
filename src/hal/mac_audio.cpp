@@ -19,7 +19,7 @@ namespace {
 
 constexpr uint32_t kOutRate = 48000;
 constexpr uint32_t kNumBuffers = 3;
-constexpr uint32_t kBufferFrames = 512;  // ~10.7 ms per buffer, ~32 ms total ring
+constexpr uint32_t kBufferFrames = 256;  // ~5.33 ms per buffer, ~10-16 ms total ring
 constexpr size_t kMaxVoices = 12;
 constexpr float kMasterGain = 0.80f;
 constexpr double kTwoPi = 6.28318530717958647692;
@@ -49,19 +49,16 @@ struct MacAudio::Impl {
     std::atomic<uint64_t> calls{0};
     std::atomic<uint64_t> samples_played{0};
 
-    static void output_callback(void* user_data, AudioQueueRef aq, AudioQueueBufferRef buf) {
-        auto* self = static_cast<Impl*>(user_data);
-        if (!self || self->closing.load(std::memory_order_acquire)) return;
-
+    void fill_buffer(AudioQueueBufferRef buf) {
         auto* out = static_cast<int16_t*>(buf->mAudioData);
         float mix[kBufferFrames];
         std::memset(mix, 0, sizeof(mix));
 
         {
-            std::lock_guard<std::mutex> lk(self->mix_mutex);
+            std::lock_guard<std::mutex> lk(mix_mutex);
             size_t i = 0;
-            while (i < self->voices.size()) {
-                Voice& v = self->voices[i];
+            while (i < voices.size()) {
+                Voice& v = voices[i];
                 const size_t avail = v.samples.size() - v.pos;
                 const size_t n = std::min<size_t>(avail, kBufferFrames);
                 const float* src = v.samples.data() + v.pos;
@@ -70,7 +67,7 @@ struct MacAudio::Impl {
                 }
                 v.pos += n;
                 if (v.pos >= v.samples.size()) {
-                    self->voices.erase(self->voices.begin() + static_cast<std::ptrdiff_t>(i));
+                    voices.erase(voices.begin() + static_cast<std::ptrdiff_t>(i));
                 } else {
                     ++i;
                 }
@@ -86,6 +83,13 @@ struct MacAudio::Impl {
             out[k] = static_cast<int16_t>(v);
         }
         buf->mAudioDataByteSize = kBufferFrames * sizeof(int16_t);
+    }
+
+    static void output_callback(void* user_data, AudioQueueRef aq, AudioQueueBufferRef buf) {
+        auto* self = static_cast<Impl*>(user_data);
+        if (!self || self->closing.load(std::memory_order_acquire)) return;
+
+        self->fill_buffer(buf);
 
         if (!self->closing.load(std::memory_order_acquire)) {
             AudioQueueEnqueueBuffer(aq, buf, 0, nullptr);
@@ -98,8 +102,7 @@ struct MacAudio::Impl {
         if (started) return true;
 
         for (uint32_t i = 0; i < kNumBuffers; ++i) {
-            std::memset(buffers[i]->mAudioData, 0, kBufferFrames * sizeof(int16_t));
-            buffers[i]->mAudioDataByteSize = kBufferFrames * sizeof(int16_t);
+            fill_buffer(buffers[i]);
             const OSStatus eq = AudioQueueEnqueueBuffer(queue, buffers[i], 0, nullptr);
             if (eq != noErr) {
                 std::fprintf(stderr, "[AUDIO] macOS AudioQueueEnqueueBuffer failed: %d\n", static_cast<int>(eq));
