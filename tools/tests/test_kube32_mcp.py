@@ -802,6 +802,32 @@ class TestTools(unittest.TestCase):
         self.assertEqual(res["ok"], True)
         self.assertIn(("default/demo-app", {"value": 99}), self.driver.posts)
 
+        # Verify repeated polling (tools/list, list_workloads, demo_read, demo_act) hits kubectl ZERO extra times
+        with open(self.log_path) as f:
+            before_calls = len(f.readlines())
+        for i in range(5):
+            tl = [t["name"] for t in s_rw.request("tools/list", {})["result"]["tools"]]
+            self.assertIn("demo_read", tl)
+            err, _ = s_rw.call("list_workloads")
+            self.assertFalse(err)
+            err, _ = s_rw.call("demo_read")
+            self.assertFalse(err)
+            err, _ = s_rw.call("demo_act", value=100 + i)
+            self.assertFalse(err)
+        with open(self.log_path) as f:
+            after_calls = len(f.readlines())
+        # list_workloads warms its cache once on the first call, then 0 extra kubectl calls on iterations 2..5
+        self.assertLessEqual(after_calls - before_calls, 4)
+
+        # Stale-on-error resilience: even if the API server state vanishes, cached service tools + endpoints still work!
+        os.unlink(self.state_path)
+        err, res = s_rw.call("demo_read")
+        self.assertFalse(err, res)
+        self.assertIn("readings", res)
+        err, wl2 = s_rw.call("list_workloads")
+        self.assertFalse(err, wl2)
+        self.assertTrue(any(p["pod"] == "demo-app" for p in wl2["pods"]))
+
     @unittest.skipUnless(have_c_toolchain(), "clang with the wasm32 target and a wasm linker are needed")
     def test_deploy_c_source(self):
         s = self.server("--allow-deploy")

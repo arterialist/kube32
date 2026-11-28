@@ -41,6 +41,20 @@ MAX_SAMPLE_SECONDS = 300
 ACTIVATION_TIMEOUT = 20.0
 DRIVER_TIMEOUT = 3.0
 SERVICE_TIMEOUT = 8.0
+DEFAULT_CACHE_TTL = 300.0
+DEFAULT_WORKLOADS_TTL = 60.0
+ERROR_BACKOFF_S = 15.0
+
+
+def _env_float(name, default):
+    raw = (os.environ.get(name) or "").strip()
+    if not raw:
+        return default
+    try:
+        val = float(raw)
+        return val if val >= 0.0 else default
+    except ValueError:
+        return default
 
 
 def _now_iso():
@@ -63,9 +77,14 @@ class Kube32:
         self.allow_deploy = allow_deploy
         self.log = log or (lambda text: None)
         self.ingress_url = (ingress_url or "").strip().rstrip("/") or None
+        self.cache_ttl = _env_float("KUBE32_MCP_CACHE_TTL", DEFAULT_CACHE_TTL)
+        self.workloads_ttl = min(_env_float("KUBE32_MCP_WORKLOADS_TTL", DEFAULT_WORKLOADS_TTL),
+                                 self.cache_ttl if self.cache_ttl > 0 else 0.0)
         self.last_action_at = {}      # (namespace, device) -> {action: time.time() of the last one sent}
         self._svc_tools_cache = (0.0, [])
+        self._svc_tools_last_attempt = 0.0
         self._endpoint_cache = {}     # (ns, ref) -> (ts, ns, pod_name, ip, port, node_name, svc_name, is_local)
+        self._workloads_cache = {}    # ns -> (ts, result_dict)
 
     # -- API ------------------------------------------------------------------
     def api(self, verb, path, body=None):
@@ -548,10 +567,18 @@ class Kube32:
         cache_key = (default_ns or self.namespace, str(ref or ""))
         now = time.time()
         entry = self._endpoint_cache.get(cache_key)
-        if not force and entry and (now - entry[0]) < 15.0:
+        if not force and entry and self.cache_ttl > 0 and (now - entry[0]) < self.cache_ttl:
             return entry[1:]
-        ns, pod, svc_name = self._resolve_service_pod(ref, default_ns=default_ns)
-        nodes = self._node_map()
+        try:
+            ns, pod, svc_name = self._resolve_service_pod(ref, default_ns=default_ns)
+            nodes = self._node_map()
+        except ToolError as e:
+            if not force and entry:
+                self.log("kube32 mcp: keeping cached endpoint for %s after API error: %s" % (ref, e))
+                # Back off API retries without dropping a working local endpoint
+                self._endpoint_cache[cache_key] = (now - self.cache_ttl + ERROR_BACKOFF_S,) + entry[1:]
+                return entry[1:]
+            raise
         ip, port, node_obj = self._pod_endpoint(pod, nodes)
         pod_name = pod["metadata"]["name"]
         node_name = (pod.get("spec") or {}).get("nodeName") or "?"
@@ -593,7 +620,7 @@ class Kube32:
         for attempt_idx in range(2):
             ns, pod_name, ip, port, node_name, svc_name, is_local = self._resolve_endpoint_cached(
                 ref, default_ns=default_ns, force=(attempt_idx > 0))
-            headers = {"X-Kube32-Pod": "%s/%s" % (ns, pod_name), "Accept": "application/json"}
+            headers = {"X-Kube32-Pod": "%s/%s" % (ns, pod_name), "Accept": "application/json", "Connection": "close"}
             if body_bytes is not None:
                 headers["Content-Type"] = "application/json"
 
@@ -620,7 +647,7 @@ class Kube32:
             # Lazy Ingress fallback ONLY when direct podIP:port is unreachable
             prefix = self._ingress_prefix(ns, svc_name or pod_name)
             if prefix is not None:
-                ing_headers = {"Accept": "application/json"}
+                ing_headers = {"Accept": "application/json", "Connection": "close"}
                 if body_bytes is not None:
                     ing_headers["Content-Type"] = "application/json"
                 ing_url = "%s%s%s" % (self.ingress_url, prefix, req_path)
@@ -651,12 +678,58 @@ class Kube32:
             "response": parsed,
         }
 
+    def _warm_endpoint_cache(self, ns, nodes, pods_raw, svcs_raw, now):
+        """Populate endpoint cache from an already-fetched nodes/pods/services snapshot."""
+        by_pod = {}
+        for p in pods_raw:
+            ip, port, node_obj = self._pod_endpoint(p, nodes)
+            if not ip:
+                continue
+            pname = p["metadata"]["name"]
+            node_name = (p.get("spec") or {}).get("nodeName") or "?"
+            labels = ((node_obj or {}).get("metadata") or {}).get("labels") or {}
+            is_local = labels.get("kube32.io/board") == "macos" or labels.get("kube32.io/simulator") == "true"
+            entry = (now, ns, pname, ip, port, node_name, None, is_local)
+            by_pod[pname] = entry
+            self._endpoint_cache[(ns, pname)] = entry
+            self._endpoint_cache[(ns, "%s/%s" % (ns, pname))] = entry
+        for s in svcs_raw:
+            sname = s["metadata"]["name"]
+            sel = (s.get("spec") or {}).get("selector") or {}
+            matched = [p for p in pods_raw
+                       if sel and all((p["metadata"].get("labels") or {}).get(k) == v for k, v in sel.items())]
+            running = [p for p in matched if (p.get("status") or {}).get("phase") == "Running"]
+            chosen = next((p for p in running if (p.get("status") or {}).get("podIP")), None) or (
+                running[0] if running else (matched[0] if matched else None))
+            if chosen is not None and chosen["metadata"]["name"] in by_pod:
+                base = by_pod[chosen["metadata"]["name"]]
+                svc_entry = (now, base[1], base[2], base[3], base[4], base[5], sname, base[7])
+                self._endpoint_cache[(ns, sname)] = svc_entry
+                self._endpoint_cache[(ns, "%s/%s" % (ns, sname))] = svc_entry
+
     def list_workloads(self, args, ctx):
         ns = args.get("namespace") or self.namespace
-        nodes = self._node_map()
-        pods_raw = (self.get("/api/v1/namespaces/%s/pods" % ns) or {}).get("items", [])
-        svcs_raw = (self.get("/api/v1/namespaces/%s/services" % ns) or {}).get("items", [])
-        ings_raw = (self.get("/apis/networking.k8s.io/v1/namespaces/%s/ingresses" % ns) or {}).get("items", [])
+        now = time.time()
+        cached = self._workloads_cache.get(ns)
+        if cached and self.workloads_ttl > 0 and (now - cached[0]) < self.workloads_ttl:
+            return cached[1]
+        try:
+            nodes = self._node_map()
+            pods_raw = (self.get("/api/v1/namespaces/%s/pods" % ns) or {}).get("items", [])
+            svcs_raw = (self.get("/api/v1/namespaces/%s/services" % ns) or {}).get("items", [])
+            ings_raw = (self.get("/apis/networking.k8s.io/v1/namespaces/%s/ingresses" % ns) or {}).get("items", [])
+        except ToolError as e:
+            if cached:
+                self.log("kube32 mcp: keeping cached list_workloads(%s) after API error: %s" % (ns, e))
+                self._workloads_cache[ns] = (now - self.workloads_ttl + ERROR_BACKOFF_S, cached[1])
+                return cached[1]
+            raise
+
+        self._warm_endpoint_cache(ns, nodes, pods_raw, svcs_raw, now)
+        if ns == self.namespace:
+            tools_built = self._build_service_mcp_tools(svcs_raw)
+            self._svc_tools_cache = (now, tools_built)
+            self._svc_tools_last_attempt = now
 
         pods_out = []
         for p in sorted(pods_raw, key=lambda x: x["metadata"]["name"]):
@@ -712,6 +785,7 @@ class Kube32:
                "deploy": "on" if self.allow_deploy else "off (kube32 mcp --allow-deploy)"}
         if ings_out:
             out["ingresses"] = ings_out
+        self._workloads_cache[ns] = (now, out)
         return out
 
     def call_service(self, args, ctx):
@@ -768,13 +842,7 @@ class Kube32:
             })
         return out
 
-    def service_mcp_tools(self, refresh=False):
-        """Dynamic MCP Tools declared by Services in self.namespace via kube32.io/mcp-tools."""
-        now = time.time()
-        ts, cached = self._svc_tools_cache
-        if not refresh and cached and (now - ts) < 15.0:
-            return cached
-        svcs = (self.get("/api/v1/namespaces/%s/services" % self.namespace) or {}).get("items", [])
+    def _build_service_mcp_tools(self, svcs):
         result = []
         seen = set()
         for svc in sorted(svcs, key=lambda x: x["metadata"]["name"]):
@@ -809,6 +877,31 @@ class Kube32:
                     destructive=not is_read,
                     idempotent=is_read,
                 ))
+        return result
+
+    def service_mcp_tools(self, refresh=False, force=False):
+        """Dynamic MCP Tools declared by Services in self.namespace via kube32.io/mcp-tools.
+
+        Caches discovered tools for self.cache_ttl seconds (default 300s) and falls back to the
+        last known good cache on transient API errors so high-frequency polling never hammers
+        a constrained control-plane node.
+        """
+        now = time.time()
+        ts, cached = self._svc_tools_cache
+        if not force and self.cache_ttl > 0 and ts > 0 and (now - ts) < self.cache_ttl:
+            if cached or not refresh:
+                return cached
+        if not cached and self._svc_tools_last_attempt > 0 and (now - self._svc_tools_last_attempt) < ERROR_BACKOFF_S and not force:
+            return cached
+        if force and self._svc_tools_last_attempt > 0 and (now - self._svc_tools_last_attempt) < ERROR_BACKOFF_S:
+            return cached
+        self._svc_tools_last_attempt = now
+        try:
+            svcs = (self.get("/api/v1/namespaces/%s/services" % self.namespace) or {}).get("items", [])
+        except ToolError as e:
+            self.log("kube32 mcp: keeping %d cached service tools after API error: %s" % (len(cached), e))
+            return cached
+        result = self._build_service_mcp_tools(svcs)
         self._svc_tools_cache = (now, result)
         return result
 

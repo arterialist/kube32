@@ -112,14 +112,17 @@ class Server:
         self.log = log or (lambda text: print(text, file=sys.stderr, flush=True))
         self.client = None
 
-    def all_tools(self, refresh=False):
+    def all_tools(self, refresh=False, force=False):
         merged = dict(self.tools)
         if self.extra_tools is not None:
             try:
                 try:
-                    extras = self.extra_tools(refresh=refresh)
+                    extras = self.extra_tools(refresh=refresh, force=force)
                 except TypeError:
-                    extras = self.extra_tools()
+                    try:
+                        extras = self.extra_tools(refresh=refresh)
+                    except TypeError:
+                        extras = self.extra_tools()
                 for t in extras:
                     if t.name not in merged:
                         merged[t.name] = t
@@ -166,7 +169,7 @@ class Server:
         if method == "ping":
             return {}
         if method == "tools/list":
-            return {"tools": [t.definition for t in self.all_tools(refresh=True).values()]}
+            return {"tools": [t.definition for t in self.all_tools(refresh=True, force=False).values()]}
         if method == "tools/call":
             return self.call_tool(params, notify)
         if method == "resources/list":
@@ -205,7 +208,7 @@ class Server:
         available = self.all_tools(refresh=False)
         tool = available.get(name)
         if tool is None and self.extra_tools is not None:
-            available = self.all_tools(refresh=True)
+            available = self.all_tools(refresh=True, force=True)
             tool = available.get(name)
         if tool is None:
             raise RpcError(INVALID_PARAMS, "no tool %s (tools: %s)" % (name, ", ".join(available)))
