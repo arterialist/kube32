@@ -49,7 +49,8 @@ std::string checkpoint_json(const std::string& ns, const std::string& name, cons
 // capability firewall's KUBE32_CAP_* bits: their grants follow the pod,
 // their state stays on the node.
 constexpr uint32_t kFollowedDevices = hal::KUBE32_CAP_DISPLAY | hal::KUBE32_CAP_KEYBOARD | hal::KUBE32_CAP_SPEAKER |
-                                      hal::KUBE32_CAP_MICROPHONE | hal::KUBE32_CAP_TOUCH | hal::KUBE32_CAP_LED | hal::KUBE32_CAP_CHIP_TEMP;
+                                      hal::KUBE32_CAP_MICROPHONE | hal::KUBE32_CAP_TOUCH | hal::KUBE32_CAP_LED | hal::KUBE32_CAP_CHIP_TEMP |
+                                      hal::KUBE32_CAP_CAMERA | hal::KUBE32_CAP_INTERACT | hal::KUBE32_CAP_IMU | hal::KUBE32_CAP_MOTOR;
 
 // The device a name grants: a resource ("hardware.kube32.io/tft-display"),
 // the part after "hardware.kube32.io/" ("tft-display") or a capability

@@ -26,6 +26,7 @@ struct BusPins {
 struct BoardProfile {
     std::string name{"generic"};
     uint64_t reserved_gpio_mask{0};                    // pins wired to on-board peripherals
+    uint64_t input_only_gpio_mask{0};                  // board pins claimable only via esp32.io/gpio-input-N (e.g., active-low buttons)
     uint8_t i2c_bus_mask{KUBE32_CHIP_I2C_MASK};        // I2C controllers pods may claim
     uint8_t uart_port_mask{KUBE32_CHIP_UART_MASK};     // UART ports pods may claim
     // Pins a claimed bus uses when the pod names none: I2C0 on GPIO 8/9 and

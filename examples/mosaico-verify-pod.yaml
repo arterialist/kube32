@@ -1,0 +1,51 @@
+# End-to-end Wasm verification pod for ESP-Mosaico CoreBoard + Interaction + Camera.
+# Runs an immediate boot check (LED chase, PIR/LDR/buttons, NEC IR TX, real JPEG
+# capture into Wasm linear memory, AMOLED preview blit) and serves HTTP on :7000:
+#   GET /              JSON hardware report
+#   GET /snapshot.jpg  Live hardware-encoded JPEG from Wasm linear memory
+#   POST /preview      Blit live camera frame to 480x480 AMOLED
+#   POST /led?rgb=00ff00  Set all 6 WS2812 LEDs
+#   POST /ir           Send 38 kHz NEC IR frame
+apiVersion: v1
+kind: Pod
+metadata:
+  name: mosaico-verify
+  namespace: default
+  labels:
+    app: mosaico-verify
+spec:
+  nodeSelector:
+    kube32.io/board: esp-mosaico
+    hardware.kube32.io/camera: "true"
+    hardware.kube32.io/interact: "true"
+  containers:
+    - name: mosaico-verify
+      image: wasm://embedded/mosaico-verify
+      ports:
+        - name: http
+          containerPort: 7000
+      resources:
+        requests:
+          memory: 256Ki
+          hardware.kube32.io/tft-display: "1"
+          hardware.kube32.io/led: "1"
+          hardware.kube32.io/interact: "1"
+          hardware.kube32.io/camera: "1"
+          hardware.kube32.io/chip-temp: "1"
+        limits:
+          memory: 256Ki
+      securityContext:
+        capabilities:
+          add: [DISPLAY, LED, INTERACT, CAMERA, CHIP_TEMP]
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: mosaico-verify
+  namespace: default
+spec:
+  selector:
+    app: mosaico-verify
+  ports:
+    - port: 80
+      targetPort: http

@@ -24,7 +24,10 @@ dependencies:
 
   espressif/esp_lcd_co5300: ^2.2
 
-  espressif/esp_lcd_touch_cst9220: ^0.1
+  espressif/esp_lcd_touch_cst9220:
+    version: "^0.1"
+    override_path: ../espressif__esp_lcd_touch_cst9220
+    public: true
 
   espressif/spi_nand_flash:
     version: "==1.4.4"

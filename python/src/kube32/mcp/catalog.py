@@ -83,6 +83,34 @@ DRIVERS = {
             "Device config: initial (off or on), active (high or low).",
         ],
     },
+    "mosaico-interact": {
+        "part": "ESP-Mosaico Interaction Module (6x WS2812 RGB LEDs, AS312 PIR, GL5506 LDR, 38 kHz NEC IR TX, 2 buttons)",
+        "bus": "internal",
+        "period_ms": 500,
+        "readings": {"left_pressed": "bool", "right_pressed": "bool", "motion": "bool", "light_pct": "%", "light_raw": "adc"},
+        "actions": [
+            {"action": "led", "index": "0-5", "r": "0-255", "g": "0-255", "b": "0-255"},
+            {"action": "led_clear"},
+            {"action": "ir_nec", "address": "0-255", "command": "0-255"},
+        ],
+        "behaviour": [
+            "Reads the Interaction Module's PIR motion sensor, ambient light level (0-100% filtered relative level and raw ADC), and left/right touch or mechanical buttons.",
+            "Action led sets LED index 0-5 (or all 6 LEDs when index is omitted) with a firmware-enforced safe brightness cap.",
+            "Action led_clear turns all 6 WS2812 LEDs off.",
+            "Action ir_nec transmits one 38 kHz NEC infrared frame with the 8-bit address and command.",
+        ],
+    },
+    "mosaico-camera": {
+        "part": "ESP-Mosaico DVP Camera Module (OV3640 / SC101IOT on left slot H2)",
+        "bus": "internal",
+        "period_ms": 5000,
+        "readings": {"present": "bool", "width": "px", "height": "px", "last_jpeg_bytes": "bytes", "captures": "count"},
+        "actions": [{"action": "snapshot", "quality": "10-95"}],
+        "behaviour": [
+            "Reports camera presence and sensor resolution. Action snapshot triggers an on-demand hardware JPEG capture and closes DVP DMA immediately afterward.",
+            "Use the capture_camera MCP tool (or GET /api/v1/nodes/<node>/proxy/camera/snapshot) to retrieve the JPEG image bytes or preview on the AMOLED.",
+        ],
+    },
 }
 
 

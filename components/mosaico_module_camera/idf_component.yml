@@ -1,0 +1,22 @@
+version: "0.2.0"
+description: Managed DVP camera module for ESP-Mosaico
+license: Apache-2.0
+
+targets:
+  - esp32s31
+
+dependencies:
+  idf: ">=6.2"
+
+  esp-mosaico-bsp:
+    version: "^0.2"
+    override_path: ../esp-mosaico-bsp
+
+  mosaico_module_mgr:
+    version: "^0.1"
+    public: true
+    override_path: ../mosaico_module_mgr
+
+  espressif/esp_video: 
+    version: "^2.4.1"
+    public: true

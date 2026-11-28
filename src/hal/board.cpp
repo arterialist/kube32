@@ -19,6 +19,8 @@ namespace {
 class CardputerBoard final : public Board {
 public:
     const char* name() const override { return "cardputer"; }
+    bool has_sd_card_slot() const override { return true; }
+    bool usb_only_console() const override { return true; }
 
     bool init() override {
         const bool has_display = init_display_and_backlight();
@@ -178,13 +180,13 @@ private:
 
 #if CONFIG_IDF_TARGET_ESP32S31
 Board* kit_board();
+Board* kit_board_detect();
 #endif
 
 Board* board_for(std::string_view name) {
     static CardputerBoard cardputer;
     static AtomS3LiteBoard atoms3_lite;
 #if CONFIG_IDF_TARGET_ESP32S31
-    // Kit pins differ from other boards with this chip: the kit is selected by name only
     if (name == "esp-mosaico" || name == "kit") return kit_board();
 #endif
     if (name == "cardputer" || name == "display") return &cardputer;
@@ -194,6 +196,14 @@ Board* board_for(std::string_view name) {
     if (name == "s31-coreboard") return &s31_coreboard;
 #endif
     return nullptr;
+}
+
+Board* default_board() {
+#if CONFIG_IDF_TARGET_ESP32S31
+    return kit_board_detect();
+#else
+    return nullptr;
+#endif
 }
 
 }  // namespace kube32::hal

@@ -1,0 +1,19 @@
+# ESP-Mosaico DVP Camera Module Device (left slot H2, EEPROM 0x50).
+# Reports presence/resolution and triggers hardware JPEG snapshots via
+# `kube32 mcp` (action: snapshot, or capture_camera MCP tool /
+# GET /api/v1/nodes/<node>/proxy/camera/snapshot).
+apiVersion: kube32.io/v1
+kind: Device
+metadata:
+  name: mosaico-camera
+  namespace: default
+  annotations:
+    kube32.io/notes: "ESP-Mosaico left-slot DVP Camera Module (OV3640/SC101IOT). Captures on demand and closes DMA immediately after each frame."
+spec:
+  driver: mosaico-camera
+  nodeSelector:
+    kube32.io/board: esp-mosaico
+    hardware.kube32.io/camera: "true"
+  intervalMs: 5000
+  activation: OnDemand
+  idleSeconds: 300

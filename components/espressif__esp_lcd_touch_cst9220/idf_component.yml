@@ -1,0 +1,14 @@
+dependencies:
+  cmake_utilities: 0.*
+  esp_lcd_touch:
+    public: true
+    version: ^1.2.0
+  idf: '>=5.3'
+description: ESP LCD Touch CST9220 - touch controller CST9220
+issues: https://github.com/espressif/esp-iot-solution/issues
+repository: git://github.com/espressif/esp-iot-solution.git
+repository_info:
+  commit_sha: f9e26eab65969f10e862d19c2a5830527b2136a3
+  path: components/display/lcd_touch/esp_lcd_touch_cst9220
+url: https://github.com/espressif/esp-iot-solution/tree/master/components/display/lcd_touch/esp_lcd_touch_cst9220
+version: 0.1.2

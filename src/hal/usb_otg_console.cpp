@@ -59,10 +59,12 @@ std::atomic<bool> s_host_open{false};
 std::atomic<bool> s_mounted{false};
 std::atomic<bool> s_line_seen{false};
 
+#if !SOC_USB_UTMI_PHY_NUM
 // Set before a restart the guard asks for: the next boot stays on
 // USB-Serial/JTAG. RTC memory, so it survives the restart and not a power cut.
 RTC_NOINIT_ATTR uint32_t s_skip_magic;
 constexpr uint32_t kSkipMagic = 0x4B333243;
+#endif
 
 void notify_drain() {
     if (s_drain_task) xTaskNotifyGive(s_drain_task);
@@ -179,6 +181,17 @@ void give_phy_to_usb_serial_jtag() { usb_serial_jtag_ll_phy_enable_external(fals
 #endif
 
 bool should_start() {
+#if SOC_USB_UTMI_PHY_NUM
+    // Dedicated HS UTMI OTG PHY (e.g. ESP32-S31 Type-C): USB-Serial/JTAG is
+    // not on this port, so always bring up the OTG console even after a crash.
+    const esp_reset_reason_t reason = esp_reset_reason();
+    if (reason == ESP_RST_PANIC || reason == ESP_RST_INT_WDT ||
+        reason == ESP_RST_TASK_WDT || reason == ESP_RST_WDT) {
+        printf("[CONSOLE] restarted after a crash (reason=%d): starting USB OTG console\n",
+               static_cast<int>(reason));
+    }
+    return true;
+#else
     const bool skip = s_skip_magic == kSkipMagic;
     s_skip_magic = 0;
     if (skip) {
@@ -195,6 +208,7 @@ bool should_start() {
         default:
             return true;
     }
+#endif
 }
 
 #if CONFIG_KUBE32_CONSOLE_USB_OTG_GUARD_SECONDS > 0 && !SOC_USB_UTMI_PHY_NUM

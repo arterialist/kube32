@@ -112,6 +112,10 @@ NodeTelemetry NodeStatusReporter::collect_telemetry() const {
     t.has_led = (onboard & hal::KUBE32_CAP_LED) != 0;
     t.has_speaker = (onboard & hal::KUBE32_CAP_SPEAKER) != 0;
     t.has_microphone = (onboard & hal::KUBE32_CAP_MICROPHONE) != 0;
+    t.has_camera = (onboard & hal::KUBE32_CAP_CAMERA) != 0;
+    t.has_interact = (onboard & hal::KUBE32_CAP_INTERACT) != 0;
+    t.has_imu = (onboard & hal::KUBE32_CAP_IMU) != 0;
+    t.has_motor = (onboard & hal::KUBE32_CAP_MOTOR) != 0;
     // The ESP32-S3's own sensor (hal/chip_temp.hpp); the simulator's HAL
     // stands in for it, a Linux board reads its SoC's when it can
     t.has_chip_temp = fw.board_profile().chip_temp;
@@ -126,7 +130,8 @@ static const char* const kOptionalResources[] = {
     "esp.io/adc", "esp32.io/adc", "esp.io/rmt-tx", "esp32.io/rmt-tx", "esp.io/rmt-rx", "esp32.io/rmt-rx",
     "hardware.kube32.io/ipc", "hardware.kube32.io/tft-display", "hardware.kube32.io/keyboard",
     "hardware.kube32.io/speaker", "hardware.kube32.io/chip-temp", "hardware.kube32.io/sd", "hardware.kube32.io/microphone",
-    "hardware.kube32.io/touch", "hardware.kube32.io/led",
+    "hardware.kube32.io/touch", "hardware.kube32.io/led", "hardware.kube32.io/camera", "hardware.kube32.io/interact",
+    "hardware.kube32.io/imu", "hardware.kube32.io/motor",
 };
 static constexpr size_t kOptionalCount = sizeof(kOptionalResources) / sizeof(kOptionalResources[0]);
 static_assert(kOptionalCount <= 32, "one bit per resource in a uint32_t");
@@ -229,6 +234,10 @@ static uint32_t append_resources(Out& json, const NodeTelemetry& t, bool capacit
         if (t.has_led) count("hardware.kube32.io/led", t.pods_capacity);
         if (t.has_speaker) count("hardware.kube32.io/speaker", t.pods_capacity);
         if (t.has_microphone) count("hardware.kube32.io/microphone", t.pods_capacity);
+        if (t.has_camera) count("hardware.kube32.io/camera", t.pods_capacity);
+        if (t.has_interact) count("hardware.kube32.io/interact", t.pods_capacity);
+        if (t.has_imu) count("hardware.kube32.io/imu", t.pods_capacity);
+        if (t.has_motor) count("hardware.kube32.io/motor", t.pods_capacity);
         if (t.has_chip_temp) count("hardware.kube32.io/chip-temp", t.pods_capacity);
         if (t.sd_present) count("hardware.kube32.io/sd", t.pods_capacity);
     }

@@ -44,9 +44,8 @@ def kubectl(cmd, stdin=None):
     return proc.returncode, proc.stdout, proc.stderr
 
 
-def api_call(args, verb, path, body=None):
-    """kubectl <verb> --raw <path> (kubeconfig credentials apply). Returns the
-    parsed JSON answer, None for an empty one; raises ApiError."""
+def api_call_raw(args, verb, path, body=None):
+    """kubectl <verb> --raw <path> returning raw response bytes; raises ApiError."""
     base = kubectl_base(args)
     missing = kubectl_missing(base)
     if missing:
@@ -66,7 +65,13 @@ def api_call(args, verb, path, body=None):
     if proc.returncode != 0:
         msg = (proc.stderr or proc.stdout).decode("utf-8", "replace").strip()
         raise ApiError(msg or "kubectl exit %d" % proc.returncode)
-    out = proc.stdout.decode("utf-8", "replace").strip()
+    return proc.stdout
+
+
+def api_call(args, verb, path, body=None):
+    """kubectl <verb> --raw <path> (kubeconfig credentials apply). Returns the
+    parsed JSON answer, None for an empty one; raises ApiError."""
+    out = api_call_raw(args, verb, path, body).decode("utf-8", "replace").strip()
     if not out:
         return None
     try:

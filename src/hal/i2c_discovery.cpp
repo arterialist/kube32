@@ -173,7 +173,10 @@ bool I2cDiscovery::scan() {
             ok = i2c_share(kScanUser, b, err) && scan_bus(bus, parts_[bus], direct, found);
             bus_release(kScanUser);
         } else {
-            ok = lines_idle(pins) && i2c_scan_begin(b, err) && scan_bus(bus, parts_[bus], direct, found);
+            // Board-wired buses (Linux /dev/i2c-N or BSP-owned ESP-IDF buses)
+            // already run on their pins; skip GPIO probing so live pins stay intact.
+            const bool fixed = (CapabilityFirewall::instance().board_profile().i2c_fixed_mask & (1U << bus)) != 0;
+            ok = (fixed || lines_idle(pins)) && i2c_scan_begin(b, err) && scan_bus(bus, parts_[bus], direct, found);
             i2c_scan_end(bus);
         }
         CapabilityFirewall::instance().return_i2c_bus(bus);

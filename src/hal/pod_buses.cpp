@@ -13,6 +13,7 @@
 #include "driver/uart.h"
 #include "esp_err.h"
 #include "esp_log.h"
+#include "esp_rom_sys.h"
 #endif
 
 namespace kube32::hal {
@@ -30,6 +31,8 @@ struct I2cSlot {
     uint8_t mux_mask[models::kMuxChannels]{};
 #if defined(ESP_PLATFORM)
     i2c_master_bus_handle_t bus{nullptr};
+    i2c_master_bus_handle_t borrowed_bus{nullptr};
+    uint32_t borrowed_speed{kDefaultI2cHz};
     // Device handles of the addresses talked to last: the driver transfers
     // through a handle per address, and users of a shared bus take turns
     struct Dev {
@@ -71,7 +74,9 @@ int32_t esp_to_hal(esp_err_t e) {
 // ignoring its address until it sees a STOP: clock the bus free (nine SCL
 // pulses, then a STOP) before the next transfer. Slot mutex held.
 int32_t i2c_failed(I2cSlot& s, unsigned index, uint8_t addr, esp_err_t e) {
-    if (s.bus) i2c_master_bus_reset(s.bus);
+    // On a board-owned shared BSP bus, only reset the bus on a timeout (stuck
+    // SDA/clock stretch) so ordinary NACKs never disturb BSP devices.
+    if (s.bus && (!s.borrowed_bus || e == ESP_ERR_TIMEOUT)) i2c_master_bus_reset(s.bus);
     s.mux_known = 0;
     if (++s.state.recoveries <= 3 || s.state.recoveries % 100 == 0) {
         printf("[HAL] I2C%u: %s talking to 0x%02x, bus cleared (%u times)\n", index, esp_err_to_name(e), addr, (unsigned)s.state.recoveries);
@@ -104,7 +109,24 @@ esp_err_t device_handle(I2cSlot& s, uint8_t addr, i2c_master_dev_handle_t& out) 
 // Transfers on an installed bus, without multiplexer handling. Slot mutex held.
 int32_t raw_write(I2cSlot& s, unsigned index, uint8_t addr, const uint8_t* data, size_t len) {
 #if defined(ESP_PLATFORM)
-    if (len == 0) return esp_to_hal(i2c_master_probe(s.bus, addr, 50));
+    if (len == 0) {
+#if CONFIG_IDF_TARGET_ESP32S31
+        // ESP32-S31 IDF 6.2 i2c_master_probe() can leave stale post-NACK state
+        // that causes the next probe to return a spurious ESP_OK. Confirm any
+        // ESP_OK with a second probe (real devices ACK twice) and briefly pause
+        // after a NACK so the controller returns to idle before the next address.
+        esp_err_t e = i2c_master_probe(s.bus, addr, 50);
+        if (e == ESP_OK) {
+            e = i2c_master_probe(s.bus, addr, 50);
+        }
+        if (e != ESP_OK) {
+            esp_rom_delay_us(500);
+        }
+        return esp_to_hal(e);
+#else
+        return esp_to_hal(i2c_master_probe(s.bus, addr, 50));
+#endif
+    }
     i2c_master_dev_handle_t dev = nullptr;
     esp_err_t e = device_handle(s, addr, dev);
     if (e != ESP_OK) return esp_to_hal(e);
@@ -171,28 +193,36 @@ int32_t select_route(I2cSlot& s, unsigned index, const models::I2cLocation& loc)
 // Slot mutex held by the caller
 bool install_i2c(I2cSlot& s, const std::string& pod_id, const BusAssignment& b, std::string& err, bool log = true) {
 #if defined(ESP_PLATFORM)
-    i2c_master_bus_config_t cfg = {};
-    cfg.i2c_port = static_cast<i2c_port_num_t>(b.index);
-    cfg.sda_io_num = static_cast<gpio_num_t>(b.pin_a);
-    cfg.scl_io_num = static_cast<gpio_num_t>(b.pin_b);
-    cfg.clk_source = I2C_CLK_SRC_DEFAULT;
-    cfg.glitch_ignore_cnt = 7;
-    cfg.flags.enable_internal_pullup = true;   // keeps an empty bus idle-high; attached devices bring their own pull-ups
     // i2c_failed reports failed transfers; the driver's line for every one
     // floods the console while a pod polls a device that does not answer
     esp_log_level_set("i2c.master", ESP_LOG_NONE);
-    esp_err_t e = i2c_new_master_bus(&cfg, &s.bus);
-    if (e != ESP_OK) {
-        s.bus = nullptr;
-        err = "cannot install the I2C" + std::to_string(b.index) + " driver: " + esp_err_to_name(e);
-        return false;
+    if (s.borrowed_bus) {
+        s.bus = s.borrowed_bus;
+    } else {
+        i2c_master_bus_config_t cfg = {};
+        cfg.i2c_port = static_cast<i2c_port_num_t>(b.index);
+        cfg.sda_io_num = static_cast<gpio_num_t>(b.pin_a);
+        cfg.scl_io_num = static_cast<gpio_num_t>(b.pin_b);
+        cfg.clk_source = I2C_CLK_SRC_DEFAULT;
+        cfg.glitch_ignore_cnt = 7;
+        cfg.flags.enable_internal_pullup = true;   // keeps an empty bus idle-high; attached devices bring their own pull-ups
+        esp_err_t e = i2c_new_master_bus(&cfg, &s.bus);
+        if (e != ESP_OK) {
+            s.bus = nullptr;
+            err = "cannot install the I2C" + std::to_string(b.index) + " driver: " + esp_err_to_name(e);
+            return false;
+        }
     }
 #endif
     s.state.installed = true;
     s.state.owner = pod_id;
     s.state.pin_a = b.pin_a;
     s.state.pin_b = b.pin_b;
+#if defined(ESP_PLATFORM)
+    s.state.speed = s.borrowed_bus ? s.borrowed_speed : (b.speed ? b.speed : kDefaultI2cHz);
+#else
     s.state.speed = b.speed ? b.speed : kDefaultI2cHz;
+#endif
     s.state.installs++;
     s.state.recoveries = 0;
     s.state.sharers = 0;
@@ -203,6 +233,11 @@ bool install_i2c(I2cSlot& s, const std::string& pod_id, const BusAssignment& b, 
 #if !defined(ESP_PLATFORM)
     if (HostI2cAdapter* adapter = s_host_i2c[b.index].load()) {
         printf("[HAL] I2C%u installed for %s: %s\n", b.index, pod_id.c_str(), adapter->device().c_str());
+        return true;
+    }
+#else
+    if (s.borrowed_bus) {
+        printf("[HAL] I2C%u attached (board bus) for %s: %u Hz\n", b.index, pod_id.c_str(), (unsigned)s.state.speed);
         return true;
     }
 #endif
@@ -217,10 +252,12 @@ void release_i2c(I2cSlot& s, unsigned index, bool log = true) {
         if (d.handle) i2c_master_bus_rm_device(d.handle);
         d.handle = nullptr;
     }
-    if (s.bus) i2c_del_master_bus(s.bus);
+    if (!s.borrowed_bus) {
+        if (s.bus) i2c_del_master_bus(s.bus);
+        gpio_reset_pin(static_cast<gpio_num_t>(s.state.pin_a));
+        gpio_reset_pin(static_cast<gpio_num_t>(s.state.pin_b));
+    }
     s.bus = nullptr;
-    gpio_reset_pin(static_cast<gpio_num_t>(s.state.pin_a));
-    gpio_reset_pin(static_cast<gpio_num_t>(s.state.pin_b));
 #endif
     if (log) printf("[HAL] I2C%u released by %s\n", index, s.state.owner.c_str());
     s.state.installed = false;
@@ -282,6 +319,13 @@ void release_uart(UartSlot& s, unsigned index) {
 #if !defined(ESP_PLATFORM)
 void set_host_i2c_adapter(uint32_t bus, HostI2cAdapter* adapter) {
     if (bus < 2) s_host_i2c[bus].store(adapter);
+}
+#else
+void set_board_i2c_bus(uint32_t bus, void* i2c_master_bus_handle, uint32_t speed_hz) {
+    if (bus >= 2) return;
+    std::lock_guard<std::mutex> lock(s_i2c[bus].mutex);
+    s_i2c[bus].borrowed_bus = static_cast<i2c_master_bus_handle_t>(i2c_master_bus_handle);
+    s_i2c[bus].borrowed_speed = speed_hz ? speed_hz : kDefaultI2cHz;
 }
 #endif
 

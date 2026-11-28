@@ -20,7 +20,7 @@ from .. import releases
 from ..build import cmd_build
 from ..cluster import driver_address, driver_request
 from ..common import format_quantity, parse_quantity, shared_file
-from ..kube import ApiError, api_call, kubectl, kubectl_base, kubectl_missing
+from ..kube import ApiError, api_call, api_call_raw, kubectl, kubectl_base, kubectl_missing
 from ..pods import _ENV_RE, _NAME_RE
 from ..wasm import HARDWARE, PAGE, check_module, format_report, read_wasm, static_memory_bytes
 from . import catalog, limits as lim, reference
@@ -185,6 +185,13 @@ class Kube32:
             if parts:
                 entry["i2c_parts"] = ["%s%s %s" % ("mux %s channel %s, " % (p["mux"], p.get("channel")) if p.get("mux") else "",
                                                    p.get("address"), p.get("chip", "unidentified")) for p in parts]
+            hw_caps = sorted(k[len("hardware.kube32.io/"):] for k, v in (st.get("allocatable") or {}).items()
+                             if k.startswith("hardware.kube32.io/") and str(v) not in ("0", ""))
+            if hw_caps:
+                entry["hardware"] = hw_caps
+            slots = {k[len("mosaico.kube32.io/"):]: v for k, v in labels.items() if k.startswith("mosaico.kube32.io/")}
+            if slots:
+                entry["mosaico_slots"] = slots
             out_nodes.append(entry)
         out_devices = []
         for d in self.devices():
@@ -394,6 +401,43 @@ class Kube32:
                             % (kind, name, MANAGED_BY, MANAGER))
         self.delete(kind, name)
         return {"deleted": "%s %s/%s" % (kind, self.namespace, name)}
+
+    def capture_camera(self, args, ctx):
+        """Captures a live JPEG snapshot (or triggers an AMOLED preview) from a node with hardware.kube32.io/camera."""
+        node = args.get("node")
+        if not node:
+            nodes = (self.api("get", "/api/v1/nodes") or {}).get("items", [])
+            for n in sorted(nodes, key=lambda x: x["metadata"]["name"]):
+                alloc = (n.get("status") or {}).get("allocatable") or {}
+                labels = (n.get("metadata") or {}).get("labels") or {}
+                if alloc.get("hardware.kube32.io/camera") or labels.get("hardware.kube32.io/camera") == "true":
+                    node = n["metadata"]["name"]
+                    break
+            if not node:
+                raise ToolError("no node advertises hardware.kube32.io/camera (list_devices shows node hardware)")
+        if args.get("preview"):
+            res = self.api("create", "/api/v1/nodes/%s/proxy/camera/preview" % quote(node, safe=""), {})
+            return {"node": node, "preview": True, "result": res}
+        quality = args.get("quality", 75)
+        if not 10 <= quality <= 95:
+            raise ToolError("quality is 10 to 95")
+        path = "/api/v1/nodes/%s/proxy/camera/snapshot?quality=%d" % (quote(node, safe=""), quality)
+        try:
+            data = api_call_raw(self.kube, "get", path)
+        except ApiError as e:
+            raise ToolError("camera snapshot on %s failed: %s" % (node, e))
+        if len(data) < 4 or data[:2] != b"\xff\xd8":
+            raise ToolError("camera snapshot on %s did not return JPEG (%s)" % (node, data[:160].decode("utf-8", "replace")))
+        out = {"node": node, "bytes": len(data), "sha256": hashlib.sha256(data).hexdigest(), "mime": "image/jpeg"}
+        save_path = args.get("save_path")
+        if save_path:
+            dest = os.path.abspath(save_path)
+            with open(dest, "wb") as f:
+                f.write(data)
+            out["saved_to"] = dest
+        if args.get("include_base64", False):
+            out["jpeg_base64"] = base64.b64encode(data).decode("ascii")
+        return out
 
     def delete(self, kind, name):
         path = ("/api/v1/namespaces/%s/pods/%s" if kind == "Pod" else "/apis/apps/v1/namespaces/%s/deployments/%s") % (self.namespace, name)
@@ -743,6 +787,16 @@ def tools(k):
              "Deletes a pod or Deployment that deploy_code created. Refuses anything else. Needs --allow-deploy.",
              {"name": {"type": "string", "description": "Pod or Deployment name"}},
              ["name"], k.delete_workload, read_only=False, destructive=True, idempotent=True),
+        Tool("capture_camera", "Capture a JPEG snapshot or AMOLED preview from a Camera Module",
+             "Captures a live JPEG frame from a node advertising hardware.kube32.io/camera (ESP-Mosaico left-slot Camera Module), "
+             "returning its byte count and sha256 (and optionally saving it to save_path or returning base64), or blits a live "
+             "RGB565 preview to the node's AMOLED display when preview=true.",
+             {"node": {"type": "string", "description": "Node name (default: first node advertising hardware.kube32.io/camera)"},
+              "quality": {"type": "integer", "description": "JPEG quality 10 to 95 (default 75)"},
+              "save_path": {"type": "string", "description": "Optional local path to write the JPEG file"},
+              "include_base64": {"type": "boolean", "description": "Include base64-encoded JPEG in response (default false)"},
+              "preview": {"type": "boolean", "description": "Blit live preview to the node's AMOLED instead of returning JPEG"}},
+             [], k.capture_camera),
     ]
 
 

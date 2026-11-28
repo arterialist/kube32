@@ -82,13 +82,16 @@ std::string node_json(const std::string& name, bool simulator, const std::string
 void test_catalog_and_spec() {
     size_t n = 0;
     const models::DeviceDriver* drivers = models::device_drivers(n);
-    assert(n == 6);
-    for (size_t i = 0; i < n; ++i) assert(drivers[i].memory_bytes == 3 * 1024);
+    assert(n == 8);
+    for (size_t i = 0; i < n; ++i) assert(drivers[i].memory_bytes >= 3 * 1024 && drivers[i].memory_bytes <= 4 * 1024);
     assert(models::find_device_driver("bme688")->address == 0x77 && models::find_device_driver("miniscale")->address == 0x26);
+    assert(models::find_device_driver("mosaico-interact") != nullptr && models::find_device_driver("mosaico-camera") != nullptr);
     assert(models::find_device_driver("pca9548") == nullptr);
 
     models::DeviceSpec s;
     std::string why;
+    assert(spec_ok(R"({"driver":"mosaico-interact","nodeName":"mosaico"})", s, why) && s.interval_ms == 500 && s.image == "wasm://embedded/driver-mosaico-interact");
+    assert(spec_ok(R"({"driver":"mosaico-camera","nodeName":"mosaico"})", s, why) && s.interval_ms == 5000 && s.image == "wasm://embedded/driver-mosaico-camera");
     assert(spec_ok(R"({"driver":"bme688","nodeName":"a"})", s, why));
     assert(s.has_i2c && s.i2c.bus == 0 && s.i2c.address == 0x77 && s.i2c.mux == 0 && s.interval_ms == 5000 && s.image == "wasm://embedded/driver-bme688");
     assert(spec_ok(R"({"driver":"bme688","nodeName":"a","i2c":{"bus":1,"address":"0x76","mux":{"channel":5}}})", s, why));

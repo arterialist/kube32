@@ -1,0 +1,19 @@
+# ESP-Mosaico Interaction Module Device (right slot H1, EEPROM 0x51).
+# Exposes PIR motion, LDR light level, and 2 buttons via GET / and events on
+# device.mosaico-interact; controls 6x WS2812 LEDs and 38 kHz NEC IR TX via
+# POST / and `kube32 mcp` write_device.
+apiVersion: kube32.io/v1
+kind: Device
+metadata:
+  name: mosaico-interact
+  namespace: default
+  annotations:
+    kube32.io/notes: "ESP-Mosaico right-slot Interaction Module (6x WS2812 with safe brightness cap, AS312 PIR, GL5506 LDR, 38 kHz NEC IR TX, 2 buttons)."
+spec:
+  driver: mosaico-interact
+  nodeSelector:
+    kube32.io/board: esp-mosaico
+    hardware.kube32.io/interact: "true"
+  intervalMs: 500
+  activation: OnDemand
+  idleSeconds: 300

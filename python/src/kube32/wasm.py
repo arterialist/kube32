@@ -101,6 +101,12 @@ LOW_LEVEL_IMPORTS = {
     "kube32_channel_send": "i(iii)",
     "kube32_channel_recv": "i(iiii)",
     "kube32_channel_close": "i(i)",
+    "k32_interact_read": "i(i)",
+    "k32_interact_led_set": "i(ii)",
+    "k32_interact_ir_send_nec": "i(ii)",
+    "k32_camera_info": "i(i)",
+    "k32_camera_capture_jpeg": "i(iii)",
+    "k32_camera_preview": "i()",
 }
 KNOWN_IMPORTS = dict(APP_IMPORTS)
 KNOWN_IMPORTS.update(LOW_LEVEL_IMPORTS)
@@ -149,6 +155,12 @@ HARDWARE_FOR_IMPORT = {
     "k32_fs_remove": "sd",
     "k32_http_call": "service-call",
     "esp32_chip_temp_read": "chip-temp",
+    "k32_interact_read": "interact",
+    "k32_interact_led_set": "interact",
+    "k32_interact_ir_send_nec": "interact",
+    "k32_camera_info": "camera",
+    "k32_camera_capture_jpeg": "camera",
+    "k32_camera_preview": "camera",
 }
 HARDWARE = {
     # name: (resource key, securityContext capability) as src/hal/capability_firewall.cpp reads them
@@ -158,12 +170,16 @@ HARDWARE = {
     "microphone": ("hardware.kube32.io/microphone", "MICROPHONE"),
     "touch": ("hardware.kube32.io/touch", "TOUCH"),
     "led": ("hardware.kube32.io/led", "LED"),
+    "camera": ("hardware.kube32.io/camera", "CAMERA"),
+    "interact": ("hardware.kube32.io/interact", "INTERACT"),
+    "imu": ("hardware.kube32.io/imu", "IMU"),
+    "motor": ("hardware.kube32.io/motor", "MOTOR"),
     "ipc": ("hardware.kube32.io/ipc", "CHANNEL_IPC"),
     "sd": ("hardware.kube32.io/sd", "SD"),
     "service-call": (None, "SERVICE_CALL"),   # k32_http_call: a capability only, no resource
     "chip-temp": ("hardware.kube32.io/chip-temp", "CHIP_TEMP"),
 }
-HARDWARE_ORDER = ("ipc", "display", "keyboard", "speaker", "microphone", "touch", "led", "sd", "service-call", "chip-temp")
+HARDWARE_ORDER = ("ipc", "display", "keyboard", "speaker", "microphone", "touch", "led", "camera", "interact", "imu", "motor", "sd", "service-call", "chip-temp")
 HARDWARE_ALIASES = {"tft-display": "display", "tft": "display", "channel_ipc": "ipc", "channels": "ipc", "sd-card": "sd", "mic": "microphone",
                     "service_call": "service-call", "http": "service-call"}
 
@@ -785,7 +801,7 @@ def hardware_for_name(text):
     name = text.strip().lower()
     name = HARDWARE_ALIASES.get(name, name)
     if name not in HARDWARE:
-        raise ValueError("unknown hardware '%s' (expected display, keyboard, speaker, microphone, touch, led, ipc, sd, service-call, chip-temp or none)" % text.strip())
+        raise ValueError("unknown hardware '%s' (expected display, keyboard, speaker, microphone, touch, led, camera, interact, imu, motor, ipc, sd, service-call, chip-temp or none)" % text.strip())
     return name
 
 

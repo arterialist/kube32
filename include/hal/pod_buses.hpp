@@ -61,6 +61,11 @@ public:
 // Transfers on bus `bus` go to `adapter` instead of MockHal's devices;
 // nullptr hands the bus back to MockHal. Set before pods run.
 void set_host_i2c_adapter(uint32_t bus, HostI2cAdapter* adapter);
+#else
+// Borrows an I2C master bus already created by the board's BSP so pods and
+// discovery can share the bus handle without calling i2c_new_master_bus /
+// i2c_del_master_bus or resetting its pins. Pass nullptr to release the borrow.
+void set_board_i2c_bus(uint32_t bus, void* i2c_master_bus_handle, uint32_t speed_hz = kDefaultI2cHz);
 #endif
 
 // Installs every bus of `buses` for the pod. On failure nothing it installed

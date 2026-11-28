@@ -24,6 +24,8 @@ const DeviceDriver kDrivers[] = {
     {"rfid", DeviceBus::I2c, 0x28, 0, "MFRC522", kDriverMemory, 200, "", false, nullptr, 1,
      {{0x37, 5, {0x15, 0x88, 0x91, 0x92, 0xB2}, {"WS1850S", "FM17522", "MFRC522", "MFRC522", "FM17522"}}}},
     {"chip-temp", DeviceBus::Internal, 0, 0, "", kDriverMemory, 10000, "", false, "hardware.kube32.io/chip-temp", 0, {}},
+    {"mosaico-interact", DeviceBus::Internal, 0, 0, "", 4 * 1024, 500, "", false, "hardware.kube32.io/interact", 0, {}},
+    {"mosaico-camera", DeviceBus::Internal, 0, 0, "", 4 * 1024, 5000, "", false, "hardware.kube32.io/camera", 0, {}},
     {"button", DeviceBus::Gpio, 0, 0, "", kDriverMemory, 50, "pin", true, nullptr, 0, {}},
     {"switch", DeviceBus::Gpio, 0, 0, "", kDriverMemory, 30000, "pin", false, nullptr, 0, {}},
 };

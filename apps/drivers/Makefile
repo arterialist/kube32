@@ -1,5 +1,5 @@
 # Builds every device driver into images/driver-<name>.wasm (see README.md).
-DRIVERS = bme688 miniscale rfid chip-temp button switch
+DRIVERS = bme688 miniscale rfid chip-temp button switch mosaico-interact mosaico-camera
 
 all clean:
 	@for d in $(DRIVERS); do $(MAKE) -C $$d $@ || exit 1; done

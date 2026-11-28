@@ -15,8 +15,11 @@
 #include <iostream>
 #include <cstdio>
 #include <cstring>
+#include <vector>
 
+#include "hal/board.hpp"
 #include "hal/chip_temp.hpp"
+#include "hal/mosaico_modules.hpp"
 #include "hal/pod_buses.hpp"
 #include "hal/pod_rmt.hpp"
 #include "runtime/pod_log.hpp"
@@ -483,6 +486,187 @@ static const void* raw_kube32_channel_close(IM3Runtime runtime, IM3ImportContext
 }
 
 // -----------------------------------------------------------------------------
+// ESP-Mosaico Expansion Module Host Functions (Interaction + Camera)
+// -----------------------------------------------------------------------------
+
+// k32_interact_read: signature "i(i)" -> returns 0 or K32_ERR_*
+// Writes 12-byte k32_interact_inputs_t to out_offset.
+static const void* raw_k32_interact_read(IM3Runtime runtime, IM3ImportContext _ctx, uint64_t* _sp, void* _mem) {
+    (void)_ctx;
+    const uint32_t out_offset = static_cast<uint32_t>(_sp[1]);
+    int32_t& ret = *reinterpret_cast<int32_t*>(_sp);
+    const std::string& pod_id = get_pod_ref(runtime);
+
+    if (!hal::CapabilityFirewall::instance().check_permission(pod_id, hal::PeripheralType::Interact, 0, hal::AccessMode::Read)) {
+        ret = hal::HAL_ERR_PERM;
+        return m3Err_none;
+    }
+    if (static_cast<uint64_t>(out_offset) + 12ULL > m3_GetMemorySizeAt(_mem)) {
+        ret = hal::HAL_ERR_FAULT;
+        return m3Err_none;
+    }
+    hal::MosaicoInteractInputs in{};
+    ret = hal::MosaicoModules::instance().interact_read(in);
+    if (ret == hal::HAL_OK) {
+        struct WireInteractInputs {
+            uint8_t left_pressed;
+            uint8_t right_pressed;
+            uint8_t motion_detected;
+            uint8_t light_level;
+            int32_t light_raw;
+            uint8_t led_count;
+            uint8_t button_mode;
+            uint16_t reserved;
+        } wire = {
+            static_cast<uint8_t>(in.left_pressed ? 1 : 0),
+            static_cast<uint8_t>(in.right_pressed ? 1 : 0),
+            static_cast<uint8_t>(in.motion_detected ? 1 : 0),
+            in.light_level,
+            in.light_raw,
+            in.led_count,
+            in.button_mode,
+            0,
+        };
+        static_assert(sizeof(wire) == 12, "k32_interact_inputs_t wire size");
+        std::memcpy(static_cast<uint8_t*>(_mem) + out_offset, &wire, sizeof(wire));
+    }
+    return m3Err_none;
+}
+
+// k32_interact_led_set: signature "i(ii)" -> returns 0 or K32_ERR_*
+// Sets LED index (0..5, or K32_LED_ALL=0xFFFFFFFF to fill all 6) to 0xRRGGBB.
+static const void* raw_k32_interact_led_set(IM3Runtime runtime, IM3ImportContext _ctx, uint64_t* _sp, void* _mem) {
+    (void)_ctx;
+    (void)_mem;
+    const uint32_t index = static_cast<uint32_t>(_sp[1]);
+    const uint32_t rgb   = static_cast<uint32_t>(_sp[2]) & 0xFFFFFFu;
+    int32_t& ret = *reinterpret_cast<int32_t*>(_sp);
+    const std::string& pod_id = get_pod_ref(runtime);
+
+    if (!hal::CapabilityFirewall::instance().check_permission(pod_id, hal::PeripheralType::Interact, 0, hal::AccessMode::Write)) {
+        ret = hal::HAL_ERR_PERM;
+        return m3Err_none;
+    }
+    ret = hal::MosaicoModules::instance().led_set(index, rgb);
+    return m3Err_none;
+}
+
+// k32_interact_ir_send_nec: signature "i(ii)" -> returns 0 or K32_ERR_*
+// Sends one 38 kHz NEC infrared frame (8-bit address, 8-bit command).
+static const void* raw_k32_interact_ir_send_nec(IM3Runtime runtime, IM3ImportContext _ctx, uint64_t* _sp, void* _mem) {
+    (void)_ctx;
+    (void)_mem;
+    const uint32_t addr = static_cast<uint32_t>(_sp[1]);
+    const uint32_t cmd  = static_cast<uint32_t>(_sp[2]);
+    int32_t& ret = *reinterpret_cast<int32_t*>(_sp);
+    const std::string& pod_id = get_pod_ref(runtime);
+
+    if (!hal::CapabilityFirewall::instance().check_permission(pod_id, hal::PeripheralType::Interact, 0, hal::AccessMode::Write)) {
+        ret = hal::HAL_ERR_PERM;
+        return m3Err_none;
+    }
+    if (addr > 0xFFu || cmd > 0xFFu) {
+        ret = hal::HAL_ERR_INVAL;
+        return m3Err_none;
+    }
+    if (runtime_stop_requested(runtime)) return m3Err_trapOutOfGas;
+    ret = hal::MosaicoModules::instance().interact_ir_send_nec(static_cast<uint8_t>(addr), static_cast<uint8_t>(cmd));
+    return m3Err_none;
+}
+
+// k32_camera_info: signature "i(i)" -> returns 0 or K32_ERR_*
+// Writes 16-byte k32_camera_info_t to out_offset.
+static const void* raw_k32_camera_info(IM3Runtime runtime, IM3ImportContext _ctx, uint64_t* _sp, void* _mem) {
+    (void)_ctx;
+    const uint32_t out_offset = static_cast<uint32_t>(_sp[1]);
+    int32_t& ret = *reinterpret_cast<int32_t*>(_sp);
+    const std::string& pod_id = get_pod_ref(runtime);
+
+    if (!hal::CapabilityFirewall::instance().check_permission(pod_id, hal::PeripheralType::Camera, 0, hal::AccessMode::Read)) {
+        ret = hal::HAL_ERR_PERM;
+        return m3Err_none;
+    }
+    if (static_cast<uint64_t>(out_offset) + 16ULL > m3_GetMemorySizeAt(_mem)) {
+        ret = hal::HAL_ERR_FAULT;
+        return m3Err_none;
+    }
+    hal::MosaicoCameraInfo info{};
+    ret = hal::MosaicoModules::instance().camera_info(info);
+    if (ret == hal::HAL_OK) {
+        uint32_t wire[4] = {info.width, info.height, info.pixel_format, info.present ? 1u : 0u};
+        std::memcpy(static_cast<uint8_t*>(_mem) + out_offset, wire, sizeof(wire));
+    }
+    return m3Err_none;
+}
+
+// k32_camera_capture_jpeg: signature "i(iii)" -> returns JPEG byte size or K32_ERR_*
+// Captures one real frame and hardware-JPEG-encodes it. If buf_offset==0 and cap==0,
+// returns the captured JPEG size without copying into linear memory.
+static const void* raw_k32_camera_capture_jpeg(IM3Runtime runtime, IM3ImportContext _ctx, uint64_t* _sp, void* _mem) {
+    (void)_ctx;
+    const uint32_t buf_offset = static_cast<uint32_t>(_sp[1]);
+    const uint32_t cap        = static_cast<uint32_t>(_sp[2]);
+    const uint32_t quality    = static_cast<uint32_t>(_sp[3]);
+    int32_t& ret = *reinterpret_cast<int32_t*>(_sp);
+    const std::string& pod_id = get_pod_ref(runtime);
+
+    if (!hal::CapabilityFirewall::instance().check_permission(pod_id, hal::PeripheralType::Camera, 0, hal::AccessMode::Read)) {
+        ret = hal::HAL_ERR_PERM;
+        return m3Err_none;
+    }
+    const size_t mem_size = m3_GetMemorySizeAt(_mem);
+    if (cap > 0 && static_cast<uint64_t>(buf_offset) + cap > mem_size) {
+        ret = hal::HAL_ERR_FAULT;
+        return m3Err_none;
+    }
+    if (runtime_stop_requested(runtime)) return m3Err_trapOutOfGas;
+
+    std::vector<uint8_t> jpeg;
+    const uint8_t q = quality == 0 ? 75 : (quality > 95 ? 95 : static_cast<uint8_t>(quality));
+    const int32_t rc = hal::MosaicoModules::instance().camera_capture_jpeg(jpeg, nullptr, q);
+    if (rc != hal::HAL_OK) {
+        ret = rc;
+        return m3Err_none;
+    }
+    if (cap == 0 && buf_offset == 0) {
+        ret = static_cast<int32_t>(jpeg.size());
+        return m3Err_none;
+    }
+    if (jpeg.size() > cap) {
+        ret = hal::HAL_ERR_TOOBIG;
+        return m3Err_none;
+    }
+    if (!jpeg.empty()) {
+        std::memcpy(static_cast<uint8_t*>(_mem) + buf_offset, jpeg.data(), jpeg.size());
+    }
+    ret = static_cast<int32_t>(jpeg.size());
+    return m3Err_none;
+}
+
+// k32_camera_preview: signature "i()" -> returns 0 or K32_ERR_*
+// Captures one frame and blits RGB565 preview directly to the 480x480 AMOLED.
+static const void* raw_k32_camera_preview(IM3Runtime runtime, IM3ImportContext _ctx, uint64_t* _sp, void* _mem) {
+    (void)_ctx;
+    (void)_mem;
+    int32_t& ret = *reinterpret_cast<int32_t*>(_sp);
+    const std::string& pod_id = get_pod_ref(runtime);
+
+    if (!hal::CapabilityFirewall::instance().check_permission(pod_id, hal::PeripheralType::Camera, 0, hal::AccessMode::Read) ||
+        !hal::CapabilityFirewall::instance().check_permission(pod_id, hal::PeripheralType::Display, 0, hal::AccessMode::Write)) {
+        ret = hal::HAL_ERR_PERM;
+        return m3Err_none;
+    }
+    if (runtime_stop_requested(runtime)) return m3Err_trapOutOfGas;
+    hal::Board* board = hal::board_for("esp-mosaico");
+    if (!board) {
+        ret = hal::HAL_ERR_NODEV;
+        return m3Err_none;
+    }
+    ret = hal::MosaicoModules::instance().camera_preview_to_display(*board);
+    return m3Err_none;
+}
+
+// -----------------------------------------------------------------------------
 // link_host_functions implementation
 // -----------------------------------------------------------------------------
 
@@ -518,6 +702,14 @@ bool link_host_functions(IM3Module module, const std::string& pod_id) {
     m3_LinkRawFunction(module, "env", "kube32_channel_send",  "i(iii)",  &raw_kube32_channel_send);
     m3_LinkRawFunction(module, "env", "kube32_channel_recv",  "i(iiii)", &raw_kube32_channel_recv);
     m3_LinkRawFunction(module, "env", "kube32_channel_close", "i(i)",    &raw_kube32_channel_close);
+
+    // Link ESP-Mosaico expansion module functions (Interaction + Camera)
+    m3_LinkRawFunction(module, "env", "k32_interact_read",        "i(i)",   &raw_k32_interact_read);
+    m3_LinkRawFunction(module, "env", "k32_interact_led_set",     "i(ii)",  &raw_k32_interact_led_set);
+    m3_LinkRawFunction(module, "env", "k32_interact_ir_send_nec", "i(ii)",  &raw_k32_interact_ir_send_nec);
+    m3_LinkRawFunction(module, "env", "k32_camera_info",          "i(i)",   &raw_k32_camera_info);
+    m3_LinkRawFunction(module, "env", "k32_camera_capture_jpeg",  "i(iii)", &raw_k32_camera_capture_jpeg);
+    m3_LinkRawFunction(module, "env", "k32_camera_preview",       "i()",    &raw_k32_camera_preview);
 
     return true;
 }

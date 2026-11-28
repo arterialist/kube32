@@ -172,6 +172,7 @@ else()
         src/hal/chip_temp.cpp
         src/hal/pod_rmt.cpp
         src/hal/mock_hal.cpp
+        src/hal/mosaico_modules.cpp
         src/hal/firmware_slots.cpp
         src/hal/linux/linux_board.cpp
         src/hal/linux/linux_display.cpp
@@ -200,6 +201,7 @@ else()
         src/app/egress_gateway.cpp
         src/app/node_storage_api.cpp
         src/app/node_blobs_api.cpp
+        src/app/node_mosaico_api.cpp
         src/app/pod_checkpoint_api.cpp
         src/app/console_relay.cpp
         src/app/improv_serial.cpp

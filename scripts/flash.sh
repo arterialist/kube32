@@ -43,6 +43,11 @@ if [ -z "$PORT" ]; then
 fi
 
 if [ -n "$BUILD_DIR" ]; then
+    if [ -f "$BUILD_DIR/sdkconfig" ] && grep -q 'CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions-kit.csv"' "$BUILD_DIR/sdkconfig"; then
+        echo "refused: $BUILD_DIR uses partitions-kit.csv (ESP-Mosaico retained 2 MiB layout)." >&2
+        echo "Use tools/kit_flash.py --build $BUILD_DIR --port <port> [--write] so bootloader/otadata/sysmeta/vibe_mode are never overwritten." >&2
+        exit 1
+    fi
     CHIP="$(python3 -c 'import json, sys; print(json.load(open(sys.argv[1]))["target"])' "$BUILD_DIR/project_description.json")"
 else
     CHIP=esp32s3

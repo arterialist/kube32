@@ -39,6 +39,48 @@ ROM_USB_ID = (0x303A, 0x0020)   # the chip's ROM download mode over the Type-C p
 RETAINED_END = 0x200000     # the factory's first 2 MiB are read-only by construction
 PARTITION_TABLE_OFFSET = 0x8000
 BAUD = 921600
+MIN_ESPTOOL = (5, 6)
+
+
+def esptool_version(path):
+    try:
+        out = subprocess.check_output([path, "version"], stderr=subprocess.STDOUT, text=True, timeout=5)
+    except Exception:
+        return None
+    for tok in out.replace("v", "").split():
+        parts = tok.split(".")
+        if len(parts) >= 2 and all(p.isdigit() for p in parts[:2]):
+            return (int(parts[0]), int(parts[1]))
+    return None
+
+
+def find_esptool(explicit=None):
+    candidates = []
+    if explicit:
+        candidates.append(explicit)
+    if os.environ.get("KUBE32_ESPTOOL"):
+        candidates.append(os.environ["KUBE32_ESPTOOL"])
+    here = os.path.dirname(os.path.abspath(__file__))
+    candidates.append(os.path.normpath(os.path.join(here, "..", "..", "work", ".esptool-venv", "bin", "esptool")))
+    for name in ("esptool", "esptool.py"):
+        found = shutil.which(name)
+        if found:
+            candidates.append(found)
+    seen = set()
+    older = []
+    for c in candidates:
+        if not c or c in seen or not os.path.isfile(c):
+            continue
+        seen.add(c)
+        ver = esptool_version(c)
+        if ver and ver >= MIN_ESPTOOL:
+            return c, ver
+        if ver:
+            older.append("%s (%d.%d)" % (c, ver[0], ver[1]))
+    msg = "no esptool >= %d.%d found (required for esp32s31)" % MIN_ESPTOOL
+    if older:
+        msg += "; found older: " + ", ".join(older)
+    sys.exit(msg)
 
 
 def csv_rows(path):
@@ -88,6 +130,7 @@ def main():
     ap.add_argument("--from-console", help="the running node's CDC console: send it K32_CMD:BOOTLOADER, use the ROM's port")
     ap.add_argument("--partitions", default="partitions-kit.csv")
     ap.add_argument("--slot", default="ota_0", help="app slot to write (default ota_0)")
+    ap.add_argument("--esptool", help="path to esptool >= 5.6 (or set KUBE32_ESPTOOL)")
     ap.add_argument("--write", action="store_true", help="run esptool (default: print the command only)")
     args = ap.parse_args()
 
@@ -107,9 +150,8 @@ def main():
 
     if not args.port and not args.from_console:
         sys.exit("pass --port (a kit in download mode) or --from-console (kube32 running)")
-    esptool = shutil.which("esptool") or shutil.which("esptool.py")
-    if not esptool:
-        sys.exit("no esptool in PATH (5.6 or newer knows this chip)")
+    esptool, ver = find_esptool(args.esptool)
+    print("using esptool %d.%d (%s)" % (ver[0], ver[1], esptool))
     port = args.port
     if args.from_console and args.write:
         port = enter_download_mode(args.from_console)

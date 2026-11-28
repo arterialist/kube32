@@ -32,6 +32,10 @@ constexpr DeviceName kDevices[] = {
     {hal::KUBE32_CAP_MICROPHONE, "microphone", "MICROPHONE", "MIC"},
     {hal::KUBE32_CAP_LED, "led", "LED", nullptr},
     {hal::KUBE32_CAP_CHIP_TEMP, "chip-temp", "CHIP_TEMP", nullptr},
+    {hal::KUBE32_CAP_CAMERA, "camera", "CAMERA", nullptr},
+    {hal::KUBE32_CAP_INTERACT, "interact", "INTERACT", nullptr},
+    {hal::KUBE32_CAP_IMU, "imu", "IMU", nullptr},
+    {hal::KUBE32_CAP_MOTOR, "motor", "MOTOR", nullptr},
 };
 
 std::string_view trim(std::string_view s) {

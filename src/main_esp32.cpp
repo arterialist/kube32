@@ -59,6 +59,7 @@
 #include "app/egress_gateway.hpp"
 #include "app/node_storage_api.hpp"
 #include "app/node_blobs_api.hpp"
+#include "app/node_mosaico_api.hpp"
 #include "app/pod_checkpoint_api.hpp"
 #include "api/checkpoint_api.hpp"
 #include "app/console_relay.hpp"
@@ -70,6 +71,7 @@
 #include "osal/system.hpp"
 #include "osal/socket.hpp"
 #include "hal/board.hpp"
+#include "hal/mosaico_modules.hpp"
 #if CONFIG_KUBE32_CONSOLE_USB_OTG
 #include "hal/usb_otg_console.hpp"
 #endif
@@ -113,14 +115,25 @@
 #include "lwip/priv/tcpip_priv.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#if CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG || CONFIG_ESP_CONSOLE_SECONDARY_USB_SERIAL_JTAG
+#define KUBE32_HAVE_USJ_CONSOLE 1
 #include "driver/usb_serial_jtag.h"
 #include "driver/usb_serial_jtag_vfs.h"
 #include "hal/usb_serial_jtag_ll.h"
+#else
+#define KUBE32_HAVE_USJ_CONSOLE 0
+#endif
 #include "driver/uart.h"
 #include "driver/uart_vfs.h"
 
 static const char* TAG = "Kube32";
 static kube32::hal::Board* s_board = nullptr;   // on-board peripherals, nullptr on a bare board
+#if CONFIG_IDF_TARGET_ESP32S31
+namespace kube32::hal {
+void kit_print_sensors(void (*write_line)(const char*, size_t, void*), void* ctx);
+uint8_t kit_touch_last_raw_points();
+}
+#endif
 
 // Role selection is capability based: the board with external PSRAM hosts the
 // control plane, the API server, the ingress and the large data pod; a board
@@ -178,19 +191,16 @@ NodeIdentity detect_identity() {
     }
     bool control_plane = id.has_psram;
     if (role[0]) control_plane = (std::strcmp(role, "control-plane") == 0);
-#if CONFIG_IDF_TARGET_ESP32S31
-    id.board = kube32::hal::board_for(board);
-    id.has_display = id.board != nullptr;
-#else
     if (board[0]) {
         id.board = kube32::hal::board_for(board);
-        if (id.board) {
-            kube32::hal::BoardProfile profile;
-            id.board->describe(profile);
-            id.has_display = (profile.onboard_devices & kube32::hal::KUBE32_CAP_DISPLAY) != 0;
-        }
+    } else {
+        id.board = kube32::hal::default_board();
     }
-#endif
+    if (id.board) {
+        kube32::hal::BoardProfile profile;
+        id.board->describe(profile);
+        id.has_display = (profile.onboard_devices & kube32::hal::KUBE32_CAP_DISPLAY) != 0;
+    }
     id.is_control_plane = control_plane;
     char derived[16];
     snprintf(derived, sizeof(derived), "esp32-%02x%02x%02x", mac[3], mac[4], mac[5]);
@@ -306,6 +316,9 @@ struct Console {
     bool uart_enabled{false};
     bool last_from_usb{true};
     bool use_otg{false};
+    bool has_usb() const {
+        return use_otg || KUBE32_HAVE_USJ_CONSOLE;
+    }
     void init(bool usb_only) {
 #if CONFIG_KUBE32_CONSOLE_USB_OTG
         use_otg = kube32::hal::usb_otg_console::start();
@@ -314,6 +327,7 @@ struct Console {
             return;
         }
 #endif
+#if KUBE32_HAVE_USJ_CONSOLE
         if (!usb_serial_jtag_is_driver_installed()) {
             // A reset other than power-on keeps the USB link of the boot
             // before, and the clock changes at app start can leave it
@@ -350,6 +364,12 @@ struct Console {
         // the board is power cycled.
         usb_serial_jtag_vfs_use_driver();
         init_uart(usb_only);
+#else
+        // USB-Serial/JTAG disabled in Kconfig (e.g. GPIO 33/34 reserved for
+        // Camera DVP on ESP-Mosaico): fall back to UART0 if OTG did not start.
+        last_from_usb = false;
+        init_uart(false);
+#endif
     }
     void init_uart(bool usb_only) {
         uart_enabled = !usb_only;
@@ -368,13 +388,23 @@ struct Console {
 #if CONFIG_KUBE32_CONSOLE_USB_OTG
         if (use_otg) return kube32::hal::usb_otg_console::read(buf, cap, timeout_ms);
 #endif
+#if KUBE32_HAVE_USJ_CONSOLE
         return usb_serial_jtag_read_bytes(buf, cap, pdMS_TO_TICKS(timeout_ms));
+#else
+        (void)buf; (void)cap; (void)timeout_ms;
+        return 0;
+#endif
     }
     // Waits on the port that carried the last bytes and only polls the other.
     // The USB-Serial/JTAG driver drops what arrives while its receive ring
     // (4 KiB) is full, so a wait on UART0 while a request streams in over USB
     // would lose part of it; UART0's own 8 KiB ring holds a line meanwhile.
     int read(char* buf, size_t cap, uint32_t timeout_ms) {
+        if (!has_usb()) {
+            int n = uart_enabled ? uart_read_bytes(UART_NUM_0, buf, cap, pdMS_TO_TICKS(timeout_ms)) : 0;
+            if (n > 0) last_from_usb = false;
+            return n;
+        }
         if (!uart_enabled) return usb_read(buf, cap, timeout_ms);
         const TickType_t wait = pdMS_TO_TICKS(timeout_ms);
         int n = usb_read(buf, cap, last_from_usb ? timeout_ms : 0);
@@ -394,6 +424,7 @@ struct Console {
             return;
         }
 #endif
+#if KUBE32_HAVE_USJ_CONSOLE
         if (last_from_usb || !uart_enabled) {
             // The driver takes a write whole or not at all, and never one
             // larger than its TX ring
@@ -404,9 +435,10 @@ struct Console {
                 if (n <= 0) break;
                 off += static_cast<size_t>(n);
             }
-        } else {
-            uart_write_bytes(UART_NUM_0, data, len);
+            return;
         }
+#endif
+        if (uart_enabled) uart_write_bytes(UART_NUM_0, data, len);
     }
     // One frame in one driver write: log output can surround it but never
     // split it. The frame must fit the TX ring (4096 or 2048 bytes on USB).
@@ -416,10 +448,12 @@ struct Console {
             return kube32::hal::usb_otg_console::write_frame(data, len, timeout_ms);
         }
 #endif
+#if KUBE32_HAVE_USJ_CONSOLE
         if (last_from_usb || !uart_enabled) {
             return usb_serial_jtag_write_bytes(data, len, pdMS_TO_TICKS(timeout_ms)) == static_cast<int>(len);
         }
-        return uart_write_bytes(UART_NUM_0, data, len) == static_cast<int>(len);
+#endif
+        return uart_enabled && uart_write_bytes(UART_NUM_0, data, len) == static_cast<int>(len);
     }
 };
 
@@ -1254,9 +1288,10 @@ void console_task(void* arg) {
                     con.write(frame.data(), frame.size());
                 }
             } else if (line == "K32_CMD:STATUS") {
-                char buf[384];
+                char buf[448];
+                const std::string chip = kube32::hal::chip_display_name();
                 int l = snprintf(buf, sizeof(buf),
-                    "K32_STATUS node=%s role=%s mac=%s free_heap=%u min_free_heap=%u largest_block=%u pod_pool_free=%u free_psram=%u uptime_ms=%llu pods=%u storage=%s auth=%s tls=%s\n",
+                    "K32_STATUS node=%s role=%s mac=%s free_heap=%u min_free_heap=%u largest_block=%u pod_pool_free=%u free_psram=%u uptime_ms=%llu pods=%u storage=%s auth=%s tls=%s board=%s chip=%s arch=%s total_psram=%u\n",
                     ident.name.c_str(), ident.is_control_plane ? "control-plane" : "worker", ident.mac.c_str(),
                     (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
                     (unsigned)heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
@@ -1266,8 +1301,11 @@ void console_task(void* arg) {
                     (unsigned long long)kube32::osal::System::get_uptime_ms(),
                     (unsigned)(s_runtime ? s_runtime->container_count() : 0),
                     kube32::hal::storage_medium_name(kube32::hal::node_storage_info().medium), s_api_token_set ? "token" : "off",
-                    s_tls ? "on" : "off");
-                con.write(buf, static_cast<size_t>(l));
+                    s_tls ? "on" : "off",
+                    ident.board ? ident.board->name() : "generic",
+                    chip.c_str(), kube32::api::build_info().arch,
+                    (unsigned)heap_caps_get_total_size(MALLOC_CAP_SPIRAM));
+                con.write(buf, std::min(static_cast<size_t>(l), sizeof(buf) - 1));
             } else if (line == "K32_CMD:STORE") {
                 kube32::storage::PersistenceStats ps;
                 char buf[448];
@@ -1371,7 +1409,7 @@ void console_task(void* arg) {
                 vTaskDelay(pdMS_TO_TICKS(200));
                 esp_restart();
             } else if (line.rfind("K32_CMD:BOARD:", 0) == 0 || line.rfind("K32_CMD:ROLE:", 0) == 0 || line.rfind("K32_CMD:AP:", 0) == 0 || line.rfind("K32_CMD:API:", 0) == 0) {
-                // Profile keys: board=<cardputer|atoms3-lite|s31-coreboard|generic>, role=<auto|worker>, ap=<on|off>, api=<control plane host|auto>
+                // Profile keys: board=<esp-mosaico|cardputer|atoms3-lite|s31-coreboard|generic|auto>, role=<auto|worker>, ap=<on|off>, api=<control plane host|auto>
                 bool is_board = line.rfind("K32_CMD:BOARD:", 0) == 0;
                 bool is_ap = line.rfind("K32_CMD:AP:", 0) == 0;
                 bool is_api = line.rfind("K32_CMD:API:", 0) == 0;
@@ -1379,7 +1417,8 @@ void console_task(void* arg) {
                 nvs_handle_t h;
                 if (nvs_open("k32", NVS_READWRITE, &h) == ESP_OK) {
                     const char* key = is_board ? "board" : (is_ap ? "ap" : (is_api ? "api" : "role"));
-                    if (value.empty() || value == "auto" || value == "generic" || value == "on") nvs_erase_key(h, key);
+                    const bool erase = value.empty() || value == "auto" || (!is_board && value == "on");
+                    if (erase) nvs_erase_key(h, key);
                     else nvs_set_str(h, key, value.c_str());
                     // A new home address: the address followed and the control plane known go
                     if (is_api) { nvs_erase_key(h, "apifollow"); nvs_erase_key(h, "apicp"); }
@@ -1388,6 +1427,7 @@ void console_task(void* arg) {
                 }
                 con.write("K32_OK profile stored, rebooting\n", 33);
                 vTaskDelay(pdMS_TO_TICKS(200));
+                if (s_board) s_board->shutdown();
                 esp_restart();
             } else if (line.rfind("K32_CMD:TASKBT:", 0) == 0) {
                 // Saved context of a blocked task: the first words of its stack
@@ -1423,20 +1463,27 @@ void console_task(void* arg) {
                 }
                 con.write(found ? "K32_OK bt\n" : "K32_ERR no such task\n", found ? 10 : 21);
             } else if (line.rfind("K32_CMD:TONE:", 0) == 0) {
-                // Plays N tones back to back from the console task to exercise the
-                // speaker driver without a pod: K32_CMD:TONE:<count>
+                // Plays N tones back to back on a deep helper stack so codec/I2S
+                // drivers never overflow the console task stack: K32_CMD:TONE:<count>
                 int n = std::atoi(line.c_str() + 13);
                 if (n < 1) n = 1;
                 if (n > 200) n = 200;
-                uint64_t t0 = kube32::osal::System::get_uptime_ms();
                 if (!s_board) {
                     con.write("K32_ERR no speaker\n", 19);
-                    continue;
+                } else {
+                    console_run_deep(con, [&] {
+                        uint64_t t0 = kube32::osal::System::get_uptime_ms();
+                        int32_t rc = kube32::hal::HAL_OK;
+                        for (int i = 0; i < n && rc == kube32::hal::HAL_OK; ++i) {
+                            rc = s_board->tone(880 + (i % 4) * 110, 20, 15);
+                        }
+                        char l[64];
+                        int ll = rc == kube32::hal::HAL_OK
+                                     ? snprintf(l, sizeof(l), "K32_OK %d tone(s) in %u ms\n", n, (unsigned)(kube32::osal::System::get_uptime_ms() - t0))
+                                     : snprintf(l, sizeof(l), "K32_ERR tone=%d\n", (int)rc);
+                        con.write(l, static_cast<size_t>(ll));
+                    }, 8192);
                 }
-                for (int i = 0; i < n; ++i) s_board->tone(880 + (i % 4) * 110, 20, 15);
-                char l[64];
-                int ll = snprintf(l, sizeof(l), "K32_OK %d tone(s) in %u ms\n", n, (unsigned)(kube32::osal::System::get_uptime_ms() - t0));
-                con.write(l, static_cast<size_t>(ll));
             } else if (line.rfind("K32_CMD:ACCESSLOG:", 0) == 0) {
                 bool on = line.substr(18) == "on";
                 if (s_api_server) s_api_server->set_access_log(on);
@@ -1447,8 +1494,8 @@ void console_task(void* arg) {
                 // K32_CMD:SYSRESERVE:<size, e.g. 192Ki>, or auto for the default
                 const std::string value = line.substr(19);
                 const int64_t bytes = value == "auto" ? 0 : kube32::models::parse_quantity(value);
-                if (value != "auto" && (bytes < 16 * 1024 || bytes > 1024 * 1024)) {
-                    con.write("K32_ERR system reserve must be 16Ki to 1Mi, or auto\n", 52);
+                if (value != "auto" && (bytes < 16 * 1024 || bytes > 8 * 1024 * 1024)) {
+                    con.write("K32_ERR system reserve must be 16Ki to 8Mi, or auto\n", 52);
                 } else {
                     nvs_handle_t h;
                     if (nvs_open("k32", NVS_READWRITE, &h) == ESP_OK) {
@@ -1459,6 +1506,7 @@ void console_task(void* arg) {
                     }
                     con.write("K32_OK system reserve stored, rebooting\n", 40);
                     vTaskDelay(pdMS_TO_TICKS(200));
+                    if (s_board) s_board->shutdown();
                     esp_restart();
                 }
             } else if (line.rfind("K32_CMD:PODCORES:", 0) == 0) {
@@ -1483,6 +1531,7 @@ void console_task(void* arg) {
 #if defined(RTC_CNTL_FORCE_DOWNLOAD_BOOT) || defined(LP_SYSTEM_REG_FORCE_DOWNLOAD_BOOT)
                 con.write("K32_OK entering download mode\n", 30);
                 vTaskDelay(pdMS_TO_TICKS(100));
+                if (s_board) s_board->shutdown();
 #if CONFIG_KUBE32_CONSOLE_USB_OTG
                 kube32::hal::usb_otg_console::prepare_download_reset();
 #endif
@@ -1516,8 +1565,9 @@ void console_task(void* arg) {
                 // The microphone's digital gain until the next boot (1 to 64)
                 if (s_board) s_board->mic_set_gain(static_cast<uint32_t>(std::strtoul(line.c_str() + 16, nullptr, 10)));
                 con.write("K32_OK mic gain\n", 16);
-            } else if (line.rfind("K32_CMD:MIC:", 0) == 0) {
-                console_run_deep(con, [&] { console_mic(con, line.substr(12)); });
+            } else if (line == "K32_CMD:MIC" || line.rfind("K32_CMD:MIC:", 0) == 0) {
+                const std::string arg = line.size() > 12 ? line.substr(12) : "500";
+                console_run_deep(con, [&] { console_mic(con, arg); }, 8192);
             } else if (line == "K32_CMD:SD") {
                 // Card state, measured figures and what is on it under /sd/kube32
                 kube32::hal::SdInfo si = kube32::hal::sd_info();
@@ -1672,9 +1722,134 @@ void console_task(void* arg) {
                     int ll = snprintf(l, sizeof(l), "K32_ERR scan failed: %s\n", esp_err_to_name(scan));
                     con.write(l, static_cast<size_t>(ll));
                 }
+            } else if (line.rfind("K32_CMD:MOTOR:", 0) == 0) {
+                // Pulse the vibration motor: K32_CMD:MOTOR:<pct>[:<ms>] (default 200 ms, max 2000 ms)
+                if (!s_board) {
+                    con.write("K32_ERR no motor\n", 17);
+                } else {
+                    std::string rest = line.substr(14);
+                    console_run_deep(con, [&] {
+                        size_t sep = rest.find(':');
+                        uint32_t pct = static_cast<uint32_t>(std::strtoul(rest.c_str(), nullptr, 10));
+                        uint32_t ms = (sep == std::string::npos) ? 200u : static_cast<uint32_t>(std::strtoul(rest.c_str() + sep + 1, nullptr, 10));
+                        if (pct > 100) pct = 100;
+                        if (ms > 2000) ms = 2000;
+                        int32_t rc = s_board->motor_set(pct);
+                        if (rc == kube32::hal::HAL_OK && pct > 0 && ms > 0) {
+                            vTaskDelay(pdMS_TO_TICKS(ms));
+                            s_board->motor_set(0);
+                        }
+                        char l[64];
+                        int ll = rc == kube32::hal::HAL_OK ? snprintf(l, sizeof(l), "K32_OK motor pct=%u ms=%u\n", (unsigned)pct, (unsigned)ms)
+                                                           : snprintf(l, sizeof(l), "K32_ERR motor=%d\n", (int)rc);
+                        con.write(l, static_cast<size_t>(ll));
+                    }, 8192);
+                }
+            } else if (line.rfind("K32_CMD:LED:", 0) == 0) {
+                // K32_CMD:LED:<index|all>:<rrggbb>
+                if (!s_board) {
+                    con.write("K32_ERR no led\n", 15);
+                } else {
+                    std::string rest = line.substr(12);
+                    console_run_deep(con, [&] {
+                        size_t sep = rest.find(':');
+                        uint32_t idx = (sep != std::string::npos && rest.substr(0, sep) == "all")
+                                           ? kube32::hal::kMosaicoLedAll
+                                           : static_cast<uint32_t>(std::strtoul(rest.c_str(), nullptr, 10));
+                        uint32_t rgb = (sep == std::string::npos) ? 0u : static_cast<uint32_t>(std::strtoul(rest.c_str() + sep + 1, nullptr, 16));
+                        int32_t rc = s_board->led_set(idx, rgb);
+                        char l[64];
+                        int ll = rc == kube32::hal::HAL_OK ? snprintf(l, sizeof(l), "K32_OK led idx=%u rgb=0x%06x\n", (unsigned)idx, (unsigned)(rgb & 0xFFFFFFu))
+                                                           : snprintf(l, sizeof(l), "K32_ERR led=%d\n", (int)rc);
+                        con.write(l, static_cast<size_t>(ll));
+                    }, 8192);
+                }
+            } else if (line == "K32_CMD:TOUCH") {
+                if (!s_board) {
+                    con.write("K32_ERR no touch\n", 17);
+                } else {
+                    console_run_deep(con, [&] {
+                        kube32::hal::TouchPoint pts[5];
+                        int32_t n = s_board->touch_read(pts, 5);
+                        char l[160];
+                        if (n < 0) {
+                            int ll = snprintf(l, sizeof(l), "K32_ERR touch=%d\n", (int)n);
+                            con.write(l, static_cast<size_t>(ll));
+                        } else {
+                            for (int32_t k = 0; k < n; ++k) {
+                                int ll = snprintf(l, sizeof(l), "K32_TOUCH id=%u x=%d y=%d p=%u\n", (unsigned)pts[k].id, (int)pts[k].x, (int)pts[k].y, (unsigned)pts[k].pressure);
+                                con.write(l, static_cast<size_t>(ll));
+                            }
+#if CONFIG_IDF_TARGET_ESP32S31
+                            int ll = snprintf(l, sizeof(l), "K32_OK touch count=%d raw=%u max=%u\n", (int)n,
+                                              (unsigned)kube32::hal::kit_touch_last_raw_points(),
+                                              (unsigned)CONFIG_ESP_LCD_TOUCH_MAX_POINTS);
+#else
+                            int ll = snprintf(l, sizeof(l), "K32_OK touch count=%d\n", (int)n);
+#endif
+                            con.write(l, static_cast<size_t>(ll));
+                        }
+                    }, 8192);
+                }
+            } else if (line == "K32_CMD:DISPLAY") {
+                if (!s_board || s_board->display_info().width <= 0) {
+                    con.write("K32_ERR no display\n", 19);
+                } else {
+                    console_run_deep(con, [&] {
+                        const kube32::hal::DisplayInfo di = s_board->display_info();
+                        const int32_t bar_w = di.width / 4;
+                        s_board->display_rect(0, 0, bar_w, di.height, 0xF800);
+                        s_board->display_rect(bar_w, 0, bar_w, di.height, 0x07E0);
+                        s_board->display_rect(bar_w * 2, 0, bar_w, di.height, 0x001F);
+                        s_board->display_rect(bar_w * 3, 0, di.width - bar_w * 3, di.height, 0xFFFF);
+                        char l[64];
+                        int ll = snprintf(l, sizeof(l), "K32_OK display %dx%d\n", (int)di.width, (int)di.height);
+                        con.write(l, static_cast<size_t>(ll));
+                    }, 8192);
+                }
+            } else if (line == "K32_CMD:SENSORS") {
+#if CONFIG_IDF_TARGET_ESP32S31
+                console_run_deep(con, [&] {
+                    kube32::hal::kit_print_sensors([](const char* s, size_t n, void* c) {
+                        static_cast<Console*>(c)->write(s, n);
+                    }, &con);
+                    con.write("K32_OK sensors\n", 15);
+                });
+#else
+                con.write("K32_ERR no onboard sensors\n", 27);
+#endif
+            } else if (line == "K32_CMD:MODULES") {
+                console_run_deep(con, [&] {
+                    kube32::hal::MosaicoModules::instance().print_status();
+                    con.write("K32_OK modules\n", 15);
+                });
+            } else if (line == "K32_CMD:INTERACT") {
+                console_run_deep(con, [&] {
+                    kube32::hal::MosaicoInteractInputs in;
+                    int32_t rc = kube32::hal::MosaicoModules::instance().interact_read(in);
+                    char l[160];
+                    int ll = rc == kube32::hal::HAL_OK
+                                 ? snprintf(l, sizeof(l), "K32_INTERACT left=%d right=%d pir=%d ldr_raw=%d ldr_pct=%u leds=%u mode=%u\n",
+                                            in.left_pressed ? 1 : 0, in.right_pressed ? 1 : 0, in.motion_detected ? 1 : 0,
+                                            (int)in.light_raw, (unsigned)in.light_level, (unsigned)in.led_count, (unsigned)in.button_mode)
+                                 : snprintf(l, sizeof(l), "K32_ERR interact=%d\n", (int)rc);
+                    con.write(l, static_cast<size_t>(ll));
+                });
+            } else if (line == "K32_CMD:CAMERA") {
+                console_run_deep(con, [&] {
+                    kube32::hal::MosaicoCameraInfo ci;
+                    int32_t rc = kube32::hal::MosaicoModules::instance().camera_info(ci);
+                    char l[160];
+                    int ll = rc == kube32::hal::HAL_OK
+                                 ? snprintf(l, sizeof(l), "K32_CAMERA present=%d sensor=%s %ux%u fourcc=0x%08x\n",
+                                            ci.present ? 1 : 0, ci.sensor, (unsigned)ci.width, (unsigned)ci.height, (unsigned)ci.pixel_format)
+                                 : snprintf(l, sizeof(l), "K32_ERR camera=%d\n", (int)rc);
+                    con.write(l, static_cast<size_t>(ll));
+                });
             } else if (line == "K32_CMD:REBOOT") {
                 con.write("K32_OK rebooting\n", 17);
                 vTaskDelay(pdMS_TO_TICKS(100));
+                if (s_board) s_board->shutdown();
                 esp_restart();
             }
             line.clear();
@@ -1779,16 +1954,19 @@ void cluster_task(void* pv) {
         kube32::runtime::AppPodHost::instance().set_event_thread_stack(4096, false);
         kube32::runtime::PodLogStore::runtime().set_ring_capacity(1024);   // 300 KB SRAM: a short log per pod
     } else {
-        // Keep the largest PSRAM block whole for pods (20 Wasm pages plus
-        // header) before task stacks and buffers fragment the heap: a big data
-        // pod's linear memory from its start, small pods from its end down.
-        // The PSRAM besides it is the system's.
-        kube32_pool_reserve_external(20 * 64 * 1024 + 4096);   // 20 Wasm pages plus wasm3's memory header
-        // A control plane sets 64 KiB of its PSRAM aside, while it is whole,
-        // for its large allocations (mem/large_blocks.hpp): lists, object
-        // copies and controller working sets of 4 to 60 KB, which its heap
-        // stops holding in one piece once small objects are spread over it
-        if (ident.is_control_plane && !kube32::mem::large_blocks_reserve(64 * 1024)) printf("[MEM] no PSRAM for the large-block region\n");
+        // Keep a contiguous PSRAM block whole for pods before task stacks and
+        // buffers fragment the heap: a big data pod's linear memory from its
+        // start, small pods from its end down. Scale up on 16-32 MB PSRAM boards
+        // (ESP-Mosaico) while keeping 2 MB boards compact.
+        const size_t total_psram = heap_caps_get_total_size(MALLOC_CAP_SPIRAM);
+        const bool large_psram = total_psram >= 8u * 1024 * 1024;
+        kube32_pool_reserve_external((large_psram ? 4u * 1024 * 1024 : 20u * 64 * 1024) + 4096);
+        // A control plane sets a PSRAM arena aside, while it is whole, for its
+        // large allocations (mem/large_blocks.hpp): lists, object copies and
+        // controller working sets which its heap stops holding in one piece
+        // once small objects are spread over it.
+        const size_t large_arena = large_psram ? 256u * 1024 : 64u * 1024;
+        if (ident.is_control_plane && !kube32::mem::large_blocks_reserve(large_arena)) printf("[MEM] no PSRAM for the large-block region\n");
         // One shared interpreter stack here too: the interpreter recursion
         // peaks near 56 KB, and a stack that size on each thread that calls
         // into pods (kubelet, ticks, events, ingress, pod server) would take
@@ -1800,13 +1978,13 @@ void cluster_task(void* pv) {
             kube32::runtime::AppPodHost::instance().set_event_thread_stack(8192, true);
         }
         // The node's system-reserved PSRAM, which pods' code and structures
-        // may not take and allocatable memory leaves out. A control plane
-        // allocates there for the store, API lists and watches (a list copies
-        // every object it returns), the controllers' working sets, the
-        // console relay and firmware staging: its peak above the boot level
-        // is 109 KiB with a few pods and over 122 KiB with the node full, and
-        // 192 KiB keep half again as much. K32_CMD:SYSRESERVE:<size> overrides.
-        size_t system_reserved = ident.is_control_plane ? 192 * 1024 : 64 * 1024;
+        // may not take and allocatable memory leaves out. Large PSRAM boards
+        // reserve 2 MiB (control plane) / 1 MiB (worker) so camera capture,
+        // JPEG encoding, API lists, and checkpoints always have headroom.
+        // K32_CMD:SYSRESERVE:<size> overrides.
+        size_t system_reserved = large_psram
+            ? (ident.is_control_plane ? 2u * 1024 * 1024 : 1024u * 1024)
+            : (ident.is_control_plane ? 192u * 1024 : 64u * 1024);
         {
             nvs_handle_t rh;
             uint32_t stored = 0;
@@ -1824,9 +2002,10 @@ void cluster_task(void* pv) {
     s_board = ident.board;
     const bool board_ready = s_board && s_board->init();
     const bool has_display = board_ready && ident.has_display;
-    // Node storage: the microSD card of the display board (its own SPI bus,
-    // FAT at /sd) when one is inserted, otherwise the internal flash
-    // "storage" partition (FAT with wear levelling at /data). One of the two.
+    const bool has_sd_slot = ident.board && ident.board->has_sd_card_slot();
+    // Node storage: the microSD card of boards wired with one (Cardputer SPI3,
+    // FAT at /sd) when inserted, otherwise the internal flash "storage"
+    // partition (FAT with wear levelling at /data). One of the two.
     {
         // K32_CMD:SDKHZ:<khz> sets the card's SPI clock (20 MHz unless set)
         nvs_handle_t h;
@@ -1836,7 +2015,7 @@ void cluster_task(void* pv) {
             nvs_close(h);
         }
         kube32::hal::sd_set_max_khz(sd_khz);
-        bool ok = kube32::hal::node_storage_mount(ident.has_display);
+        bool ok = kube32::hal::node_storage_mount(has_sd_slot);
         kube32::hal::NodeStorageInfo si = kube32::hal::node_storage_info();
         if (ok) {
             printf("[STORAGE] %s at %s: %llu KiB total, %llu KiB free; mount took %lld bytes internal RAM, %lld bytes PSRAM\n",
@@ -1892,7 +2071,7 @@ void cluster_task(void* pv) {
         } else {
             printf("[BLOBS] no flash region: no \"blobs\" partition and no second app slot that maps\n");
         }
-        kube32::storage::set_node_blob_stores(flash_blobs.get(), ident.has_display ? &card_blobs : nullptr);
+        kube32::storage::set_node_blob_stores(flash_blobs.get(), has_sd_slot ? &card_blobs : nullptr);
     }
     install_hardware_hooks(board_ready ? ident.board : nullptr);
     kube32::app::install_default_platform_hooks();   // event_emit through the channel layer
@@ -2044,6 +2223,7 @@ void cluster_task(void* pv) {
     s_api_token_set = valid_token(api_token);
     if (s_api_token_set) kubelet_cfg.api_token = api_token;
     kubelet_cfg.node_labels["kube32.io/board"] = ident.board ? ident.board->name() : "generic";
+    if (board_ready && ident.board) ident.board->extra_labels(kubelet_cfg.node_labels);
     // Devices answering on the board's I2C pins become node labels, and the
     // parts identified among them a node annotation for the Device controller
     static kube32::hal::I2cDiscovery discovery;
@@ -2288,6 +2468,7 @@ void cluster_task(void* pv) {
             [](kube32::api::HttpConnection& conn, std::string_view path) {
                 if (kube32::app::is_pod_checkpoint_path(path)) return kube32::app::serve_pod_checkpoint(conn, path, std::string());
                 if (kube32::app::is_node_blobs_path(path)) return kube32::app::serve_node_blobs(conn, path, std::string());
+                if (kube32::app::is_node_mosaico_path(path)) return kube32::app::serve_node_mosaico(conn, path, std::string());
                 if (!kube32::app::is_node_storage_path(path)) return false;
                 return kube32::app::serve_node_storage(conn, path, std::string(), 8u * 1024 * 1024);
             });
@@ -2297,7 +2478,8 @@ void cluster_task(void* pv) {
         static std::unique_ptr<kube32::api::FirmwareApi> firmware_api;
         // Checkpoint data (/apis/kube32.io/v1/.../checkpoints/<name>/data), in PSRAM
         static std::unique_ptr<kube32::api::CheckpointApi> checkpoint_api;
-        checkpoint_api = std::make_unique<kube32::api::CheckpointApi>(*store, api_server->route_handler(), 256 * 1024, node_proxy.get());
+        const size_t ck_budget = heap_caps_get_total_size(MALLOC_CAP_SPIRAM) >= 8u * 1024 * 1024 ? 1024u * 1024 : 256u * 1024;
+        checkpoint_api = std::make_unique<kube32::api::CheckpointApi>(*store, api_server->route_handler(), ck_budget, node_proxy.get());
         firmware_api = std::make_unique<kube32::api::FirmwareApi>(*s_firmware_slots, *store, api_server->route_handler(), checkpoint_api.get());
         s_firmware_api = firmware_api.get();
 
@@ -2441,21 +2623,23 @@ void cluster_task(void* pv) {
                 if (len == name.size() && std::memcmp(data, name.data(), len) == 0) k->request_sync();
             });
         printf("[WORKER] kubelet -> http://%s:6443\n", api_host.c_str());
-        if (has_display) {
-            // The boot screen stays product-neutral on purpose: what runs the
-            // board is not announced on the display, the apps draw their own UI.
-            constexpr uint16_t kBanner = 0x194B, kGreen = 0x07E0, kWhite = 0xFFFF, kCyan = 0x07FF, kDark = 0x10A2;
-            s_board->display_rect(0, 0, s_board->display_info().width, 18, kBanner);
-            s_board->display_text(6, 5, "ready", 5, kGreen, kBanner);
-            s_board->display_text(6, 28, ip.c_str(), ip.size(), kWhite, kDark);
-            std::string app_url = "http://" + api_host + "/";
-            s_board->display_text(6, 40, app_url.c_str(), app_url.size(), kCyan, kDark);
-        }
+    }
+    if (has_display) {
+        // The boot screen stays product-neutral on purpose: what runs the
+        // board is not announced on the display, the apps draw their own UI.
+        constexpr uint16_t kBanner = 0x194B, kGreen = 0x07E0, kWhite = 0xFFFF, kCyan = 0x07FF, kDark = 0x10A2;
+        const kube32::hal::DisplayInfo di = s_board->display_info();
+        s_board->display_rect(0, 0, di.width, di.height, kDark);
+        s_board->display_rect(0, 0, di.width, 18, kBanner);
+        s_board->display_text(6, 5, "ready", 5, kGreen, kBanner);
+        s_board->display_text(6, 28, ip.c_str(), ip.size(), kWhite, kDark);
+        std::string app_url = "http://" + (ident.is_control_plane ? ip : api_host) + "/";
+        s_board->display_text(6, 40, app_url.c_str(), app_url.size(), kCyan, kDark);
     }
     log_memory("cluster services up");
 
     // Console on a small task of its own
-    console.init(ident.has_display);   // USB-Serial-JTAG on the display board, UART0 (CH340) on the devkit
+    console.init(ident.board && ident.board->usb_only_console());   // USB only on boards sharing UART0 pins (Cardputer), else USB + UART0
     if (!ident.is_control_plane) s_forward_host = api_host;   // workers relay console HTTP to the control plane
     if (ingress) s_ingress_server = ingress->server();
     {
@@ -2477,7 +2661,7 @@ void cluster_task(void* pv) {
     // full (the host gets no backpressure), so the reader runs above the pod,
     // kubelet, HTTP and storage threads and drains a request from the gateway
     // as fast as it arrives. It blocks in reads nearly all the time.
-    xTaskCreatePinnedToCore(console_task, "k32_console", 4096, &console_ctx, 11, nullptr, 0);
+    xTaskCreatePinnedToCore(console_task, "k32_console", ident.has_psram ? 8192 : 4096, &console_ctx, 11, nullptr, 0);
 
     // A pod is ticked once per kube32.io/tick-interval (1 s by default); one
     // that returns >0 from k32_tick has background work left (incremental

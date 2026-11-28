@@ -684,6 +684,45 @@ K32_IMPORT("esp32_gpio_read")     int32_t esp32_gpio_read(uint32_t pin);        
  * K32_ERR_IO. */
 K32_IMPORT("esp32_chip_temp_read") int32_t esp32_chip_temp_read(int32_t* out_milli_c);
 
+/* ---- ESP-Mosaico Interaction Module, gated by hardware.kube32.io/interact --
+ * Reads the right-slot Interaction Module's AS312 PIR motion sensor, GL5506
+ * LDR ambient light sensor (filtered 0..100 + raw ADC), and 2 capacitive/GPIO
+ * buttons, controls its 6x WS2812 RGB LEDs (index 0..5, or K32_LED_ALL to
+ * fill all 6; safe brightness cap applied by the firmware), and transmits
+ * 38 kHz NEC infrared frames. Standard k32_led_set(0..5, rgb) also drives
+ * the 6 LEDs when granted hardware.kube32.io/led. */
+#define K32_LED_ALL 0xFFFFFFFFu
+typedef struct {
+    uint8_t left_pressed;
+    uint8_t right_pressed;
+    uint8_t motion_detected;
+    uint8_t light_level;      /* 0..100 filtered relative level */
+    int32_t light_raw;        /* raw ADC reading */
+    uint8_t led_count;        /* 6 on Interaction Module */
+    uint8_t button_mode;      /* 1 = GPIO, 2 = TOUCH */
+    uint16_t reserved;
+} k32_interact_inputs_t;
+K32_IMPORT("k32_interact_read")        int32_t k32_interact_read(k32_interact_inputs_t* out);
+K32_IMPORT("k32_interact_led_set")     int32_t k32_interact_led_set(uint32_t index, uint32_t rgb);
+K32_IMPORT("k32_interact_ir_send_nec") int32_t k32_interact_ir_send_nec(uint32_t address, uint32_t command);
+
+/* ---- ESP-Mosaico Camera Module, gated by hardware.kube32.io/camera --------
+ * Captures frames from the left-slot DVP Camera Module (OV3640 / SC101IOT).
+ * k32_camera_capture_jpeg captures a frame and hardware-JPEG-encodes it into
+ * buf (up to cap bytes, returning JPEG size or K32_ERR_TOOBIG); passing
+ * buf=0, cap=0 captures and returns the JPEG byte size without copying.
+ * k32_camera_preview (also requires hardware.kube32.io/tft-display) captures
+ * a frame and blits an RGB565 preview directly to the 480x480 AMOLED. */
+typedef struct {
+    uint32_t width;
+    uint32_t height;
+    uint32_t pixel_format;    /* V4L2 FOURCC */
+    uint32_t flags;           /* bit 0: present */
+} k32_camera_info_t;
+K32_IMPORT("k32_camera_info")         int32_t k32_camera_info(k32_camera_info_t* out);
+K32_IMPORT("k32_camera_capture_jpeg") int32_t k32_camera_capture_jpeg(void* buf, uint32_t cap, uint32_t quality);
+K32_IMPORT("k32_camera_preview")      int32_t k32_camera_preview(void);
+
 /* Existing low-level imports (see host_functions.cpp) remain available:
  * esp32_adc_read, esp32_uart_write, esp32_uart_read, esp32_get_time_us,
  * esp32_delay_ms, kube32_channel_open/send/recv/close. */

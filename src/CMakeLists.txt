@@ -70,6 +70,7 @@ set(KUBE32_APP_SRCS
     hal/tft_keyboard_hardware.cpp
     hal/board.cpp
     hal/board_kit.cpp
+    hal/mosaico_modules.cpp
     hal/es8311_audio.cpp
     hal/addressable_led.cpp
     hal/usb_otg_console.cpp
@@ -126,6 +127,7 @@ set(KUBE32_APP_SRCS
     app/egress_gateway.cpp
     app/node_storage_api.cpp
     app/node_blobs_api.cpp
+    app/node_mosaico_api.cpp
     app/pod_checkpoint_api.cpp
     app/console_relay.cpp
     app/improv_serial.cpp
@@ -144,7 +146,20 @@ set(KUBE32_APP_SRCS
 idf_build_get_property(kube32_target IDF_TARGET)
 set(KUBE32_BOARD_REQUIRES)
 if(kube32_target STREQUAL "esp32s31")
-    list(APPEND KUBE32_BOARD_REQUIRES esp-mosaico-bsp esp_lcd esp_driver_i2s espressif__esp_lcd_touch espressif__esp_codec_dev)
+    list(APPEND KUBE32_BOARD_REQUIRES
+        esp-mosaico-bsp
+        mosaico_module_mgr
+        mosaico_module_camera
+        mosaico_module_interact
+        mosaico_nand_storage
+        esp_driver_cam
+        esp_driver_jpeg
+        esp_driver_ppa
+        esp_lcd
+        esp_driver_i2s
+        espressif__esp_lcd_touch
+        espressif__esp_codec_dev
+    )
 endif()
 
 idf_component_register(
