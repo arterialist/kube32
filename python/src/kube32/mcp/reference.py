@@ -3,19 +3,22 @@ to writing a pod that uses a Device, and the explore-then-codify prompt."""
 from . import limits as lim
 
 INSTRUCTIONS = """\
-kube32 runs a Kubernetes-compatible cluster on ESP32-S3 microcontrollers. Parts wired to the boards \
-(sensors, scales, readers, switches) are Devices. A driver pod on the part's node operates each one, \
-started on demand. These tools discover and read Devices, send them actions within the limits their \
-owner declared, and deploy WebAssembly pods that the agent writes in C or Rust.
+kube32 runs a Kubernetes-compatible cluster on ESP32-S3 microcontrollers and host simulator nodes. \
+Parts wired to the boards (sensors, scales, readers, switches) are Devices, and user workloads run as \
+WebAssembly Pods exposed by Services and Ingresses. These tools discover and read Devices, inspect \
+workloads and pod logs, call HTTP Services/Pods (including any declarative tools advertised via \
+kube32.io/mcp-tools on a Service), send actions within declared limits, and deploy WebAssembly pods.
 
-Work in two steps. Explore: list_devices, describe_device (the Device's reference: what it reads, its \
-actions, its owner's notes and limits), then read_device with samples to learn how the part behaves. \
-Codify: write a pod that does the task deterministically, deploy it with deploy_code bound to the \
-Device, and check its output with workload_status. The resource kube32://guides/device-pod shows how \
-to write such a pod; the prompt explore-then-codify walks through the steps.
+Work in two steps for Devices. Explore: list_devices, describe_device (the Device's reference: what it \
+reads, its actions, its owner's notes and limits), then read_device with samples to learn how the part \
+behaves. Codify: write a pod that does the task deterministically, deploy it with deploy_code bound to \
+the Device, and check its output with workload_status or pod_logs. For application workloads, use \
+list_workloads to discover Pods, Services and Ingresses, call_service to invoke HTTP endpoints, and \
+pod_logs or workload_status to inspect runtime logs.
 
-Readings are values of the physical world: report them with their units. write_device moves real \
-hardware: send an action only when the user asked for it."""
+Readings are values of the physical world: report them with their units. write_device and non-GET \
+call_service calls affect live hardware or workloads: require --allow-writes and send only what the \
+user asked for."""
 
 GUIDE_URI = "kube32://guides/device-pod"
 ABI_URI = "kube32://sdk/k32_app_abi.h"

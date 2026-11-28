@@ -165,6 +165,23 @@ class TestProtocol(unittest.TestCase):
             self.assertEqual(post({"jsonrpc": "2.0", "id": 1, "method": "ping"}, {"Origin": "http://evil.example"})[0], 403)
             self.assertEqual(post({"jsonrpc": "2.0", "id": 1, "method": "ping"}, {"Origin": "http://localhost:3000"})[0], 200)
             self.assertEqual(post({"jsonrpc": "2.0", "id": 1, "method": "ping"}, path=url[:-4] + "/other")[0], 404)
+            # CORS preflight (no auth required on OPTIONS) and chunked POST body
+            req = urllib.request.Request(url, headers={"Origin": "http://localhost:3000"}, method="OPTIONS")
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                self.assertEqual(resp.status, 204)
+                self.assertEqual(resp.headers.get("Access-Control-Allow-Origin"), "http://localhost:3000")
+            import http.client
+            conn = http.client.HTTPConnection("127.0.0.1", httpd.server_address[1], timeout=10)
+            payload = json.dumps({"jsonrpc": "2.0", "id": 7, "method": "tools/call",
+                                  "params": {"name": "echo", "arguments": {"text": "chunked", "n": None}}}).encode()
+            chunked = ("%x\r\n" % len(payload)).encode() + payload + b"\r\n0\r\n\r\n"
+            conn.request("POST", "/mcp", body=chunked, headers={
+                "Content-Type": "application/json", "Authorization": "Bearer s3cret", "Transfer-Encoding": "chunked"})
+            resp = conn.getresponse()
+            self.assertEqual(resp.status, 200)
+            parsed = json.loads(resp.read().decode())
+            self.assertEqual(json.loads(parsed["result"]["content"][0]["text"]), {"said": "chunked"})
+            conn.close()
         finally:
             httpd.shutdown()
             httpd.server_close()
@@ -705,6 +722,85 @@ class TestTools(unittest.TestCase):
         self.assertFalse([k for k in self.state()["objects"] if "echo-d" in k])
         err, out = s.call("workload_status", name="echo-d")
         self.assertIn("no pod or Deployment echo-d", out)
+
+    def test_workloads_call_service_and_service_mcp_tools(self):
+        # Add a node with custom kubeletEndpoint.Port (like macOS --pod-port 17001), a Pod whose
+        # containerPort is 7000, and a Service declaring kube32.io/mcp-tools.
+        st = self.state()
+        port = self.driver.port
+        self.driver.readings["default/demo-svc"] = {"ok": True}
+        st["objects"]["/api/v1/nodes/host-1"] = {
+            "metadata": {"name": "host-1", "labels": {"kube32.io/board": "macos"}},
+            "status": {"conditions": [{"type": "Ready", "status": "True"}],
+                       "daemonEndpoints": {"kubeletEndpoint": {"Port": port}},
+                       "allocatable": {"memory": "256Ki"}},
+        }
+        st["objects"][POD + "demo-app"] = {
+            "apiVersion": "v1", "kind": "Pod",
+            "metadata": {"name": "demo-app", "namespace": "default", "labels": {"app": "demo"},
+                         "annotations": {"kube32.io/event-topics": "demo.a,demo.b"}},
+            "spec": {"nodeName": "host-1", "containers": [{"name": "app", "ports": [{"name": "http", "containerPort": 7000}]}]},
+            "status": {"phase": "Running", "podIP": "127.0.0.1", "containerStatuses": [{"restartCount": 0, "state": {"running": {}}}]},
+        }
+        st["logs"]["demo-app"] = "demo-app: line1\ndemo-app: line2"
+        declared = [
+            {"name": "demo_read", "title": "Read demo", "description": "Reads demo state", "method": "GET", "path": "/describe",
+             "properties": {"filter": {"type": "string"}}, "required": []},
+            {"name": "demo_act", "title": "Act demo", "description": "Sends action", "method": "POST", "path": "/act",
+             "properties": {"value": {"type": "integer"}}, "required": ["value"]},
+        ]
+        st["objects"]["/api/v1/namespaces/default/services/demo-svc"] = {
+            "apiVersion": "v1", "kind": "Service",
+            "metadata": {"name": "demo-svc", "namespace": "default",
+                         "annotations": {"kube32.io/notes": "Demo HTTP service", "kube32.io/mcp-tools": json.dumps(declared)}},
+            "spec": {"selector": {"app": "demo"}, "ports": [{"port": 80, "targetPort": "http"}]},
+        }
+        with open(self.state_path, "w") as f:
+            json.dump(st, f)
+
+        # Read-only server: list_workloads, pod_logs, GET call_service, GET declarative tool work; POST refused
+        s_ro = self.server()
+        tool_names = [t["name"] for t in s_ro.request("tools/list", {})["result"]["tools"]]
+        for expected in ("list_workloads", "call_service", "pod_logs", "demo_read", "demo_act"):
+            self.assertIn(expected, tool_names)
+        err, wl = s_ro.call("list_workloads")
+        self.assertFalse(err, wl)
+        demo_pod = next(p for p in wl["pods"] if p["pod"] == "demo-app")
+        self.assertEqual(demo_pod["pod_port"], port)
+        self.assertEqual(demo_pod["event_topics"], ["demo.a", "demo.b"])
+        demo_svc = next(x for x in wl["services"] if x["name"] == "demo-svc")
+        self.assertEqual(demo_svc["pods"], ["demo-app"])
+        self.assertEqual(demo_svc["mcp_tools"], ["demo_read", "demo_act"])
+
+        err, logs = s_ro.call("pod_logs", name="demo-app", tail_lines=10)
+        self.assertFalse(err, logs)
+        self.assertEqual(logs["log"], "demo-app: line1\ndemo-app: line2")
+
+        err, res = s_ro.call("call_service", service="demo-svc", path="/describe")
+        self.assertFalse(err, res)
+        self.assertEqual(res["pod"], "demo-app")
+        self.assertEqual(res["status"], 200)
+
+        err, res = s_ro.call("demo_read")
+        self.assertFalse(err, res)
+        self.assertIn("readings", res)
+
+        err, out = s_ro.call("call_service", service="demo-svc", method="POST", path="/act", body={"value": 42})
+        self.assertTrue(err)
+        self.assertIn("writes are off", out)
+        err, out = s_ro.call("demo_act", value=42)
+        self.assertTrue(err)
+        self.assertIn("writes are off", out)
+
+        # With --allow-writes: POST call_service and POST declarative tool succeed
+        s_rw = self.server("--allow-writes")
+        err, res = s_rw.call("call_service", service="demo-svc", method="POST", path="/act", body={"value": 7})
+        self.assertFalse(err, res)
+        self.assertEqual(res["response"]["ok"], True)
+        err, res = s_rw.call("demo_act", value=99)
+        self.assertFalse(err, res)
+        self.assertEqual(res["ok"], True)
+        self.assertIn(("default/demo-app", {"value": 99}), self.driver.posts)
 
     @unittest.skipUnless(have_c_toolchain(), "clang with the wasm32 target and a wasm linker are needed")
     def test_deploy_c_source(self):

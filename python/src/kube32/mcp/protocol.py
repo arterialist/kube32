@@ -55,12 +55,14 @@ def check_arguments(tool, args):
     if not isinstance(args, dict):
         return "arguments must be an object"
     for key in tool.required:
-        if key not in args:
+        if key not in args or args[key] is None:
             return "missing argument '%s'" % key
     for key, value in args.items():
         schema = tool.properties.get(key)
         if schema is None:
             return "unknown argument '%s' (the tool takes %s)" % (key, ", ".join(sorted(tool.properties)) or "none")
+        if value is None and key not in tool.required:
+            continue
         types = schema.get("type")
         types = types if isinstance(types, list) else [types]
         ok = any(isinstance(value, _JSON_TYPES[t]) and not (t in ("integer", "number") and isinstance(value, bool))
@@ -97,17 +99,33 @@ class Server:
     prompts maps a name to (definition, fn(arguments) -> {description, messages})."""
 
     def __init__(self, name, version, instructions, tools, resources=None, resource_templates=(), read_resource=None,
-                 prompts=None, log=None):
+                 prompts=None, log=None, extra_tools=None):
         self.name = name
         self.version = version
         self.instructions = instructions
         self.tools = {t.name: t for t in tools}
+        self.extra_tools = extra_tools
         self.resources = resources or (lambda: [])
         self.resource_templates = list(resource_templates)
         self.read_resource = read_resource
         self.prompts = prompts or {}
         self.log = log or (lambda text: print(text, file=sys.stderr, flush=True))
         self.client = None
+
+    def all_tools(self, refresh=False):
+        merged = dict(self.tools)
+        if self.extra_tools is not None:
+            try:
+                try:
+                    extras = self.extra_tools(refresh=refresh)
+                except TypeError:
+                    extras = self.extra_tools()
+                for t in extras:
+                    if t.name not in merged:
+                        merged[t.name] = t
+            except Exception as e:  # noqa: BLE001 - dynamic service discovery must not break built-in tools
+                self.log("kube32 mcp: extra_tools failed: %s" % e)
+        return merged
 
     # -- messages --------------------------------------------------------------
     def handle_message(self, msg, notify=None):
@@ -148,7 +166,7 @@ class Server:
         if method == "ping":
             return {}
         if method == "tools/list":
-            return {"tools": [t.definition for t in self.tools.values()]}
+            return {"tools": [t.definition for t in self.all_tools(refresh=True).values()]}
         if method == "tools/call":
             return self.call_tool(params, notify)
         if method == "resources/list":
@@ -183,16 +201,23 @@ class Server:
         raise RpcError(METHOD_NOT_FOUND, "no method %s" % method)
 
     def call_tool(self, params, notify):
-        tool = self.tools.get(params.get("name"))
+        name = params.get("name")
+        available = self.all_tools(refresh=False)
+        tool = available.get(name)
+        if tool is None and self.extra_tools is not None:
+            available = self.all_tools(refresh=True)
+            tool = available.get(name)
         if tool is None:
-            raise RpcError(INVALID_PARAMS, "no tool %s (tools: %s)" % (params.get("name"), ", ".join(self.tools)))
-        args = params.get("arguments") or {}
+            raise RpcError(INVALID_PARAMS, "no tool %s (tools: %s)" % (name, ", ".join(available)))
+        raw_args = params.get("arguments")
+        args = {} if raw_args is None else raw_args
         why = check_arguments(tool, args)
         if why:
             return tool_result("%s: %s" % (tool.name, why), error=True)
+        cleaned = {k: v for k, v in args.items() if v is not None}
         token = (params.get("_meta") or {}).get("progressToken")
         try:
-            out = tool.fn(args, Context(notify, token))
+            out = tool.fn(cleaned, Context(notify, token))
         except ToolError as e:
             return tool_result(str(e), error=True)
         return tool_result(out)
@@ -265,35 +290,73 @@ def make_http_server(server, host, port, path="/mcp", token=None):
         def log_message(self, fmt, *args):
             server.log("kube32 mcp: %s %s" % (self.address_string(), fmt % args))
 
+        def cors_headers(self):
+            origin = self.headers.get("Origin")
+            if origin and origin_allowed(origin, host):
+                return [
+                    ("Access-Control-Allow-Origin", origin),
+                    ("Vary", "Origin"),
+                    ("Access-Control-Allow-Methods", "POST, OPTIONS"),
+                    ("Access-Control-Allow-Headers", "Content-Type, Authorization, Accept, Mcp-Session-Id"),
+                ]
+            return []
+
         def reply(self, code, body=None, headers=()):
             data = b"" if body is None else json.dumps(body, ensure_ascii=False).encode("utf-8")
             self.send_response(code)
             if body is not None:
                 self.send_header("Content-Type", "application/json")
-            for k, v in headers:
+            for k, v in list(self.cors_headers()) + list(headers):
                 self.send_header(k, v)
             self.send_header("Content-Length", str(len(data)))
             self.end_headers()
             self.wfile.write(data)
 
-        def refused(self):
+        def read_body(self):
+            te = (self.headers.get("Transfer-Encoding") or "").lower()
+            if "chunked" in te:
+                chunks = []
+                while True:
+                    line = self.rfile.readline()
+                    if not line:
+                        break
+                    size_str = line.split(b";", 1)[0].strip()
+                    if not size_str:
+                        break
+                    size = int(size_str, 16)
+                    if size == 0:
+                        while True:
+                            trailer = self.rfile.readline()
+                            if not trailer or trailer in (b"\r\n", b"\n"):
+                                break
+                        break
+                    chunks.append(self.rfile.read(size))
+                    self.rfile.readline()
+                return b"".join(chunks)
+            length = int(self.headers.get("Content-Length", "0"))
+            return self.rfile.read(length) if length > 0 else b""
+
+        def refused(self, require_auth=True):
             if urlsplit(self.path).path != path:
                 self.reply(404, {"error": "the MCP endpoint is %s" % path})
                 return True
             if not origin_allowed(self.headers.get("Origin"), host):
                 self.reply(403, {"error": "origin %s is not allowed" % self.headers.get("Origin")})
                 return True
-            if token and self.headers.get("Authorization", "") != "Bearer " + token:
+            if require_auth and token and self.headers.get("Authorization", "") != "Bearer " + token:
                 self.reply(401, {"error": "this server needs Authorization: Bearer <token>"}, [("WWW-Authenticate", "Bearer")])
                 return True
             return False
+
+        def do_OPTIONS(self):
+            if not self.refused(require_auth=False):
+                self.reply(204)
 
         def do_POST(self):
             if self.refused():
                 return
             try:
-                length = int(self.headers.get("Content-Length", "0"))
-                msg = json.loads(self.rfile.read(length).decode("utf-8"))
+                msg = json.loads(self.read_body().decode("utf-8"))
             except ValueError as e:
                 self.reply(400, error_response(None, PARSE_ERROR, "not JSON: %s" % e))
                 return

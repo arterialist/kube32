@@ -4,6 +4,9 @@
 #include "hal/capability_firewall.hpp"
 #include "hal/chip_temp.hpp"
 #include "hal/linux_board.hpp"
+#if defined(__APPLE__)
+#include "hal/mac_audio.hpp"
+#endif
 #include "hal/mock_hal.hpp"
 #include "hal/pod_buses.hpp"
 #include "hal/node_storage.hpp"
@@ -313,6 +316,8 @@ struct SimOptions {
     std::string sim_i2c;                   // simulated I2C parts on this process's bus 0 (MockHal::attach_parts)
     std::string sim_mic;                   // 16 kHz mono 16-bit PCM (raw or WAV) the microphone hears, looped
     std::string sim_devices;               // on-board devices the nodes offer, served by stand-ins (models::parse_devices)
+    bool mac_audio{false};                 // --mac-audio: real macOS CoreAudio speaker output + hardware.kube32.io/speaker
+    bool no_mac_audio{false};              // --no-mac-audio: disable automatic macOS CoreAudio speaker for --board macos
     // A Linux board's devices over the --board preset (Linux hosts); "none" leaves one out
     std::optional<std::string> fb, keyboard_dev, keymap, backlight, thermal, screen_owner, audio_card, ir_rx, ir_tx;
     std::vector<std::pair<uint8_t, std::string>> i2c_buses;   // --i2c-bus <n>=<device|none>
@@ -367,6 +372,11 @@ static void print_sim_usage(std::ostream& out) {
            "  --sim-devices <list>        on-board devices this process's nodes offer pods, served by stand-ins,\n"
            "                              e.g. tft-display,keyboard (tft-display, keyboard, touch, speaker,\n"
            "                              microphone, led; default none)\n"
+           "\n"
+           "macOS host audio:\n"
+           "  --mac-audio                 use the Mac's real CoreAudio speaker for k32_tone/k32_audio_play and\n"
+           "                              advertise hardware.kube32.io/speaker (auto-enabled with --board macos)\n"
+           "  --no-mac-audio              keep the speaker disabled even with --board macos\n"
            "\n"
            "Linux boards (the process's nodes use the board's own devices; a value of none leaves one out):\n"
            "  --board cardputer-zero      the M5Stack Cardputer Zero's screen, keyboard, I2C bus, temperature,\n"
@@ -455,6 +465,8 @@ static SimOptions parse_sim_args(int argc, char* argv[]) {
         else if (arg == "--sim-i2c" && i + 1 < argc) opts.sim_i2c = argv[++i];
         else if (arg == "--sim-mic" && i + 1 < argc) opts.sim_mic = argv[++i];
         else if (arg == "--sim-devices" && i + 1 < argc) opts.sim_devices = argv[++i];
+        else if (arg == "--mac-audio") { opts.mac_audio = true; opts.no_mac_audio = false; }
+        else if (arg == "--no-mac-audio") { opts.no_mac_audio = true; opts.mac_audio = false; }
         else if (arg == "--fb" && i + 1 < argc) opts.fb = argv[++i];
         else if (arg == "--keyboard-dev" && i + 1 < argc) opts.keyboard_dev = argv[++i];
         else if (arg == "--backlight" && i + 1 < argc) opts.backlight = argv[++i];
@@ -643,6 +655,63 @@ static void release_linux_board() {
     if (s_linux_board) s_linux_board->close();
 }
 
+#if defined(__APPLE__)
+static kube32::hal::MacAudio* s_mac_audio = nullptr;
+
+static bool install_mac_audio(const SimOptions& opts) {
+    const bool want = opts.mac_audio || (opts.board == "macos" && !opts.no_mac_audio);
+    if (!want) return false;
+    if (opts.role == "control-plane") {
+        std::cout << "[AUDIO] macOS speaker: control-plane role runs no kubelet (use --role standalone or --role worker)" << std::endl;
+        return false;
+    }
+    auto* audio = new kube32::hal::MacAudio();
+    std::string why;
+    if (!audio->open(why)) {
+        std::cerr << "[AUDIO] macOS CoreAudio speaker unavailable: " << why << std::endl;
+        delete audio;
+        return false;
+    }
+    s_mac_audio = audio;
+
+    kube32::runtime::AppPlatformHooks hooks = kube32::runtime::app_platform_hooks();
+    hooks.tone = [audio](uint32_t freq, uint32_t ms, uint32_t vol) -> int32_t {
+        return audio->tone(freq, ms, vol);
+    };
+    hooks.audio_play = [audio](const int16_t* samples, uint32_t count, uint32_t rate, uint32_t vol) -> int32_t {
+        return audio->play(samples, count, rate, vol);
+    };
+    kube32::runtime::set_app_platform_hooks(hooks);
+
+    kube32::hal::BoardProfile profile = kube32::hal::CapabilityFirewall::instance().board_profile();
+    profile.onboard_devices |= kube32::hal::KUBE32_CAP_SPEAKER;
+    kube32::hal::CapabilityFirewall::instance().set_board_profile(profile);
+
+    std::cout << "[AUDIO] macOS CoreAudio speaker active (48 kHz polyphonic AudioQueue; hardware.kube32.io/speaker advertised)" << std::endl;
+    return true;
+}
+
+static void release_mac_audio() {
+    if (s_mac_audio) {
+        s_mac_audio->close();
+        delete s_mac_audio;
+        s_mac_audio = nullptr;
+    }
+}
+#else
+static bool install_mac_audio(const SimOptions& opts) {
+    if (opts.mac_audio) {
+        std::cerr << "kube32-sim: --mac-audio needs a macOS host" << std::endl;
+        std::exit(2);
+    }
+    if (opts.board == "macos") {
+        std::cout << "[AUDIO] --board macos has macOS CoreAudio speaker; on this host its speaker is not enabled" << std::endl;
+    }
+    return false;
+}
+static void release_mac_audio() {}
+#endif
+
 int main(int argc, char* argv[]) {
     std::signal(SIGINT, signal_handler);
     std::signal(SIGTERM, signal_handler);
@@ -733,7 +802,27 @@ int main(int argc, char* argv[]) {
             };
             kube32::runtime::set_app_platform_hooks(hooks);
         }
+        if (devices & kube32::hal::KUBE32_CAP_SPEAKER) {
+            kube32::runtime::AppPlatformHooks hooks = kube32::runtime::app_platform_hooks();
+            if (!hooks.audio_play) {
+                hooks.audio_play = [](const int16_t*, uint32_t count, uint32_t rate, uint32_t vol) -> int32_t {
+                    if (rate < 8000 || rate > 48000) return kube32::hal::HAL_ERR_INVAL;
+                    if (count > rate) count = rate;
+                    std::printf("[AUDIO] %u samples @ %u Hz (%u%%)\n", static_cast<unsigned>(count),
+                                static_cast<unsigned>(rate), static_cast<unsigned>(vol));
+                    std::fflush(stdout);
+                    return static_cast<int32_t>(count);
+                };
+                kube32::runtime::set_app_platform_hooks(hooks);
+            }
+        }
         std::cout << "[SIM] devices offered: " << kube32::models::devices_text(profile.onboard_devices) << std::endl;
+    }
+    const bool mac_audio_active = install_mac_audio(opts);
+    if (mac_audio_active && opts.role == "standalone") {
+        if (!opts.workers_set) opts.workers.clear();
+        else if (!opts.workers.empty())
+            std::cout << "[AUDIO] in-process workers share the Mac speaker with " << opts.kubelet_name << std::endl;
     }
 
     // Local image registry from the embedded table
@@ -1037,6 +1126,7 @@ int main(int argc, char* argv[]) {
             std::cout << "[LEAVE] deleted Node " << opts.node_name << ": HTTP " << node_st << std::endl;
         }
         release_linux_board();
+        release_mac_audio();
         kube32::ipc::ChannelManager::instance().shutdown();
         kube32::osal::Socket::cleanup_networking();
         return 0;
@@ -1400,6 +1490,7 @@ int main(int argc, char* argv[]) {
     if (local_kubelet) local_kubelet->stop();
     for (auto& k : worker_kubelets) k->stop();
     release_linux_board();
+    release_mac_audio();
     mdns->stop_service_announcement();
     server->stop();
     checkpoints.stop();

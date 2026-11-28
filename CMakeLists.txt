@@ -221,6 +221,9 @@ else()
         list(APPEND KUBE32_LINUX_AUDIO_SRCS src/hal/linux/linux_audio_alsa.cpp)
     endif()
     list(APPEND KUBE32_CORE_SRCS ${KUBE32_LINUX_AUDIO_SRCS})
+    if(APPLE)
+        list(APPEND KUBE32_CORE_SRCS src/hal/mac_audio.cpp)
+    endif()
 
     # Embedded images (images/*.wasm) and static bundles (images/web/<bundle>/)
     # are turned into a generated source so the host simulator serves the same
@@ -267,6 +270,9 @@ else()
     )
     target_include_directories(kube32_core PRIVATE ${CMAKE_BINARY_DIR}/generated)
     target_link_libraries(kube32_core PUBLIC wasm3 pthread)
+    if(APPLE)
+        target_link_libraries(kube32_core PUBLIC "-framework AudioToolbox")
+    endif()
 
     # TLS on the simulator's API port (--tls): OpenSSL when the host has it
     # (Homebrew keeps it outside the default search path)

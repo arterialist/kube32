@@ -7,14 +7,17 @@ import argparse
 import base64
 import contextlib
 import hashlib
+import http.client
 import io
 import json
 import os
 import re
 import shutil
 import time
+import urllib.error
+import urllib.request
 from datetime import datetime, timezone
-from urllib.parse import quote
+from urllib.parse import quote, urlencode
 
 from .. import releases
 from ..build import cmd_build
@@ -29,12 +32,15 @@ from .protocol import Tool, ToolError
 DEVICES = "/apis/kube32.io/v1/devices"
 MANAGED_BY = "app.kubernetes.io/managed-by"
 MANAGER = "kube32-mcp"
+MCP_TOOLS_ANNOTATION = "kube32.io/mcp-tools"
+_TOOL_NAME_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_-]{0,63}$")
 # What deploy_code grants a pod: events and Service calls. Hardware stays with the drivers.
 DEPLOY_HARDWARE = ("ipc", "service-call")
 NO_READING_YET = "no reading yet"
 MAX_SAMPLE_SECONDS = 300
 ACTIVATION_TIMEOUT = 20.0
 DRIVER_TIMEOUT = 3.0
+SERVICE_TIMEOUT = 8.0
 
 
 def _now_iso():
@@ -50,13 +56,16 @@ class Kube32:
     """One cluster, reached through kubectl with `kube` (argparse namespace of kubectl, kubeconfig,
     context and server). Writes and deploys need the server's opt-in."""
 
-    def __init__(self, kube, namespace="default", allow_writes=False, allow_deploy=False, log=None):
+    def __init__(self, kube, namespace="default", allow_writes=False, allow_deploy=False, log=None, ingress_url=None):
         self.kube = kube
         self.namespace = namespace
         self.allow_writes = allow_writes
         self.allow_deploy = allow_deploy
         self.log = log or (lambda text: None)
+        self.ingress_url = (ingress_url or "").strip().rstrip("/") or None
         self.last_action_at = {}      # (namespace, device) -> {action: time.time() of the last one sent}
+        self._svc_tools_cache = (0.0, [])
+        self._endpoint_cache = {}     # (ns, ref) -> (ts, ns, pod_name, ip, port, node_name, svc_name, is_local)
 
     # -- API ------------------------------------------------------------------
     def api(self, verb, path, body=None):
@@ -389,6 +398,419 @@ class Kube32:
             pods.append(entry)
         out["pods"] = pods
         return out
+
+    def read_pod_logs(self, args, ctx):
+        name = args["name"]
+        tail = args.get("tail_lines", 50)
+        if not 1 <= tail <= 500:
+            raise ToolError("tail_lines is 1 to 500")
+        previous = bool(args.get("previous", False))
+        # Fast path: single `kubectl logs` call for a Pod (avoids extra API roundtrips)
+        base = kubectl_base(self.kube)
+        missing = kubectl_missing(base)
+        if missing:
+            raise ToolError(missing)
+        cmd = base + ["logs", name, "-n", self.namespace, "--tail=%d" % tail] + (["--previous"] if previous else [])
+        rc, out, _ = kubectl(cmd)
+        if rc == 0:
+            return {
+                "pod": name,
+                "namespace": self.namespace,
+                "tail_lines": tail,
+                "previous": previous,
+                "log": out.rstrip("\n"),
+            }
+        # Fallback: Deployment name or pod error lookup
+        kind, obj = self.workload(name)
+        if kind is None:
+            raise ToolError("no pod or Deployment %s in namespace %s" % (name, self.namespace))
+        pods = self.pods_of(kind, obj)
+        if not pods:
+            raise ToolError("%s %s has no pods in namespace %s" % (kind, name, self.namespace))
+        pod = pods[0]
+        pod_name = pod["metadata"]["name"]
+        return {
+            "pod": pod_name,
+            "namespace": self.namespace,
+            "node": (pod.get("spec") or {}).get("nodeName") or "not scheduled",
+            "phase": (pod.get("status") or {}).get("phase", "Pending"),
+            "tail_lines": tail,
+            "previous": previous,
+            "log": self.pod_logs(pod_name, tail, previous),
+        }
+
+    # -- Services & Workloads --------------------------------------------------
+    def _node_map(self):
+        nodes = (self.get("/api/v1/nodes") or {}).get("items", [])
+        return {n["metadata"]["name"]: n for n in nodes if (n.get("metadata") or {}).get("name")}
+
+    def _node_pod_port(self, node_obj):
+        if not node_obj:
+            return 0
+        st = node_obj.get("status") or {}
+        port = ((st.get("daemonEndpoints") or {}).get("kubeletEndpoint") or {}).get("Port", 0)
+        return int(port) if isinstance(port, int) and 0 < port <= 65535 else 0
+
+    def _pod_endpoint(self, pod, nodes=None):
+        """(ip, port, node_obj) for a Pod, preferring Node kubeletEndpoint.Port over containerPort."""
+        st = pod.get("status") or {}
+        spec = pod.get("spec") or {}
+        node_name = spec.get("nodeName") or ""
+        node_obj = (nodes or {}).get(node_name)
+        ip = st.get("podIP") or ""
+        if not ip and node_obj:
+            for addr in (node_obj.get("status") or {}).get("addresses") or []:
+                if addr.get("type") == "InternalIP" and addr.get("address"):
+                    ip = addr["address"]
+                    break
+        port = self._node_pod_port(node_obj)
+        if not port:
+            for c in spec.get("containers") or []:
+                for p in c.get("ports") or []:
+                    if p.get("name") == "http" and p.get("containerPort"):
+                        port = int(p["containerPort"])
+                        break
+                if port:
+                    break
+        if not port:
+            for c in spec.get("containers") or []:
+                for p in c.get("ports") or []:
+                    if p.get("containerPort"):
+                        port = int(p["containerPort"])
+                        break
+                if port:
+                    break
+        return ip, (port or 7000), node_obj
+
+    def _parse_ref(self, ref, default_ns=None):
+        ns, sep, name = str(ref or "").rpartition("/")
+        return (ns if sep else (default_ns or self.namespace)), name
+
+    def _resolve_service_pod(self, ref, default_ns=None):
+        """Resolve a Service or Pod reference to (namespace, pod_obj, service_name_or_None)."""
+        ns, name = self._parse_ref(ref, default_ns)
+        if not name:
+            raise ToolError("service name must not be empty")
+        svc = self.get("/api/v1/namespaces/%s/services/%s" % (ns, name))
+        if svc is not None:
+            selector = (svc.get("spec") or {}).get("selector") or {}
+            if selector:
+                sel = ",".join("%s=%s" % kv for kv in sorted(selector.items()))
+                pods = (self.get("/api/v1/namespaces/%s/pods?labelSelector=%s" % (ns, quote(sel, safe=""))) or {}).get("items", [])
+                running = [p for p in pods if (p.get("status") or {}).get("phase") == "Running"]
+                chosen = next((p for p in running if (p.get("status") or {}).get("podIP")), None) or (running[0] if running else (pods[0] if pods else None))
+                if chosen is not None:
+                    return ns, chosen, name
+            # Service exists but selector matched nothing (or selector empty); try same-named pod
+            pod = self.get("/api/v1/namespaces/%s/pods/%s" % (ns, name))
+            if pod is not None:
+                return ns, pod, name
+            raise ToolError("Service %s/%s has no running backend pods" % (ns, name))
+        pod = self.get("/api/v1/namespaces/%s/pods/%s" % (ns, name))
+        if pod is not None:
+            return ns, pod, None
+        raise ToolError("no Service or Pod %s in namespace %s (list_workloads lists them)" % (name, ns))
+
+    def _ingress_prefix(self, ns, service_name):
+        if not self.ingress_url or not service_name:
+            return None
+        ings = (self.get("/apis/networking.k8s.io/v1/namespaces/%s/ingresses" % ns) or {}).get("items", [])
+        matches = []
+        for ing in ings:
+            for rule in (ing.get("spec") or {}).get("rules") or []:
+                for p in ((rule.get("http") or {}).get("paths") or []):
+                    backend = ((p.get("backend") or {}).get("service") or {}).get("name")
+                    if backend == service_name and p.get("path"):
+                        matches.append(p["path"].rstrip("/"))
+        if not matches:
+            return None
+        matches.sort(key=len, reverse=True)
+        return matches[0]
+
+    def _raw_http_json(self, url, method, headers, body_bytes, timeout):
+        req = urllib.request.Request(url, data=body_bytes, headers=headers, method=method)
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                status = resp.status
+                raw = resp.read().decode("utf-8", "replace")
+        except urllib.error.HTTPError as e:
+            status = e.code
+            raw = e.read().decode("utf-8", "replace")
+        except http.client.HTTPException as e:
+            raise OSError("%s: %s" % (type(e).__name__, e))
+        try:
+            parsed = json.loads(raw) if raw.strip() else {}
+        except ValueError:
+            parsed = {"text": raw}
+        return status, parsed
+
+    def _resolve_endpoint_cached(self, ref, default_ns=None, force=False):
+        cache_key = (default_ns or self.namespace, str(ref or ""))
+        now = time.time()
+        entry = self._endpoint_cache.get(cache_key)
+        if not force and entry and (now - entry[0]) < 15.0:
+            return entry[1:]
+        ns, pod, svc_name = self._resolve_service_pod(ref, default_ns=default_ns)
+        nodes = self._node_map()
+        ip, port, node_obj = self._pod_endpoint(pod, nodes)
+        pod_name = pod["metadata"]["name"]
+        node_name = (pod.get("spec") or {}).get("nodeName") or "?"
+        labels = ((node_obj or {}).get("metadata") or {}).get("labels") or {}
+        is_local = labels.get("kube32.io/board") == "macos" or labels.get("kube32.io/simulator") == "true"
+        resolved = (ns, pod_name, ip, port, node_name, svc_name, is_local)
+        if ip:
+            self._endpoint_cache[cache_key] = (now,) + resolved
+        return resolved
+
+    def _http_service_call(self, ref, method="GET", path="/", query=None, body=None, timeout=SERVICE_TIMEOUT, default_ns=None):
+        method = str(method or "GET").upper()
+        if method not in ("GET", "POST", "PUT", "DELETE"):
+            raise ToolError("method must be GET, POST, PUT or DELETE")
+        if method != "GET":
+            self.require("writes")
+        req_path = "/" + str(path or "/").lstrip("/")
+        if query:
+            pairs = []
+            for k, v in query.items():
+                if v is None:
+                    continue
+                if isinstance(v, bool):
+                    pairs.append((k, "true" if v else "false"))
+                elif isinstance(v, list):
+                    pairs.append((k, ",".join(str(x) for x in v)))
+                else:
+                    pairs.append((k, str(v)))
+            if pairs:
+                sep = "&" if "?" in req_path else "?"
+                req_path = req_path + sep + urlencode(pairs)
+        body_bytes = None
+        if body is not None:
+            body_bytes = json.dumps(body, ensure_ascii=False).encode("utf-8")
+
+        last_err = None
+        status, parsed, used_url = 0, None, None
+        ns = pod_name = node_name = svc_name = ""
+        for attempt_idx in range(2):
+            ns, pod_name, ip, port, node_name, svc_name, is_local = self._resolve_endpoint_cached(
+                ref, default_ns=default_ns, force=(attempt_idx > 0))
+            headers = {"X-Kube32-Pod": "%s/%s" % (ns, pod_name), "Accept": "application/json"}
+            if body_bytes is not None:
+                headers["Content-Type"] = "application/json"
+
+            candidates = []
+            if ip:
+                candidates.append(("http://%s:%d%s" % (ip, port, req_path), headers))
+            if ip != "127.0.0.1" and is_local:
+                candidates.append(("http://127.0.0.1:%d%s" % (port, req_path), headers))
+
+            for url, hdrs in candidates:
+                try:
+                    status, parsed = self._raw_http_json(url, method, hdrs, body_bytes, timeout)
+                    used_url = url
+                    break
+                except OSError as e:
+                    last_err = "%s (%s)" % (url, getattr(e, "reason", None) or e)
+            if used_url is not None:
+                break
+            # Invalidate stale cache on failure before retrying once
+            cache_key = (default_ns or self.namespace, str(ref or ""))
+            if attempt_idx == 0 and cache_key in self._endpoint_cache:
+                self._endpoint_cache.pop(cache_key, None)
+                continue
+            # Lazy Ingress fallback ONLY when direct podIP:port is unreachable
+            prefix = self._ingress_prefix(ns, svc_name or pod_name)
+            if prefix is not None:
+                ing_headers = {"Accept": "application/json"}
+                if body_bytes is not None:
+                    ing_headers["Content-Type"] = "application/json"
+                ing_url = "%s%s%s" % (self.ingress_url, prefix, req_path)
+                try:
+                    status, parsed = self._raw_http_json(ing_url, method, ing_headers, body_bytes, timeout)
+                    used_url = ing_url
+                except OSError as e:
+                    last_err = "%s (%s)" % (ing_url, getattr(e, "reason", None) or e)
+            break
+
+        if used_url is None:
+            if not last_err:
+                raise ToolError("Pod %s/%s has no podIP or reachable endpoint yet" % (ns, pod_name))
+            raise ToolError("cannot reach %s/%s (pod %s on %s): %s" % (ns, svc_name or pod_name, pod_name, node_name, last_err))
+        if method != "GET":
+            self.log("kube32 mcp: %s %s/%s%s -> http %d" % (method, ns, svc_name or pod_name, req_path, status))
+        if status >= 400:
+            detail = parsed.get("error", parsed) if isinstance(parsed, dict) else parsed
+            raise ToolError("%s %s%s answered http %d: %s" % (method, svc_name or pod_name, req_path, status, detail))
+        return {
+            "service": "%s/%s" % (ns, svc_name or pod_name),
+            "pod": pod_name,
+            "node": node_name,
+            "method": method,
+            "path": req_path,
+            "status": status,
+            "ok": True,
+            "response": parsed,
+        }
+
+    def list_workloads(self, args, ctx):
+        ns = args.get("namespace") or self.namespace
+        nodes = self._node_map()
+        pods_raw = (self.get("/api/v1/namespaces/%s/pods" % ns) or {}).get("items", [])
+        svcs_raw = (self.get("/api/v1/namespaces/%s/services" % ns) or {}).get("items", [])
+        ings_raw = (self.get("/apis/networking.k8s.io/v1/namespaces/%s/ingresses" % ns) or {}).get("items", [])
+
+        pods_out = []
+        for p in sorted(pods_raw, key=lambda x: x["metadata"]["name"]):
+            meta = p["metadata"]
+            ann = meta.get("annotations") or {}
+            entry = pod_summary(p)
+            ip, port, _ = self._pod_endpoint(p, nodes)
+            if ip:
+                entry["pod_ip"] = ip
+                entry["pod_port"] = port
+            if meta.get("labels"):
+                entry["labels"] = meta["labels"]
+            if ann.get("kube32.io/event-topics"):
+                entry["event_topics"] = [t.strip() for t in ann["kube32.io/event-topics"].split(",") if t.strip()]
+            if ann.get(lim.NOTES_ANNOTATION):
+                entry["notes"] = ann[lim.NOTES_ANNOTATION].strip()
+            pods_out.append(entry)
+
+        svcs_out = []
+        for s in sorted(svcs_raw, key=lambda x: x["metadata"]["name"]):
+            meta, spec = s["metadata"], s.get("spec") or {}
+            ann = meta.get("annotations") or {}
+            sel = spec.get("selector") or {}
+            matched = [p["metadata"]["name"] for p in pods_raw
+                       if sel and all((p["metadata"].get("labels") or {}).get(k) == v for k, v in sel.items())]
+            entry = {"name": meta["name"], "selector": sel,
+                     "ports": [p.get("port") for p in spec.get("ports") or []],
+                     "pods": sorted(matched)}
+            if ann.get(lim.NOTES_ANNOTATION):
+                entry["notes"] = ann[lim.NOTES_ANNOTATION].strip()
+            declared = self._parse_service_mcp_tools(s)
+            if declared:
+                entry["mcp_tools"] = [t["name"] for t in declared]
+            svcs_out.append(entry)
+
+        ings_out = []
+        for ing in sorted(ings_raw, key=lambda x: x["metadata"]["name"]):
+            meta = ing["metadata"]
+            ann = meta.get("annotations") or {}
+            routes = []
+            for rule in (ing.get("spec") or {}).get("rules") or []:
+                for p in ((rule.get("http") or {}).get("paths") or []):
+                    svc = (p.get("backend") or {}).get("service") or {}
+                    routes.append({"path": p.get("path", "/"), "service": svc.get("name", ""),
+                                   "port": (svc.get("port") or {}).get("number")})
+            entry = {"name": meta["name"], "routes": routes}
+            if ann.get("kube32.io/event-stream"):
+                entry["event_stream"] = ann["kube32.io/event-stream"]
+            ings_out.append(entry)
+
+        out = {"namespace": ns, "pods": pods_out, "services": svcs_out,
+               "writes": "on" if self.allow_writes else "off (kube32 mcp --allow-writes)",
+               "deploy": "on" if self.allow_deploy else "off (kube32 mcp --allow-deploy)"}
+        if ings_out:
+            out["ingresses"] = ings_out
+        return out
+
+    def call_service(self, args, ctx):
+        return self._http_service_call(
+            args["service"],
+            method=args.get("method", "GET"),
+            path=args.get("path", "/"),
+            query=args.get("query"),
+            body=args.get("body"),
+        )
+
+    def _parse_service_mcp_tools(self, svc):
+        """Parse valid tool declarations from a Service's kube32.io/mcp-tools JSON annotation."""
+        ann = (svc.get("metadata") or {}).get("annotations") or {}
+        raw = ann.get(MCP_TOOLS_ANNOTATION)
+        if not raw:
+            return []
+        try:
+            items = json.loads(raw)
+        except ValueError as e:
+            self.log("kube32 mcp: ignoring invalid %s on Service %s: %s" % (
+                MCP_TOOLS_ANNOTATION, (svc.get("metadata") or {}).get("name", "?"), e))
+            return []
+        if not isinstance(items, list):
+            return []
+        out = []
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            name = item.get("name")
+            if not isinstance(name, str) or not _TOOL_NAME_RE.match(name):
+                continue
+            method = str(item.get("method", "GET")).upper()
+            if method not in ("GET", "POST", "PUT", "DELETE"):
+                continue
+            props = item.get("properties")
+            if props is None:
+                props = {}
+            if not isinstance(props, dict):
+                continue
+            req = item.get("required") or []
+            if not isinstance(req, list) or not all(isinstance(r, str) for r in req):
+                continue
+            out.append({
+                "name": name,
+                "title": str(item.get("title") or name),
+                "description": str(item.get("description") or ("%s %s on Service %s" % (
+                    method, item.get("path", "/"), (svc.get("metadata") or {}).get("name", "")))),
+                "method": method,
+                "path": str(item.get("path") or "/"),
+                "properties": props,
+                "required": req,
+                "query_keys": set(item.get("query_keys") or ()),
+            })
+        return out
+
+    def service_mcp_tools(self, refresh=False):
+        """Dynamic MCP Tools declared by Services in self.namespace via kube32.io/mcp-tools."""
+        now = time.time()
+        ts, cached = self._svc_tools_cache
+        if not refresh and cached and (now - ts) < 15.0:
+            return cached
+        svcs = (self.get("/api/v1/namespaces/%s/services" % self.namespace) or {}).get("items", [])
+        result = []
+        seen = set()
+        for svc in sorted(svcs, key=lambda x: x["metadata"]["name"]):
+            meta = svc.get("metadata") or {}
+            ns = meta.get("namespace", self.namespace)
+            svc_name = meta.get("name", "")
+            for spec in self._parse_service_mcp_tools(svc):
+                if spec["name"] in seen:
+                    continue
+                seen.add(spec["name"])
+
+                def make_fn(ref, method, path, query_keys, target_ns):
+                    def fn(args, ctx):
+                        if method == "GET":
+                            res = self._http_service_call(ref, method="GET", path=path, query=args or None, default_ns=target_ns)
+                        else:
+                            q = {k: v for k, v in (args or {}).items() if k in query_keys} or None
+                            b = {k: v for k, v in (args or {}).items() if k not in query_keys}
+                            res = self._http_service_call(ref, method=method, path=path, query=q, body=b, default_ns=target_ns)
+                        return res["response"]
+                    return fn
+
+                is_read = spec["method"] == "GET"
+                result.append(Tool(
+                    spec["name"],
+                    spec["title"],
+                    spec["description"],
+                    spec["properties"],
+                    spec["required"],
+                    make_fn("%s/%s" % (ns, svc_name), spec["method"], spec["path"], spec["query_keys"], ns),
+                    read_only=is_read,
+                    destructive=not is_read,
+                    idempotent=is_read,
+                ))
+        self._svc_tools_cache = (now, result)
+        return result
 
     def delete_workload(self, args, ctx):
         self.require("deploy")
@@ -783,6 +1205,27 @@ def tools(k):
               "tail_lines": {"type": "integer", "description": "Log lines per pod, 1 to 500 (default 40)"},
               "previous": {"type": "boolean", "description": "The log of the previous container, after a restart"}},
              ["name"], k.workload_status, idempotent=True),
+        Tool("pod_logs", "Read recent logs of a pod",
+             "Returns the last log lines of a Pod (or the first pod of a Deployment) in the server's namespace.",
+             {"name": {"type": "string", "description": "Pod or Deployment name"},
+              "tail_lines": {"type": "integer", "description": "Log lines to return, 1 to 500 (default 50)"},
+              "previous": {"type": "boolean", "description": "Logs of the previous container instance (default false)"}},
+             ["name"], k.read_pod_logs, idempotent=True),
+        Tool("list_workloads", "List pods, services and ingresses",
+             "Lists Pods (phase, node, IP, resolved pod server port, labels, event topics), Services (selectors, "
+             "matching pods, notes, and any kube32.io/mcp-tools declared on them), and Ingresses in the namespace.",
+             {"namespace": {"type": "string", "description": "Namespace to inspect (default: server's namespace)"}},
+             [], k.list_workloads, idempotent=True),
+        Tool("call_service", "Call an HTTP endpoint on a Service or Pod",
+             "Sends an HTTP request (GET, POST, PUT or DELETE) to a kube32 Service or Pod, automatically resolving "
+             "the target node's pod HTTP port (status.daemonEndpoints.kubeletEndpoint.Port). GET is always allowed; "
+             "POST, PUT and DELETE require a server started with --allow-writes.",
+             {"service": {"type": "string", "description": "Service or Pod name, or namespace/name (list_workloads lists them)"},
+              "path": {"type": "string", "description": "HTTP path starting with '/' (default '/')"},
+              "method": {"type": "string", "enum": ["GET", "POST", "PUT", "DELETE"], "description": "HTTP method (default GET)"},
+              "query": {"type": "object", "description": "Optional URL query parameters"},
+              "body": {"type": "object", "description": "Optional JSON request body for POST or PUT"}},
+             ["service"], k.call_service, read_only=False),
         Tool("delete_workload", "Delete a deployed pod",
              "Deletes a pod or Deployment that deploy_code created. Refuses anything else. Needs --allow-deploy.",
              {"name": {"type": "string", "description": "Pod or Deployment name"}},

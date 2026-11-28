@@ -38,6 +38,7 @@ def cmd_mcp(args):
     from .tools import Kube32, prompts, resources, tools
 
     token = args.token or os.environ.get("KUBE32_MCP_TOKEN") or None
+    ingress_url = (os.environ.get("KUBE32_INGRESS_URL") or "").strip().rstrip("/") or None
     listen = None
     if args.http:
         try:
@@ -50,11 +51,15 @@ def cmd_mcp(args):
     missing = kubectl_missing(kubectl_base(args))
     if missing:
         log("kube32 mcp: warning: %s" % missing)
-    k = Kube32(args, namespace=args.namespace, allow_writes=args.allow_writes, allow_deploy=args.allow_deploy, log=log)
+    k = Kube32(args, namespace=args.namespace, allow_writes=args.allow_writes, allow_deploy=args.allow_deploy,
+               log=log, ingress_url=ingress_url)
     listing, templates, read = resources(k)
-    server = Server("kube32", version(), INSTRUCTIONS, tools(k), listing, templates, read, prompts(), log)
-    mode = "writes %s, deploys %s, namespace %s%s" % ("on" if args.allow_writes else "off", "on" if args.allow_deploy else "off",
-                                                     args.namespace, ", context " + args.context if args.context else "")
+    server = Server("kube32", version(), INSTRUCTIONS, tools(k), listing, templates, read, prompts(), log,
+                    extra_tools=k.service_mcp_tools)
+    mode = "writes %s, deploys %s, namespace %s%s%s" % (
+        "on" if args.allow_writes else "off", "on" if args.allow_deploy else "off",
+        args.namespace, ", context " + args.context if args.context else "",
+        ", ingress " + ingress_url if ingress_url else "")
     if listen is None:
         log("kube32 mcp: serving on stdio (%s)" % mode)
         return serve_stdio(server)
