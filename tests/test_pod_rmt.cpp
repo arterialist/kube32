@@ -556,9 +556,39 @@ void test_irremote_pod() {
 
 } // namespace
 
+// A board that keeps a TX channel for its own LED offers pods the chip's
+// other three; receive channels are all theirs
+void test_board_held_tx_channel() {
+    auto& fw = CapabilityFirewall::instance();
+    fw.reset();
+    const std::string tx_req = R"("esp32.io/rmt-tx":"1")";
+    std::string err;
+    BoardProfile p;
+    p.rmt_tx_board_channels = 1;
+    fw.set_board_profile(p);
+    kubelet::NodeStatusReporter reporter("node", "10.0.0.2");
+    kubelet::NodeTelemetry t = reporter.collect_telemetry();
+    assert(t.total_rmt_tx_count == 3 && t.total_rmt_rx_count == 4);
+    assert(fw.claimable_rmt_tx_count() == 3);
+    for (int i = 0; i < 3; ++i) {
+        const std::string id = "default/t" + std::to_string(i);
+        assert(fw.register_pod(id, pod(tx_req, R"("kube32.io/rmt-tx":"pin=)" + std::to_string(10 + i) + "\""), err));
+    }
+    assert(!fw.register_pod("default/t3", pod(tx_req, R"("kube32.io/rmt-tx":"pin=13")"), err));
+    assert(err == "Insufficient allocatable RMT TX channels: requested 1, available 0");
+    // More channels than the chip has: none for pods
+    p.rmt_tx_board_channels = 9;
+    fw.reset();
+    fw.set_board_profile(p);
+    assert(fw.claimable_rmt_tx_count() == 0 && fw.claimable_rmt_rx_count() == 4);
+    fw.reset();
+    std::cout << "[PASS] test_board_held_tx_channel" << std::endl;
+}
+
 int main() {
     std::cout << "=== RMT (IR) for pods ===" << std::endl;
     test_rmt_admission_and_release();
+    test_board_held_tx_channel();
     test_rmt_send_and_receive();
     test_cardputer_profile_capacity_and_scheduling();
     test_irremote_pod();

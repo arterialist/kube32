@@ -8,6 +8,7 @@
 #include <iostream>
 #include <cassert>
 #include "osal/system.hpp"
+#include "api/version_info.hpp"
 #include <thread>
 
 using namespace kube32::kubelet;
@@ -75,6 +76,29 @@ void test_node_status_reporter() {
         assert(host_reg.find("psram") == std::string::npos);   // no PSRAM: not advertised
         assert(host_reg.find("\"cpu\":\"" + std::to_string(t.cpu_cores) + "\"") != std::string::npos);
         assert(host_reg.find("\"kubernetes.io/arch\":\"xtensa\"") == std::string::npos);
+        // Architecture and OS as Kubernetes names them, as labels and in nodeInfo
+#if defined(__aarch64__) || defined(__arm64__)
+        const std::string arch = "arm64";
+#elif defined(__x86_64__)
+        const std::string arch = "amd64";
+#else
+        const std::string arch = kube32::api::build_info().arch;
+#endif
+#if defined(__APPLE__)
+        const std::string os = "darwin";
+#elif defined(__linux__)
+        const std::string os = "linux";
+#else
+        const std::string os = kube32::api::build_info().os;
+#endif
+        for (const std::string& reg : {host_reg, reporter.build_registration_json(t, true)}) {
+            assert(reg.find("\"kubernetes.io/arch\":\"" + arch + "\"") != std::string::npos);
+            assert(reg.find("\"kubernetes.io/os\":\"" + os + "\"") != std::string::npos);
+            assert(reg.find("\"architecture\":\"" + arch + "\"") != std::string::npos);
+            assert(reg.find("\"operatingSystem\":\"" + os + "\"") != std::string::npos);
+        }
+        // Heartbeats leave the labels as registration set them
+        assert(reporter.build_heartbeat_patch_json(t, false).find("\"labels\"") == std::string::npos);
     }
     t.memory_capacity_bytes = 320 * 1024;
 

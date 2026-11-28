@@ -120,26 +120,34 @@ CHECKPOINTS_PATH = "/apis/kube32.io/v1/namespaces/%s/checkpoints"
 
 
 def cmd_checkpoint(args):
-    """checkpoint and move: a Checkpoint with action Save or Move, then its result"""
-    if not _NAME_RE.match(args.pod):
-        return err_exit("invalid pod name '%s'" % args.pod, EXIT_USAGE)
-    name = "%s-%s" % (args.pod[:56], os.urandom(3).hex()[:5])
+    """checkpoint, move and copy: a Checkpoint with action Save, Move or Copy, then its result"""
+    into = getattr(args, "into", None)
+    for pod in (args.pod, into or args.pod):
+        if not _NAME_RE.match(pod):
+            return err_exit("invalid pod name '%s'" % pod, EXIT_USAGE)
+    name = "%s-%s" % ((into or args.pod)[:56], os.urandom(3).hex()[:5])
     spec = {"podName": args.pod, "action": args.action}
     if args.container:
         spec["containerName"] = args.container
+    target = {"podName": into} if into else {}
     if getattr(args, "to", None):
-        spec["target"] = {"nodeName": args.to}
+        target["nodeName"] = args.to
+    if target:
+        spec["target"] = target
     manifest = {"apiVersion": "kube32.io/v1", "kind": "Checkpoint", "metadata": {"name": name, "namespace": args.namespace}, "spec": spec}
     path = CHECKPOINTS_PATH % args.namespace
     try:
         api_call(args, "create", path, json.dumps(manifest).encode())
     except ApiError as e:
         return err_exit(str(e), EXIT_KUBECTL)
-    print("checkpoint %s: %s of pod %s" % (name, "move" if args.action == "Move" else "save", args.pod))
+    if into:
+        print("checkpoint %s: copy of pod %s into pod %s" % (name, args.pod, into))
+    else:
+        print("checkpoint %s: %s of pod %s" % (name, "move" if args.action == "Move" else "save", args.pod))
     if args.no_wait:
         print("follow it with: %s checkpoints, kubectl get checkpoint %s, kubectl get events" % (common.PROG, name))
         return EXIT_OK
-    done = ("Completed", "Failed") if args.action == "Move" else ("Saved", "Failed")
+    done = ("Saved", "Failed") if args.action == "Save" else ("Completed", "Failed")
     last = None
     deadline = time.time() + args.timeout
     while time.time() < deadline:

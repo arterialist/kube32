@@ -11,7 +11,7 @@ The firewall reads `resources.requests`, or `resources.limits` when `requests` i
 | `esp32.io/gpio-<N>: "1"` | None | Read, write, and configure GPIO pin `N` |
 | `esp32.io/gpio-input-<N>: "1"` | None | Read GPIO pin `N` and set it as an input, with or without a pull. The pod cannot drive the pin. A pod can claim GPIO `0`, the boot button, in this way |
 | `esp32.io/gpio: "<count>"` | None | `<count>` free claimable GPIO pins, lowest numbers first |
-| `esp32.io/adc1-channel-<0..9>: "1"` | None | Read ADC1 channel `0..9` (samples GPIO `channel + 1`) |
+| `esp32.io/adc1-channel-<0..9>: "1"` | None | Read ADC1 channel `0..9`, which samples GPIO `channel + 1` on the ESP32-S3. The ESP32-S31 has channels `0..7`, on GPIO 42 to 49 |
 | `esp32.io/adc: "<count>"` | None | `<count>` free claimable ADC1 channels |
 | `esp32.io/i2c-bus-<0\|1>: "1"` | None | I2C controller `0` or `1` and its SDA/SCL pins |
 | Annotation `kube32.io/i2c-device: "bus=<n>,addr=0x<hh>[,mux=0x<hh>:<channel>]"` | None | One address on I2C bus `n`. Other pods' grants share the bus. With `mux`, the address is behind a PCA9548A channel ([shared I2C buses](devices.md#shared-i2c-buses)) |
@@ -25,6 +25,7 @@ The firewall reads `resources.requests`, or `resources.limits` when `requests` i
 | `hardware.kube32.io/keyboard: "1"` | `KEYBOARD` | `k32_key_read` |
 | `hardware.kube32.io/speaker: "1"` | `SPEAKER`, `AUDIO` | `k32_tone`, `k32_audio_play` |
 | `hardware.kube32.io/microphone: "1"` | `MICROPHONE`, `MIC` | `k32_mic_read` |
+| `hardware.kube32.io/led: "1"` | `LED` | `k32_led_set` |
 | `hardware.kube32.io/ipc: "1"` | `CHANNEL_IPC`, `IPC` | `k32_event_emit`, `kube32_channel_*` |
 | `hardware.kube32.io/sd: "1"` | `SD`, `SD_CARD` | `k32_fs_*` in the pod's volume claim ([storage](storage.md)) |
 | `hardware.kube32.io/chip-temp: "1"` | `CHIP_TEMP` | `esp32_chip_temp_read` |
@@ -38,11 +39,11 @@ Pods share each device that a `hardware.kube32.io/*` resource grants, and a pod 
 | Resource | Advertised by |
 | --- | --- |
 | `hardware.kube32.io/ipc` | Every node |
-| `hardware.kube32.io/chip-temp` | Every node: the ESP32-S3's internal sensor, a stand-in in the simulator. A node on a [Linux board](hardware-spec.md#linux-boards) reads its SoC's thermal zone and advertises the grant only when the zone can be read |
-| `hardware.kube32.io/tft-display`, `keyboard`, `speaker`, `microphone`, `touch` | Boards with the devices on board (the Cardputer profile has a display, keyboard, speaker and microphone; a Linux board, the framebuffer, keyboard and sound card that opened) |
+| `hardware.kube32.io/chip-temp` | Every node: the chip's internal sensor, a stand-in in the simulator. A node on a [Linux board](hardware-spec.md#linux-boards) reads its SoC's thermal zone and advertises the grant only when the zone can be read |
+| `hardware.kube32.io/tft-display`, `keyboard`, `speaker`, `microphone`, `touch`, `led` | Boards with the devices on board (the Cardputer profile has a display, keyboard, speaker and microphone; the `s31-coreboard` profile a speaker, microphone and RGB LED; the `atoms3-lite` profile an RGB LED; a Linux board, the framebuffer, keyboard and sound card that opened) |
 | `hardware.kube32.io/sd` | Nodes with a mounted microSD card ([storage](storage.md)) |
 
-A resource that a node no longer has (a card taken out, a board profile changed between boots) is set to `null` in the next status write and leaves the Node. The scheduler does not filter on these resources; the firewall checks the grants at admission.
+A resource that a node no longer has (a card taken out, a board profile changed between boots) is set to `null` in the next status write and leaves the Node. The scheduler does not filter on these resources; the firewall checks the grants at admission. A [hardware-following pod](migration.md#hardware-following-pods) is the exception: the scheduler binds it to a node with the devices of its current step, and on each node the firewall grants it the devices it lists that the node has.
 
 ## Host functions
 
@@ -55,8 +56,8 @@ Declared in `include/runtime/k32_app_abi.h` and linked in `src/runtime/host_func
 | `esp32_gpio_set_mode` | `i(ii)` | `int32_t esp32_gpio_set_mode(uint32_t pin, uint32_t mode)` | Configures `pin`: `0` input, `1` output, `2` input pull-up, `3` input pull-down. Returns `0` or negative error. |
 | `esp32_gpio_write` | `i(ii)` | `int32_t esp32_gpio_write(uint32_t pin, uint32_t value)` | Sets output level (`0` or `1`) on `pin`. Returns `0` or negative error. |
 | `esp32_gpio_read` | `i(i)` | `int32_t esp32_gpio_read(uint32_t pin)` | Returns input level (`0` or `1`) on `pin`, or negative error. |
-| `esp32_adc_read` | `i(i)` | `int32_t esp32_adc_read(uint32_t channel)` | One-shot read on ADC1 `channel` (`0..9`, 12 dB attenuation). Returns raw reading or negative error. |
-| `esp32_chip_temp_read` | `i(i)` | `int32_t esp32_chip_temp_read(int32_t* out_milli_c)` | Stores the ESP32-S3's internal temperature in milli-degrees Celsius and returns `0`, or a negative error. The sensor measures the die, which is warmer than the air around it. The simulator reports 40.0 °C. |
+| `esp32_adc_read` | `i(i)` | `int32_t esp32_adc_read(uint32_t channel)` | One-shot read on ADC1 `channel` (`0..9`, 12 dB attenuation; the ESP32-S31's ADC has one input range). Returns the raw 12-bit reading or negative error. |
+| `esp32_chip_temp_read` | `i(i)` | `int32_t esp32_chip_temp_read(int32_t* out_milli_c)` | Stores the chip's internal temperature in milli-degrees Celsius and returns `0`, or a negative error. The sensor measures the die, which is warmer than the air around it. The simulator reports 40.0 °C. |
 | `esp32_i2c_write` | `i(iiii)` | `int32_t esp32_i2c_write(uint32_t bus, uint32_t addr, const void* data, uint32_t len)` | Writes `len` bytes to 7-bit `addr` on `bus` (100 ms timeout). Returns bytes written or negative error. |
 | `esp32_i2c_read` | `i(iiii)` | `int32_t esp32_i2c_read(uint32_t bus, uint32_t addr, void* buf, uint32_t len)` | Reads `len` bytes from 7-bit `addr` on `bus` (100 ms timeout). Returns bytes read or negative error. |
 | `esp32_uart_write` | `i(iii)` | `int32_t esp32_uart_write(uint32_t port, const void* data, uint32_t len)` | Writes `len` bytes to UART `port` (`1` or `2`). Returns bytes queued or negative error. |
@@ -81,7 +82,7 @@ Error codes (`include/runtime/k32_app_abi.h`, `include/hal/hal_types.hpp`):
 
 ### Cardputer display, keypad, speaker, and microphone
 
-Nodes running the `cardputer` board profile, selected with `K32_CMD:BOARD:cardputer`, expose the M5Stack Cardputer's built-in 240x135 ST7789 display, 56-key matrix, NS4168 I2S speaker, and SPM1423 PDM microphone (`src/runtime/app_pod.cpp`, `src/hal/tft_keyboard_hardware.cpp`). On nodes without this profile, these functions return `K32_ERR_NODEV` (`-19`). A node on a [Linux board](hardware-spec.md#linux-boards) serves the display, keyboard, speaker and microphone functions with the board's own panel, keyboard and sound card, the display at the panel's size.
+Nodes running the `cardputer` board profile, selected with `K32_CMD:BOARD:cardputer`, expose the M5Stack Cardputer's built-in 240x135 ST7789 display, 56-key matrix, NS4168 I2S speaker, and SPM1423 PDM microphone (`src/runtime/app_pod.cpp`, `src/hal/tft_keyboard_hardware.cpp`). On nodes without this profile, these functions return `K32_ERR_NODEV` (`-19`). The `s31-coreboard` profile serves the speaker and microphone functions with the ESP32-S31-Function-CoreBoard-1's codec ([below](#speaker-and-microphone-on-the-esp32-s31-function-coreboard-1)). A node on a [Linux board](hardware-spec.md#linux-boards) serves the display, keyboard, speaker and microphone functions with the board's own panel, keyboard and sound card, the display at the panel's size.
 
 | Import | Wasm signature | C declaration | Behavior |
 | --- | --- | --- | --- |
@@ -117,6 +118,34 @@ On a Linux board such as the Cardputer Zero, `kube32-sim` reaches the sound card
 * The Cardputer Zero's output sounds only about 200 ms after a stream starts, so a sound after a pause begins with that much silence. The output queue grows by the same amount, so a call never waits longer than on the Cardputer, and the stream stays open for a second after a sound, so the next one starts at once.
 * The board profile sets the codec's mixer controls when the node starts and puts them back when it stops.
 
+### Speaker and microphone on the ESP32-S31-Function-CoreBoard-1
+
+The `s31-coreboard` profile plays through the board's ES8311 codec and the NS4150B amplifier behind its speaker connector, and records from its on-board microphone through the same codec ([pins](hardware-spec.md#esp32-s31-function-coreboard-1)). The four imports keep the semantics above: the same ceiling, the same return values, a 16 kHz microphone with a 64 ms buffer whose first 100 ms read as silence, channels that exist only while sound moves, and the speaker before the microphone, since the codec's converters share one I2S controller and its clocks. What differs:
+
+* The node sets the codec up over I2C once at boot, for a master clock at 256 times the sample rate, a setup that serves every rate: the codec takes no I2C controller from pods.
+* The amplifier is on only while the speaker's channel runs.
+* The codec amplifies the microphone by 72 dB (30 dB analog, 42 dB digital) and removes its DC offset with a high-pass filter. A quiet room's floor reads about 150 RMS. `K32_CMD:MICGAIN:<n>` multiplies the samples on top of that (1 to 64, 1 by default).
+* `k32_tone` returns `K32_ERR_IO` when the codec's I2S channel fails and `K32_ERR_BUSY` when other calls keep the speaker for 2 seconds, where the Cardputer returns `0`.
+
+### RGB LED
+
+A pod with `hardware.kube32.io/led: "1"` or the `LED` capability sets the board's addressable RGB LEDs. Pods that hold the grant share them, and an LED keeps its color until the next call.
+
+| Import | Wasm signature | C declaration | Behavior |
+| --- | --- | --- | --- |
+| `k32_led_set` | `i(ii)` | `int32_t k32_led_set(uint32_t index, uint32_t rgb)` | Sets LED `index` (`0` on a board with one) to the color `0xRRGGBB`, `0` for off. Returns `0`, `K32_ERR_INVAL` for an index past the board's LEDs, or `K32_ERR_NODEV` on a node without one. |
+
+The `s31-coreboard` profile has one WS2812 LED, on GPIO 60, and the `atoms3-lite` profile one WS2812C LED, on GPIO 35. The node keeps one RMT TX channel for the LED from boot, so each of these boards offers pods three RMT TX channels, and sends each color to the LED as a WS2812 frame (green, red, blue).
+
+`apps/ledcycle` sets LED 0 to red, green, blue, white and off, one color a tick from its start, logs what each call returned, and answers the results on `GET /` (`{"step":5,"rc":[0,0,0,0,0]}` on a board with the LED):
+
+```sh
+make -C apps/ledcycle
+kube32 deploy images/sd/ledcycle.wasm --name ledcycle --node <node>
+kubectl logs ledcycle    # ledcycle: red 0x400000 rc 0 ... ledcycle: off 0x000000 rc 0
+kubectl delete pod ledcycle
+``` The LED has an import of its own because WS2812 bits last 0.3 and 0.9 microseconds, and the pods' RMT channels count durations in whole microseconds.
+
 ## Bus configuration and driver lifecycle
 
 ### Pin annotations and board defaults
@@ -139,6 +168,7 @@ When the annotation is omitted, the bus uses the board profile's default pins. C
 | --- | --- | --- |
 | `generic` | 33 GPIO, 10 ADC, 2 I2C (`0`, `1`), 2 UART (`1`, `2`) | `I2C0` SDA 8, SCL 9; `I2C1` none; `UART1` TX 17, RX 18; `UART2` none |
 | `cardputer` | 11 GPIO, 3 ADC, 1 I2C (`0`), 1 UART (`1`) | `I2C0` SDA 2, SCL 1; `UART1` TX 2, RX 1 |
+| `s31-coreboard` | 22 GPIO, 8 ADC, 2 I2C (`0`, `1`), 2 UART (`1`, `2`), 3 RMT TX | `I2C0` SDA 2, SCL 3; `I2C1` none; `UART1` TX 38, RX 39; `UART2` none |
 | `cardputer-zero` (Linux) | 1 I2C (`0`) | `I2C0` is `/dev/i2c-1`, on the pins the kernel set up |
 
 On the Cardputer, `I2C0` and `UART1` share the Grove port pins GPIO 2 and GPIO 1, so only one of the two can be claimed at a time. On a [Linux board](hardware-spec.md#linux-boards) the kernel sets each bus's pins and speed: a claim takes no pins, and a `kube32.io/i2c-bus-<n>` annotation is refused.
@@ -188,7 +218,7 @@ kubectl --context kube32 get nodes -L i2c.kube32.io/0x28
 
 ## Infrared (RMT)
 
-The ESP32-S3 RMT peripheral sends and captures pulse trains, the signal of infrared remote controls. A pod claims one transmit channel (`esp32.io/rmt-tx: "1"`), one receive channel (`esp32.io/rmt-rx: "1"`), or one of each. The chip has four channels of each direction; a node advertises at most four of each and only as many as it has pins for, so a profile without a claimable pin for a direction advertises none of it. A Linux board offers one channel of each direction on its own infrared devices ([below](#infrared-on-a-linux-board)).
+The ESP32-S3 RMT peripheral sends and captures pulse trains, the signal of infrared remote controls. A pod claims one transmit channel (`esp32.io/rmt-tx: "1"`), one receive channel (`esp32.io/rmt-rx: "1"`), or one of each. The chip has four channels of each direction (the ESP32-S31 too); a node advertises at most four of each and only as many as it has pins for, so a profile without a claimable pin for a direction advertises none of it. A board that keeps a TX channel for its own device advertises one fewer: the `atoms3-lite` and `s31-coreboard` profiles keep one for their [RGB LED](#rgb-led). A Linux board offers one channel of each direction on its own infrared devices ([below](#infrared-on-a-linux-board)).
 
 ### Pins and settings
 
@@ -212,6 +242,7 @@ metadata:
 | --- | --- | --- | --- |
 | `generic` | 4 RMT TX, 4 RMT RX | None | None |
 | `cardputer` | 4 RMT TX, 4 RMT RX | GPIO 44, the built-in IR LED | None |
+| `atoms3-lite` | 3 RMT TX, 4 RMT RX | GPIO 4, the built-in IR LED | None |
 | `cardputer-zero` (Linux) | 1 RMT TX, 1 RMT RX | The board's IR LED, no pin | The board's IR receiver, no pin |
 
 Channel pins are claimed like bus pins: admission fails when the chip or the board reserves the pin, when another pod holds it, or when the claim names no pin and the board has no default (`RMT RX has no default pin on the cardputer board: set annotation kube32.io/rmt-rx: "pin=<n>"`).
@@ -332,13 +363,15 @@ The `rfid` [device driver](https://github.com/arterialist/kube32/tree/main/apps/
 
 ## Reserved pins
 
-The ESP32-S3 provides GPIO 0 to 21 and 26 to 48. The firewall blocks claims on reserved pins (`include/hal/capability_firewall.hpp`):
+The ESP32-S3 provides GPIO 0 to 21 and 26 to 48. The firewall blocks claims on reserved pins (`include/hal/chip_caps.hpp`):
 
 * Every board (`KUBE32_RESERVED_GPIO_MASK`) reserves GPIO `0` for boot strapping, `19` and `20` for native USB, `26` to `32` for SPI flash and quad PSRAM, and `43` and `44` for the UART0 console. The `cardputer` profile offers GPIO `44` to RMT TX channels for its IR LED. A pod can claim GPIO `0` as an input pin (`esp32.io/gpio-input-0`) to read the boot button.
 * The `cardputer` profile also reserves LCD SPI pins `33` to `38`, I2S speaker pins `41` to `43`, microphone data pin `46`, keyboard matrix pins `3` to `9`, `11`, `13`, and `15`, and microSD SPI pins `12`, `14`, `39`, and `40`.
-* The `atoms3-lite` profile offers only its Grove pins `1` and `2`, header pins `5` to `8`, `38` and `39`, and button pin `41`. It reserves the rest, including RGB LED pin `35`, and offers IR LED pin `4` to RMT TX channels.
+* The `atoms3-lite` profile offers only its Grove pins `1` and `2`, header pins `5` to `8`, `38` and `39`, and button pin `41`. It reserves the rest, including RGB LED pin `35`, which the node drives for `k32_led_set`, and offers IR LED pin `4` to RMT TX channels.
 
 An ADC1 channel `N` from `0` to `9` is claimable only when its pad, GPIO `N + 1`, is claimable by the board profile.
+
+The ESP32-S31 provides GPIO 0 to 61 except 29 and 41. Every ESP32-S31 board reserves GPIO `26` to `28` and `30` to `32` for SPI flash (the PSRAM has pins of its own), `33` and `34` for native USB, `36`, `37`, `60` and `61` for boot strapping, and `58` and `59` for the UART0 console. A pod can claim GPIO `36`, `37` and `61`, the boot button of most boards, as input pins. The `s31-coreboard` profile also reserves the Ethernet PHY's pins `4` to `19`, the codec's `50` to `57` and RGB LED pin `60`. ADC1 channel `N` from `0` to `7` samples GPIO `N + 42`.
 
 ## Example: I2C bus scanner
 

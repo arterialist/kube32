@@ -1,5 +1,7 @@
 /* boardinfo: the test pod of tests/test_board_api.cpp. GET /info answers with
- * what k32_display_info and k32_touch_read return.
+ * what k32_display_info and k32_touch_read return, and what k32_led_set
+ * returns for LED 0 set to 0x102030. POST /need answers {"need":<rc>} with
+ * what k32_need returns for the request's body (tests/test_hardware_need.cpp).
  *
  * Build: clang --target=wasm32 -Os -nostdlib -ffreestanding -mcpu=mvp -c boardinfo.c -o boardinfo.o
  *        rust-lld -flavor wasm --no-entry --export-dynamic --allow-undefined --stack-first \
@@ -29,9 +31,24 @@ static void put_i(int32_t value) {
     while (n && out_len < sizeof out) out[out_len++] = d[--n];
 }
 
+static void reply(void) {
+    k32_resp_begin(200, "application/json", 16);
+    k32_resp_write(out, out_len);
+    k32_resp_end();
+}
+
 K32_EXPORT("k32_handle") int32_t k32_handle(uint32_t ptr, uint32_t len) {
-    (void)ptr;
-    (void)len;
+    const char* req = (const char*)(uintptr_t)ptr;
+    out_len = 0;
+    if (len > 10 && req[0] == 'P' && req[5] == '/' && req[6] == 'n') {
+        /* POST /need: the body follows the blank line */
+        uint32_t body = 0;
+        while (body + 1 < len && !(req[body] == '\n' && req[body + 1] == '\n')) body++;
+        body += 2;
+        put("{\"need\":"); put_i(k32_need(req + body, body < len ? len - body : 0)); put("}");
+        reply();
+        return 0;
+    }
     int32_t w = 0, h = 0, f = 0;
     const int32_t info = k32_display_info(&w, &h, &f);
     k32_touch_point_t p[2];
@@ -43,9 +60,8 @@ K32_EXPORT("k32_handle") int32_t k32_handle(uint32_t ptr, uint32_t len) {
     put(",\"f\":"); put_i(f);
     put(",\"touches\":"); put_i(touches);
     if (touches > 0) { put(",\"x\":"); put_i(p[0].x); put(",\"y\":"); put_i(p[0].y); put(",\"id\":"); put_i((int32_t)p[0].id); }
+    put(",\"led\":"); put_i(k32_led_set(0, 0x102030));
     put("}");
-    k32_resp_begin(200, "application/json", 16);
-    k32_resp_write(out, out_len);
-    k32_resp_end();
+    reply();
     return 0;
 }

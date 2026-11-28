@@ -29,7 +29,7 @@ RUSTFLAGS="-C link-arg=-zstack-size=16384 -C link-arg=--initial-memory=65536 -C 
 ## Features
 
 - `panic-handler` (default): a `#[panic_handler]` that logs through `k32_log` and traps.
-- `hardware`: the display, keypad, speaker and infrared imports.
+- `hardware`: the display, keypad, speaker, RGB LED and infrared imports, and `need` for pods that follow their hardware from node to node.
 - `fs`: the `k32_fs_*` imports for pod volumes.
 - `linalg`: native products for quantized neural networks (`k32_matvec_*`, `k32_matmul_*`, `k32_vecmat_f32_i8`, `k32_softmax_f32`) and their element-wise steps (`k32_rmsnorm_f32`, `k32_quantize_i8`, `k32_rope_f32`, `k32_swiglu_f32`, `k32_add_f32`, `k32_argmax_f32`).
 

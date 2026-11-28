@@ -37,6 +37,7 @@
 #include "controller/device_controller.hpp"
 #include "controller/checkpoint_controller.hpp"
 #include "models/device.hpp"
+#include "models/migration.hpp"
 #include "hal/firmware_slots.hpp"
 #include "osal/sha256.hpp"
 #include "kubelet/kube_api_client.hpp"
@@ -80,8 +81,8 @@ static void signal_handler(int sig) {
 }
 
 // The API server a worker dials. The kubelet's threads and the main loop read
-// it; the main loop replaces it when the control plane announces another
-// address.
+// it; the follow thread replaces it with the home address or an address the
+// control plane announces (net::ApiFollower).
 class ApiEndpoint {
 public:
     ApiEndpoint(std::string host, uint16_t port) : host_(std::move(host)), port_(port) {}
@@ -311,6 +312,7 @@ struct SimOptions {
     int64_t psram_bytes{-1};
     std::string sim_i2c;                   // simulated I2C parts on this process's bus 0 (MockHal::attach_parts)
     std::string sim_mic;                   // 16 kHz mono 16-bit PCM (raw or WAV) the microphone hears, looped
+    std::string sim_devices;               // on-board devices the nodes offer, served by stand-ins (models::parse_devices)
     // A Linux board's devices over the --board preset (Linux hosts); "none" leaves one out
     std::optional<std::string> fb, keyboard_dev, keymap, backlight, thermal, screen_owner, audio_card, ir_rx, ir_tx;
     std::vector<std::pair<uint8_t, std::string>> i2c_buses;   // --i2c-bus <n>=<device|none>
@@ -362,6 +364,9 @@ static void print_sim_usage(std::ostream& out) {
            "                              parts: pahub, bme688, miniscale, rfid)\n"
            "  --sim-mic <file>            what k32_mic_read hears: 16 kHz mono 16-bit PCM, raw or WAV, played\n"
            "                              in real time and looped\n"
+           "  --sim-devices <list>        on-board devices this process's nodes offer pods, served by stand-ins,\n"
+           "                              e.g. tft-display,keyboard (tft-display, keyboard, touch, speaker,\n"
+           "                              microphone, led; default none)\n"
            "\n"
            "Linux boards (the process's nodes use the board's own devices; a value of none leaves one out):\n"
            "  --board cardputer-zero      the M5Stack Cardputer Zero's screen, keyboard, I2C bus, temperature,\n"
@@ -449,6 +454,7 @@ static SimOptions parse_sim_args(int argc, char* argv[]) {
         }
         else if (arg == "--sim-i2c" && i + 1 < argc) opts.sim_i2c = argv[++i];
         else if (arg == "--sim-mic" && i + 1 < argc) opts.sim_mic = argv[++i];
+        else if (arg == "--sim-devices" && i + 1 < argc) opts.sim_devices = argv[++i];
         else if (arg == "--fb" && i + 1 < argc) opts.fb = argv[++i];
         else if (arg == "--keyboard-dev" && i + 1 < argc) opts.keyboard_dev = argv[++i];
         else if (arg == "--backlight" && i + 1 < argc) opts.backlight = argv[++i];
@@ -705,6 +711,30 @@ int main(int argc, char* argv[]) {
             std::cout << "[BOARD] the in-process workers share the board's devices with " << opts.kubelet_name << std::endl;
     }
     if (!opts.sim_mic.empty() && !install_sim_mic(opts.sim_mic)) return 2;
+    if (!opts.sim_devices.empty()) {
+        // The devices the nodes offer: the display, keyboard and speaker
+        // stand-ins print what pods do, the keyboard has no keys
+        uint32_t devices = 0;
+        if (linux_board || !kube32::models::parse_devices(opts.sim_devices, devices)) {
+            std::cerr << "kube32-sim: --sim-devices: " << (linux_board ? "the board's own devices serve this process" : "a list of tft-display, keyboard, touch, speaker, microphone, led")
+                      << std::endl;
+            return 2;
+        }
+        kube32::hal::BoardProfile profile = kube32::hal::CapabilityFirewall::instance().board_profile();
+        profile.onboard_devices = devices & ~kube32::hal::KUBE32_CAP_CHIP_TEMP;   // the chip's temperature is offered anyway
+        kube32::hal::CapabilityFirewall::instance().set_board_profile(profile);
+        if (devices & kube32::hal::KUBE32_CAP_LED) {
+            kube32::runtime::AppPlatformHooks hooks = kube32::runtime::app_platform_hooks();
+            hooks.led_set = [](uint32_t index, uint32_t rgb) -> int32_t {
+                if (index != 0) return kube32::hal::HAL_ERR_INVAL;
+                std::printf("[LED] #%06x\n", static_cast<unsigned>(rgb));
+                std::fflush(stdout);   // as the other stand-ins print: whole lines, at once
+                return kube32::hal::HAL_OK;
+            };
+            kube32::runtime::set_app_platform_hooks(hooks);
+        }
+        std::cout << "[SIM] devices offered: " << kube32::models::devices_text(profile.onboard_devices) << std::endl;
+    }
 
     // Local image registry from the embedded table
     {
@@ -926,27 +956,33 @@ int main(int argc, char* argv[]) {
                   << " -> connected to http://" << master_host << ":" << master_port << std::endl;
         if (linux_board) linux_board->show_ready(node_ip, "http://" + master_host + "/");
 
-        // As on the boards: an API server that has not answered for
-        // kApiSilenceBeforeFollowMs while the control plane announces another
-        // address (it joined another network, or its address changed) is
-        // dialed at that address, at the same port. Pods keep running.
-        uint64_t quiet_since = kube32::osal::System::get_uptime_ms();
-        uint64_t next_follow_check = 0;
-        auto follow_announced_api = [&] {
-            const uint64_t now = kube32::osal::System::get_uptime_ms();
-            if (now < next_follow_check) return;
-            next_follow_check = now + 1000;
-            const std::string announced = kube32::ipc::ChannelManager::instance().announced_api();
-            const std::string current = api.host();
-            if (!kube32::net::should_follow_announced_api(now, std::max(kubelet->last_sync_ok_ms(), quiet_since), announced, current)) return;
-            std::cout << "[NET] no answer from " << current << "; the control plane announces " << announced << ", switching" << std::endl;
-            const uint16_t port = api.port();
-            api.set_host(announced);
-            api_client->set_server(announced, port);
-            kubelet->set_api_server(announced, port);
-            service_client.set_gateway(announced, port);
-            quiet_since = now;
-        };
+        // As on the boards (net::ApiFollower): after kApiSilenceBeforeFollowMs
+        // without an answer the worker dials its --join address again, or the
+        // address its control plane announces, once a kube32 API server
+        // answers there, at the same port. Pods keep running, and are ticked
+        // while the probes wait on a thread of their own.
+        std::atomic<bool> following{true};
+        std::thread follow_thread([&] {
+            kube32::net::ApiFollower follower(master_host, master_host);
+            uint64_t quiet_since = kube32::osal::System::get_uptime_ms();
+            while (following.load()) {
+                kube32::osal::Thread::sleep_ms(1000);
+                const uint64_t now = kube32::osal::System::get_uptime_ms();
+                const std::string from = follower.current();
+                const uint16_t port = api.port();
+                const std::string next = follower.poll(now, kubelet->last_sync_ok_ms(), quiet_since,
+                    kube32::ipc::ChannelManager::instance().api_announcements(),
+                    [port](const std::string& host) { return kube32::net::api_server_answers(host, port); });
+                if (next.empty()) continue;
+                std::cout << "[NET] no answer from " << from << "; " << (next == follower.home() ? "the home address " : "the announced address ")
+                          << next << " answers, switching" << std::endl;
+                api.set_host(next);
+                api_client->set_server(next, port);
+                kubelet->set_api_server(next, port);
+                service_client.set_gateway(next, port);
+                quiet_since = now;
+            }
+        });
 
         kube32::app::PodServerOptions po;
         po.port = opts.pod_port;
@@ -967,13 +1003,14 @@ int main(int argc, char* argv[]) {
         while (g_sim_running.load()) {
             tick();
             rejoin();
-            follow_announced_api();
             if (worker_slots->reboot_requested()) {
                 std::cout << "[SIM] " << opts.node_name << " switched firmware slots: start kube32-sim again to boot it" << std::endl;
                 rebooting = true;
                 break;
             }
         }
+        following.store(false);
+        follow_thread.join();
         // A signal: the worker leaves the cluster while its kubelet and pod
         // server still serve the moves
         bool emptied = false;

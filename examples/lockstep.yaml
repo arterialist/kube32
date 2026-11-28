@@ -1,0 +1,224 @@
+# lockstep: three lanes of one computation on three CPU architectures, for
+# the voter of examples/voter.yaml. Each lane integrates the same double
+# pendulum (apps/lockstep) in binary64 arithmetic with its own sin and cos,
+# so an Xtensa, a RISC-V and an arm64 node compute the same bits at every
+# step. The lanes advance in lockstep with the target step the voter
+# publishes and report a checkpoint of their state every CHECK_EVERY steps;
+# the voter compares them bit for bit and outvotes a lane that differs.
+#
+# The module travels inline. make -C apps/lockstep writes
+# apps/lockstep/build/lockstep.yaml, this manifest with the module in place
+# of "@lockstep.wasm":
+#
+#   make -C apps/lockstep
+#   kubectl --context kube32 apply -f apps/lockstep/build/lockstep.yaml
+#
+# Each lane selects its node by kubernetes.io/arch: xtensa (an ESP32-S3),
+# riscv32 (an ESP32-S31) and arm64 (a Linux board or kube32-sim). Change the
+# selectors to place the lanes elsewhere; any three nodes that run pods take
+# them. Each lane has a Service, lockstep-<lane>, whose GET /fault is the
+# lane's fault injection (apps/lockstep/README.md).
+#
+# At the voter's default rate of 200 steps a second a lane takes about a
+# fifth of an ESP32-S3's interpreter; its 7 KB module and 16 KiB of memory fit
+# the pod memory of a board without PSRAM.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: lockstep-a
+  namespace: default
+  labels:
+    app: lockstep
+    lockstep.kube32.io/lane: "a"
+  annotations:
+    kube32.io/wasm-base64: "@lockstep.wasm"
+    kube32.io/migration: OnDrain        # moves on a drain; a Copy restores another lane's state into it
+    kube32.io/tick-interval: 100ms      # up to STEPS_PER_TICK steps a tick
+    kube32.io/wasm-stack: 1Ki
+spec:
+  nodeSelector:
+    kubernetes.io/arch: xtensa             # an ESP32-S3
+  restartPolicy: Always
+  containers:
+    - name: lockstep
+      image: wasm://inline/lockstep
+      ports:
+        - containerPort: 7000
+          name: http
+      env:
+        - name: LANE
+          value: "a"
+        - name: POD_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.name
+        - name: NODE_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: spec.nodeName
+        - name: VOTER_URL               # the voter's Service
+          value: http://voter/report
+        - name: STEPS_PER_TICK
+          value: "50"
+        - name: CHECK_EVERY             # 100 steps of 1 ms: a checkpoint every 0.1 s of pendulum time
+          value: "100"
+        - name: REPORT_MS
+          value: "400"
+        - name: FAULT_BIT               # what GET /fault flips without ?bit=: a bit of theta1's
+          value: "48"                   # mantissa whose flip shows on the screen at once
+      resources:
+        requests:
+          memory: 16Ki                  # 2 KiB stack, 5 KiB data and buffers
+        limits:
+          memory: 16Ki
+      securityContext:
+        capabilities:
+          add: ["SERVICE_CALL"]         # reports to the voter
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: lockstep-a
+  namespace: default
+spec:
+  selector:
+    app: lockstep
+    lockstep.kube32.io/lane: "a"
+  ports:
+    - name: http
+      port: 80
+      targetPort: 7000
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: lockstep-b
+  namespace: default
+  labels:
+    app: lockstep
+    lockstep.kube32.io/lane: "b"
+  annotations:
+    kube32.io/wasm-base64: "@lockstep.wasm"
+    kube32.io/migration: OnDrain        # moves on a drain; a Copy restores another lane's state into it
+    kube32.io/tick-interval: 100ms      # up to STEPS_PER_TICK steps a tick
+    kube32.io/wasm-stack: 1Ki
+spec:
+  nodeSelector:
+    kubernetes.io/arch: riscv32            # an ESP32-S31
+  restartPolicy: Always
+  containers:
+    - name: lockstep
+      image: wasm://inline/lockstep
+      ports:
+        - containerPort: 7000
+          name: http
+      env:
+        - name: LANE
+          value: "b"
+        - name: POD_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.name
+        - name: NODE_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: spec.nodeName
+        - name: VOTER_URL               # the voter's Service
+          value: http://voter/report
+        - name: STEPS_PER_TICK
+          value: "50"
+        - name: CHECK_EVERY             # 100 steps of 1 ms: a checkpoint every 0.1 s of pendulum time
+          value: "100"
+        - name: REPORT_MS
+          value: "400"
+        - name: FAULT_BIT               # what GET /fault flips without ?bit=: a bit of theta1's
+          value: "48"                   # mantissa whose flip shows on the screen at once
+      resources:
+        requests:
+          memory: 16Ki                  # 2 KiB stack, 5 KiB data and buffers
+        limits:
+          memory: 16Ki
+      securityContext:
+        capabilities:
+          add: ["SERVICE_CALL"]         # reports to the voter
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: lockstep-b
+  namespace: default
+spec:
+  selector:
+    app: lockstep
+    lockstep.kube32.io/lane: "b"
+  ports:
+    - name: http
+      port: 80
+      targetPort: 7000
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: lockstep-c
+  namespace: default
+  labels:
+    app: lockstep
+    lockstep.kube32.io/lane: "c"
+  annotations:
+    kube32.io/wasm-base64: "@lockstep.wasm"
+    kube32.io/migration: OnDrain        # moves on a drain; a Copy restores another lane's state into it
+    kube32.io/tick-interval: 100ms      # up to STEPS_PER_TICK steps a tick
+    kube32.io/wasm-stack: 1Ki
+spec:
+  nodeSelector:
+    kubernetes.io/arch: arm64              # a Linux board
+  restartPolicy: Always
+  containers:
+    - name: lockstep
+      image: wasm://inline/lockstep
+      ports:
+        - containerPort: 7000
+          name: http
+      env:
+        - name: LANE
+          value: "c"
+        - name: POD_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.name
+        - name: NODE_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: spec.nodeName
+        - name: VOTER_URL               # the voter's Service
+          value: http://voter/report
+        - name: STEPS_PER_TICK
+          value: "50"
+        - name: CHECK_EVERY             # 100 steps of 1 ms: a checkpoint every 0.1 s of pendulum time
+          value: "100"
+        - name: REPORT_MS
+          value: "400"
+        - name: FAULT_BIT               # what GET /fault flips without ?bit=: a bit of theta1's
+          value: "48"                   # mantissa whose flip shows on the screen at once
+      resources:
+        requests:
+          memory: 16Ki                  # 2 KiB stack, 5 KiB data and buffers
+        limits:
+          memory: 16Ki
+      securityContext:
+        capabilities:
+          add: ["SERVICE_CALL"]         # reports to the voter
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: lockstep-c
+  namespace: default
+spec:
+  selector:
+    app: lockstep
+    lockstep.kube32.io/lane: "c"
+  ports:
+    - name: http
+      port: 80
+      targetPort: 7000

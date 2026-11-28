@@ -2933,8 +2933,13 @@ HttpResponse RouteHandler::handle_generic(const HttpRequest& req, const RouteMat
             if (match.category == RouteCategory::CheckpointsCollection) {
                 const models::JsonValue* spec = doc.get("spec");
                 const std::string action = spec ? spec->get_string("action", "Save") : "";
-                if (!spec || spec->get_string("podName", "").empty() || (action != "Save" && action != "Move")) {
-                    return make_status(422, "Invalid", "Checkpoint.kube32.io \"" + name + "\" is invalid: spec.podName is required, spec.action is Save or Move");
+                const models::JsonValue* target = spec ? spec->get("target") : nullptr;
+                const bool into = target && !target->get_string("podName", "").empty();
+                if (!spec || spec->get_string("podName", "").empty() || (action != "Save" && action != "Move" && action != "Copy") ||
+                    (action == "Copy") != into) {
+                    return make_status(422, "Invalid", "Checkpoint.kube32.io \"" + name +
+                                                           "\" is invalid: spec.podName is required, spec.action is Save, Move or Copy, "
+                                                           "and spec.target.podName names the pod a Copy restores into");
                 }
                 doc.remove("status");   // written through checkpoints/status and the data upload
             }

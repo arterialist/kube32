@@ -42,6 +42,10 @@ public:
     virtual int32_t audio_play(const int16_t*, uint32_t, uint32_t, uint32_t) { return HAL_ERR_NODEV; }
     virtual int32_t mic_read(int16_t*, uint32_t, uint32_t) { return HAL_ERR_NODEV; }
     virtual void mic_set_gain(uint32_t) {}
+
+    // Sets addressable LED `index` to 0xRRGGBB: HAL_OK, HAL_ERR_INVAL for an
+    // index past the board's LEDs, HAL_ERR_BUSY or HAL_ERR_IO
+    virtual int32_t led_set(uint32_t, uint32_t) { return HAL_ERR_NODEV; }
 };
 
 // The implementation for a profile name, nullptr for a board without

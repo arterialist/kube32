@@ -113,7 +113,7 @@ A message of up to 224 bytes travels as one frame. A larger message travels in f
 
 Each node announces the topics it subscribes to, and the bytes a second it takes, on the topic `k32.subs` with every HELLO (every 3 s) and when its subscriptions change: its pods' `kube32.io/event-topics`, the topics of its Ingress event streams, and the channels its pods open by name. A publish goes only to the nodes that subscribe to its topic. A node that announces no subscriptions, or whose last announcement is older than 20 s, gets every topic. A publish to a node that announces a rate waits until that node's pace allows the message, at most 500 ms, so a fast publisher slows down instead of overrunning a small receiver.
 
-Messages go over UDP port 7400 through the access point to every node whose address is known, and over ESP-NOW to a node heard only over ESP-NOW. ESP-NOW carries only HELLOs, subscription announcements and nodes without an address. HELLOs go over UDP to every node with a known address, and over ESP-NOW broadcast.
+Messages go over UDP port 7400 through the access point to every node whose address is known, and over ESP-NOW to a node heard only over ESP-NOW. ESP-NOW carries only HELLOs, subscription announcements and nodes without an address. HELLOs go over UDP to every node with a known address, and over ESP-NOW broadcast. A worker also sends its HELLO to the UDP broadcast address, so a control plane that has no address for it, such as a Linux control plane without ESP-NOW, finds it.
 
 ### Memory
 

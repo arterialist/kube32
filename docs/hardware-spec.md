@@ -1,6 +1,6 @@
 # Hardware
 
-Kube32 runs on ESP32-S3 microcontrollers with 8 MB of flash. One firmware image boots both cluster roles:
+Kube32 runs on ESP32-S3 microcontrollers with 8 MB of flash, and on the ESP32-S31 ([ESP32-S31-Function-CoreBoard-1](#esp32-s31-function-coreboard-1)). One firmware image per chip boots both cluster roles:
 
 | Role | Reference board | PSRAM | Console |
 | --- | --- | --- | --- |
@@ -11,15 +11,16 @@ A board with PSRAM defaults to the control plane. A board without PSRAM defaults
 
 ## Board profiles and labels
 
-Select the peripheral profile with `K32_CMD:BOARD:cardputer|atoms3-lite|generic`:
+Select the peripheral profile with `K32_CMD:BOARD:cardputer|atoms3-lite|s31-coreboard|generic`. The ESP32-S31 image has the `s31-coreboard` profile, and the ESP32-S3 image the others:
 
 | Profile | Labels | Allocatable peripherals | Default bus pins |
 | --- | --- | --- | --- |
 | `generic` | `kube32.io/board: generic` | 33 GPIO, 10 ADC, 2 I2C, 2 UART, chip temperature | I2C0 on GPIO 8/9, UART1 on GPIO 17/18 |
 | `cardputer` | `kube32.io/board: cardputer` | 11 GPIO, 3 ADC, 1 I2C, 1 UART, chip temperature | I2C0 or UART1 on Grove port GPIO 2/1 |
-| `atoms3-lite` | `kube32.io/board: atoms3-lite` | 9 GPIO, 6 ADC, 1 I2C, 1 UART, chip temperature | I2C0 or UART1 on Grove port GPIO 2/1; RMT TX on GPIO 4 (IR LED) |
+| `atoms3-lite` | `kube32.io/board: atoms3-lite` | 9 GPIO, 6 ADC, 1 I2C, 1 UART, 3 RMT TX, RGB LED, chip temperature | I2C0 or UART1 on Grove port GPIO 2/1; RMT TX on GPIO 4 (IR LED) |
+| `s31-coreboard` | `kube32.io/board: s31-coreboard` | 22 GPIO and 3 input-only pins, 8 ADC, 2 I2C, 2 UART, 3 RMT TX, speaker, microphone, RGB LED, chip temperature | I2C0 on GPIO 2/3, UART1 on GPIO 38/39 |
 
-Control plane nodes also carry the `node-role.kubernetes.io/control-plane` label, and worker nodes carry `node-role.kubernetes.io/worker`.
+Control plane nodes also carry the `node-role.kubernetes.io/control-plane` label, and worker nodes carry `node-role.kubernetes.io/worker`. Every node carries `kubernetes.io/arch` (`xtensa` on the ESP32-S3, `riscv32` on the RISC-V chips) and `kubernetes.io/os` (`freertos` on a board), the same values as its `status.nodeInfo.architecture` and `operatingSystem` ([Node labels and system info](api-reference.md#node-labels-and-system-info)).
 
 ## Cardputer pins
 
@@ -32,7 +33,7 @@ Control plane nodes also carry the `node-role.kubernetes.io/control-plane` label
 
 ## AtomS3 Lite pins
 
-The M5Stack AtomS3 Lite is an ESP32-S3 with 8 MB of flash and no PSRAM, so it joins as a worker. It has no screen and no microSD slot: node storage is the internal flash partition. The `atoms3-lite` profile offers pods only the pins a user can reach, plus the button:
+The M5Stack AtomS3 Lite is an ESP32-S3 with 8 MB of flash and no PSRAM, so it joins as a worker. It has no screen and no microSD slot: node storage is the internal flash partition. The `atoms3-lite` profile drives the RGB LED and offers pods only the pins a user can reach, plus the button:
 
 | Function | GPIO |
 | --- | --- |
@@ -40,12 +41,37 @@ The M5Stack AtomS3 Lite is an ESP32-S3 with 8 MB of flash and no PSRAM, so it jo
 | Header | 5, 6, 7, 8, 38, 39 |
 | Button, low when pressed | 41 (`button` driver: `pull: up`, `active: low`) |
 | IR LED, the default RMT TX pin | 4 |
-| WS2812 RGB LED, reserved | 35 |
+| WS2812C RGB LED, from the 3.3 V rail with no enable pin (`k32_led_set`) | 35 |
 
 ```sh
 # on the Atom's console
 K32_CMD:BOARD:atoms3-lite
 ```
+
+## ESP32-S31-Function-CoreBoard-1
+
+The Espressif ESP32-S31-Function-CoreBoard-1 carries an ESP32-S31-WROOM-3 module: a dual-core RISC-V ESP32-S31 at 320 MHz with Wi-Fi 6, 16 MB of quad SPI flash and 16 MB of octal PSRAM. Its node reports `kubernetes.io/arch: riscv32`, and with PSRAM it defaults to the control plane. The console runs on both Type-C ports: USB Serial/JTAG, and the CP2102N USB-to-UART bridge on UART0. [ESP32-S31](#esp32-s31) shows how to build and flash the firmware. The `s31-coreboard` profile drives the on-board audio and LED and offers pods the header pins that nothing on the board uses:
+
+| Function | GPIO |
+| --- | --- |
+| ES8311 codec, I2C control at address `0x18` | SDA 51, SCL 50 |
+| ES8311 codec, I2S | MCLK 52, BCLK 53, LRCK 55, data to the codec 56, data from the codec 54 |
+| NS4150B speaker amplifier, enable (high for on) | 57 |
+| WS2812 RGB LED, through a level shifter (`k32_led_set`) | 60 |
+| Boot button, low when pressed | 61, input only (`button` driver: `pull: up`, `active: low`) |
+| Gigabit Ethernet PHY (RGMII, MDIO, reset, interrupt), reserved | 4 to 19 |
+| USB-to-UART bridge (UART0), reserved | TX 58, RX 59 |
+| Header J2 | 0 to 3, 20 to 25, 35, 38 to 40, 42 to 49 |
+| Header J2, strapping pins, input only | 36, 37 |
+
+ADC1 channels 0 to 7 sample GPIO 42 to 49, all on the header. The ESP32-S31's ADC has one input range and returns 12-bit readings. GPIO 4, on the header, is also the Ethernet PHY's interrupt line, so the profile reserves it. The Ethernet port and the USB 2.0 host port are not supported yet: the node uses Wi-Fi, and the PHY's pins stay reserved.
+
+```sh
+# on the board's console
+K32_CMD:BOARD:s31-coreboard
+```
+
+Measured on the board: 20.83 million wasm3 operations per second (`kube32.io/interp-mops`; 9.65 on an AtomS3 Lite), 15.19 MB of PSRAM free with the node running, and 8 ms to load and compile a 3.5 KB pod. The chip's temperature sensor reads whole degrees: chips of revision v0.0 carry no calibration for it in eFuse.
 
 ## Memory budget
 
@@ -103,9 +129,29 @@ Layout in `partitions.csv` for 8 MB flash:
 | `journal` | `0x6A0000` | 1 MB | Raw object store journal (`data`, subtype `0x40`), used when no microSD card is mounted |
 | `storage` | `0x7A0000` | 384 KB | FAT filesystem with wear levelling at `/data`, used when no microSD card is mounted |
 
+`partitions-esp32s31.csv` has the same partitions on 16 MB of flash, with 5 MB app slots for the ESP32-S31 image of about 3.5 MB: `ota_0` at `0x20000`, `ota_1` at `0x520000`, `journal` (1 MB) at `0xA20000` and `storage` (4.9 MB) at `0xB20000`. The ESP32-S31's bootloader starts at `0x2000`.
+
 ## Other targets
 
 The firmware also builds with ESP-IDF 6.1 for the ESP32-C3 (`sdkconfig.defaults.esp32c3`, 4 MB flash, one app slot, no firmware rollouts) and the ESP32-P4 (`sdkconfig.defaults.esp32p4`), with `idf.py -DIDF_TARGET=<target>` as in [CONTRIBUTING.md](https://github.com/arterialist/kube32/blob/main/CONTRIBUTING.md#firmware). Neither image has run on a board yet. An ESP32-C3 image built with `sdkconfig.defaults.qemu` boots in Espressif's QEMU (`-nic user,model=open_eth`), joins a control plane over the emulated Ethernet and runs pods. The ESP32-P4 has no radio, so a P4 node has no network in this firmware yet.
+
+### ESP32-S31
+
+No ESP-IDF release supports the ESP32-S31 yet. The firmware builds with ESP-IDF master at commit `7b9cc1ac79f865983f59bb8ff3ff43eb74ff1dbe`, the commit CI builds with. `sdkconfig.defaults.esp32s31` sets 16 MB of quad SPI flash at 80 MHz, octal PSRAM at 200 MHz, the cores at 320 MHz and `partitions-esp32s31.csv`:
+
+```sh
+# in an ESP-IDF clone
+git fetch --depth 1 origin 7b9cc1ac79f865983f59bb8ff3ff43eb74ff1dbe
+git checkout FETCH_HEAD
+git submodule update --init --recursive --depth 1
+./install.sh esp32s31
+. ./export.sh
+# in the kube32 checkout
+idf.py -B build-esp32s31 -DIDF_TARGET=esp32s31 -DSDKCONFIG=build-esp32s31/sdkconfig build
+scripts/flash.sh --build build-esp32s31 <serial port>
+```
+
+Flashing the ESP32-S31 takes esptool 5.6 or later, which ESP-IDF at that commit installs; PlatformIO's esptool 5.4 cannot flash it. `scripts/flash.sh --build` picks an esptool that is new enough and writes the parts that `flash_args` in the build directory lists, the bootloader at `0x2000`. The browser installer writes ESP32-S3 releases only.
 
 ## Linux boards
 
@@ -178,6 +224,7 @@ Settings in `platformio.ini` and `sdkconfig.defaults`:
 
 - Target CPU clock is 240 MHz. Flash runs at 80 MHz, written with `--flash-mode dio` by `scripts/flash.sh`.
 - PSRAM is configured for 80 MHz quad SPI via `CONFIG_SPIRAM_MODE_QUAD=y` and `CONFIG_SPIRAM_IGNORE_NOTFOUND=y` so the same image boots on boards without PSRAM.
+- The ESP32-S31 image (`sdkconfig.defaults.esp32s31`) runs its cores at 320 MHz, the most the chip and the ESP32-S31-WROOM-3 module support, with 16 MB of flash in QIO mode at 80 MHz and octal PSRAM at 200 MHz.
 
 ## Limitations
 

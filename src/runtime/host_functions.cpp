@@ -25,6 +25,7 @@
 #if defined(KUBE32_TARGET_ESP32)
 #include "driver/gpio.h"
 #include "esp_adc/adc_oneshot.h"
+#include "soc/soc_caps.h"
 #endif
 
 namespace kube32::runtime {
@@ -569,7 +570,8 @@ static bool adc1_prepare(uint32_t channel) {
     }
     if (!(s_adc1_configured_mask & (1u << channel))) {
         adc_oneshot_chan_cfg_t ch_cfg = {};
-        ch_cfg.atten = ADC_ATTEN_DB_12;
+        // The widest input range; a chip with one range (ESP32-S31) has only that
+        ch_cfg.atten = SOC_ADC_ATTEN_NUM > 1 ? ADC_ATTEN_DB_12 : ADC_ATTEN_DB_0;
         ch_cfg.bitwidth = ADC_BITWIDTH_DEFAULT;
         if (adc_oneshot_config_channel(s_adc1_handle, static_cast<adc_channel_t>(channel), &ch_cfg) != ESP_OK) return false;
         s_adc1_configured_mask |= (1u << channel);

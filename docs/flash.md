@@ -1,6 +1,6 @@
 # Install from the browser
 
-The installer on this page writes the latest kube32 release to an ESP32-S3 board over USB and then sets up the board's Wi-Fi. It needs no toolchain, only a desktop browser with Web Serial, such as Google Chrome or Microsoft Edge.
+The installer on this page writes the latest kube32 release to an ESP32-S3 board over USB and then sets up the board's Wi-Fi. An ESP32-S31 board takes a firmware built from source and flashed with `scripts/flash.sh --build` ([ESP32-S31](hardware-spec.md#esp32-s31)). It needs no toolchain, only a desktop browser with Web Serial, such as Google Chrome or Microsoft Edge.
 
 <p>
 <esp-web-install-button manifest="../firmware/latest/manifest.json">

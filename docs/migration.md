@@ -1,8 +1,8 @@
 # Pod migration
 
-A running request pod can move to another node and continue with its state. The pod does not start again: its counters, buffers and clock carry over, and `k32_init` does not run a second time. A pod moves on request, when a node is drained, when its node runs short of memory, and when a faster node joins or leaves. A pod with periodic checkpoints comes back on another node when its node is lost.
+A running request pod can move to another node and continue with its state. The pod does not start again: its counters, buffers and clock carry over, and `k32_init` does not run a second time. A pod moves on request, when a node is drained, when its node runs short of memory, when a faster node joins or leaves, and to the node that has the hardware its current step needs. A pod with periodic checkpoints comes back on another node when its node is lost. The state of one pod can also be copied into another pod that runs the same module, which then continues from it ([Copies](#copies)).
 
-Nodes of any architecture take part. A pod saved on an ESP32-S3 restores on another board or on a `kube32-sim` worker on a laptop, and the other way round.
+Nodes of any architecture take part. A pod saved on an ESP32-S3 restores on another board or on a `kube32-sim` worker on a laptop, and the other way round. The module computes the same bits on every node, floating point included ([Wasm runtime](architecture/wasm-runtime.md#floating-point)), so a pod that integrates a simulation continues after a move exactly as it would have where it was.
 
 ## What moves
 
@@ -27,8 +27,8 @@ A move that cannot happen is refused. The Checkpoint turns `Failed`, `status.blo
 
 | Blocker | Found by | Cause |
 | --- | --- | --- |
-| `grant <resource>` | Control plane, from the pod spec | A request or limit for a hardware resource: `hardware.kube32.io/*` other than `ipc`, or `esp32.io/*` |
-| `grant capability <NAME>` | Control plane | `securityContext.capabilities.add` names `DISPLAY`, `KEYBOARD`, `SPEAKER`, `SD` or `CHIP_TEMP` |
+| `grant <resource>` | Control plane, from the pod spec | A request or limit for a hardware resource: `hardware.kube32.io/*` other than `ipc`, or `esp32.io/*`. The on-board device grants of a [hardware-following pod](#hardware-following-pods) are not blockers |
+| `grant capability <NAME>` | Control plane | `securityContext.capabilities.add` names `DISPLAY`, `KEYBOARD`, `SPEAKER`, `SD` or `CHIP_TEMP`. For a hardware-following pod, only `SD` |
 | `grant kube32.io/i2c-device` | Control plane | The pod has an I2C device grant |
 | `volume claim <claim> on node storage` | Control plane | A `persistentVolumeClaim` or `kube32.io/sd` volume |
 | `annotation kube32.io/migration: Never` | Control plane | The pod opts out |
@@ -77,6 +77,7 @@ When the replacement fails to restore (`RestoreError`), fails, or does not run w
 | `Saving` | The node freezes the pod and sends its state |
 | `Saved` | A Save checkpoint is stored |
 | `Moving` | The replacement is restoring on the target |
+| `Copying` | The target pod of a [Copy](#copies) is restoring the copied state |
 | `Completed` | The replacement runs on the target |
 | `Failed` | Refused or rolled back, see `status.message` and `status.blockers` |
 
@@ -86,12 +87,46 @@ The controller records each decision as an event on the pod:
 | --- | --- |
 | `Checkpointed` | A Save checkpoint is stored |
 | `CheckpointFailed` | A Save checkpoint failed |
-| `Moving` | The replacement is bound to the target |
-| `Moved` | The replacement runs. The message gives the time from the freeze |
-| `MoveFailed` | A move was refused or rolled back, or a restore failed |
+| `Moving` | The replacement is bound to the target. For a move a [hardware need](#hardware-following-pods) asked for, the message names the need: `Moving from node devkit to node cardputer for its need hardware.kube32.io/tft-display,hardware.kube32.io/keyboard with checkpoint ...` |
+| `Moved` | The replacement runs. The message gives the time from the freeze, and the need as `Moving` does |
+| `MoveFailed` | A move was refused or rolled back, a restore failed, or no node has the devices a hardware-following pod needs |
 | `Restored` | A pod restored outside a move runs: after a node loss or a rollback. The message gives the checkpoint's age |
+| `Copying`, `Copied`, `CopyFailed` | On the target pod of a [Copy](#copies): restoring, running with the copied state (the message gives the time from the snapshot), or refused or failed |
 
 `kube32 checkpoint <pod>` saves a pod's state without moving it. The pod keeps running.
+
+## Copies
+
+A Copy restores the state of a running pod into another pod that runs the same module. The source pod keeps running. The target pod continues from the source's memory, globals and clock, as if it had run the source's history. Replicas of a deterministic computation use it: a replica whose state diverged, that started over, or whose node is gone takes the state of a healthy one and agrees with it again, on any architecture.
+
+```
+kube32 copy replica-a --into replica-c
+```
+
+or create a Checkpoint:
+
+```yaml
+apiVersion: kube32.io/v1
+kind: Checkpoint
+metadata:
+  name: replica-c-from-a
+spec:
+  podName: replica-a        # the pod whose state is copied
+  action: Copy
+  target:
+    podName: replica-c      # the pod that takes it, required
+    nodeName: devkit        # optional, or nodeSelector
+```
+
+The Checkpoint controller carries out the copy:
+
+1. It checks both pods. The source can be checkpointed, and the target can move: neither has a [blocker](#what-keeps-a-pod-from-moving). The target runs the same module (the same `kube32.io/wasm-sha256` for an inline image, else the same image) and is not being deleted.
+2. It picks the target pod's node. The target stays on its node while that node is Ready and `spec.target` names no node. Otherwise it goes to `spec.target.nodeName`, or to the node the scheduler picks with `spec.target.nodeSelector` added to the pod's own, never to its own node when that node is not Ready.
+3. It asks the source's kubelet for a snapshot with the pod left running and stores the bytes as the Checkpoint's data.
+4. It replaces the target pod in one write, as a move replaces a pod: the same name, spec, labels and owners, a new uid, `spec.nodeName` set to the node of step 2 and `kube32.io/restore-from` naming the Checkpoint. The target's kubelet stops the old instance and the node it is bound to restores the copy. `k32_restored` runs there.
+5. Once the target runs, the copy is `Completed` and the annotation is removed. A `RestoreError`, a `Failed` pod or no `Running` within 60 s starts the target afresh where it is bound, and the copy is `Failed`.
+
+The target keeps its own spec: environment, labels, limits, events and channels. Its memory holds the source's values, so `k32_restored` reads again what differs from pod to pod, such as a name or a role from the environment. No other checkpoint of the target starts while the copy restores, and none of the source while its snapshot is taken.
 
 ## Drain and evictions
 
@@ -118,12 +153,99 @@ The pod annotation `kube32.io/migration` sets the policy:
 | `Never` | The pod never moves and is never checkpointed. Evictions delete it |
 | `Auto` | `OnDrain`, and the pod also moves on its own, as below |
 
-An `Auto` pod moves on its own in two cases:
+An `Auto` pod moves on its own in three cases:
 
 - Memory pressure. A kubelet reports the node condition `MemoryPressure` while its free heap is below 24 KiB. The controller then moves the `Auto` pod on that node that requests the most memory, at most one pod per node per minute.
 - A faster node, with `kube32.io/placement: fastest`. Each node reports its interpreter speed at boot in the annotation `kube32.io/interp-mops`, measured on a fixed kernel. The pod moves to the fastest Ready node that takes it when that node is at least twice as fast as its current one. A move of such a pod without a target, such as a drain, also goes to the fastest node that fits. When the fast node leaves, the pod comes back: a drain or a stopped `kube32-sim` worker moves it, and a lost node restores it from its periodic checkpoint.
+- Hardware, with `kube32.io/placement: hardware`. The pod moves to a node that has the devices its current step needs, see [Hardware-following pods](#hardware-following-pods).
 
-A pod moves on its own at most once per 10 minutes.
+A pod moves for memory pressure or a faster node at most once per 10 minutes. Moves that a pod's hardware need asks for come at most once per 3 seconds: the pod asks for each of them itself, between two steps of its own work.
+
+## Hardware-following pods
+
+A job whose steps use different devices can run each step on the node that has that step's device. The pod moves with its state from node to node, and on each node it uses the hardware there. A check-in station is such a job: it reads a scale, takes a label typed on a keyboard and plays a confirmation on a speaker, where each device is on another board.
+
+A move costs seconds (see [Measured times](#measured-times)), so it pays for a step that uses its device many times or on a tight schedule: a loop of key reads and redraws, a tone sequence with fixed gaps. A step that reads a sensor once calls the sensor's [Device](devices.md) Service instead and stays where it is.
+
+### The pod
+
+```yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  name: checkin
+  annotations:
+    kube32.io/migration: Auto
+    kube32.io/placement: hardware
+    kube32.io/prefer-nodes: "cardputer, kube32.io/board=s31-coreboard"   # optional
+spec:
+  containers:
+    - name: checkin
+      image: wasm://inline/checkin
+      resources:
+        requests:
+          memory: 8Ki
+          hardware.kube32.io/tft-display: "1"   # every device of the job's life
+          hardware.kube32.io/keyboard: "1"
+          hardware.kube32.io/speaker: "1"
+          hardware.kube32.io/led: "1"
+```
+
+The spec lists every on-board device the pod uses over its life: `hardware.kube32.io/tft-display`, `keyboard`, `touch`, `speaker`, `microphone`, `led` and `chip-temp`, as resources or as their capabilities in `securityContext.capabilities.add`. These grants follow the pod and do not keep it from moving. The other grants still do: pins and buses (`esp32.io/*`), I2C device grants and volumes name the wiring or the storage of one node.
+
+### The need
+
+The pod tells its node what its current step needs with `k32_need`, a comma-separated list of device names: resource names (`hardware.kube32.io/speaker`), the part after `hardware.kube32.io/` (`speaker`) or capabilities (`SPEAKER`). An empty list is a step without hardware.
+
+```c
+int32_t k32_need(const char* resources, uint32_t len);
+```
+
+| Result | Meaning |
+| --- | --- |
+| `K32_OK` (`0`) | The pod holds every named grant on this node |
+| `K32_NEED_MOVING` (`1`) | The node lacks one: the pod moves to a node that has them. It runs on until it is frozen |
+| `K32_ERR_PERM` (`-1`) | The spec does not list a named device |
+| `K32_ERR_NODEV` (`-19`) | The node lacks one and the pod does not follow its hardware |
+| `K32_ERR_INVAL` (`-22`) | An entry names no on-board device, or the list is longer than 256 bytes |
+| `K32_ERR_FAULT` (`-14`) | The list is outside linear memory |
+
+The call returns at once. The kubelet writes each change of the need to the Pod's annotation `kube32.io/needs`, as resource names (`hardware.kube32.io/speaker,hardware.kube32.io/led`), and writes a change it could not deliver again a second later. A pod calls `k32_need` on every tick of a step: after the move, `k32_restored` runs on the new node and the same call answers `K32_OK` there.
+
+### Where the pod goes
+
+- The scheduler binds a hardware-following pod only to a node that offers every device of `kube32.io/needs`: one whose allocatable `hardware.kube32.io/*` resources hold them. The other devices the spec lists do not filter nodes. A pod created without the annotation fits any node; a pod created with it starts on a node with those devices. A node that fits none fails with `Insufficient hardware.kube32.io/<device>`.
+- `kube32.io/prefer-nodes` ranks the nodes that fit, best first: node names or `<label>=<value>`, comma-separated. A node that matches an earlier entry wins over the scheduler's other scores. It applies to any pod, at binding and at every move.
+- The Checkpoint controller moves a running hardware-following pod when its node lacks a device of its need. It creates a Move Checkpoint with the label `kube32.io/trigger: hardware` to the node the scheduler picks among the other nodes: Ready and schedulable, matching the pod's node selector, with room for its memory and its pod count, offering the need, by `kube32.io/prefer-nodes`. The move then runs as any move does, and the `Moving` and `Moved` events name the need.
+- A move without a target, such as a drain, also goes to a node that offers the need.
+- A pod's need moves it at most once per 3 seconds. These moves do not count against the 10 minutes of the other `Auto` moves.
+- When no node has the need, a `MoveFailed` event names it and the scheduler's reason, once for each need: `No node has hardware.kube32.io/speaker,hardware.kube32.io/led for the pod's need (0/4 nodes are available: ...): it runs on node cardputer and moves once a node has it`. The pod keeps running, `k32_need` keeps answering `K32_NEED_MOVING` and the annotation keeps the need. A Node that joins or changes its devices starts a pass of the controller, which moves the pod once a node fits.
+
+### Grants on each node
+
+On each node the capability firewall gives the pod the devices its spec lists that the node has. A call to a listed device the node lacks returns `K32_ERR_PERM`, as any call without its grant does, and the node logs the violation. A pod that does not follow its hardware holds every device it lists, whatever the node has.
+
+The state of the hardware stays on its node. The display, keyboard, speaker, microphone, touch panel and LED are devices of the board, shared by the pods that hold their grants. A pod holds no handle of its own on them between two calls, and freezes only between calls. When the pod leaves, its grants go: the panel keeps what the pod drew, the LED keeps its color, keys typed after the pod left stay in the board's queue, and a sound plays to its end. So a pod turns the LED off and lets its sound end before it needs other hardware, and sets up the hardware of its next step on the node it arrives at: `k32_restored` runs there first, then the step.
+
+### In the simulator
+
+`kube32-sim --sim-devices <list>` gives a node stand-in devices: the Node advertises their grants and the calls print what the pod does. Workers with different lists model boards with different hardware ([CLI reference](cli-reference.md)):
+
+```
+kube32-sim --role worker --node-name desk --node-id 1 --join http://192.0.2.10:6443 --sim-devices tft-display,keyboard
+kube32-sim --role worker --node-name bell --node-id 2 --join http://192.0.2.10:6443 --sim-devices speaker,led
+```
+
+### Example
+
+`apps/checkin` with `examples/checkin.yaml` is a check-in job of four steps. The weight and the label are globals in its linear memory, so they travel with it:
+
+| Step | Needs | Runs on | Why there |
+| --- | --- | --- | --- |
+| 1 weigh | nothing | where `kube32.io/prefer-nodes` puts it, a devkit | The scale's driver pod owns its I2C bus; one reading is one small request to the scale's Service |
+| 2 label | display and keyboard | a Cardputer (Xtensa) | Typing is a loop of key reads and redraws: a function call each on the board with the keys |
+| 3 confirm | speaker and LED | an ESP32-S31 CoreBoard (RISC-V) | The tones keep their spacing only on a local speaker; the LED flash is on the same board |
+| 4 log | nothing | where step 3 ran | The record goes to the pod's log |
 
 ## Periodic checkpoints and node loss
 
@@ -137,7 +259,7 @@ When a node stops renewing its Lease, the node lifecycle controller evicts its p
 - Other Checkpoints, `Failed` ones included, go 1 hour after they finished.
 - A Checkpoint stays while a pod's `kube32.io/restore-from` names it.
 
-The label `kube32.io/trigger` tells what created a Checkpoint: `periodic`, `eviction`, `memory-pressure` or `placement`. Checkpoints a user creates carry none.
+The label `kube32.io/trigger` tells what created a Checkpoint: `periodic`, `eviction`, `memory-pressure`, `placement` or `hardware`. Checkpoints a user creates carry none.
 
 ## Snapshot format
 
@@ -217,8 +339,8 @@ A pod with the annotation `kube32.io/restore-from: <checkpoint>` starts from tha
 | --- | --- |
 | `spec.podName` | The pod, required |
 | `spec.containerName` | Its container. Default: the only container |
-| `spec.action` | `Save` (the default) or `Move` |
-| `spec.target` | For `Move`: `nodeName` or `nodeSelector` |
+| `spec.action` | `Save` (the default), `Move` or `Copy` |
+| `spec.target` | For `Move`: `nodeName` or `nodeSelector`. For `Copy`: `podName`, the pod that takes the state (required), and optionally `nodeName` or `nodeSelector` |
 | `status.phase` | `Pending`, `Saving`, `Saved`, `Moving`, `Completed` or `Failed` |
 | `status.nodeName`, `status.takenAt` | Where and when the snapshot was taken |
 | `status.sizeBytes`, `status.snapshotSha256`, `status.imageSha256`, `status.podTimeMs` | Facts of the stored snapshot |
@@ -239,14 +361,15 @@ Snapshot data lives in the control plane's memory, outside the object store, up 
 
 `kubectl get checkpoints` prints `NAME`, `POD`, `ACTION`, `PHASE`, `NODE`, `SIZE` and `AGE`. `-o wide` adds `TARGET`, `NEW POD` and `MESSAGE`.
 
-The Checkpoint controller carries out `Save` and `Move` Checkpoints, see [Moves](#moves).
+The Checkpoint controller carries out `Save`, `Move` and `Copy` Checkpoints, see [Moves](#moves) and [Copies](#copies).
 
 ## Limits
 
 - The control plane takes one snapshot at a time. Others wait for it.
 - A move freezes the pod for the snapshot and the transfer. Requests in that time answer `503` with `Retry-After: 1`.
 - A replacement that does not run within 60 s rolls back. When the source node is not Ready then, the pod waits for the scheduler and restores where it is bound.
-- The cooldowns of the `Auto` policy live in memory: a control plane restart clears them.
+- The cooldowns of the `Auto` policy live in memory: a control plane restart clears them. So does the record of the needs a `MoveFailed` event named, which the next pass names again.
+- A hardware-following pod's step runs where its node has the step's devices. Devices the Node does not advertise (a part on a GPIO pin, an I2C part) are reached through their [Device](devices.md) Service, not followed.
 - A moved pod has a new uid and creation time, so `kubectl get pods` shows its age from the move.
 - Checkpoint data lives in the control plane's memory, 256 KiB on the board, and counts against the memory the control plane offers pods. The oldest data goes first when the space is full, and a control plane restart loses it. A restore from a Checkpoint without data fails, and the pod starts afresh.
 - A pod moves only to a node with room for it. A pod with one 64 KiB page does not fit a Cardputer that runs three drivers.

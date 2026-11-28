@@ -6,7 +6,7 @@ Use `kubectl` and k9s to manage the cluster. Use the tools below to run the host
 | --- | --- |
 | `kube32` | Flash boards, open their serial console, run the simulator, create, build, check, deploy, embed, and push Wasm pods and node storage files, roll out firmware, checkpoint and move pods, and serve the cluster's Devices to AI agents over MCP ([Install](install.md)) |
 | `kube32-sim` | Run control-plane and worker nodes as host processes |
-| `scripts/flash.sh` | Build and flash firmware to an ESP32-S3 board from a checkout |
+| `scripts/flash.sh` | Build and flash firmware to an ESP32-S3 board from a checkout, or flash an `idf.py` build of any target |
 | `tools/tessera_loadtest.py` | Run concurrent HTTP load tests against a Tessera ingress |
 | `tools/embed_assets.py`, `tools/pio_embed.py` | Generate embedded Wasm image and web asset tables |
 
@@ -35,6 +35,7 @@ Use `kubectl` and k9s to manage the cluster. Use the tools below to run the host
 | `--pod-cores <n>` | `2` (`1` with `--psram 0`) | [Pod workers](architecture/wasm-runtime.md#pod-workers) that tick pods and deliver their events in parallel, as on a board with PSRAM. `1` runs one tick loop and one event thread, as a board without PSRAM. |
 | `--system-reserved <size>` | `16Ki` (`24Ki` with `--psram 0`) | Memory the modelled heap keeps back for the system, the equivalent of a board's `K32_CMD:SYSRESERVE`. Pods are never given it: allocatable `memory` and `esp32.io/psram` leave it out, and the Node reports it in the `kube32.io/system-reserved` annotation. It takes effect with `--heap-budget` or `--psram 0`. A control plane board keeps `192Ki`. |
 | `--sim-i2c <parts>` | none | Simulated I2C parts on bus 0 of this process's node, for example `pahub,bme688@2,miniscale@3,rfid@4`. The format is `<part>[:0x<address>][@<PaHub channel>]`, and the parts are `pahub`, `bme688`, `miniscale` and `rfid`. Discovery finds them and drivers read them ([Devices](devices.md#compute-on-a-laptop)). |
+| `--sim-devices <list>` | none | On-board devices this process's nodes offer pods, from `tft-display`, `keyboard`, `touch`, `speaker`, `microphone` and `led`, comma-separated. The Node advertises their `hardware.kube32.io/*` grants and stand-ins serve the calls: the display and the speaker print what pods do, the LED prints its color and the keyboard has no keys. A cluster of such workers models boards with different hardware for [hardware-following pods](migration.md#hardware-following-pods). Not with a Linux board's own devices. |
 | `--sim-mic <file>` | none | What `k32_mic_read` hears on this process's nodes: 16 kHz mono 16-bit PCM, raw or WAV. The file plays in real time from the first read and loops; as on the board, the microphone keeps the last 64 ms between reads and starts afresh after a read with no samples asked for or a second without reads. |
 | `--fb <device>` | none | Linux: the framebuffer pods draw on, at 16 or 32 bits a pixel ([below](#linux-boards)). |
 | `--keyboard-dev <device>` | none | Linux: the evdev keyboard `k32_key_read` reads. |
@@ -78,7 +79,11 @@ A worker whose machine changes network keeps working without a restart or a new 
 
 **Node address.** With `--node-ip auto`, and with no `--node-ip` when the worker's API server is not on its own host, the node address is the local address that the system uses to reach the API server. The worker reads it again before each registration and heartbeat and patches the Node's `InternalIP` when it changes, so boards keep reaching the node's pods. When no route exists, as with Wi-Fi down, the previous address stays. A worker that joins `localhost` or a `127.0.0.0/8` address reports `127.0.0.1` unless `--node-ip` says otherwise, and `--node-ip <ip>` fixes the address. On a control plane or a standalone process, `auto` is the local address of the default route.
 
-**API address.** A control plane announces its API server address in its HELLO frames on the IPC channel ([Peer discovery](architecture/espnow-ipc.md#peer-discovery)), as boards do. A `kube32-sim` control plane announces the address of `--node-ip`, or the one it finds with `auto`, and nothing without `--node-ip`, because the loopback default names its own host to no other. A worker that has had no answer from its API server for 30 seconds, and hears a control plane announce another address, dials that address at the same port instead. Its pods keep running, and the worker logs `[NET] no answer from <old>; the control plane announces <new>, switching`. A worker hears the announcements from the peers named with `--peer`, from a board control plane, which sends HELLO to the address of every registered Node, and, when it dials a host other than its own, from a control plane that hears the worker's HELLO frames sent to the UDP broadcast address on port 7400: the control plane adds the worker as a peer and answers it with its API address.
+**API address.** A control plane announces its API server address in its HELLO frames on the IPC channel ([Peer discovery](architecture/espnow-ipc.md#peer-discovery)), as boards do. A `kube32-sim` control plane announces the address of `--node-ip`, or the one it finds with `auto`, and nothing without `--node-ip`, because the loopback default names its own host to no other.
+
+A worker's `--join` address is its home address. A worker that has had no answer from its API server for 30 seconds tries, every 10 seconds, its home address and then the addresses its control plane announces, newest announcement first and at most four, and dials the first one where a kube32 API server answers `GET /version` within 1.5 seconds, at the same port. Its pods keep running, and the worker logs `[NET] no answer from <old>; the announced address <new> answers, switching`, or `the home address <new>` when it goes back to the address it was given. The worker does not follow an announced address where no API server answers, such as the address a control plane gets on a network the worker cannot reach, behind a phone hotspot's NAT for example, and logs `[NET] <node> announces <address>, where no API server answers: not followed`. Only an announcement from a HELLO of the last 15 seconds counts. The worker's control plane is the peer that announces the address the worker dials while that address answers, logged as `[NET] the control plane is <node>, at <address>`. Once the worker knows its control plane, it ignores the addresses other peers announce.
+
+A worker hears the announcements from the peers named with `--peer`, from a board control plane, which sends HELLO to the address of every registered Node, and from a control plane that hears the worker's HELLO frames sent to the UDP broadcast address on port 7400: the control plane adds the worker as a peer and answers it with its API address. A board worker always sends its HELLO frames to the broadcast address, and a `kube32-sim` worker does when it dials a host other than its own.
 
 ### Modeling boards without PSRAM
 
@@ -138,6 +143,7 @@ Pod migration commands (see [Pod migration](migration.md)) create and read Check
 | --- | --- |
 | `checkpoint <pod>` | Create a `Save` Checkpoint named `<pod>-<suffix>` and wait until it is `Saved` or `Failed`. Prints the size and the node. The pod keeps running. Flags: `-n <ns>`, default `default`, `-c <container>`, `--no-wait`, `--timeout <s>`, default `60`. |
 | `move <pod> [--to <node>]` | Create a `Move` Checkpoint and wait until it is `Completed` or `Failed`. Without `--to` the scheduler picks the node. Prints the move's message, or the reason and each blocker. Flags: `-n <ns>`, `-c <container>`, `--no-wait`, `--timeout <s>`, default `120`. |
+| `copy <pod> --into <pod> [--to <node>]` | Create a `Copy` Checkpoint: the state of the first pod restores into the second, which runs the same module ([Copies](migration.md#copies)). Waits until it is `Completed` or `Failed`. Without `--to` the target pod stays on its node while that node is Ready. Prints the copy's message, or the reason and each blocker. Flags: `-n <ns>`, `-c <container>`, `--no-wait`, `--timeout <s>`, default `120`. |
 | `checkpoints` | List the Checkpoints of a namespace (`-n`, default `default`, or `-A`), oldest first: name, pod, action, phase, node, target, size, trigger and message. |
 
 Exit codes:
@@ -159,13 +165,14 @@ Build if needed and flash one board over serial from a checkout, see [Flashing](
 
 ```
 scripts/flash.sh <serial port> [baud]
+scripts/flash.sh --build <idf.py build directory> <serial port> [baud]
 ```
 
 - Uses `<serial port>` or `KUBE32_SERIAL_PORT`, and defaults to `460800` baud.
-- Locates `pio` on `PATH` or in `${PLATFORMIO_CORE_DIR:-~/.platformio}/penv/bin`, and `esptool` in PlatformIO's virtualenv or system `python3`.
-- Runs `pio run -e esp32s3` if `bootloader.bin`, `partitions.bin`, or `firmware.bin` is missing from `.pio/build/esp32s3/`.
-- Writes the bootloader at `0x0`, the partition table at `0x8000`, an erased `otadata`, and the firmware into the first app slot, at the offsets in `partitions.csv`.
-- Writes 256-byte paced blocks on CH340 bridges, vendor ID `0x1a86`. Uses `KUBE32_FLASH_BEFORE`, default `default-reset`, and `KUBE32_FLASH_AFTER`, default `hard-reset` on CH340 and `watchdog-reset` on native USB.
+- Locates `pio` on `PATH` or in `${PLATFORMIO_CORE_DIR:-~/.platformio}/penv/bin`. Runs `esptool` from the first of `$KUBE32_PYTHON`, PlatformIO's virtualenv and system `python3` whose esptool is new enough for the chip: 5.6 or later for the ESP32-S31.
+- Without `--build`, runs `pio run -e esp32s3` if `bootloader.bin`, `partitions.bin`, or `firmware.bin` is missing from `.pio/build/esp32s3/`, then writes the bootloader at `0x0`, the partition table at `0x8000`, an erased `otadata`, and the firmware into the first app slot, at the offsets in `partitions.csv`.
+- With `--build`, flashes the `idf.py` build in that directory for the target it was built for: the parts and offsets its `flash_args` lists, the same set (on the ESP32-S31, the bootloader at `0x2000`).
+- Writes 256-byte paced blocks on CH340 bridges, vendor ID `0x1a86`. Uses `KUBE32_FLASH_BEFORE`, default `default-reset`, and `KUBE32_FLASH_AFTER`, default `watchdog-reset` on an ESP32-S3's native USB and `hard-reset` otherwise.
 
 ## kube32 gateway
 

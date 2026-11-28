@@ -2,6 +2,8 @@
 #include "runtime/container_lifecycle.hpp"
 #include <iostream>
 #include <cassert>
+#include <cfenv>
+#include <cstring>
 #include <vector>
 
 using namespace kube32::runtime;
@@ -293,6 +295,55 @@ void test_interp_i64_check() {
     std::cout << "[PASS] test_interp_i64_check" << std::endl;
 }
 
+// div_lo(a, b): the low word of the f64 quotient a / b. To nearest, 1 / 10
+// and -1 / 10 end in ...9999A; toward zero, downward and upward, one of them
+// ends in ...99999.
+static const uint8_t wasm_div_lo[] = {
+    0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00,                    // Header
+    0x01, 0x07, 0x01, 0x60, 0x02, 0x7f, 0x7f, 0x01, 0x7f,              // Type: (i32, i32) -> i32
+    0x03, 0x02, 0x01, 0x00,                                            // Function 0: type 0
+    0x07, 0x0a, 0x01, 0x06, 'd', 'i', 'v', '_', 'l', 'o', 0x00, 0x00,  // Export: div_lo
+    0x0a, 0x0d, 0x01, 0x0b, 0x00,                                      // Code: no locals
+    0x20, 0x00, 0xb7, 0x20, 0x01, 0xb7, 0xa3,                          // f64(a) / f64(b)
+    0xbd, 0xa7, 0x0b                                                   // i64.reinterpret_f64, i32.wrap_i64, end
+};
+
+static uint32_t native_div_lo(double a, double b) {
+    volatile double x = a, y = b;
+    const double q = x / y;
+    uint64_t bits = 0;
+    std::memcpy(&bits, &q, sizeof bits);
+    return static_cast<uint32_t>(bits);
+}
+
+// A call into a pod rounds to nearest, ties to even, whatever rounding mode
+// the calling thread holds: the thread is set back to it and the call counted
+void test_calls_round_to_nearest() {
+    ContainerConfig cfg;
+    cfg.pod_id = "round-pod";
+    cfg.container_name = "round";
+    cfg.memory_limit_bytes = 64 * 1024;
+    ContainerLifecycleController controller(cfg);
+    assert(controller.deploy(wasm_div_lo, sizeof(wasm_div_lo)));
+    const uint32_t nearest = 0x9999999Au;
+    assert(static_cast<uint32_t>(controller.call_function("div_lo", {1, 10})) == nearest);
+    assert(static_cast<uint32_t>(controller.call_function("div_lo", {-1, 10})) == nearest);
+
+    const uint32_t resets = rounding_mode_resets();
+    for (int mode : {FE_TOWARDZERO, FE_DOWNWARD, FE_UPWARD}) {
+        assert(std::fesetround(mode) == 0);
+        // The thread itself rounds that way
+        assert(native_div_lo(1, 10) != nearest || native_div_lo(-1, 10) != nearest);
+        assert(static_cast<uint32_t>(controller.call_function("div_lo", {1, 10})) == nearest);
+        assert(std::fegetround() == FE_TONEAREST);
+        assert(std::fesetround(mode) == 0);
+        assert(static_cast<uint32_t>(controller.call_function("div_lo", {-1, 10})) == nearest);
+    }
+    std::fesetround(FE_TONEAREST);
+    assert(rounding_mode_resets() == resets + 6);
+    std::cout << "[PASS] test_calls_round_to_nearest" << std::endl;
+}
+
 int main() {
     std::cout << "========================================" << std::endl;
     std::cout << " Running Wasm3 Sandboxed Runtime Tests  " << std::endl;
@@ -306,6 +357,7 @@ int main() {
     test_trap_report_mapping();
     test_container_lifecycle_thread();
     test_interp_i64_check();
+    test_calls_round_to_nearest();
 
     std::cout << "All Wasm Runtime tests passed successfully!" << std::endl;
     return 0;

@@ -49,6 +49,7 @@ All imports belong to the `env` module (`src/runtime/app_pod.cpp`, `src/runtime/
 | ESP32 peripherals | `esp32_gpio_set_mode/write/read`, `esp32_adc_read`, `esp32_i2c_write/read`, `esp32_uart_write/read` | `i(ii)`, `i(ii)`, `i(i)`, `i(i)`, `i(iiii)`, `i(iiii)`, `i(iii)`, `i(iii)` | `esp32.io/*` resources | [Peripherals](peripherals.md), [GPIO and other peripherals](peripherals.md) |
 | Chip temperature | `esp32_chip_temp_read` | `i(i)` | `hardware.kube32.io/chip-temp` (`CHIP_TEMP`) | [Peripherals](peripherals.md) |
 | Infrared (RMT) | `esp32_rmt_send`, `esp32_rmt_receive` | `i(ii)`, `i(ii)` | `esp32.io/rmt-tx`, `esp32.io/rmt-rx` | [Peripherals](peripherals.md#infrared-rmt) |
+| Hardware need | `k32_need` | `i(ii)` | nothing; it names devices the manifest lists | [Following hardware](#following-hardware), [Hardware-following pods](migration.md#hardware-following-pods) |
 
 Calls without the required resource or capability return `K32_ERR_PERM` (`-1`) and log a firewall violation.
 
@@ -152,6 +153,10 @@ wasm3 on the ESP32-S3 also uses the native stack. The compiler makes no tail cal
 
 Every host-initiated call (`k32_init`, `k32_alloc`, `k32_handle`, `k32_tick`, `k32_event`) gets a fresh wasm3 gas budget, defaulting to `4,000,000,000` units. The [linear algebra](#linear-algebra) imports charge the budget for their work. Override it with the pod annotation `kube32.io/execution-budget: "<units>"` or disable metering with `"off"` (or `"0"`). Unmetered pods compile without gas checks and cannot be interrupted mid-call when stopped.
 
+### Floating point
+
+`f32` and `f64` operations round to nearest, ties to even, on every node, as Wasm requires, and every call into a pod begins in that rounding mode. A module computes the same bits on every node, apart from the payload bits of NaN results: two copies of a simulation on different boards, or one that [moves](#moving-to-another-node) between them, keep identical state. [Wasm runtime](architecture/wasm-runtime.md#floating-point) describes how the boards keep the rounding mode of each task.
+
 ### Restart policy and exit codes
 
 Pods support `restartPolicy: Always`, `OnFailure`, and `Never`. Failed or restarting containers back off starting at 10 s, doubling on each crash up to 5 minutes (`CrashLoopBackOff`), and reset the back-off after 10 minutes of running. Container status records `lastState`, `restartCount`, and `BackOff` events. Blocking host calls (sleep, channel receive, tone, HTTP call) abort early when the kubelet stops a container, and deleting a pod reclaims its memory.
@@ -203,8 +208,8 @@ The node refuses to move a pod in these cases, and names each one:
 | The pod | Blocker |
 | --- | --- |
 | exports `_start`, `app_main` or `main` | `entry point _start runs on its own thread` |
-| requests or limits `hardware.kube32.io/*` (other than `ipc`) or `esp32.io/*` | `grant esp32.io/gpio-4` |
-| adds `DISPLAY`, `KEYBOARD`, `SPEAKER`, `SD` or `CHIP_TEMP` in `securityContext.capabilities` | `grant capability DISPLAY` |
+| requests or limits `hardware.kube32.io/*` (other than `ipc`) or `esp32.io/*`, except the on-board device grants of a pod that [follows its hardware](#following-hardware) | `grant esp32.io/gpio-4` |
+| adds `DISPLAY`, `KEYBOARD`, `SPEAKER`, `SD` or `CHIP_TEMP` in `securityContext.capabilities`, except the device capabilities of a pod that follows its hardware | `grant capability DISPLAY` |
 | has the annotation `kube32.io/i2c-device` | `grant kube32.io/i2c-device` |
 | mounts a `persistentVolumeClaim` or `kube32.io/sd` volume | `volume claim notes on node storage` |
 | has the annotation `kube32.io/migration: Never` | `annotation kube32.io/migration: Never` |
@@ -212,6 +217,26 @@ The node refuses to move a pod in these cases, and names each one:
 | is in a call that does not return within the timeout | `call k32_handle still running after 10000 ms` |
 
 To write a pod that moves, keep its state in linear memory and globals, close files before a call returns, and leave hardware to a driver pod that it reaches through a Service or channel events.
+
+### Following hardware
+
+A job whose steps use different on-board devices can go to each device instead ([Hardware-following pods](migration.md#hardware-following-pods)). Give the pod the annotations `kube32.io/migration: Auto` and `kube32.io/placement: hardware`, list in its manifest every device it uses over its life, and call `k32_need` with the devices of the current step:
+
+```c
+static int32_t step;   /* in linear memory: it moves with the pod */
+
+K32_EXPORT("k32_tick") int32_t k32_tick(uint32_t now) {
+    if (step == 2) {
+        const int32_t rc = k32_need("tft-display,keyboard", 20);
+        if (rc == K32_NEED_MOVING) return 0;   /* the control plane moves the pod; k32_restored runs there */
+        if (rc < 0) return 0;                  /* K32_ERR_PERM: not in the manifest */
+        /* this node has the display and the keyboard: draw, read keys */
+    }
+    return 0;
+}
+```
+
+`k32_need` takes resource names (`hardware.kube32.io/speaker`), the part after `hardware.kube32.io/` (`speaker`) or capability names (`SPEAKER`), comma-separated, and an empty list for a step without hardware. It returns at once: `0` when the pod holds every named grant on this node, `K32_NEED_MOVING` (`1`) when the node lacks one and the pod moves, `K32_ERR_PERM` for a device the manifest does not list, `K32_ERR_NODEV` when the node lacks one and the pod does not follow its hardware, and `K32_ERR_INVAL` for any other name. The node records each change of the need, so call it on every tick of a step. Hardware state stays behind: turn the LED off and let sounds end before the next step, and set the hardware up again in `k32_restored`. `apps/checkin` is a job built this way.
 
 ---
 
@@ -239,13 +264,13 @@ The `Makefile` of a C project compiles every `.c` file with `clang --target=wasm
 | Feature of `kube32-sdk` | Provides |
 | --- | --- |
 | `panic-handler` (default) | `#[panic_handler]` that logs through `k32_log` and traps |
-| `hardware` | `hardware::{display_text, display_rect, display_bar, key_read, tone, rgb565, rmt_send, rmt_receive}` |
+| `hardware` | `hardware::{display_text, display_rect, display_bar, key_read, tone, led_set, need, rgb565, rmt_send, rmt_receive}` |
 | `fs` | `fs::{File, list, remove}` over `k32_fs_*` |
 | `linalg` | `linalg::{matvec_i8, matvec_i4, matvec_f32_i8, vecmat_f32_i8, softmax_f32, expf}` |
 
 ### Request pod
 
-`kube32_app!` exports the request entry points (`alloc`, `init`, `handle`, `tick`, `event`, in that order) and reserves the static `k32_alloc` buffer (default `16 KiB + 512`). From `sdk/rust/examples/counter/src/lib.rs`:
+`kube32_app!` exports the request entry points (`alloc`, `init`, `restored`, `handle`, `tick`, `event`, in that order) and reserves the static `k32_alloc` buffer (default `16 KiB + 512`). From `sdk/rust/examples/counter/src/lib.rs`:
 
 ```rust
 #![no_std]
@@ -519,7 +544,7 @@ Key flags for `kube32 deploy`:
 
 * `--replace`: deletes an existing pod of the same name (`kubectl delete pod <name> --wait=true`) before creating the new one. The kubelet does not restart a running pod when its manifest changes in place.
 * `--memory <qty>` and `--psram <qty>`: set `requests.memory`, `limits.memory`, and `esp32.io/psram`.
-* `--hardware <list>`: comma-separated list of `ipc,display,keyboard,speaker,sd,service-call,chip-temp` or `none` (default: inferred from the module's imports).
+* `--hardware <list>`: comma-separated list of `ipc,display,keyboard,speaker,microphone,touch,led,sd,service-call,chip-temp` or `none` (default: inferred from the module's imports).
 * `--sd-claim <claim>`: volume claim name when `sd` is used (default: pod name).
 * `--image <wasm://...>`: references an SD or embedded image instead of attaching `kube32.io/wasm-base64`.
 * `--dry-run`: prints the generated Pod YAML without calling `kubectl`.
@@ -586,6 +611,9 @@ Rebuild the firmware with `pio run -e esp32s3`, or reconfigure and build the hos
 | `kube32.io/tick-interval` | Pod | Period of the pod's `k32_tick`: `"250ms"`, `"2s"`, or an integer in milliseconds, from 50 ms to 1 h (default 1 s) |
 | `kube32.io/core` | Pod | The core whose [pod worker](architecture/wasm-runtime.md#pod-workers) ticks the pod and delivers its events: `"0"`, `"1"`, or `"auto"` (default: placed by load) |
 | `kube32.io/restore-from` | Pod | A Checkpoint in the pod's namespace: the container starts from its snapshot instead of `k32_init` ([Pod migration](migration.md#kubelet-endpoints)) |
+| `kube32.io/placement` | Pod | With `kube32.io/migration: Auto`: `fastest` runs the pod on the fastest node, `hardware` on a node with what its current step needs ([Following hardware](#following-hardware)) |
+| `kube32.io/needs` | Pod | The devices a hardware-following pod's current step needs, resource names comma-separated. Its kubelet writes it from `k32_need`; set in a manifest, it places the first step |
+| `kube32.io/prefer-nodes` | Pod | Nodes the scheduler prefers among those that fit, best first: node names or `<label>=<value>`, comma-separated |
 | `kube32.io/i2c-bus-<N>` | Pod | Bus pins and speed, e.g. `"sda=8,scl=9,hz=100000"` |
 | `kube32.io/uart-<N>` | Pod | UART pins and baud rate, e.g. `"tx=17,rx=18,baud=115200"` |
 | `kube32.io/rmt-tx` | Pod | IR transmit pin and carrier, e.g. `"pin=2,carrier=38000,duty=33"` (`carrier=0`: no carrier) |

@@ -4,8 +4,10 @@ A worker is started with a --join address that does not answer, as one is
 after its machine changed networks, and with the control plane's IPC port as
 a static peer, so that HELLO frames flow between the two. The control plane
 announces its API address in its HELLO frames (--node-ip); after 30 s without
-an answer the worker dials that address instead, registers, and its Node turns
-Ready.
+an answer the worker dials that address instead, once a kube32 API server
+answers there, registers, and its Node turns Ready. An announced address where
+no API server answers is not followed: the worker keeps its --join address and
+registers there when a control plane answers at it.
 
 Run it in the Linux container image of the integration suites, not on a
 developer machine: a worker that dials a non-loopback API server also sends
@@ -26,11 +28,14 @@ from tests.integration.framework import BaseTestCase
 from tests.integration.cluster_harness import BIN_PATH, node_ready_condition
 
 API_PORT = 17143
+AWAY_API_PORT = 17144
 CP_IPC_PORT = 18140
 WORKER_IPC_PORT = 18141
+CP_HOME_IPC_PORT = 18142
 WORKER_POD_PORT = 18150
-# An address in the documentation range (RFC 5737): nothing answers there
+# Addresses in the documentation range (RFC 5737): nothing answers there
 SILENT_API_HOST = "192.0.2.1"
+UNREACHABLE_HOST = "192.0.2.77"
 FOLLOW_AFTER_S = 30
 
 
@@ -102,13 +107,46 @@ class TestApiFollow(BaseTestCase):
         self.assertGreaterEqual(elapsed, FOLLOW_AFTER_S - 1, f"the worker switched after {elapsed:.0f} s, before the silence was long enough")
 
         log = self._read(worker_log)
-        line = f"[NET] no answer from {SILENT_API_HOST}; the control plane announces 127.0.0.1, switching"
+        line = f"[NET] no answer from {SILENT_API_HOST}; the announced address 127.0.0.1 answers, switching"
         self.assertIn(line, log)
         self.assertEqual(log.count("switching"), 1)
+        self.assertIn("[NET] the control plane is cp-follow, at 127.0.0.1", log)
 
         # Its Node reports the address the route to the new API server gives
         addresses = self._node("w-follow").get("status", {}).get("addresses", [])
         self.assertEqual([a["address"] for a in addresses if a.get("type") == "InternalIP"], ["127.0.0.1"])
+
+    def test_worker_stays_home_when_announced_address_is_silent(self):
+        """An announced address where no API server answers is not followed; the home address is dialed when it answers"""
+        # The control plane announces an address of a network the worker
+        # cannot reach, and its API server does not answer at the worker's
+        # home address (127.0.0.1:API_PORT) yet
+        self._sim("cp-away", ["--role", "control-plane", "--node-id", "0", "--port", str(AWAY_API_PORT), "--ipc-port", str(CP_IPC_PORT),
+                                       "--node-ip", UNREACHABLE_HOST])
+        started = time.time()
+        worker_log = self._sim("w-home", ["--role", "worker", "--node-id", "1", "--ipc-port", str(WORKER_IPC_PORT),
+                                          "--pod-port", str(WORKER_POD_PORT), "--join", f"http://127.0.0.1:{API_PORT}",
+                                          "--peer", f"cp-away:0:{CP_IPC_PORT}", "--peer", f"cp-home:2:{CP_HOME_IPC_PORT}"])
+        refused = f"[NET] cp-away announces {UNREACHABLE_HOST}, where no API server answers: not followed"
+        self.wait_for_condition(lambda: refused in self._read(worker_log), timeout=FOLLOW_AFTER_S + 20, interval=0.5,
+                                description="the worker refuses the announced address")
+        self.assertGreaterEqual(time.time() - started, FOLLOW_AFTER_S - 1)
+
+        # The control plane answers at the home address again: the worker registers there
+        self._sim("cp-home", ["--role", "control-plane", "--node-id", "2", "--port", str(API_PORT), "--ipc-port", str(CP_HOME_IPC_PORT),
+                              "--node-ip", "127.0.0.1", "--not-ready-timeout", "4000", "--reconcile-interval", "500"])
+
+        def ready():
+            cond = node_ready_condition(f"http://127.0.0.1:{API_PORT}", "w-home")
+            return cond if cond and cond.get("status") == "True" else None
+        self.wait_for_condition(ready, timeout=40, interval=0.5, description="w-home Ready at its home address")
+        # The peer that announces the address that answers is the worker's control plane
+        known = "[NET] the control plane is cp-home, at 127.0.0.1"
+        self.wait_for_condition(lambda: known in self._read(worker_log), timeout=15, interval=0.5,
+                                description="cp-home known as the control plane")
+        log = self._read(worker_log)
+        self.assertNotIn("switching", log)
+        self.assertEqual(log.count(refused), 1, "the refusal is logged once")
 
     def _version(self):
         try:

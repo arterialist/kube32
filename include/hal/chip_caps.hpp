@@ -49,6 +49,14 @@ constexpr uint64_t KUBE32_INPUT_GPIO_MASK = 1ULL << 9;
 // Strapping and UART0 34-38, native USB 24-25. GPIO 35 is the boot button of most boards.
 constexpr uint64_t KUBE32_RESERVED_GPIO_MASK = (0x1FULL << 34) | (0x3ULL << 24);
 constexpr uint64_t KUBE32_INPUT_GPIO_MASK = 1ULL << 35;
+#elif defined(CONFIG_IDF_TARGET_ESP32S31)
+// SPI flash 26-28 and 30-32 (the chip has no GPIO 29; its PSRAM has pins of
+// its own), native USB 33-34, strapping 36 (flash voltage), 37 (JTAG
+// source), 60 and 61 (boot mode), UART0 58-59. GPIO 61 is the boot button of
+// most boards.
+constexpr uint64_t KUBE32_RESERVED_GPIO_MASK = (0x7ULL << 26) | (0x7ULL << 30) | (0x3ULL << 33) | (0x3ULL << 36) |
+                                               (0x3ULL << 58) | (0x3ULL << 60);
+constexpr uint64_t KUBE32_INPUT_GPIO_MASK = 1ULL << 61;
 #else
 // The board profile reserves the pins its chip keeps
 constexpr uint64_t KUBE32_RESERVED_GPIO_MASK = 0;

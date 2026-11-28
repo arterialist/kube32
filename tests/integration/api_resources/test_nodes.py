@@ -98,6 +98,12 @@ class TestNodes(BaseTestCase):
         self.assertIn("kubeletVersion", node_info)
         self.assertIn("osImage", node_info)
         self.assertTrue(len(node_info["kubeletVersion"]) > 0)
+        # Architecture and OS as Kubernetes names them, the same as the well-known labels
+        labels = node.get("metadata", {}).get("labels", {})
+        self.assertIn(node_info.get("architecture"), ("arm64", "amd64"))
+        self.assertIn(node_info.get("operatingSystem"), ("darwin", "linux"))
+        self.assertEqual(labels.get("kubernetes.io/arch"), node_info["architecture"])
+        self.assertEqual(labels.get("kubernetes.io/os"), node_info["operatingSystem"])
 
     def test_kubectl_get_nodes_cli(self):
         """

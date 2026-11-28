@@ -15,6 +15,7 @@
 #include "osal/condition_variable.hpp"
 #include "osal/socket.hpp"
 #include "hal/hal_types.hpp"
+#include "net/api_follow.hpp"
 
 namespace kube32::ipc {
 
@@ -352,8 +353,9 @@ public:
     // A control plane announces where its API server answers: HELLO carries
     // the name, a NUL and "api=<address>". "" stops the announcement.
     void set_announced_api(const std::string& address);
-    // The address the most recently heard control plane announces, or ""
-    std::string announced_api() const;
+    // The API server addresses peers announce, with the uptime of each
+    // peer's last HELLO (a HELLO without one takes the peer's back)
+    std::vector<net::ApiAnnouncement> api_announcements() const;
     // Uptime in ms when a HELLO last arrived over IP (UDP) from `ip`, 0 if
     // none has: proof that the access point carries this node's traffic
     uint64_t last_ip_hello_ms(const std::string& ip) const;

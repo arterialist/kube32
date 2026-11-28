@@ -3,7 +3,7 @@
 [![CI](https://github.com/arterialist/kube32/actions/workflows/ci.yml/badge.svg)](https://github.com/arterialist/kube32/actions/workflows/ci.yml)
 [![Docs](https://github.com/arterialist/kube32/actions/workflows/docs.yaml/badge.svg)](https://github.com/arterialist/kube32/actions/workflows/docs.yaml)
 
-kube32 is a Kubernetes-compatible control plane and WebAssembly pod runtime for ESP32-S3 microcontrollers.
+kube32 is a Kubernetes-compatible control plane and WebAssembly pod runtime for ESP32-S3 and ESP32-S31 microcontrollers.
 
 `kubectl` and k9s manage a cluster of boards over Wi-Fi or USB serial. Pods are WebAssembly modules executed by the [wasm3](https://github.com/wasm3/wasm3) interpreter. One firmware image runs on every board. A board with PSRAM acts as the control plane and runs a local kubelet, while boards without PSRAM join as workers. The same sources build `kube32-sim`, a host simulator for macOS and Linux.
 
@@ -29,6 +29,7 @@ kube32 is a Kubernetes-compatible control plane and WebAssembly pod runtime for 
 | --- | --- | --- |
 | Control plane | ESP32-S3, 8 MB flash, 2 MB or more quad SPI PSRAM | Generic ESP32-S3 devkit with 2 MB PSRAM |
 | Worker | Any ESP32-S3 with 8 MB flash | M5Stack Cardputer with ST7789 display, keypad, speaker, and microSD |
+| Control plane or worker | ESP32-S31, 16 MB flash, octal PSRAM | Espressif ESP32-S31-Function-CoreBoard-1 with speaker, microphone, and RGB LED |
 
 See [docs/hardware-spec.md](docs/hardware-spec.md) for pin assignments and memory budgets.
 

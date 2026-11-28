@@ -84,7 +84,8 @@ struct KubeletConfig {
     std::string api_token;                 // bearer token for the API server, empty when it has none
     size_t api_max_body{0};                // largest API response kept in memory (0: no limit)
     // Labels the node sets on its Node object besides kubernetes.io/hostname,
-    // kubernetes.io/arch and the role label (for example kube32.io/board).
+    // kubernetes.io/arch, kubernetes.io/os and the role label (for example
+    // kube32.io/board).
     std::map<std::string, std::string> node_labels;
     // Labels the node finds on itself (attached hardware), read before
     // registering and every node_label_refresh_ms after; changes are patched
@@ -177,6 +178,10 @@ public:
     void report_heartbeat();
     void sync_assigned_pods();
     void monitor_and_report_pod_statuses();
+    // Writes each change of a hardware-following pod's need (k32_need) to
+    // its Pod's annotation kube32.io/needs; one that fails is tried again
+    // a second later
+    void record_pod_needs();
     void handle_pod_completion(LocalPodRecord& rec, const runtime::ContainerStatus& cs);
 
     // Query local state
@@ -272,6 +277,7 @@ private:
     uint64_t last_sync_ms_{0};
     uint64_t last_status_report_ms_{0};
     uint64_t last_label_refresh_ms_{0};
+    uint64_t need_retry_ms_{0};   // a need that could not be recorded is tried again from then
     std::map<std::string, std::string> found_labels_;   // from node_label_source, as on the Node
     std::map<std::string, std::string> found_annotations_;   // from node_annotation_source
     bool annotations_sent_{false};                          // found_annotations_ are on the Node

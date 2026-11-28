@@ -35,7 +35,8 @@ enum class PeripheralType : uint8_t {
     RmtRx    = 11,  // RMT (IR) receive channel (esp32.io/rmt-rx)
     ChipTemp = 12,  // The chip's temperature sensor (hardware.kube32.io/chip-temp)
     Microphone = 13, // On-board PDM microphone (hardware.kube32.io/microphone)
-    Touch    = 14   // On-board touch panel (hardware.kube32.io/touch)
+    Touch    = 14,  // On-board touch panel (hardware.kube32.io/touch)
+    Led      = 15   // On-board addressable RGB LED (hardware.kube32.io/led)
 };
 
 enum class AccessMode : uint8_t {
@@ -69,6 +70,7 @@ constexpr uint32_t KUBE32_CAP_RMT_RX   = (1U << 7);   // esp32_rmt_receive from 
 constexpr uint32_t KUBE32_CAP_CHIP_TEMP = (1U << 8);  // esp32_chip_temp_read
 constexpr uint32_t KUBE32_CAP_MICROPHONE = (1U << 9); // k32_mic_read
 constexpr uint32_t KUBE32_CAP_TOUCH    = (1U << 10);  // k32_touch_read
+constexpr uint32_t KUBE32_CAP_LED      = (1U << 11);  // k32_led_set
 
 // A board's display, reported by k32_display_info (width 0: none)
 constexpr int32_t KUBE32_DISPLAY_RGB565 = 1;

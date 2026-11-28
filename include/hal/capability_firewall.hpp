@@ -54,8 +54,12 @@ struct BoardProfile {
     // direction offers that channel, a claim takes no pin and its annotation
     // names none
     uint8_t rmt_fixed_mask{0};
+    // RMT TX channels the board's own devices keep (an addressable LED):
+    // pods may claim the chip's other channels
+    uint8_t rmt_tx_board_channels{0};
     // On-board devices the board has (KUBE32_CAP_DISPLAY, KUBE32_CAP_KEYBOARD,
-    // KUBE32_CAP_SPEAKER): the Node advertises their hardware.kube32.io/* grants
+    // KUBE32_CAP_SPEAKER, KUBE32_CAP_LED): the Node advertises their
+    // hardware.kube32.io/* grants
     uint32_t onboard_devices{0};
 };
 
@@ -74,6 +78,10 @@ struct PodSecurityRecord {
     // on a shared I2C bus, with the multiplexer channel it sits behind
     bool has_i2c_device{false};
     models::I2cLocation i2c_device;
+    // On-board devices (models::kFollowedDevices) the pod's spec lists; the
+    // grant of a hardware-following pod holds those the node has
+    uint32_t listed_devices{0};
+    bool follows_hardware{false};
 };
 
 // What a pod's transfer to an I2C address may use
@@ -166,12 +174,20 @@ public:
     uint8_t  claimable_uart_mask() const;
     // RMT channels pods can claim on this board (esp32.io/rmt-tx and
     // esp32.io/rmt-rx capacity): one per pin a channel can use, at most the
-    // chip's four of each direction; one for a direction the board runs on
-    // its own device
+    // chip's four of each direction less the TX channels the board keeps;
+    // one for a direction the board runs on its own device
     uint32_t claimable_rmt_tx_count() const;
     uint32_t claimable_rmt_rx_count() const;
     // BoardProfile::onboard_devices
     uint32_t onboard_devices() const;
+    // The devices the node offers pods: the on-board ones and, when the
+    // board reads it, the chip's temperature (KUBE32_CAP_CHIP_TEMP)
+    uint32_t node_devices() const;
+    // The on-board devices a registered pod's spec lists (`listed`), those
+    // its grant holds (`held`) and whether it follows its hardware
+    // (kube32.io/placement: hardware): such a pod holds the listed devices
+    // the node has. False for a pod not registered.
+    bool pod_devices(const std::string& pod_id, uint32_t& listed, uint32_t& held, bool& follows) const;
     // A pod's grant holds one of `capabilities` (KUBE32_CAP_*)
     bool capability_held(uint32_t capabilities) const;
     uint32_t get_allocated_rmt_tx_count() const;

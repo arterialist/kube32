@@ -1,0 +1,174 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>lockstep vote</title>
+<base href="@BASE@">
+<style>
+:root{color-scheme:dark;background:#0b0d10;color:#c8ced6}
+body{background:#0b0d10;color:#c8ced6;font:13px/1.5 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;margin:20px auto;max-width:1200px;padding:0 16px}
+h1{font-size:17px;margin:0;font-weight:600}h2{font-size:15px;margin:32px 0 4px;font-weight:600}
+p{margin:4px 0}.m{color:#8f98a2}
+.row{display:flex;flex-wrap:wrap;gap:24px;align-items:flex-start;margin-top:12px}
+.col{flex:1;min-width:360px}
+canvas{background:#111418;border:1px solid #1f242b;width:min(100%,520px);aspect-ratio:1}
+table{border-collapse:collapse;margin:6px 0}td,th{padding:2px 12px 2px 0;text-align:left;white-space:nowrap}th{color:#8f98a2;font-weight:normal}
+.agree{color:#46e07a}.outvoted{color:#ff4d4d}.joining,.behind,.split,.repairing{color:#ffa020}.lost,.absent{color:#8f98a2}
+.sw{display:inline-block;width:10px;height:10px;margin-right:6px;vertical-align:-1px}
+button{background:#1c2128;color:#c8ced6;border:1px solid #30363d;border-radius:3px;padding:0 8px;font:inherit;cursor:pointer}
+button:hover{border-color:#6a727c}
+input{background:#111418;color:#c8ced6;border:1px solid #30363d;font:inherit;width:4em}
+.x{color:#ff4d4d}.cur td{background:#161b21}
+#nt td,#nt th{padding-right:8px;font-size:12px}#det p{margin:2px 0}#log{color:#8f98a2;white-space:pre-wrap;margin-top:12px;font-size:12px}
+</style>
+<h1>lockstep vote <span id="sum" class="m"></span></h1>
+<p id="sub" class="m"></p>
+<div class="row">
+<canvas id="pc" width="640" height="640"></canvas>
+<div class="col">
+<table id="lt"></table>
+<p>fault injection flips bit <input id="bit" type="number" min="0" max="255" value="48"> of a lane's state
+(0..63 theta1, 64..127 theta2, 128..255 the angular velocities)</p>
+<p><button onclick="act('repair','')">repair every outvoted or lagging lane</button></p>
+<div id="det"></div>
+<div id="log"></div>
+</div>
+</div>
+<h2>native</h2>
+<p class="m">Recorded native runs of the same double pendulum: one C source (apps/voter/native/chaos.c), the same equations, step and
+start, compiled natively with each toolchain below and run with the C library's sin and cos. These runs were recorded once and
+replay here at the step of the vote; they are not computed live. The lanes above compute the pendulum in Wasm with their own
+sin and cos.</p>
+<div class="row">
+<canvas id="nc" width="640" height="640"></canvas>
+<div class="col"><table id="nl"></table><p id="nd" class="m"></p><div style="overflow-x:auto"><table id="nt"></table></div></div>
+</div>
+<script src="native.js"></script>
+<script>
+const LC=['#33d6ff','#ff5cd6','#ffe14d','#b5e550'],NC=['#ff8a3d','#4dd2a0','#8f9cff','#e6e6e6'];
+const $=id=>document.getElementById(id);
+const dv=new DataView(new ArrayBuffer(8));
+const f64=h=>{dv.setBigUint64(0,BigInt('0x'+h));return dv.getFloat64(0)};
+const ang=b=>b?[f64(b[0]),f64(b[1])]:null;
+const esc=s=>String(s).replace(/[&<>"]/g,c=>'&#'+c.charCodeAt(0)+';');
+let S=null,A=null,B=null,t0=0,dur=1,trail=[],ntrail=[],runs=null;
+
+function act(what,lane){
+  const q=what=='fault'?`fault?lane=${encodeURIComponent(lane)}&bit=${$('bit').value|0}`:`repair?lane=${encodeURIComponent(lane)}`;
+  fetch(q,{cache:'no-store'}).then(r=>r.json()).then(j=>note(JSON.stringify(j))).catch(e=>note(String(e)));
+}
+function note(t){$('log').dataset.note=t}
+
+function lerp(a,b,k){return a&&b?[a[0]+(b[0]-a[0])*k,a[1]+(b[1]-a[1])*k]:b}
+function cur(){
+  if(!B)return null;
+  const k=Math.min(1,(performance.now()-t0)/dur);
+  if(!A)return B;
+  return{step:A.step+(B.step-A.step)*k,v:lerp(A.v,B.v,k),l:B.l.map((b,i)=>lerp(A.l[i],b,k))};
+}
+
+function tip(cx,cy,L,a){
+  if(!a||!isFinite(a[0])||!isFinite(a[1])||Math.abs(a[0])>1e9||Math.abs(a[1])>1e9)return null;
+  const x1=cx+L*Math.sin(a[0]),y1=cy+L*Math.cos(a[0]);
+  return[x1,y1,x1+L*Math.sin(a[1]),y1+L*Math.cos(a[1])];
+}
+function arms(g,cx,cy,L,a,col,w,r){
+  const p=tip(cx,cy,L,a);if(!p)return null;
+  g.strokeStyle=g.fillStyle=col;g.lineWidth=w;g.lineCap=g.lineJoin='round';
+  g.beginPath();g.moveTo(cx,cy);g.lineTo(p[0],p[1]);g.lineTo(p[2],p[3]);g.stroke();
+  g.beginPath();g.arc(p[0],p[1],r*0.8,0,7);g.fill();g.beginPath();g.arc(p[2],p[3],r,0,7);g.fill();
+  return p;
+}
+function path(g,pts,col,w){
+  g.strokeStyle=col;g.lineWidth=w;g.beginPath();
+  pts.forEach((p,i)=>p?(i&&pts[i-1]?g.lineTo(p[0],p[1]):g.moveTo(p[0],p[1])):0);g.stroke();
+}
+
+function frame(){
+  const W=640,c=W/2,L=W/4-16,d=cur();
+  let g=$('pc').getContext('2d');g.clearRect(0,0,W,W);
+  if(d&&S){
+    const p=tip(c,c,L,d.v);trail.push(p?[p[2],p[3]]:null);if(trail.length>360)trail.shift();
+    path(g,trail,'#2a3038',2);
+    // each lane thinner than the one before: lanes that agree show as one striped arm
+    const n=d.l.length;d.l.forEach((a,i)=>{const s=S.lanes[i];if(s&&s.status!='lost')arms(g,c,c,L,a,LC[i%4],2+5*(n-i),4+4*(n-i))});
+    arms(g,c,c,L,d.v,'#f2f4f6',2,5);
+    g.fillStyle='#8f98a2';g.font='16px ui-monospace,monospace';
+    g.fillText(`step ${Math.round(d.step)}   t = ${(d.step/1000).toFixed(2)} s`,16,28);
+  }
+  g.fillStyle='#b8c0c8';g.beginPath();g.arc(c,c,4,0,7);g.fill();
+  g=$('nc').getContext('2d');g.clearRect(0,0,W,W);
+  const rs=natives();
+  if(rs&&d){
+    const n=rs[0].length/2,e=NATIVE.every,x=d.step/e-1,i=Math.max(0,Math.floor(x))%n,j=Math.min(i+1,n-1),k=x<0?0:x-Math.floor(x);
+    const at=(u,q)=>[u[2*q]/65536*2*Math.PI,u[2*q+1]/65536*2*Math.PI];
+    const mix=(a,b)=>a.map((v,q)=>{let t=b[q]-v;if(t>Math.PI)t-=2*Math.PI;if(t<-Math.PI)t+=2*Math.PI;return v+t*k});
+    rs.forEach((u,r)=>{
+      const a=mix(at(u,i),at(u,j)),p=tip(c,c,L,a);
+      (ntrail[r]=ntrail[r]||[]).push(p?[p[2],p[3]]:null);if(ntrail[r].length>240)ntrail[r].shift();
+      path(g,ntrail[r],NC[r%4]+'55',2);
+    });
+    rs.forEach((u,r)=>arms(g,c,c,L,mix(at(u,i),at(u,j)),NC[r%4],2+4*(rs.length-r),3+3*(rs.length-r)));
+    g.fillStyle='#8f98a2';g.font='16px ui-monospace,monospace';
+    g.fillText(`recorded, step ${((i+1)*e)%(n*e)||n*e}   t = ${(((i+1)*e)/1000).toFixed(2)} s`,16,28);
+    const row=Math.floor(((i+1)*e)/2000);
+    document.querySelectorAll('#nt tr').forEach((tr,q)=>tr.classList.toggle('cur',q==row));
+  }
+  g.fillStyle='#b8c0c8';g.beginPath();g.arc(c,c,4,0,7);g.fill();
+  requestAnimationFrame(frame);
+}
+
+function natives(){
+  if(!window.NATIVE)return null;
+  if(runs)return runs;
+  runs=NATIVE.runs.map(r=>{const b=atob(r.a),u=new Uint16Array(b.length>>1);for(let i=0;i<u.length;i++)u[i]=b.charCodeAt(2*i)|b.charCodeAt(2*i+1)<<8;return u});
+  $('nl').innerHTML='<tr><th>run<th>toolchain and C library'+NATIVE.runs.map((r,i)=>`<tr><td><span class=sw style="background:${NC[i%4]}"></span>${i+1}<td>${esc(r.label)}`).join('');
+  const steps=NATIVE.runs[0].bits.map(b=>b[0]);
+  let first=0;
+  $('nt').innerHTML='<tr><th>step'+NATIVE.runs.map((r,i)=>`<th>theta1, run ${i+1}`).join('')+'<tr><td>0'+NATIVE.runs.map(_=>'<td class=m>4000000000000000').join('')+steps.map((s,q)=>{
+    const ref=NATIVE.runs[0].bits[q][1];
+    return `<tr><td>${s}`+NATIVE.runs.map(r=>{const h=r.bits[q][1];if(h!=ref&&!first)first=s;
+      return '<td>'+[...h].map((ch,z)=>ch==ref[z]?ch:`<span class=x>${ch}</span>`).join('')}).join('');
+  }).join('');
+  let part=0;const n=runs[0].length/2;
+  for(let q=0;q<n&&!part;q++){for(const u of runs){let t=Math.abs(u[2*q]-runs[0][2*q]);t=Math.min(t,65536-t)/65536*2*Math.PI;if(t>0.1){part=(q+1)*NATIVE.every;break}}}
+  $('nd').textContent=`The runs start from the same state and differ in the bits of theta1 from step ${first||'-'} (t = ${first/1000} s); `+
+    (part?`their angles part by more than 0.1 rad at step ${part} (t = ${part/1000} s).`:'their angles stay within 0.1 rad.');
+  return runs;
+}
+
+function lanes(s){
+  $('lt').innerHTML='<tr><th>lane<th>status<th>node<th>arch<th>step<th>hash at '+s.step+'<th>us/step<th>'+s.lanes.map((l,i)=>{
+    const st=l.repairing?'repairing':l.status,bad=l.hash&&s.hash&&l.hash!=s.hash;
+    return `<tr><td><span class=sw style="background:${LC[i%4]}"></span>${esc(l.name)}<td class=${st}>${st}<td>${esc(l.node||'-')}`+
+      `<td>${esc(l.arch?l.arch+'/'+l.os:'-')}<td>${l.step}<td class=${bad?'x':''}>${l.hash||'-'}<td>${l.us||'-'}`+
+      `<td><button onclick="act('fault','${esc(l.name)}')">inject fault</button> <button onclick="act('repair','${esc(l.name)}')">repair</button>`;
+  }).join('');
+  const out=[];
+  s.lanes.forEach(l=>{
+    const d=l.det;
+    if(d)out.push(d.injected?`<p><b>lane ${esc(l.name)}</b>: bit ${d.bit} flipped at step ${d.fault_step}, outvoted at the checkpoint of step ${d.step}: detected after ${d.steps} steps and ${d.ms} ms</p>`:
+      `<p><b>lane ${esc(l.name)}</b>: outvoted at step ${d.step} with no fault injected, ${d.step-d.from} steps after it began at step ${d.from}</p>`);
+    if(l.repairing)out.push(`<p class=repairing>lane ${esc(l.name)}: restoring a copy of lane ${esc(l.repair_from)}</p>`);
+    else if(l.repairs)out.push(`<p class=agree>lane ${esc(l.name)}: agrees again ${(l.repair_ms/1000).toFixed(1)} s after a copy of lane ${esc(l.repair_from)} (${l.repairs} repair${l.repairs>1?'s':''})</p>`);
+  });
+  $('det').innerHTML=out.join('');
+  const n=s.lanes.length,agree=s.lanes.filter(l=>l.status=='agree').length;
+  $('sum').textContent=!s.voted?(s.started?'voting starts':'waiting for the lanes'):s.majority?`${agree} of ${n} lanes agree at step ${s.step}`:`no majority at step ${s.step}`;
+  $('sub').textContent=`target ${s.target}, ${s.rate} steps/s, a checkpoint every ${s.every} steps; ${s.votes} votes, ${s.unanimous} with every lane bit-identical`;
+  $('log').textContent=($('log').dataset.note?$('log').dataset.note+'\n':'')+s.log.join('\n');
+}
+
+function poll(){
+  fetch('state',{cache:'no-store'}).then(r=>r.json()).then(s=>{
+    if(!B||s.step!=B.step){
+      A=cur();B={step:s.step,v:ang(s.bits),l:s.lanes.map(l=>ang(l.at))};t0=performance.now();
+      dur=A?Math.min(2000,Math.max(80,(B.step-A.step)/Math.max(1,s.rate)*1000)):1;
+      if(A&&B.step<A.step)A=null;
+    }
+    S=s;lanes(s);
+  }).catch(_=>{$('sum').textContent='(the voter does not answer)'}).finally(_=>setTimeout(poll,200));
+}
+poll();requestAnimationFrame(frame);
+</script>
+</html>

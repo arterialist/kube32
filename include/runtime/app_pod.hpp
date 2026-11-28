@@ -145,6 +145,8 @@ struct AppPlatformHooks {
     std::function<int32_t(hal::DisplayInfo& info)> display_info;
     // k32_touch_read: up to max points now touching, the count (0: nothing touches)
     std::function<int32_t(hal::TouchPoint* out, uint32_t max)> touch_read;
+    // k32_led_set: LED `index` of the board to 0xRRGGBB
+    std::function<int32_t(uint32_t index, uint32_t rgb)> led_set;
     std::function<uint32_t()> random;
     std::function<int32_t(const std::string& pod_id, std::string_view topic, const uint8_t* data, size_t len)> event_emit;
     // k32_http_call: resolves the Service and performs the call. Returns the
@@ -152,7 +154,7 @@ struct AppPlatformHooks {
     std::function<int32_t(const ServiceCallRequest& req, BufferResponseSink& sink)> service_call;
 };
 void set_app_platform_hooks(AppPlatformHooks hooks);
-// Points the display, touch, keyboard, speaker and microphone hooks at
+// Points the display, touch, keyboard, speaker, microphone and LED hooks at
 // `board`'s devices (hal/board.hpp); a device it lacks answers HAL_ERR_NODEV
 void set_board_hooks(AppPlatformHooks& hooks, hal::Board& board);
 void set_app_request_logging(bool verbose);
@@ -330,6 +332,17 @@ public:
     // kRestoreErrorPrefix); -2 when k32_restored returned non-zero (`why`).
     int restore_pod(const std::string& pod_id, const SnapshotStream& stream, std::string& why);
 
+    // Hardware-following pods (docs/migration.md#hardware-following-pods) --
+    // k32_need: the result for the devices `list` names (K32_OK, K32_NEED_MOVING
+    // or a K32_ERR_*). A hardware-following pod's need is kept for the
+    // kubelet to record on the Pod.
+    int32_t need(const std::string& pod_id, std::string_view list);
+    // A need of this node's pods that its Pod does not show yet; false when
+    // every Pod shows its pod's need
+    bool unrecorded_need(std::string& pod_id, uint32_t& devices) const;
+    // The Pod shows `devices` as the pod's need
+    void need_recorded(const std::string& pod_id, uint32_t devices);
+
 private:
     AppPodHost() = default;
     struct Entry {
@@ -364,6 +377,8 @@ private:
     struct MigrationInfo {
         std::string container;
         std::vector<std::string> blockers;
+        uint32_t need{0};       // the devices of the pod's last k32_need
+        uint32_t recorded{0};   // the devices its Pod's kube32.io/needs names
     };
     std::map<std::string, MigrationInfo> migration_;
     void set_busy(const std::string& pod_id, const char* fn);

@@ -7,6 +7,8 @@
 //! | `display_*`        | `hardware.kube32.io/tft-display: "1"` | `DISPLAY`  |
 //! | `key_read`         | `hardware.kube32.io/keyboard: "1"`    | `KEYBOARD` |
 //! | `tone`             | `hardware.kube32.io/speaker: "1"`     | `SPEAKER`  |
+//! | `led_set`          | `hardware.kube32.io/led: "1"`         | `LED`      |
+//! | `need`             | none: names devices the manifest lists | none      |
 //! | `rmt_send`         | `esp32.io/rmt-tx: "1"`                | none       |
 //! | `rmt_receive`      | `esp32.io/rmt-rx: "1"`                | none       |
 //! | `chip_temp_milli_c` | `hardware.kube32.io/chip-temp: "1"`  | `CHIP_TEMP` |
@@ -77,6 +79,48 @@ pub fn key_read() -> Result<Option<u8>, Error> {
 pub fn tone(freq_hz: u32, duration_ms: u32, volume_pct: u32) -> Result<(), Error> {
     let rc = unsafe { abi::k32_tone(freq_hz, duration_ms, volume_pct) };
     Error::from_rc(rc).map(|_| ())
+}
+
+/// Sets the board's addressable RGB LED `index` (`0` on a board with one) to
+/// `0xRRGGBB`, `0` for off. The LED keeps the color until the next call, and
+/// pods that hold the grant share it. `Error::Invalid` for an index past the
+/// board's LEDs, `Error::NoDevice` on a node without one.
+pub fn led_set(index: u32, rgb: u32) -> Result<(), Error> {
+    let rc = unsafe { abi::k32_led_set(index, rgb) };
+    Error::from_rc(rc).map(|_| ())
+}
+
+/// `k32_need` when the node lacks a device the list names (`K32_NEED_MOVING`).
+pub const NEED_MOVING: i32 = 1;
+/// The longest list `need` takes, in bytes (`K32_NEED_MAX_BYTES`).
+pub const NEED_MAX_BYTES: usize = 256;
+
+/// Where the pod's current step can run, as `need` answers it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Need {
+    /// The pod holds every named device on this node.
+    Met,
+    /// The node lacks one: the control plane moves the pod, with its state,
+    /// to a node that has them. `k32_restored` runs there, where `need` with
+    /// the same list answers `Met`.
+    Moving,
+}
+
+/// Tells the node which on-board devices the pod's current step needs: a
+/// comma-separated list of resource names (`"hardware.kube32.io/speaker"`),
+/// the part after `hardware.kube32.io/` (`"speaker"`) or capabilities
+/// (`"SPEAKER"`); `""` for none. It returns at once. A pod with the
+/// annotations `kube32.io/migration: Auto` and `kube32.io/placement:
+/// hardware` lists every device of its life in the manifest and holds, on
+/// each node, those the node has; the kubelet records the need on the Pod
+/// and the control plane moves the pod when its node lacks part of it
+/// (docs/migration.md). `Error::Permission` for a device the manifest does
+/// not list, `Error::NoDevice` when the node lacks one and the pod does not
+/// follow its hardware, `Error::Invalid` for a name that is no on-board
+/// device or a list longer than `NEED_MAX_BYTES`.
+pub fn need(devices: &str) -> Result<Need, Error> {
+    let rc = unsafe { abi::k32_need(devices.as_ptr(), devices.len() as u32) };
+    Error::from_rc(rc).map(|n| if n as i32 == NEED_MOVING { Need::Moving } else { Need::Met })
 }
 
 /// Most durations in one IR frame, sent or received (`K32_RMT_MAX_DURATIONS`).

@@ -265,12 +265,10 @@ public:
         if (running_.load()) return true;
         if (!sock_.create(osal::SocketType::Udp)) return false;
         sock_.set_reuse_addr(true);
-#if !defined(KUBE32_TARGET_ESP32)
-        // A simulated worker sends its HELLO to the broadcast address
+        // A worker sends its HELLO to the broadcast address
         // (ChannelManager::add_seed_peer) to be found by a control plane
         // that does not know its address
         sock_.set_broadcast(true);
-#endif
         bool bound = false;
         for (int attempt = 0; attempt < 20 && !bound; ++attempt) {
             bound = sock_.bind("0.0.0.0", port_);
@@ -1205,14 +1203,13 @@ void ChannelManager::set_announced_api(const std::string& address) {
     announced_api_ = address;
 }
 
-std::string ChannelManager::announced_api() const {
+std::vector<net::ApiAnnouncement> ChannelManager::api_announcements() const {
     osal::LockGuard guard(peer_mutex_);
-    const PeerInfo* latest = nullptr;
+    std::vector<net::ApiAnnouncement> out;
     for (const auto& kv : peers_) {
-        if (kv.second.api_address.empty()) continue;
-        if (!latest || kv.second.last_seen_ms > latest->last_seen_ms) latest = &kv.second;
+        if (!kv.second.api_address.empty()) out.push_back({kv.second.node_name, kv.second.api_address, kv.second.last_seen_ms});
     }
-    return latest ? latest->api_address : std::string();
+    return out;
 }
 
 uint64_t ChannelManager::last_ip_hello_ms(const std::string& ip) const {

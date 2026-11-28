@@ -57,7 +57,7 @@ Discovery endpoints accept `GET` and `HEAD`.
 | `authorization.k8s.io/v1` | SelfSubjectAccessReview, SelfSubjectRulesReview | | create | Always returns allowed |
 | `kube32.io/v1` | FirmwareRollout | `fwr` | get, list, watch, create, update, patch, delete | Cluster-scoped. `spec.sha256` names the staged firmware image. The rollout controller updates nodes one at a time and writes `status`. The API server serves the staged image at `/apis/kube32.io/v1/firmware`. See [Firmware updates](firmware-updates.md#api). |
 | `kube32.io/v1` | Device | `dev` | get, list, watch, create, update, patch, delete; `status`; `activate` (create) | A part wired to a node. `spec.driver` must be a driver of the catalog. The API server checks I2C addresses, multiplexer channels, pins, `activation` and `idleSeconds`, and stores addresses as `"0x77"`. A write to the object keeps `status`. A write to `status` changes nothing else. The Device controller runs the driver pod and Service and writes `status`. `POST .../devices/<name>/activate` reports a use of an `OnDemand` Device and stores nothing. See [Devices](devices.md). |
-| `kube32.io/v1` | Checkpoint | `ckpt` | get, list, watch, create, update, patch, delete; `status`, `data` | A pod's snapshot. `spec.podName` is required and `spec.action` is `Save` or `Move`. A write to the object keeps `status`. `GET` and `PUT` of `checkpoints/<name>/data` read and store the snapshot (`application/octet-stream`), kept in memory outside the object store. See [Pod migration](migration.md#checkpoint-objects-and-data). |
+| `kube32.io/v1` | Checkpoint | `ckpt` | get, list, watch, create, update, patch, delete; `status`, `data` | A pod's snapshot. `spec.podName` is required and `spec.action` is `Save`, `Move` or `Copy`; a `Copy` names the pod it restores into in `spec.target.podName`. A write to the object keeps `status`. `GET` and `PUT` of `checkpoints/<name>/data` read and store the snapshot (`application/octet-stream`), kept in memory outside the object store. See [Pod migration](migration.md#checkpoint-objects-and-data). |
 
 ## Eviction
 
@@ -76,10 +76,10 @@ The Checkpoint controller writes `status` of each `kube32.io/v1` Checkpoint. The
 
 | Field | Meaning |
 | --- | --- |
-| `phase` | `Pending`, `Saving`, `Saved` (Save), `Moving`, `Completed` (Move) or `Failed` |
+| `phase` | `Pending`, `Saving`, `Saved` (Save), `Moving`, `Completed` (Move), `Copying`, `Completed` (Copy) or `Failed` |
 | `nodeName` | The node the pod ran on when the snapshot was taken |
-| `targetNode` | Move: the node the replacement runs on |
-| `newPodName` | Move: the replacement's name, the pod's own |
+| `targetNode` | Move: the node the replacement runs on. Copy: the node the target pod restores on |
+| `newPodName` | Move: the replacement's name, the pod's own. Copy: the target pod |
 | `imageSha256` | SHA-256 of the pod's module, from the snapshot |
 | `snapshotSha256` | The snapshot's trailer, the SHA-256 of its bytes before it |
 | `sizeBytes` | Size of the checkpoint's data |
@@ -95,11 +95,13 @@ See [Pod migration](migration.md) for the phases and the retention of Checkpoint
 | Annotation | On | Meaning |
 | --- | --- | --- |
 | `kube32.io/migration` | Pod | `OnDrain` (default), `Never` or `Auto`. See [Policies](migration.md#policies) |
-| `kube32.io/placement` | Pod | `fastest`: with `Auto`, run on the fastest node, by `kube32.io/interp-mops` |
+| `kube32.io/placement` | Pod | With `Auto`: `fastest` runs the pod on the fastest node, by `kube32.io/interp-mops`; `hardware` on a node with the devices its current step needs. See [Hardware-following pods](migration.md#hardware-following-pods) |
+| `kube32.io/needs` | Pod | The devices the current step of a hardware-following pod needs: resource names such as `hardware.kube32.io/speaker`, comma-separated, empty for none. The pod's kubelet writes it from `k32_need`; the scheduler and the Checkpoint controller place the pod by it |
+| `kube32.io/prefer-nodes` | Pod | Nodes the scheduler prefers among those that fit the pod, best first: node names or `<label>=<value>`, comma-separated. A node that matches an earlier entry wins over the other scores |
 | `kube32.io/checkpoint-interval` | Pod | Save the pod's state at this interval (`"60s"`, `"5m"`), 10 s at the least |
 | `kube32.io/restore-from` | Pod | The Checkpoint the kubelet restores the pod from. The Checkpoint controller and the node lifecycle controller set it and remove it once the pod runs |
 | `kube32.io/interp-mops` | Node | Interpreter speed the node measured at boot, millions of wasm3 operations per second |
-| `kube32.io/trigger` (label) | Checkpoint | What created it: `periodic`, `eviction`, `memory-pressure` or `placement` |
+| `kube32.io/trigger` (label) | Checkpoint | What created it: `periodic`, `eviction`, `memory-pressure`, `placement` or `hardware` |
 
 `POST /apis/kube32.io/v1/egress` is the egress gateway: it makes the `https://` calls of pods on workers, for nodes only. See [Networking](networking.md#egress-gateway).
 
@@ -111,6 +113,35 @@ See [Pod migration](migration.md) for the phases and the retention of Checkpoint
 | --- | --- | --- |
 | `kube32.io/interp-mops` | Kubelet, once at boot | The interpreter's speed: millions of wasm3 operations per second on a fixed integer kernel, timed on the stack and memory the node gives pods: the fastest of 10 runs a random 25 to 75 ms apart, by the CPU time the interpreter ran, e.g. `"6.88"` on a Cardputer |
 | `kube32.io/interp-check` | Kubelet, once at boot | `ok` when the interpreter computes 64-bit integer values right on a fixed module: a global, `i64.load` in each form, locals and arguments over a call, and a host call's result. Otherwise `failed: <step>`, and pods on the node get wrong 64-bit values |
+
+## Node labels and system info
+
+Every kubelet sets these labels on its Node when it registers, and again over a Node that outlived it:
+
+| Label | Value |
+| --- | --- |
+| `kubernetes.io/hostname` | The node's name |
+| `kubernetes.io/arch` | The CPU architecture the node's build runs on: `xtensa` (ESP32-S3), `riscv32` (ESP32-S31, ESP32-C3, ESP32-P4), `arm64` or `amd64` (`kube32-sim`) |
+| `kubernetes.io/os` | `freertos` on a board, `linux` or `darwin` for `kube32-sim` by its host |
+| `node-role.kubernetes.io/control-plane`, `node-role.kubernetes.io/worker` | The node's role, empty value |
+| `kube32.io/board` | The board profile ([Board profiles and labels](hardware-spec.md#board-profiles-and-labels)) |
+
+The architecture and OS names follow Go's `GOARCH` and `GOOS` where Go has one; Xtensa and 32-bit RISC-V have none, so they are `xtensa` and `riscv32`. Heartbeats leave labels as they are, so a label a user sets stays.
+
+`status.nodeInfo` carries the same build facts:
+
+| Field | Value |
+| --- | --- |
+| `architecture` | As `kubernetes.io/arch` |
+| `operatingSystem` | As `kubernetes.io/os` |
+| `osImage` | `kube32 <version> (<ESP-IDF version or host OS>)` |
+| `kernelVersion` | `FreeRTOS <version>` on a board, the host kernel's release for `kube32-sim` |
+| `kubeletVersion` | `v1.33.0-kube32` |
+| `containerRuntimeVersion` | `wasm3://<version>` |
+
+```
+kubectl --context kube32 get nodes -L kubernetes.io/arch,kubernetes.io/os
+```
 
 ## kubectl and k9s
 

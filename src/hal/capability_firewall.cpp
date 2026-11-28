@@ -1,5 +1,6 @@
 #include "hal/capability_firewall.hpp"
 #include "models/kube_models.hpp"
+#include "models/migration.hpp"
 #include "osal/thread.hpp"
 #if defined(ESP_PLATFORM)
 #include "esp_adc/adc_oneshot.h"
@@ -57,6 +58,21 @@ BoardProfile CapabilityFirewall::board_profile() const {
 uint32_t CapabilityFirewall::onboard_devices() const {
     osal::LockGuard guard(mutex_);
     return profile_.onboard_devices;
+}
+
+uint32_t CapabilityFirewall::node_devices() const {
+    osal::LockGuard guard(mutex_);
+    return profile_.onboard_devices | (profile_.chip_temp ? KUBE32_CAP_CHIP_TEMP : 0);
+}
+
+bool CapabilityFirewall::pod_devices(const std::string& pod_id, uint32_t& listed, uint32_t& held, bool& follows) const {
+    osal::LockGuard guard(mutex_);
+    auto it = pod_records_.find(pod_id);
+    if (it == pod_records_.end()) return false;
+    listed = it->second.listed_devices;
+    held = it->second.grant.capabilities_mask & models::kFollowedDevices;
+    follows = it->second.follows_hardware;
+    return true;
 }
 
 bool CapabilityFirewall::capability_held(uint32_t capabilities) const {
@@ -121,7 +137,9 @@ uint32_t CapabilityFirewall::claimable_rmt_count_locked(RmtDir dir) const {
     if (dir == RmtDir::Tx) pins |= profile_.rmt_tx_pin_mask;
     uint32_t n = 0;
     for (; pins; pins &= pins - 1) n++;
-    return n < kRmtChannels ? n : kRmtChannels;
+    uint32_t channels = kRmtChannels;
+    if (dir == RmtDir::Tx) channels -= profile_.rmt_tx_board_channels < kRmtChannels ? profile_.rmt_tx_board_channels : kRmtChannels;
+    return n < channels ? n : channels;
 }
 
 uint32_t CapabilityFirewall::allocated_rmt_count_locked(RmtDir dir) const {
@@ -725,6 +743,9 @@ bool CapabilityFirewall::register_pod_locked(const std::string& pod_id, const st
                     else if (key == "hardware.kube32.io/touch") {
                         if (val_str != "0") grant.capabilities_mask |= KUBE32_CAP_TOUCH;
                     }
+                    else if (key == "hardware.kube32.io/led") {
+                        if (val_str != "0") grant.capabilities_mask |= KUBE32_CAP_LED;
+                    }
                     else if (key == "hardware.kube32.io/chip-temp") {
                         if (val_str != "0") grant.capabilities_mask |= KUBE32_CAP_CHIP_TEMP;
                     }
@@ -735,7 +756,7 @@ bool CapabilityFirewall::register_pod_locked(const std::string& pod_id, const st
                 }
             }
 
-            // securityContext.capabilities.add: [CHANNEL_IPC, DISPLAY, KEYBOARD, SPEAKER, MICROPHONE, TOUCH, SD, SERVICE_CALL, CHIP_TEMP]
+            // securityContext.capabilities.add: [CHANNEL_IPC, DISPLAY, KEYBOARD, SPEAKER, MICROPHONE, TOUCH, LED, SD, SERVICE_CALL, CHIP_TEMP]
             for (const auto& c : containers->arr_val) {
                 if (!c.is_object()) continue;
                 const models::JsonValue* sc = c.get("securityContext");
@@ -753,6 +774,7 @@ bool CapabilityFirewall::register_pod_locked(const std::string& pod_id, const st
                     else if (name == "SPEAKER" || name == "AUDIO") grant.capabilities_mask |= KUBE32_CAP_SPEAKER;
                     else if (name == "MICROPHONE" || name == "MIC") grant.capabilities_mask |= KUBE32_CAP_MICROPHONE;
                     else if (name == "TOUCH") grant.capabilities_mask |= KUBE32_CAP_TOUCH;
+                    else if (name == "LED") grant.capabilities_mask |= KUBE32_CAP_LED;
                     else if (name == "SD" || name == "SD_CARD") sd_requested = true;
                     else if (name == "SERVICE_CALL") grant.capabilities_mask |= KUBE32_CAP_SERVICE_CALL;
                     else if (name == "CHIP_TEMP") grant.capabilities_mask |= KUBE32_CAP_CHIP_TEMP;
@@ -832,9 +854,17 @@ bool CapabilityFirewall::register_pod_locked(const std::string& pod_id, const st
         return false;
     }
 
+    // A pod that follows its hardware holds the devices it lists that this
+    // node has; on another node, those that one has
+    const uint32_t listed_devices = grant.capabilities_mask & models::kFollowedDevices;
+    const bool follows = models::follows_hardware(doc);
+    if (follows) grant.capabilities_mask &= ~(listed_devices & ~(profile_.onboard_devices | (profile_.chip_temp ? KUBE32_CAP_CHIP_TEMP : 0)));
+
     PodSecurityRecord record;
     record.pod_id = pod_id;
     record.grant = grant;
+    record.listed_devices = listed_devices;
+    record.follows_hardware = follows;
     record.action = SecurityAction::LogAndDeny;
     record.violation_count = 0;
     record.sd_claim = sd_claim;
@@ -1363,6 +1393,9 @@ bool CapabilityFirewall::check_permission(const std::string& pod_id, PeripheralT
         case PeripheralType::Touch:
             permitted = grant.has_capability(KUBE32_CAP_TOUCH);
             break;
+        case PeripheralType::Led:
+            permitted = grant.has_capability(KUBE32_CAP_LED);
+            break;
         case PeripheralType::SdCard:
             permitted = grant.has_capability(KUBE32_CAP_SD);
             break;
@@ -1447,7 +1480,7 @@ void CapabilityFirewall::log_violation(const std::string& pod_id, PeripheralType
     static int logged = 0;
     if (logged >= 16) return;
     logged++;
-    static const char* const names[] = {"gpio", "adc", "i2c", "uart", "ipc", "display", "keyboard", "speaker", "sd", "service-call", "rmt-tx", "rmt-rx", "chip-temp", "microphone", "touch"};   // PeripheralType order
+    static const char* const names[] = {"gpio", "adc", "i2c", "uart", "ipc", "display", "keyboard", "speaker", "sd", "service-call", "rmt-tx", "rmt-rx", "chip-temp", "microphone", "touch", "led"};   // PeripheralType order
     unsigned ti = static_cast<unsigned>(type);
     std::cout << "[FIREWALL] denied " << pod_id << ": " << (ti < sizeof(names) / sizeof(names[0]) ? names[ti] : "peripheral")
               << " " << target;

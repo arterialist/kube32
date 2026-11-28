@@ -120,7 +120,7 @@ The controller also sets these annotations and resources:
 
 - `kube32.io/tick-interval` with the reading period.
 - For an I2C driver, the device grant `kube32.io/i2c-device` (see [shared I2C buses](#shared-i2c-buses)).
-- A driver that only reads its pins (`button`) requests `esp32.io/gpio-input-<n>` for each pin. This resource also admits GPIO 0, the boot button.
+- A driver that only reads its pins (`button`) requests `esp32.io/gpio-input-<n>` for each pin. This resource also admits the boot button: GPIO 0 on the ESP32-S3, GPIO 61 on the ESP32-S31.
 - A driver that drives its pins (`switch`) requests `esp32.io/gpio-<n>`.
 - `chip-temp` requests `hardware.kube32.io/chip-temp`.
 
@@ -170,7 +170,7 @@ One table in the firmware (`src/models/device.cpp`) supplies the API server's va
 | `miniscale` | I2C | `0x26` | Register `0xFF`, the unit's I2C address, reads `0x26`, and the button register `0x20` reads `0` or `1` | `weight_g`, `raw` / `tare`, `led` | 1 s |
 | `rfid` | I2C | `0x28` | Version register `0x37` reads `0x15` (WS1850S), `0x88` or `0xB2` (FM17522), `0x91` or `0x92` (MFRC522) | `tag`, `present`. An event for each tag | 200 ms |
 | `chip-temp` | Internal | | Not discovered | `temperature_c` of the die. It is above room temperature while the chip works | 10 s |
-| `button` | GPIO pin `pin`, read only (GPIO 0 allowed) | | Not discovered | `pressed`, an event on change. Config `pull` (`up`, `down`, `none`) and `active` (`low`, `high`) | 50 ms |
+| `button` | GPIO pin `pin`, read only (the boot button allowed: GPIO 0, or 61 on the ESP32-S31) | | Not discovered | `pressed`, an event on change. Config `pull` (`up`, `down`, `none`) and `active` (`low`, `high`) | 50 ms |
 | `switch` | GPIO pin `pin` | | Not discovered | `on` / `{"action":"set","on":true}` | 30 s |
 
 ## Driver API
@@ -283,7 +283,7 @@ A `kube32-sim` worker can join a cluster of boards and run app pods. Driver pods
 kube32-sim --role worker --join http://<control-plane-ip>:6443 --node-name laptop --pod-port 17000
 ```
 
-The laptop reports the address that its route to the control plane uses, an address that the boards can reach. An app on the laptop calls a driver at its board's address. Drivers and Services reach the laptop's pod server at the laptop's address. When the laptop changes network, the Node's address follows, and the worker dials the control plane at the address it announces after 30 seconds without an answer ([Following the network](cli-reference.md#following-the-network)). `--node-ip <ip>` fixes the address.
+The laptop reports the address that its route to the control plane uses, an address that the boards can reach. An app on the laptop calls a driver at its board's address. Drivers and Services reach the laptop's pod server at the laptop's address. When the laptop changes network, the Node's address follows, and the worker dials the control plane at the address it announces after 30 seconds without an answer, once the API server answers there ([Following the network](cli-reference.md#following-the-network)). `--node-ip <ip>` fixes the address.
 
 The pod server uses the node's own port. Endpoints, Ingress routes and Service calls reach a pod on the laptop at the port that the laptop reports, whatever its `containerPort` is.
 

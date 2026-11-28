@@ -26,7 +26,7 @@ pio run -e esp32s3
 bash scripts/flash.sh <serial port> 921600
 ```
 
-`scripts/flash.sh <serial port> [baud]` defaults to `460800` baud and reads `KUBE32_SERIAL_PORT` when you omit the port argument. The script locates `pio` on `PATH`, then in `$PLATFORMIO_CORE_DIR/penv/bin` or `~/.platformio/penv/bin`. It runs `esptool` from PlatformIO's virtualenv or from a system `python3` with `esptool` installed.
+`scripts/flash.sh <serial port> [baud]` defaults to `460800` baud and reads `KUBE32_SERIAL_PORT` when you omit the port argument. The script locates `pio` on `PATH`, then in `$PLATFORMIO_CORE_DIR/penv/bin` or `~/.platformio/penv/bin`. It runs `esptool` from PlatformIO's virtualenv or from a system `python3` with `esptool` installed. `scripts/flash.sh --build <directory> <serial port>` flashes an `idf.py` build instead, of any target, and takes the chip and the offsets from the build directory; the ESP32-S31 needs esptool 5.6 or later ([ESP32-S31](hardware-spec.md#esp32-s31)).
 
 - Writes `bootloader.bin` at `0x0`, `partitions.bin` at `0x8000`, an erased `otadata` at `0x11000`, and `firmware.bin` into the `ota_0` app slot at `0x20000` from `.pio/build/esp32s3/` in `dio` mode with an 8 MB flash size, using the offsets from `partitions.csv`. The board boots the flashed image. This leaves NVS and the object store journal untouched. Runs `pio run` if the binaries are missing.
 - Writes 256-byte blocks with a 1.5 ms pause on CH340 USB-UART bridges, vendor ID `0x1a86`. Uses `esptool` defaults on native USB-Serial/JTAG ports.
@@ -81,7 +81,7 @@ Profile commands write to the `k32` NVS namespace, return `K32_OK ..., rebooting
 | Command | Effect |
 | --- | --- |
 | `K32_CMD:WIFI:<ssid>:<password>` | Join a 2.4 GHz network as a station. The station picks the strongest access point with that name and roams to one at least 10 dB stronger when signal drops below -70 dBm. The SSID cannot contain `:`. `K32_CMD:WIFI:` erases credentials. |
-| `K32_CMD:API:<host>` | Set the control plane address for a worker, default `192.168.4.1`. `auto` erases it. A worker that gets no answer there switches to the address the control plane announces over ESP-NOW. |
+| `K32_CMD:API:<host>` | Set a worker's home control plane address, default `192.168.4.1`. `auto` erases it. A worker whose API server has not answered for 30 seconds dials its home address again, or the address its control plane announces in HELLO frames, once a kube32 API server answers there. It stores an address it follows beside the home address and restarts, and comes back to the home address when that answers again ([Following the network](cli-reference.md#following-the-network)). `K32_CMD:API` clears the followed address and the control plane the worker knows. |
 | `K32_CMD:AP:off` | Disable the `Kube32-Cluster` access point on the control plane. `on` erases the setting. |
 | `K32_CMD:APPASS:<password>` | Set the `Kube32-Cluster` access point password (8 to 63 printable characters) on the control plane and on each worker that joins the access point. An empty value erases the password, and the control plane generates a replacement on its next boot. |
 | `K32_CMD:APPASS` | Print the stored access point password as `K32_APPASS <password>`. |
